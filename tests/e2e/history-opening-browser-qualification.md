@@ -63,7 +63,8 @@ before arming. This setup repair has compiler-free tests only, not a runtime pas
   absence of browser chat POST are observed.
 - A harness-only owner-file switch makes the Vite preview destroy only this
   aggregate's GET transport. The browser witnesses actual request failure and a
-  visible history error. No synthetic JSON, public headers, page routing or
+  correlated owned requestfailed outcome; no page-alert contract is inferred for
+  background aggregate probes. No synthetic JSON, public headers, page routing or
   offline mode are used.
 - One exact release precedes actual accepted message/event-cursor observation,
   enabled composer, exact successor chat request/response and persistence while
@@ -100,3 +101,50 @@ owned stream tracking without starting any server/browser or invoking a compiler
 Syntax/selftest success is not runtime success. Runtime `result.json` starts
 failed, includes per-case receipts, and records verified actual startup separately
 from browser completion. Child failure logs and cleanup receipts remain retained.
+
+## Recorder scope and retained failed attempt
+
+Retained run 38506297019, artifact 11868396037, harness cf1940955929bb6460720d885789761c5fa4e1da
+completed all eight ordinary behavioral assertions, then failed the final capture
+assertion with five `Network.getResponseBody` no-data errors. Global did **not**
+execute. The old async recorder saved response metadata only after body retrieval;
+these five failures therefore have no saved URLs/methods/statuses. Their endpoint
+and causal classification are unknown. They are not retroactively classified as
+telemetry, navigation cancellation, application defects or harmless errors, and
+this recorder repair does not turn that failed artifact into a qualification.
+The application remains pinned d4c2772; a new executed artifact is required.
+
+The instrumented recorder uses a discriminated capture policy:
+
+- **Required aggregate JSON**: GET of the selected aggregate endpoint, or its
+  exact known member/source aliases, including Global history. The committed
+  successor identity registers an additional owned alias before navigation.
+  Status 200, JSON content type, segments/boundaries arrays, exact canonical root
+  and ProductConversation identity are required. Raw UTF-8 receipt (up to 2 MiB),
+  byte count and parsed identity are retained. Invalid JSON/wrong identity/body
+  unavailability/overlimit/disposal or the 11-second body deadline fail qualification.
+- **Metadata-only API consumer**: all other API responses, including stream
+  response headers and telemetry acknowledgments. No response-body read is
+  attempted. Browser request payloads, including telemetry POSTs, remain in
+  `browser-requests.jsonl`. Telemetry ack bodies are not owned history evidence;
+  this harness imports no telemetry readiness or telemetry qualification claim.
+
+Every API response saves immutable URL/method/status/content-type, request and
+response times, request ordinal and navigation epochs **before** any body read.
+Ordinals come from a WeakMap of actual Playwright Request objects and are labelled
+local ordinals, never represented as CDP request IDs. Failures repeat their owning
+metadata in `browser-capture-errors.jsonl` and response outcomes. Absent response
+status/content type/time are explicitly null on missing-response/requestfailed
+outcomes. Application `pageerror` events have a separate file and result array.
+
+End-of-case seal removes the response/request producer before draining all
+outstanding required tasks under their deadlines. `browser-capture-drain.jsonl`
+records terminal outcomes and `partial:false`, even when qualification fails;
+that field means receipt drain is complete, **not** that assertions passed.
+Missing required responses fail. A real requestfailed transport outcome is not a
+body-capture error; only an exact aggregate GET while the owned roster fault is
+active is an expected exception, and the original failed-endpoint behavioral
+assertion remains mandatory. A status200 body failure is never forgiven by that
+exception. Both application errors and capture errors must be empty; cleanup
+failure still forces failed status/exit. Controllable response mocks exist only
+inside compiler-free selftests and invoke the actual installed producer.

@@ -128,6 +128,154 @@ export async function releaseOnce(state, send) {
   assert.equal((await send({ command: 'release', predecessor: state.predecessor, client_turn_key: state.key })).state, 'released');
 }
 
+/** @typedef {{kind: 'required_aggregate_json'} | {kind: 'metadata_only'}} CapturePolicy */
+export const REQUIRED_BODY_DEADLINE_MS = 11000;
+export const REQUIRED_BODY_MAX_BYTES = 2 * 1024 * 1024;
+
+/** @returns {CapturePolicy} */
+export function capturePolicy(aggregate, method, url) {
+  const path = new URL(url).pathname;
+  const prefix = aggregate.kind === 'global' ? '/api/global/coordinator/history/' : '/api/product-conversations/';
+  const owned = [aggregate.endpoint, ...aggregate.members.map(id => prefix + encodeURIComponent(id))];
+  return method === 'GET' && owned.includes(path)
+    ? { kind: 'required_aggregate_json' } : { kind: 'metadata_only' };
+}
+
+// Playwright request ordinals are local identities, not CDP Network.requestId.
+export function installAggregateRecorder(page, aggregate, record, snapshots, {
+  deadlineMs = REQUIRED_BODY_DEADLINE_MS, maxBytes = REQUIRED_BODY_MAX_BYTES,
+  expectedRequestFailure = () => false,
+} = {}) {
+  aggregate = { ...aggregate, members: [...aggregate.members] };
+  const requests = [], failed = [], applicationErrors = [], captureErrors = [];
+  const identities = new WeakMap(), required = new Map(), tasks = new Set();
+  let ordinal = 0, navigationEpoch = 0, sealed = false, drain;
+  const identity = req => {
+    if (!identities.has(req)) identities.set(req, Object.freeze({
+      request_ordinal: ++ordinal, identity_source: 'playwright_request_local_ordinal',
+      navigation_epoch: navigationEpoch, url: req.url(), method: req.method(), at: performance.now(),
+      status: null, type: null, response_at: null,
+    }));
+    return identities.get(req);
+  };
+  const emitFailure = (metadata, reason, error, extra = {}) => {
+    const entry = { ...metadata, ...extra, outcome: 'capture_failed', reason, error: String(error) };
+    captureErrors.push(entry); record('browser-capture-errors.jsonl', entry);
+    record('browser-responses.jsonl', entry);
+  };
+  const onRequest = req => {
+    const metadata = identity(req), policy = capturePolicy(aggregate, metadata.method, metadata.url);
+    const entry = { ...metadata, body: req.postData(), policy };
+    requests.push(entry); record('browser-requests.jsonl', entry);
+    if (policy.kind === 'required_aggregate_json') required.set(metadata.request_ordinal, { metadata, outcome: 'awaiting_response' });
+  };
+  const onFailed = req => {
+    const entry = { ...identity(req), failure: req.failure(), outcome: 'request_failed' };
+    failed.push(entry); record('browser-failed.jsonl', entry);
+    const state = required.get(entry.request_ordinal);
+    if (state?.outcome === 'awaiting_response') {
+      state.outcome = 'request_failed'; state.expected_transport_failure = expectedRequestFailure(entry);
+      record('browser-required-transport.jsonl', { ...entry, expected_transport_failure: state.expected_transport_failure });
+    }
+  };
+  const onPageError = error => {
+    const entry = { error: String(error), at: performance.now(), navigation_epoch: navigationEpoch };
+    applicationErrors.push(entry); record('page-errors.jsonl', entry);
+  };
+  const onNavigation = frame => { if (frame === page.mainFrame()) navigationEpoch++; };
+  const onResponse = response => {
+    if (sealed || !new URL(response.url()).pathname.startsWith('/api/')) return;
+    const req = response.request(), requestIdentity = identity(req);
+    const metadata = Object.freeze({ ...requestIdentity, url: response.url(), status: response.status(),
+      type: response.headers()['content-type'] ?? '', response_at: performance.now(),
+      response_navigation_epoch: navigationEpoch });
+    const policy = capturePolicy(aggregate, metadata.method, metadata.url);
+    record('browser-responses.jsonl', { ...metadata, policy, outcome: 'response_metadata' });
+    if (policy.kind === 'metadata_only') {
+      record('browser-responses.jsonl', { ...metadata, policy, outcome: 'metadata_only', consumer: 'api_metadata_no_response_body' });
+      return;
+    }
+    const state = { metadata, outcome: 'reading_body' };
+    required.set(metadata.request_ordinal, state);
+    let timer, abort;
+    const disposed = new Promise((_, reject) => { abort = reject; });
+    state.dispose = () => abort(Object.assign(new Error('page disposed during required receipt'), { captureReason: 'disposed' }));
+    const task = (async () => {
+      let raw;
+      try {
+        assert.equal(metadata.status, 200, 'required aggregate HTTP status');
+        assert.match(metadata.type, /application\/json/i, 'required aggregate JSON content type');
+        const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(
+          new Error(`required body deadline ${deadlineMs}ms`), { captureReason: 'deadline' })), deadlineMs); });
+        try { raw = await Promise.race([Promise.resolve().then(() => response.text()), timeout, disposed]); }
+        catch (error) { error.captureReason ??= 'body_transport'; throw error; }
+        const bytes = Buffer.byteLength(raw);
+        if (bytes > maxBytes) {
+          state.outcome = 'capture_failed';
+          emitFailure(metadata, 'over_limit', `required body ${bytes} exceeds ${maxBytes} bytes`, { body_bytes: bytes, max_bytes: maxBytes });
+          return;
+        }
+        record('browser-responses.jsonl', { ...metadata, outcome: 'body_received', raw, body_bytes: bytes });
+        let data;
+        try { data = JSON.parse(raw); }
+        catch (error) { error.captureReason = 'parse'; throw error; }
+        if (!Array.isArray(data?.segments) || !Array.isArray(data?.boundaries)
+          || data.canonical_root?.transcript_row_id !== aggregate.members[0]
+          || data.product_conversation_id !== aggregate.manual_opening.edge.product_conversation_id) {
+          throw Object.assign(new Error('required response is not the owned aggregate'), { captureReason: 'wrong_aggregate' });
+        }
+        assert.ok(snapshots.length < 300, 'aggregate snapshot bound');
+        const parsed_identity = { product_conversation_id: data.product_conversation_id,
+          canonical_root_transcript_row_id: data.canonical_root.transcript_row_id,
+          requested_transcript_row_id: data.requested_transcript_row_id, latest_transcript_row_id: data.latest_transcript_row_id };
+        snapshots.push({ ...metadata, raw, data, parsed_identity });
+        state.outcome = 'captured';
+        record('browser-responses.jsonl', { ...metadata, outcome: 'captured', parsed_identity, body_bytes: bytes });
+      } catch (error) {
+        state.outcome = 'capture_failed';
+        emitFailure(metadata, error.captureReason ?? 'required_contract', error);
+      } finally { clearTimeout(timer); delete state.dispose; }
+    })();
+    tasks.add(task);
+    task.then(() => tasks.delete(task), error => {
+      tasks.delete(task); state.outcome = 'capture_failed';
+      captureErrors.push({ ...metadata, reason: 'recorder_write', error: String(error) });
+    });
+  };
+  const onClose = () => { for (const state of required.values()) state.dispose?.(); };
+  page.on('request', onRequest); page.on('requestfailed', onFailed); page.on('response', onResponse);
+  page.on('pageerror', onPageError); page.on('framenavigated', onNavigation); page.on('close', onClose);
+  return { requests, failed, applicationErrors, captureErrors,
+    registerMember(id) { assert.ok(typeof id === 'string' && id.length > 0); aggregate.members.push(id); },
+    sealAndDrain() {
+      if (drain) return drain;
+      sealed = true;
+      page.off('response', onResponse); page.off('request', onRequest);
+      drain = (async () => {
+        await Promise.all([...tasks]);
+        for (const state of required.values()) {
+          if (state.outcome === 'awaiting_response') {
+            state.outcome = 'capture_failed'; emitFailure(state.metadata, 'missing_response', 'required request has no response or requestfailed outcome');
+          }
+        }
+        const summary = { sealed: true, partial: false, pending_required: tasks.size,
+          required_outcomes: [...required.values()].map(({ metadata, outcome, expected_transport_failure }) => ({ ...metadata, outcome, expected_transport_failure })),
+          application_page_errors: applicationErrors, cdp_capture_errors: captureErrors };
+        record('browser-capture-drain.jsonl', summary);
+        return summary;
+      })();
+      return drain;
+    },
+    assertQualified() {
+      assert.ok(sealed && tasks.size === 0, 'sealed completed drain required');
+      assert.deepEqual(applicationErrors, [], 'application page errors');
+      assert.deepEqual(captureErrors, [], 'required API/CDP capture errors');
+      assert.ok([...required.values()].every(s => s.outcome === 'captured'
+        || (s.outcome === 'request_failed' && s.expected_transport_failure === true)), 'all required outcomes captured or exact expected transport failure');
+    },
+  };
+}
+
 async function run() {
   const app = resolve(process.env.APP_ROOT), output = resolve(process.env.HISTORY_OUTPUT);
   const ui = loopback(process.env.HISTORY_BASE_URL), api = loopback(process.env.HISTORY_API_URL);
@@ -140,8 +288,9 @@ async function run() {
   const checked = (name, data) => { result.checks.push(name); record('assertions.jsonl', { name, ...data }); };
   const gate = { armed: false, releaseAttempted: false, predecessor: a.members.at(-1), key: randomUUID() };
   const command = async body => { const reply = await ipc(control, body); record('ipc.jsonl', { command: body, reply }); return reply; };
-  let browser, page, continuation;
-  const errors = [], captureErrors = [], tasks = new Set(), snapshots = [], events = [], requests = [], failed = [];
+  let browser, page, continuation, recorder;
+  const snapshots = [], events = [];
+  let requests = [], failed = [];
   const hardStop = setTimeout(() => { writeFileSync(resolve(output, 'browser-result.json'), JSON.stringify({ ...result, error: 'wall deadline' })); process.exit(1); }, 170000);
   async function poll(fn, label, ms = 10000) {
     const end = performance.now() + ms;
@@ -179,25 +328,10 @@ async function run() {
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 1360, height: 900 } });
     page = await context.newPage(); page.setDefaultTimeout(10000); page.setDefaultNavigationTimeout(10000);
-    page.on('pageerror', error => errors.push(String(error)));
-    page.on('request', req => { const entry = { url: req.url(), method: req.method(), body: req.postData(), at: performance.now() };
-      requests.push(entry); record('browser-requests.jsonl', entry); });
-    page.on('requestfailed', req => { const entry = { url: req.url(), method: req.method(), failure: req.failure() };
-      failed.push(entry); record('browser-failed.jsonl', entry); });
-    page.on('response', response => {
-      if (!new URL(response.url()).pathname.startsWith('/api/')) return;
-      const task = (async () => {
-        const entry = { url: response.url(), status: response.status(), type: response.headers()['content-type'], at: performance.now() };
-        if (!entry.type?.includes('text/event-stream')) {
-          const raw = await response.text(); assert.ok(Buffer.byteLength(raw) < 1000000, 'HTTP receipt bound'); entry.raw = raw;
-          if (entry.type?.includes('application/json') && raw) {
-            const data = JSON.parse(raw); if (data.segments && data.boundaries) snapshots.push({ ...entry, data });
-          }
-        }
-        record('browser-responses.jsonl', entry);
-      })();
-      tasks.add(task); task.finally(() => tasks.delete(task)).catch(error => captureErrors.push(String(error)));
+    recorder = installAggregateRecorder(page, a, record, snapshots, {
+      expectedRequestFailure: entry => faultTarget(entry.method, entry.url, JSON.parse(readFileSync(fault)), 'roster'),
     });
+    ({ requests, failed } = recorder);
     const cdp = await context.newCDPSession(page); await cdp.send('Network.enable');
     cdp.on('Network.eventSourceMessageReceived', event => { events.push(event); record('browser-sse.jsonl', event); });
 
@@ -228,6 +362,7 @@ async function run() {
     assert.equal(entered.predecessor_transcript_row_id, gate.predecessor); assert.equal(entered.client_turn_key, gate.key);
     assert.equal(entered.edge, 'committed_intent_before_first_message_persistence');
     const latest = entered.successor_transcript_row_id, acceptedId = `${latest}:${gate.key}`;
+    recorder.registerMember(latest);
     const pending = await http('GET', a.endpoint + '?boundary_representation=original_messages');
     assert.equal(pending.latest_transcript_row_id, latest); assert.ok(openingMatches(pending.latest_opening, entered, 'pending'));
     const direct = await http('GET', `/api/conversations/${latest}`);
@@ -314,12 +449,14 @@ async function run() {
     const physical = await rendered.evaluate(el => { const box = el.getBoundingClientRect(); const view = document.querySelector('#messages').getBoundingClientRect(); return box.height > 0 && box.bottom > view.top && box.top < view.bottom; });
     assert.equal(physical, true);
     checked('accepted manual opening renders once with exact persisted identity after real chapter click', { acceptedId });
-    await Promise.all([...tasks]); assert.deepEqual(errors, []); assert.deepEqual(captureErrors, []);
+    await recorder.sealAndDrain(); recorder.assertQualified();
     result.status = 'passed_assertions';
   } catch (error) {
     result.error = String(error.stack ?? error); process.exitCode = 1;
     if (page) await page.screenshot({ path: resolve(output, 'failure.png') }).catch(() => {});
   } finally {
+    try { if (recorder) { await recorder.sealAndDrain(); recorder.assertQualified(); } }
+    catch (error) { result.status = 'failed'; result.capture_error = String(error); process.exitCode = 1; }
     try { if (gate.armed && !gate.releaseAttempted) {
       const entered = await command({ command: 'entered' });
       if (entered.state === 'entered') await releaseOnce(gate, command);
@@ -327,7 +464,13 @@ async function run() {
     try { await command({ command: 'stop' }); } catch (error) { record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; result.status = 'failed'; }
     try { updateFault(fault, { failRoster: false }); if (browser) await browser.close(); }
     catch (error) { result.status = 'failed'; result.cleanup_error = String(error); process.exitCode = 1; }
-    finally { clearTimeout(hardStop); writeFileSync(resolve(output, 'browser-result.json'), JSON.stringify(result, null, 2) + '\n'); }
+    finally {
+      try { recorder?.assertQualified(); }
+      catch (error) { result.status = 'failed'; result.capture_error = String(error); process.exitCode = 1; }
+      result.application_page_errors = recorder?.applicationErrors ?? [];
+      result.cdp_capture_errors = recorder?.captureErrors ?? [];
+      clearTimeout(hardStop); writeFileSync(resolve(output, 'browser-result.json'), JSON.stringify(result, null, 2) + '\n');
+    }
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await run();
