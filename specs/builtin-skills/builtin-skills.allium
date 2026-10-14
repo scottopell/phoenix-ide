@@ -218,14 +218,17 @@ rule PhoenixApiDestinationAuthority {
 
     requires: ActiveWorkScope(work_scope_id)
 
-    ensures: action.destination_identity_is_authoritative = true
     ensures: action.local_work_scope_authorizes_execution_only = true
+    ensures: action.destination_identity_is_authoritative = true
     ensures: action.destination_authentication_is_authoritative = true
-    ensures: action.destination_credential_is_bound_to_selected_destination = true
-    ensures: action.destination_target_and_state_are_current = true
-    ensures: action.destination_is_nonlocal = false or action.nonlocal_credential_hop_uses_authenticated_encryption = true
+    ensures: action.authentication_requires_unsatisfied_credential = false or action.destination_credential_is_bound_to_selected_destination = true
+    ensures: action.authentication_requires_unsatisfied_credential = false or action.destination_credential_is_nonserialized = true
+    ensures: action.authentication_requires_unsatisfied_credential = true or action.credential_is_sent = false
+    ensures: action.is_ambiguous_continue_retry = true or action.destination_target_and_state_are_current = true
+    ensures: action.is_ambiguous_continue_retry = false or action.continue_target_is_original_predecessor = true
+    ensures: action.is_ambiguous_continue_retry = false or action.continue_intent_is_exactly_reused = true
+    ensures: action.destination_is_nonlocal = false or action.nonlocal_transport_is_authenticated_and_encrypted = true
     ensures: action.destination_is_nonlocal = false or action.api_executes_in_destination_context = true
-    ensures: action.destination_is_nonlocal = false or action.destination_credential_is_nonserialized = true
     ensures: action.local_curl_recipe_used_for_nonlocal_destination = false
     ensures: action.consumes_destination_cwd = false or action.destination_cwd_is_authoritative = true
     ensures: action.uses_local_message_tool_for_remote_destination = false

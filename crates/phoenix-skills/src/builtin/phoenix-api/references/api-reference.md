@@ -6,7 +6,7 @@ This authenticated reference is for the live Phoenix deployment the user named. 
 
 Every HTTP command must run through Global's Bash tool with an explicit active local `work_scope_id` admitted from authoritative Coordinator home context or WorkScope rows. That WorkScope authorizes local execution only. Separately establish the selected destination's identity, authentication, current `ProductConversation` or transcript, and lifecycle state from authoritative, user-authorized sources. Require destination cwd provenance only when the operation consumes cwd.
 
-Transport grants no destination authority. Use only a user-identified credential source bound to the selected destination. The copyable curl recipes are local-only: their origin and ambient `PHOENIX_PASSWORD` belong to the Phoenix server owning the active WorkScope. A nonlocal API call must instead execute in the destination context through a user-authorized, authenticated encrypted transport that supplies the destination credential without serializing it into the Bash command; stop if that capability is unavailable. Apply the operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged.
+Transport grants no destination authority. When authentication requires a credential, use only a user-identified credential source bound to the selected destination. The copyable curl recipes are local-only: their origin and ambient `PHOENIX_PASSWORD` belong to the Phoenix server owning the active WorkScope. A nonlocal API call must instead execute in the destination context through a user-authorized, authenticated encrypted transport that supplies any required destination credential without serializing it into the Bash command; stop if that capability is unavailable. Apply the operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged.
 
 For the documented local Bash recipes, Global interprets each response structurally and retains the request identity and exact intent. Treat payloads as data, not shell syntax. Do not install dependencies or substitute ad-hoc text parsing.
 
@@ -21,8 +21,7 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
    CA_CERT_PATH_B64='' # optional base64 of its authoritative CA path
    if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
    ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
-   [[ "$ORIGIN" =~ ^https://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ||
-      "$ORIGIN" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
+   [[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
    CURL_TLS=(--globoff)
    if [[ -n "$CA_CERT_PATH_B64" ]]; then
      CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
@@ -103,8 +102,7 @@ CA_CERT_PATH_B64='' # optional base64 of its authoritative CA path
 INTENT_B64='base64-of-the-complete-exact-json-intent'
 if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
 ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
-[[ "$ORIGIN" =~ ^https://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ||
-   "$ORIGIN" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
+[[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
 CURL_TLS=(--globoff)
 if [[ -n "$CA_CERT_PATH_B64" ]]; then
   CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
@@ -171,7 +169,7 @@ For local message steering, use `send_conversation_message` with non-empty liter
 
 For cancel, re-resolve and call `POST /api/conversations/{writable_transcript_row_id}/cancel`. The response always has `ok`; `no_op` is omitted when false. Therefore `{ "ok": true }` means cancellation found in-flight work, while `{ "ok": true, "no_op": true }` means nothing cancellable was observed. Cancel has no caller idempotency key or uniform operation receipt.
 
-Remote Continue executes that existing API in the selected destination's context and is independent of federated message steering. For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript. Call `POST /api/conversations/{latest_transcript_row_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. Reuse the same `message_id` for an uncertain exact retry. Preserve the successor even for `dispatch_failed`, then re-read aggregate and transcript state. A History aggregate requires a separate Open follow-up, not `/continue`.
+Remote Continue executes that existing API in the selected destination's context and is independent of federated message steering. For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript. Retain that transcript as the original predecessor before calling `POST /api/conversations/{original_predecessor_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. An uncertain exact retry uses the same original predecessor, message identity, and intent; never retarget a newly current successor. Preserve the successor even for `dispatch_failed`, then re-read aggregate and transcript state. A History aggregate requires a separate Open follow-up, not `/continue`.
 
 ## Honest gaps
 

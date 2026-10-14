@@ -305,13 +305,13 @@ mod tests {
         assert!(skill.contains("acceptance, not proof"));
         assert!(reference.contains("GET /api/auth/status"));
         assert!(reference.contains("writable_transcript_row_id"));
-        assert!(reference.contains("/{latest_transcript_row_id}/continue"));
+        assert!(reference.contains("/{original_predecessor_id}/continue"));
         assert!(reference.contains("conversation.state.type == \"context_exhausted\""));
         assert!(!reference.contains("verified as `ContextExhausted`"));
         assert!(reference.contains("send_conversation_message"));
         assert!(reference.contains("Do not use `POST /api/conversations/{id}/chat`"));
         assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
-        assert!(reference.contains("Reuse the same `message_id`"));
+        assert!(reference.contains("same original predecessor, message identity, and intent"));
         assert!(reference.contains("Current APIs do not provide"));
         assert!(!reference.contains("NEVER call Phoenix HTTP API through Bash"));
     }
@@ -328,11 +328,13 @@ mod tests {
         assert!(skill.contains("user-identified credential source"));
         assert!(skill.contains("bound to that destination"));
         assert!(skill.contains("authenticated encryption for nonlocal transport"));
+        assert!(skill.contains("When authentication requires a credential"));
+        assert!(skill.contains("retained original predecessor and exact intent"));
         assert!(skill.contains(
             "Copyable curl recipes, local-only tools, and local cwd target only the local destination"
         ));
         assert!(skill.contains(
-            "nonlocal API calls must execute in the destination context with a nonserialized destination credential"
+            "nonlocal API calls must execute in the destination context with any required credential supplied without serialization"
         ));
         assert!(skill.contains("destination cwd provenance only when the operation consumes cwd"));
         assert!(skill.contains(
@@ -355,6 +357,8 @@ mod tests {
         ));
         assert!(reference.contains("execute in the destination context"));
         assert!(reference.contains("without serializing it into the Bash command"));
+        assert!(reference.contains("If auth is disabled, send no credential"));
+        assert!(reference.contains("any required destination credential"));
         assert!(reference.contains("This creation recipe is local-only"));
         assert!(reference.contains("never send the local executor's `$PWD` as a remote cwd"));
         assert!(reference.contains("base64-of-the-local-workscope-origin"));
@@ -363,9 +367,11 @@ mod tests {
         assert!(reference.contains(
             "Remote Continue executes that existing API in the selected destination's context and is independent of federated message steering"
         ));
-        assert!(reference.contains("^https://"));
-        assert!(reference.contains("^http://(localhost|127\\.0\\.0\\.1|\\[::1\\])"));
-        assert!(!reference.contains("^https?://"));
+        assert!(reference.contains("Retain that transcript as the original predecessor"));
+        assert!(reference.contains(
+            "same original predecessor, message identity, and intent; never retarget a newly current successor"
+        ));
+        assert!(reference.contains("^https?://"));
         assert!(reference.contains(
             "operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged"
         ));
