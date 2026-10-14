@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 6b5c9a9107e93a4e24bd7af23caebab73c2d8a47
+          ref: d4c2772a95aa46da608b356c8fe7be074de1b7aa
           path: pinned-app
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -247,7 +247,7 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 6b5c9a9107e93a4e24bd7af23caebab73c2d8a47
+          test "$(git rev-parse HEAD)" = d4c2772a95aa46da608b356c8fe7be074de1b7aa
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
@@ -272,7 +272,7 @@ jobs:
           python3 - <<'PY'
           import hashlib, json, pathlib, shutil, subprocess
           root = pathlib.Path.cwd()
-          selector = ['cargo', 'test', '-p', 'phoenix-ide', '--lib', '--no-run', '--message-format=json']
+          selector = ['cargo', 'test', '-p', 'phoenix_ide', '--lib', '--no-run', '--message-format=json']
           selected = subprocess.run(selector, capture_output=True, text=True, timeout=120)
           (root.parent/'opening-instrumented-selector.log').write_text(selected.stdout+selected.stderr)
           assert selected.returncode == 0, 'libtest artifact metadata selection failed'
