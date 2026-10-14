@@ -9527,16 +9527,6 @@ mod tests {
         assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
-    // The exact safe-retry admission boundary rejects a fresh run (so no new run
-    // ordinal is allocated) exactly when `probe_retry_worktree_writers` returns
-    // an error, and admits only when it returns `Ok`. `validate_close_safe_retry`
-    // calls the probe before `admit_close_safe_retry`, so a probe rejection
-    // short-circuits admission. These tests exercise that decision over the
-    // injectable observation seam with controlled observations, so the decision
-    // is proven without scanning the host `/proc`, spawning a writer, or running
-    // real Git/deletion. Live syscall qualification of the real writer scan is a
-    // documented coverage gap (see specs/work-lifecycle/executive.md).
-
     #[test]
     fn retry_admission_rejects_when_a_target_holds_a_positive_writer() {
         let original = Path::new("/captured/worktree");

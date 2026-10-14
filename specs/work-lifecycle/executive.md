@@ -81,3 +81,21 @@ Retained adjacent coverage unaffected by the removal: the descriptor-relative ob
 These gaps are a deliberate choice to drop live-syscall qualification from the default gate rather than assert fake equivalence for it. They are a coverage gap, not a behavior change; the production scans and their platform syscalls are unchanged.
 
 The inventory and existing focused runtime tests above do not establish acceptance of the entire matrix. Targeted test and spec-check results must be distinguished from whole-repository qualification, UI acceptance, production deployment, and migration acceptance.
+
+### Process sequencing properties
+
+The seven `process_step_*` tests execute the same `run_close_process_steps` runner
+used by `complete_close_resource_lease`, with controlled typed effect observations
+and real in-memory Phoenix persistence. They replace the fixture that launched
+`sleep` process groups and a shell PTY solely to manufacture ordering failures.
+The tests assert exact effect order, first-failure stopping, persistence stopping
+later dispatch, successes surviving a later scope failure and outbox rollback,
+rejected observations producing no receipt, and a complete second pass dispatching
+nothing. Bash/terminal registry adapter tests own generation and process-identity
+validation; the scripted runner tests do not claim to re-test OS signaling.
+
+Git inspection adapters retain local temporary repositories where needed to
+produce evidence about staged, ignored, hidden and detached work. The ignored
+nested-submodule and detached-submodule tests no longer require a final successful
+deletion: observation of unique work is their property. Descriptor-relative
+object-swap/deletion adapter tests remain local-file tests, separate from lifecycle.
