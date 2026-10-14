@@ -44,8 +44,12 @@ export function makeCompactEventsScenario(global: boolean): ProductConversationS
     ...base,
     id: global ? 'compact-events-global' : 'compact-events-ordinary',
     title: global ? 'Compact events / actual Global page' : 'Compact events / ordinary continued transcript',
-    ...(global ? { initialEntry: '/global/source-member' } : {}),
-    sourceSnapshot: { ...source, product_conversation_id: 'source-member', canonical_route: '/product-conversations/source-member', requested_transcript_row_id: 'source-member', latest_transcript_row_id: 'source-member', writable_transcript_row_id: 'source-member', segments: [{ ...first, messages: global ? messages : [
+    sourceIsGlobal: false,
+    ...(global ? {
+      initialEntry: '/global/event-latest',
+      alignedLatestMessages: messages.map(message => ({ ...message, conversation_id: 'event-latest' })),
+    } : {}),
+    sourceSnapshot: { ...source, product_conversation_id: 'source-member', canonical_route: '/product-conversations/source-member', requested_transcript_row_id: 'source-member', latest_transcript_row_id: 'source-member', writable_transcript_row_id: 'source-member', segments: [{ ...first, messages: [
       { ...messages[3]!, content: { text: 'Source conversation for compact event acceptance.' } },
     ] }] },
     snapshot: {

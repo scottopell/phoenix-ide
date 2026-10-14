@@ -128,7 +128,9 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
   api.ensureGlobalCoordinator = async () => ({ conversation: { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });
-  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: id === sourceId && scenario.sourceIsGlobal ? sourceId : null });
+  api.resolveCoordinatorRoute = async (id) => ({
+    coordinator_id: scenario.initialEntry === `/global/${id}` ? id : id === sourceId && scenario.sourceIsGlobal ? sourceId : null,
+  });
   api.listConversations = async () => [];
   api.listArchivedConversations = async () => [];
   api.listModels = async () => ({
@@ -174,6 +176,16 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       record('SendCount', sendCount);
       record('LastSentText', body.text ?? '');
       return Response.json({ queued: false, already_persisted: true });
+    }
+    if ((init?.method ?? 'GET') === 'GET' && scenario.initialEntry?.startsWith('/global/')) {
+      if (url === '/api/coordinator/watches') {
+        record('WatchRequests', Number(document.documentElement.dataset['productConversationFixtureWatchRequests'] ?? '0') + 1);
+        return Response.json([] satisfies Awaited<ReturnType<typeof api.listActiveCoordinatorWatches>>);
+      }
+      if (url === '/api/coordinator/bash/live') {
+        record('LiveBashRequests', Number(document.documentElement.dataset['productConversationFixtureLiveBashRequests'] ?? '0') + 1);
+        return Response.json([] satisfies Awaited<ReturnType<typeof api.listLiveCoordinatorBashHandles>>);
+      }
     }
     if (new URL(url, location.href).pathname.startsWith('/api/')) throw new Error(`Unexpected fixture API request: ${url}`);
     return originalFetch(input, init);
