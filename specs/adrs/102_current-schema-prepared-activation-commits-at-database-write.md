@@ -1,4 +1,4 @@
-# ADR-104: Current-schema prepared activation commits at the database-write boundary
+# ADR-102: Current-schema prepared activation commits at the database-write boundary
 
 - **Status:** Accepted
 - **Date:** 2026-10-14

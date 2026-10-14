@@ -1,4 +1,4 @@
-# ADR-105: Ordinary forward candidate launch is the downgrade boundary
+# ADR-103: Ordinary forward candidate launch is the downgrade boundary
 
 - **Status:** Accepted
 - **Date:** 2026-10-14
@@ -39,4 +39,4 @@ Recovery is an explicit operator decision through `prod resume-forward TXN`. Tha
 - `specs/compatibility/requirements.md` REQ-COMP-013
 - `specs/launchd-deployment/requirements.md` REQ-LDD-023
 - `specs/production-deployment/requirements.md` REQ-PD-022
-- ADR-104
+- ADR-102
