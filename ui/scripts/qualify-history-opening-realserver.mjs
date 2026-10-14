@@ -297,9 +297,17 @@ async function run() {
     assert.equal(finalRow.messages.filter(m => m.message_id === acceptedId).length, 1);
     checked('same-page transport SSE drop/reconnect preserves accepted full-edge identity', { accepted_cursor: acceptedCursor, reconnect, requests: requests.slice(requestStart) });
     await page.screenshot({ path: resolve(output, 'accepted-reconnected.png') });
+    updateFault(fault, { failRoster: false });
+    const restoredAggregate = page.waitForResponse(response => response.request().method() === 'GET'
+      && faultTarget('GET', response.url(), { ...JSON.parse(readFileSync(fault)), failRoster: true }, 'roster')
+      && response.ok());
     // An explicit chapter selection may move the reader; verify its persisted ID after the click.
     const chapter = page.locator('#conversation-nav [role="button"]').filter({ hasText: 'opening-probe' });
     assert.equal(await chapter.count(), 1); await chapter.click();
+    const restoredResponse = await restoredAggregate;
+    checked('new chapter ownership acquisition uses restored real aggregate transport', {
+      url: restoredResponse.url(), status: restoredResponse.status(), fault_active_during_acceptance_and_reconnect: true,
+      fault_restored_before_new_pin_acquisition: true });
     await page.waitForURL(value => value.hash === `#message-${encodeURIComponent(acceptedId)}`);
     const rendered = page.locator(persistedMessageSelector(acceptedId));
     await rendered.waitFor({ state: 'visible' }); assert.equal(await rendered.count(), 1);

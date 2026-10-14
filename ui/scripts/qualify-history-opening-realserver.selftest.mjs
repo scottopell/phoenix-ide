@@ -6,6 +6,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector, acceptedWireCursor } from './qualify-history-opening-realserver.mjs';
 
+test('fault remains active through acceptance and same-page reconnect, but new pin acquisition restores real transport', () => {
+  const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  const reconnect = script.indexOf("checked('same-page transport SSE drop/reconnect");
+  const restored = script.indexOf('updateFault(fault, { failRoster: false })');
+  const click = script.indexOf('await chapter.click()');
+  const physical = script.indexOf("checked('accepted manual opening renders once");
+  assert.ok(reconnect >= 0 && reconnect < restored && restored < click && click < physical);
+  assert.match(script, /const restoredAggregate = page\.waitForResponse/);
+  assert.match(script, /const restoredResponse = await restoredAggregate/);
+  assert.match(script, /await rendered\.waitFor\(\{ state: 'visible' \}\); assert\.equal\(await rendered\.count\(\), 1\)/);
+});
+
 test('aggregate transport failure proof does not fabricate an alert contract for background probes', () => {
   const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
   assert.match(script, /const failedRoster = await poll\(\(\) => failed\.find/);
