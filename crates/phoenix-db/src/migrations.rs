@@ -646,6 +646,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_wake_feature_preserving_history",
         sql: WAKE_FEATURE_RETIREMENT_SQL,
     },
+    Migration {
+        version: 127,
+        name: "coordinator_owned_work_scope_home",
+        sql: include_str!("migrations/coordinator_home.sql"),
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -11329,6 +11334,8 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
     Ok(true)
 }
 
+mod coordinator_home;
+
 struct WritableSchemaGuard {
     connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
     armed: bool,
@@ -11579,6 +11586,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
         if migration.version == 121 {
             run_migration_121(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 127 {
+            coordinator_home::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -14130,6 +14143,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (127, "coordinator_owned_work_scope_home"),
             (126, "retire_wake_feature_preserving_history"),
             (125, "support_ipv6_federation_peer_hosts"),
             (124, "persist_federation_peer_tls_trust"),
@@ -19436,7 +19450,8 @@ mod tests {
                     (123, 'temporarily_skip_close_startup_interruption'),
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement')",
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home')",
         )
         .execute(&pool)
         .await
@@ -20300,7 +20315,8 @@ mod tests {
                     (123, 'temporarily_skip_close_startup_interruption'),
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement')",
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home')",
         )
         .execute(pool)
         .await

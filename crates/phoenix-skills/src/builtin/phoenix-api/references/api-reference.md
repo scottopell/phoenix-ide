@@ -4,7 +4,7 @@ This authenticated reference is for the live Phoenix deployment the user named. 
 
 ## Execution and trust boundary
 
-Every HTTP command must run through Global's Bash tool with an explicit active `work_scope_id` admitted from authoritative WorkScope rows. The selected origin must be the same Phoenix server that owns that WorkScope and resolves its scoped `$PWD`; the public API has no remote-server cwd resolver. Stop if that identity is not established.
+Every HTTP command must run through Global's Bash tool with an explicit active `work_scope_id` admitted from authoritative Coordinator home context or WorkScope rows. The selected origin must be the same Phoenix server that owns that WorkScope and resolves its scoped `$PWD`; the public API has no remote-server cwd resolver. Stop if that identity is not established.
 
 The recipe is deliberately staged. Global structurally interprets each raw JSON response, prepares data for the next scoped Bash call, and retains the request identity and exact intent. Bash transports opaque base64 data; it does not parse JSON or interpolate user/model text into shell grammar. The only runtime commands required are `curl`, `base64`, and `od`, available on supported Phoenix hosts. Do not install dependencies or substitute ad-hoc text parsing.
 

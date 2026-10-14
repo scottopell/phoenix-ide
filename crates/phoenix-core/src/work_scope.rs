@@ -282,6 +282,9 @@ pub enum EnvironmentContext {
         branch_name: Option<String>,
         base_branch: Option<String>,
     },
+    CoordinatorHome {
+        cwd: String,
+    },
     UnownedCwd {
         cwd: String,
     },
@@ -332,6 +335,7 @@ pub enum WorkScopeRetirementOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkScopeRetirementBlocker {
+    CoordinatorOwned,
     CurrentUserOwner,
     UserSuccessor,
     ActiveSubAgent,

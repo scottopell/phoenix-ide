@@ -4399,10 +4399,20 @@ async fn get_system_prompt(
     );
     let system_prompt = if is_coordinator {
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
-        crate::system_prompt::build_coordinator_system_prompt(
+        let mut prompt = crate::system_prompt::build_coordinator_system_prompt(
             conversation.llm_language,
             catalog.as_ref(),
-        )
+        );
+        crate::coordinator_home::append_context(
+            &mut prompt,
+            state
+                .runtime
+                .db()
+                .coordinator_work_scope()
+                .await
+                .map_err(|error| error.to_string()),
+        );
+        prompt
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
@@ -7151,6 +7161,35 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     };
 
+    match runtime.db().coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context
+            else {
+                return CascadeProjectsReport {
+                    error: Some("Invalid Coordinator home ownership".into()),
+                    ..Default::default()
+                };
+            };
+            let worker = PathBuf::from(&worktree_path);
+            let worker = worker.canonicalize().unwrap_or(worker);
+            let home = PathBuf::from(cwd);
+            if home.starts_with(&worker) || worker.starts_with(&home) {
+                return CascadeProjectsReport {
+                    error: Some("Cleanup refused: worker path overlaps Coordinator home".into()),
+                    ..Default::default()
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return CascadeProjectsReport {
+                error: Some(format!(
+                    "Cannot establish Coordinator home retention: {error}"
+                )),
+                ..Default::default()
+            }
+        }
+    }
     let mut report = CascadeProjectsReport {
         worktree_path: Some(worktree_path.clone()),
         branch_name: Some(branch_name.clone()),
@@ -7698,6 +7737,22 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
+    match state.db.coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            if let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context {
+                match crate::coordinator_home::validate_home(std::path::Path::new(&cwd)) {
+                    Ok(path) => roots.push(path),
+                    Err(error) => {
+                        tracing::warn!(%error, "Coordinator home excluded from file allowlist");
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "Coordinator home ownership lookup failed for file allowlist");
+        }
+    }
     for skill_root in state.runtime_env.skill_viewer_roots() {
         if let Ok(dir) = fs::canonicalize(skill_root) {
             roots.push(dir);

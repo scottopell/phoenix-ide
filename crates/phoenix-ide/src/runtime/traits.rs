@@ -124,6 +124,13 @@ pub trait MessageStore: Send + Sync {
         &self,
         message_id: &str,
     ) -> Result<Option<crate::db::ContinuationOpeningRead>, String>;
+
+    async fn coordinator_home_scope(
+        &self,
+    ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
+        Ok(None)
+    }
+
     async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String>;
 
     async fn accepted_continuation_handoff_message_id(
@@ -1593,6 +1600,15 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
         self.db
             .read_message_continuation_opening(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn coordinator_home_scope(
+        &self,
+    ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
+        self.db
+            .coordinator_work_scope()
             .await
             .map_err(|error| error.to_string())
     }

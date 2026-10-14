@@ -71,6 +71,7 @@ pub enum WorkScopeUnavailableReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolvedEnvironmentKind {
+    CoordinatorHome,
     AllocatedWorktree,
     UnownedCwd,
     None,
@@ -897,6 +898,29 @@ impl GlobalReadService {
         &self,
         requested_work_scope_id: &str,
     ) -> Result<ValidatedCoordinatorBashSpawnTarget, CoordinatorWorkScopeTargetError> {
+        if let Some(home) = self
+            .db
+            .coordinator_work_scope()
+            .await
+            .map_err(|_| CoordinatorWorkScopeTargetError::Persistence)?
+        {
+            if home.work_scope_id.as_str() == requested_work_scope_id {
+                let phoenix_core::work_scope::EnvironmentContext::CoordinatorHome { cwd } =
+                    home.context
+                else {
+                    return Err(CoordinatorWorkScopeTargetError::Authority);
+                };
+                let path = crate::coordinator_home::validate_home(std::path::Path::new(&cwd))
+                    .map_err(|_| CoordinatorWorkScopeTargetError::Read)?;
+                return Ok(ValidatedCoordinatorBashSpawnTarget {
+                    path,
+                    work_scope_id: home.work_scope_id,
+                    owner_name: "Global Coordinator".into(),
+                    owner_product_conversation_id: None,
+                    project_path: None,
+                });
+            }
+        }
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
             "SELECT environment.id, environment.worktree_path, environment.cwd
              FROM work_scopes environment
@@ -1635,6 +1659,7 @@ fn resolved_work_scope_from_columns(
         _ => None,
     };
     let environment_kind = match raw_environment {
+        Some("coordinator_home") => Some(ResolvedEnvironmentKind::CoordinatorHome),
         Some("allocated_worktree") => Some(ResolvedEnvironmentKind::AllocatedWorktree),
         Some("unowned_cwd") => Some(ResolvedEnvironmentKind::UnownedCwd),
         Some("none") => Some(ResolvedEnvironmentKind::None),
@@ -2401,6 +2426,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::TranscriptSnapshotChanged
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
+        | DbError::CoordinatorWorkScope(_)
         | DbError::Serialization(_)
         | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)
@@ -3323,7 +3349,11 @@ mod tests {
         let first = super::attributed_sender_with_cache(&db, &origin, &mut cache)
             .await
             .unwrap();
-        db.delete_conversation(&coordinator.id).await.unwrap();
+        db.pool().close().await;
+        assert!(db
+            .product_conversation_kind(&coordinator.product_conversation_id)
+            .await
+            .is_err());
         let second = super::attributed_sender_with_cache(&db, &origin, &mut cache)
             .await
             .unwrap();

@@ -8152,6 +8152,12 @@ where
                 explore_bash_capability,
             )
         };
+        if is_coordinator {
+            crate::coordinator_home::append_context(
+                &mut system_prompt,
+                self.storage.coordinator_home_scope().await,
+            );
+        }
         if is_sub_agent
             && matches!(
                 self.context.resource_authority,

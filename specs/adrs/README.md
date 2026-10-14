@@ -7,6 +7,8 @@ was chosen; they are authoritative history, not a live behavioral contract.
 The live behavioral contract remains `requirements.md` plus `.allium` where an
 Allium spec exists. Status and verification coverage live in `executive.md`.
 
+The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |
@@ -114,7 +116,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [098](098_retire-wake-execution-and-preserve-history.md) | Retire wake execution and preserve history | Accepted; supersedes wake execution obligations | REQ-WAKE-RETIRE-001–005; retired REQ-WAKE-001–018, REQ-DWF-WAKE-001–005, REQ-SA-009 |
 | [099](099_bounded-markdown-disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
-| [101](101_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
+| [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
+| [102](102_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
 
 ## For agents: which decisions bind your task
 

@@ -2315,6 +2315,9 @@ pub(crate) async fn conversation_retains_work_scope(
 }
 
 fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
+    if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        return Some(ResourceScopeKey::Coordinator);
+    }
     match conv.attached_work_scope_id.clone() {
         Some(scope) => Some(ResourceScopeKey::Work(scope)),
         None if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent => {

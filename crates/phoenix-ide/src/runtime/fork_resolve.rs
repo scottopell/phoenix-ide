@@ -1641,6 +1641,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::MessageConflict(_)
         | DbError::TranscriptSnapshotChanged
         | DbError::SlugExists(_)
+        | DbError::CoordinatorWorkScope(_)
         | DbError::Serialization(_)
         | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)

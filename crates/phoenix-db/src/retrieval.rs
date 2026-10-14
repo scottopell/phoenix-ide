@@ -944,6 +944,7 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::MessageConflict(_)
         | crate::DbError::TranscriptSnapshotChanged
         | crate::DbError::SlugExists(_)
+        | crate::DbError::CoordinatorWorkScope(_)
         | crate::DbError::Serialization(_)
         | crate::DbError::ContinuationPrecondition(_)
         | crate::DbError::CloseFoundationConflict(_)
