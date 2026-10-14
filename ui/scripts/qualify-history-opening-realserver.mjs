@@ -147,7 +147,7 @@ export function globalChapterReferencePath(a) {
   assert.equal(a.kind, 'global');
   return a.endpoint + '?message_limit=100&boundary_representation=original_messages';
 }
-export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, seed, reconnect, observedEvents, streamUrls, row, ack, chatRequest, instruction }) {
+export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, seed, reconnect, observedEvents, streamUrls, row, preDropRow, ack, chatRequest, instruction }) {
   assert.equal(a.kind, 'global');
   const latest = evidence.successor_transcript_row_id, id = `${latest}:${evidence.client_turn_key}`;
   assert.equal(evidence.edge, 'committed_intent_before_first_message_persistence');
@@ -235,6 +235,23 @@ export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, se
   if (coverage === 'preserve') {
     assert.deepEqual(init.messages, [], 'preserve reconnect messages must be empty');
     assert.equal(init.last_sequence_id, priorPendingSequence, 'preserve replay must reach claimed tip');
+    assert.equal(preDropRow?.conversation?.id, latest, 'pre-drop durable floor owner');
+    assert.equal(preDropRow.conversation.transcript_generation, requestGeneration, 'pre-drop durable floor generation');
+    assert.ok(Array.isArray(preDropRow.messages), 'pre-drop durable floor messages required');
+    for (const [messageId, text] of [[id, instruction], [ack.canonical_message_id, chatRequest.text]]) {
+      const matches = preDropRow.messages.filter(message => message.message_id === messageId);
+      assert.equal(matches.length, 1, 'pre-drop durable opening and ACK unique');
+      assert.equal(matches[0].conversation_id, latest, 'pre-drop durable message owner');
+      assert.equal(matches[0].message_type, 'user', 'pre-drop durable message shape');
+      assert.deepEqual(matches[0].content, { text }, 'pre-drop durable message content');
+    }
+    let durableFloor = 0;
+    for (const message of preDropRow.messages) {
+      assert.equal(message.conversation_id, latest, 'pre-drop durable floor message owner');
+      assert.ok(Number.isSafeInteger(message.sequence_id) && message.sequence_id > 0, 'pre-drop durable floor safe sequence');
+      durableFloor = Math.max(durableFloor, message.sequence_id);
+    }
+    assert.ok(requestCursor >= durableFloor, 'preserve cursor covers pre-drop durable floor');
     assert.ok(Number.isSafeInteger(init.pending_anchor_sequence_id) && init.pending_anchor_sequence_id >= 0,
       'preserve reconnect anchor required');
     assert.ok(init.pending_anchor_sequence_id <= requestCursor, 'preserve reconnect anchor cannot exceed cursor');
@@ -1000,7 +1017,11 @@ async function run() {
       canonical_message_id: `${latest}:${body.message_id}` };
     checked('actual successor chat ACK receipt', chatAck);
     validateChatAck(chatAck, latest, body.message_id);
-    await poll(async () => (await http('GET', `/api/conversations/${latest}`)).messages.some(m => m.message_id === `${latest}:${body.message_id}`), 'actual composer message persisted');
+    const preDropRow = await poll(async () => {
+      const persisted = await http('GET', `/api/conversations/${latest}`);
+      return persisted.messages.some(m => m.message_id === `${latest}:${body.message_id}`) ? persisted : null;
+    }, 'actual composer message persisted');
+    record('reconnect-durable-floor.jsonl', { acquisition: 'INDEPENDENT_driver_reference_before_stream_drop', row: preDropRow });
     checked('accepted SSE unblocks exact successor composer despite actual aggregate GET failure', { accepted_cursor: acceptedCursor, fault: faultObservation, chat_message_id: body.message_id });
     const reconnectStart = events.length, requestStart = requests.length, url = page.url();
     updateFault(fault, { drop: 1 });
@@ -1050,7 +1071,7 @@ async function run() {
       const cached = snapshots.slice(start, chapterSnapshotStart).find(s => s.data.latest_transcript_row_id === latest && openingMatches(s.data.latest_opening, entered, 'pending'));
       assert.ok(cached, 'actual verified browser Pending full-roster cache');
       const authority = validateGlobalCacheAuthority(a, { evidence: entered, cached, accepted, seed: acceptedSeed, reconnect,
-        observedEvents: events, streamUrls: streamRequests, row: currentRow, ack: chatAck, chatRequest: body, instruction });
+        observedEvents: events, streamUrls: streamRequests, row: currentRow, preDropRow, ack: chatAck, chatRequest: body, instruction });
       record('global-chapter-reference.jsonl', { acquisition: 'INDEPENDENT_reference_NOT_browser_acquisition', method: 'GET', path: referencePath, authority });
       await recorder.sealAndDrain(); recorder.assertQualified();
       const browserSlice = requests.slice(chapterRequestStart);

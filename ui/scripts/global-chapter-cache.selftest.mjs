@@ -125,12 +125,17 @@ const chatRequest832 = JSON.parse(requests832.find(record => record.method === '
 const streamPath832 = `/api/conversations/${latest832}/stream`;
 const seedStream832 = requests832.find(record => new URL(record.url).pathname === streamPath832).url;
 const reconnectRequest832 = reconnectAssertion832.requests.find(record => new URL(record.url).pathname === streamPath832);
+// OFFLINE adapter: the first durable GET containing the composer ACK is the existing
+// successful pre-drop persistence poll in the retained driver call order, not an init-time DB tip.
+const preDropRow832 = JSON.parse(lines832('driver-http.jsonl').find(record => record.method === 'GET'
+  && record.path === `/api/conversations/${latest832}`
+  && JSON.parse(record.raw).messages.some(message => message.message_id === ack832.canonical_message_id)).raw);
 const sourceFacts832 = { evidence: evidence832, cached: cached832, accepted: accepted832, seed: seed832,
   reconnect: reconnect832, observedEvents: events832,
   // OFFLINE retained-log adapter only: assertion request slice supplies the authentic reconnect URL,
   // while live qualification requires the CDP requestId map.
   streamUrls: new Map([[accepted832.requestId, seedStream832], [reconnect832.requestId, reconnectRequest832.url]]),
-  row: row832, ack: ack832, chatRequest: chatRequest832, instruction: instruction832 };
+  row: row832, preDropRow: preDropRow832, ack: ack832, chatRequest: chatRequest832, instruction: instruction832 };
 const facts832 = () => structuredClone(sourceFacts832);
 const changeEvent832 = (factsValue, key, change) => {
   const payload = JSON.parse(factsValue[key].data); change(payload); factsValue[key].data = JSON.stringify(payload);
@@ -155,6 +160,11 @@ test('authentic 832 preserve reconnect chain passes authority offline; failed ru
   assert.match(result.error, /'preserve'[\s\S]*'complete'/);
 });
 
+test('later durable writes do not replace pre-drop floor (UNIT ONLY later-row extension)', () => {
+  const candidate = facts832();
+  candidate.row.messages.push({ ...candidate.row.messages.at(-1), message_id: 'unit-later', sequence_id: 99 });
+  assert.equal(validateGlobalCacheAuthority(a832, candidate).latest, latest832);
+});
 const preserveNegatives = {
   missing_seed: [factsValue => { factsValue.seed = undefined; }, /accepted owning seed Init must precede/],
   fabricated_seed: [factsValue => { factsValue.seed = structuredClone(factsValue.seed); }, /accepted owning seed Init must precede|selected seed is the actual accepted owning prior Init/],
@@ -187,6 +197,19 @@ const preserveNegatives = {
     payload.sequence_id = 16; payload.last_sequence_id = 16;
     payload.pending_events = [{ type: 'agent_done', sequence_id: 15 }];
   }), /preserve replay must reach claimed tip/],
+  cursor_below_pre_drop_durable_floor: [factsValue => {
+    changeReconnectUrl832(factsValue, url => url.searchParams.set('after_event_sequence', '1'));
+    changeEvent832(factsValue, 'reconnect', payload => {
+      payload.sequence_id = 1; payload.last_sequence_id = 1; payload.pending_anchor_sequence_id = 1;
+    });
+  }, /preserve cursor covers pre-drop durable floor/],
+  missing_pre_drop_floor: [factsValue => { delete factsValue.preDropRow; }, /pre-drop durable floor owner/],
+  pre_drop_floor_generation: [factsValue => { factsValue.preDropRow.conversation.transcript_generation = 2; }, /pre-drop durable floor generation/],
+  pre_drop_floor_owner: [factsValue => { factsValue.preDropRow.conversation.id = 'foreign'; }, /pre-drop durable floor owner/],
+  pre_drop_floor_missing_ACK: [factsValue => {
+    factsValue.preDropRow.messages = factsValue.preDropRow.messages.filter(message => message.message_id !== ack832.canonical_message_id);
+  }, /pre-drop durable opening and ACK unique/],
+  pre_drop_floor_unsafe_sequence: [factsValue => { factsValue.preDropRow.messages[0].sequence_id = null; }, /pre-drop durable floor safe sequence/],
   pending_order: [factsValue => changeEvent832(factsValue, 'reconnect', payload => {
     payload.sequence_id = 16; payload.last_sequence_id = 16;
     payload.pending_events = [{ type: 'agent_done', sequence_id: 16 }, { type: 'state_change', sequence_id: 15 }];

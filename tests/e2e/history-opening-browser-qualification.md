@@ -819,3 +819,17 @@ pinned producer. Two negative cases reject empty and nonempty replay short of th
 claimed tip. This does not constrain message-bearing complete/tail snapshots.
 Final exact-HEAD rereview is required before one hosted successor; no dispatch or
 qualification follows from the offline correction alone.
+
+Rereview of local `ed511e1ea` then blocked a distinct preserve regression:
+request cursor1/tip1/anchor1 could cover the accepted publication but omit durable
+composer rows already present before the drop. The correction retains the actual
+successful composer-persistence poll snapshot **before** causing the transport
+drop, records it as an independent driver reference, and requires the preserve
+cursor to cover that owned, generation-matched durable lower bound. Both opening
+and composer ACK must exist uniquely with exact full message bytes in that
+snapshot. It is a pre-drop lower bound, **not an init-time exact DB watermark**;
+a later driver row cannot replace it because persistence may advance after Init.
+Authentic832 uses the first successful retained driver poll as an explicitly
+offline call-order adapter. Missing/foreign/cross-generation/unsafe floor and
+cursor-below-floor negatives reject, while a UNIT-only later-row extension does
+not raise the earlier floor. Final rereview remains mandatory before dispatch.
