@@ -8152,24 +8152,10 @@ where
             )
         };
         if is_coordinator {
-            match self.storage.coordinator_home_scope().await {
-                Ok(Some(home)) => match crate::coordinator_home::context(&home) {
-                    Ok(orientation) => system_prompt.push_str(&orientation),
-                    Err(error) => {
-                        tracing::warn!(%error, "Coordinator home context validation failed");
-                        system_prompt.push_str(
-                            "\n\nCoordinator home unavailable; do not guess a cwd or scope.",
-                        );
-                    }
-                },
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "Coordinator home context lookup failed");
-                    system_prompt.push_str(
-                        "\n\nCoordinator home metadata unavailable; do not guess a cwd or scope.",
-                    );
-                }
-            }
+            crate::coordinator_home::append_context(
+                &mut system_prompt,
+                self.storage.coordinator_home_scope().await,
+            );
         }
         if is_sub_agent
             && matches!(

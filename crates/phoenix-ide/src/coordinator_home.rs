@@ -78,9 +78,42 @@ pub(crate) async fn initialize(
         }
     }
     let home = validate_home(&home)?;
+    validate_writable_home(&home)?;
     db.initialize_coordinator_work_scope(home.to_str().ok_or("Coordinator home path is not UTF-8")?)
         .await
         .map_err(|e| e.to_string())
+}
+
+fn validate_writable_home(home: &Path) -> Result<(), String> {
+    let probe = tempfile::Builder::new()
+        .prefix(".phoenix-home-probe-")
+        .tempfile_in(home)
+        .map_err(|error| format!("Coordinator home cannot create retained files: {error}"))?;
+    probe
+        .close()
+        .map_err(|error| format!("Coordinator home cannot remove probe files: {error}"))
+}
+
+pub(crate) fn append_context(
+    prompt: &mut String,
+    home: Result<Option<WorkScopeEnvironmentRecord>, String>,
+) {
+    match home {
+        Ok(Some(home)) => match context(&home) {
+            Ok(orientation) => prompt.push_str(&orientation),
+            Err(error) => {
+                tracing::warn!(%error, "Coordinator home context validation failed");
+                prompt.push_str("\n\nCoordinator home unavailable; do not guess a cwd or scope.");
+            }
+        },
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "Coordinator home context lookup failed");
+            prompt.push_str(
+                "\n\nCoordinator home metadata unavailable; do not guess a cwd or scope.",
+            );
+        }
+    }
 }
 
 pub(crate) fn context(record: &WorkScopeEnvironmentRecord) -> Result<String, String> {
@@ -159,6 +192,57 @@ mod tests {
                 .is_err()
         );
         assert_eq!(db.coordinator_work_scope().await.unwrap().unwrap(), scope);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_unwritable_home_before_binding_and_preserves_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let env = PhoenixRuntimeEnvironment::with_root(temp.path());
+        let home = env.data_dir().join("coordinator");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("retained"), "kept").unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root can write despite POSIX mode bits; exercise the effective access of this service identity.
+        let denied = tempfile::NamedTempFile::new_in(&home).is_err();
+        let db = Database::open_in_memory().await.unwrap();
+        let result = initialize(&db, &env).await;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if denied {
+            assert!(result.unwrap_err().contains("cannot create retained files"));
+            assert!(db.coordinator_work_scope().await.unwrap().is_none());
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(
+            std::fs::read_to_string(home.join("retained")).unwrap(),
+            "kept"
+        );
+        assert_eq!(std::fs::read_dir(home).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_projection_reports_same_orientation_and_unavailable_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = PhoenixRuntimeEnvironment::with_root(temp.path());
+        let db = Database::open_in_memory().await.unwrap();
+        let home = initialize(&db, &env).await.unwrap();
+        let mut live = String::from("base");
+        append_context(&mut live, Ok(Some(home.clone())));
+        assert!(live.contains(home.work_scope_id.as_str()));
+        assert!(live.contains("server directory="));
+        let EnvironmentContext::CoordinatorHome { cwd } = &home.context else {
+            panic!()
+        };
+        std::fs::remove_dir(cwd).unwrap();
+        let mut unavailable = String::from("base");
+        append_context(&mut unavailable, Ok(Some(home)));
+        assert!(unavailable.contains("home unavailable"));
+        assert!(!unavailable.contains("active work_scope_id="));
+        let mut failure = String::from("base");
+        append_context(&mut failure, Err("lookup failure".into()));
+        assert!(failure.contains("metadata unavailable"));
     }
 
     #[cfg(unix)]

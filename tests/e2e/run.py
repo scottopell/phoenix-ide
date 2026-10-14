@@ -1074,6 +1074,10 @@ def scenario_coordinator_home(_base_url: str) -> None:
             coordinator = response.json()['conversation']
             assert coordinator['cwd'] == cwd
             conv_id = coordinator['id']
+            inspected = httpx.get(f"{base_url}/api/conversations/{conv_id}/system-prompt", timeout=10)
+            inspected.raise_for_status()
+            assert f'active work_scope_id={scope}' in inspected.json()['system_prompt']
+            assert f'server directory={cwd}' in inspected.json()['system_prompt']
             _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
             _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages), 'Coordinator home Bash completed', timeout=SCENARIO_TIMEOUT_SECONDS)
             final = _get_conv(base_url, conv_id)
