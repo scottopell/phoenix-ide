@@ -75,7 +75,7 @@ test('hardware wheel delta is finite negative and bounded by actual observed pos
 });
 test('runtime walk preserves first current-cursor fault, sentinel and gate ordering without programmatic trigger', () => {
   const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
-  const action = source.slice(source.indexOf("    if (a.kind === 'global') {\n      const owned"), source.indexOf("    const before = await poll(() => anchor()"));
+  const action = source.slice(source.indexOf("    if (a.kind === 'global') {\n      const owned"), source.indexOf("    const before = a.kind === 'global'"));
   assert.ok(action.indexOf('settled Global viewport') < action.indexOf('const target = selectGlobalPrefixFault'));
   assert.ok(action.indexOf('failRoster: true') < action.indexOf('page.mouse.wheel'));
   assert.match(action, /attempt < 3/); assert.match(action, /post.scrollTop <= 2 && post.startIndex <= 2/);

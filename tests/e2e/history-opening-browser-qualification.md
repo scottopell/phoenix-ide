@@ -615,3 +615,76 @@ UI writer, build, hosted dispatch, push, provider request destruction, productio
 or physical-device action was performed. App d4 is unchanged. Actual hardware
 wheel/sentinel timing, current-cursor fault, SSE/reconnect/send/anchor and normal
 cleanup remain runtime obligations, not retroactive acceptance of b1.
+
+## Scoped postfault physical baseline correction (parent 3ec063739)
+
+The retained actual 3ec Global artifact is a **failed** runtime, not acceptance.
+It certifies the hardware wheel/current-cursor acquisition fault, preview
+transport destruction, visible prefix error and unreleased Pending gate. Its
+browser result has two checks, then fails at the original middle-message
+visibility wait (driver line 795). The actual wheel receipt changes scrollTop
+7383→0, scrollHeight22616→21806 and clientHeight798→729. Restoring a pixel value
+cannot certify the original logical location across that layout change. No
+screenshot is used as persisted-identity proof; no old DOM snapshot is invented.
+
+Retained harness-local evidence is under
+`../../refresh/terminal-followthrough/witness3ec-artifact.zip`, relative to this
+implementation worktree. SHA256:
+
+- Artifact: `9862555fe097c583cce2f83e0c2eb5414423c61c67cd930da69e4b5687f882dc`
+- Exact Global fixture bytes: `33d0d3518267a574271b426680d8cca944a9ddd107af9ddf262e5602d78e4e58`
+- Exact Global wheel JSONL: `40b3952b383b07be67a339f5e43cb26e73cd1e654a731f89675b16acdb9b08df`
+
+The successor removes savedTop/scrollIntoView restoration. Its declared baseline
+is explicitly **settled POSTFAULT**, after visible error and while Pending, not
+the prefault viewport, original middle anchor or URL-hash reconfirmation. The
+unchanged `pinned_source_transcript` and separately measured `physical_source_row`
+are both recorded; the latter may legitimately be a different historical member
+following the user's upward hardware wheel.
+
+The exact installed, self-contained DOM probe selects the first fully visible
+virtual row with a fully visible positive-size persisted-message descendant.
+It resolves an exact `data-message-id` or a DOM ID with only the documented outer
+`message-` wrapper removed against fixture occurrences. Source authority is the
+occurrence ordinal's known historical member, **never an ID-prefix/text guess**.
+Actual3ec has232 occurrences across four prior members and includes opaque IDs;
+requiring every ID to embed its source would incorrectly reject this fixture.
+The Pending successor, optimistic IDs, group-key-only identity and new opening
+are not fixture members/occurrences and cannot certify a baseline. No generic
+row fallback, private React state, extra chapter GET or new wheel is added.
+Failure to certify is a hard failure, within the retained20s prefix budget.
+
+Before release, the receipt includes virtual key/offset, exact persisted ID,
+source row, element ID/data-message-id, row/message/viewport bounds, URL, source
+pin and layout dimensions, four consecutive stable frames (≤2px), and
+`checkedGatePending`. Existing `anchor()` and virtual-key/offset `anchorMatches`
+remain in the acceptance/reconnect subsequence. Both checks additionally require
+the declared exact persisted child/source to remain physically visible with
+message offset≤2px; a surviving agent-group virtual key alone is insufficient.
+The prefix error is checked again after both. Fault restoration still occurs
+only before the existing explicit new-chapter acquisition phase. Ordinary
+behavior, SSE/opening/chat ownership and normal-server guards are unchanged.
+
+### Executed bounded validation
+
+- Eight Node files: **117 passed, zero skipped** (retained95 +22 new DOM/mapping,
+  stability and driver guards). The installed probe is serialized into a VM with
+  **fabricated DOM/geometry UNIT ONLY**. These tests do not prove actual browser
+  boxes. Exact3ec fixture mapping passed separately within that suite.
+- Python opening wrapper: **16 passed**.
+- `UV_OFFLINE=1 PHOENIX_CHECK_WORKERS=1 ./dev.py check --lanes task,spec-shape,spec-anchors`:
+  task validation, spec shape, dev.py unit tests and spec anchors all passed.
+- `git diff --check` passed. Logs remain harness-local under
+  `.phoenix/evidence/continuous-history/postfault3ec-offline/`.
+
+Reproduce the95 retained tests with the evidence environment recorded in the
+preceding sections, adding `ui/scripts/history-postfault-baseline.selftest.mjs`
+and `HISTORY_GLOBAL_3EC_FIXTURE` pointing to the exact extracted3ec Global fixture.
+
+**Residual gate:** independent exact-HEAD review is mandatory before one
+successor attempt. Actual DOM collection, virtualization/box stability, wheel
+user-intent handling, acceptance/reconnect anchor preservation and cleanup
+remain runtime obligations. No runtime, browser, server, compiler/build, hosted
+dispatch, dependency change, UI writer, push or production action was performed.
+Shipping app d4 is unchanged. This is a locally tested harness correction, not a
+new runtime pass or retroactive qualification of3ec.

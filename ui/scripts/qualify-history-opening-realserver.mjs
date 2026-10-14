@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate, aggregateBoundaries } from './qualify-history-realserver.mjs';
+import { historicalMessageIdentities, observePhysicalHistoricalRow, physicalBaselineMatches, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
 
 export function ownedWireCursor(event, observedEvents) {
   const payload = JSON.parse(event.data);
@@ -645,11 +646,24 @@ async function run() {
       return row ? { key: row.dataset.virtualKey, offset: row.getBoundingClientRect().top - viewport.top } : null;
     }, key);
   }
+  const knownHistoricalMessages = a.kind === 'global' ? historicalMessageIdentities(a) : null;
+  const physicalRow = expected => page.evaluate(observePhysicalHistoricalRow, { known: knownHistoricalMessages, expected });
+  const nextFrame = () => page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
+  async function declarePostFaultBaseline(budget) {
+    const observed = await poll(() => physicalRow(null), 'postfault visible persisted historical identity', budget());
+    const baseline = await holdPostFaultBaseline(observed, physicalRow, nextFrame);
+    budget();
+    return baseline;
+  }
   async function sameAnchor(before, label) {
     let frames = 0;
     const after = await poll(async () => { await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-      const value = await anchor(before.key); frames = anchorMatches(before, value) ? frames + 1 : 0; return frames >= 4 && value; }, label);
+      const value = await anchor(before.key);
+      const physical = before.persistedMessageID ? await physicalRow(before) : null;
+      frames = anchorMatches(before, value) && (!before.persistedMessageID || physicalBaselineMatches(before, physical)) ? frames + 1 : 0;
+      return frames >= 4 && { ...value, ...(physical ?? {}) }; }, label);
     checked(label, { before, after, tolerance_css_px: 2 });
+    if (before.persistedMessageID) await page.locator('#chat-view [role="alert"]').filter({ hasText: GLOBAL_PREFIX_ERROR_TEXT }).waitFor({ state: 'visible' });
   }
   const composerReadonly = async () => {
     const composer = page.locator(COMPOSER_SELECTOR);
@@ -728,7 +742,7 @@ async function run() {
     await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible' });
     await poll(composerReadonly, 'Pending composer readonly');
     assert.equal(await page.locator(persistedMessageSelector(acceptedId)).count(), 0);
-    let globalFaultObservation;
+    let globalFaultObservation, postfaultbaseline;
     const pin = new URL(page.url()).searchParams.get('source_transcript'); assert.equal(pin, a.members[1]);
     if (a.kind === 'global') {
       const owned = { ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } };
@@ -746,7 +760,7 @@ async function run() {
         return count === snapshots.length && pre.scrollTop === post.scrollTop && pre.scrollHeight === post.scrollHeight;
       }, 'settled Global viewport and captured prefix cursor', prefixBudget());
       const target = selectGlobalPrefixFault(owned, snapshots.slice(start), page.url(), latest);
-      const savedViewport = await viewport(), savedTop = savedViewport.scrollTop;
+      const prefaultViewport = await viewport();
       const pendingComposerCount = await page.locator(COMPOSER_SELECTOR).count();
       const failureStart = failed.length;
       updateFault(fault, { aggregatePath: target.pathname, failRoster: true });
@@ -789,17 +803,22 @@ async function run() {
       assert.equal(new URL(page.url()).searchParams.get('source_transcript'), pin);
       globalFaultObservation = { ...target, request, destroyed,
         before_parameter: new URL(request.url).searchParams.get('before'), failed_while_pending: true,
-        wheel_receipts: wheelReceipts, saved_viewport: savedViewport, pending_key: gate.key, gate_release_attempted: gate.releaseAttempted };
+        wheel_receipts: wheelReceipts, prefault_viewport: prefaultViewport, pending_key: gate.key, gate_release_attempted: gate.releaseAttempted };
       checked('Global earlier-history acquisition failed while Pending before release', globalFaultObservation);
-      await page.locator('#messages').evaluate((el, top) => { el.scrollTop = top; }, savedTop);
-      await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible', timeout: prefixBudget() });
-      await page.locator(persistedMessageSelector(middle)).first().evaluate(el => el.scrollIntoView({ block: 'center' }));
+      postfaultbaseline = await declarePostFaultBaseline(prefixBudget);
       await prefixError.waitFor({ state: 'visible', timeout: prefixBudget() });
-      record('global-prefix-restored.jsonl', { viewport: await viewport(), saved_viewport: savedViewport, pending_key: gate.key,
-        gate_release_attempted: gate.releaseAttempted, positive_baseline: target.positive_baseline });
+      assert.equal(postfaultbaseline.sourcepin, pin);
+      assert.equal((await command({ command: 'entered' })).state, 'entered');
+      assert.equal(gate.releaseAttempted, false);
+      assert.equal(await composerReadonly(), true);
+      checked('Global declared postfault physical historical baseline while Pending', {
+        baseline: postfaultbaseline, checkedGatePending: true, pinned_source_transcript: pin,
+        physical_source_row: postfaultbaseline.sourceRow, pending_key: gate.key,
+        gate_release_attempted: gate.releaseAttempted, fault_still_active: JSON.parse(readFileSync(fault)).failRoster === true });
+      assert.equal(JSON.parse(readFileSync(fault)).failRoster, true);
       prefixBudget();
     }
-    const before = await poll(() => anchor(), 'historical physical anchor');
+    const before = a.kind === 'global' ? postfaultbaseline : await poll(() => anchor(), 'historical physical anchor');
     assert.equal(requests.some(r => r.method === 'POST' && new URL(r.url).pathname.endsWith('/chat')), false);
     checked('committed Pending: browser/HTTP/new SSE init available, opening deferred and composer readonly', { entered, before });
     if (a.kind !== 'global') {

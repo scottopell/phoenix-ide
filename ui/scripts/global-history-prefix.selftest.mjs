@@ -51,7 +51,7 @@ test('pinned d4 rendered prefix sentinel/error and exact physical selectors rema
   const trigger = driver.indexOf('await page.mouse.wheel(0, deltaY);');
   const failed = driver.indexOf("'actual failed Global prefix GET'");
   const destroyed = driver.indexOf("assert.ok(destroyed,");
-  const baseline = driver.indexOf("const before = await poll(() => anchor()");
+  const baseline = driver.indexOf("postfaultbaseline = await declarePostFaultBaseline(prefixBudget)");
   const release = driver.indexOf('await releaseOnce(gate, command);');
   assert.ok(trigger < failed && failed < destroyed && destroyed < baseline && baseline < release);
   assert.ok(driver.includes('prefixDeadline = performance.now() + 20000'));
