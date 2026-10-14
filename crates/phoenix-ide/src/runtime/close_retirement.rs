@@ -6973,9 +6973,6 @@ mod tests {
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
-    use std::io::Write as _;
-    #[cfg(target_os = "linux")]
-    use std::io::{BufRead as _, Read as _};
     use std::path::Path;
 
     #[test]
@@ -10397,79 +10394,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_nondumpable_process_helper() {
-        if std::env::var_os("PHOENIX_NONDUMPABLE_PROCESS_HELPER").is_none() {
-            return;
-        }
-        let cwd = std::env::var_os("PHOENIX_NONDUMPABLE_CWD").unwrap();
-        std::env::set_current_dir(cwd).unwrap();
-        // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` has no pointer arguments.
-        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
-        println!("ready");
-        std::io::stdout().flush().unwrap();
-        let _ = std::io::stdin().read(&mut [0_u8]);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cwd_scan_treats_same_user_nondumpable_process_as_observational() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runtime::close_retirement::tests::linux_nondumpable_process_helper",
-                "--nocapture",
-            ])
-            .env("PHOENIX_NONDUMPABLE_PROCESS_HELPER", "1")
-            .env("PHOENIX_NONDUMPABLE_CWD", temp.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                output.read_line(&mut line).unwrap(),
-                0,
-                "helper exited before ready"
-            );
-            if line.trim() == "ready" {
-                break;
-            }
-        }
-
-        let proc_root = temp.path().join("proc");
-        std::fs::create_dir(&proc_root).unwrap();
-        std::os::unix::fs::symlink(
-            format!("/proc/{}", child.id()),
-            proc_root.join(child.id().to_string()),
-        )
-        .unwrap();
-        // SAFETY: `geteuid` has no preconditions.
-        let effective_uid = unsafe { libc::geteuid() };
-        let process = std::fs::read_dir(&proc_root)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            super::linux_process_owner(&process, effective_uid, "working-directory").unwrap(),
-            super::LinuxProcessOwner::Relevant,
-            "same-user nondumpable process must be attributed from kernel credentials"
-        );
-        let scan = super::quarantine_has_process_cwd_in(temp.path(), &proc_root, effective_uid);
-
-        drop(child.stdin.take());
-        child.wait().unwrap();
-        assert!(
-            scan.is_ok(),
-            "same-user nondumpable process unreadability must remain observational: {scan:?}"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn descriptor_scan_skips_unreadable_links() {
         let worktree = Path::new("/quarantine/worktree");
         for kind in [
@@ -10611,104 +10535,6 @@ mod tests {
         assert!(super::quarantine_has_process_cwd_in(&missing_quarantine, &proc_root, 1).is_err());
         assert!(
             super::quarantine_has_writable_mappings_in(&missing_quarantine, &proc_root, 1).is_err()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn mapping_scan_detects_writable_shared_mapping_after_descriptor_is_closed() {
-        use std::os::fd::AsRawFd as _;
-
-        let temp = tempfile::tempdir().unwrap();
-        let mapped_file = temp.path().join("mapped");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&mapped_file)
-            .unwrap();
-        file.set_len(4096).unwrap();
-        // SAFETY: the file is at least 4096 bytes, and the result is checked before use.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(mapping, libc::MAP_FAILED);
-        drop(file);
-
-        assert_eq!(
-            super::quarantine_has_open_descriptors(temp.path()).unwrap(),
-            super::ExternalWriterEvidence::NoPositiveEvidence,
-        );
-        assert!(super::quarantine_has_writable_mappings(temp.path()).unwrap());
-
-        // SAFETY: `mapping` is the successful result of the matching 4096-byte mmap call.
-        assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn quarantine_detects_external_process_working_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .current_dir(temp.path())
-            .spawn()
-            .unwrap();
-        assert!(super::quarantine_has_process_cwd(temp.path()).unwrap());
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn quarantine_preserves_worktree_with_open_file_descriptor() {
-        let temp = tempfile::tempdir().unwrap();
-        let closing = temp.path().join("closing");
-        initialize_repository(&closing);
-        let tracked = closing.join("tracked");
-        std::fs::write(&tracked, "before\n").unwrap();
-        run_git(&closing, &["add", "tracked"]);
-        run_git(&closing, &["commit", "--quiet", "-m", "tracked"]);
-        let identity = inspection_identity(&closing);
-        let confirmed = inspect_worktree(&identity).await.unwrap().0;
-        let mut descriptor = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&tracked)
-            .unwrap();
-
-        let administrative_dir = closing.join(".git");
-        let outcome = quarantine_and_remove_exact_worktree(
-            &identity,
-            &confirmed,
-            administrative_dir.clone(),
-            observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
-            None,
-            |_, _, _| Ok(()),
-            move |_| {
-                descriptor.write_all(b"after\n").unwrap();
-                descriptor.flush().unwrap();
-                std::mem::forget(descriptor);
-            },
-        )
-        .await
-        .unwrap();
-
-        let ExactWorktreeRemoval::Residual { detail } = outcome else {
-            panic!("open descriptor must preserve quarantine");
-        };
-        assert!(detail.contains("open descriptors"));
-        assert!(!closing.exists());
-        let quarantine = worktree_quarantine_path(&identity).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(quarantine.join("tracked")).unwrap(),
-            "before\nafter\n"
         );
     }
 

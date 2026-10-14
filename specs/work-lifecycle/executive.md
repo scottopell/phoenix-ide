@@ -57,4 +57,27 @@ These are acceptance obligations, **not tests reported as passing**:
 
 Aggregate archival remains covered by `archive_chain_handler_completes_one_aggregate_close`. Runtime cleanup-failure finalization, outbox rollback, and process-step failure ordering have separate deterministic tests; the inventory test does not duplicate those contracts. Git observation and exact-object deletion adapter tests remain separate coverage.
 
+### Safe-retry admission versus the live writer probe
+
+The exact safe-retry admission boundary rejects a fresh run (allocating no new run ordinal) exactly when the retry writer probe reports an external writer or fails to observe a candidate, and admits only when every candidate is absent or carries no positive writer evidence. `validate_close_safe_retry` runs this probe before `admit_close_safe_retry`, so a probe rejection short-circuits ordinal allocation.
+
+`probe_retry_worktree_writers` now threads the per-candidate observation (existence plus `quarantine_has_external_writer`) through an injectable closure consumed by the pure decision `probe_retry_worktree_writers_with`. Production passes the real observation; the decision is unchanged (same candidate order original -> quarantine -> tombstone object, same existence gate, same probe, same rejection message).
+
+`retry_admission_rejects_when_a_target_holds_a_positive_writer`, `retry_admission_rejects_when_observing_a_target_fails`, and `retry_admission_admits_when_no_target_holds_a_writer` prove the decision over controlled observations with no filesystem or `/proc` access. They replace `safe_retry_writer_rejection_does_not_allocate_an_ordinal`, which scanned the host `/proc`, held a real descriptor into the captured worktree, and ran real Git plus real deletion retry to observe the ordinal effect.
+
+### Writer-evidence scan coverage after live-test removal
+
+The external-writer scans (`quarantine_has_open_descriptors`, `quarantine_has_process_cwd`, `quarantine_has_writable_mappings`) are inspected deterministically through their fake-`/proc` `_in` variants and pure parsers; the live host-scan tests were removed from the default module. The decision these scans feed is proven by the admission-seam tests above. Old-to-new mapping and retained dependencies:
+
+| Removed live test | Behavior it exercised | Retained deterministic coverage | Coverage gap (reported, not faked) |
+|---|---|---|---|
+| `mapping_scan_detects_writable_shared_mapping_after_descriptor_is_closed` (linux) | real `mmap` MAP_SHARED writable mapping detected via real `/proc/self/maps` after the fd closed | `mapping_scan_ignores_ambient_unreadability_and_finds_readable_writer` (parses `rw-s` maps line, path-within match over fake `/proc`) | live `mmap` -> real `/proc/<pid>/maps` round trip no longer qualified in-suite |
+| `quarantine_detects_external_process_working_directory` (linux + macos) | real child process cwd within quarantine returns positive | linux: `cwd_scan_ignores_ambient_unreadability_and_finds_readable_writer` over fake `/proc`; macos: none | linux live `/proc/<pid>/cwd` round trip and the macos `proc_pidinfo(PROC_PIDVNODEPATHINFO)` syscall path are unqualified in-suite |
+| `quarantine_preserves_worktree_with_open_file_descriptor` (unix) | real open fd makes `quarantine_and_remove_exact_worktree` return `Residual` with writes landing in quarantine | `descriptor_scan_ignores_ambient_failures_and_finds_readable_writer` (fd symlink within quarantine -> positive over fake `/proc`) plus the admission-seam tests | end-to-end residual-on-open-descriptor path of `quarantine_and_remove_exact_worktree` is unqualified live |
+| `cwd_scan_treats_same_user_nondumpable_process_as_observational` + its `linux_nondumpable_process_helper` (linux) | a same-user nondumpable process is attributed `Relevant` from kernel credentials, and its cwd unreadability stays observational | `linux_status_parser_rejects_missing_malformed_and_ambiguous_credentials` (credential parser) plus the fake-`/proc` cwd/mapping scan tests | live `PR_SET_DUMPABLE` credential-attribution round trip is unqualified in-suite |
+
+Retained adjacent coverage unaffected by the removal: the descriptor-relative object-swap adapter tests, the Git evidence-generation adapter tests, and the fake-`/proc` canonicalization/no-evidence tests (`cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_no_evidence`, `cwd_and_mapping_scans_keep_quarantine_canonicalization_authoritative`). Fail-closed semantics for invalid or unreadable evidence are unchanged: ambient `/proc` read errors remain observational (no proof of a writer), while a probe error at the admission boundary rejects the retry.
+
+These gaps are a deliberate choice to drop live-syscall qualification from the default gate rather than assert fake equivalence for it. They are a coverage gap, not a behavior change; the production scans and their platform syscalls are unchanged.
+
 The inventory and existing focused runtime tests above do not establish acceptance of the entire matrix. Targeted test and spec-check results must be distinguished from whole-repository qualification, UI acceptance, production deployment, and migration acceptance.
