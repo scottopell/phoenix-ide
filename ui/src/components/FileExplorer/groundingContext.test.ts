@@ -6,7 +6,7 @@ describe('authoritative non-project grounding', () => {
   it('uses explicit serialized attached scope, never routing key as an execution identity', () => {
     const home = { runtime_role: 'coordinator', work_scope_id: 'owned', work_scope_key: 'coordinator' } as Conversation;
     expect(conversationGroundingContext(home)).toEqual({kind: 'coordinator_home', workScopeId: 'owned'});
-    expect(conversationGroundingContext({...home, work_scope_id: undefined})).toEqual({kind:'coordinator_home',workScopeId:null});
+    expect(conversationGroundingContext({runtime_role: 'coordinator'})).toEqual({kind:'coordinator_home',workScopeId:null});
   });
   it('handles Coordinator route before snapshot and keeps ordinary scope separate', () => {
     expect(conversationGroundingContext(null,true).kind).toBe('coordinator_home');

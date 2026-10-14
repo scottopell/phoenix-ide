@@ -8201,11 +8201,13 @@ mod tests {
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?1")
-            .bind(&coordinator.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        assert!(
+            sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?1")
+                .bind(&coordinator.id)
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
 
         assert!(matches!(
             db.message_target_admission("open-archived-drift")
@@ -8219,7 +8221,7 @@ mod tests {
         ));
         assert_eq!(
             db.message_target_admission(&coordinator.id).await.unwrap(),
-            MessageTargetAdmission::StandaloneArchived
+            MessageTargetAdmission::StandaloneAvailable
         );
     }
 

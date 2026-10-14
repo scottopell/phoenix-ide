@@ -1121,7 +1121,16 @@ def scenario_coordinator_home(_base_url: str) -> None:
             read.raise_for_status()
             assert read.json()['content'] == 'coordinator-home-proof'
             assert _get_conv(base_url, worker['id'])['conversation']['cwd'] == worker['cwd']
-            deleted = httpx.delete(f"{base_url}/api/conversations/{worker['id']}", timeout=10)
+            closed = httpx.post(f"{base_url}/api/conversations/{worker['id']}/archive", timeout=10)
+            closed.raise_for_status()
+            deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+            while not _get_conv(base_url, worker['id'])['conversation'].get('archived'):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('ordinary Close did not commit History')
+                time.sleep(0.05)
+            assert binding() == (scope, cwd)
+            assert sentinel.read_text() == 'separate-worker-bytes'
+            deleted = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
             deleted.raise_for_status()
             assert binding() == (scope, cwd)
             assert Path(cwd, 'e2e-home-evidence.txt').read_text() == 'coordinator-home-proof'
