@@ -1717,7 +1717,12 @@ def record_recovery_error(manifest: Manifest, error: str | Exception, *, quarant
         prior = {}
     if not prior or prior.get("transaction_id") != manifest.transaction_id:
         return
-    if prior.get("state") in {"committed", "preparing", "activation_failed_database_committed"}:
+    if prior.get("state") in {
+        "committed",
+        "preparing",
+        "migration_started",
+        "activation_failed_database_committed",
+    }:
         return
     previous = prior.get("rollback_failure")
     merged = f"{previous}; recovery attempt failed: {error}" if previous else error

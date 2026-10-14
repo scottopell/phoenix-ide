@@ -10307,6 +10307,12 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             "Do not start the predecessor or remove the claim. Preserve the retained candidate and evidence; "
             f"after explicit forward-recovery authorization run ./dev.py prod resume-forward {owner}."
         )
+    if current_schema and status.get("transaction_id") == owner and status.get("state") == "migration_started":
+        return (
+            f"current-schema offline migration {owner} was invoked and predecessor recovery is forbidden. "
+            "Preserve the claim, candidate, backup/proof, and diagnostics. If the retained proof has the exact target commit, "
+            f"use ./dev.py prod finalize-current {owner}; otherwise qualify a compatible forward repair."
+        )
     if current_schema and status.get("transaction_id") == owner and status.get("state") == "activation_failed_database_committed":
         return (
             f"current-schema migration {owner} committed database writes before activation failed. "
@@ -10628,6 +10634,17 @@ def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False
         recovery_status = {}
     if recovery_status.get("transaction_id") == transaction_id and recovery_status.get("state") == "committed":
         raise SystemExit(f"committed {mode_name} transactions cannot enter database rollback; inspect pending publication/cleanup guidance in prod status")
+    if (
+        current_schema
+        and recovery_status.get("transaction_id") == transaction_id
+        and recovery_status.get("state") in {
+            "migration_started",
+            "activation_failed_database_committed",
+        }
+    ):
+        raise SystemExit(
+            "current-schema offline migration was invoked or may have committed writes; predecessor recovery is forbidden"
+        )
     if not manifest_path.exists() or recovery_status.get("state") in {"preparing", "prepared"}:
         with _launchd_claim_lock():
             status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())

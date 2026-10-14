@@ -466,6 +466,42 @@ sys.exit({7 if partial else 0})
             )
         self.assertEqual(launchctl.start_calls, 1)
 
+    def test_repeated_recover_current_preserves_migration_started_fence(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        self.write_snapshot_proof(manifest)
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        helper.write_status(
+            manifest,
+            "migration_started",
+            finalization_pending=True,
+            committed_diagnostic="offline migration invoked",
+        )
+        original_status = Path(manifest.status_path).read_text()
+        argv = [
+            "launchd_deploy_helper.py",
+            "recover-current",
+            "--manifest",
+            str(self.root / "manifest.json"),
+            "--helper-label",
+            manifest.helper_label,
+            "--uid",
+            str(manifest.uid),
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(helper, "restore") as restore, mock.patch.object(
+            helper, "request_helper_bootout"
+        ):
+            self.assertEqual(helper.main(), 1)
+            self.assertEqual(helper.main(), 1)
+
+        restore.assert_not_called()
+        self.assertEqual(Path(manifest.status_path).read_text(), original_status)
+        self.assertEqual(Path(manifest.active_path).read_text(), manifest.transaction_id)
+
     def test_current_recovery_rechecks_unchanged_source_after_teardown(self) -> None:
         database = self.database()
         manifest = self.manifest(database)
