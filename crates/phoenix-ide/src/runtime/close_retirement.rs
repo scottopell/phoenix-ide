@@ -7163,10 +7163,7 @@ fn opaque_resource(kind: RetiredResourceKind, value: String) -> RetiredResourceI
     .expect("registry resource kind accepts opaque stable identity")
 }
 
-/// Parses stable registry instance identities retained in the live lease into
-/// opaque identities for the observed retirement. The lease is the same
-/// capability the executor called the registry with, so these identities are the
-/// exact instances retired.
+/// Parses nonempty stable registry identity strings into opaque identities.
 fn lease_process_identities(identities: impl Iterator<Item = String>) -> Vec<OpaqueIdentity> {
     identities
         .map(|identity| {
