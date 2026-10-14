@@ -13,7 +13,7 @@ const completed = {
   occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
 } satisfies EventPresentation;
 
-function eventMessage(id: string, sequence: number, presentation: EventPresentation, text: string): EnrichedMessage {
+function eventMessage(id: string, sequence: number, presentation: EventPresentation, text: string): EnrichedMessage & { content: { text: string } } {
   return {
     message_id: id, conversation_id: 'source-member', sequence_id: sequence, message_type: 'user',
     origin: { kind: 'subscription_event', event_id: presentation.event_id }, event_presentation: presentation,
@@ -24,7 +24,7 @@ function eventMessage(id: string, sequence: number, presentation: EventPresentat
 export function makeCompactEventsScenario(global: boolean): ProductConversationScenario {
   const base = getProductConversationScenario(global ? 'source-call-global' : 'source-call-ordinary');
   const source = base.sourceSnapshot!;
-  const messages: EnrichedMessage[] = [
+  const messages = [
     eventMessage('event-completed', 1, completed, '[fixture original completion]\nThe source turn finished. Task completion is not inferred.'),
     eventMessage('event-failed', 2, {
       ...completed, event_id: 'fixture-event-failed', display_name: 'Validate source navigation',
@@ -38,7 +38,7 @@ export function makeCompactEventsScenario(global: boolean): ProductConversationS
       content: { text: 'Review these events without treating them as new user chapters.' },
       display_data: null, usage_data: null, created_at: '2026-10-12T08:54:00Z',
     },
-  ];
+  ] satisfies EnrichedMessage[];
   const first = source.segments[0]!;
   return {
     ...base,
