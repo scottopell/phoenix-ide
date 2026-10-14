@@ -1,8 +1,121 @@
 //! Explicit, isolated actual-server opening qualification. Never linked in shipping builds.
 #![allow(clippy::too_many_lines)]
 
+use std::ffi::{OsStr, OsString};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+const TRACE_EXPORT_ENV_KEYS: [&str; 4] = [
+    "PHOENIX_TRACE_EXPORTER",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_SERVICE_NAME",
+];
+const QUALIFICATION_SERVICE_PREFIX: &str = "phoenix-view-qualification-";
+
+#[derive(Debug, PartialEq, Eq)]
+struct TraceExporterEnv {
+    exporter: String,
+    protocol: String,
+    endpoint: String,
+    service_name: String,
+}
+
+impl TraceExporterEnv {
+    fn from_env_pairs(
+        pairs: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Result<Option<Self>, String> {
+        let mut captured = [None, None, None, None];
+        for (key, value) in pairs {
+            let Some(index) = TRACE_EXPORT_ENV_KEYS
+                .iter()
+                .position(|candidate| key.as_os_str() == OsStr::new(candidate))
+            else {
+                continue;
+            };
+            if captured[index].replace(value).is_some() {
+                return Err(format!(
+                    "duplicate trace exporter variable: {}",
+                    TRACE_EXPORT_ENV_KEYS[index]
+                ));
+            }
+        }
+        if captured.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let [Some(exporter), Some(protocol), Some(endpoint), Some(service_name)] = captured else {
+            return Err("trace exporter variables must be supplied as a complete quartet".into());
+        };
+        let exporter = exporter
+            .into_string()
+            .map_err(|_| "trace exporter variable must be Unicode")?;
+        let protocol = protocol
+            .into_string()
+            .map_err(|_| "trace exporter protocol must be Unicode")?;
+        let endpoint = endpoint
+            .into_string()
+            .map_err(|_| "trace exporter endpoint must be Unicode")?;
+        let service_name = service_name
+            .into_string()
+            .map_err(|_| "trace exporter service name must be Unicode")?;
+        if exporter != "otlp" {
+            return Err("trace exporter must be otlp".into());
+        }
+        if protocol != "http/protobuf" {
+            return Err("trace exporter protocol must be http/protobuf".into());
+        }
+        validate_trace_endpoint(&endpoint)?;
+        validate_qualification_service(&service_name)?;
+        Ok(Some(Self {
+            exporter,
+            protocol,
+            endpoint,
+            service_name,
+        }))
+    }
+
+    fn env_pairs(&self) -> [(&'static str, &str); 4] {
+        [
+            (TRACE_EXPORT_ENV_KEYS[0], &self.exporter),
+            (TRACE_EXPORT_ENV_KEYS[1], &self.protocol),
+            (TRACE_EXPORT_ENV_KEYS[2], &self.endpoint),
+            (TRACE_EXPORT_ENV_KEYS[3], &self.service_name),
+        ]
+    }
+}
+
+fn validate_trace_endpoint(endpoint: &str) -> Result<(), String> {
+    let port = endpoint
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|remainder| remainder.strip_suffix("/v1/traces"))
+        .ok_or_else(|| {
+            "trace exporter endpoint must target the loopback OTLP receiver".to_owned()
+        })?;
+    let parsed = port
+        .parse::<u16>()
+        .map_err(|_| "trace exporter endpoint must contain an explicit canonical port")?;
+    if parsed == 0 || parsed.to_string() != port {
+        return Err("trace exporter endpoint must contain a nonzero canonical port".into());
+    }
+    Ok(())
+}
+
+fn validate_qualification_service(service_name: &str) -> Result<(), String> {
+    let run_id = service_name
+        .strip_prefix(QUALIFICATION_SERVICE_PREFIX)
+        .ok_or_else(|| {
+            "trace exporter service must identify the qualification receiver".to_owned()
+        })?;
+    if run_id.is_empty()
+        || run_id.len() > 80
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("trace exporter service must contain a bounded synthetic run identity".into());
+    }
+    Ok(())
+}
 
 use phoenix_workflow::ClientTurnKey;
 use serde::{Deserialize, Serialize};
@@ -401,6 +514,8 @@ async fn actual_server_opening_qualifier() {
         .parse()
         .unwrap();
     assert!(port != 0);
+    let trace_exporter = TraceExporterEnv::from_env_pairs(std::env::vars_os().collect::<Vec<_>>())
+        .expect("invalid isolated trace exporter environment");
     let home = tempfile::Builder::new()
         .prefix("opening-server-")
         .tempdir_in(&parent)
@@ -419,6 +534,11 @@ async fn actual_server_opening_qualifier() {
     std::env::set_var("PHOENIX_TLS", "off");
     std::env::set_var("PHOENIX_ENABLE_MOCK_MODEL", "1");
     std::env::set_var("PHOENIX_LOG_STDOUT", "1");
+    if let Some(trace_exporter) = &trace_exporter {
+        for (key, value) in trace_exporter.env_pairs() {
+            std::env::set_var(key, value);
+        }
+    }
     let gate = Arc::new(Gate::new());
     assert!(GATE.set(gate.clone()).is_ok());
     let listener = UnixListener::bind(&socket).unwrap();
@@ -503,6 +623,170 @@ mod tests {
     use super::*;
     use crate::db::{ContinueOutcome, MessageContent, NewContinuationDispatchIntent};
     use phoenix_core::domain::db_schema::ContinuationContent;
+
+    fn valid_trace_env() -> Vec<(OsString, OsString)> {
+        [
+            "otlp",
+            "http/protobuf",
+            "http://127.0.0.1:4318/v1/traces",
+            "phoenix-view-qualification-run_42-test",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| (TRACE_EXPORT_ENV_KEYS[index].into(), value.into()))
+        .collect()
+    }
+
+    fn trace_env_with(index: usize, value: &str) -> Vec<(OsString, OsString)> {
+        let mut pairs = valid_trace_env();
+        pairs[index].1 = value.into();
+        pairs
+    }
+
+    #[test]
+    fn trace_exporter_env_accepts_absent_or_exact_bounded_quartet() {
+        assert_eq!(TraceExporterEnv::from_env_pairs(Vec::new()).unwrap(), None);
+
+        let captured = TraceExporterEnv::from_env_pairs(valid_trace_env())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            captured.env_pairs(),
+            [
+                ("PHOENIX_TRACE_EXPORTER", "otlp"),
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+                (
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "http://127.0.0.1:4318/v1/traces"
+                ),
+                (
+                    "OTEL_SERVICE_NAME",
+                    "phoenix-view-qualification-run_42-test"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_exporter_env_rejects_partial_duplicate_and_invalid_quartets() {
+        for missing in 0..TRACE_EXPORT_ENV_KEYS.len() {
+            let mut pairs = valid_trace_env();
+            pairs.remove(missing);
+            assert!(TraceExporterEnv::from_env_pairs(pairs).is_err());
+        }
+        assert!(TraceExporterEnv::from_env_pairs(vec![(
+            TRACE_EXPORT_ENV_KEYS[0].into(),
+            OsString::from("otlp")
+        )])
+        .is_err());
+
+        let mut duplicate = valid_trace_env();
+        duplicate.push((TRACE_EXPORT_ENV_KEYS[0].into(), "otlp".into()));
+        assert!(TraceExporterEnv::from_env_pairs(duplicate).is_err());
+        assert!(TraceExporterEnv::from_env_pairs(trace_env_with(0, "OTLP")).is_err());
+        assert!(TraceExporterEnv::from_env_pairs(trace_env_with(1, "grpc")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_exporter_env_rejects_non_unicode_quartet_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut pairs = valid_trace_env();
+        pairs[2].1 = OsString::from_vec(vec![0xff]);
+        assert!(TraceExporterEnv::from_env_pairs(pairs).is_err());
+
+        assert_eq!(
+            TraceExporterEnv::from_env_pairs(vec![(
+                OsString::from_vec(vec![0xff]),
+                OsString::from_vec(vec![0xfe]),
+            )])
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn trace_exporter_env_rejects_nonliteral_or_unbounded_endpoints() {
+        for endpoint in [
+            "https://127.0.0.1:4318/v1/traces",
+            "http://localhost:4318/v1/traces",
+            "http://[::1]:4318/v1/traces",
+            "http://127.0.0.2:4318/v1/traces",
+            "http://receiver.example:4318/v1/traces",
+            "http://user@127.0.0.1:4318/v1/traces",
+            "http://127.0.0.1:4318@receiver.example/v1/traces",
+            "http://127%2e0%2e0%2e1:4318/v1/traces",
+            "http://127.0.0.1/v1/traces",
+            "http://127.0.0.1:4318",
+            "http://127.0.0.1:4318/",
+            "http://127.0.0.1:4318/v1/metrics",
+            "http://127.0.0.1:4318/v1/traces/extra",
+            "http://127.0.0.1:4318/v1/traces?token=secret",
+            "http://127.0.0.1:4318/v1/traces#fragment",
+            "http://127.0.0.1:0/v1/traces",
+            "http://127.0.0.1:04318/v1/traces",
+            "http://127.0.0.1:65536/v1/traces",
+        ] {
+            assert!(
+                TraceExporterEnv::from_env_pairs(trace_env_with(2, endpoint)).is_err(),
+                "accepted endpoint {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_exporter_env_rejects_invalid_service_run_identities() {
+        let invalid_services = [
+            String::new(),
+            "phoenix-view-qualification-".to_owned(),
+            "phoenix-view-telemetry-run-42".to_owned(),
+            "phoenix-view-qualification-run.42".to_owned(),
+            "phoenix-view-qualification-run/42".to_owned(),
+            "phoenix-view-qualification-rún".to_owned(),
+            format!("{QUALIFICATION_SERVICE_PREFIX}{}", "a".repeat(81)),
+        ];
+        for service in invalid_services {
+            assert!(
+                TraceExporterEnv::from_env_pairs(trace_env_with(3, &service)).is_err(),
+                "accepted service {service}"
+            );
+        }
+        assert!(TraceExporterEnv::from_env_pairs(trace_env_with(
+            3,
+            &format!("{QUALIFICATION_SERVICE_PREFIX}{}", "a".repeat(80))
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn trace_exporter_env_projects_no_ambient_telemetry_or_credentials() {
+        let mut pairs = valid_trace_env();
+        for (key, value) in [
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=secret"),
+            ("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "token=secret"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://production.example"),
+            ("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=prod"),
+            ("DD_API_KEY", "secret"),
+            ("DD_TRACE_AGENT_URL", "https://production.example"),
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("OPENAI_API_KEY", "secret"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ] {
+            pairs.push((key.into(), value.into()));
+        }
+
+        let captured = TraceExporterEnv::from_env_pairs(pairs).unwrap().unwrap();
+        let projected = captured.env_pairs();
+        assert_eq!(projected.len(), TRACE_EXPORT_ENV_KEYS.len());
+        assert!(projected
+            .iter()
+            .all(|(key, _)| TRACE_EXPORT_ENV_KEYS.contains(key)));
+        assert!(projected.iter().all(|(_, value)| !value.contains("secret")));
+        assert!(projected
+            .iter()
+            .all(|(_, value)| !value.contains("production")));
+    }
 
     async fn pending() -> (Arc<Database>, String, String) {
         let db = Arc::new(Database::open_in_memory().await.unwrap());
