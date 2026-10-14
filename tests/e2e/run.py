@@ -1075,9 +1075,9 @@ def scenario_coordinator_home(_base_url: str) -> None:
             assert coordinator['cwd'] == cwd
             conv_id = coordinator['id']
             _send_chat_and_stream(base_url, conv_id, f"[[coordinator_home_bash:{scope}]]", SCENARIO_TIMEOUT_SECONDS)
-            _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool_result' for m in messages), 'Coordinator home Bash completed', timeout=SCENARIO_TIMEOUT_SECONDS)
+            _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages), 'Coordinator home Bash completed', timeout=SCENARIO_TIMEOUT_SECONDS)
             final = _get_conv(base_url, conv_id)
-            results = [m.get('content', {}) for m in final['messages'] if m.get('message_type') == 'tool_result']
+            results = [m.get('content', {}) for m in final['messages'] if m.get('message_type') == 'tool']
             assert any(r.get('is_error') is False and cwd in str(r) for r in results), results
             read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
             read.raise_for_status()
@@ -1088,8 +1088,8 @@ def scenario_coordinator_home(_base_url: str) -> None:
             for bad in ['missing', 'not-an-active-scope']:
                 before = len(_get_conv(base_url, conv_id)['messages'])
                 _send_chat_and_stream(base_url, conv_id, f"[[coordinator_home_bash:{bad}]]", SCENARIO_TIMEOUT_SECONDS)
-                _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool_result' for m in messages[before:]), 'invalid scope rejected', timeout=SCENARIO_TIMEOUT_SECONDS)
-                results = [m.get('content', {}) for m in _get_conv(base_url, conv_id)['messages'][before:] if m.get('message_type') == 'tool_result']
+                _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages[before:]), 'invalid scope rejected', timeout=SCENARIO_TIMEOUT_SECONDS)
+                results = [m.get('content', {}) for m in _get_conv(base_url, conv_id)['messages'][before:] if m.get('message_type') == 'tool']
                 assert any(r.get('is_error') is True for r in results), results
             exhausted_chat = httpx.post(f'{base_url}/api/conversations/{conv_id}/chat', json={'text':'[[scenario:context_window_exceeded]] exhaust Coordinator for continuation','images':[], 'message_id':str(uuid.uuid4())}, timeout=10)
             exhausted_chat.raise_for_status()

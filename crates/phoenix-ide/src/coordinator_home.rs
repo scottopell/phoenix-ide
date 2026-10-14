@@ -128,9 +128,21 @@ mod tests {
         )
         .unwrap();
         let db = Database::open_in_memory().await.unwrap();
-        let before = db.get_or_create_coordinator("mock").await.unwrap();
+        let before = db
+            .get_or_create_coordinator(
+                Some("mock"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
         let scope = initialize(&db, &env).await.unwrap();
-        let after = db.get_or_create_coordinator("mock").await.unwrap();
+        let after = db
+            .get_or_create_coordinator(
+                Some("mock"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(before.id, after.id);
         assert_eq!(
             after.attached_work_scope_id,

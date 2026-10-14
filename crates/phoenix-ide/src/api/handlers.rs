@@ -7703,14 +7703,14 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
                 match crate::coordinator_home::validate_home(std::path::Path::new(&cwd)) {
                     Ok(path) => roots.push(path),
                     Err(error) => {
-                        tracing::warn!(%error, "Coordinator home excluded from file allowlist")
+                        tracing::warn!(%error, "Coordinator home excluded from file allowlist");
                     }
                 }
             }
         }
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(%error, "Coordinator home ownership lookup failed for file allowlist")
+            tracing::warn!(%error, "Coordinator home ownership lookup failed for file allowlist");
         }
     }
     for skill_root in state.runtime_env.skill_viewer_roots() {

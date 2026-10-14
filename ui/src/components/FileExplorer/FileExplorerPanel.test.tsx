@@ -80,7 +80,7 @@ function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, col
               collapsed={collapsed}
               onToggle={() => {}}
               rootPath={coordinatorHome ? "/data/coordinator" : "/repo"}
-              grounding={coordinatorHome ? { kind: "coordinator_home", workScopeId: "owned-home" } : undefined}
+              grounding={coordinatorHome ? { kind: "coordinator_home", workScopeId: "owned-home" } : { kind: 'ordinary' }}
               conversationId={conversationId}
               showToast={() => {}}
               showError={() => {}}

@@ -8,7 +8,7 @@ export const ORDINARY_GROUNDING: GroundingContext = { kind: 'ordinary' };
 
 export function conversationGroundingContext(
   conversation: Pick<Conversation, 'runtime_role' | 'work_scope_id'> | null,
-  coordinatorRoute: boolean,
+  coordinatorRoute = false,
 ): GroundingContext {
   return coordinatorRoute || conversation?.runtime_role === 'coordinator'
     ? { kind: 'coordinator_home', workScopeId: conversation?.work_scope_id ?? null }

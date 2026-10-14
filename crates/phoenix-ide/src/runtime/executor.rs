@@ -8155,9 +8155,12 @@ where
             match self.storage.coordinator_home_scope().await {
                 Ok(Some(home)) => match crate::coordinator_home::context(&home) {
                     Ok(orientation) => system_prompt.push_str(&orientation),
-                    Err(error) => system_prompt.push_str(&format!(
-                        "\n\nCoordinator home unavailable: {error}. Do not guess a cwd or scope."
-                    )),
+                    Err(error) => {
+                        tracing::warn!(%error, "Coordinator home context validation failed");
+                        system_prompt.push_str(
+                            "\n\nCoordinator home unavailable; do not guess a cwd or scope.",
+                        );
+                    }
                 },
                 Ok(None) => {}
                 Err(error) => {
