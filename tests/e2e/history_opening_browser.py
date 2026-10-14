@@ -361,6 +361,87 @@ def equal_text_fixture(fixture, aggregate):
 SERVER_COMPLETION_TIMEOUT = 65
 
 
+class LifecycleFailures:
+    def __init__(self):
+        self.primary = None
+        self.cleanup = []
+        self.cleanup_overflow = False
+
+    def remember_primary(self, stage, error):
+        if self.primary is None:
+            self.primary = (stage, error)
+
+    def remember_cleanup(self, stage, error):
+        if any(existing is error for _, existing in self.cleanup):
+            return
+        if len(self.cleanup) < 8:
+            self.cleanup.append((stage, error))
+        else:
+            self.cleanup_overflow = True
+
+    @contextlib.contextmanager
+    def own(self, manager, stage):
+        if stage not in {"receiver", "server", "preview", "browser"}:
+            raise ValueError("unknown lifecycle evidence stage")
+        body_error = None
+        try:
+            with manager as resource:
+                try:
+                    yield resource
+                except BaseException as error:
+                    self.remember_primary(stage, error)
+                    body_error = self.primary[1]
+                    if error is not body_error:
+                        self.remember_cleanup(stage, error)
+                        raise body_error from error
+                    raise
+        except BaseException as error:
+            if body_error is not None and error is not body_error:
+                self.remember_cleanup(stage, error)
+                raise body_error from error
+            self.remember_primary(stage, error)
+            raise
+        if body_error is not None:
+            raise body_error
+
+    def write_receipt(self, path):
+        try:
+            shipping.write_json(path, self.receipt())
+        except Exception as error:
+            self.remember_cleanup("failure_receipt", error)
+            if self.primary is not None:
+                raise self.primary[1] from error
+            raise
+
+    def receipt(self):
+        def fact(item):
+            stage, error = item
+            message = str(error)
+            return {"stage": stage, "type": type(error).__name__,
+                    "message": message[:1024], "message_truncated": len(message) > 1024}
+        return {"primary": fact(self.primary) if self.primary else None,
+                "cleanup": [fact(item) for item in self.cleanup],
+                "cleanup_overflow": self.cleanup_overflow}
+
+
+def forced_server_shutdown(server, case, control, failures):
+    receipt = {"status": "forced_shutdown_attempt", "control_present": control.exists(),
+               "stop_response_received": False, "returncode_before": server.poll()}
+    try:
+        if receipt["control_present"]:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(2)
+                client.connect(str(control))
+                client.sendall(b'{"command":"stop"}\n')
+                receipt["stop_response_received"] = bool(client.recv(4096))
+    except (OSError, ValueError) as error:
+        failures.remember_cleanup("server_control_stop", error)
+        receipt["error_type"] = type(error).__name__
+    finally:
+        receipt["returncode_after"] = server.poll()
+        shipping.write_json(case / "forced-server-shutdown.json", receipt)
+
+
 def normal_server_completion(server, case, startup, control):
     """Called before owned_process's forced process-group cleanup."""
     receipt = {"status": "failed", "normal_wait_timeout_seconds": SERVER_COMPLETION_TIMEOUT,
@@ -403,8 +484,9 @@ def qualify(app, exe, output, joint_telemetry=False):
             receiver = server = None
             app_stopped = receiver_stopped = False
             lifecycle_errors = []
+            failures = LifecycleFailures()
             try:
-                with receiver_context as receiver:
+                with failures.own(receiver_context, "receiver") as receiver:
                     receiver_receipt = (receiver_startup_check(receiver, run_id, services)
                                         if receiver else None)
                     with tempfile.TemporaryDirectory(prefix=kind + "-", dir=temp) as owned:
@@ -422,9 +504,9 @@ def qualify(app, exe, output, joint_telemetry=False):
                                                 receiver_receipt)
                         command = [str(exe), DRIVER, "--exact", "--ignored",
                                    "--test-threads=1", "--nocapture"]
-                        with shipping.owned_process(
+                        with failures.own(shipping.owned_process(
                                 command, work, env,
-                                case / "instrumented-runtime.log") as server:
+                                case / "instrumented-runtime.log"), "server") as server:
                             try:
                                 readiness(server, base + "/api/models")
                                 startup = startup_identity(
@@ -502,16 +584,16 @@ def qualify(app, exe, output, joint_telemetry=False):
                                         "HISTORY_TELEMETRY_MODULE_SHA256":
                                             TELEMETRY_MODULES[
                                                 "ui/scripts/qualify-view-telemetry.mjs"]}
-                                with shipping.owned_process(
+                                with failures.own(shipping.owned_process(
                                         ["node", str(app /
                                             "ui/node_modules/vite/bin/vite.js"),
                                          "preview", "--config", str(config)],
-                                        work, node_env, case / "preview.log") as preview:
+                                        work, node_env, case / "preview.log"), "preview") as preview:
                                     readiness(preview, ui, shipping.digest(
                                         app / "ui/dist/index.html"))
-                                    with shipping.owned_process(
+                                    with failures.own(shipping.owned_process(
                                             ["node", str(SCRIPT)], work, node_env,
-                                            case / "browser.log") as driver:
+                                            case / "browser.log"), "browser") as driver:
                                         driver.wait(timeout=500 if receiver else 180)
                                         assert driver.returncode == 0, (
                                             "opening browser assertions failed; see case logs")
@@ -535,19 +617,17 @@ def qualify(app, exe, output, joint_telemetry=False):
                                         "receiver_expired": receiver.expired,
                                         "receiver_lifetime_seconds": 650,
                                         "scope": "observed after normal app completion before receiver exit"})
+                            except BaseException as error:
+                                failures.remember_primary("server_body", error)
+                                raise
                             finally:
                                 if not (case / "server-completion.json").exists():
                                     shipping.write_json(
                                         case / "server-completion.json", {
                                             "status": "force_cleanup_required",
                                             "returncode": server.poll()})
-                                if control.exists():
-                                    with contextlib.suppress(OSError, ValueError):
-                                        with socket.socket(socket.AF_UNIX) as client:
-                                            client.settimeout(2)
-                                            client.connect(str(control))
-                                            client.sendall(b'{"command":"stop"}\n')
-                                            client.recv(4096)
+                                if json.loads((case / "server-completion.json").read_text())["status"] != "success":
+                                    forced_server_shutdown(server, case, control, failures)
                         completion_path = case / "server-completion.json"
                         if completion_path.is_file():
                             app_stopped = (json.loads(completion_path.read_text()).get(
@@ -573,17 +653,24 @@ def qualify(app, exe, output, joint_telemetry=False):
                         drain_receipt=drain)
                     shipping.write_json(case / "telemetry-final.json", final)
             except Exception as error:
+                failures.remember_primary("case", error)
                 lifecycle_errors.append(f"{type(error).__name__}: {error}")
-                if receiver is not None:
-                    receiver_stopped = receiver_is_stopped(receiver)
-                    drain_path = case / "telemetry-drain.json"
-                    if not drain_path.exists():
-                        shipping.write_json(drain_path, {
-                            "run_id": run_id, "service_name": receiver.service,
-                            "app_stopped": app_stopped,
-                            "receiver_stopped": receiver_stopped,
-                            "errors": lifecycle_errors})
+                try:
+                    if receiver is not None:
+                        receiver_stopped = receiver_is_stopped(receiver)
+                        drain_path = case / "telemetry-drain.json"
+                        if not drain_path.exists():
+                            shipping.write_json(drain_path, {
+                                "run_id": run_id, "service_name": receiver.service,
+                                "app_stopped": app_stopped,
+                                "receiver_stopped": receiver_stopped,
+                                "errors": lifecycle_errors})
+                except Exception as cleanup_error:
+                    failures.remember_cleanup("failure_drain", cleanup_error)
+                    raise error from cleanup_error
                 raise
+            finally:
+                failures.write_receipt(case / "lifecycle-failures.json")
 
 
 def main():
@@ -625,6 +712,10 @@ def main():
             "verified_runtime_startup": (output / kind / "startup.json").is_file(),
             "server_completion": json.loads((output / kind / "server-completion.json").read_text())
                 if (output / kind / "server-completion.json").is_file() else {"status": "not_completed"},
+            "lifecycle_failures": json.loads((output / kind / "lifecycle-failures.json").read_text())
+                if (output / kind / "lifecycle-failures.json").is_file() else {"status": "not_observed"},
+            "forced_shutdown": json.loads((output / kind / "forced-server-shutdown.json").read_text())
+                if (output / kind / "forced-server-shutdown.json").is_file() else {"status": "not_observed"},
             "browser": json.loads((output / kind / "browser-result.json").read_text())
                 if (output / kind / "browser-result.json").is_file() else {"status": "not_completed"},
             "telemetry": json.loads((output / kind / "telemetry-final.json").read_text())

@@ -290,6 +290,134 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["successor_transcript_row_id"], "successor")
         with self.assertRaises(AssertionError): opening.shipping.member_boundaries(["root", "successor"], [[], []])
 
+    def test_lifecycle_preserves_primary_and_nested_cleanup_failures(self):
+        import contextlib
+        failures = opening.LifecycleFailures()
+        primary = AssertionError("browser report missing")
+
+        @contextlib.contextmanager
+        def broken_cleanup(message):
+            try:
+                yield object()
+            finally:
+                raise RuntimeError(message)
+
+        with self.assertRaises(AssertionError) as caught:
+            with failures.own(broken_cleanup("receiver cleanup"), "receiver"):
+                with failures.own(broken_cleanup("server cleanup"), "server"):
+                    raise primary
+        self.assertIs(caught.exception, primary)
+        receipt = failures.receipt()
+        self.assertEqual(receipt["primary"]["message"], "browser report missing")
+        self.assertEqual([item["message"] for item in receipt["cleanup"]],
+                         ["server cleanup", "receiver cleanup"])
+
+    def test_lifecycle_cleanup_only_and_suppression_remain_failures(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def cleanup_failure():
+            yield None
+            raise RuntimeError("cleanup only")
+
+        failures = opening.LifecycleFailures()
+        with self.assertRaisesRegex(RuntimeError, "cleanup only"):
+            with failures.own(cleanup_failure(), "server"):
+                pass
+        self.assertEqual(failures.receipt()["primary"]["message"], "cleanup only")
+        self.assertEqual(failures.receipt()["cleanup"], [])
+        failures = opening.LifecycleFailures()
+        with self.assertRaisesRegex(AssertionError, "must not suppress"):
+            with failures.own(contextlib.suppress(AssertionError), "browser"):
+                raise AssertionError("must not suppress")
+
+    def test_lifecycle_pre_finally_primary_survives_body_cleanup_mask(self):
+        import contextlib
+        failures = opening.LifecycleFailures()
+        primary = AssertionError("original body")
+        with self.assertRaises(AssertionError) as caught:
+            with failures.own(contextlib.nullcontext(), "server"):
+                try:
+                    raise primary
+                except BaseException as error:
+                    failures.remember_primary("server_body", error)
+                    raise
+                finally:
+                    raise RuntimeError("finally failed")
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(failures.receipt()["cleanup"][0]["message"], "finally failed")
+
+    def test_lifecycle_failure_receipt_is_bounded_and_marks_overflow(self):
+        failures = opening.LifecycleFailures()
+        failures.remember_primary("case", AssertionError("x" * 2048))
+        for index in range(10):
+            failures.remember_cleanup("server", RuntimeError(str(index)))
+        receipt = failures.receipt()
+        self.assertEqual(len(receipt["primary"]["message"]), 1024)
+        self.assertTrue(receipt["primary"]["message_truncated"])
+        self.assertEqual(len(receipt["cleanup"]), 8)
+        self.assertTrue(receipt["cleanup_overflow"])
+
+    def test_lifecycle_receipt_write_failure_cannot_mask_primary(self):
+        failures = opening.LifecycleFailures()
+        primary = AssertionError("primary before receipt write")
+        failures.remember_primary("case", primary)
+        with patch.object(opening.shipping, "write_json", side_effect=OSError("receipt failed")):
+            with self.assertRaises(AssertionError) as caught:
+                failures.write_receipt(self.root / "lifecycle.json")
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(failures.receipt()["cleanup"][0]["stage"], "failure_receipt")
+        failures = opening.LifecycleFailures()
+        with patch.object(opening.shipping, "write_json", side_effect=OSError("receipt failed")):
+            with self.assertRaises(OSError):
+                failures.write_receipt(self.root / "lifecycle.json")
+
+    def test_forced_shutdown_zero_is_not_normal_and_retains_control_error(self):
+        from unittest.mock import Mock
+        control = self.root / "fake-control.sock"
+        control.touch()
+        failures = opening.LifecycleFailures()
+        with patch.object(opening.socket, "socket", side_effect=OSError("control failed")):
+            opening.forced_server_shutdown(Mock(poll=Mock(return_value=0)),
+                                           self.root, control, failures)
+        receipt = json.loads((self.root / "forced-server-shutdown.json").read_text())
+        self.assertEqual(receipt["status"], "forced_shutdown_attempt")
+        self.assertEqual(receipt["returncode_after"], 0)
+        self.assertFalse(receipt["stop_response_received"])
+        self.assertEqual(receipt["error_type"], "OSError")
+        self.assertEqual(failures.receipt()["cleanup"][0]["stage"], "server_control_stop")
+        self.assertFalse((self.root / "server-completion.json").exists())
+
+    def test_actual_qualify_failure_path_preserves_primary_and_forced_zero(self):
+        import contextlib
+        from unittest.mock import Mock
+        output = self.root / "qualification"
+        output.mkdir()
+        server = Mock(poll=Mock(return_value=0))
+
+        @contextlib.contextmanager
+        def process(*args):
+            try:
+                yield server
+            finally:
+                raise RuntimeError("process cleanup failed")
+
+        with patch.object(opening.shipping, "load_app_harness", return_value=Mock()), \
+                patch.object(opening.shipping, "owned_process", side_effect=process), \
+                patch.object(opening, "readiness", side_effect=AssertionError("startup primary")):
+            with self.assertRaisesRegex(AssertionError, "startup primary"):
+                opening.qualify(self.root, self.exe, output)
+        case = output / "ordinary"
+        completion = json.loads((case / "server-completion.json").read_text())
+        self.assertEqual(completion, {"status": "force_cleanup_required", "returncode": 0})
+        forced = json.loads((case / "forced-server-shutdown.json").read_text())
+        self.assertEqual(forced["status"], "forced_shutdown_attempt")
+        self.assertEqual(forced["returncode_after"], 0)
+        failures = json.loads((case / "lifecycle-failures.json").read_text())
+        self.assertEqual(failures["primary"]["message"], "startup primary")
+        self.assertEqual(failures["cleanup"][0]["message"], "process cleanup failed")
+        self.assertFalse((output / "global").exists())
+
     def test_normal_server_completion_requires_zero_and_owned_cleanup(self):
         from unittest.mock import Mock
         home = self.root / "removed-driver-home"
@@ -474,8 +602,11 @@ class OpeningQualificationTests(unittest.TestCase):
         final = next(node for node in calls if isinstance(node.func, ast.Attribute)
                      and node.func.attr == "assertPhoenixTelemetry")
         receiver_with = next(node for node in ast.walk(qualify) if isinstance(node, ast.With)
-                             and any(isinstance(item.context_expr, ast.Name)
-                                     and item.context_expr.id == "receiver_context"
+                             and any(isinstance(item.context_expr, ast.Call)
+                                     and isinstance(item.context_expr.func, ast.Attribute)
+                                     and item.context_expr.func.attr == "own"
+                                     and isinstance(item.context_expr.args[0], ast.Name)
+                                     and item.context_expr.args[0].id == "receiver_context"
                                      for item in node.items))
         self.assertLess(startup.lineno, normal.lineno)
         self.assertLess(normal.lineno, receiver_with.end_lineno)
