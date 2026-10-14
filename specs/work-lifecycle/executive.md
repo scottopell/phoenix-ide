@@ -51,4 +51,10 @@ These are acceptance obligations, **not tests reported as passing**:
 
 ## Validation Notes
 
-This is a specification-only slice. Targeted Allium parsing and repository spec-shape/anchor checks must be distinguished from whole-repository analyser baseline checks and implementation acceptance. No runtime, UI, production, or migration acceptance is claimed here; the required matrix above remains unvalidated until a source candidate is qualified against it.
+### Inventory preparation versus host cleanup
+
+`prepare_retirement_captures_and_seals_one_exact_shared_worktree` exercises the production first-pass inventory preparation boundary using retained SQLite identities, without a Git repository, watcher shutdown, or filesystem deletion. It replaces `archive_chain_captures_first_pass_close_inventory`, whose inventory assertion depended on full host cleanup succeeding. The regression checks one exact target for a three-member shared chain, retained snapshot, repeat preparation, admission fences, and no retirement evidence or lifecycle transition from capture alone.
+
+Aggregate archival remains covered by `archive_chain_handler_completes_one_aggregate_close`. Runtime cleanup-failure finalization, outbox rollback, and process-step failure ordering have separate deterministic tests; the inventory test does not duplicate those contracts. Git observation and exact-object deletion adapter tests remain separate coverage.
+
+The inventory and existing focused runtime tests above do not establish acceptance of the entire matrix. Targeted test and spec-check results must be distinguished from whole-repository qualification, UI acceptance, production deployment, and migration acceptance.

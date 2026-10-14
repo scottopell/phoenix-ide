@@ -837,6 +837,26 @@ impl RuntimeManager {
     }
 
     /// Retires exactly the unresolved inventory targets.
+    async fn prepare_close_retirement_targets(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> Result<Vec<CloseExpectedRetirementResource>, String> {
+        if !self
+            .db()
+            .close_retirement_inventory_is_complete(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
+                .await?;
+        }
+        self.db()
+            .list_close_expected_retirement_resources(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn retire_close_runtime_resources(
         &self,
@@ -862,20 +882,9 @@ impl RuntimeManager {
             .snapshot()
             .cloned()
             .ok_or_else(|| "retirement requested without an inspection snapshot".to_string())?;
-        let inventory_is_complete = self
-            .db()
-            .close_retirement_inventory_is_complete(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        if !inventory_is_complete {
-            self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
-                .await?;
-        }
         let targets = self
-            .db()
-            .list_close_expected_retirement_resources(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
+            .prepare_close_retirement_targets(&attempt_id, &snapshot)
+            .await?;
         let evidence = self
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
@@ -7423,6 +7432,259 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn build_close_attempt_with_sentinel_worktree(
+        db: &crate::db::Database,
+        ids: &[&str; 3],
+    ) -> (
+        phoenix_core::domain::close::CloseAttemptId,
+        phoenix_core::work_scope::WorkScopeId,
+        WorktreeIdentity,
+    ) {
+        use phoenix_core::domain::close::{
+            CloseAttemptId, CloseRetirementSnapshot, TranscriptConversationId,
+        };
+
+        let root = db
+            .create_conversation(ids[0], ids[0], "/tmp", true, None, None)
+            .await
+            .expect("create root conversation");
+        let scope = root
+            .attached_work_scope_id
+            .clone()
+            .expect("root conversation has an attached scope");
+
+        let worktree = WorktreeIdentity::from_parts(
+            WorktreeId::parse("sentinel-worktree-id").unwrap(),
+            WorktreeFingerprint::parse("sentinel-fingerprint").unwrap(),
+            GitPathIdentity::from_bytes(b"/inert/sentinel/worktree-never-touched".to_vec()),
+        );
+        sqlx::query(
+            "UPDATE work_scopes
+             SET environment_kind = 'allocated_worktree',
+                 worktree_path = ?1, worktree_id = ?2, worktree_fingerprint = ?3,
+                 branch_name = 'sentinel-branch', base_branch = 'main'
+             WHERE id = ?4",
+        )
+        .bind("/inert/sentinel/worktree-never-touched")
+        .bind(worktree.id().as_str())
+        .bind(worktree.fingerprint().as_str())
+        .bind(scope.as_str())
+        .execute(db.pool())
+        .await
+        .expect("seal the sentinel worktree onto the scope (no filesystem touched)");
+
+        // Two continuations sharing the root's scope -- same membership
+        // wiring as the chain-archive fixture, minus the real git worktree.
+        for pair in ids.windows(2) {
+            let predecessor_id = pair[0];
+            let id = pair[1];
+            let mut tx = db.pool().begin().await.expect("begin continuation fixture");
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .expect("defer fixture foreign keys");
+            sqlx::query(
+                "INSERT INTO product_continuation_reservations (
+                     predecessor_conversation_id, successor_conversation_id, product_conversation_id
+                 ) VALUES (?1, ?2, ?3)",
+            )
+            .bind(predecessor_id)
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("reserve continuation edge");
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(id)
+                .bind(predecessor_id)
+                .execute(&mut *tx)
+                .await
+                .expect("link");
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, title, user_initiated,
+                     state, state_kind, state_updated_at, created_at, updated_at,
+                     archived, model, project_id, desired_base_branch,
+                     cm_kind, cm_task_id, cm_task_title, runtime_role, work_scope_id
+                 )
+                 SELECT ?1, product_conversation_id, ?2, ?3, 1,
+                        state, state_kind, ?4, ?4, ?4,
+                        0, model, project_id, desired_base_branch,
+                        cm_kind, cm_task_id, cm_task_title, 'user', work_scope_id
+                 FROM conversations WHERE id = ?5",
+            )
+            .bind(id)
+            .bind(format!("slug-{id}"))
+            .bind(format!("Title {id}"))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .expect("create continuation member");
+            sqlx::query(
+                "DELETE FROM product_continuation_reservations
+                 WHERE predecessor_conversation_id = ?1",
+            )
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .expect("consume continuation reservation");
+            tx.commit().await.expect("commit continuation fixture");
+        }
+
+        let attempt_id = CloseAttemptId::parse(format!("close-attempt-{}", ids[0])).unwrap();
+        db.begin_close_foundation(
+            &root.product_conversation_id,
+            &TranscriptConversationId::parse(ids[2]).unwrap(),
+            attempt_id.as_str(),
+        )
+        .await
+        .expect("begin close foundation");
+        db.confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .expect("confirm stop-work");
+        db.begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .expect("begin active-work settlement");
+        db.advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .expect("advance to awaiting retirement inspection");
+        db.replace_close_inspection(crate::db::ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes: vec![crate::db::ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("sentinel-gen", "sentinel-fp").unwrap(),
+                losses: vec![],
+            }],
+        })
+        .await
+        .expect("replace inspection with zero losses -> RetirementRequested");
+
+        (attempt_id, scope, worktree)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn prepare_retirement_captures_and_seals_one_exact_shared_worktree() {
+        use phoenix_core::domain::close::{
+            CapturedWorktreeIdentity, ClosePhase, LossItemIdentity, RetiredResourceKind,
+        };
+        use std::sync::Arc;
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let ids = ["ri-a", "ri-a2", "ri-a3"];
+        let (attempt_id, scope, worktree) =
+            build_close_attempt_with_sentinel_worktree(&db, &ids).await;
+
+        let obligation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::RetirementRequested);
+        let snapshot = obligation
+            .snapshot()
+            .cloned()
+            .expect("sealed aggregate snapshot present");
+        let product_conversation_id = obligation.product_conversation_id().clone();
+
+        assert!(
+            !db.close_retirement_inventory_is_complete(attempt_id.as_str())
+                .await
+                .unwrap(),
+            "inventory must be incomplete before capture"
+        );
+
+        let manager = super::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::platform::PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        );
+
+        manager
+            .prepare_close_retirement_targets(&attempt_id, &snapshot)
+            .await
+            .expect("production capture must succeed from committed DB state alone");
+
+        assert!(
+            db.close_retirement_inventory_is_complete(attempt_id.as_str())
+                .await
+                .unwrap(),
+            "inventory must be complete after capture"
+        );
+
+        let captured_scopes = db
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            captured_scopes.len(),
+            1,
+            "3 continuation members must share exactly one captured scope"
+        );
+        assert_eq!(captured_scopes[0].scope, scope);
+        assert_eq!(
+            captured_scopes[0].captured_worktree,
+            Some(CapturedWorktreeIdentity::Resolved(worktree.clone())),
+            "captured worktree identity must be the exact sentinel identity"
+        );
+
+        let expected = db
+            .list_close_expected_retirement_resources(attempt_id.as_str())
+            .await
+            .unwrap();
+        let worktree_targets: Vec<_> = expected
+            .iter()
+            .filter(|target| target.resource.kind() == RetiredResourceKind::Worktree)
+            .collect();
+        assert_eq!(
+            worktree_targets.len(),
+            1,
+            "exactly one worktree target sealed"
+        );
+        assert_eq!(
+            worktree_targets[0].resource.identity(),
+            &LossItemIdentity::Worktree(worktree.clone())
+        );
+
+        manager
+            .prepare_close_retirement_targets(&attempt_id, &snapshot)
+            .await
+            .expect("repeat capture against the sealed snapshot must be idempotent");
+        let expected_again = db
+            .list_close_expected_retirement_resources(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            expected, expected_again,
+            "repeat capture must not duplicate sealed resources"
+        );
+
+        assert!(
+            db.list_close_retirement_evidence(attempt_id.as_str())
+                .await
+                .unwrap()
+                .is_empty(),
+            "capture must not produce any retirement receipts"
+        );
+
+        assert_close_admission_fenced(&manager, &scope).await;
+
+        let aggregate = db
+            .get_ordinary_product_conversation(&product_conversation_id)
+            .await
+            .unwrap();
+        assert_ne!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
+            "capture must not transition the aggregate to History by itself"
+        );
+
+        let after = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
+        assert_eq!(after.phase(), ClosePhase::RetirementRequested);
     }
 
     #[tokio::test]
