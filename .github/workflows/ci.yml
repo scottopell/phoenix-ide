@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: c825370814d22f0e03faf72d18f37df97bb59329
+          ref: caa8138cad185530b4c5ddb17b5082502f21bb01
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -248,8 +248,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = c825370814d22f0e03faf72d18f37df97bb59329
-          test "$(git rev-parse HEAD^{tree})" = ac4539bb02bff27c8094264322b6f5a8398e5011
+          test "$(git rev-parse HEAD)" = caa8138cad185530b4c5ddb17b5082502f21bb01
+          test "$(git rev-parse HEAD^{tree})" = 94fd6cdc6f5e7518feb72f004402cd04e53f36cf
           test "$(git merge-base HEAD 84fbebb0781067cbe843f61c53093dcc0f0d64f2)" = 84fbebb0781067cbe843f61c53093dcc0f0d64f2
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'

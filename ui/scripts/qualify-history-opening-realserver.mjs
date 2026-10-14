@@ -8,7 +8,7 @@ import { createConnection } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate, aggregateBoundaries } from './qualify-history-realserver.mjs';
 import { historicalMessageIdentities, observePhysicalHistoricalRow, physicalBaselineMatches, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
-import { prepareJointTelemetry, runJointTelemetryStage } from './history-joint-telemetry.mjs';
+import { prepareJointTelemetry, runJointTelemetryStage, installObservedHistoryTelemetry } from './history-joint-telemetry.mjs';
 
 export function ownedWireCursor(event, observedEvents) {
   const payload = JSON.parse(event.data);
@@ -778,7 +778,7 @@ async function run() {
   const checked = (name, data) => { result.checks.push(name); record('assertions.jsonl', { name, ...data }); };
   const gate = { armed: false, releaseAttempted: false, predecessor: a.members.at(-1), key: randomUUID() };
   const command = async body => { const reply = await ipc(control, body); record('ipc.jsonl', { command: body, reply }); return reply; };
-  let browser, page, continuation, recorder;
+  let browser, page, continuation, recorder, historyTelemetry, finalizeHistoryTelemetry;
   const snapshots = [], events = [];
   let requests = [], failed = [];
   const deadlineStarted = performance.now();
@@ -838,6 +838,7 @@ async function run() {
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 1360, height: 900 } });
     page = await context.newPage(); page.setDefaultTimeout(10000); page.setDefaultNavigationTimeout(10000);
+    if (jointTelemetry) historyTelemetry = installObservedHistoryTelemetry(page, ui);
     recorder = installAggregateRecorder(page, a, record, snapshots, {
       expectedRequestFailure: entry => faultTarget(entry.method, entry.url, JSON.parse(readFileSync(fault)), 'roster'),
     });
@@ -1120,10 +1121,12 @@ async function run() {
       record('joint-history-physical.jsonl', historyPhysical);
       clearTimeout(hardStop);
       hardStop = setTimeout(wallFailure, Math.min(310000, Math.max(1, 480000 - (performance.now() - deadlineStarted))));
-      result.joint_telemetry = await runJointTelemetryStage({ config: jointTelemetry, browser, baseURL: ui,
+      const jointStage = await runJointTelemetryStage({ config: jointTelemetry, browser, baseURL: ui,
         outputDir: output, historyPhysical, harnessPath: fileURLToPath(import.meta.url),
         historyGlobalOwnedGetCount: a.kind === 'global' ? requests.slice(chapterRequestStart).filter(r =>
           capturePolicy({ ...a, members: [...a.members, latest] }, r.method, r.url).kind === 'required_aggregate_json').length : null });
+      result.joint_telemetry = jointStage.receipt;
+      finalizeHistoryTelemetry = jointStage.finalizeHistory;
       record('joint-telemetry-source-receipt.jsonl', result.joint_telemetry);
     }
     result.status = 'passed_assertions';
@@ -1137,6 +1140,16 @@ async function run() {
       const entered = await command({ command: 'entered' });
       if (entered.state === 'entered') await releaseOnce(gate, command);
     } } catch (error) { record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; result.status = 'failed'; }
+    if (jointTelemetry && browser) {
+      try {
+        await browser.close(); browser = undefined;
+        if (finalizeHistoryTelemetry) {
+          const inventory = historyTelemetry.snapshot();
+          finalizeHistoryTelemetry(inventory);
+          record('observed-history-telemetry-inventory.jsonl', inventory);
+        }
+      } catch (error) { result.status = 'failed'; result.error = String(error.stack ?? error); process.exitCode = 1; }
+    }
     try { await command({ command: 'stop' }); } catch (error) { record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; result.status = 'failed'; }
     try { updateFault(fault, { failRoster: false }); if (browser) await browser.close(); }
     catch (error) { result.status = 'failed'; result.cleanup_error = String(error); process.exitCode = 1; }

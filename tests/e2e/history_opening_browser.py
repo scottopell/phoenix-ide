@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent c825370 checkout, independently built ignored
+Inputs are a clean independent caa8138 checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports three hash-attested telemetry harness
@@ -31,8 +31,8 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "c825370814d22f0e03faf72d18f37df97bb59329"
-TREE_PIN = "ac4539bb02bff27c8094264322b6f5a8398e5011"
+PIN = "caa8138cad185530b4c5ddb17b5082502f21bb01"
+TREE_PIN = "94fd6cdc6f5e7518feb72f004402cd04e53f36cf"
 BASE_PIN = "84fbebb0781067cbe843f61c53093dcc0f0d64f2"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
@@ -40,7 +40,7 @@ ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
     "ui/scripts/qualify-view-telemetry.mjs": "d0a52f49d583ae55ede9320d6f2ef1bd581fdd2f17dff9f6f989e9a6f75adb83",
-    "tests/e2e/view_telemetry_sink.py": "15d822cfe895097009249c6d4b6674dcf1826b5c6129bdd633545c2b4a91881b",
+    "tests/e2e/view_telemetry_sink.py": "aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",
 }
 TELEMETRY_KEYS = frozenset({"PHOENIX_TRACE_EXPORTER", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
@@ -81,7 +81,10 @@ def identity(app, exe, receipt_path):
         raise ValueError("instrumented build selector/focused tests missing")
     return measured | {"rustc": receipt["rustc"], "receipt_sha256": shipping.digest(receipt_path),
         "harness_files": {str(p.relative_to(ROOT)): shipping.digest(p) for p in
-            [Path(__file__), SCRIPT, Path(shipping.__file__), ROOT / "ui/scripts/qualify-history-realserver.mjs"]},
+            [Path(__file__), SCRIPT, Path(shipping.__file__),
+             ROOT / "ui/scripts/qualify-history-realserver.mjs",
+             ROOT / "ui/scripts/history-postfault-baseline.mjs",
+             ROOT / "ui/scripts/history-joint-telemetry.mjs"]},
         "runtime_imports": {str((app / relative).resolve()): digest for relative, digest in modules.items()},
         "source_provenance": "independent build-owner attestation"}
 
@@ -182,7 +185,13 @@ def telemetry_environment(base, receiver):
     return result
 
 
+def receiver_serving_check(receiver):
+    if receiver.expired or not receiver.is_serving():
+        raise RuntimeError("owned receiver expired or stopped before app drain completed")
+
+
 def receiver_startup_check(receiver, run_id, services):
+    receiver_serving_check(receiver)
     endpoint = urlparse(receiver.endpoint)
     expected_service = f"phoenix-view-qualification-{run_id}"
     if (endpoint.scheme != "http" or endpoint.hostname != "127.0.0.1"
@@ -389,7 +398,7 @@ def qualify(app, exe, output, joint_telemetry=False):
             case = output / kind
             case.mkdir()
             run_id = f"history-{kind}-{shipping.uuid.uuid4().hex[:16]}"
-            receiver_context = (telemetry[0].telemetry_sink(case, run_id)
+            receiver_context = (telemetry[0].telemetry_sink(case, run_id, lifetime_seconds=650)
                                 if telemetry else contextlib.nullcontext(None))
             receiver = server = None
             app_stopped = receiver_stopped = False
@@ -512,11 +521,20 @@ def qualify(app, exe, output, joint_telemetry=False):
                                 if receiver:
                                     telemetry_result = case / "telemetry/telemetry-browser-result.json"
                                     telemetry_browser_result(telemetry_result)
+                                    receiver_serving_check(receiver)
                                     receiver.assert_receipt(telemetry_result)
                                 completion = normal_server_completion(
                                     server, case, startup, control)
                                 app_stopped = (completion["status"] == "success"
                                                and server.poll() == 0)
+                                if receiver:
+                                    receiver_serving_check(receiver)
+                                    shipping.write_json(case / "telemetry-app-stop-liveness.json", {
+                                        "run_id": run_id, "service_name": receiver.service,
+                                        "app_stopped": app_stopped, "receiver_serving": receiver.is_serving(),
+                                        "receiver_expired": receiver.expired,
+                                        "receiver_lifetime_seconds": 650,
+                                        "scope": "observed after normal app completion before receiver exit"})
                             finally:
                                 if not (case / "server-completion.json").exists():
                                     shipping.write_json(

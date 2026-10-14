@@ -368,6 +368,36 @@ class OpeningQualificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             opening.actual_server_identity(startup, fixture)
 
+    def test_executed_helper_bytes_are_in_before_after_identity(self):
+        helper = opening.ROOT / "ui/scripts/history-joint-telemetry.mjs"
+        baseline = self.identity()
+        self.assertIn("ui/scripts/history-joint-telemetry.mjs", baseline["harness_files"])
+        self.assertIn("ui/scripts/history-postfault-baseline.mjs", baseline["harness_files"])
+        original_digest = self.digest
+        def changed_digest(path):
+            return "changed-helper-bytes" if Path(path) == helper else original_digest(path)
+        with patch.object(self, "digest", changed_digest):
+            changed = self.identity()
+        self.assertNotEqual(baseline, changed)
+        self.assertIn('assert identity(app, exe, args.instrumented_receipt) == before, "artifact identity changed"', Path(opening.__file__).read_text())
+
+    def test_early_receiver_expiry_and_stopped_worker_fail_liveness(self):
+        for expired, serving in [(True, True), (True, False), (False, False)]:
+            with self.subTest(expired=expired, serving=serving), self.assertRaises(RuntimeError):
+                opening.receiver_serving_check(types.SimpleNamespace(expired=expired, is_serving=lambda: serving))
+        opening.receiver_serving_check(types.SimpleNamespace(expired=False, is_serving=lambda: True))
+
+    def test_receiver_liveness_is_observed_inside_context_after_normal_app_completion(self):
+        source = Path(opening.__file__).read_text()
+        self.assertIn("lifetime_seconds=650", source)
+        normal = source.index("completion = normal_server_completion(")
+        check = source.index("receiver_serving_check(receiver)", normal)
+        exit_check = source.index("receiver_stopped = receiver_is_stopped(receiver)", check)
+        self.assertLess(normal, check)
+        self.assertLess(check, exit_check)
+        self.assertIn('"receiver_expired": receiver.expired', source)
+        self.assertIn('"receiver_serving": receiver.is_serving()', source)
+
     def test_joint_source_orders_app_then_receiver_stop_before_final_assertion(self):
         import ast
         qualify = next(node for node in ast.parse(Path(opening.__file__).read_text()).body

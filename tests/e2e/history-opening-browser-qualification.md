@@ -889,3 +889,43 @@ or readiness was performed as part of this source-only wiring. Runtime and
 Rust qualification require separate resource/host admission and exact-HEAD
 source review. ADR numbering on frozen source is unchanged by speculative
 installer/federation landing; integration renumbering must carry a new identity.
+
+Exact review of local harness `1f3b9333` blocked source readiness on three
+concrete gaps: original-history sampled exports were absent from the stock
+module's exact inventory; the receiver's standalone 300-second timer could stop
+before the joint app; and the executed joint helper was missing from the
+before/after byte manifest. That checkpoint was never pushed or activated.
+
+The repair rebinds to app `caa8138cad185530b4c5ddb17b5082502f21bb01`,
+tree `94fd6cdc6f5e7518feb72f004402cd04e53f36cf`, parent `c8253708`.
+Only the receiver donor changes: SHA-256
+`aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd`.
+The JS module and final-assertion hashes remain unchanged. The standalone
+receiver keeps its 300-second default; joint ownership explicitly chooses its
+validated 650-second maximum, covering setup, the existing 500-second driver
+wait and normal app/drain cleanup without increasing those outer bounds.
+Expiry persists a capture error. The harness checks actual `is_serving()` and
+`expired` before startup and after normal app completion while still inside the
+receiver context. The receiver's shared four-second join budget begins **after
+synchronous `server.shutdown()`**, not as an end-to-end teardown guarantee.
+The outer case deadline remains necessary.
+
+An independent original-page listener attaches before any history navigation,
+retains bounded actual report POST bodies and collector statuses, and records
+actual finite/SSE request open IDs plus response trace headers. It remains
+active through browser closure so late beacons cannot be silently excluded.
+After closure and before app stop, privacy-validated reports and independently
+matched request/trace/SSE correlations join the stock journey inventory using
+the unchanged exported projection functions. The union is bounded to 64,
+unique, browser-derived and explicitly scoped; no receiver output is used to
+invent expected journeys. Missing reports/statuses/correlations, rejected
+collector responses, duplicate identities and observer errors fail closed.
+The final unchanged assertion still rejects any additional receiver view span
+that was not independently captured. Natural sampling is unchanged.
+
+The before/after manifest now covers both the joint helper and the existing
+post-fault baseline helper as well as their importers and Python owner. The
+joint receipt also hashes its own helper bytes. Helper mutation, receiver early
+expiry, original-view inventory/correlation omissions, late capture and cleanup
+ordering have compiler-free negative regressions. These are source/unit guards,
+not executed app, receiver, Rust or lifecycle readiness receipts.

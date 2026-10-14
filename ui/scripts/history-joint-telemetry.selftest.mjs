@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_SPA_SELECTOR, UNIT_ONLY,
-  prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage } from './history-joint-telemetry.mjs';
+  prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage,
+  installObservedHistoryTelemetry, appendObservedHistory } from './history-joint-telemetry.mjs';
 
 // All positive fake browser/module/fixture values in this file are UNIT ONLY, not runtime proof.
 function input() {
@@ -81,8 +83,8 @@ test('UNIT ONLY stage owns a fresh context and closes it without promoting parti
       baseURL: 'http://127.0.0.1:12345', outputDir: f.root, harnessPath: import.meta.filename,
       historyPhysical: { count: 1, visible: true, persistedMessageID: 'unit-exact' }, historyGlobalOwnedGetCount: 0,
       UNIT: { label: UNIT_ONLY, importModule: async () => ({ runTelemetryChecks: async () => stock() }) } });
-    assert.deepEqual(calls, ['fresh', 'close']); assert.equal(result.classification.overhead_clearance, false);
-    assert.match(result.scope.telemetry, /not telemetry lifecycle physical-target proof/);
+    assert.deepEqual(calls, ['fresh', 'close']); assert.equal(result.receipt.classification.overhead_clearance, false);
+    assert.match(result.receipt.scope.telemetry, /not telemetry lifecycle physical-target proof/);
   } finally { f.cleanup(); }
 });
 test('UNIT ONLY module failure propagates and still closes fresh context', async () => {
@@ -96,11 +98,61 @@ test('UNIT ONLY module failure propagates and still closes fresh context', async
 });
 test('source stage remains after sealed physical history and before server stop; original history deadline unchanged', () => {
   const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
-  const stage = source.indexOf('result.joint_telemetry = await runJointTelemetryStage');
+  const stage = source.indexOf('const jointStage = await runJointTelemetryStage');
   const sealed = source.lastIndexOf('await recorder.sealAndDrain(); recorder.assertQualified();', stage);
   assert.ok(sealed > 0 && sealed < stage);
   assert.ok(source.indexOf("command({ command: 'stop' })", stage) > stage);
   assert.match(source, /let hardStop = setTimeout\(wallFailure, 170000\)/);
   assert.ok(source.indexOf('480000 - (performance.now() - deadlineStarted)') > sealed);
   assert.match(source.slice(stage), /harnessPath: fileURLToPath\(import.meta.url\)/);
+});
+
+function historyInventory() {
+  const report = { ...structuredClone(stock().trials[0].reports[0]), open_id: 'unit-history', correlations: [{ kind: 'request', id: 'unit-history' }] };
+  return { scope: 'UNIT_ONLY_original_history', errors: [], reports: [report], statuses: [{ open_id: report.open_id, status: 204 }],
+    requestRecords: [{ kind: 'request', open_id: report.open_id, trace_id: null }] };
+}
+const unitModule = {
+  captureReport: raw => JSON.parse(raw),
+  assertRequestCorrelation: (ids, report) => { for (const id of ids) assert.ok(report.correlations.some(c => c.kind === 'request' && c.id === id)); },
+  journeyExpectation: report => ({ open_id: report.open_id, expected: { 'browser.outcome': report.outcome,
+    ...Object.fromEntries(Object.entries(report.marks).map(([k, v]) => [`browser.${k}_ms`, v])) } }),
+};
+test('UNIT ONLY independently captured original history views join exact stock inventory without receiver output', () => {
+  const result = appendObservedHistory(stock(), historyInventory(), input().fixtures.identity, unitModule);
+  assert.equal(result.journeys.length, 2); assert.equal(result.additional_history.reports, 1);
+  assert.deepEqual(result.trials.at(-1).reports.map(r => r.open_id), ['unit-history']);
+});
+for (const [name, mutate] of Object.entries({
+  missing_capture_status: i => { i.statuses = []; },
+  unexpected_export_without_browser_report: i => { i.reports = []; },
+  missing_request: i => { i.requestRecords = []; },
+  foreign_request_correlation: i => { i.reports[0].correlations[0].id = 'foreign'; },
+  unobserved_trace_correlation: i => { i.reports[0].correlations.push({ kind: 'trace', id: 'f'.repeat(32) }); },
+  duplicate_original_report: i => { i.reports.push(structuredClone(i.reports[0])); i.statuses.push({ ...i.statuses[0] }); },
+  observer_failed: i => { i.errors.push('UNIT capture failure'); },
+  duplicate_stock_identity: i => { i.reports[0].open_id = 'unit-ready'; },
+  rejected_collector: i => { i.statuses[0].status = 400; },
+})) test(`original history inventory rejects ${name} (UNIT ONLY)`, () => {
+  const i = historyInventory(); mutate(i); assert.throws(() => appendObservedHistory(stock(), i, input().fixtures.identity, unitModule));
+});
+test('UNIT ONLY late report capture retains raw body/response and independent header trace provenance', () => {
+  const page = new EventEmitter(), capture = installObservedHistoryTelemetry(page, 'http://127.0.0.1:12345');
+  const request = { method: () => 'GET', url: () => 'http://127.0.0.1:12345/api/product-conversations/unit?open_id=unit-history' };
+  page.emit('request', request);
+  page.emit('response', { request: () => request, status: () => 200, headers: () => ({ traceparent: '00-' + 'a'.repeat(32) + '-' + 'b'.repeat(16) + '-01' }) });
+  assert.equal(capture.snapshot().reports.length, 0);
+  const report = historyInventory().reports[0], post = { method: () => 'POST', url: () => 'http://127.0.0.1:12345/api/telemetry/conversation-view', postData: () => JSON.stringify(report) };
+  page.emit('request', post); page.emit('response', { request: () => post, status: () => 204, headers: () => ({}) });
+  const retained = capture.snapshot(); assert.equal(retained.requestRecords[0].trace_id, 'a'.repeat(32));
+  assert.deepEqual(retained.reports, [report]); assert.equal(retained.statuses[0].status, 204);
+  appendObservedHistory(stock(), retained, input().fixtures.identity, unitModule);
+});
+test('source observer precedes first history navigation and union follows browser close before server stop', () => {
+  const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  assert.ok(source.indexOf('historyTelemetry = installObservedHistoryTelemetry(page, ui)') < source.indexOf('await page.goto('));
+  const closed = source.indexOf('await browser.close(); browser = undefined;');
+  const union = source.indexOf('finalizeHistoryTelemetry(inventory)', closed);
+  const stopped = source.indexOf("command({ command: 'stop' })", union);
+  assert.ok(closed > 0 && closed < union && union < stopped);
 });

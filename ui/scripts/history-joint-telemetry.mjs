@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = 'c825370814d22f0e03faf72d18f37df97bb59329';
+export const APP_PIN = 'caa8138cad185530b4c5ddb17b5082502f21bb01';
 export const APP_BASE_PIN = '84fbebb0781067cbe843f61c53093dcc0f0d64f2';
 export const TELEMETRY_MODULE_SHA256 = 'd0a52f49d583ae55ede9320d6f2ef1bd581fdd2f17dff9f6f989e9a6f75adb83';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
@@ -120,12 +120,77 @@ export function validateTelemetryResult(result) {
   }));
 }
 
+export function installObservedHistoryTelemetry(page, baseURL) {
+  const origin = new URL(baseURL).origin, requests = [], reports = [], statuses = [], errors = [];
+  const postReports = new Map(), requestRecords = new Map();
+  page.on('request', request => {
+    try {
+      const url = new URL(request.url()); if (url.origin !== origin) return;
+      if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+        const raw = request.postData() ?? '';
+        assert.ok(Buffer.byteLength(raw) <= 8192 && reports.length < 7, 'history report capture bound');
+        const report = JSON.parse(raw); assert.equal(typeof report.open_id, 'string');
+        postReports.set(request, report); reports.push(report);
+      } else if (url.pathname.startsWith('/api/') && url.searchParams.has('open_id')) {
+        assert.ok(requests.length < 128, 'history correlated request capture bound');
+        assert.equal(url.searchParams.getAll('open_id').length, 1);
+        const record = { method: request.method(), url: request.url(), open_id: url.searchParams.get('open_id'),
+          kind: /\/api\/conversations\/[^/]+\/stream$/.test(url.pathname) ? 'sse' : 'request', trace_id: null };
+        requests.push(record); requestRecords.set(request, record);
+      }
+    } catch (error) { errors.push(String(error.message)); }
+  });
+  page.on('response', response => {
+    try {
+      const request = response.request();
+      if (postReports.has(request)) statuses.push({ open_id: postReports.get(request).open_id, status: response.status() });
+      const record = requestRecords.get(request);
+      if (record) {
+        const trace = response.headers().traceparent?.match(/^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$/i);
+        if (trace && !/^0{32}$/.test(trace[1]) && !/^0{16}$/.test(trace[2])) record.trace_id = trace[1].toLowerCase();
+      }
+    } catch (error) { errors.push(String(error.message)); }
+  });
+  return { snapshot() { return structuredClone({ scope: 'independently_captured_original_history_page_not_receiver_derived', reports, requestRecords: requests, statuses, errors }); } };
+}
+
+export function appendObservedHistory(result, inventory, identity, module) {
+  assert.deepEqual(inventory.errors, [], 'history report observer errors');
+  assert.equal(inventory.statuses.length, inventory.reports.length, 'history report response drain');
+  assert.ok(inventory.reports.length <= 7 && inventory.requestRecords.length <= 128);
+  const seen = new Set(result.journeys.map(journey => journey.open_id));
+  const added = [];
+  for (const report of inventory.reports) {
+    module.captureReport(JSON.stringify(report), result.forbidden ?? []);
+    assert.ok(!seen.has(report.open_id), 'history/module report identity must be unique'); seen.add(report.open_id);
+    const statuses = inventory.statuses.filter(status => status.open_id === report.open_id);
+    assert.equal(statuses.length, 1, 'every captured history report has one response');
+    assert.equal(statuses[0].status, 204, 'actual history collector acceptance');
+    const finite = inventory.requestRecords.filter(record => record.kind === 'request' && record.open_id === report.open_id);
+    assert.ok(finite.length > 0, 'history report needs independently observed finite request');
+    module.assertRequestCorrelation(finite.map(record => record.open_id), report);
+    for (const correlation of report.correlations) {
+      const observed = inventory.requestRecords.some(record => correlation.kind === 'trace'
+        ? record.trace_id === correlation.id : record.kind === correlation.kind && record.open_id === correlation.id);
+      assert.ok(observed, 'history report correlation must have independent request/response provenance');
+    }
+    added.push(module.journeyExpectation(report, identity));
+  }
+  assert.ok(result.journeys.length + added.length <= 64, 'complete history/module inventory bound');
+  result.journeys.push(...added);
+  result.trials.push({ ...inventory, status: 'observed_history_inventory', sampled: inventory.reports.length > 0 });
+  result.additional_history = { reports: inventory.reports.length, scope: inventory.scope };
+  validateTelemetryResult(result);
+  return result;
+}
+
 export async function runJointTelemetryStage({ config, browser, baseURL, outputDir, historyPhysical, harnessPath, historyGlobalOwnedGetCount, UNIT }) {
   if (config === null) return null;
   assert.equal(config.unitOnly, UNIT !== undefined, 'UNIT dependency injection cannot become fixture proof');
   if (UNIT) assert.equal(UNIT.label, UNIT_LABEL);
   assert.ok(historyPhysical?.count === 1 && historyPhysical.visible === true && historyPhysical.persistedMessageID,
     'independent sealed history physical target receipt required');
+  if (!config.unitOnly) assert.equal(sha256(readFileSync(config.modulePath)), config.moduleHash, 'module changed before runtime import');
   const load = UNIT?.importModule ?? (url => import(url));
   const module = await load(pathToFileURL(config.modulePath).href);
   assert.equal(typeof module.runTelemetryChecks, 'function', 'installed telemetry module export required');
@@ -135,7 +200,9 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
     const result = await module.runTelemetryChecks({ page, context, baseURL,
       serviceName: config.input.serviceName, runId: config.input.runId, outputDir: resolve(outputDir, 'telemetry'), fixtures: config.input.fixtures });
     const readyReportOracle = validateTelemetryResult(result);
-    return { status: 'passed_assertions', imported_source: config.modulePath, imported_sha256: config.moduleHash,
+    const receipt = { status: 'passed_assertions', imported_source: config.modulePath, imported_sha256: config.moduleHash,
+      evidence_class: config.unitOnly ? 'UNIT_ONLY_not_runtime' : 'joint_runtime_source_receipt_pending_final_drain',
+      helper_source: fileURLToPath(import.meta.url), helper_sha256: sha256(readFileSync(fileURLToPath(import.meta.url))),
       app_pin: APP_PIN, app_base_pin: APP_BASE_PIN, harness_path: resolve(harnessPath),
       generated_fixtures: config.input, history_physical: historyPhysical,
       scope: { history_physical: 'sealed original history page exact persisted target',
@@ -143,6 +210,13 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
       classification: { stock_acceptance: result.acceptance, overhead_clearance: false,
         history_global_cache_zero_get_is_history_evidence_not_telemetry_cold_start: historyGlobalOwnedGetCount === 0 },
       ready_report_oracle: readyReportOracle };
+    let finalized = false;
+    return { receipt, finalizeHistory(inventory) {
+      assert.equal(finalized, false, 'history inventory finalizes once after browser closure'); finalized = true;
+      appendObservedHistory(result, inventory, config.input.fixtures.identity, module);
+      writeFileSync(resolve(outputDir, 'telemetry/telemetry-browser-result.json'), JSON.stringify(result, null, 2));
+      receipt.additional_history = result.additional_history;
+    } };
   } finally { await context.close(); }
 }
 
