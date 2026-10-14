@@ -129,7 +129,7 @@ describe('parseEvent', () => {
       context_window_size: 0,
       project_name: null,
       pending_anchor_sequence_id: 0,
-      pending_events: [],
+      opening: null, pending_events: [],
       pending_truncated: false,
     };
 
@@ -244,7 +244,7 @@ describe('parseEvent', () => {
       const { dispatch, actions } = mockDispatch();
       const res = parseEvent(
         SseMessageDataSchema,
-        makeEvent({ sequence_id: 5, message: goodMsg }),
+        makeEvent({ opening: null, sequence_id: 5, message: goodMsg }),
         'message',
         dispatch,
       );
@@ -257,7 +257,7 @@ describe('parseEvent', () => {
       expect(_origin).toEqual({ kind: 'unknown_historical' });
       inProdMode(() => {
         const { dispatch } = mockDispatch();
-        expect(parseEvent(SseMessageDataSchema, makeEvent({ sequence_id: 5, message: withoutOrigin }), 'message', dispatch).ok).toBe(false);
+        expect(parseEvent(SseMessageDataSchema, makeEvent({ opening: null, sequence_id: 5, message: withoutOrigin }), 'message', dispatch).ok).toBe(false);
       });
     });
 
@@ -274,7 +274,7 @@ describe('parseEvent', () => {
         const res = parseEvent(
           SseMessageDataSchema,
           makeEvent({
-            sequence_id: 5,
+            opening: null, sequence_id: 5,
             message: { ...goodMsg, sequence_id: '5' },
           }),
           'message',
@@ -306,7 +306,7 @@ describe('parseEvent', () => {
         const res = parseEvent(
           SseMessageDataSchema,
           makeEvent({
-            sequence_id: 5,
+            opening: null, sequence_id: 5,
             message: { ...goodMsg, message_type: 'wizard' },
           }),
           'message',
@@ -324,7 +324,7 @@ describe('parseEvent', () => {
         delete rest['message_id'];
         const res = parseEvent(
           SseMessageDataSchema,
-          makeEvent({ sequence_id: 5, message: rest }),
+          makeEvent({ opening: null, sequence_id: 5, message: rest }),
           'message',
           dispatch,
         );
@@ -350,7 +350,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseMessageUpdatedDataSchema,
         makeEvent({
-          sequence_id: 7,
+          opening: null, sequence_id: 7,
           message_id: 'msg-1',
           transcript_generation: 3,
           display_data: { type: 'subagent_summary' },
@@ -368,7 +368,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseMessageUpdatedDataSchema,
         makeEvent({
-          sequence_id: 8,
+          opening: null, sequence_id: 8,
           message_id: 'msg-tool',
           transcript_generation: 4,
           display_data: null,
@@ -387,7 +387,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseMessageUpdatedDataSchema,
         makeEvent({
-          sequence_id: 9,
+          opening: null, sequence_id: 9,
           message_id: 'msg-subagent',
           transcript_generation: 5,
           display_data: { type: 'subagent_summary' },
@@ -433,7 +433,7 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseMessageUpdatedDataSchema,
-          makeEvent({ sequence_id: 7, message_id: 'msg-1', display_data: { type: 'x' } }),
+          makeEvent({ opening: null, sequence_id: 7, message_id: 'msg-1', display_data: { type: 'x' } }),
           'message_updated',
           dispatch,
         );
@@ -744,7 +744,7 @@ describe('parseEvent', () => {
       const res = parseEvent(
         SseErrorDataSchema,
         makeEvent({
-          sequence_id: 8,
+          opening: null, sequence_id: 8,
           message: 'rate limited',
           error: { title: 'Rate limited', detail: 'retry', kind: 'retryable' },
         }),

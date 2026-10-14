@@ -24,6 +24,7 @@ import type { ChainSseWireEvent } from './generated/ChainSseWireEvent';
 // required fields are present and typed correctly.
 
 import * as v from 'valibot';
+import { ContinuationOpeningSchema } from './conversation/opening';
 import type { ErrorKind as WireErrorKind } from './generated/sse';
 import type { Conversation, InputOrigin, Message, QueuedSteeringMessage } from './api';
 // Generated wire types — aliased so we can reuse the short `Sse*Data`
@@ -197,6 +198,7 @@ export const QueuedSteeringMessageSchema = v.pipe(
  *  02677 tightened this field from the previously-optional schema shape
  *  after the generated type surfaced the actual wire contract. */
 export const SseInitDataSchema = v.looseObject({
+  opening: v.nullable(ContinuationOpeningSchema),
   sequence_id: v.number(),
   conversation: ConversationSchema,
   transcript_generation: v.number(),
@@ -233,6 +235,7 @@ export const SseInitDataSchema = v.looseObject({
  *  in `src/runtime.rs`). The reducer uses the envelope id for ordering and
  *  the message id for identity-based defense-in-depth dedup. */
 export const SseMessageDataSchema = v.looseObject({
+  opening: v.nullable(ContinuationOpeningSchema),
   sequence_id: v.number(),
   message: MessageSchema,
 }) satisfies v.GenericSchema<unknown, WireMessageData>;
@@ -244,6 +247,7 @@ export const SseMessageDataSchema = v.looseObject({
  *  all other paths. `sequence_id` is the envelope id; the persisted
  *  `message.sequence_id` is immutable and not repeated here. */
 export const SseMessageUpdatedDataSchema = v.looseObject({
+  opening: v.nullable(ContinuationOpeningSchema),
   sequence_id: v.number(),
   message_id: v.string(),
   transcript_generation: v.nullable(v.number()),

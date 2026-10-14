@@ -1189,13 +1189,55 @@ impl AdmittedPublication<'_> {
     pub(crate) fn persisted_message(self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.broadcaster.observe_seq(seq);
-        self.send(SseEvent::Message { message }, seq, RingOp::Anchor)
+        self.send(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Anchor,
+        )
+    }
+
+    pub(crate) async fn persisted_opening_message<S: traits::MessageStore + ?Sized>(
+        self,
+        storage: &S,
+        message: crate::db::Message,
+    ) -> Result<usize, String> {
+        let opening = match storage
+            .read_message_continuation_opening(&message.message_id)
+            .await
+        {
+            Ok(opening) => opening.map(crate::api::ContinuationOpeningView::from),
+            Err(error) => {
+                tracing::error!(message_id = %message.message_id, %error, "committed opening projection read failed");
+                let _ = self.event(|sequence_id| SseEvent::Error {
+                    sequence_id,
+                    error: user_facing_error::UserFacingError::with_action(
+                        "read the committed continuation opening",
+                    ),
+                });
+                return Err(error);
+            }
+        };
+        let seq = message.sequence_id;
+        self.broadcaster.observe_seq(seq);
+        Ok(self
+            .send(SseEvent::Message { message, opening }, seq, RingOp::Anchor)
+            .unwrap_or(0))
     }
 
     pub(crate) fn assistant_message(self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.broadcaster.observe_seq(seq);
-        self.send(SseEvent::Message { message }, seq, RingOp::Append)
+        self.send(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Append,
+        )
     }
 
     pub(crate) fn message_updated(
@@ -1208,6 +1250,7 @@ impl AdmittedPublication<'_> {
         let seq = self.broadcaster.next_seq();
         self.send(
             SseEvent::MessageUpdated {
+                opening: None,
                 sequence_id: seq,
                 message_id,
                 transcript_generation,
@@ -1607,7 +1650,14 @@ impl SseBroadcaster {
     pub fn send_persisted_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Anchor)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Anchor,
+        )
     }
 
     /// Backward-compatible alias for [`SseBroadcaster::send_persisted_message`].
@@ -1634,7 +1684,14 @@ impl SseBroadcaster {
     pub fn send_ephemeral_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Append)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Append,
+        )
     }
 
     pub(crate) fn admitted_publication<'a>(
@@ -2001,6 +2058,7 @@ pub enum SseEvent {
         /// renders the DB snapshot and waits for the next live event to
         /// repopulate the in-flight UI.
         pending_truncated: bool,
+        opening: Option<crate::api::ContinuationOpeningView>,
     },
     /// A newly-persisted message joins the conversation. Uses `message.sequence_id`
     /// as its envelope `sequence_id` — no separate field needed because
@@ -2008,12 +2066,14 @@ pub enum SseEvent {
     /// [`SseBroadcaster::send_message`], folds into the broadcaster's counter.
     Message {
         message: crate::db::Message,
+        opening: Option<crate::api::ContinuationOpeningView>,
     },
     /// An existing message's mutable fields changed. Carries only the delta —
     /// `message_id` is the target; `sequence_id` is the envelope id used by
     /// the client reducer for dedup (task 02675). The message's persistent
     /// `sequence_id` is immutable and not repeated here.
     MessageUpdated {
+        opening: Option<crate::api::ContinuationOpeningView>,
         sequence_id: i64,
         message_id: String,
         /// Conversation transcript generation after a persisted mutation commits.
@@ -6627,6 +6687,11 @@ impl RuntimeManager {
             ));
         };
 
+        #[cfg(test)]
+        crate::opening_qualifier::before_reserved_message(&self.db, conversation_id, message_id)
+            .await
+            .map_err(SteeringAdmissionError::Internal)?;
+
         // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
             text: text.clone(),
@@ -7899,11 +7964,11 @@ mod broadcaster_tests {
 
         assert!(matches!(
             first,
-            SseEvent::Message { ref message } if message.message_id == "reserved-1"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-1"
         ));
         assert!(matches!(
             second,
-            SseEvent::Message { ref message } if message.message_id == "reserved-2"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-2"
         ));
         assert!(matches!(
             queued,
@@ -7948,7 +8013,7 @@ mod broadcaster_tests {
 
         assert!(matches!(
             rx.try_recv().expect("reserved message arrives first"),
-            SseEvent::Message { ref message }
+            SseEvent::Message { ref message, .. }
                 if message.message_id == "persisted" && message.sequence_id == 43
         ));
         assert!(matches!(
@@ -8220,7 +8285,7 @@ mod broadcaster_tests {
         assert_eq!(highest, 3, "highest_seq covers the eager message at seq 3");
         assert_eq!(events.len(), 2, "token + eager message both in ring");
         match &events[1] {
-            SseEvent::Message { message } => assert_eq!(message.message_id, "eager"),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, "eager"),
             other => panic!("expected Message, got {other:?}"),
         }
     }
@@ -10609,6 +10674,86 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn committed_opening_publication_carries_receipt_without_aggregate_get() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation(
+                "opening-publication",
+                "opening-publication",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let boundary = crate::db::MessageContent::Continuation(crate::db::ContinuationContent {
+            summary: "exact context".into(),
+        });
+        db.add_message("live-boundary", &root.id, &boundary, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "exact context".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let (outcome, _) = db
+            .continue_conversation_with_intent(
+                &root.id,
+                crate::db::NewContinuationDispatchIntent::generated_predecessor_context(
+                    phoenix_workflow::ClientTurnKey::try_from("live-key").unwrap(),
+                    "exact context".into(),
+                ),
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected successor")
+        };
+        let message = db
+            .add_message(
+                &format!("{}:live-key", successor.id),
+                &successor.id,
+                &boundary,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let storage = traits::DatabaseStorage::new(db);
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut receiver = broadcaster.subscribe();
+        let mut admitted = fence.try_acquire().unwrap();
+        broadcaster
+            .admitted_publication(&mut admitted)
+            .persisted_opening_message(&storage, message.clone())
+            .await
+            .unwrap();
+        let event = receiver.try_recv().unwrap();
+        let crate::api::wire::SseWireEvent::Message {
+            sequence_id,
+            opening: Some(opening),
+            ..
+        } = event.into()
+        else {
+            panic!("missing committed opening observation")
+        };
+        assert_eq!(sequence_id, message.sequence_id);
+        let json = serde_json::to_value(opening).unwrap();
+        assert_eq!(json["status"], "accepted");
+        assert_eq!(json["accepted_message_id"], message.message_id);
+        assert_eq!(json["presentation"], "boundary");
+        assert_eq!(json["edge"]["continuation_message_id"], "live-boundary");
+        assert!(json.get("summary").is_none());
+    }
+
+    #[tokio::test]
     async fn queued_admitted_assistant_retains_owner_until_reserved_range_release() {
         let fence = FatalLocalAuthorityFence::new();
         let broadcaster =
@@ -10648,7 +10793,7 @@ mod scope_liveness_tests {
         drop(reservation);
 
         assert!(
-            matches!(receiver.try_recv(), Ok(SseEvent::Message { message }) if message.sequence_id == queued_seq)
+            matches!(receiver.try_recv(), Ok(SseEvent::Message { message, .. }) if message.sequence_id == queued_seq)
         );
         assert_eq!(fence.owner_count(), 0);
     }
@@ -10719,7 +10864,7 @@ mod scope_liveness_tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(SseEvent::Message { message }) if message.sequence_id == admitted_seq
+            Ok(SseEvent::Message { message, .. }) if message.sequence_id == admitted_seq
         ));
         assert_eq!(fence.owner_count(), 0);
     }
@@ -11054,7 +11199,9 @@ mod scope_liveness_tests {
             .expect("enqueue reaches the replacement runtime");
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let SseEvent::Message { message } = events.recv().await.expect("runtime event") {
+                if let SseEvent::Message { message, .. } =
+                    events.recv().await.expect("runtime event")
+                {
                     if message.message_id == "survives-eviction" {
                         break;
                     }
@@ -12082,7 +12229,8 @@ mod scope_liveness_tests {
         .await
         .expect("persist and broadcast marker");
 
-        let SseEvent::Message { message } = receiver.try_recv().expect("message broadcast") else {
+        let SseEvent::Message { message, .. } = receiver.try_recv().expect("message broadcast")
+        else {
             panic!("expected persisted message event");
         };
         let persisted = mgr

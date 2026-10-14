@@ -24,10 +24,9 @@ import {
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
-  type HistoryScrollCommand,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
-import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { transcriptPositioningCommandKey, transcriptPositioningInputFromHistoryExpansion, type TranscriptPositioningCompletion } from '../conversation/transcriptPositioning';
 import { transcriptCoverageAfterInit } from '../conversation/atom';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import {
@@ -1149,14 +1148,16 @@ function ConversationPageContent({
     }
   }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessagesForIntent]);
 
-  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => {
+  const handleHistoryScrollCommand = useCallback((completion: TranscriptPositioningCompletion) => {
+    const command = historyExpansion.pendingCommand;
+    if (!command || transcriptPositioningCommandKey(command) !== completion.commandKey) return;
     dispatchHistoryExpansion({
       type: 'command_acknowledged',
-      commandToken: token,
-      view,
-      result,
+      commandToken: command.token,
+      view: command.view,
+      result: completion.result,
     });
-  }, []);
+  }, [historyExpansion.pendingCommand]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {

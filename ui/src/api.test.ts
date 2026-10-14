@@ -459,7 +459,7 @@ describe('conversation message history clients', () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => ({ segments: [], has_older: false, before: null }),
+      json: async () => ({ latest_opening: { status: 'none' }, segments: [], has_older: false, before: null }),
     } as unknown as Response);
 
     await api.getProductConversationSnapshot('pc-1', { message_limit: 100, before: 'cursor-1' });

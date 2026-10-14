@@ -2,6 +2,8 @@ import { useMemo } from 'react';
 import { PillStrip } from './PillStrip';
 import type { PillItem } from './PillStrip';
 import type { Chapter } from '../conversation/conversationChapters';
+import type { ConversationHistoryBoundaryView } from '../generated/ConversationHistoryBoundaryView';
+import './ConversationNav.css';
 import { inputOriginPresentation } from '../conversation/inputOriginPresentation';
 
 const PROSE_TITLE = 'Assistant';
@@ -11,12 +13,12 @@ interface ConversationNavProps {
    *  order. Derived by `buildConversationChapters` from the same
    *  `historicalUnits` array MessageList feeds to VirtualTranscript. */
   chapters: Chapter[];
+  historyBoundaries?: ConversationHistoryBoundaryView[] | undefined;
+  onJumpBoundary?: ((messageId: string) => void) | undefined;
   /** `unitIndex` of the chapter currently in view (scroll-spy), or null when
    *  none is resolved. Applies the active pill styling. */
   activeUnitIndex: number | null;
-  /** Jump the message list to the chapter's render unit. Wired to
-   *  `MessageListHandle.scrollToUnitIndex`. */
-  onJump: (unitIndex: number) => void;
+  onJump: (chapter: Chapter) => void;
 }
 
 /**
@@ -26,30 +28,54 @@ interface ConversationNavProps {
  * jumps the virtualized message list to that unit, and the scroll-spy
  * highlights the chapter currently in view.
  */
-export function ConversationNav({ chapters, activeUnitIndex, onJump }: ConversationNavProps) {
+export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoundaries, onJumpBoundary }: ConversationNavProps) {
   // Memoize on the chapter list + active index so the mapped `items` array is
   // referentially stable across the parent's unrelated re-renders (streaming
   // token churn, heartbeat) — this avoids rebuilding the pill list and
   // re-running PillStrip's per-`items` effects when neither the chapters nor
   // the active index changed.
+  const orderByKey = useMemo(() => {
+    const ordinals = new Map<string, number>();
+    const order = new Map<string, number>();
+    for (const boundary of historyBoundaries ?? []) {
+      ordinals.set(boundary.predecessor_transcript_row_id, boundary.segment_ordinal);
+      ordinals.set(boundary.successor_transcript_row_id, boundary.segment_ordinal + 1);
+      order.set(boundary.message_id, boundary.segment_ordinal * 2 + 1);
+    }
+    for (const chapter of chapters) {
+      if (chapter.kind === 'boundary' || chapter.target.kind === 'pending') continue;
+      const ordinal = chapter.target.transcriptId ? ordinals.get(chapter.target.transcriptId) : undefined;
+      if (ordinal !== undefined) order.set(chapter.target.messageId, ordinal * 2);
+    }
+    return order;
+  }, [chapters, historyBoundaries]);
   const items: PillItem[] = useMemo(
-    () =>
-      chapters.map((chapter) => {
+    () => [
+      ...(historyBoundaries ?? []).filter((boundary) => !chapters.some((chapter) => chapter.kind === 'boundary' && chapter.messageId === boundary.message_id)).map((boundary): PillItem => ({
+        key: boundary.message_id,
+        label: `Context ${boundary.segment_ordinal + 1} · load`,
+        className: 'boundary',
+        ariaLabel: `Load context boundary ${boundary.segment_ordinal + 1}`,
+        onClick: () => onJumpBoundary?.(boundary.message_id),
+      })),
+      ...chapters.map((chapter) => {
         const isActive = chapter.unitIndex === activeUnitIndex;
         const origin = chapter.kind === 'prompt' ? inputOriginPresentation(chapter.origin) : null;
         return {
-          key: `chapter-${chapter.unitIndex}`,
+          key: chapter.kind === 'boundary' ? chapter.messageId : chapter.target.kind === 'persisted' ? chapter.target.messageId : `pending-${chapter.unitIndex}`,
           label: origin && origin.className === 'meta' ? `${origin.label} · ${chapter.label}` : chapter.label,
           active: isActive,
-          className: chapter.kind === 'prose' ? 'assistant' : origin?.className,
-          ariaLabel: `${origin?.title ?? PROSE_TITLE}: ${chapter.label}`,
-          onClick: () => onJump(chapter.unitIndex),
+          className: chapter.kind === 'boundary' ? 'boundary' : chapter.kind === 'prose' ? 'assistant' : origin?.className,
+          ariaLabel: chapter.kind === 'boundary' ? `Context boundary ${(historyBoundaries?.find(boundary => boundary.message_id === chapter.messageId)?.segment_ordinal ?? chapters.filter(candidate => candidate.kind === 'boundary' && candidate.unitIndex < chapter.unitIndex).length) + 1}` : `${origin?.title ?? PROSE_TITLE}: ${chapter.label}`,
+          onClick: () => chapter.kind === 'boundary' && chapter.messageId && onJumpBoundary
+            ? onJumpBoundary(chapter.messageId) : onJump(chapter),
         };
       }),
-    [chapters, activeUnitIndex, onJump],
+    ].sort((left, right) => (orderByKey.get(left.key) ?? Number.MAX_SAFE_INTEGER) - (orderByKey.get(right.key) ?? Number.MAX_SAFE_INTEGER)),
+    [chapters, activeUnitIndex, onJump, historyBoundaries, onJumpBoundary, orderByKey],
   );
 
-  if (chapters.length === 0) {
+  if (items.length === 0) {
     return null;
   }
 

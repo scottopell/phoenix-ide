@@ -47,7 +47,7 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
   return {
     conversation: testConversation,
     messages: [],
-    steeringMessages: [],
+    opening: null, steeringMessages: [],
     phase: { type: 'idle' },
     contextWindow: { used: 1000 },
     transcriptGeneration: 1,
@@ -471,7 +471,7 @@ describe('conversationReducer', () => {
       expect(atom.messages).toHaveLength(1);
 
       for (const seq of [96, 97, 98, 99, 100]) {
-        atom = dispatch(atom, { type: 'sse_message', message: makeMessage(seq), sequenceId: seq });
+        atom = dispatch(atom, { type: 'sse_message', opening: null, message: makeMessage(seq), sequenceId: seq });
       }
 
       expect(atom.messages).toHaveLength(6);
@@ -541,7 +541,7 @@ describe('conversationReducer', () => {
         type: 'sse_init',
         payload: makeInitPayload({
           messages: [delivered],
-          steeringMessages: [steeringMessage, { ...steeringMessage, message_id: 'already-delivered' }],
+          opening: null, steeringMessages: [steeringMessage, { ...steeringMessage, message_id: 'already-delivered' }],
         }),
       });
 
@@ -553,7 +553,7 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         conversationId: 'conv-1',
         conversation: testConversation,
-        steeringMessages: [steeringMessage],
+        opening: null, steeringMessages: [steeringMessage],
       };
       const delivered = { ...makeMessage(8, 'user'), message_id: steeringMessage.message_id };
 
@@ -590,7 +590,7 @@ describe('conversationReducer', () => {
       expect(atom.steeringMessages[0]?.text).toBe('authoritative replacement');
 
       atom = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         sequenceId: 6,
         message: { ...makeMessage(6, 'user'), message_id: 'steer-1' },
       });
@@ -614,7 +614,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         conversationId: 'conv-1',
-        steeringMessages: [steeringMessage],
+        opening: null, steeringMessages: [steeringMessage],
       };
 
       const cancelled = dispatch(atom, {
@@ -639,14 +639,14 @@ describe('conversationReducer', () => {
         conversationId: testConversation.id,
         conversation: testConversation,
         lastAppliedEventSeq: 5,
-        steeringMessages: [steeringMessage],
+        opening: null, steeringMessages: [steeringMessage],
       };
       const atom = dispatch(beforeReconnect, {
         type: 'sse_init',
         payload: makeInitPayload({
           lastAppliedEventSeq: 5,
           pendingAnchorSequenceId: 5,
-          steeringMessages: [],
+          opening: null, steeringMessages: [],
         }),
       });
 
@@ -682,7 +682,7 @@ describe('conversationReducer', () => {
       };
     }
     function messageEntry(seq: number, msg: Message): unknown {
-      return { type: 'message', sequence_id: seq, message: msg };
+      return { type: 'message', opening: null, sequence_id: seq, message: msg };
     }
     it('fresh connect with pending tokens rebuilds streamingBuffer', () => {
       const payload = makeInitPayload({
@@ -784,7 +784,7 @@ describe('conversationReducer', () => {
       };
 
       const pending = dispatch(seeded, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 11,
         messageId: 'late-msg',
         displayData: { type: 'patched-from-ring' },
@@ -822,7 +822,7 @@ describe('conversationReducer', () => {
       });
 
       const delivered = dispatch(drained, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         sequenceId: 14,
         message: { ...makeMessage(2), message_id: 'late-msg', display_data: { existing: true } as Record<string, unknown> },
       });
@@ -1049,7 +1049,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 9 };
       const msg = makeMessage(10);
 
-      const next = dispatch(atom, { type: 'sse_message', message: msg, sequenceId: 10 });
+      const next = dispatch(atom, { type: 'sse_message', opening: null, message: msg, sequenceId: 10 });
 
       expect(next.messages).toHaveLength(1);
       expect(next.lastAppliedEventSeq).toBe(10);
@@ -1059,7 +1059,7 @@ describe('conversationReducer', () => {
       const existing = makeMessage(10, { content: [{ type: 'text', text: 'persisted' }] });
       const atom: ConversationAtom = { ...createInitialAtom(), messages: [existing], lastAppliedEventSeq: 9 };
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         sequenceId: 10,
         message: { ...existing, content: [{ type: 'text', text: 'replayed duplicate' }] },
       });
@@ -1075,7 +1075,7 @@ describe('conversationReducer', () => {
       };
 
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message: makeMessage(10),
         sequenceId: 10,
       });
@@ -1087,7 +1087,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 100 };
 
       const buffered = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message: makeMessage(501),
         sequenceId: 501,
       });
@@ -1126,7 +1126,7 @@ describe('conversationReducer', () => {
       // Same message_id, but only the next contiguous event is admissible.
       const duplicateWithFreshSeq: Message = { ...original, sequence_id: 6 };
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message: duplicateWithFreshSeq,
         sequenceId: 6,
       });
@@ -1143,7 +1143,7 @@ describe('conversationReducer', () => {
       };
 
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message: makeMessage(9),
         sequenceId: 9,
       });
@@ -1178,7 +1178,7 @@ describe('conversationReducer', () => {
       };
 
       const next = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 43,
         messageId: original.message_id,
         transcriptGeneration: 3,
@@ -1199,7 +1199,7 @@ describe('conversationReducer', () => {
       };
 
       const next = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 11,
         messageId: 'nonexistent-id',
         transcriptGeneration: 7,
@@ -1231,7 +1231,7 @@ describe('conversationReducer', () => {
 
       // Update only display_data, not content
       const next = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 11,
         messageId: original.message_id,
         transcriptGeneration: 8,
@@ -1257,7 +1257,7 @@ describe('conversationReducer', () => {
       };
 
       const once = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 11,
         messageId: original.message_id,
         transcriptGeneration: 9,
@@ -1265,7 +1265,7 @@ describe('conversationReducer', () => {
       });
       // Second delivery with the SAME sequenceId: the replay guard rejects it.
       const twice = dispatch(once, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 11,
         messageId: original.message_id,
         transcriptGeneration: 9,
@@ -1287,7 +1287,7 @@ describe('conversationReducer', () => {
       };
 
       const once = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 11,
         messageId: original.message_id,
         transcriptGeneration: 9,
@@ -1295,7 +1295,7 @@ describe('conversationReducer', () => {
       });
       // Second delivery with the SAME sequenceId: the replay guard rejects it.
       const twice = dispatch(once, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 11,
         messageId: original.message_id,
         transcriptGeneration: 9,
@@ -1322,7 +1322,7 @@ describe('conversationReducer', () => {
       }
 
       patched = dispatch(patched, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 25,
         messageId: 'late-msg',
         transcriptGeneration: 11,
@@ -1339,7 +1339,7 @@ describe('conversationReducer', () => {
       });
 
       const created = dispatch(patched, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         sequenceId: 26,
         message: {
           ...makeMessage(7),
@@ -1375,14 +1375,14 @@ describe('conversationReducer', () => {
       }
 
       withPending = dispatch(withPending, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 35,
         messageId: 'msg-stale',
         transcriptGeneration: 12,
         displayData: { type: 'newer' },
       });
       const created = dispatch(withPending, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         sequenceId: 36,
         message: {
           ...makeMessage(8),
@@ -1398,7 +1398,7 @@ describe('conversationReducer', () => {
       });
 
       const replayedCreate = dispatch(created, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         sequenceId: 37,
         message: {
           ...makeMessage(8),
@@ -1415,6 +1415,75 @@ describe('conversationReducer', () => {
       expect(withPending.transcriptGeneration).toBe(12);
     });
 
+    it.each(['live', 'fresh replay', 'reconnect replay'] as const)(
+      'keeps the generation fence while applying mixed opening and ordinary updates: %s',
+      (delivery) => {
+        const opening = makeMessage(1, { message_type: 'continuation', content: { summary: 'context' } });
+        const ordinary = makeMessage(2);
+        const openingContent = { summary: 'restored context' };
+        const ordinaryContent = { text: 'owed ordinary edit' };
+        const messages = [opening, ordinary];
+        const initial = dispatch(createInitialAtom(), {
+          type: 'sse_init',
+          payload: makeInitPayload({ messages, transcriptGeneration: 1, lastAppliedEventSeq: 20 }),
+        });
+        let next: ConversationAtom;
+        if (delivery === 'live') {
+          next = dispatch(initial, {
+            type: 'sse_message_updated', opening: null, sequenceId: 21, messageId: opening.message_id,
+            transcriptGeneration: 3, content: openingContent,
+          });
+          expect(next.transcriptGeneration).toBe(3);
+          next = dispatch(next, {
+            type: 'sse_message_updated', opening: null, sequenceId: 22, messageId: ordinary.message_id,
+            transcriptGeneration: 2, content: ordinaryContent, displayData: { owed: true },
+          });
+        } else {
+          next = dispatch(delivery === 'fresh replay' ? createInitialAtom() : initial, {
+            type: 'sse_init',
+            payload: makeInitPayload({
+              messages, transcriptGeneration: 3, pendingAnchorSequenceId: 20, lastAppliedEventSeq: 22,
+              pendingEvents: [
+                { type: 'message_updated', opening: null, sequence_id: 21, message_id: opening.message_id,
+                  transcript_generation: 3, content: openingContent, display_data: null },
+                { type: 'message_updated', opening: null, sequence_id: 22, message_id: ordinary.message_id,
+                  transcript_generation: 2, content: ordinaryContent, display_data: { owed: true } },
+              ],
+            }),
+          });
+        }
+        expect(next.transcriptGeneration).toBe(3);
+        expect(next.lastAppliedEventSeq).toBe(22);
+        expect(next.messages[0]!.content).toEqual(openingContent);
+        expect(next.messages[1]!.content).toEqual(ordinaryContent);
+        expect(next.messages[1]!.display_data).toEqual({ owed: true });
+        expect(next.eventGap).toBeNull();
+      },
+    );
+
+    it('does not regress generation for an unknown target or a lower-generation same-owner init', () => {
+      let next = dispatch(createInitialAtom(), {
+        type: 'sse_init', payload: makeInitPayload({ transcriptGeneration: 3, lastAppliedEventSeq: 20 }),
+      });
+      next = dispatch(next, {
+        type: 'sse_message_updated', opening: null, sequenceId: 21, messageId: 'not-yet-materialized',
+        transcriptGeneration: 2, content: { text: 'owed patch' },
+      });
+      expect(next.transcriptGeneration).toBe(3);
+      expect(next.pendingMessagePatches['not-yet-materialized']!.patches).toHaveLength(1);
+      next = dispatch(next, {
+        type: 'sse_init', payload: makeInitPayload({ transcriptGeneration: 2, lastAppliedEventSeq: 21 }),
+      });
+      expect(next.transcriptGeneration).toBe(3);
+      expect(next.lastAppliedEventSeq).toBe(21);
+      next = dispatch(next, {
+        type: 'sse_init', payload: makeInitPayload({
+          conversation: { ...testConversation, id: 'another-owner' }, transcriptGeneration: 1,
+        }),
+      });
+      expect(next.transcriptGeneration).toBe(1);
+    });
+
     it('replayed message_updated advances transcript generation', () => {
       const target = makeMessage(1);
       const payload = makeInitPayload({
@@ -1423,7 +1492,7 @@ describe('conversationReducer', () => {
         lastAppliedEventSeq: 12,
         pendingAnchorSequenceId: 11,
         pendingEvents: [{
-          type: 'message_updated',
+          type: 'message_updated', opening: null,
           sequence_id: 12,
           message_id: target.message_id,
           transcript_generation: 5,
@@ -1452,7 +1521,7 @@ describe('conversationReducer', () => {
       };
 
       const next = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 21,
         messageId: original.message_id,
         transcriptGeneration: 13,
@@ -1483,7 +1552,7 @@ describe('conversationReducer', () => {
 
       // Stale sequenceId — should be rejected
       const next = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 29,
         messageId: original.message_id,
         transcriptGeneration: 14,
@@ -1508,7 +1577,7 @@ describe('conversationReducer', () => {
       };
 
       const next = dispatch(atom, {
-        type: 'sse_message_updated',
+        type: 'sse_message_updated', opening: null,
         sequenceId: 31,
         messageId: original.message_id,
         displayData: { marker: 'keep', ephemeral: true },
@@ -2371,7 +2440,7 @@ describe('conversationReducer', () => {
     it('rejects stamped actions until connection_opened establishes their epoch', () => {
       const atom = createInitialAtom();
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message: makeMessage(1),
         sequenceId: 1,
         epoch: 1,
@@ -2389,7 +2458,7 @@ describe('conversationReducer', () => {
         connectionEpoch: 7,
       };
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message: makeMessage(100),
         sequenceId: 100,
         epoch: 5,
@@ -2405,7 +2474,7 @@ describe('conversationReducer', () => {
         connectionEpoch: 3,
       };
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message: makeMessage(1),
         sequenceId: 1,
         epoch: 3,
@@ -2430,7 +2499,7 @@ describe('conversationReducer', () => {
         created_at: '2024-01-01T00:00:00Z',
       };
       const next = dispatch(atom, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         message,
         sequenceId: 100,
         epoch: 5,
@@ -3059,7 +3128,7 @@ describe('bash tool progress', () => {
     expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('building');
 
     atom = conversationReducer(atom, {
-      type: 'sse_message',
+      type: 'sse_message', opening: null,
       sequenceId: 1,
       message: makeMessage(1, {
         message_type: 'tool',
@@ -3130,4 +3199,36 @@ it('applies replaceable bash progress without advancing the replay sequence floo
   });
   expect(atom.lastAppliedEventSeq).toBe(5);
   expect(atom.eventGap).toBeNull();
+});
+
+
+describe('typed continuation opening observations', () => {
+  const edge = { product_conversation_id: 'pc-1', predecessor_transcript_row_id: 'predecessor', successor_transcript_row_id: 'conv-1', continuation_message_id: 'boundary' };
+  const pending = { status: 'pending' as const, edge, client_turn_key: 'key', opening_authority: 'generated_predecessor_context' as const };
+  const accepted = { status: 'accepted' as const, edge, accepted_message_id: 'opening', opening_authority: pending.opening_authority, presentation: 'boundary' as const };
+  it('replays committed observations, preserves null hydration and rejects stale epochs and foreign successors', () => {
+    let atom = conversationReducer(createInitialAtom(), { type: 'sse_init', payload: makeInitPayload({ opening: pending, lastAppliedEventSeq: 1, pendingAnchorSequenceId: 0,
+      pendingEvents: [{ type: 'message', sequence_id: 1, message: makeMessage(1, { message_id: 'opening', origin: { kind: 'system_generated' } }), opening: accepted }] }) });
+    expect(atom.opening).toEqual(accepted);
+    atom = conversationReducer(atom, { type: 'sse_init', payload: makeInitPayload({ opening: null, lastAppliedEventSeq: 1 }) });
+    expect(atom.opening).toEqual(accepted);
+    atom = conversationReducer(atom, { type: 'sse_message_updated', sequenceId: 2, messageId: 'opening', opening: { ...accepted, presentation: 'separate_message' }, content: { text: 'Edited' } });
+    expect(atom.opening).toEqual({ ...accepted, presentation: 'separate_message' });
+    const oldEpoch = conversationReducer(atom, { type: 'sse_message_updated', epoch: -1, sequenceId: 3, messageId: 'opening', opening: accepted });
+    expect(oldEpoch.opening).toBe(atom.opening);
+    atom = conversationReducer(atom, { type: 'sse_message_updated', sequenceId: 3, messageId: 'opening', opening: { ...accepted, edge: { ...edge, successor_transcript_row_id: 'foreign' } } });
+    expect(atom.opening?.status === 'accepted' && atom.opening.presentation).toBe('separate_message');
+    atom = conversationReducer(atom, { type: 'sse_init', payload: makeInitPayload({ opening: pending, lastAppliedEventSeq: 3 }) });
+    expect(atom.opening?.status).toBe('accepted');
+  });
+  it('distinguishes null, none and a different reserved edge', () => {
+    let atom = conversationReducer(createInitialAtom(), { type: 'sse_init', payload: makeInitPayload({ opening: pending }) });
+    atom = conversationReducer(atom, { type: 'sse_init', payload: makeInitPayload({ opening: null }) });
+    expect(atom.opening).toEqual(pending);
+    atom = conversationReducer(atom, { type: 'sse_init', payload: makeInitPayload({ opening: { status: 'none' } }) });
+    expect(atom.opening).toEqual({ status: 'none' });
+    const different = { ...pending, edge: { ...edge, continuation_message_id: 'new-boundary' } };
+    atom = conversationReducer(atom, { type: 'sse_init', payload: makeInitPayload({ opening: different }) });
+    expect(atom.opening).toEqual(different);
+  });
 });

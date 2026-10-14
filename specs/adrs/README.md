@@ -113,8 +113,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [097](097_bounded-retrieval-reconciliation.md) | Bounded orphan pruning and terminal retrieval readiness | Accepted | REQ-RET-003 |
 | [098](098_retire-wake-execution-and-preserve-history.md) | Retire wake execution and preserve history | Accepted; supersedes wake execution obligations | REQ-WAKE-RETIRE-001–005; retired REQ-WAKE-001–018, REQ-DWF-WAKE-001–005, REQ-SA-009 |
 | [099](099_bounded-markdown-disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
-
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
+| [101](101_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
 
 ## For agents: which decisions bind your task
 
