@@ -99,12 +99,21 @@ Source implementation introduces an instance-owned singleton scope, explicit `co
 
 | Requirement | Verification status | Evidence surface |
 |---|---|---|
-| REQ-GR-016 | Qualification in progress | DB and startup tests authored; SQLite migration preservation/rollback probe passed; Rust tests not yet qualified. |
-| REQ-GR-017 | Qualification in progress | Real scoped-Bash/file-view E2E and UI grounding regressions; exact-head hosted results required. |
-| REQ-GR-018 | Documented operational contract | No automatic pruning/import; manual offline paired backup and deliberate owner file cleanup. |
+| REQ-GR-016 | Implemented; hosted qualification passed | DB/startup/continuation and prior-schema preservation/rollback tests; exact source `97f39d517` passed the hosted Rust lane. |
+| REQ-GR-017 | Implemented; hosted qualification passed | Real scoped Bash discovers its ID from system context, writes/reads files, continues/restarts and rediscovers; desktop/mobile grounding source and focused UI regressions; shared SVG/path containment regressions. |
+| REQ-GR-018 | Documented operational contract | No automatic pruning/import; manual offline paired backup and deliberate owner file cleanup; ordinary Close/Delete independence exercised in isolated E2E. |
 
 ### Backup, export and cleanup
 
 Conversation export exports transcripts, not home bytes. A DB-only deployment snapshot is not a Coordinator-file backup. To retain complete state, stop Phoenix; back up its SQLite database and `<resolved data_dir>/coordinator/` together; retain the configured location and permissions. Restore offline at the same configured canonical location, then restart and inspect startup validation. Do not change `PHOENIX_DATA_DIR` to silently relocate an existing binding. Missing bound directories or mismatches stop initialization; restore retained files deliberately rather than auto-create an empty replacement.
 
 Files persist until the owner deliberately deletes selected historical notes/evidence with explicit scope-targeted operations or an offline operator cleanup. Keep the home directory and binding. Full instance decommission is an explicit stopped-runtime database/data removal, not ordinary close/delete or a new cleanup API. No automatic recovery or cross-version restore guarantee is added; compatibility requirements govern.
+
+
+### Qualification record
+
+The implemented source at `97f39d517d4de299abd60023e040e5e486af3e05` passed [hosted CI 38509024448](https://github.com/scottopell/phoenix-ide/actions/runs/38509024448): Rust, actual codegen/stale guard, musl production-feature compile, Clippy, UI/specs, E2E and task validation. The same head passed [macOS 38509024546](https://github.com/scottopell/phoenix-ide/actions/runs/38509024546). [PR #910](https://github.com/scottopell/phoenix-ide/pull/910) holds final-head check state and review/failure evidence. Production integration/deployment is not implied.
+
+Independent frozen-source review plus cleanup/SVG/E2E review and subsequent exact-delta reviews found initial runtime-field, ownership-overlap and test-oracle defects; they were fixed and qualified. Reviews are bounded static evidence, not exhaustive proof. Lightweight isolated SQLite preservation/rollback checks and 15 focused UI regressions also passed. No generated TypeScript was hand-edited; hosted genuine codegen completed with a clean stale guard.
+
+Retained failed runs are linked in the delivery task and PR rather than treated as pending successes. Integration must reconcile the concurrent unmerged ADR-101 reservation against the actual main ledger while preserving both decisions; no forced renumbering is performed ahead of that integration. No merge/deploy admission has been granted by this delivery record.

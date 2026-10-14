@@ -69,3 +69,53 @@ All remaining federation five-tool/client/notes/provenance/navigation/acceptance
 ## Approval outcome
 
 Approval authorizes this dedicated local design/implementation/test/review delivery in an isolated checkout, not heavy-build admission, merge/deploy admission, or a claim that runtime/source changes already exist. Contract recovery and private-work request remain explicit first-step obligations.
+
+
+## Delivery record (supersedes proposal-time recovery/qualification status)
+
+### Source and contract recovery
+
+- Local implementation is [PR #910](https://github.com/scottopell/phoenix-ide/pull/910), on `work/coordinator-home-98020`, owned directly by Global. Source-qualified head: `97f39d517d4de299abd60023e040e5e486af3e05`. No merge or deployment performed.
+- The targeted private-work request was accepted as queued steering, then the owner replied with exact original design `4e67257292f09823d3ac76622c404c0021c57dcf`: federation REQ-FED-011 and directory/grounding portion of REQ-FED-012, CoordinatorExecution/CoordinatorContinues, commit-specific ADR-073. Original five-tool/client/peer-note/provenance/navigation/message acceptance and approved subscription scope remains federation-owned.
+- Owner's bounded retained search found no verified private home implementation/final interface; that is not a universal claim that none exists. No private writer was duplicated and dirty parent/owner source checkouts were not modified.
+- Local REQ-GR-016–018 and ADR-101 deliberately retain REQUIRED explicit `work_scope_id`, superseding the old implicit-default-target design. Shared relational scope/environment interfaces remain available to later federation integration.
+
+### Delivered behavior
+
+- One immutable instance-owned singleton relation and `CoordinatorHome` environment at `<resolved data_dir>/coordinator/`, independent of worker/product ownership, with zero-worker availability and stable attachment across continuation/restart.
+- Safe fresh/existing initialization and prior-schema migration, rollback and ownership constraints. Missing bound home, symlink replacement, configuration rebinding, worker-worktree overlap and invalid bindings fail explicitly; no destructive note migration or arbitrary cwd fallback.
+- Explicit scoped Bash and SVG resolution, trusted prompt metadata, concise optional historical note/evidence pointers and handoff lessons; no file scanning/automatic compaction ingestion. Coordinator process routing remains separate.
+- Desktop/mobile server-backed file grounding without fake Git/task/ordinary-retirement controls; canonical file-root validation is repeated per request.
+- Ordinary Close/Delete/cleanup and generic mode/cwd/task mutations cannot retire or rebind the home. Independent retention, deliberate owner file cleanup, transcript/database-only export exclusions and paired offline backup are documented. Development default data roots are worktree-isolated while explicit operator roots are honored.
+
+### Passed qualification
+
+- [CI 38509024448](https://github.com/scottopell/phoenix-ide/actions/runs/38509024448), exact source `97f39d517`: terminal SUCCESS, including Rust, actual codegen and clean stale guard, musl production-feature check, Clippy, UI/specs, E2E, task validation and worker-budget source validation.
+- [macOS 38509024546](https://github.com/scottopell/phoenix-ide/actions/runs/38509024546): terminal SUCCESS on the same source head.
+- Isolated real-binary E2E proves no ordinary bootstrap; ID discovery from actual Coordinator system context; explicit real Bash pwd/write; server list/read; continued successor retains scope/cwd; restart retains bytes and regenerates discoverable scope context; separate ordinary scope; ordinary Close then Delete leaves home/sentinel state intact; missing/unknown target rejection and outside-home read denial.
+- Focused local UI regressions: 15 passed, bounded to one Vitest worker using an existing pinned installation. Allium validation and spec-shape checks passed. SQLite exact migration probe passed preservation, raw-SQL ownership rejection, injected failure rollback/FK restoration/retry. These lightweight probes complement, not replace, hosted Rust/E2E.
+- Independent review froze full source range `07940b7ce..6133f330b`, with complementary cleanup/SVG/E2E review at the same head; later exact test/fixture/context-proof deltas were independently reviewed through `97f39d517`. Initial actionable findings were fixed; no confirmed remaining actionable defect within review coverage. Review limitations remain explicit; no exhaustive all-repository sign-off is claimed.
+
+### Retained failures and terminal follow-through
+
+Each failed head was retained and followed by a specific fix and fresh hosted run; no old pending check was treated as green:
+
+| Run | Disposition |
+|---|---|
+| [38502563670](https://github.com/scottopell/phoenix-ide/actions/runs/38502563670) | New enum error conversion/initial source qualification failures; fixed. |
+| [38503394396](https://github.com/scottopell/phoenix-ide/actions/runs/38503394396) | Additional exhaustive conversions, migration test lint and ADR ledger shape; fixed. |
+| [38503786122](https://github.com/scottopell/phoenix-ide/actions/runs/38503786122) | UI fixture signature, lint and E2E tool-message oracle; fixed. |
+| [38504323341](https://github.com/scottopell/phoenix-ide/actions/runs/38504323341) | Environment projection decoder omission; fixed. |
+| [38504717821](https://github.com/scottopell/phoenix-ide/actions/runs/38504717821) | Old raw-archive fixture contradicted new protected Coordinator shape; test preserved with guard assertion. Optional-field fixture and real Delete endpoint also fixed. |
+| [38505627949](https://github.com/scottopell/phoenix-ide/actions/runs/38505627949) | File-backed concurrent fixture omitted numbered migration setup; fixed to match server initialization. |
+| [38506534505](https://github.com/scottopell/phoenix-ide/actions/runs/38506534505) | Historical selective migration fixtures allowed unrelated new migration; skip ledgers maintained. |
+| [38507333107](https://github.com/scottopell/phoenix-ide/actions/runs/38507333107) | Sender-cache fixture attempted forbidden Coordinator deletion; cache regression strengthened using a closed-pool uncached failure instead. |
+| [38509024448](https://github.com/scottopell/phoenix-ide/actions/runs/38509024448) | Exact implemented source: all applicable hosted gates terminal SUCCESS. |
+
+### Remaining admission/integration seams (not implementation pairing blockers)
+
+- Global alone admits merge/deploy. Do not deploy from this task status or PR check result.
+- The remote/local owner independently verified a concurrent unmerged ADR-101 reservation (`101_web-history-selects-original-boundary-messages` in history `904d4`). Neither is assumed landed. Reconcile actual main ledger once at integration, preserving both decisions; do not preemptively churn numbering/builds or drop federation acceptance.
+- Source/test changes after the qualified head require fresh exact-head qualification. This delivery record/status update changes no source/tests; final record-head CI and PR disposition are reported through checkable PR evidence.
+- Workflow TODO: a supposedly lightweight local `dev.py check` lane invocation unexpectedly ran a nested Cargo build through unconditional check dependencies. It was identified and terminated, including only this checkout's compiler children; no local heavy-build success is claimed or used as admission evidence. Future local heavy validation still requires actual self-service admission. Investigate disclosure/admission of that dependency outside this local product delivery.
+- Quiet updates are not passive coordination; delegation is not execution; fresh runtime/source/test evidence supersedes stale pending claims; blockers remain visible and waits have concrete supported triggers. Filesystem notes never automatically populate compaction.
