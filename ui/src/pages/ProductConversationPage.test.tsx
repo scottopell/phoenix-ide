@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { StrictMode, useEffect } from 'react';
-import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
@@ -17,8 +17,11 @@ import { ConversationReadinessProvider } from '../contexts/ConversationReadiness
 import { FileExplorerProvider } from '../components/FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
-import { ApiResponseError, type ChainView, type Message, type ProductConversationSnapshotView } from '../api';
+import { ApiResponseError, type ChainView, type Message, type ProductConversationHistorySnapshotView as ProductConversationSnapshotView } from '../api';
+import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
 import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
+import type { ConversationHistorySegmentView } from '../generated/ConversationHistorySegmentView';
+import type { ProductConversationHandoffView } from '../generated/ProductConversationHandoffView';
 import {
   notifyCloseSnapshotChanged,
   notifyProductConversationDeleted,
@@ -108,7 +111,7 @@ vi.mock('../components/ConversationNavStack', () => ({
         <div data-testid="message-count">{messages.length}</div>
         <div data-testid="message-order">{messages.map((m) => m.message_id).join(',')}</div>
         <div data-testid="message-types">{messages.map((m) => m.message_type).join(',')}</div>
-        <div data-testid="message-text-order">{messages.map((m) => typeof m.content === 'object' && m.content !== null && 'text' in m.content ? String((m.content as { text?: string }).text ?? '') : '').join('|')}</div>
+        <div data-testid="message-text-order">{messages.map((m) => typeof m.content === 'object' && m.content !== null && 'text' in m.content ? String((m.content as { text?: string }).text ?? '') : typeof m.content === 'object' && m.content !== null && 'summary' in m.content ? String((m.content as { summary?: string }).summary ?? '') : '').join('|')}</div>
       </div>
     );
   },
@@ -206,7 +209,9 @@ vi.mock('../api', async () => {
     ...actual,
     api: {
       ...actual.api,
+      getProductConversationHistorySnapshot: vi.fn(),
       getProductConversationSnapshot: vi.fn(),
+      getCoordinatorHistory: vi.fn(),
       getProductConversationAutomaticContinuation: vi.fn(),
       updateProductConversationAutomaticContinuation: vi.fn(),
       reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
@@ -236,16 +241,21 @@ function makeMessage(message_id: string, sequence_id: number, conversation_id = 
   };
 }
 
-function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}): ProductConversationSnapshotView {
-  return {
+type SnapshotFixtureInput = Omit<ProductConversationSnapshotView, 'segments'> & {
+  segments: Array<ConversationHistorySegmentView & { handoff?: ProductConversationHandoffView | null }>;
+};
+function makeSnapshot(overrides: Partial<SnapshotFixtureInput> = {}): ProductConversationSnapshotView {
+  const snapshot: SnapshotFixtureInput = {
     product_conversation_id: 'pc-1',
     close: null,
+    boundaries: [],
     canonical_route: '/product-conversations/pc-1',
     requested_transcript_row_id: 'row-2',
     canonical_root: { transcript_row_id: 'row-1', slug: 'root-slug', title: 'Root title' },
     ordinary_lifecycle: 'open',
     latest_transcript_row_id: 'row-2',
     writable_transcript_row_id: 'row-2',
+    latest_opening_pending: false,
     updated_at: '2026-01-01T00:00:00Z',
     presentation: { kind: 'state', display_name: 'Product Alpha', presentation_mode: 'idle' },
     work_identity: {
@@ -270,11 +280,11 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
         transcript_row_id: 'row-1',
         slug: 'row-1',
         title: 'Earlier',
-        messages: [makeMessage('m-1', 1), makeMessage('m-2', 2)],
+        messages: [makeMessage('m-1', 1, 'row-1'), makeMessage('m-2', 2, 'row-1')],
         handoff: {
           kind: 'historical',
-          predecessor_transcript_row_id: 'row-0',
-          successor_transcript_row_id: 'row-1',
+          predecessor_transcript_row_id: 'row-1',
+          successor_transcript_row_id: 'row-2',
           continuation_message_id: 'cont-1',
           summary: 'First handoff',
         },
@@ -284,20 +294,19 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
         transcript_row_id: 'row-2',
         slug: 'row-2',
         title: 'Latest',
-        messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
-        handoff: {
-          kind: 'historical',
-          predecessor_transcript_row_id: 'row-1',
-          successor_transcript_row_id: 'row-2',
-          continuation_message_id: 'cont-2',
-          summary: 'Second handoff should not repeat',
-        },
+        messages: [makeMessage('m-3', 3, 'row-2'), makeMessage('m-4', 4, 'row-2')],
+        handoff: null,
       },
     ],
     before: 'cursor-1',
     has_older: true,
     ...overrides,
   };
+  snapshot.boundaries = overrides.boundaries ?? snapshot.segments.flatMap((segment) => segment.handoff ? [{ represented_successor_opening_message_id: null, message_id: segment.handoff.continuation_message_id, predecessor_transcript_row_id: segment.transcript_row_id, successor_transcript_row_id: segment.handoff.successor_transcript_row_id, segment_ordinal: segment.segment_ordinal }] : []);
+  const segments = snapshot.segments.map(({ handoff, ...segment }) => !handoff || segment.messages.some((message) => message.message_id === handoff.continuation_message_id) ? segment : {
+    ...segment, messages: [...segment.messages, { ...makeMessage(handoff.continuation_message_id, Math.max(0, ...segment.messages.map((message) => message.sequence_id)) + 1, segment.transcript_row_id), message_type: 'continuation' as const, content: { summary: handoff.summary } }],
+  });
+  return { ...snapshot, segments };
 }
 
 function makeChain(overrides: Partial<ChainView> = {}): ChainView {
@@ -334,7 +343,31 @@ function ProductRouteSwitch() {
   return <>
     <button onClick={() => navigate('/product-conversations/pc-1')}>open first product</button>
     <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>
+    <button onClick={() => navigate('/global/row-2')}>open second Global member</button>
+    <button onClick={() => navigate('/global/row-4')}>open newly created Global member</button>
   </>;
+}
+
+function HistoryRouteControls() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  return <><div data-testid="history-location">{location.pathname}{location.search}{location.hash}</div>
+    <button onClick={() => navigate({ ...location, hash: '#message-m-3' })}>jump latest message</button>
+    <button onClick={() => navigate({ ...location, hash: '' })}>clear message hash</button>
+    <button onClick={() => navigate({ pathname: location.pathname, search: '', hash: '' }, { state: { chapterSelection: 'pending' } })}>select pending chapter</button>
+    <button onClick={() => navigate(-1)}>history back</button>
+    <button onClick={() => navigate(1)}>history forward</button>
+  </>;
+}
+
+function coordinatorSnapshot(snapshot: ProductConversationSnapshotView) {
+  return {
+    product_conversation_id: snapshot.product_conversation_id,
+    canonical_route: '/global/row-2', requested_transcript_row_id: 'row-1',
+    canonical_root: snapshot.canonical_root, latest_transcript_row_id: snapshot.latest_transcript_row_id,
+    writable_transcript_row_id: snapshot.writable_transcript_row_id, latest_opening_pending: snapshot.latest_opening_pending, updated_at: snapshot.updated_at,
+    segments: snapshot.segments, boundaries: snapshot.boundaries, before: snapshot.before, has_older: snapshot.has_older,
+  };
 }
 
 let conversationStore: ConversationStore;
@@ -348,7 +381,9 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
           <ChainProvider>
             <FileExplorerProvider>
             {withRouteSwitch && <ProductRouteSwitch />}
+            <HistoryRouteControls />
             <Routes>
+              <Route path="/global/:slug" element={<ProductConversationPage productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: undefined }} />} />
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
             </Routes>
             </FileExplorerProvider>
@@ -428,10 +463,347 @@ async function waitForPageReady() {
 }
 
 describe('ProductConversationPage', () => {
+  it('uses aggregate Global history without ordinary lifecycle and keeps newest composer separate from pinned evidence', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
+    renderPage('/global/row-1?source_transcript=row-1&source_tool=exact-call#message-m-1');
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('m-1,m-2,cont-1,m-3,m-4'));
+    expect(api.getProductConversationHistorySnapshot).not.toHaveBeenCalled();
+    expect(screen.queryByText('Open')).not.toBeInTheDocument();
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]).toMatchObject({ slug: 'row-2', routePrefix: '/global' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1?source_transcript=row-1&source_tool=exact-call#message-m-1');
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } });
+  });
+
+  it('loads an unloaded Global boundary by exact message ID through the same bounded page loader', async () => {
+    const { api } = await import('../api');
+    const complete = coordinatorSnapshot(makeSnapshot({ before: null, has_older: false }));
+    const tail = { ...complete, segments: complete.segments.map((segment) => segment.transcript_row_id === 'row-1' ? { ...segment, messages: [] } : segment), before: 'global-before', has_older: true };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(tail).mockResolvedValueOnce(complete);
+    renderPage('/global/row-1?source_transcript=row-1#message-cont-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'cont-1' } }));
+    expect(api.getCoordinatorHistory).toHaveBeenNthCalledWith(2, 'row-1', { message_limit: 100, before: 'global-before' });
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).filter((message) => message.message_id === 'cont-1')).toHaveLength(1);
+    expect(screen.getByTestId('history-location')).toHaveTextContent('?source_transcript=row-1#message-cont-1');
+  });
+
+  it.each([[false, 'user'], [true, 'user'], [false, 'continuation'], [true, 'continuation']] as const)('keeps a reserved opening read-only until its accepted signal refreshes readiness (Global=%s, opening=%s)', async (global, openingType) => {
+    const { api } = await import('../api');
+    const pending = makeSnapshot({ latest_opening_pending: true, writable_transcript_row_id: null, before: null, has_older: false });
+    pending.segments = pending.segments.map((segment) => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [] } : segment);
+    const opening = { ...makeMessage('accepted-opening', 1, 'row-2'), message_type: openingType, content: openingType === 'continuation' ? { type: 'continuation', summary: 'generated opening' } : { type: 'user', text: 'accepted opening' } };
+    const ready = { ...pending, latest_opening_pending: false, writable_transcript_row_id: 'row-2', segments: pending.segments.map((segment) => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [opening] } : segment) };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(pending)).mockResolvedValueOnce(coordinatorSnapshot(ready));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(pending).mockResolvedValueOnce(ready);
+    renderPage(global ? '/global/row-1' : '/product-conversations/pc-1');
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(false));
+    emitLatestProjection({ messages: [opening], phase: { type: 'idle' } });
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.mutationEnabled).toBe(true));
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+  });
+
+  it('does not apply an old prefix anchor after the reader explicitly navigates to another message', async () => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot();
+    let resolveOlder!: (page: ProductConversationSnapshotView) => void;
+    const pending = new Promise<ProductConversationSnapshotView>((resolve) => { resolveOlder = resolve; });
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockReturnValueOnce(pending);
+    renderPage('/product-conversations/pc-1');
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('m-3'));
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+    fireEvent.click(screen.getByRole('button', { name: 'jump latest message' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { kind: 'jump_to_message', targetMessageId: 'm-3' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    await act(async () => resolveOlder({ ...initial, before: null, has_older: false }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('#message-m-3');
+  });
+
+  it('lazily selects an exact historical transcript-only Global pin without moving its composer', async () => {
+    const { api } = await import('../api');
+    const complete = coordinatorSnapshot(makeSnapshot({ before: null, has_older: false }));
+    const tail = { ...complete, segments: complete.segments.map((segment) => segment.transcript_row_id === 'row-1' ? { ...segment, messages: [] } : segment), before: 'global-before', has_older: true };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(tail).mockResolvedValueOnce(complete);
+    renderPage('/global/row-1?source_transcript=row-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(2);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1?source_transcript=row-1');
+  });
+
+  it('repositions an acknowledged message link when Back returns from a hashless entry', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
+    renderPage('/global/row-1?source_transcript=row-1#message-m-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'clear message hash' }));
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['ordinary', 'reader_anchor'], ['ordinary', 'reader_viewport'],
+    ['coordinator', 'reader_anchor'], ['coordinator', 'reader_viewport'],
+  ] as const)('keeps newer same-route %s %s intent when an older page completes', async (kind, basisKind) => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot();
+    let resolveOlder!: (page: ProductConversationSnapshotView) => void;
+    const pending = new Promise<ProductConversationSnapshotView>(resolve => { resolveOlder = resolve; });
+    if (kind === 'ordinary') {
+      vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockReturnValueOnce(pending);
+    } else {
+      vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce({ ...coordinatorSnapshot(initial), requested_transcript_row_id: initial.latest_transcript_row_id }).mockImplementationOnce(async () => {
+        const page = await pending;
+        return { ...coordinatorSnapshot(page), requested_transcript_row_id: page.latest_transcript_row_id };
+      });
+    }
+    renderPage(kind === 'coordinator' ? `/global/${initial.latest_transcript_row_id}` : '/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+    const update = conversationNavStackSpy.mock.lastCall?.[0]?.onUpdateOlderMessagesRestore as ((basis: import('../conversation/historyExpansion').RestoreBasis) => void) | undefined;
+    expect(update).toBeDefined();
+    act(() => update?.(basisKind === 'reader_anchor'
+      ? { kind: 'reader_anchor', messageId: 'm-4', viewportStartOffset: 35 }
+      : { kind: 'reader_viewport' }));
+    await act(async () => resolveOlder(makeSnapshot({ before: null, has_older: false,
+      segments: [{ segment_ordinal: 0, transcript_row_id: 'older', slug: 'older', title: 'Older', messages: [makeMessage('old-message', 1, 'older')], handoff: null }],
+    })));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
+    const positioning = conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning;
+    if (basisKind === 'reader_anchor') expect(positioning).toMatchObject({ kind: 'positioning', command: { kind: 'restore_after_prefix_expansion', messageId: 'm-4', viewportStartOffset: 35 } });
+    else expect(positioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).not.toHaveTextContent('#');
+  });
+
+  it('retires an implicit historical Global route anchor when selecting a local pending chapter', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
+    renderPage('/global/row-1?source_transcript=row-1&source_tool=old-call#message-m-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'select pending chapter' }));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1');
+    expect(screen.getByTestId('history-location')).not.toHaveTextContent('source_transcript');
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])('positions an omitted generated-opening bookmark at its exact persisted boundary (Global=%s, lazy=%s)', async (global, lazy) => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ before: null, has_older: false, boundaries: [{
+      message_id: 'cont-1', represented_successor_opening_message_id: 'represented-opening', predecessor_transcript_row_id: 'row-1', successor_transcript_row_id: 'row-2', segment_ordinal: 0,
+    }] });
+    const tail = lazy ? { ...initial, before: 'alias-older', has_older: true, segments: initial.segments.map(segment => ({ ...segment, messages: segment.messages.filter(message => message.message_id !== 'cont-1') })) } : initial;
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(initial)).mockResolvedValueOnce(coordinatorSnapshot(tail));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(initial).mockResolvedValueOnce(tail);
+    renderPage(global ? '/global/row-2?source_transcript=row-2#message-represented-opening' : '/product-conversations/pc-1?source_transcript=row-2#message-represented-opening');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'cont-1' } }));
+    expect(screen.queryByText('The linked message is not available')).not.toBeInTheDocument();
+    expect(screen.getByTestId('history-location')).toHaveTextContent('#message-represented-opening');
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(lazy ? 2 : 1);
+  });
+
+  it.each([false, true])('excludes only the exact represented successor opening from live hydration (Global=%s)', async (global) => {
+    const { api } = await import('../api');
+    const boundary = { ...makeMessage('original-boundary', 2, 'row-1'), message_type: 'continuation' as const, content: { type: 'continuation', summary: 'Persisted summary' } };
+    const opening = { ...makeMessage('represented-opening', 1, 'row-2'), message_type: 'continuation' as const, content: { type: 'continuation', summary: 'Persisted summary' } };
+    const editedOpening = { ...makeMessage('distinct-opening', 2, 'row-2'), content: { type: 'user', text: 'Persisted summary plus explicit instruction' } };
+    const sameTextDifferentIdentity = { ...makeMessage('distinct-repeat', 3, 'row-2'), content: { type: 'user', text: 'Persisted summary' } };
+    const initial = makeSnapshot({ before: null, has_older: false, segments: [
+      { segment_ordinal: 0, transcript_row_id: 'row-1', slug: 'row-1', title: 'Old', messages: [boundary] },
+      { segment_ordinal: 1, transcript_row_id: 'row-2', slug: 'row-2', title: 'Newest', messages: [] },
+    ], boundaries: [{ represented_successor_opening_message_id: 'represented-opening', message_id: 'original-boundary', predecessor_transcript_row_id: 'row-1', successor_transcript_row_id: 'row-2', segment_ordinal: 0 }] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(initial));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(initial);
+    renderPage(global ? '/global/row-2' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ messages: [opening, editedOpening, sameTextDifferentIdentity], pendingMessages: [], convState: { type: 'idle' } }));
+    await waitFor(() => expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual(['original-boundary', 'distinct-opening', 'distinct-repeat']));
+    const continued = makeSnapshot({ ...initial, latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', segments: [...initial.segments, {
+      segment_ordinal: 2, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')],
+    }] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(continued));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(continued);
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual(['original-boundary', 'distinct-opening', 'distinct-repeat', 'newest-message']);
+  });
+
+  it('positions the new hashless Global route member without replacing the acquired aggregate owner', async () => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: null, has_older: false });
+    initial.segments.push({ segment_ordinal: 2, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')] });
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(initial));
+    renderPage('/global/row-1', true);
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'open second Global member' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-3' } }));
+    expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(1);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3');
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+  });
+
+  it('refreshes unresolved warm Global route topology without substituting its old requested member', async () => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ before: null, has_older: false });
+    let release!: (snapshot: CoordinatorConversationSnapshotView) => void;
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    renderPage('/global/row-1', true);
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'open newly created Global member' }));
+    await waitFor(() => expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(2));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    const continued = { ...initial, latest_transcript_row_id: 'row-5', writable_transcript_row_id: 'row-5', segments: [...initial.segments,
+      { segment_ordinal: 2, transcript_row_id: 'row-4', slug: 'row-4', title: 'Requested', messages: [makeMessage('requested-new-member', 1, 'row-4')] },
+      { segment_ordinal: 3, transcript_row_id: 'row-5', slug: 'row-5', title: 'Newest', messages: [makeMessage('newest-member', 1, 'row-5')] },
+    ] };
+    await act(async () => release(coordinatorSnapshot(continued)));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'requested-new-member' } }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-5');
+  });
+
+  it('keeps a hashless newest Global reader unpinned when its route member continues', async () => {
+    const { api } = await import('../api');
+    const initial = { ...coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })), requested_transcript_row_id: 'row-2' };
+    const continued = { ...initial, latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', segments: [...initial.segments, {
+      segment_ordinal: 2, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')],
+    }] };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(initial).mockResolvedValueOnce(continued);
+    renderPage('/global/row-2');
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2'));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-2');
+  });
+
+  it.each([false, true])('retains acquired live predecessor rows across a bounded continuation refresh (Global=%s)', async (global) => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ before: null, has_older: false, segments: [{
+      segment_ordinal: 0, transcript_row_id: 'row-2', slug: 'row-2', title: 'Predecessor',
+      messages: Array.from({ length: 100 }, (_, index) => makeMessage(`acquired-${index + 1}`, index + 1, 'row-2')),
+    }] });
+    const live = Array.from({ length: 250 }, (_, index) => makeMessage(`acquired-${index + 1}`, index + 1, 'row-2'));
+    const continued = makeSnapshot({ latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: 'bounded-tail', has_older: true, segments: [
+      { ...initial.segments[0]!, messages: live.slice(151) },
+      { segment_ordinal: 1, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')] },
+    ] });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue({ ...coordinatorSnapshot(continued), requested_transcript_row_id: 'row-2' }).mockResolvedValueOnce({ ...coordinatorSnapshot(initial), requested_transcript_row_id: 'row-2' });
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(continued).mockResolvedValueOnce(initial);
+    renderPage(global ? '/global/row-2#message-acquired-125' : '/product-conversations/pc-1#message-acquired-125');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ messages: live, pendingMessages: [], convState: { type: 'idle' } }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ command: { targetMessageId: 'acquired-125' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    const props = conversationNavStackSpy.mock.lastCall?.[0];
+    expect((props?.messages as Message[]).map(message => message.message_id)).toEqual([...live.map(message => message.message_id), 'newest-message']);
+    expect(props?.transcriptPositioning).toMatchObject({ kind: 'idle' });
+    expect(screen.getByTestId('history-location')).toHaveTextContent('#message-acquired-125');
+  });
+
+  it.each([false, true])('orders a paged predecessor gap between retained prefix and refreshed tail (Global=%s)', async (global) => {
+    const { api } = await import('../api');
+    const rows = Array.from({ length: 250 }, (_, index) => makeMessage(`gap-${index + 1}`, index + 1, 'row-2'));
+    const segment = { segment_ordinal: 0, transcript_row_id: 'row-2', slug: 'row-2', title: 'Predecessor', messages: rows.slice(0, 100) };
+    const initial = makeSnapshot({ before: null, has_older: false, segments: [segment] });
+    const continued = makeSnapshot({ latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: 'gap-cursor', has_older: true, segments: [
+      { ...segment, messages: rows.slice(151) },
+      { segment_ordinal: 1, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')] },
+    ] });
+    const gap = { ...continued, before: null, has_older: false, segments: [{ ...segment, messages: rows.slice(51, 151) }] };
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce({ ...coordinatorSnapshot(initial), requested_transcript_row_id: 'row-2' }).mockResolvedValueOnce({ ...coordinatorSnapshot(continued), requested_transcript_row_id: 'row-2' }).mockResolvedValueOnce({ ...coordinatorSnapshot(gap), requested_transcript_row_id: 'row-2' });
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockResolvedValueOnce(continued).mockResolvedValueOnce(gap);
+    renderPage(global ? '/global/row-2' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual([...rows.map(message => message.message_id), 'newest-message']);
+  });
+
+  it.each([false, true])('retains the fresh cursor when a delayed old-ceiling page finishes across continuation (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const rows = Array.from({ length: 400 }, (_, index) => makeMessage(`ceiling-${index + 1}`, index + 1, 'row-2'));
+    const segment = { segment_ordinal: 0, transcript_row_id: 'row-2', slug: 'row-2', title: 'Predecessor', messages: rows.slice(100, 200) };
+    const initial = makeSnapshot({ before: 'old-ceiling', has_older: true, segments: [segment] });
+    const oldPrefix = { ...initial, before: null, has_older: false, segments: [{ ...segment, messages: rows.slice(0, 100) }] };
+    const fresh = makeSnapshot({ latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', before: 'fresh-ceiling', has_older: true, segments: [
+      { ...segment, messages: rows.slice(301) },
+      { segment_ordinal: 1, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')] },
+    ] });
+    let release!: () => void;
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockReturnValueOnce(new Promise(resolve => { release = () => resolve(coordinatorSnapshot(oldPrefix)); })).mockResolvedValueOnce(coordinatorSnapshot(fresh)).mockResolvedValueOnce(coordinatorSnapshot({ ...fresh, before: null, has_older: false, segments: [{ ...segment, messages: rows.slice(100, 301) }] }));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockReturnValueOnce(new Promise(resolve => { release = () => resolve(oldPrefix); })).mockResolvedValueOnce(fresh).mockResolvedValueOnce({ ...fresh, before: null, has_older: false, segments: [{ ...segment, messages: rows.slice(100, 301) }] });
+    renderPage(global ? '/global/row-2' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    await act(async () => release());
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    expect((global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot)).toHaveBeenLastCalledWith(expect.any(String), { before: 'fresh-ceiling', message_limit: 100 });
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual([...rows.map(message => message.message_id), 'newest-message']);
+  });
+
+  it('preserves the aggregate reader anchor and newest composer when continuation races an older page', async () => {
+    const { api } = await import('../api');
+    const initial = coordinatorSnapshot(makeSnapshot());
+    let resolveOlder!: (page: ReturnType<typeof coordinatorSnapshot>) => void;
+    const pendingOlder = new Promise<ReturnType<typeof coordinatorSnapshot>>((resolve) => { resolveOlder = resolve; });
+    const continued = { ...initial, latest_transcript_row_id: 'row-3', writable_transcript_row_id: 'row-3', segments: [...initial.segments, {
+      segment_ordinal: 3, transcript_row_id: 'row-3', slug: 'row-3', title: 'Newest', messages: [makeMessage('newest-message', 1, 'row-3')], handoff: null,
+    }] };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(initial).mockReturnValueOnce(pendingOlder).mockResolvedValueOnce(continued);
+    renderPage('/global/row-1?source_transcript=row-1');
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('m-1'));
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3'));
+    await act(async () => resolveOlder({ ...initial, before: null, has_older: false, segments: [{ segment_ordinal: 0, transcript_row_id: 'older', slug: 'older', title: 'Older', messages: [makeMessage('old-message', 1, 'older')] }, ...initial.segments] }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
+    const props = conversationNavStackSpy.mock.lastCall?.[0];
+    expect(props?.conversationId).toBe('pc-1');
+    expect(props?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { kind: 'restore_after_prefix_expansion', messageId: 'm-3', viewportStartOffset: 17, view: { conversationId: 'pc-1' } } });
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-3');
+    expect((props?.messages as Message[]).map((message) => message.message_id)).toEqual(['old-message', 'm-1', 'm-2', 'cont-1', 'm-3', 'm-4', 'newest-message']);
+    expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1?source_transcript=row-1');
+  });
+
+  it('reissues acknowledged exact-message positioning on browser back/forward without refetching history', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot({ before: null, has_older: false })));
+    renderPage('/global/row-1?source_transcript=row-1#message-m-1');
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    const first = (conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning as { command: { token: number } }).command.token;
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'jump latest message' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-3' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    expect((conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning as { command: { token: number } }).command.token).toBeGreaterThan(first);
+    expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(1);
+  });
+
   beforeEach(async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockReset();
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
+    vi.mocked(api.getProductConversationHistorySnapshot).mockReset();
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot());
     vi.mocked(api.getProductConversationAutomaticContinuation).mockReset();
     vi.mocked(api.getProductConversationAutomaticContinuation).mockResolvedValue({
       aggregate: { kind: 'ordinary', product_conversation_id: 'pc-1' },
@@ -477,7 +849,7 @@ describe('ProductConversationPage', () => {
   it('ignores a stale initial snapshot and open report after a route switch', async () => {
     const { api } = await import('../api');
     let resolveFirst: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
       .mockResolvedValueOnce(makeSnapshot({
         product_conversation_id: 'pc-2',
@@ -485,7 +857,7 @@ describe('ProductConversationPage', () => {
         presentation: { kind: 'state', display_name: 'Product Beta', presentation_mode: 'idle' },
       }));
     renderPage('/product-conversations/pc-1', true);
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
     expect(await screen.findByRole('heading', { name: 'Product Beta' })).toBeInTheDocument();
 
@@ -498,7 +870,7 @@ describe('ProductConversationPage', () => {
 
   it('refreshes the active title from the aggregate snapshot invalidation authority', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockResolvedValueOnce(makeSnapshot({
         presentation: { kind: 'state', display_name: 'Renamed Product', presentation_mode: 'idle' },
@@ -509,7 +881,7 @@ describe('ProductConversationPage', () => {
     act(() => notifyProductConversationSnapshotChanged('pc-1'));
 
     expect(await screen.findByRole('heading', { name: 'Renamed Product' })).toBeInTheDocument();
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('clears a writable open snapshot when its aggregate is deleted', async () => {
@@ -539,11 +911,11 @@ describe('ProductConversationPage', () => {
   it('defers authoritative absence for an unresolved legacy alias until canonical snapshot', async () => {
     const { api } = await import('../api');
     let resolveSnapshot: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
-    vi.mocked(api.getProductConversationSnapshot).mockImplementationOnce(
+    vi.mocked(api.getProductConversationHistorySnapshot).mockImplementationOnce(
       () => new Promise((resolve) => { resolveSnapshot = resolve; }),
     );
     renderPage('/product-conversations/root-alias');
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledOnce());
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledOnce());
 
     act(() => notifyProductConversationsReconciled(new Set(['pc-1'])));
     expect(screen.queryByText('This product conversation was deleted.')).not.toBeInTheDocument();
@@ -555,7 +927,7 @@ describe('ProductConversationPage', () => {
 
   it('clears a writable snapshot when stream reconciliation is confirmed by authoritative absence', async () => {
     const { api, ApiResponseError } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockRejectedValueOnce(new ApiResponseError('not found', 404));
     renderPage();
@@ -569,7 +941,7 @@ describe('ProductConversationPage', () => {
 
   it('refreshes an alias route from canonical aggregate invalidation', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockResolvedValueOnce(makeSnapshot({
         presentation: { kind: 'state', display_name: 'Canonical Rename', presentation_mode: 'idle' },
@@ -580,30 +952,30 @@ describe('ProductConversationPage', () => {
     act(() => notifyProductConversationSnapshotChanged('pc-1'));
 
     expect(await screen.findByRole('heading', { name: 'Canonical Rename' })).toBeInTheDocument();
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('replays a canonical rename invalidation received while an alias snapshot is loading', async () => {
     const { api } = await import('../api');
     let resolveInitial: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveInitial = resolve; }))
       .mockResolvedValueOnce(makeSnapshot({
         presentation: { kind: 'state', display_name: 'Canonical Rename', presentation_mode: 'idle' },
       }));
     renderPage('/product-conversations/root-alias');
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1));
 
     act(() => notifyProductConversationSnapshotChanged('pc-1'));
     act(() => resolveInitial?.(makeSnapshot()));
 
     expect(await screen.findByRole('heading', { name: 'Canonical Rename' })).toBeInTheDocument();
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('rearms canonical snapshot invalidation after each refresh', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockResolvedValueOnce(makeSnapshot({
         presentation: { kind: 'state', display_name: 'First Rename', presentation_mode: 'idle' },
@@ -619,24 +991,24 @@ describe('ProductConversationPage', () => {
     act(() => notifyProductConversationSnapshotChanged('pc-1'));
 
     expect(await screen.findByRole('heading', { name: 'Second Rename' })).toBeInTheDocument();
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(3);
   });
 
   it('starts a new measured open when revisiting a previously loaded product route', async () => {
     const { api } = await import('../api');
     renderPage('/product-conversations/pc-1', true);
     await waitForPageReady();
-    const firstOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[0]?.[1]?.open_id;
+    const firstOpenId = vi.mocked(api.getProductConversationHistorySnapshot).mock.calls[0]?.[1]?.open_id;
     await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
     expect(api.reportProductConversationOpen).toHaveBeenLastCalledWith(
       expect.objectContaining({ open_id: firstOpenId }),
     );
     fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
-    const secondOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[1]?.[1]?.open_id;
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
+    const secondOpenId = vi.mocked(api.getProductConversationHistorySnapshot).mock.calls[1]?.[1]?.open_id;
     fireEvent.click(screen.getByRole('button', { name: 'open first product' }));
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
-    const revisitOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[2]?.[1]?.open_id;
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(3));
+    const revisitOpenId = vi.mocked(api.getProductConversationHistorySnapshot).mock.calls[2]?.[1]?.open_id;
     await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(2));
     expect(api.reportProductConversationOpen).toHaveBeenLastCalledWith(
       expect.objectContaining({ open_id: revisitOpenId }),
@@ -651,27 +1023,36 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     renderPage('/product-conversations/pc-strict', false, true);
     await waitForPageReady();
-    const correlatedCalls = vi.mocked(api.getProductConversationSnapshot).mock.calls
+    const correlatedCalls = vi.mocked(api.getProductConversationHistorySnapshot).mock.calls
       .map(([, options]) => options?.open_id)
       .filter(Boolean);
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1);
     expect(new Set(correlatedCalls).size).toBe(1);
     await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
   });
 
   it('reuses the open correlation when an initial snapshot retry succeeds', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockRejectedValueOnce(new Error('temporary failure'))
       .mockResolvedValueOnce(makeSnapshot());
     renderPage('/product-conversations/pc-retry');
 
     expect(await screen.findByRole('alert')).toHaveTextContent('temporary failure');
-    const firstOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[0]?.[1]?.open_id;
+    const firstOpenId = vi.mocked(api.getProductConversationHistorySnapshot).mock.calls[0]?.[1]?.open_id;
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitForPageReady();
-    expect(vi.mocked(api.getProductConversationSnapshot).mock.calls[1]?.[1]?.open_id).toBe(firstOpenId);
+    expect(vi.mocked(api.getProductConversationHistorySnapshot).mock.calls[1]?.[1]?.open_id).toBe(firstOpenId);
     await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
+  });
+
+  it('does not emit an uncorrelated ordinary-open journey for Global history', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot()));
+    renderPage('/global/row-2');
+    await waitForPageReady();
+    expect(api.getCoordinatorHistory).toHaveBeenCalledWith('row-1', { message_limit: 100 });
+    expect(api.reportProductConversationOpen).not.toHaveBeenCalled();
   });
 
   it('correlates the initial snapshot with one bounded browser readiness report', async () => {
@@ -679,7 +1060,7 @@ describe('ProductConversationPage', () => {
     renderPage('/product-conversations/pc-telemetry');
     await waitForPageReady();
 
-    const initialOptions = vi.mocked(api.getProductConversationSnapshot).mock.calls[0]?.[1];
+    const initialOptions = vi.mocked(api.getProductConversationHistorySnapshot).mock.calls[0]?.[1];
     expect(initialOptions?.open_id).toMatch(/^[0-9a-f-]{36}$/);
     await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
     expect(api.reportProductConversationOpen).toHaveBeenCalledWith(expect.objectContaining({
@@ -700,7 +1081,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const scenario = getProductConversationScenario('latest-row-aligned-prefix-tail');
     if (!scenario.snapshot || !scenario.alignedLatestMessages) throw new Error('fixture scenario incomplete');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(scenario.snapshot);
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(scenario.snapshot);
     renderPage('/product-conversations/pc-aligned-prefix-tail');
     await waitForPageReady();
     act(() => emitLatestProjection({
@@ -744,7 +1125,7 @@ describe('ProductConversationPage', () => {
     latest.messages = latest.messages.map((message) => message.sequence_id === 101
       ? { ...message, message_id: 'stale-terminal-identity' }
       : message);
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(snapshot);
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(snapshot);
 
     renderPage('/product-conversations/pc-aligned-prefix-tail');
     await waitForPageReady();
@@ -767,7 +1148,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     const scenario = getProductConversationScenario('latest-row-aligned-prefix-tail');
     if (!scenario.snapshot) throw new Error('fixture scenario incomplete');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(scenario.snapshot);
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(scenario.snapshot);
 
     renderPage('/product-conversations/pc-aligned-prefix-tail');
     await waitForPageReady();
@@ -804,12 +1185,12 @@ describe('ProductConversationPage', () => {
     expect(messages.at(-1)?.message_id).toBe('aligned-prefix-terminal-assistant');
     expect(props.pendingMessages).toEqual([]);
     expect(props.convState).toEqual({ type: 'idle' });
-    expect(props.conversationId).toBe('row-aligned-prefix-tail');
+    expect(props.conversationId).toBe('pc-aligned-prefix-tail');
   });
 
   it('refetches the authoritative aggregate when SSE changes member archive state', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'open' }))
       .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history' }));
 
@@ -817,20 +1198,20 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
 
     act(() => emitLatestProjection({ isArchived: false, serverArchived: false }));
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1);
     act(() => emitLatestProjection({ isArchived: false, serverArchived: true }));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByText('History is read-only.')).toBeInTheDocument());
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('orders flattened segment messages chronologically', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       segments: [
-        { segment_ordinal: 2, transcript_row_id: 'row-2', slug: null, title: null, messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)], handoff: null },
-        { segment_ordinal: 1, transcript_row_id: 'row-1', slug: null, title: null, messages: [makeMessage('m-1', 1), makeMessage('m-2', 2)], handoff: null },
+        { segment_ordinal: 2, transcript_row_id: 'row-2', slug: null, title: null, messages: [makeMessage('m-3', 3, 'row-2'), makeMessage('m-4', 4, 'row-2')], handoff: null },
+        { segment_ordinal: 1, transcript_row_id: 'row-1', slug: null, title: null, messages: [makeMessage('m-1', 1, 'row-1'), makeMessage('m-2', 2, 'row-1')], handoff: null },
       ],
     }));
 
@@ -843,7 +1224,7 @@ describe('ProductConversationPage', () => {
 
   it('renders every typed historical handoff exactly once at the segment boundary', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       latest_transcript_row_id: 'row-3',
       writable_transcript_row_id: 'row-3',
       segments: [
@@ -896,27 +1277,28 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4,product-handoff:pc-1:row-2:cont-2,m-5,m-6,product-handoff:pc-1:row-3:cont-3'
+        'm-1,m-2,cont-1,m-3,m-4,cont-2,m-5,m-6,cont-3'
       );
     });
-    expect(screen.getByTestId('message-types').textContent).toBe('user,agent,system,user,agent,system,user,agent,system');
+    expect(screen.getByTestId('message-types').textContent).toBe('user,agent,continuation,user,agent,continuation,user,agent,continuation');
     expect(screen.getByTestId('message-text-order').textContent).toContain('First handoff');
     expect(screen.getByTestId('message-text-order').textContent).toContain('Second handoff');
     expect(screen.getByTestId('message-text-order').textContent).toContain('Third handoff');
-    const messages = conversationNavStackSpy.mock.lastCall?.[0]?.['messages'] as Array<{ message_id: string }>;
-    expect(messages.filter((message) => message.message_id.includes('product-handoff:'))).toHaveLength(3);
+    const messages = conversationNavStackSpy.mock.lastCall?.[0]?.['messages'] as Message[];
+    expect(messages.filter((message) => message.message_type === 'continuation').map((message) => message.message_id)).toEqual(['cont-1', 'cont-2', 'cont-3']);
+    expect(messages.every((message) => message.sequence_id > 0)).toBe(true);
   });
 
   it('renders completed handoffs as the single typed segment boundary', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       segments: [
         {
           segment_ordinal: 1,
           transcript_row_id: 'row-1',
           slug: 'row-1',
           title: 'Earlier',
-          messages: [makeMessage('m-1', 1), makeMessage('m-2', 2)],
+          messages: [makeMessage('m-1', 1, 'row-1'), makeMessage('m-2', 2, 'row-1')],
           handoff: null,
         },
         {
@@ -942,7 +1324,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,accepted-successor,product-handoff:pc-1:row-2:continuation-request'
+        'm-1,m-2,accepted-successor,continuation-request'
       );
     });
     expect(screen.getByTestId('message-text-order')).toHaveTextContent('Completed handoff');
@@ -953,7 +1335,7 @@ describe('ProductConversationPage', () => {
     const segment0Messages = Array.from({ length: 35 }, (_, index) => makeMessage(`m-${index + 1}`, index + 1, 'conv-0'));
     const segment1Messages = Array.from({ length: 35 }, (_, index) => makeMessage(`m-${index + 36}`, index + 36, 'conv-1'));
     const segment2Messages = Array.from({ length: 40 }, (_, index) => makeMessage(`m-${index + 71}`, index + 71, 'conv-2'));
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({
         latest_transcript_row_id: 'row-3',
         writable_transcript_row_id: 'row-3',
@@ -1050,10 +1432,10 @@ describe('ProductConversationPage', () => {
     });
     const order = screen.getByTestId('message-order').textContent?.split(',') ?? [];
     expect(order[0]).toBe('m-1');
-    expect(order[35]).toBe('product-handoff:pc-1:row-1:cont-1');
-    expect(order[71]).toBe('product-handoff:pc-1:row-2:cont-2');
+    expect(order[35]).toBe('cont-1');
+    expect(order[71]).toBe('cont-2');
     expect(order[111]).toBe('m-110');
-    expect(order.at(-1)).toBe('product-handoff:pc-1:row-3:cont-3');
+    expect(order.at(-1)).toBe('cont-3');
     expect(new Set(order).size).toBe(order.length);
   });
 
@@ -1071,7 +1453,7 @@ describe('ProductConversationPage', () => {
 
   it('shows loading then request error state', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockRejectedValueOnce(new Error('boom'));
+    vi.mocked(api.getProductConversationHistorySnapshot).mockRejectedValueOnce(new Error('boom'));
 
     renderPage();
 
@@ -1081,7 +1463,7 @@ describe('ProductConversationPage', () => {
 
   it('surfaces pagination failure through aggregated status', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockRejectedValueOnce(new Error('older failed'));
 
@@ -1118,7 +1500,7 @@ describe('ProductConversationPage', () => {
 
   it('renders the aggregate title and present source link for Open and History', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'Open title', presentation_mode: 'idle' } }))
       .mockResolvedValueOnce(makeSnapshot({
         ordinary_lifecycle: 'history',
@@ -1143,7 +1525,7 @@ describe('ProductConversationPage', () => {
 
   it('renders deleted source copy without a dead source link', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       source: { ...makeSnapshot().source!, status: 'deleted' },
     }));
     renderPage();
@@ -1164,7 +1546,7 @@ describe('ProductConversationPage', () => {
       work_change: { kind: 'clean' },
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
     });
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history', writable_transcript_row_id: null }));
 
@@ -1256,7 +1638,7 @@ describe('ProductConversationPage', () => {
 
   it('does not expose note sending when History has no composer capability', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       ordinary_lifecycle: 'history',
       writable_transcript_row_id: null,
     }));
@@ -1304,7 +1686,7 @@ describe('ProductConversationPage', () => {
 
   it('preserves embedded task approval ownership on degraded fallback routes', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockRejectedValueOnce(new Error('snapshot failed'));
+    vi.mocked(api.getProductConversationHistorySnapshot).mockRejectedValueOnce(new Error('snapshot failed'));
 
     renderPage();
 
@@ -1319,7 +1701,7 @@ describe('ProductConversationPage', () => {
 
   it('keeps latest open row mounted even when writable transcript is null', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       writable_transcript_row_id: null,
       chain_qa_compatibility: null,
     }));
@@ -1361,7 +1743,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4,live-sent,live-streamed,product-handoff:pc-1:row-2:cont-2'
+        'm-1,m-2,cont-1,m-3,m-4,live-sent,live-streamed'
       );
       expect(conversationNavStackSpy.mock.lastCall?.[0]?.['pendingMessages']).toEqual([
         expect.objectContaining({ localId: 'pending-local', status: 'pending' }),
@@ -1378,7 +1760,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => {
       const props = conversationNavStackSpy.mock.lastCall?.[0] as Record<string, unknown>;
       expect(props['slug']).toBe('row-2');
-      expect(props['conversationId']).toBe('row-2');
+      expect(props['conversationId']).toBe('pc-1');
       expect(props['workScopeKey']).toBe('ws-latest');
     });
   });
@@ -1389,7 +1771,7 @@ describe('ProductConversationPage', () => {
     ['close_incomplete', 'open', 'Close incomplete — shutdown could not be confirmed', 'work_scope'],
   ] as const)('retains %s status and read-only controls on cold load and remount (%s, %s, %s)', async (outcome, lifecycle, label, resourceKind) => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({
       ordinary_lifecycle: lifecycle,
       writable_transcript_row_id: null,
       close: {
@@ -1448,7 +1830,7 @@ describe('ProductConversationPage', () => {
       expect(screen.getByTestId(lifecycle === 'history'
         ? 'product-conversation-history' : 'product-conversation-close-incomplete')).toBeVisible();
     }
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('refreshes cleanup-attention History to archived through the mounted conversation stream', async () => {
@@ -1502,7 +1884,7 @@ describe('ProductConversationPage', () => {
         failure: null,
       },
     });
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(cleanupAttention)
       .mockResolvedValueOnce(archived);
 
@@ -1519,7 +1901,7 @@ describe('ProductConversationPage', () => {
       conversation: { archived: true },
     }));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => {
       expect(screen.queryByRole('alert', { name: 'Close status' })).not.toBeInTheDocument();
       expect(screen.queryByTestId('product-conversation-close-live-update-owner')).not.toBeInTheDocument();
@@ -1529,7 +1911,7 @@ describe('ProductConversationPage', () => {
 
   it('disables the ordinary composer while Close is active', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       close: {
         attempt_id: 'close-active',
         phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
@@ -1548,7 +1930,7 @@ describe('ProductConversationPage', () => {
 
   it('does not expose aggregate note sending while Close makes the composer read-only', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       close: {
         attempt_id: 'close-active',
         phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
@@ -1579,7 +1961,7 @@ describe('ProductConversationPage', () => {
     } satisfies ProductConversationCloseView;
     let resolveRefresh!: (value: ProductConversationSnapshotView) => void;
     const refresh = new Promise<ProductConversationSnapshotView>((resolve) => { resolveRefresh = resolve; });
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
       .mockReturnValueOnce(refresh);
 
@@ -1587,7 +1969,7 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
     act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     expect(screen.queryByTestId('skeleton')).not.toBeInTheDocument();
     expect(screen.getByTestId('message-order')).toHaveTextContent('m-1,m-2');
     await act(async () => resolveRefresh(makeSnapshot({
@@ -1606,7 +1988,7 @@ describe('ProductConversationPage', () => {
       losses: [],
       residuals: [],
     } satisfies ProductConversationCloseView;
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
       .mockResolvedValueOnce(makeSnapshot({
         close: activeClose,
@@ -1636,7 +2018,7 @@ describe('ProductConversationPage', () => {
             transcript_row_id: 'row-2',
             slug: 'row-2',
             title: 'Second',
-            messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+            messages: [makeMessage('m-3', 3, 'row-2'), makeMessage('m-4', 4, 'row-2')],
             handoff: null,
           },
         ],
@@ -1649,9 +2031,9 @@ describe('ProductConversationPage', () => {
 
     act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
-    expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4');
+    expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,cont-1,m-3,m-4');
     expect(screen.getByTestId('message-order').textContent?.split(',').filter((id) => id === 'old-message')).toHaveLength(1);
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({ kind: 'idle' }));
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
@@ -1667,7 +2049,7 @@ describe('ProductConversationPage', () => {
       losses: [],
       residuals: [],
     } satisfies ProductConversationCloseView;
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({
         close: activeClose,
         latest_transcript_row_id: 'row-stale',
@@ -1678,7 +2060,7 @@ describe('ProductConversationPage', () => {
             transcript_row_id: 'row-2',
             slug: 'row-2',
             title: 'Second',
-            messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+            messages: [makeMessage('m-3', 3, 'row-2'), makeMessage('m-4', 4, 'row-2')],
             handoff: null,
           },
           {
@@ -1698,7 +2080,7 @@ describe('ProductConversationPage', () => {
           transcript_row_id: 'row-2',
           slug: 'row-2',
           title: 'Second',
-          messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+          messages: [makeMessage('m-3', 3, 'row-2'), makeMessage('m-4', 4, 'row-2')],
           handoff: null,
         }],
       }));
@@ -1707,7 +2089,7 @@ describe('ProductConversationPage', () => {
 
     act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByTestId('message-order')).not.toHaveTextContent('stale-message'));
     expect(screen.getByTestId('message-order')).toHaveTextContent('m-3,m-4');
   });
@@ -1722,7 +2104,7 @@ describe('ProductConversationPage', () => {
       losses: [],
       residuals: [],
     } satisfies ProductConversationCloseView;
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
       .mockResolvedValueOnce(makeSnapshot({
         close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
@@ -1733,7 +2115,7 @@ describe('ProductConversationPage', () => {
 
     act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByTestId('message-count')).toHaveTextContent('0'));
   });
 
@@ -1747,7 +2129,7 @@ describe('ProductConversationPage', () => {
       losses: [],
       residuals: [],
     } satisfies ProductConversationCloseView;
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ close: activeClose, before: null, has_older: false }))
       .mockResolvedValueOnce(makeSnapshot({
         close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
@@ -1760,7 +2142,7 @@ describe('ProductConversationPage', () => {
 
     act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.['hasOlderMessages']).toBe(true));
   });
 
@@ -1772,13 +2154,13 @@ describe('ProductConversationPage', () => {
     act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
     await act(async () => Promise.resolve());
 
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('skeleton')).not.toBeInTheDocument();
   });
 
   it('discovers an explicitly-started Close while the loaded snapshot is Open', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockResolvedValueOnce(makeSnapshot({
         close: {
@@ -1795,13 +2177,13 @@ describe('ProductConversationPage', () => {
 
     act(() => notifyCloseSnapshotChanged('row-2'));
 
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false));
   });
 
   it('renders History as the aggregate transcript with no ordinary composer', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       writable_transcript_row_id: null,
       ordinary_lifecycle: 'history',
     }));
@@ -1811,7 +2193,7 @@ describe('ProductConversationPage', () => {
 
     expect(screen.getByTestId('product-conversation-history')).toHaveTextContent('History is read-only.');
     expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
-    expect(screen.getByTestId('message-order')).toHaveTextContent('product-handoff:pc-1:row-1:cont-1');
+    expect(screen.getByTestId('message-order')).toHaveTextContent('cont-1');
   });
 
   it('keeps aggregate transcript viewer actions reachable while the aggregate route owns placement', async () => {
@@ -1831,7 +2213,7 @@ describe('ProductConversationPage', () => {
 
   it('enables the live runtime for an open aggregate despite stale writable-row metadata', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       writable_transcript_row_id: null,
       ordinary_lifecycle: 'open',
     }));
@@ -1844,7 +2226,7 @@ describe('ProductConversationPage', () => {
 
   it('keeps an Open aggregate mutable after archived drift triggers a failed background refresh', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'open' }))
       .mockRejectedValueOnce(new Error('refresh failed'));
     renderPage();
@@ -1853,7 +2235,7 @@ describe('ProductConversationPage', () => {
     act(() => emitLatestProjection({ serverArchived: true }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('refresh failed');
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
     expect(screen.getByTestId('message-order')).toHaveTextContent('m-1,m-2');
     expect(screen.queryByText('Showing cached row if available.')).not.toBeInTheDocument();
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(true);
@@ -1862,7 +2244,7 @@ describe('ProductConversationPage', () => {
 
   it('keeps a History aggregate read-only after a failed background refresh despite unarchived drift', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history' }))
       .mockRejectedValueOnce(new Error('refresh failed'));
     renderPage();
@@ -1871,7 +2253,7 @@ describe('ProductConversationPage', () => {
     act(() => notifyCloseSnapshotChanged('row-2'));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('refresh failed');
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
     expect(screen.getByTestId('message-order')).toHaveTextContent('m-1,m-2');
     expect(screen.getByText('History is read-only.')).toBeInTheDocument();
     expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
@@ -1879,7 +2261,7 @@ describe('ProductConversationPage', () => {
   });
   it('gates task approval mutations behind liveControlsEnabled', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       close: {
         attempt_id: 'attempt-1',
         phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null,
@@ -1899,7 +2281,7 @@ describe('ProductConversationPage', () => {
 
   it('retries older-page fetch once with a fresh tail cursor after a stale 400 cursor error', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockRejectedValueOnce(new ApiResponseError('stale cursor', 400))
       .mockResolvedValueOnce(makeSnapshot({ before: 'cursor-2', has_older: true }))
@@ -1913,8 +2295,8 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
     fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
 
-    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4'));
-    expect(vi.mocked(api.getProductConversationSnapshot).mock.calls.slice(1, 4)).toEqual([
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,cont-1,m-3,m-4'));
+    expect(vi.mocked(api.getProductConversationHistorySnapshot).mock.calls.slice(1, 4)).toEqual([
       ['pc-1', { message_limit: 100, before: 'cursor-1' }],
       ['pc-1', { message_limit: 100 }],
       ['pc-1', { message_limit: 100, before: 'cursor-2' }],
@@ -1945,7 +2327,7 @@ describe('ProductConversationPage', () => {
       before,
       has_older: hasOlder,
     });
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ close: activeClose, before: 'cursor-1', has_older: true }))
       .mockResolvedValueOnce(page('older-1', 0, 'cursor-0', true))
       .mockResolvedValueOnce(page('older-0', -1, 'stale-cursor', true))
@@ -1961,14 +2343,14 @@ describe('ProductConversationPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'load older' }));
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('older-0'));
     act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
-    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(4));
     fireEvent.click(screen.getByRole('button', { name: 'load older' }));
 
-    const expected = 'recovered,older-0,older-1,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4';
+    const expected = 'recovered,older-0,older-1,m-1,m-2,cont-1,m-3,m-4';
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(expected));
     const ids = screen.getByTestId('message-order').textContent?.split(',') ?? [];
     expect(new Set(ids).size).toBe(ids.length);
-    act(() => emitLatestProjection({ messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)] as never }));
+    act(() => emitLatestProjection({ messages: [makeMessage('m-3', 3, 'row-2'), makeMessage('m-4', 4, 'row-2')] as never }));
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(expected));
   });
 
@@ -1976,7 +2358,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     let resolveOlder!: (value: ProductConversationSnapshotView) => void;
     const older = new Promise<ProductConversationSnapshotView>((resolve) => { resolveOlder = resolve; });
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockReturnValueOnce(older)
       .mockResolvedValueOnce(makeSnapshot({
@@ -2006,7 +2388,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     let rejectOlder!: (reason: Error) => void;
     const older = new Promise<ProductConversationSnapshotView>((_resolve, reject) => { rejectOlder = reject; });
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockReturnValueOnce(older)
       .mockResolvedValueOnce(makeSnapshot({
@@ -2041,7 +2423,7 @@ describe('ProductConversationPage', () => {
       losses: [],
       residuals: [],
     } satisfies ProductConversationCloseView;
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
       .mockResolvedValueOnce(makeSnapshot({
         product_conversation_id: 'pc-2',
@@ -2061,14 +2443,14 @@ describe('ProductConversationPage', () => {
     act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
     await act(async () => Promise.resolve());
 
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
     expect(screen.getByTestId('message-order')).toHaveTextContent('beta-message');
     expect(screen.getByTestId('message-order')).toHaveTextContent('beta-message');
   });
 
   it('threads restore basis, root directory, system prompt, and explicit absent work scope', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot({ work_identity: null }))
       .mockResolvedValueOnce(makeSnapshot({
         segments: [{ segment_ordinal: 0, transcript_row_id: 'row-old', slug: 'old', title: 'Old', messages: [makeMessage('old-message', 0)], handoff: null }],
@@ -2154,7 +2536,7 @@ describe('ProductConversationPage', () => {
     expect(await screen.findByLabelText('recall draft')).toHaveFocus();
 
     cleanup();
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       ordinary_lifecycle: 'history',
       writable_transcript_row_id: null,
     }));
@@ -2272,7 +2654,7 @@ describe('ProductConversationPage', () => {
 
   it('keeps History Recall persisted but disables asking and re-ask mutations', async () => {
     const { api } = await import('../api');
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(makeSnapshot({
       ordinary_lifecycle: 'history',
       writable_transcript_row_id: null,
     }));
@@ -2312,7 +2694,7 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getChain)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveOldChain = resolve; }))
       .mockResolvedValueOnce(makeChain({ root_conv_id: 'root-chain-2', display_name: 'Product Beta' }));
-    vi.mocked(api.getProductConversationSnapshot)
+    vi.mocked(api.getProductConversationHistorySnapshot)
       .mockResolvedValueOnce(makeSnapshot())
       .mockResolvedValueOnce(makeSnapshot({
         product_conversation_id: 'pc-2',

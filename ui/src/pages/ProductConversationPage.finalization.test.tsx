@@ -12,7 +12,7 @@ import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
 import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { getProductConversationScenario } from '../fixtures/productConversation/scenarios';
-import { api, type Conversation, type Message, type ProductConversationSnapshotView } from '../api';
+import { api, type Conversation, type Message, type ProductConversationHistorySnapshotView as ProductConversationSnapshotView } from '../api';
 import type { RenderUnit } from '../conversation/renderUnits';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { VirtualTranscriptHandle, VirtualTranscriptProps } from '../components/VirtualTranscript';
@@ -95,7 +95,7 @@ vi.mock('../utils/syntaxHighlighter', () => ({ SyntaxHighlighter: () => null, on
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
   return { ...actual, api: { ...actual.api,
-    getProductConversationSnapshot: vi.fn(),
+    getProductConversationHistorySnapshot: vi.fn(),
     reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
   } };
 });
@@ -163,12 +163,13 @@ beforeEach(() => {
   probe.scrollToTail.mockClear();
   commits.length = 0;
   localStorage.clear();
-  const fixture = getProductConversationScenario('desktop-multi-segment-qa-work').snapshot!;
+  const scenario = getProductConversationScenario('desktop-multi-segment-qa-work');
+  const fixture = scenario.snapshot!;
   latestRow = fixture.latest_transcript_row_id;
   snapshot = { ...fixture, chain_qa_compatibility: null, writable_transcript_row_id: latestRow,
-    segments: fixture.segments.map((segment) => ({ ...segment, handoff: null,
+    segments: fixture.segments.map((segment) => ({ ...segment,
       messages: segment.transcript_row_id === latestRow ? [] : segment.messages })) };
-  vi.mocked(api.getProductConversationSnapshot).mockImplementation(async () => snapshot);
+  vi.mocked(api.getProductConversationHistorySnapshot).mockImplementation(async () => snapshot);
   seed(latestRow);
   vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(1000);
   vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(400);

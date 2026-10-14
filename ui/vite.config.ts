@@ -1,6 +1,6 @@
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, realpathSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 
 // Restore .gitkeep after vite wipes dist/ so fresh worktrees compile.
@@ -161,6 +161,7 @@ const isLadle = process.env.PHOENIX_LADLE === '1';
 // https://vitejs.dev/config/
 export default defineConfig(isLadle ? {
   plugins: [gitkeep()],
+  server: { fs: { allow: [resolve(__dirname), realpathSync(resolve(__dirname, 'node_modules'))] } },
 } : {
   plugins: [react(), shikiLangPrune(), gitkeep()],
   server: {

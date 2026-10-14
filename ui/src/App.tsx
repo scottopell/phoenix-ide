@@ -127,7 +127,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
   const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
-  const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; lifecycleOpen: boolean; mutationEnabled: boolean } | null>(null);
+  const [validatedSelection, setValidatedSelection] = useState<string | null>(null);
   const [pinError, setPinError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const locationRef = useRef(location);
@@ -136,14 +136,14 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   const pinned = sourcePins[0];
   const invalidPin = sourcePins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned));
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
+  const selectionKey = JSON.stringify([reference, sourcePins, location.pathname]);
 
   useEffect(() => {
     if (!reference) {
       setFallbackSnapshot(null);
       return;
     }
-    setExactMember(null);
-    setResolvedProduct(null);
+    setValidatedSelection(null);
     setFallbackSnapshot(null);
     setPinError(null);
     if (invalidPin) {
@@ -172,25 +172,23 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             if (source.product_conversation_id !== snapshot.product_conversation_id || source.requested_transcript_row_id !== pinned) {
               throw new Error('Transcript is not a member of this conversation');
             }
-            if (!cancelled) setExactMember({
-              reference,
-              transcript: pinned,
-              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
-              mutationEnabled: pinned === snapshot.writable_transcript_row_id,
-            });
+            if (!cancelled) {
+              setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+              setValidatedSelection(selectionKey);
+            }
             return;
           }
           if (!locationRef.current.pathname.startsWith('/product-conversations/') &&
-              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
-            setExactMember({
-              reference,
-              transcript: reference,
-              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
-              mutationEnabled: reference === snapshot.writable_transcript_row_id,
-            });
+              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id
+              && (locationRef.current.state as { chapterSelection?: unknown } | null)?.chapterSelection !== 'pending') {
+            setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+            const query = new URLSearchParams(locationRef.current.search);
+            query.set('source_transcript', reference);
+            navigate({ pathname: locationRef.current.pathname, search: query.toString(), hash: locationRef.current.hash }, { replace: true, state: locationRef.current.state });
             return;
           }
           setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+          setValidatedSelection(selectionKey);
           if (locationRef.current.pathname !== snapshot.canonical_route) {
             navigate({
               pathname: snapshot.canonical_route,
@@ -214,18 +212,17 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
         }
       });
     return () => { cancelled = true; };
-  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken]);
+  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken, selectionKey]);
 
+  if (resolvedProduct && !activeFallback) {
+    return <>
+      {pinError && <main><div role="alert">{pinError}</div></main>}
+      <div hidden={!!pinError || validatedSelection !== selectionKey} style={{ height: '100%' }}>
+        <ProductConversationPage productId={resolvedProduct.id} />
+      </div>
+    </>;
+  }
   if (pinError) return <main><div role="alert">{pinError}</div></main>;
-
-  if (exactMember && exactMember.reference === reference) {
-    return <EmbeddedConversationPage slug={exactMember.transcript} suppressCanonicalization routePrefix="/c"
-      aggregateLifecycleOpen={exactMember.lifecycleOpen} mutationEnabled={exactMember.mutationEnabled} />;
-  }
-
-  if (resolvedProduct && resolvedProduct.reference === reference && !activeFallback) {
-    return <ProductConversationPage productId={resolvedProduct.id} />;
-  }
 
   if (activeFallback) {
     return (

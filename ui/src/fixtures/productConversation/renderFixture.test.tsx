@@ -23,6 +23,67 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
 describe('ProductConversationFixture', () => {
+  it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('keeps an explicit loaded prompt selection when the %s unloaded-boundary read resolves', async (id) => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
+    const { container } = render(<ProductConversationFixture scenario={getProductConversationScenario(id)} />);
+    await waitFor(() => expect(container.querySelector(`[data-product-conversation-fixture-ready="${id}"]`)).not.toBeNull());
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-hold-older')));
+    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 2' }));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('1'));
+    fireEvent.click(await screen.findByRole('button', { name: /Member 3 request$/ }));
+    await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-history-prompt-3'));
+    act(() => window.dispatchEvent(new Event('product-conversation-fixture-release-older')));
+    await screen.findByRole('button', { name: 'Context boundary 2' });
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-history-prompt-3');
+    expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('1');
+    expect(screen.getByPlaceholderText('Type a message...')).toBeEnabled();
+  });
+
+  it.each(['source-call-ordinary', 'source-call-global'] as const)('resolves the real %s alias and expands its exact source call', async (id) => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
+    render(<ProductConversationFixture scenario={getProductConversationScenario(id)} />);
+    fireEvent.click(await screen.findByRole('link', { name: /transcript ID source-member · source call$/ }));
+    await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toContain(id === 'source-call-global' ? '/global/source-member?' : '/c/source-member?'));
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('source_transcript=source-member');
+    await waitFor(() => expect(document.querySelector('[data-tool-id="source-send-call"]')?.textContent).toContain('Source jump fixture payload'));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('keeps the fixture default metadata projection distinct from web history without live API fallback', async () => {
+    const scenario = getProductConversationScenario('ordinary-lazy-history');
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-fixture-ready="ordinary-lazy-history"]')).not.toBeNull());
+    const snapshot = await api.getProductConversationSnapshot('fixture-product-conversation', { message_limit: 1 });
+    expect(snapshot).not.toHaveProperty('boundaries');
+    expect(snapshot.segments[0]?.handoff?.summary).toBe('Preserved summary from member 1');
+    expect(snapshot.segments[1]?.handoff?.summary).toBe('Preserved summary from member 2');
+    expect(snapshot.segments.flatMap(segment => segment.messages).some(message => message.message_type === 'continuation')).toBe(false);
+  });
+
+  it.each(['ordinary-lazy-history', 'global-lazy-history'] as const)('loads both older cursor pages through the real %s adapter and keeps newest composer ownership', async (id) => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    const scenario = getProductConversationScenario(id);
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+    await waitFor(() => expect(container.querySelector(`[data-product-conversation-fixture-ready="${id}"]`)).not.toBeNull());
+    const history = vi.spyOn(api, id === 'global-lazy-history' ? 'getCoordinatorHistory' : 'getProductConversationHistorySnapshot');
+    const legacy = vi.spyOn(api, 'getProductConversationSnapshot');
+    expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBeUndefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Load context boundary 1' }));
+    await waitFor(() => expect(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests']).toBe('2'));
+    expect(history.mock.calls.map(call => call[1]?.before)).toEqual(['history-before-3', 'history-before-2']);
+    expect(legacy).not.toHaveBeenCalled();
+    expect(await screen.findByRole('button', { name: 'Context boundary 1' })).toBeInTheDocument();
+    expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('#message-continue-history-1');
+    expect(document.documentElement.dataset['productConversationFixtureEventSourceLastUrl']).toContain('history-3');
+    expect(screen.getByPlaceholderText('Type a message...')).toBeEnabled();
+    if (id === 'global-lazy-history') {
+      expect(scenario.snapshot).not.toHaveProperty('ordinary_lifecycle');
+      expect(scenario.snapshot).not.toHaveProperty('close');
+    }
+  });
+
   it('preserves origin-aware navigation after mounting a continued transcript again', async () => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     const originalRect = HTMLElement.prototype.getBoundingClientRect;
@@ -138,7 +199,7 @@ describe('ProductConversationFixture', () => {
       } });
       reactionStore.dispatch(snapshot.product_conversation_id, { type: 'edit', body: 'Keep this guarantee.' });
     });
-    const fetchSnapshot = vi.spyOn(api, 'getProductConversationSnapshot');
+    const fetchSnapshot = vi.spyOn(api, 'getProductConversationHistorySnapshot');
     fireEvent.click(await screen.findByRole('button', { name: /Return to passage/ }));
     const input = await screen.findByRole('textbox', { name: 'Your reaction' });
     expect(input).toHaveValue('Keep this guarantee.');
@@ -208,7 +269,7 @@ describe('ProductConversationFixture', () => {
 
   it('restores mutable API hooks after unmount', async () => {
     const scenario = getProductConversationScenario('mobile-open');
-    const originalGetSnapshot = api.getProductConversationSnapshot;
+    const originalGetSnapshot = api.getProductConversationHistorySnapshot;
     const originalGetPrStatus = api.getPrStatus;
     const originalGetChain = api.getChain;
     const originalSubmitChainQuestion = api.submitChainQuestion;
@@ -221,7 +282,7 @@ describe('ProductConversationFixture', () => {
       expect(container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
     });
 
-    expect(api.getProductConversationSnapshot).not.toBe(originalGetSnapshot);
+    expect(api.getProductConversationHistorySnapshot).not.toBe(originalGetSnapshot);
     expect(api.getPrStatus).not.toBe(originalGetPrStatus);
     expect(api.getChain).not.toBe(originalGetChain);
     expect(api.submitChainQuestion).not.toBe(originalSubmitChainQuestion);
@@ -231,7 +292,7 @@ describe('ProductConversationFixture', () => {
 
     unmount();
 
-    expect(api.getProductConversationSnapshot).toBe(originalGetSnapshot);
+    expect(api.getProductConversationHistorySnapshot).toBe(originalGetSnapshot);
     expect(api.getPrStatus).toBe(originalGetPrStatus);
     expect(api.getChain).toBe(originalGetChain);
     expect(api.submitChainQuestion).toBe(originalSubmitChainQuestion);

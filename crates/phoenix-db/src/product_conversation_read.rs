@@ -70,7 +70,16 @@ pub struct OrdinaryProductConversationCitation {
 #[derive(Debug, Clone)]
 pub struct ProductConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
+    pub latest_opening_pending: bool,
     pub close: Option<CloseProjection>,
+    pub messages: Vec<(i64, crate::Message)>,
+    pub requested_transcript_row_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinatorConversationSnapshotRead {
+    pub aggregate: ProductConversationAggregate,
+    pub latest_opening_pending: bool,
     pub messages: Vec<(i64, crate::Message)>,
     pub requested_transcript_row_id: String,
 }
@@ -306,10 +315,10 @@ fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> 
 }
 
 const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
-     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = (SELECT CASE kind WHEN 'coordinator' THEN 'coordinator' ELSE 'user' END FROM product_conversations WHERE id = ?1) AND root.parent_conversation_id IS NULL
      AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
      UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
-     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = (SELECT CASE kind WHEN 'coordinator' THEN 'coordinator' ELSE 'user' END FROM product_conversations WHERE id = ?1) AND successor.parent_conversation_id IS NULL
  ), snapshot_ceiling AS (
      SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
@@ -865,6 +874,11 @@ impl Database {
             )
             .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
+            let latest_opening_pending: i64 =
+                sqlx::query_scalar(Self::PENDING_CONTINUATION_OPENING_SQL)
+                    .bind(&aggregate.latest_transcript_row_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             let close = Self::get_active_close_projection_for_product_on(
                 &mut tx,
                 aggregate.product_conversation.id(),
@@ -882,6 +896,7 @@ impl Database {
             .await?;
             Ok(ProductConversationSnapshotRead {
                 aggregate,
+                latest_opening_pending: latest_opening_pending != 0,
                 close,
                 messages,
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
@@ -898,19 +913,88 @@ impl Database {
         result
     }
 
+    /// Reads bounded Global history without ordinary lifecycle or Close authority.
+    ///
+    /// # Errors
+    /// Returns an error for absent/non-Coordinator references or invalid persisted topology.
+    pub async fn read_coordinator_product_conversation_snapshot(
+        &self,
+        reference: &str,
+        before: Option<(i64, i64, String)>,
+        segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
+        limit: usize,
+    ) -> DbResult<CoordinatorConversationSnapshotRead> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin().await?;
+        let result = async {
+            let resolved = Self::resolve_product_conversation_on(
+                &mut tx,
+                reference,
+                ProductConversationKind::Coordinator,
+            )
+            .await?;
+            let aggregate = Self::get_product_conversation_on(
+                &mut tx,
+                &resolved.product_conversation_id,
+                ProductConversationKind::Coordinator,
+            )
+            .await?;
+            let latest_opening_pending: i64 =
+                sqlx::query_scalar(Self::PENDING_CONTINUATION_OPENING_SQL)
+                    .bind(&aggregate.latest_transcript_row_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let messages = Self::get_product_conversation_messages_page_on(
+                &mut tx,
+                aggregate.product_conversation.id(),
+                before,
+                segment_ceilings,
+                limit,
+            )
+            .await?;
+            Ok(CoordinatorConversationSnapshotRead {
+                aggregate,
+                latest_opening_pending: latest_opening_pending != 0,
+                messages,
+                requested_transcript_row_id: resolved.requested_transcript_row_id,
+            })
+        }
+        .await;
+        tx.rollback().await?;
+        result
+    }
+
     async fn resolve_ordinary_product_conversation_on(
         connection: &mut SqliteConnection,
         reference: &str,
     ) -> DbResult<ResolvedProductConversation> {
+        Self::resolve_product_conversation_on(
+            connection,
+            reference,
+            ProductConversationKind::Ordinary,
+        )
+        .await
+    }
+
+    async fn resolve_product_conversation_on(
+        connection: &mut SqliteConnection,
+        reference: &str,
+        kind: ProductConversationKind,
+    ) -> DbResult<ResolvedProductConversation> {
         let row = sqlx::query(
             "SELECT c.product_conversation_id, c.id
              FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
-             WHERE p.kind = 'ordinary' AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
+             WHERE p.kind = ?2 AND c.runtime_role = ?3 AND c.parent_conversation_id IS NULL
                AND (p.id = ?1 OR c.id = ?1 OR c.slug = ?1)
              ORDER BY CASE WHEN p.id = ?1 THEN 0 WHEN c.id = ?1 THEN 1 ELSE 2 END,
                       c.created_at ASC, c.id ASC LIMIT 1",
         )
         .bind(reference)
+        .bind(kind.as_str())
+        .bind(match kind {
+            ProductConversationKind::Ordinary => "user",
+            ProductConversationKind::Coordinator => "coordinator",
+        })
         .fetch_optional(&mut *connection)
         .await?;
         let Some(row) = row else {
@@ -925,10 +1009,23 @@ impl Database {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn get_ordinary_product_conversation_on(
         connection: &mut SqliteConnection,
         product_conversation_id: &ProductConversationId,
+    ) -> DbResult<ProductConversationAggregate> {
+        Self::get_product_conversation_on(
+            connection,
+            product_conversation_id,
+            ProductConversationKind::Ordinary,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_product_conversation_on(
+        connection: &mut SqliteConnection,
+        product_conversation_id: &ProductConversationId,
+        kind: ProductConversationKind,
     ) -> DbResult<ProductConversationAggregate> {
         let product =
             sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id = ?1")
@@ -941,27 +1038,39 @@ impl Database {
             ));
         };
         if ProductConversationKind::from_db_str(&product.try_get::<String, _>("kind")?)
-            != Some(ProductConversationKind::Ordinary)
+            != Some(kind)
         {
             return Err(DbError::ConversationNotFound(
                 product_conversation_id.to_string(),
             ));
         }
-        let lifecycle = product.try_get::<String, _>("ordinary_lifecycle")?;
-        let lifecycle =
-            OrdinaryProductConversationLifecycle::from_db_str(&lifecycle).ok_or_else(|| {
-                DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
-            })?;
+        let product_conversation = match kind {
+            ProductConversationKind::Ordinary => {
+                let lifecycle = product.try_get::<String, _>("ordinary_lifecycle")?;
+                let lifecycle = OrdinaryProductConversationLifecycle::from_db_str(&lifecycle)
+                    .ok_or_else(|| {
+                        DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
+                    })?;
+                ProductConversation::ordinary(product_conversation_id.clone(), lifecycle)
+            }
+            ProductConversationKind::Coordinator => {
+                ProductConversation::coordinator(product_conversation_id.clone())
+            }
+        };
+        let runtime_role = match kind {
+            ProductConversationKind::Ordinary => "user",
+            ProductConversationKind::Coordinator => "coordinator",
+        };
         let rows = sqlx::query(
             "WITH RECURSIVE transcript(id, ordinal) AS (
                  SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1
-                   AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+                   AND root.runtime_role = ?2 AND root.parent_conversation_id IS NULL
                    AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
                  UNION ALL
                  SELECT successor.id, transcript.ordinal + 1 FROM transcript
                  JOIN conversations predecessor ON predecessor.id = transcript.id
                  JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
-                 WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+                 WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = ?2 AND successor.parent_conversation_id IS NULL
              ) SELECT transcript.id, transcript.ordinal,
                     COALESCE((SELECT MAX(message.sequence_id) FROM messages message WHERE message.conversation_id = transcript.id), 0) AS tail_sequence_id,
                     (SELECT message.message_id FROM messages message
@@ -980,7 +1089,7 @@ impl Database {
              LEFT JOIN conversation_approved_task_objectives objective
                ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
-        ).bind(product_conversation_id.as_str()).fetch_all(&mut *connection).await?;
+        ).bind(product_conversation_id.as_str()).bind(runtime_role).fetch_all(&mut *connection).await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.try_get("id")?;
@@ -1026,10 +1135,7 @@ impl Database {
         let source =
             Self::product_conversation_source_on(connection, product_conversation_id).await?;
         Ok(ProductConversationAggregate {
-            product_conversation: ProductConversation::ordinary(
-                product_conversation_id.clone(),
-                lifecycle,
-            ),
+            product_conversation,
             root,
             latest_transcript_row_id: latest.transcript_row.conversation.id.clone(),
             updated_at,
@@ -1086,26 +1192,29 @@ impl Database {
             let summary = continuation_summary(&row, "continuation_content")?;
             let accepted_content =
                 message_content_from_row(&row, "accepted_message_type", "accepted_content")?;
-            let accepted_is_duplicate_summary = match accepted_content {
-                MessageContent::User(user) => user.text == summary,
-                MessageContent::Continuation(continuation) => continuation.summary == summary,
-                MessageContent::Agent(_)
-                | MessageContent::Tool(_)
-                | MessageContent::System(_)
-                | MessageContent::Error(_)
-                | MessageContent::Skill(_) => false,
-            };
+            let opening_authority = ContinuationOpeningAuthority::from_db_str(
+                &row.try_get::<String, _>("opening_authority")?,
+            )
+            .ok_or_else(|| {
+                DbError::Serialization("unknown continuation opening authority".to_string())
+            })?;
+            let accepted_is_duplicate_summary = opening_authority
+                == ContinuationOpeningAuthority::GeneratedPredecessorContext
+                && match accepted_content {
+                    MessageContent::User(user) => user.text == summary,
+                    MessageContent::Continuation(continuation) => continuation.summary == summary,
+                    MessageContent::Agent(_)
+                    | MessageContent::Tool(_)
+                    | MessageContent::System(_)
+                    | MessageContent::Error(_)
+                    | MessageContent::Skill(_) => false,
+                };
             return Ok(Some(ProductConversationHandoff::Completed {
                 predecessor_transcript_row_id: predecessor.to_string(),
                 successor_transcript_row_id: successor.to_string(),
                 continuation_message_id: row.try_get("continuation_message_id")?,
                 accepted_successor_message_id: row.try_get("accepted_successor_message_id")?,
-                opening_authority: ContinuationOpeningAuthority::from_db_str(
-                    &row.try_get::<String, _>("opening_authority")?,
-                )
-                .ok_or_else(|| {
-                    DbError::Serialization("unknown continuation opening authority".to_string())
-                })?,
+                opening_authority,
                 summary,
                 accepted_is_duplicate_summary,
             }));
@@ -1635,7 +1744,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn resolves_member_identity_and_reads_typed_handoff() {
+    async fn resolves_member_identity_and_preserves_equal_text_user_authorized_handoff() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
             .create_conversation("root", "root-slug", "/tmp", true, None, None)
@@ -1654,7 +1763,7 @@ mod tests {
                 &root.id,
                 NewContinuationDispatchIntent::user_authorized(
                     ClientTurnKey::try_from("opening").unwrap(),
-                    "accepted opening handoff".to_string(),
+                    "exact handoff".to_string(),
                     None,
                 ),
             )
@@ -1681,7 +1790,7 @@ mod tests {
         db.add_message(
             "opening",
             &successor.id,
-            &MessageContent::user("accepted opening handoff"),
+            &MessageContent::user("exact handoff"),
             None,
             None,
         )
@@ -1749,6 +1858,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_history_pages_across_three_members_without_ordinary_lifecycle() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let mut member = root.clone();
+        let mut expected = Vec::new();
+        for ordinal in 0..3 {
+            for index in 0..3 {
+                let id = format!("global-{ordinal}-{index}");
+                db.add_message(
+                    &id,
+                    &member.id,
+                    &MessageContent::user(id.clone()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                expected.push(id);
+            }
+            if ordinal < 2 {
+                let id = format!("global-boundary-{ordinal}");
+                db.add_message(
+                    &id,
+                    &member.id,
+                    &MessageContent::Continuation(ContinuationContent {
+                        summary: format!("summary {ordinal}"),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                expected.push(id);
+                db.update_conversation_state(
+                    &member.id,
+                    &ConvState::ContextExhausted {
+                        summary: format!("summary {ordinal}"),
+                    },
+                )
+                .await
+                .unwrap();
+                member = match db.continue_conversation(&member.id).await.unwrap() {
+                    ContinueOutcome::Created(next) => next,
+                    ContinueOutcome::AlreadyContinued(_) => {
+                        panic!("unexpected existing continuation")
+                    }
+                    ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                        panic!("unexpected parent state {state_variant}")
+                    }
+                };
+            }
+        }
+        let mut before = None;
+        let mut actual = Vec::new();
+        loop {
+            let page = db
+                .read_coordinator_product_conversation_snapshot(&root.id, before, None, 2)
+                .await
+                .unwrap();
+            assert!(matches!(
+                page.aggregate.product_conversation,
+                ProductConversation::Coordinator { .. }
+            ));
+            assert_eq!(page.aggregate.latest_transcript_row_id, member.id);
+            assert_eq!(page.aggregate.segments.len(), 3);
+            if page.messages.is_empty() {
+                break;
+            }
+            let (ordinal, last) = page.messages.last().unwrap();
+            before = Some((*ordinal, last.sequence_id, last.message_id.clone()));
+            actual.extend(
+                page.messages
+                    .into_iter()
+                    .map(|(_, message)| message.message_id),
+            );
+        }
+        actual.reverse();
+        assert_eq!(actual, expected);
+        assert!(db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, None, 2)
+            .await
+            .is_err());
+        let ordinary = db
+            .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert!(db
+            .read_coordinator_product_conversation_snapshot(&ordinary.id, None, None, 2)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

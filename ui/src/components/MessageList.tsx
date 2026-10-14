@@ -377,6 +377,7 @@ function renderHistoricalUnit(
       );
     case 'continuation': {
       const summary = (unit.message.content as { summary?: string })?.summary;
+      const handoff = (unit.message.display_data as ProductHistoricalHandoffDisplayData | null)?.productHistoricalHandoff;
       if (!summary) return null;
       const revealedSummary = activeHighlight?.owner === 'message-text'
         ? renderHighlightedText(summary, activeHighlight.start, activeHighlight.end)
@@ -385,6 +386,7 @@ function renderHistoricalUnit(
         <div id={`message-${unit.message.message_id}`}>
           <CompletedContinuationBoundary
             summary={summary}
+            provenance={{ predecessor: unit.message.conversation_id, messageId: unit.message.message_id, ...(handoff ? { successor: handoff.successor_transcript_row_id } : {}) }}
             revealedSummary={revealedSummary}
             revealSummary={revealedSummary !== undefined}
           />
@@ -1356,10 +1358,12 @@ function MessageListImpl({
       pending.conversationId !== conversationId ||
       pending.key !== key
     ) return;
+    const toolTarget = pending.toolUseId ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) : null;
+    if (pending.toolUseId && !toolTarget) return;
     pendingPulseRef.current = null;
     clearHighlight();
     const target = pending.toolUseId
-      ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) ?? row
+      ? toolTarget!
       : pending.memberMessageId
         ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
         : row.querySelector('.message') ?? row;
@@ -1377,7 +1381,7 @@ function MessageListImpl({
     clearHighlight();
   }, [clearHighlight]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     pendingPulseRef.current = null;
     clearHighlight();
   }, [conversationId, clearHighlight]);
@@ -1388,6 +1392,19 @@ function MessageListImpl({
       .find((candidate) => candidate.dataset['renderUnitKey'] === key);
     if (row) pulseMountedRow(key, row);
   }, [pulseMountedRow]);
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!sourceToolId || !scroller) return;
+    const applyPendingPulse = () => {
+      const pending = pendingPulseRef.current;
+      if (pending) pulseIfMounted(pending.key);
+    };
+    const observer = new MutationObserver(applyPendingPulse);
+    observer.observe(scroller, { childList: true, subtree: true });
+    applyPendingPulse();
+    return () => observer.disconnect();
+  }, [sourceToolId, pulseIfMounted]);
 
   const scrollToUnitIndex = useCallback((
     unitIndex: number,
@@ -1444,10 +1461,15 @@ function MessageListImpl({
   useEffect(() => {
     const key = sourceMessageId && sourceToolId ? `${sourceMessageId}:${sourceToolId}` : null;
     if (!key) { revealedSourceRef.current = null; return; }
+    if (transcriptPositioning.kind === 'positioning' && transcriptPositioning.command.kind === 'jump_to_message'
+      && transcriptPositioning.command.targetMessageId === sourceMessageId) {
+      revealedSourceRef.current = key;
+      return;
+    }
     if (revealedSourceRef.current !== key && sourceMessageId && scrollToMessageId(sourceMessageId)) {
       revealedSourceRef.current = key;
     }
-  }, [sourceMessageId, sourceToolId, scrollToMessageId]);
+  }, [sourceMessageId, sourceToolId, scrollToMessageId, transcriptPositioning]);
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;

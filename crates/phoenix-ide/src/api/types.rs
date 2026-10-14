@@ -363,7 +363,7 @@ pub enum ProductConversationCloseUnavailableReasonView {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ProductConversationSnapshotView {
+pub struct ProductConversationSnapshotMetadataView {
     pub product_conversation_id: String,
     pub close: Option<ProductConversationCloseView>,
     pub canonical_route: String,
@@ -372,12 +372,70 @@ pub struct ProductConversationSnapshotView {
     pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
     pub latest_transcript_row_id: String,
     pub writable_transcript_row_id: Option<String>,
+    pub latest_opening_pending: bool,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
     pub work_identity: Option<ProductConversationWorkIdentityView>,
     pub source: Option<ProductConversationSourceView>,
     pub chain_qa_compatibility: Option<ProductConversationChainQaCompatibilityView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationHistorySnapshotView {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub metadata: ProductConversationSnapshotMetadataView,
+    pub segments: Vec<ConversationHistorySegmentView>,
+    pub boundaries: Vec<ConversationHistoryBoundaryView>,
+    pub before: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConversationHistorySegmentView {
+    pub segment_ordinal: i64,
+    pub transcript_row_id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub messages: Vec<crate::api::wire::EnrichedMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationSnapshotView {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub metadata: ProductConversationSnapshotMetadataView,
     pub segments: Vec<ProductConversationSegmentView>,
+    pub before: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConversationHistoryBoundaryView {
+    pub message_id: String,
+    pub represented_successor_opening_message_id: Option<String>,
+    pub predecessor_transcript_row_id: String,
+    pub successor_transcript_row_id: String,
+    pub segment_ordinal: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CoordinatorConversationSnapshotView {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub requested_transcript_row_id: String,
+    pub canonical_root: ProductConversationTranscriptRowView,
+    pub latest_transcript_row_id: String,
+    pub writable_transcript_row_id: Option<String>,
+    pub latest_opening_pending: bool,
+    pub updated_at: String,
+    pub segments: Vec<ConversationHistorySegmentView>,
+    pub boundaries: Vec<ConversationHistoryBoundaryView>,
     pub before: Option<String>,
     pub has_older: bool,
 }

@@ -636,7 +636,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
         writable_transcript_row_id: null, updated_at: '2024-06-01T00:00:00Z',
         presentation: { kind: 'state' as const, display_name: 'A', presentation_mode: 'idle' },
         work_identity: null, source: null, chain_qa_compatibility: null,
-        segments: [], before: null, has_older: false,
+        segments: [], latest_opening_pending: false, before: null, has_older: false,
       };
       store.observeProductConversationSnapshot(snapshot);
       store.observeProductConversationSnapshot({ ...snapshot, ordinary_lifecycle: 'open' });
