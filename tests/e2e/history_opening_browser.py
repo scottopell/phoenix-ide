@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent 77ab7a4 checkout, independently built ignored
+Inputs are a clean independent 2f57bd1 checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports three hash-attested telemetry harness
@@ -31,8 +31,8 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "77ab7a42db1a74f6eb841bcf0c9c4669fb9ce4b0"
-TREE_PIN = "b1ed4d13258e94d43ac533731b0c5c28fcdeaf38"
+PIN = "2f57bd1ba22569a01381d63117480cd946b6bd8d"
+TREE_PIN = "61b490ca88624f159a0eb51e35abc200c99220bd"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
