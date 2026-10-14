@@ -5021,11 +5021,7 @@ impl Database {
              FROM work_scope_environments e
              JOIN conversations c ON c.work_scope_id = e.work_scope_id
                WHERE e.environment_kind = 'allocated_worktree'
-                 AND c.id NOT IN (SELECT id FROM coordinator_chain)
-             UNION
-             SELECT scope.cwd FROM coordinator_work_scope owner
-             JOIN work_scopes scope ON scope.id = owner.work_scope_id
-             WHERE scope.lifecycle = 'active' AND scope.environment_kind = 'coordinator_home'",
+                 AND c.id NOT IN (SELECT id FROM coordinator_chain)",
         )
         .fetch_all(&self.pool)
         .await?;

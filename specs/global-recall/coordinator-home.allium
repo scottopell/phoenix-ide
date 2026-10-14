@@ -8,7 +8,12 @@ entity InstanceHome {
     state: unbound | ready | unavailable
 }
 
+entity CoordinatorMember {
+    scope_id: String?
+}
+
 entity HomeObservation {
+    scope_identity: String
     canonical_path: String
     directory_valid: Boolean
     worker_overlap: Boolean
@@ -20,9 +25,8 @@ rule InitializeHome {
     requires: observation.directory_valid
     requires: not observation.worker_overlap
     requires: observation.canonical_path = home.configured_path
-    let identity = AllocateHomeScopeIdentity()
     ensures:
-        home.scope_id = identity
+        home.scope_id = observation.scope_identity
         home.persisted_path = observation.canonical_path
         home.state = ready
     @guidance
@@ -54,19 +58,38 @@ rule RejectInvalidBoundHome {
 }
 
 rule CoordinatorContinues {
-    when: CoordinatorContinuationAccepted(home)
+    when: CoordinatorContinuationAccepted(home, successor)
     requires: home.scope_id != null
     ensures:
-        home.scope_id = home.scope_id
-        home.persisted_path = home.persisted_path
+        successor.scope_id = home.scope_id
     @guidance
         -- Attach the successor to the same instance-owned scope, irrespective
         -- of ordinary mode or current transcript identity. Regenerate trusted
         -- home context and preserve deliberate historical pointers, not file instructions.
 }
 
-@invariant IndependentRetention
-    -- Ordinary conversation Close/Delete, task approval, Git cleanup and
-    -- transcript continuation cannot mutate/delete the binding or home files.
-    -- Coordinator home is non-project; scoped execution still requires an
-    -- explicit active scope ID. Retained notes never confer authority.
+invariant ReadyHomeHasAuthority {
+    for home in InstanceHome:
+        home.state = ready implies (home.scope_id != null and home.persisted_path != null)
+}
+
+surface ServerHomeInitialization {
+    facing observation: HomeObservation
+    context home: InstanceHome
+    provides:
+        InitializeRequested(home, observation)
+    @guarantee IndependentRetention
+        -- Ordinary Close/Delete, task approval, Git cleanup and continuation
+        -- cannot mutate/delete the binding or retained home. Explicit scoped
+        -- execution remains required; notes never confer authority.
+    @guarantee TrustedObservation
+        -- Filesystem validation and identity allocation are server-owned; this
+        -- surface does not accept paths or identities from model-authored notes.
+}
+
+surface CoordinatorContinuation {
+    facing successor: CoordinatorMember
+    context home: InstanceHome
+    provides:
+        CoordinatorContinuationAccepted(home, successor)
+}

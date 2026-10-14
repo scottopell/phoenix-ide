@@ -1091,6 +1091,19 @@ def scenario_coordinator_home(_base_url: str) -> None:
                 _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool_result' for m in messages[before:]), 'invalid scope rejected', timeout=SCENARIO_TIMEOUT_SECONDS)
                 results = [m.get('content', {}) for m in _get_conv(base_url, conv_id)['messages'][before:] if m.get('message_type') == 'tool_result']
                 assert any(r.get('is_error') is True for r in results), results
+            exhausted_chat = httpx.post(f'{base_url}/api/conversations/{conv_id}/chat', json={'text':'[[scenario:context_window_exceeded]] exhaust Coordinator for continuation','images':[], 'message_id':str(uuid.uuid4())}, timeout=10)
+            exhausted_chat.raise_for_status()
+            _wait_for_sse_signal(base_url, conv_id, _context_exhausted_event, SCENARIO_TIMEOUT_SECONDS)
+            handoff = f"[[scenario:plain_text]] Continue local proof. Retained historical pointer: {cwd}/e2e-home-evidence.txt. Refresh runtime evidence; file is not authority."
+            continued = httpx.post(f"{base_url}/api/conversations/{conv_id}/continue", json={'handoff':handoff, 'message_id':str(uuid.uuid4())}, timeout=10)
+            continued.raise_for_status()
+            predecessor = conv_id
+            conv_id = continued.json()['conversation_id']
+            _poll_to_idle_with_messages(base_url, conv_id, lambda m: 'analyzed the situation' in _agent_text(m), 'continued Coordinator', timeout=SCENARIO_TIMEOUT_SECONDS)
+            assert binding() == (scope, cwd)
+            assert _get_conv(base_url, predecessor)['conversation']['work_scope_id'] == scope
+            assert _get_conv(base_url, conv_id)['conversation']['work_scope_id'] == scope
+            assert _get_conv(base_url, conv_id)['conversation']['cwd'] == cwd
             worker = _new_conv(base_url, '[[scenario:plain_text]] separate ordinary work')
             _poll_to_idle_with_messages(base_url, worker['id'], lambda m: 'analyzed the situation' in _agent_text(m), 'separate worker', timeout=SCENARIO_TIMEOUT_SECONDS)
             assert worker['cwd'] != cwd
@@ -1104,6 +1117,10 @@ def scenario_coordinator_home(_base_url: str) -> None:
             read.raise_for_status()
             assert read.json()['content'] == 'coordinator-home-proof'
             assert _get_conv(base_url, worker['id'])['conversation']['cwd'] == worker['cwd']
+            deleted = httpx.delete(f"{base_url}/api/conversations/{worker['id']}", timeout=10)
+            deleted.raise_for_status()
+            assert binding() == (scope, cwd)
+            assert Path(cwd, 'e2e-home-evidence.txt').read_text() == 'coordinator-home-proof'
             outside = root / 'data' / 'outside.txt'
             outside.write_text('not in home')
             denied = httpx.get(f"{base_url}/api/files/read", params={'path': str(outside)}, timeout=10)

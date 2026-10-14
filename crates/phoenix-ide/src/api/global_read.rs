@@ -2423,6 +2423,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::MessageConflict(_)
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
+        | DbError::CoordinatorWorkScope(_)
         | DbError::Serialization(_)
         | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)
