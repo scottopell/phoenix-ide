@@ -399,6 +399,8 @@ test('chat ACK retains exact actual URL/status/body/canonical ID and rejects dup
   const receipt = { url: 'http://127.0.0.1:1/api/conversations/successor/chat', status: 200,
     raw: JSON.stringify(body), body, canonical_message_id: 'successor:key' };
   validateChatAck(receipt, 'successor', 'key');
+  const pinnedBody = { queued: true };
+  validateChatAck({ ...receipt, raw: JSON.stringify(pinnedBody), body: pinnedBody }, 'successor', 'key');
   for (const mutation of [{ url: receipt.url.replace('successor', 'foreign') }, { status: 201 },
     { canonical_message_id: 'foreign:key' }, { body: { ...body, already_persisted: true } },
     { body: { ...body, steering: true } }, { body: { ...body, queued: false } }]) {

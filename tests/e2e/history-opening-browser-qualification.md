@@ -128,7 +128,7 @@ The instrumented recorder uses a discriminated capture policy:
   read is attempted. The actual successor chat ACK is separately read/retained
   by the behavioral driver in `assertions.jsonl` (URL, status, raw/parsed body,
   exact canonical message ID); a fresh randomized turn requires queued true,
-  steering false and already_persisted false. Browser request payloads, including telemetry POSTs, remain in
+  steering/already_persisted false when present (the pinned DTO omits false fields). Browser request payloads, including telemetry POSTs, remain in
   `browser-requests.jsonl`. Telemetry ack bodies are not owned history evidence;
   this harness imports no telemetry readiness or telemetry qualification claim.
 
@@ -283,16 +283,16 @@ Earlier audit results above remain historical, not evidence of this source.
 | Hard stop omitted incomplete capture state | Corrected: `partial:true` receipt and result inventory include pending metadata, outcomes, body task count and absolute deadline before nonzero exit. Complete drain is recorded only after all states/tasks terminate. | Partial-inventory regression plus source hard-stop wiring; no hard-stop child/runtime was executed. |
 | Python could count forced SIGTERM as normal server completion | Corrected: after successful browser/Stop, wait at most 65 seconds **inside** `owned_process`, before its forced-cleanup finally. Require actual libtest returncode zero, removed IPC socket, removed driver-owned HOME from the validated startup receipt. | Fake-process success, timeout, positive/signal exit and resource-cleanup override tests. `server-completion.json` retains success/timeout/nonzero/signal/cleanup failure; failures before normal wait are `force_cleanup_required`, never success. Outer `result.json` includes each completion receipt. |
 | Full manual edge and restored acquisition | Existing four-field manual fixture/Pending oracle retained; restored `fetchedLatestAccepted` body now independently validates ownership and full accepted edge against committed IPC evidence, not its own roundtrip. | Each of four edge fields mutated for fixture/Pending/accepted; Global acquisition uses all owned aliases. URL alone cannot qualify a foreign body. Python stable-product and persisted adjacent-boundary checks retained and endpoints asserted explicitly. |
-| Actual chat ACK retained only as generic metadata | Corrected: driver saves real raw/parsed ACK, actual URL/status and exact canonical ID in assertions before validation. Fresh-key duplicate (`already_persisted:true`) and steering responses fail. | ACK field mutations fail; queued/steering/duplicate contract inspected in pinned/current `ChatResponse` implementation. Real ACK execution remains required. |
+| Actual chat ACK retained only as generic metadata | Corrected: driver saves real raw/parsed ACK, actual URL/status and exact canonical ID in assertions before validation. Fresh-key duplicate (`already_persisted:true`) and steering responses fail. Pinned false-field omission is accepted without fabricating keys in the retained body. | ACK field mutations fail; queued/steering/duplicate contract inspected in pinned/current `ChatResponse` implementation. Real ACK execution remains required. |
 | Mock server can fail after Stop rejects a worker | No bypass added. Exact pinned ignored driver polls actual `run_server`, uses existing Stop/gate cleanup and drops its driver-owned TempDir before test process return. The new zero-exit gate exposes server/worker failure instead of forgiving it. | Read-only driver source audit only; a normal Stop returning nonzero is a genuine qualification failure requiring investigation, not a forced-cleanup pass. |
 
 ### Fresh authentic replay and source hashes
 
 New local output, **not** replacement of any old artifact:
-`.phoenix/evidence/continuous-history/pre-dispatch428-drain-audit/`.
+`.phoenix/evidence/continuous-history/pre-dispatch428-drain-audit/final-with-pinned-ack/`.
 `ordinary/manifest.json` and `global/manifest.json` hash the corrected recorder,
 shared helper, replay CLI, exact pinned generated DTOs, original inputs and new
-outputs. `source-audit.json` additionally hashes Python, Node tests, this document,
+outputs. The parent directory’s `source-audit.json` additionally hashes Python, Node tests, this document,
 and the read-only pinned ignored driver. Same authentic source JSONL/IPC/SSE inputs
 and CLI flags as above were rerun with `--output` changed to these fresh
 `ordinary/` and `global/` directories; original full raw bodies remain unchanged.

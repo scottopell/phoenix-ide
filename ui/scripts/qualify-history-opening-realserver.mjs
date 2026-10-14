@@ -121,7 +121,11 @@ export function validateChatAck(receipt, successor, key) {
   assert.equal(new URL(receipt.url).pathname, `/api/conversations/${successor}/chat`);
   assert.equal(receipt.status, 200);
   assert.equal(receipt.canonical_message_id, `${successor}:${key}`);
-  assert.deepEqual(receipt.body, { queued: true, steering: false, already_persisted: false });
+  assert.equal(receipt.body.queued, true);
+  // Pinned ChatResponse omits false steering/already_persisted fields.
+  for (const field of ['steering', 'already_persisted']) {
+    if (Object.hasOwn(receipt.body, field)) assert.equal(receipt.body[field], false, field);
+  }
   assert.deepEqual(JSON.parse(receipt.raw), receipt.body);
 }
 export function faultTarget(method, url, state, kind) {
