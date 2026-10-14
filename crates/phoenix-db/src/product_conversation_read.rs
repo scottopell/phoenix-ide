@@ -305,7 +305,8 @@ fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> 
     Ok(content.summary)
 }
 
-const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
+#[cfg(test)]
+const ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
      SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
      AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
      UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
@@ -322,6 +323,28 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
  WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
    AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
  ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6";
+
+const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
+     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+     AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
+     UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+ ), snapshot_ceiling AS (
+     SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
+            json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
+            json_extract(value, '$.tail_message_id') AS tail_message_id
+     FROM json_each(?2)
+ ), selected AS MATERIALIZED (
+     SELECT messages.message_id, messages.conversation_id, messages.sequence_id, transcript.ordinal
+     FROM transcript
+     CROSS JOIN messages INDEXED BY messages_conversation_sequence
+       ON messages.conversation_id = transcript.id
+     WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
+       AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
+     ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6
+ ) SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content, m.display_data, m.usage_data, m.created_at, m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id, selected.ordinal
+ FROM selected JOIN messages m ON m.message_id = selected.message_id
+ ORDER BY selected.ordinal DESC, selected.sequence_id DESC, selected.message_id DESC";
 
 impl Database {
     /// Returns the accepted opening message ID for a completed continuation edge.
@@ -1367,6 +1390,478 @@ mod tests {
     use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
 
+    async fn full_message_page_rows(
+        connection: &mut SqliteConnection,
+        sql: &str,
+        product_id: &str,
+        before: Option<&(i64, i64, String)>,
+        ceilings: Option<&str>,
+        limit: i64,
+    ) -> Vec<serde_json::Value> {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(product_id)
+            .bind(ceilings)
+            .bind(before.map(|cursor| cursor.0))
+            .bind(before.map(|cursor| cursor.1))
+            .bind(before.map(|cursor| cursor.2.as_str()))
+            .bind(limit)
+            .fetch_all(connection)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                assert_eq!(row.len(), 15);
+                let mut value = serde_json::Map::new();
+                for column in [
+                    "message_id",
+                    "conversation_id",
+                    "message_type",
+                    "content",
+                    "display_data",
+                    "usage_data",
+                    "created_at",
+                    "origin_kind",
+                    "origin_product_conversation_id",
+                    "origin_transcript_id",
+                    "origin_subscription_event_id",
+                    "origin_source_message_id",
+                    "origin_source_tool_use_id",
+                ] {
+                    value.insert(
+                        column.into(),
+                        serde_json::to_value(row.try_get::<Option<String>, _>(column).unwrap())
+                            .unwrap(),
+                    );
+                }
+                for column in ["sequence_id", "ordinal"] {
+                    value.insert(column.into(), row.try_get::<i64, _>(column).unwrap().into());
+                }
+                serde_json::Value::Object(value)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn late_hydration_matches_full_row_oracle_matrix() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        // This isolated SQL fixture permits sequence ties without weakening the production schema.
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, product_conversation_id TEXT NOT NULL,
+                runtime_role TEXT NOT NULL, parent_conversation_id TEXT, continued_in_conv_id TEXT
+             );
+             CREATE TABLE messages (
+                message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL,
+                message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT,
+                created_at TEXT NOT NULL, origin_kind TEXT NOT NULL, origin_product_conversation_id TEXT,
+                origin_transcript_id TEXT, origin_subscription_event_id TEXT,
+                origin_source_message_id TEXT, origin_source_tool_use_id TEXT
+             );
+             CREATE INDEX messages_conversation_sequence ON messages(conversation_id, sequence_id);
+             INSERT INTO conversations VALUES
+                ('s0', 'product', 'user', NULL, 's1'),
+                ('s1', 'product', 'user', NULL, 's2'),
+                ('s2', 'product', 'user', NULL, NULL),
+                ('noise', 'other-product', 'user', NULL, NULL),
+                ('child', 'product', 'user', 's0', NULL),
+                ('agent', 'product', 'sub_agent', NULL, NULL),
+                ('empty', 'empty-product', 'user', NULL, NULL);",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let sequences = [0_i64, 7, 7, 9_007_199_254_740_993, i64::MAX];
+        for segment in ["s0", "s1", "s2", "noise", "child", "agent"] {
+            for (index, sequence) in sequences.iter().enumerate() {
+                let id = format!("{segment}-{index}");
+                let optional = |field| (index % 2 == 0).then(|| format!("{field}-{id}"));
+                sqlx::query(
+                    "INSERT INTO messages VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6,
+                     '2026-01-01T00:00:00Z', 'internal_conversation', ?7, ?8, ?9, ?10, ?11)",
+                )
+                .bind(&id)
+                .bind(segment)
+                .bind(sequence)
+                .bind(format!("{id}:{}", "payload".repeat(256)))
+                .bind(optional("display"))
+                .bind(optional("usage"))
+                .bind(optional("product"))
+                .bind(optional("transcript"))
+                .bind(optional("subscription"))
+                .bind(optional("source-message"))
+                .bind(optional("source-tool"))
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            }
+        }
+        let mut cursors = vec![
+            None,
+            Some((-1, 0, String::new())),
+            Some((3, i64::MAX, "z".into())),
+        ];
+        for ordinal in 0..3_i64 {
+            for (index, sequence) in sequences.iter().enumerate() {
+                cursors.push(Some((ordinal, *sequence, format!("s{ordinal}-{index}"))));
+            }
+            cursors.push(Some((ordinal, 7, format!("s{ordinal}-1a"))));
+        }
+        let all_ceilings = (0..3)
+            .map(|ordinal| ProductConversationSegmentCeiling {
+                transcript_row_id: format!("s{ordinal}"),
+                tail_sequence_id: i64::MAX,
+                tail_message_id: Some(format!("s{ordinal}-4")),
+            })
+            .collect::<Vec<_>>();
+        let partial_ceilings = vec![
+            ProductConversationSegmentCeiling {
+                transcript_row_id: "s0".into(),
+                tail_sequence_id: 7,
+                tail_message_id: Some("s0-1".into()),
+            },
+            ProductConversationSegmentCeiling {
+                transcript_row_id: "s2".into(),
+                tail_sequence_id: 9_007_199_254_740_993,
+                tail_message_id: Some("s2-3".into()),
+            },
+        ];
+        let null_tail_ceiling = vec![ProductConversationSegmentCeiling {
+            transcript_row_id: "s1".into(),
+            tail_sequence_id: 7,
+            tail_message_id: None,
+        }];
+        let ceilings = [
+            None,
+            Some("[]".to_string()),
+            Some(serde_json::to_string(&all_ceilings).unwrap()),
+            Some(serde_json::to_string(&partial_ceilings).unwrap()),
+            Some(serde_json::to_string(&null_tail_ceiling).unwrap()),
+        ];
+        for product in ["product", "empty-product", "missing-product"] {
+            for cursor in &cursors {
+                for ceiling in &ceilings {
+                    for limit in [0, 1, 2, 5, 51] {
+                        let expected = full_message_page_rows(
+                            &mut connection,
+                            ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                            product,
+                            cursor.as_ref(),
+                            ceiling.as_deref(),
+                            limit,
+                        )
+                        .await;
+                        let actual = full_message_page_rows(
+                            &mut connection,
+                            PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                            product,
+                            cursor.as_ref(),
+                            ceiling.as_deref(),
+                            limit,
+                        )
+                        .await;
+                        assert_eq!(
+                            actual, expected,
+                            "product={product} cursor={cursor:?} ceiling={ceiling:?} limit={limit}"
+                        );
+                    }
+                }
+            }
+        }
+        let complete = full_message_page_rows(
+            &mut connection,
+            PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+            "product",
+            None,
+            None,
+            51,
+        )
+        .await;
+        assert_eq!(complete.len(), 15);
+        assert_eq!(complete[0]["message_id"], "s2-4");
+        assert_eq!(complete[0]["sequence_id"].as_i64(), Some(i64::MAX));
+        assert_eq!(
+            complete[1]["sequence_id"].as_i64(),
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(complete[2]["message_id"], "s2-2");
+        assert_eq!(complete[3]["message_id"], "s2-1");
+        assert_eq!(complete[14]["message_id"], "s0-0");
+    }
+
+    #[tokio::test]
+    async fn late_hydration_matches_oracle_after_attachment_hydration() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("hydrate", "hydrate", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        seed_reset_message(&db, &root).await;
+        let mut connection = db.pool.acquire().await.unwrap();
+        let mut expected = sqlx::query(ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL)
+            .bind(root.product_conversation_id.as_str())
+            .bind(None::<String>)
+            .bind(None::<i64>)
+            .bind(None::<i64>)
+            .bind(None::<String>)
+            .bind(2_i64)
+            .try_map(|row| {
+                let ordinal: i64 = row.try_get("ordinal")?;
+                super::super::parse_message_row(row).map(|message| (ordinal, message))
+            })
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(expected.len(), 1);
+        let mut messages = expected
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect::<Vec<_>>();
+        super::super::hydrate_attachments_conn(&mut connection, &mut messages)
+            .await
+            .unwrap();
+        for ((_, message), hydrated) in expected.iter_mut().zip(messages) {
+            *message = hydrated;
+        }
+        let actual = Database::get_product_conversation_messages_page_on(
+            &mut connection,
+            &root.product_conversation_id,
+            None,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    async fn seed_reset_message(db: &Database, root: &crate::Conversation) {
+        use phoenix_core::domain::db_schema::{
+            FileAttachment, ImageData, InputOrigin, SourceToolCall,
+        };
+        let content = MessageContent::User(crate::UserContent {
+            text: "old view".into(),
+            images: vec![ImageData {
+                media_type: "image/png".into(),
+                data: "old-image".into(),
+            }],
+            files: vec![FileAttachment {
+                original_name: "old.txt".into(),
+                media_type: "text/plain".into(),
+                size_bytes: 3,
+                stored_path: "/tmp/old.txt".into(),
+            }],
+            llm_text: Some("expanded old view".into()),
+            is_meta: true,
+        });
+        db.add_message_with_seq_and_origin(
+            "old",
+            &root.id,
+            1,
+            &content,
+            Some(&serde_json::json!({"display": "retained"})),
+            Some(&crate::UsageData {
+                input_tokens: 7,
+                output_tokens: 3,
+                reasoning_tokens: Some(1),
+                cache_creation_tokens: 2,
+                cache_read_tokens: 1,
+            }),
+            &InputOrigin::InternalConversation {
+                product_conversation_id: root.product_conversation_id.clone(),
+                transcript_id: root.id.clone(),
+                source_call: Some(Box::new(SourceToolCall {
+                    message_id: "call-message".into(),
+                    tool_use_id: "call".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_hydration_snapshot_survives_committed_reset_and_preserves_hydrated_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("race.db").to_str().unwrap())
+            .await
+            .unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        let root = db
+            .create_conversation("race", "race", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        seed_reset_message(&db, &root).await;
+        let expected = db.get_messages(&root.id).await.unwrap();
+        let mut reader = db.pool.acquire().await.unwrap();
+        let mut tx = reader.begin().await.unwrap();
+        let before =
+            Database::get_ordinary_product_conversation_on(&mut tx, &root.product_conversation_id)
+                .await
+                .unwrap();
+        let before_value = serde_json::to_value(&before.root.conversation).unwrap();
+        let mut writer = db.pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM messages WHERE conversation_id=?")
+            .bind(&root.id)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET transcript_generation=transcript_generation+1 WHERE id=?",
+        )
+        .bind(&root.id)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+        writer.commit().await.unwrap();
+        let page = Database::get_product_conversation_messages_page_on(
+            &mut tx,
+            &root.product_conversation_id,
+            None,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(page.iter().map(|(_, m)| m).collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let still =
+            Database::get_ordinary_product_conversation_on(&mut tx, &root.product_conversation_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            before.root.conversation.transcript_generation,
+            still.root.conversation.transcript_generation
+        );
+        assert_eq!(before.root.tail_message_id, still.root.tail_message_id);
+        assert_eq!(
+            before_value,
+            serde_json::to_value(&still.root.conversation).unwrap()
+        );
+        tx.rollback().await.unwrap();
+        drop(reader);
+        let fresh = db
+            .read_ordinary_product_conversation_snapshot(
+                root.product_conversation_id.as_str(),
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(fresh.messages.is_empty());
+        assert_eq!(
+            fresh.aggregate.root.conversation.transcript_generation,
+            before.root.conversation.transcript_generation + 1
+        );
+        db.pool.close().await;
+    }
+
+    fn assert_page_ids(snapshot: &ProductConversationSnapshotRead, ids: &[&str]) {
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .map(|(_, m)| m.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn late_hydration_snapshot_cursor_ceiling_and_metadata_share_one_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("cursor", "cursor", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for sequence in 1..=4 {
+            db.add_message_with_seq(
+                &format!("m{sequence}"),
+                &root.id,
+                sequence,
+                &MessageContent::user(format!("message{sequence}")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let first = db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, None, 3)
+            .await
+            .unwrap();
+        assert_page_ids(&first, &["m4", "m3", "m2"]);
+        let ceiling = ProductConversationSegmentCeiling {
+            transcript_row_id: root.id.clone(),
+            tail_sequence_id: 4,
+            tail_message_id: Some("m4".into()),
+        };
+        db.add_message_with_seq(
+            "m5",
+            &root.id,
+            5,
+            &MessageContent::user("append"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let bounded = db
+            .read_ordinary_product_conversation_snapshot(
+                &root.id,
+                None,
+                Some(std::slice::from_ref(&ceiling)),
+                3,
+            )
+            .await
+            .unwrap();
+        assert_page_ids(&bounded, &["m4", "m3", "m2"]);
+        let unbounded = db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(unbounded.messages[0].1.message_id, "m5");
+        let second = db
+            .read_ordinary_product_conversation_snapshot(
+                &root.id,
+                Some((0, 3, "m3".into())),
+                Some(&[ceiling]),
+                3,
+            )
+            .await
+            .unwrap();
+        assert_page_ids(&second, &["m2", "m1"]);
+        assert_eq!(
+            first.aggregate.product_conversation.id(),
+            second.aggregate.product_conversation.id()
+        );
+        assert_eq!(
+            first.aggregate.root.conversation.transcript_generation,
+            second.aggregate.root.conversation.transcript_generation
+        );
+        assert_eq!(second.aggregate.root.tail_message_id.as_deref(), Some("m5"));
+        assert_eq!(
+            second.requested_transcript_row_id.as_str(),
+            root.id.as_str()
+        );
+        let empty = db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, Some(&[]), 3)
+            .await
+            .unwrap();
+        assert!(empty.messages.is_empty());
+    }
+
     #[tokio::test]
     async fn source_call_survives_real_snapshot_and_message_page() {
         use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
@@ -1605,6 +2100,8 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        assert!(normalized.contains("selected AS MATERIALIZED ( SELECT messages.message_id, messages.conversation_id, messages.sequence_id, transcript.ordinal"));
+        assert!(normalized.contains("FROM selected JOIN messages m ON m.message_id = selected.message_id ORDER BY selected.ordinal DESC, selected.sequence_id DESC, selected.message_id DESC"));
         assert!(normalized.contains(
             "FROM transcript CROSS JOIN messages INDEXED BY messages_conversation_sequence ON messages.conversation_id = transcript.id"
         ));
