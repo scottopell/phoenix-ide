@@ -177,12 +177,12 @@ test('BFCache witness requires actual persisted pageshow with unchanged document
   }
 });
 test('SPA driver requires real same-document replacement and correlated canceled outcome', async () => {
-  for (const mode of ['canceled', 'ready', 'incomplete', 'cross_document', 'wrong_request', 'off_host', 'rejected_report']) {
+  for (const mode of ['canceled', 'ready', 'incomplete', 'cross_document', 'wrong_request', 'off_host', 'rejected_report', 'duplicate_anchor', 'hidden_anchor']) {
     let url = 'http://127.0.0.1:8123/c/old';
     let clicked = false;
     let evaluations = 0;
     const page = { url: () => url, evaluate: async () => ++evaluations === 1 || mode !== 'cross_document' ? 10 : 11,
-      locator: () => ({ getAttribute: async () => mode === 'off_host' ? 'https://production.example/c/new' : '/c/new',
+      locator: () => ({ count: async () => mode === 'duplicate_anchor' ? 2 : 1, isVisible: async () => mode !== 'hidden_anchor', getAttribute: async () => mode === 'off_host' ? 'https://production.example/c/new' : '/c/new',
         click: async () => { clicked = true; url = 'http://127.0.0.1:8123/c/new'; } }),
       waitForURL: async target => { assert.equal(url, target); } };
     const report = { outcome: ['ready', 'incomplete'].includes(mode) ? mode : 'canceled',
@@ -195,7 +195,7 @@ test('SPA driver requires real same-document replacement and correlated canceled
     const args = { page, baseURL: 'http://127.0.0.1:8123', selector: 'a', capture };
     if (mode === 'canceled') assert.equal((await runPendingSPACancellation(args)).status, 'observed_spa_canceled');
     else await assert.rejects(runPendingSPACancellation(args));
-    assert.equal(clicked, mode !== 'off_host');
+    assert.equal(clicked, !['off_host', 'duplicate_anchor', 'hidden_anchor'].includes(mode));
   }
 });
 test('actual request capture rejects precompleted requests, preterminal reports, and rejected collector response', async () => {
@@ -307,7 +307,7 @@ function lifecycleBrowserFixture(mode = 'normal') {
         state = 'visible'; actions.push([kind, 'foreground']);
         if (kind === 'pending_background' && end === 1 && !initialReady) { post(report('initial')); makeReady(); }
       },
-      locator: () => ({ getAttribute: async () => '/c/successor', click: async () => {
+      locator: () => ({ count: async () => 1, isVisible: async () => true, getAttribute: async () => '/c/successor', click: async () => {
         actions.push([kind, 'click']); url = 'http://127.0.0.1:8123/c/successor';
         post(report('initial', 'canceled'));
         post({ ...report('successor'), correlations: [{ kind: 'request', id: 'successor-request' }] });

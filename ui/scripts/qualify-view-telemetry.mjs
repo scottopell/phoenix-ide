@@ -383,6 +383,8 @@ export async function runPendingSPACancellation({ page, baseURL, selector, captu
   capture.assertPending();
   candidateDestination(page.url(), baseURL);
   const target = page.locator(selector);
+  assert.equal(await target.count(), 1, 'exactly one mounted SPA anchor required');
+  assert.equal(await target.isVisible(), true, 'SPA anchor must be CSS visible');
   const href = await target.getAttribute('href');
   assert.ok(href, 'cancellation must use a real navigable anchor');
   const destination = candidateDestination(href, baseURL);
