@@ -390,6 +390,41 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   };
 }
 
+export const GLOBAL_PREFIX_ERROR_TEXT = 'Could not load earlier history:';
+
+// Receipts are already validated by the installed recorder; revalidate the frozen selection.
+export function selectGlobalPrefixFault(a, snapshots, mountedUrl, latest) {
+  assert.equal(a.kind, 'global');
+  const mounted = new URL(mountedUrl);
+  const route = mounted.pathname.match(/^\/global\/([^/]+)$/);
+  assert.ok(route, 'mounted Global route required');
+  const pins = mounted.searchParams.getAll('source_transcript');
+  assert.equal(pins.length, 1, 'unambiguous mounted source required');
+  const source = pins[0];
+  assert.ok(a.members.includes(decodeURIComponent(route[1])), 'registered mounted route required');
+  assert.ok(a.members.includes(source), 'registered source alias required');
+  const path = `/api/global/coordinator/history/${encodeURIComponent(source)}`;
+  const baseline = snapshots.findLast(s => new URL(s.url).pathname === path);
+  assert.ok(baseline, 'positive mounted history baseline required');
+  assert.equal(baseline.method, 'GET'); assert.equal(baseline.status, 200);
+  assert.match(baseline.type, /application\/json/);
+  assert.notEqual(baseline.truncated, true);
+  assert.equal(typeof baseline.raw, 'string');
+  assert.ok(Buffer.byteLength(baseline.raw) <= REQUIRED_BODY_MAX_BYTES);
+  const data = JSON.parse(baseline.raw);
+  if (baseline.body_bytes !== undefined) assert.equal(baseline.body_bytes, Buffer.byteLength(baseline.raw));
+  validateOwnedAggregate(a, data, baseline.url);
+  assert.equal(data.requested_transcript_row_id, source);
+  assert.equal(data.latest_transcript_row_id, latest);
+  assert.equal(data.has_older, true); assert.ok(typeof data.before === 'string' && data.before.length > 0);
+  return Object.freeze({ kind: 'global_history_prefix_acquisition', pathname: path,
+    source_alias: source, product_conversation_id: data.product_conversation_id,
+    latest_transcript_row_id: latest, positive_baseline: { url: baseline.url,
+      status: baseline.status, request_ordinal: baseline.request_ordinal,
+      before_parameter: new URL(baseline.url).searchParams.get('before'), next_before: data.before },
+    observation_scope: 'earlier-history acquisition failure; not full fresh-tail refresh' });
+}
+
 async function run() {
   const app = resolve(process.env.APP_ROOT), output = resolve(process.env.HISTORY_OUTPUT);
   const ui = loopback(process.env.HISTORY_BASE_URL), api = loopback(process.env.HISTORY_API_URL);
@@ -509,12 +544,52 @@ async function run() {
     await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible' });
     await poll(composerReadonly, 'Pending composer readonly');
     assert.equal(await page.locator(persistedMessageSelector(acceptedId)).count(), 0);
-    const before = await poll(() => anchor(), 'historical physical anchor');
+    let globalFaultObservation;
     const pin = new URL(page.url()).searchParams.get('source_transcript'); assert.equal(pin, a.members[1]);
+    if (a.kind === 'global') {
+      const owned = { ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } };
+      const target = selectGlobalPrefixFault(owned, snapshots.slice(start), page.url(), latest);
+      const prefixDeadline = performance.now() + 20000;
+      const prefixBudget = () => { const left = Math.floor(prefixDeadline - performance.now()); assert.ok(left > 0, 'Global prefix action absolute 20s bound'); return Math.min(5000, left); };
+      const savedTop = await page.locator('#messages').evaluate(el => el.scrollTop);
+      const pendingComposerCount = await page.locator(COMPOSER_SELECTOR).count();
+      const failureStart = failed.length;
+      updateFault(fault, { aggregatePath: target.pathname, failRoster: true });
+      // A DOM scroll uses the rendered transcript's prefix-top sentinel, not React internals.
+      await page.locator('#messages').evaluate(el => { el.scrollTop = 0; });
+      const request = await poll(() => failed.slice(failureStart).find(r =>
+        faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')
+        && new URL(r.url).searchParams.get('message_limit') === '100'
+        && !!new URL(r.url).searchParams.get('before')), 'actual failed Global prefix GET', prefixBudget());
+      assert.equal(new URL(request.url).searchParams.get('before'), target.positive_baseline.next_before, 'actual prefix cursor from positive mounted page');
+      const transport = readFileSync(resolve(output, 'preview-transport.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      const destroyed = transport.find(t => t.action === 'destroy-roster' && t.method === 'GET'
+        && new URL(t.url, ui).pathname === target.pathname
+        && new URL(t.url, ui).search === new URL(request.url).search);
+      assert.ok(destroyed, 'owned preview destroyed the actual prefix GET before release');
+      const prefixError = page.locator('#chat-view [role="alert"]').filter({ hasText: GLOBAL_PREFIX_ERROR_TEXT });
+      await prefixError.waitFor({ state: 'visible', timeout: prefixBudget() });
+      assert.equal(await page.locator(COMPOSER_SELECTOR).count(), pendingComposerCount, 'prefix failure does not erase Pending composer');
+      assert.equal(await composerReadonly(), true, 'prefix failure retains Pending composer');
+      assert.equal((await command({ command: 'entered' })).state, 'entered');
+      assert.equal(gate.releaseAttempted, false);
+      assert.equal(new URL(page.url()).searchParams.get('source_transcript'), pin);
+      globalFaultObservation = { ...target, request, destroyed,
+        before_parameter: new URL(request.url).searchParams.get('before'), failed_while_pending: true };
+      checked('Global earlier-history acquisition failed while Pending before release', globalFaultObservation);
+      await page.locator('#messages').evaluate((el, top) => { el.scrollTop = top; }, savedTop);
+      await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible', timeout: prefixBudget() });
+      await page.locator(persistedMessageSelector(middle)).first().evaluate(el => el.scrollIntoView({ block: 'center' }));
+      await prefixError.waitFor({ state: 'visible', timeout: prefixBudget() });
+      prefixBudget();
+    }
+    const before = await poll(() => anchor(), 'historical physical anchor');
     assert.equal(requests.some(r => r.method === 'POST' && new URL(r.url).pathname.endsWith('/chat')), false);
     checked('committed Pending: browser/HTTP/new SSE init available, opening deferred and composer readonly', { entered, before });
-    const actualRoster = snapshots.slice(start).find(s => belongsToAggregate(a, s));
-    updateFault(fault, { aggregatePath: new URL(actualRoster.url).pathname, failRoster: true });
+    if (a.kind !== 'global') {
+      const actualRoster = snapshots.slice(start).find(s => belongsToAggregate(a, s));
+      updateFault(fault, { aggregatePath: new URL(actualRoster.url).pathname, failRoster: true });
+    }
     const acceptedStart = events.length, failureStart = failed.length;
     await releaseOnce(gate, command);
     const continued = await continuation; assert.equal(continued.status, 'accepted'); assert.equal(continued.conversation_id, latest);
@@ -523,9 +598,9 @@ async function run() {
     }), 'actual accepted opening SSE', 10000);
     const event = JSON.parse(accepted.data); const acceptedCursor = acceptedWireCursor(accepted, events);
     assert.equal(event.message?.message_id ?? event.message_id, acceptedId);
-    const failedRoster = await poll(() => failed.slice(failureStart).find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
+    const failedRoster = globalFaultObservation?.request ?? await poll(() => failed.slice(failureStart).find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
     const failedRosterUrl = new URL(failedRoster.url);
-    const faultObservation = { request: failedRoster, pathname: failedRosterUrl.pathname,
+    const faultObservation = globalFaultObservation ?? { request: failedRoster, pathname: failedRosterUrl.pathname,
       message_limit: failedRosterUrl.searchParams.get('message_limit'),
       observation_scope: failedRosterUrl.searchParams.get('message_limit') === '1'
         ? 'background aggregate ownership probe; no page-alert contract'

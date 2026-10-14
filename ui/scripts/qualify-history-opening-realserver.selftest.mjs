@@ -20,7 +20,7 @@ test('fault remains active through acceptance and same-page reconnect, but new p
 
 test('aggregate transport failure proof does not fabricate an alert contract for background probes', () => {
   const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
-  assert.match(script, /const failedRoster = await poll\(\(\) => failed\.slice\(failureStart\)\.find/);
+  assert.match(script, /const failedRoster = globalFaultObservation\?\.request \?\? await poll\(\(\) => failed\.slice\(failureStart\)\.find/);
   assert.match(script, /background aggregate ownership probe; no page-alert contract/);
   assert.match(script, /Accepted composer enabled despite roster failure/);
   assert.match(script, /actual composer message persisted/);

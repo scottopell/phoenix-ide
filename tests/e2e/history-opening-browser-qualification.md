@@ -313,3 +313,80 @@ Independent parent source review remains next. The retained Global SSE still has
 message cursors); generated authority, real providers, shipping/production,
 physical devices and other engines remain unqualified. No new lifecycle or
 public control surface was added.
+
+## Global prefix-fault causality correction on parent 5fb (offline only)
+
+Artifact **11870928672**, local
+`.phoenix/evidence/continuous-history/instrumented5fb-artifact/opening-browser-evidence/`,
+is retained unchanged. Ordinary completed **nine checks**, with no application or
+capture errors, complete drain (`partial:false`, pending zero), normal server exit
+zero and successful cleanup. This is ordinary instrumented evidence only.
+Global completed two checks (manual opening and held Pending), released the gate,
+and failed waiting for an actual failed owned GET. Its server completion is
+**`force_cleanup_required`**, even though the eventual recorded returncode is zero;
+it is not normal server-completion proof.
+
+Raw Global observations, independently inspected:
+
+- Request ordinal 42 / response lines 39–41: original-route Global history 200.
+- Ordinal 95 / lines 104–106: mounted middle member history 200, Pending successor.
+- Ordinal 100 / lines 109–111: same middle member history 200 with `before`.
+- Ordinals 103, 109 and 110: `/api/product-conversations/<successor>` is **404**,
+  metadata-only negative ownership probing, not a successful history response.
+- No post-release Page history GET or preview destruction witness was retained.
+  The old first-snapshot target and passive post-release assumption cannot prove
+  this failure scenario. No 404 is reclassified as 200 or faulted as a substitute.
+
+The new **Global-only** branch freezes the exact history pathname from the most
+recent owned, registered, complete positive snapshot for the mounted URL's single
+`source_transcript` pin. The route alias must also be registered but need not equal
+that pin. Stable product, selected member, latest successor, full opening edge,
+JSON/status and pagination cursor are revalidated. Ordinary retains its existing
+post-release fault trigger/assertion pipeline.
+
+While Pending, a DOM-only `#messages.scrollTop = 0` uses the pinned d4 rendered
+prefix-top sentinel. No React callback/store access, fabricated event/API body,
+page route interception, direct DB write, or application edit is added. The branch
+requires the actual failed GET with message_limit 100 and the exact positive
+page's next `before` cursor, matching owned preview destruction, and the existing
+`Could not load earlier history:` prefix-error indicator **before release**.
+It checks the gate remains entered, composer presence/read-only state and source
+pin survive. A shared absolute 20-second prefix budget (per-wait cap five seconds)
+is separate from the unchanged 60-second gate deadline. DOM scrolling restores
+the saved viewport and exact persisted middle ID before taking the physical
+anchor baseline, so deliberate reader movement is not acceptance movement.
+
+The typed attribution kind is `global_history_prefix_acquisition`, retaining
+source alias, stable product, known latest successor, positive URL/status/local
+ordinal/cursor, actual failed request and destruction. Its scope is explicitly
+**earlier-history acquisition failure, not full fresh-tail refresh**. Existing
+accepted SSE, exact successor composer ACK/persistence, same-page reconnect,
+physical-ID/count/anchor, fault-restore-before-chapter and drain assertions remain
+mandatory. The prefix error is not cleared before that restoration step.
+
+### Compiler-free validation performed
+
+```sh
+HISTORY_GLOBAL_5FB_EVIDENCE=.phoenix/evidence/continuous-history/instrumented5fb-artifact/opening-browser-evidence/global \
+HISTORY_PINNED_SOURCE=target/history-hidden-geometry-repair \
+HISTORY_OFFLINE_EVIDENCE=.phoenix/evidence/continuous-history/pre-dispatch428-drain-audit/final-with-pinned-ack \
+node --test ui/scripts/qualify-history-realserver.selftest.mjs \
+  ui/scripts/qualify-history-opening-realserver.selftest.mjs \
+  ui/scripts/replay-history-opening-recorder.selftest.mjs \
+  ui/scripts/global-history-prefix.selftest.mjs
+python3 -B tests/e2e/history_opening_browser.test.py
+```
+
+46 Node tests passed, zero skips, including authentic 5fb request/response target
+replay, 404/foreign/truncated/ambiguous-source rejection and literal checks against
+the pinned d4 `MessageList` sentinel/error source. The old authentic ordinary and
+Global installed-recorder replays remain included. Python: 16 passed. The new
+artifact-dependent tests skip without their explicit evidence/source variables;
+they do not fabricate substitute fixtures. Syntax and whitespace checks passed.
+
+No hosted push/run, compiler/build, dependency install, browser/server, production
+operation, app source or generated DTO edit was performed. Roadmap body 806 was
+read for orientation only. **Independent next source review is required before
+one hosted run.** Global's new user-scroll/failure/restore sequence, held-gate SSE
+acceptance/composer/reconnect and normal server completion remain runtime gates,
+not offline passes. Shipping/provider/device claims remain excluded.
