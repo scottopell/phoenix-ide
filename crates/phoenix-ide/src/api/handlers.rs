@@ -7121,6 +7121,35 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     };
 
+    match runtime.db().coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context
+            else {
+                return CascadeProjectsReport {
+                    error: Some("Invalid Coordinator home ownership".into()),
+                    ..Default::default()
+                };
+            };
+            let worker = PathBuf::from(&worktree_path);
+            let worker = worker.canonicalize().unwrap_or(worker);
+            let home = PathBuf::from(cwd);
+            if home.starts_with(&worker) || worker.starts_with(&home) {
+                return CascadeProjectsReport {
+                    error: Some("Cleanup refused: worker path overlaps Coordinator home".into()),
+                    ..Default::default()
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return CascadeProjectsReport {
+                error: Some(format!(
+                    "Cannot establish Coordinator home retention: {error}"
+                )),
+                ..Default::default()
+            }
+        }
+    }
     let mut report = CascadeProjectsReport {
         worktree_path: Some(worktree_path.clone()),
         branch_name: Some(branch_name.clone()),

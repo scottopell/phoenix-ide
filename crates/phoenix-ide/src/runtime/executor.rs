@@ -8152,7 +8152,7 @@ where
             )
         };
         if is_coordinator {
-            match self.db.coordinator_work_scope().await {
+            match self.storage.coordinator_home_scope().await {
                 Ok(Some(home)) => match crate::coordinator_home::context(&home) {
                     Ok(orientation) => system_prompt.push_str(&orientation),
                     Err(error) => system_prompt.push_str(&format!(

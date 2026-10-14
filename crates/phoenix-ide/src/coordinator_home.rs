@@ -40,6 +40,25 @@ pub(crate) async fn initialize(
         .canonicalize()
         .map_err(|e| format!("Coordinator data directory unavailable: {e}"))?;
     let home = root.join("coordinator");
+    let worktrees: Vec<String> = sqlx::query_scalar(
+        "SELECT worktree_path FROM work_scopes WHERE environment_kind='allocated_worktree'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| e.to_string())?;
+    for worktree in worktrees {
+        let path = PathBuf::from(&worktree);
+        let canonical = match path.canonicalize() {
+            Ok(path) => path,
+            Err(_) if !path.exists() => path,
+            Err(e) => return Err(format!("Cannot validate worker ownership: {e}")),
+        };
+        if home.starts_with(&canonical) || canonical.starts_with(&home) {
+            return Err(
+                "Coordinator home overlaps a disposable worker worktree; refusing adoption".into(),
+            );
+        }
+    }
     if let Some(record) = &persisted {
         if record.context
             != (EnvironmentContext::CoordinatorHome {

@@ -1,0 +1,72 @@
+-- allium: 3
+-- REQ-GR-016–018: local instance ownership, initialization and continuation.
+
+entity InstanceHome {
+    configured_path: String
+    scope_id: String?
+    persisted_path: String?
+    state: unbound | ready | unavailable
+}
+
+entity HomeObservation {
+    canonical_path: String
+    directory_valid: Boolean
+    worker_overlap: Boolean
+}
+
+rule InitializeHome {
+    when: InitializeRequested(home, observation)
+    requires: home.state = unbound
+    requires: observation.directory_valid
+    requires: not observation.worker_overlap
+    requires: observation.canonical_path = home.configured_path
+    let identity = AllocateHomeScopeIdentity()
+    ensures:
+        home.scope_id = identity
+        home.persisted_path = observation.canonical_path
+        home.state = ready
+    @guidance
+        -- Validate the filesystem and configuration before atomically binding one
+        -- instance-owned active scope. Concurrent initialization adopts that same
+        -- binding; it must not allocate another scope or import worker files.
+}
+
+rule ReconcileBoundHome {
+    when: InitializeRequested(home, observation)
+    requires: home.scope_id != null
+    requires: observation.directory_valid
+    requires: not observation.worker_overlap
+    requires: home.persisted_path = observation.canonical_path
+    requires: home.configured_path = observation.canonical_path
+    ensures:
+        home.state = ready
+}
+
+rule RejectInvalidBoundHome {
+    when: InitializeRequested(home, observation)
+    requires: home.scope_id != null
+    requires: not observation.directory_valid or observation.worker_overlap or home.persisted_path != observation.canonical_path or home.configured_path != observation.canonical_path
+    ensures:
+        home.state = unavailable
+    @guidance
+        -- Fail initialization with an actionable error; preserve binding and
+        -- retained bytes. Never silently recreate, relocate, or delete a bound home.
+}
+
+rule CoordinatorContinues {
+    when: CoordinatorContinuationAccepted(home)
+    requires: home.scope_id != null
+    ensures:
+        home.scope_id = home.scope_id
+        home.persisted_path = home.persisted_path
+    @guidance
+        -- Attach the successor to the same instance-owned scope, irrespective
+        -- of ordinary mode or current transcript identity. Regenerate trusted
+        -- home context and preserve deliberate historical pointers, not file instructions.
+}
+
+@invariant IndependentRetention
+    -- Ordinary conversation Close/Delete, task approval, Git cleanup and
+    -- transcript continuation cannot mutate/delete the binding or home files.
+    -- Coordinator home is non-project; scoped execution still requires an
+    -- explicit active scope ID. Retained notes never confer authority.

@@ -7,6 +7,8 @@ was chosen; they are authoritative history, not a live behavioral contract.
 The live behavioral contract remains `requirements.md` plus `.allium` where an
 Allium spec exists. Status and verification coverage live in `executive.md`.
 
+The local Coordinator home decision is [ADR-144](144_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |

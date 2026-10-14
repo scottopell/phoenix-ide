@@ -108,3 +108,22 @@ WHEN OLD.runtime_role = 'coordinator'
 BEGIN
     SELECT RAISE(ABORT, 'Coordinator transcript is outside ordinary project lifecycle');
 END;
+
+CREATE TRIGGER coordinator_home_disjoint_insert BEFORE INSERT ON work_scopes
+WHEN NEW.environment_kind = 'coordinator_home' AND EXISTS (
+ SELECT 1 FROM work_scopes worker WHERE worker.environment_kind='allocated_worktree'
+ AND (NEW.cwd=worker.worktree_path OR substr(NEW.cwd,1,length(rtrim(worker.worktree_path,'/'))+1)=rtrim(worker.worktree_path,'/')||'/'
+ OR substr(worker.worktree_path,1,length(rtrim(NEW.cwd,'/'))+1)=rtrim(NEW.cwd,'/')||'/')
+) BEGIN SELECT RAISE(ABORT,'Coordinator home overlaps worker ownership'); END;
+CREATE TRIGGER worker_home_disjoint_insert BEFORE INSERT ON work_scopes
+WHEN NEW.environment_kind='allocated_worktree' AND EXISTS (
+ SELECT 1 FROM work_scopes home WHERE home.environment_kind='coordinator_home'
+ AND (home.cwd=NEW.worktree_path OR substr(home.cwd,1,length(rtrim(NEW.worktree_path,'/'))+1)=rtrim(NEW.worktree_path,'/')||'/'
+ OR substr(NEW.worktree_path,1,length(rtrim(home.cwd,'/'))+1)=rtrim(home.cwd,'/')||'/')
+) BEGIN SELECT RAISE(ABORT,'Worker environment overlaps Coordinator home'); END;
+CREATE TRIGGER worker_home_disjoint_update BEFORE UPDATE OF environment_kind,worktree_path ON work_scopes
+WHEN NEW.environment_kind='allocated_worktree' AND EXISTS (
+ SELECT 1 FROM work_scopes home WHERE home.environment_kind='coordinator_home'
+ AND (home.cwd=NEW.worktree_path OR substr(home.cwd,1,length(rtrim(NEW.worktree_path,'/'))+1)=rtrim(NEW.worktree_path,'/')||'/'
+ OR substr(NEW.worktree_path,1,length(rtrim(home.cwd,'/'))+1)=rtrim(home.cwd,'/')||'/')
+) BEGIN SELECT RAISE(ABORT,'Worker environment overlaps Coordinator home'); END;
