@@ -97,9 +97,11 @@ async fn missing_lookup_failed_and_shared_projections_keep_original_message() {
         })
     ));
     let shared_json = serde_json::to_value(shared).unwrap();
-    assert!(shared_json["event_presentation"]
-        .get("display_name")
-        .is_none());
+    assert!(
+        shared_json["event_presentation"]
+            .get("display_name")
+            .is_none()
+    );
     db.pool().close().await;
     let failed = enrich_messages(&db, &messages).await;
     assert_eq!(failed.len(), 2);
