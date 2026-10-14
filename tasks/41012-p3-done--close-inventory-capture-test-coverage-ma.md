@@ -21,8 +21,10 @@ New test (added):
   `confirm_close_stop_work`, `begin_close_active_work_settlement`,
   `advance_close_settlement_when_quiescent`, `replace_close_inspection`).
   The sealed worktree identity names an inert sentinel path
-  (`/inert/sentinel/worktree-never-touched`) that is never created and is
-  asserted absent after capture -- no Git, filesystem, or process scan runs.
+  (`/inert/sentinel/worktree-never-touched`) that is never created. The test
+  asserts only committed DB state (captured scope/worktree identity, sealed
+  targets, idempotent re-capture); it runs no Git, filesystem, or process scan
+  and makes no filesystem-absence assertion about the sentinel path.
   New fixture `build_close_attempt_with_sentinel_worktree` adapts the
   continuation-membership wiring from `build_workmode_chain_with_shared_worktree`
   (3 members sharing one WorkScope), dropping the real git/tempdir setup.

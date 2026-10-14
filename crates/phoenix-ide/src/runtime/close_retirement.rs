@@ -836,7 +836,8 @@ impl RuntimeManager {
         }
     }
 
-    /// Retires exactly the unresolved inventory targets.
+    /// Captures the first-pass inventory if incomplete, then lists exactly the
+    /// unresolved retirement targets. Performs no resource effects.
     async fn prepare_close_retirement_targets(
         &self,
         attempt_id: &CloseAttemptId,
@@ -857,6 +858,7 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())
     }
 
+    /// Retires exactly the unresolved inventory targets.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn retire_close_runtime_resources(
         &self,
