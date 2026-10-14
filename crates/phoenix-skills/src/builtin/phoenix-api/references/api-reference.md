@@ -4,19 +4,21 @@ This authenticated reference is for the live Phoenix deployment the user named. 
 
 ## Execution and trust boundary
 
-Every HTTP command must run through Global's Bash tool with an explicit active `work_scope_id` admitted from authoritative Coordinator home context or WorkScope rows. The selected origin must be the same Phoenix server that owns that WorkScope and resolves its scoped `$PWD`; the public API has no remote-server cwd resolver. Stop if that identity is not established.
+Every HTTP command must run through Global's Bash tool with an explicit active local `work_scope_id` admitted from authoritative Coordinator home context or WorkScope rows. That WorkScope authorizes local execution only. Separately establish the selected destination's identity, authentication, current `ProductConversation` or transcript, and lifecycle state from authoritative, user-authorized sources. Require destination cwd provenance only when the operation consumes cwd.
 
-The recipe is deliberately staged. Global structurally interprets each raw JSON response, prepares data for the next scoped Bash call, and retains the request identity and exact intent. Bash transports opaque base64 data; it does not parse JSON or interpolate user/model text into shell grammar. The only runtime commands required are `curl`, `base64`, and `od`, available on supported Phoenix hosts. Do not install dependencies or substitute ad-hoc text parsing.
+Transport grants no destination authority. When authentication requires a credential, use only a user-identified credential source bound to the selected destination. The copyable curl recipes are local-only: their origin and ambient `PHOENIX_PASSWORD` belong to the Phoenix server owning the active WorkScope. A nonlocal API call must instead execute in the destination context through a user-authorized, authenticated encrypted transport that supplies any required destination credential without serializing it into the Bash command; stop if that capability is unavailable. Apply the operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged.
+
+For the documented local Bash recipes, Global interprets each response structurally and retains the request identity and exact intent. Treat payloads as data, not shell syntax. Do not install dependencies or substitute ad-hoc text parsing.
 
 Prefer the live API contract. Inspect source only when `/api/version` proves a target/source mismatch or a live response genuinely contradicts this embedded contract.
 
 ## Authorization and live model discovery
 
-1. In scoped Bash, initialize the selected origin from data, then call `GET /api/auth/status`:
+1. In scoped Bash, initialize the local WorkScope-owning origin from data, then call `GET /api/auth/status`:
 
    ```bash
-   ORIGIN_B64='base64-of-the-same-server-origin'
-   CA_CERT_PATH_B64='' # optional base64 of authoritative same-server CA path
+   ORIGIN_B64='base64-of-the-local-workscope-origin'
+   CA_CERT_PATH_B64='' # optional base64 of its authoritative CA path
    if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
    ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
    [[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
@@ -30,13 +32,13 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
      curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" -- "$ORIGIN/api/auth/status"
    ```
 
-   This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls. For private-CA HTTPS, `CA_CERT_PATH_B64` must encode a user-identified or authoritative same-server readable CA certificate path. Browser trust is not sufficient for server-side curl. Do not disable TLS verification; stop if the CA path is unavailable. Repeat the same origin/CA initialization in each later scoped Bash call because shell variables do not persist.
-2. If auth is disabled, send no credential. If auth is required and this request is not authenticated, use only a credential already supplied or explicitly identified by the user for this deployment. A configured password is accepted as `Authorization: Bearer …`; a `phoenix-auth` cookie is an opaque session token, not the password.
-3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated `PHOENIX_PASSWORD`, stream the header through process substitution: `--header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD")`. Never print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
+   This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls. For private-CA HTTPS, `CA_CERT_PATH_B64` must encode an authoritative readable CA certificate path for the local destination. Browser trust is not sufficient for server-side curl. Do not disable TLS verification; stop if the CA path is unavailable. Repeat the same origin/CA initialization in each later scoped Bash call because shell variables do not persist.
+2. If auth is disabled, send no credential. If auth is required and this local request is not authenticated, use only the user-identified credential for this local deployment. A configured password is accepted as `Authorization: Bearer …`; a `phoenix-auth` cookie is an opaque session token, not the password.
+3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated local `PHOENIX_PASSWORD`, stream the header through process substitution: `--header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD")`. Never print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
 4. Call authenticated `GET /api/models`. Its `models` array and `default` field are the live authority. Select an exact model `id`: preserve a user-selected ID when present, otherwise use `default`.
 5. Call authenticated `GET /api/settings/llm-language`. Its `language` is the default and `available` enumerates supported explicit values. Preserve an explicitly requested supported language on the first POST; use JSON `null` only when the user did not choose one. The selected model's `effort_capabilities` is one of `{"support":"unsupported"}`, `{"support":"unknown"}`, or `{"support":"supported","levels":[...],"native_default":...}`. Use JSON `null` for no override, or only a level listed for that exact model.
 
-For authenticated raw reads, repeat the same origin/CA initialization and then use:
+For authenticated local raw reads, repeat the same origin/CA initialization and then use:
 
 ```bash
 https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
@@ -48,6 +50,8 @@ https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PR
 Omit the `--header` line when auth is disabled or the request is already authenticated.
 
 ## Create one ProductConversation
+
+This creation recipe is local-only: its origin must be the Phoenix server that owns the active WorkScope and resolves `$PWD`. For another destination, stop; never send the local executor's `$PWD` as a remote cwd.
 
 `POST /api/product-conversations/new` accepts exactly:
 
@@ -89,12 +93,12 @@ Global now has the retained UUID, encoded scoped cwd, exact live model/effort, e
 
 ### 3. Copyable POST transport
 
-Set only base64-alphabet literals in this scoped Bash command. `ORIGIN_B64` is the same-server origin; `INTENT_B64` is the complete exact JSON from step 2. The request body is streamed on stdin, not argv. The body and HTTP status are emitted separately so Global can interpret the response structurally.
+Set only base64-alphabet literals in this scoped Bash command. `ORIGIN_B64` is the local WorkScope-owning Phoenix origin; `INTENT_B64` is the complete exact JSON from step 2. The request body is streamed on stdin, not argv. The body and HTTP status are emitted separately so Global can interpret the response structurally.
 
 ```bash
 set -u
-ORIGIN_B64='base64-of-the-same-server-origin'
-CA_CERT_PATH_B64='' # optional authoritative same-server CA path
+ORIGIN_B64='base64-of-the-local-workscope-origin'
+CA_CERT_PATH_B64='' # optional base64 of its authoritative CA path
 INTENT_B64='base64-of-the-complete-exact-json-intent'
 if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
 ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
@@ -161,12 +165,12 @@ Current read routes accept a ProductConversation ID, transcript-row ID, or slug 
 - `GET /api/product-conversations/{reference}/route` returns a canonical transcript route target.
 - `GET /api/conversations/{transcript_row_id}` returns exact transcript state and messages.
 
-For message steering, use `send_conversation_message` with non-empty literal text. Do not use `POST /api/conversations/{id}/chat`: that browser route expands slash commands and file references. Delivered/queued is acceptance only; read state separately when observation is required.
+For local message steering, use `send_conversation_message` with non-empty literal text. It resolves only on the local Phoenix instance; never substitute it for remote steering. Do not use `POST /api/conversations/{id}/chat`: that browser route expands slash commands and file references. Delivered/queued is acceptance only; read state separately when observation is required.
 
 For cancel, re-resolve and call `POST /api/conversations/{writable_transcript_row_id}/cancel`. The response always has `ok`; `no_op` is omitted when false. Therefore `{ "ok": true }` means cancellation found in-flight work, while `{ "ok": true, "no_op": true }` means nothing cancellable was observed. Cancel has no caller idempotency key or uniform operation receipt.
 
-For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript. Call `POST /api/conversations/{latest_transcript_row_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. Reuse the same `message_id` for an uncertain exact retry. Preserve the successor even for `dispatch_failed`, then re-read aggregate and transcript state. A History aggregate requires a separate Open follow-up, not `/continue`.
+Remote Continue executes that existing API in the selected destination's context and is independent of federated message steering. For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript. Retain that transcript as the original predecessor before calling `POST /api/conversations/{original_predecessor_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. An uncertain exact retry uses the same original predecessor, message identity, and intent; never retarget a newly current successor. Preserve the successor even for `dispatch_failed`, then re-read aggregate and transcript state. A History aggregate requires a separate Open follow-up, not `/continue`.
 
 ## Honest gaps
 
-Current APIs do not provide a general Coordinator lifecycle endpoint, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded image upload/creation transport, bounded creation lookup by request ID, bounded state-only conversation projection, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.
+Current APIs do not provide a general Coordinator lifecycle endpoint, destination-aware remote literal-message steering, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded image upload/creation transport, bounded creation lookup by request ID, bounded state-only conversation projection, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.
