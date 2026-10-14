@@ -317,24 +317,31 @@ mod tests {
     }
 
     #[test]
-    fn phoenix_api_embeds_authorized_ssh_remote_local_contract() {
+    fn phoenix_api_separates_execution_from_destination_authority() {
         let skill = embedded_skill("phoenix-api").unwrap();
         let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
 
-        assert!(skill.contains("local WorkScope authorizes transport execution"));
-        assert!(skill.contains("verified host-key SSH"));
-        assert!(skill.contains("destination process memory"));
-        assert!(reference.contains("User-authorized SSH remote-local transport"));
-        assert!(reference.contains("StrictHostKeyChecking=yes"));
-        assert!(reference.contains("EnvironmentVariables.PHOENIX_PASSWORD"));
-        assert!(reference.contains("remote loopback (`127.0.0.1` or `[::1]`)"));
-        assert!(reference.contains("never substitutes for destination lifecycle authority"));
-        assert!(reference
-            .contains("does not require the local WorkScope to belong to the destination server"));
-        assert!(reference.contains("same message identity and exact intent"));
-        assert!(reference.contains("Never redirect, fall back locally"));
-        assert!(!reference.contains("StrictHostKeyChecking=no"));
-        assert!(!reference.contains("sshpass"));
+        assert!(skill.contains("active local WorkScope authorizes local execution only"));
+        assert!(skill.contains(
+            "selected destination's identity, authentication, current target, and lifecycle state"
+        ));
+        assert!(skill.contains("user-identified credential source"));
+        assert!(skill.contains("destination cwd provenance only when the operation consumes cwd"));
+        assert!(skill.contains(
+            "existing lifecycle, target-resolution, and retry rules regardless of transport"
+        ));
+        assert!(reference.contains("WorkScope authorizes local execution only"));
+        assert!(reference.contains(
+            "selected destination's identity, authentication, current `ProductConversation` or transcript, and lifecycle state"
+        ));
+        assert!(reference.contains("user-identified credential source"));
+        assert!(
+            reference.contains("destination cwd provenance only when the operation consumes cwd")
+        );
+        assert!(reference.contains("Transport grants no destination authority"));
+        assert!(reference.contains(
+            "operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged"
+        ));
     }
 
     #[test]

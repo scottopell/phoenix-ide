@@ -1404,7 +1404,11 @@ mod tests {
             "--max-time 30",
             "no_proxy='*'",
             "NO_PROXY='*'",
-            "same Phoenix server that owns that WorkScope",
+            "active local WorkScope authorizes local execution only",
+            "selected destination's identity, authentication, current target, and lifecycle state",
+            "destination cwd provenance only when the operation consumes cwd",
+            "user-identified credential source",
+            "existing lifecycle, target-resolution, and retry rules regardless of transport",
             "llm_language",
             "ordered `images` collection",
             "requires exactly `images: []`",
@@ -1414,7 +1418,6 @@ mod tests {
             "`no_op` is omitted when false",
             "stored normalized language always wins",
             "`llm_language` is the explicit exception",
-            "only runtime commands required are `curl`, `base64`, and `od`",
         ] {
             assert!(
                 trusted.contains(required),
