@@ -12,6 +12,10 @@ Live production deployment remains an explicitly gated operator action; automate
 
 The prepared-artifact paired path is deliberately narrower than ordinary release deployment: the prepared standalone binary remains byte-identical and is only strict-codesign checked (not ad-hoc resigned), while the clean controller `HEAD` supplies the helper. Its private transaction directory retains the SQLite backup/proof and active claim for manual recovery; snapshot, open-file, path, ledger, or health proof failures fail closed rather than silently starting an unproven runtime.
 
+The explicit current-schema prepared mode shares those supply-chain checks but has a different compatibility boundary. It admits only the exact migration-123 baseline and exact migration-127 candidate registry, reserves backup plus restore capacity with a 20 GiB post-reservation floor, snapshots under exclusive ownership, and runs the installed candidate offline before runtime traffic. Before offline migration invocation, exact unchanged source contents permit predecessor rollback; invocation itself ends that authority because a failed process cannot prove that no migration/reconciliation write committed. A complete target ledger can be resumed only by `finalize-current`, which verifies proof before starting the exact retained candidate and never reruns offline migration or snapshot restore; normal compatible startup retains ownership of its idempotent initialization and reconciliation.
+
+Ordinary in-place deployment remains backup-free. For the same exact 123-to-127 interval it retains candidate registry/helper evidence and persists a forward-only fence before attempting candidate startup. Pre-start failures keep ordinary predecessor rollback; startup or health failure stops and retains the candidate without launching the predecessor. `resume-forward` is the only automated continuation and starts only the exact retained candidate after operator authorization.
+
 ## Paired prepared-artifact surface
 
 - `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade` is macOS launchd-only and rejects release aliases, first install, or a mismatched installed database path.
@@ -58,6 +62,11 @@ It is qualified locally/CI only; no healthy production finalization was executed
 
 | Requirement | Implementation / verification |
 | --- | --- |
+| REQ-LDD-019 | Explicit `--current-schema-upgrade`, controller/helper/registry identity binding, exact-ledger fail-closed tests |
+| REQ-LDD-020 | Integrity/FK/ledger/logical-hash snapshot proof and backup/restore plus 20 GiB capacity-floor tests |
+| REQ-LDD-021 | Bounded offline migration, exact target verification, pre-invocation-only rollback, and partial/ambiguous-write no-rollback fault tests |
+| REQ-LDD-023 | Ordinary candidate registry/helper binding, pre-start rollback, post-start forward-only failure, and exact-candidate resume tests |
+| REQ-LDD-022 | Mode-matched current recovery/finalization with proof-before-start, no offline-migration replay, and exact compatible candidate resume |
 | REQ-LDD-018 | Finalization-only retry / no-runtime-no-DB fault and replay regressions; not shipped on main until #836 |
 | REQ-LDD-001 | `_helper_plist`, `launchd_prod_deploy`; disposable integration harness |
 | REQ-LDD-002 | `launchd_prod_deploy`, `_binary_identity`; preparation tests |
@@ -82,6 +91,9 @@ It is qualified locally/CI only; no healthy production finalization was executed
 - `./dev.py prod deploy` — checked local `HEAD` build.
 - `./dev.py prod deploy --release vX.Y.Z` — exact published release.
 - `./dev.py prod deploy --release latest` — latest stable release resolved once.
+- `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --current-schema-upgrade` — exact migration-123 to migration-127 prepared activation.
+- `./dev.py prod recover-current TXN` / `finalize-current TXN` — mode-matched unchanged-source recovery or committed-candidate finalization.
+- `./dev.py prod resume-forward TXN` — explicitly resume only the retained ordinary forward candidate after predecessor rollback becomes unsafe.
 - `./dev.py prod status` — launchd PID/runtime identity and durable transaction result.
 - `./dev.py prod restart` — restart the installed process in place without rebuilding or changing installed configuration.
 

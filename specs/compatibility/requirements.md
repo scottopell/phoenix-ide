@@ -158,3 +158,15 @@ THE SYSTEM SHALL guarantee this contract only for selection and local subprocess
 AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or restored-archive source-level debug fidelity
 
 **Rationale:** Compiler caching is an optional development optimization. Exact qualification, explicit opt-in for unqualified fidelity, and subprocess scoping prevent an accelerator from becoming an implicit correctness or compatibility promise.
+
+### REQ-COMP-012: Qualified irreversible current-schema transition
+
+The system SHALL treat the migration-123 production baseline to the exact candidate migration-127 registry as an explicitly qualified prepared-artifact transition, not as generic forward compatibility. The candidate registry SHALL identify migration 126 as `retire_wake_feature_preserving_history` and migration 127 as `coordinator_owned_work_scope_home`; any different, missing, or newer registry SHALL fail closed.
+
+After any offline migration or reconciliation write commits, the system SHALL consider the predecessor database/runtime pair incompatible for automatic activation and SHALL prohibit snapshot replay or predecessor startup. Before such a write commits, rollback MAY restore only the transaction-bound predecessor snapshot/runtime pair. This guarantee does not authorize downgrade, later-writer restore, mixed-version live operation, or compatibility for any other schema interval.
+
+### REQ-COMP-013: Ordinary forward activation is not downgrade-safe after candidate start
+
+For the qualified migration-123 to migration-127 ordinary in-place transition, the system SHALL treat the first candidate startup attempt as the conservative predecessor-compatibility boundary. Before that boundary, runtime artifact rollback MAY restart the unchanged predecessor database. At or after that boundary, failure or uncertainty SHALL retain the exact candidate and fail stopped/forward-only; it SHALL NOT infer predecessor compatibility from failed health, unchanged highest ledger, or absent production row evidence.
+
+This policy SHALL NOT require a standalone backup for ordinary forward deployment and SHALL NOT claim automatic database rollback. Explicit forward recovery SHALL use only the exact retained candidate. The wake-retirement metadata and coordinator-home environment kind remain unsupported by the predecessor unless a separate compatibility qualification proves otherwise.

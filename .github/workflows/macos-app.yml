@@ -12,6 +12,10 @@ on:
       - "crates/phoenix-ide/Cargo.toml"
       - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/devpy/test_launchd_deploy.py"
+      - "tests/devpy/test_current_schema_prepared_upgrade.py"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
@@ -33,6 +37,10 @@ on:
       - "crates/phoenix-ide/Cargo.toml"
       - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/devpy/test_launchd_deploy.py"
+      - "tests/devpy/test_current_schema_prepared_upgrade.py"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
@@ -70,6 +78,8 @@ jobs:
           python3 scripts/test-desktop-release-workflow.py
           node --test scripts/test-check-signed-helper.cjs
           python3 scripts/test_release_version.py
+      - name: Test launchd deployment controller
+        run: python3 -m unittest tests.devpy.test_launchd_deploy tests.devpy.test_current_schema_prepared_upgrade
       - name: Build a real unsigned Release package
         run: |
           version=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')

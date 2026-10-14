@@ -113,3 +113,53 @@ THE SYSTEM SHALL use only the retained byte-bound helper and immutable transacti
 THE SYSTEM SHALL retry only atomic publication of that captured candidate plist and removal/fsync of the transaction-owned temporary restore reservation, retain authoritative audit backup/proof, and persist pending status/claim through interruption or error. It SHALL clear pending and release only the owned claim after durable completion. An already completed rerun SHALL verify that same candidate/configuration and produce an idempotent result without applying ambient configuration.
 
 THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an older runtime, or generalize this operation into downgrade or cross-version recovery. Unknown, stale, mismatched, or absent evidence SHALL refuse without releasing ownership.
+
+### REQ-LDD-019: Explicit current-schema prepared-artifact mode
+
+**Condition:** When an authorized operator selects a prepared artifact to replace a production database at the qualified current-schema baseline,
+**System:** the deployment controller SHALL require an explicit current-schema mode distinct from paired legacy upgrade, preserve every prepared-artifact receipt/signature/identity check, bind the retained controller helper and candidate migration registry by exact path and SHA-256, reject release and runtime-only sources, and fail closed for a missing, unknown, mismatched, or newer migration ledger.
+
+**Rationale:** Relaxing the legacy eligibility gate would make incompatible database families indistinguishable and would weaken the signed-artifact handoff.
+
+### REQ-LDD-020: Current-schema snapshot and capacity proof
+
+**Condition:** When current-schema activation is prepared,
+**System:** the activation helper SHALL verify the exact qualified migration ledger, required ProductConversation tables, SQLite integrity, and foreign keys before disruption; physically reserve both backup and restore capacity while retaining at least 20 GiB free on each affected filesystem after the prepared install overhead has already been materialized; stop the service and prove exclusive database ownership; create a SQLite backup snapshot; and bind snapshot hash, logical contents, source and target ledgers, controller, helper, candidate, predecessor, and transaction identity in a private durable proof before running a migration.
+
+**Rationale:** Free-space estimates and a highest-version check do not prove that a multi-gigabyte live database can be restored or that it belongs to the qualified migration lineage.
+
+### REQ-LDD-021: Offline migration commit boundary and rollback prohibition
+
+**Condition:** When a qualified current-schema snapshot exists,
+**System:** the activation helper SHALL install the exact candidate binary, invoke that binary's bounded `--migrate-only` operation against the manifest-bound database while exclusive ownership remains proven, and verify the exact target ledger, SQLite integrity, and foreign keys before admitting candidate runtime traffic.
+
+**Condition:** When current-schema activation fails before any migration or reconciliation write commits,
+**System:** the activation helper MAY restore only the matching verified snapshot and predecessor binary/configuration, then SHALL verify predecessor identity before releasing ownership.
+
+**Condition:** When current-schema migration commits any database write, including a proper prefix of the target ledger,
+**System:** the activation helper SHALL NOT replay the snapshot or start the predecessor, SHALL retain exclusive deployment ownership and the compatible candidate artifacts, and SHALL report whether candidate start/publication is pending or migration repair is required.
+
+**Rationale:** Migrations commit independently, migration 126 retires wake behavior while preserving history, and migration 127 changes coordinator-home ownership. Treating a successful or partially committed migration as reversible could erase committed state or run an incompatible predecessor.
+
+### REQ-LDD-022: Current-schema finalization and recovery
+
+**Condition:** When the exact target ledger was durably verified but candidate start or persistent plist publication did not finish,
+**System:** `prod finalize-current <transaction>` SHALL re-verify the retained helper, candidate, private plist, database commit proof, and claim before startup; MAY start only that exact candidate; SHALL NOT replay the snapshot or invoke offline migration again; and SHALL publish the persistent plist and release temporary restore capacity only after candidate identity succeeds. Normal startup MAY perform candidate-owned idempotent initialization and reconciliation because those writes use the already committed forward-compatible runtime.
+
+**Condition:** When activation failed before offline candidate migration was invoked and the stopped, exclusively owned database still has the exact source ledger and logical contents,
+**System:** `prod recover-current <transaction>` SHALL use the retained immutable transaction to restore and verify the predecessor, while refusing recovery whenever offline migration was invoked, the database changed, or either fact is ambiguous.
+
+**Rationale:** Current-schema committed-state finalization needs a compatible candidate runtime, whereas paired legacy finalization remains publication-only and never bootstraps a runtime.
+
+### REQ-LDD-023: Ordinary forward activation failure boundary
+
+**Condition:** When ordinary in-place launchd deployment detects the exact migration-123 baseline and exact migration-127 candidate registry,
+**System:** the controller SHALL retain the exact candidate registry and helper with the transaction without requiring a standalone database backup, and the helper SHALL preserve ordinary predecessor rollback only for failures before candidate startup is attempted.
+
+**Condition:** When candidate startup is attempted,
+**System:** the helper SHALL treat migration 126, migration 127, and coordinator-home initialization as possibly committed even when startup or health fails; SHALL stop the failed candidate when possible; SHALL retain the candidate binary/configuration, transaction evidence, and ownership fence; SHALL NOT launch the predecessor; and SHALL report a forward-only recovery state.
+
+**Condition:** When an operator explicitly authorizes `prod resume-forward <transaction>`,
+**System:** the controller SHALL re-verify the retained helper, candidate binary/configuration, candidate registry, stopped target, and ownership claim; SHALL start only that exact retained candidate; and SHALL retain the forward-only fence on another failure.
+
+**Rationale:** Migration 126 commits independently and older wake logic does not understand its retirement metadata. Migration 127 plus coordinator-home initialization can durably introduce an environment kind the predecessor resource-authority reader rejects. A failed health check cannot establish that the database remained predecessor-compatible.

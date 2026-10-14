@@ -2,6 +2,7 @@ import datetime
 import fcntl
 import importlib.util
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -1803,6 +1804,51 @@ class PreparationTests(unittest.TestCase):
                     self.assertNotIn("remove the marker", str(error.exception))
                     self.assertEqual(active.read_text(), "broken-pair\n")
 
+    def test_forward_only_claim_survives_unreadable_retained_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "forward"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text("invalid-json")
+            active = root / "active"
+            active.write_text("forward\n")
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "forward",
+                        "state": "ordinary_activation_failed_forward_only",
+                        "finalization_pending": True,
+                    }
+                )
+            )
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                self.assertFalse(
+                    self.dev._status_is_terminal_for_owner(
+                        status, "forward", self.dev._DEPLOY_TERMINAL_STATES
+                    )
+                )
+                for admission in (
+                    self.dev._claim_launchd_deploy,
+                    self.dev._claim_launchd_restart,
+                ):
+                    with self.subTest(admission=admission.__name__), self.assertRaises(
+                        SystemExit
+                    ) as error:
+                        admission("new-operation")
+                    self.assertIn("Do not remove", str(error.exception))
+                    self.assertEqual(active.read_text(), "forward\n")
+
     def test_checkpointed_terminal_claim_public_recovery_remains_publication_only(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2115,14 +2161,32 @@ class PreparationTests(unittest.TestCase):
                 ordinary.mkdir()
                 (ordinary / "manifest.json").write_text(json.dumps({"paired_database_upgrade": None}))
                 os.utime(ordinary, (100 + i, 100 + i))
-            for name, content in (("paired", json.dumps({"paired_database_upgrade": {"backup_path": "private"}})), ("unreadable", "invalid-json"), ("unknown", None)):
+            for name, content in (
+                ("paired", json.dumps({"paired_database_upgrade": {"backup_path": "private"}})),
+                ("current-historical", json.dumps({"current_schema_upgrade": {"backup_path": "private"}})),
+                ("unreadable", "invalid-json"),
+                ("unknown", None),
+            ):
                 transaction = root / name
                 transaction.mkdir()
                 if content is not None:
                     (transaction / "manifest.json").write_text(content)
                 os.utime(transaction, (1, 1))
-            self.dev._prune_launchd_deploy_transactions(root, "current")
-            self.assertEqual(sorted(p.name for p in root.iterdir()), ["ordinary-3", "ordinary-4", "ordinary-5", "ordinary-6", "ordinary-7", "paired", "unknown", "unreadable"])
+            self.dev._prune_launchd_deploy_transactions(root, "new-current")
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir()),
+                [
+                    "current-historical",
+                    "ordinary-3",
+                    "ordinary-4",
+                    "ordinary-5",
+                    "ordinary-6",
+                    "ordinary-7",
+                    "paired",
+                    "unknown",
+                    "unreadable",
+                ],
+            )
 
     def test_claim_release_is_transaction_owned(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -2824,7 +2888,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_controller_durability_test")
 
     @contextlib.contextmanager
-    def deployment(self, *, paired=True, predecessor=True, fail_sync=None, fail_terminal=False):
+    def deployment(self, *, paired=True, current=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             root = Path(td)
             deploy = root / "deploy"
@@ -2849,7 +2913,8 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             controller = self.dev.ProdDeployControllerOptions(
                 transaction_id="durability", prepared_artifact=root if paired else None,
                 expected_full_commit=identity.git_sha if paired else None,
-                paired_database_upgrade=paired,
+                paired_database_upgrade=paired and not current,
+                current_schema_upgrade=current,
             )
             events = []
             real_fsync = os.fsync
@@ -2886,6 +2951,20 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 events.append(("command", tuple(command)))
                 if "rev-parse" in command:
                     return subprocess.CompletedProcess(command, 0, "d" * 40, "")
+                if command[:2] == ["git", "status"] and dirty:
+                    return subprocess.CompletedProcess(command, 0, " M dev.py\n", "")
+                if command[:2] == ["git", "show"]:
+                    return subprocess.CompletedProcess(command, 0, b"candidate registry bytes\n", b"")
+                if "bootstrap" in command and interrupt_handoff:
+                    real_write(
+                        deploy / "status.json",
+                        {
+                            "transaction_id": "durability",
+                            "state": "candidate_may_migrate",
+                            "finalization_pending": True,
+                        },
+                    )
+                    raise KeyboardInterrupt("controller lost accepted handoff")
                 if "--protocol-version" in command:
                     return subprocess.CompletedProcess(command, 0, str(self.dev.LAUNCHD_HANDOFF_PROTOCOL_VERSION) + "\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -2923,6 +3002,80 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(self.dev.os, "fsync", side_effect=fsync))
             stack.enter_context(mock.patch.object(self.dev.subprocess, "run", side_effect=run))
             yield staging, controller, events
+
+    def test_ordinary_forward_installer_binds_candidate_registry_and_helper(self):
+        with self.deployment(paired=False, current=False) as (staging, controller, events):
+            self.dev.launchd_prod_deploy(controller=controller)
+            manifest = json.loads((staging / "manifest.json").read_text())
+            forward = manifest["ordinary_forward_migration"]
+            self.assertEqual(forward["database_path"], str(self.dev.PROD_DB_PATH))
+            self.assertEqual(forward["helper_path"], str(staging / "activate.py"))
+            self.assertEqual(
+                forward["helper_sha256"], self.dev._file_sha256(staging / "activate.py")
+            )
+            self.assertEqual(forward["migration_registry_path"], str(staging / "migrations.rs"))
+            self.assertIn(
+                ("command", ("git", "show", "a" * 40 + ":crates/phoenix-db/src/migrations.rs")),
+                events,
+            )
+
+    def test_ordinary_interrupted_handoff_preserves_forward_boundary_and_claim(self):
+        with self.deployment(
+            paired=False, current=False, interrupt_handoff=True
+        ) as (staging, controller, _events):
+            with self.assertRaises(KeyboardInterrupt):
+                self.dev.launchd_prod_deploy(controller=controller)
+            status = json.loads((staging.parents[1] / "status.json").read_text())
+            self.assertEqual(status["state"], "candidate_may_migrate")
+            self.assertTrue(status["finalization_pending"])
+            self.assertEqual(
+                (staging.parents[1] / "active").read_text().strip(), "durability"
+            )
+
+    def test_current_schema_direct_launchd_entry_rejects_missing_artifact_without_build(self):
+        controller = self.dev.ProdDeployControllerOptions(current_schema_upgrade=True, expected_full_commit="a" * 40)
+        with mock.patch.object(self.dev, "_prepare_local_candidate") as build:
+            with self.assertRaisesRegex(SystemExit, "requires --prepared-artifact"):
+                self.dev.launchd_prod_deploy(controller=controller)
+            build.assert_not_called()
+
+    def test_current_schema_stages_candidate_commit_registry_before_handoff(self):
+        with self.deployment(current=True) as (staging, controller, events):
+            self.dev.launchd_prod_deploy(controller=controller)
+            manifest = json.loads((staging / "manifest.json").read_text())
+            upgrade = manifest["current_schema_upgrade"]
+            registry = staging / "migrations.rs"
+            self.assertIsNone(manifest["paired_database_upgrade"])
+            self.assertEqual(upgrade["controller_source_commit"], "d" * 40)
+            self.assertEqual(upgrade["database_path"], str(self.dev.PROD_DB_PATH))
+            self.assertEqual(upgrade["backup_path"], str(staging / "database-backup.sqlite3"))
+            self.assertEqual(upgrade["proof_path"], str(staging / "database-backup-proof.json"))
+            self.assertEqual(upgrade["controller_helper_path"], str(staging / "activate.py"))
+            self.assertEqual(upgrade["controller_helper_sha256"], self.dev._file_sha256(staging / "activate.py"))
+            self.assertEqual(upgrade["migration_registry_path"], str(registry))
+            self.assertEqual(upgrade["migration_registry_sha256"], self.dev._file_sha256(registry))
+            self.assertEqual(registry.read_bytes(), b"candidate registry bytes\n")
+            self.assertEqual(registry.stat().st_mode & 0o777, 0o600)
+            self.assertIn(("command", ("git", "show", "a" * 40 + ":crates/phoenix-db/src/migrations.rs")), events)
+            prepared = events.index(("status", "prepared"))
+            self.assertLess(events.index(("file", "migrations.rs")), prepared)
+            self.assertLess(events.index(("directory", staging)), prepared)
+            self.assertLess(prepared, next(i for i, event in enumerate(events) if event[0] == "command" and "bootstrap" in event[1]))
+
+    def test_current_schema_rejects_dirty_controller_before_staging_registry(self):
+        with self.deployment(current=True, dirty=True) as (staging, controller, events):
+            with self.assertRaisesRegex(SystemExit, "clean controller checkout"):
+                self.dev.launchd_prod_deploy(controller=controller)
+            self.assertFalse((staging / "migrations.rs").exists())
+            self.assertNotIn(("status", "prepared"), events)
+            self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_current_schema_registry_fsync_failure_prevents_handoff(self):
+        with self.deployment(current=True, fail_sync="migrations.rs") as (staging, controller, events):
+            with self.assertRaisesRegex(OSError, "injected artifact fsync failure"):
+                self.dev.launchd_prod_deploy(controller=controller)
+            self.assertNotIn(("status", "prepared"), events)
+            self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
 
     def test_reused_transaction_cannot_mutate_hardlinked_installed_plist(self):
         with self.deployment() as (staging, controller, events):
@@ -3152,6 +3305,33 @@ class PreparedArtifactTests(unittest.TestCase):
         deploy.assert_called_once_with(None, controller=controller)
         check.assert_not_called()
 
+    def test_current_schema_options_require_triad_and_exclude_release(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            prepared_artifact=Path("prepared"), expected_full_commit="a" * 40,
+            current_schema_upgrade=True,
+        )
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check:
+            self.dev.cmd_prod_deploy(controller=controller)
+            deploy.assert_called_once_with(None, controller=controller)
+            check.assert_not_called()
+            with self.assertRaisesRegex(SystemExit, "excludes --release"):
+                self.dev.cmd_prod_deploy("v1.2.3", controller=controller)
+            with self.assertRaisesRegex(SystemExit, "mutually exclusive"):
+                self.dev.cmd_prod_deploy(controller=dataclasses.replace(controller, paired_database_upgrade=True))
+        with mock.patch.object(self.dev.sys, "platform", "linux"):
+            with self.assertRaisesRegex(SystemExit, "only by macOS launchd"):
+                self.dev.cmd_prod_deploy(controller=controller)
+        for invalid in (
+            self.dev.ProdDeployControllerOptions(current_schema_upgrade=True),
+            self.dev.ProdDeployControllerOptions(current_schema_upgrade=True, expected_full_commit="a" * 40),
+            self.dev.ProdDeployControllerOptions(current_schema_upgrade=True, prepared_artifact=Path("prepared")),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(SystemExit, "required together"):
+                self.dev.cmd_prod_deploy(controller=invalid)
+
     def test_cmd_prod_deploy_rejects_incomplete_prepared_artifact_options(self):
         cases = [
             (self.dev.ProdDeployControllerOptions(prepared_artifact=Path("prepared"), paired_database_upgrade=True), "required together"),
@@ -3183,6 +3363,28 @@ class PreparedArtifactTests(unittest.TestCase):
                 observed = json.loads(status.read_text())
                 self.assertEqual(observed["state"], "precondition_failed")
                 self.assertEqual(observed["source_kind"], "prepared_artifact")
+
+    def test_current_schema_receipt_validation_failure_prevents_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            controller = self.dev.ProdDeployControllerOptions(
+                prepared_artifact=root / "artifact", expected_full_commit="a" * 40,
+                current_schema_upgrade=True, transaction_id="failed-current-receipt",
+            )
+            with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
+                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+                 mock.patch.object(self.dev, "_claim_launchd_deploy"), \
+                 mock.patch.object(self.dev, "_release_launchd_deploy_claim"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), \
+                 mock.patch.object(self.dev, "_prepare_prepared_artifact", side_effect=SystemExit("receipt rejected")) as validate, \
+                 mock.patch.object(self.dev.subprocess, "run") as run:
+                with self.assertRaisesRegex(SystemExit, "receipt rejected"):
+                    self.dev.launchd_prod_deploy(controller=controller)
+                validate.assert_called_once_with(root / "artifact", "a" * 40)
+                run.assert_not_called()
+                self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
 
     def test_cmd_prod_deploy_rejects_nonmac_and_release_for_prepared_artifact(self):
         controller = self.dev.ProdDeployControllerOptions(

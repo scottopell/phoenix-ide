@@ -8,6 +8,10 @@ Production deployment restores the previous binary, configuration, environment, 
 
 Database restore or replacement is an offline operator procedure. Phoenix does not provide live replacement fencing for an SQLite file already opened by a running process.
 
+A narrow prepared-artifact launchd exception qualifies the exact migration-123 to migration-127 transition. Its controller proves an offline snapshot and exact source/target ledgers, and automatic predecessor rollback exists only while the source ledger and logical contents remain unchanged. Any committed migration or reconciliation write forbids snapshot replay and predecessor startup; this does not create a general downgrade guarantee.
+
+The ordinary in-place route does not gain a backup requirement. Instead, for that exact interval, the first candidate startup attempt is a conservative downgrade boundary: later failure retains the candidate and stops forward-only because wake retirement or coordinator-home initialization may already have committed.
+
 Internal SQLite timestamps use mixed representations. New or changed internal timestamp columns must converge on explicitly unit-named integer Unix microseconds unless a more specific normative requirement identifies an external reader and requires another representation.
 
 Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as an explicit opt-in, with sccache and uncached automatic fallbacks. Automatic selection excludes Kache for every build surface because restored-archive source-level debug fidelity is unqualified; the fidelity blocker remains open. Cache selection is scoped to Cargo subprocesses and does not establish a general cross-version, remote-cache, performance, or debug-symbol compatibility guarantee.
@@ -16,6 +20,8 @@ Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as
 
 | Requirement | Current coverage / gap |
 | --- | --- |
+| REQ-COMP-013 | Ordinary no-backup pre-start rollback, post-start forward-only fence, no predecessor launch, and exact-candidate resume tests |
+| REQ-COMP-012 | Exact 123-to-127 registry qualification, irreversible 126/127 identity, pre-invocation-only rollback, and partial/ambiguous-write fail-closed tests in the launchd prepared helper |
 | REQ-COMP-001 | The requirement is defined in `requirements.md`, and contributor guidance points agents to that authority. A broader guarantee inventory remains follow-up work. |
 | REQ-COMP-002 | Phoenix-managed forward migrations and intentional seeder gaps are implemented and tested. Damaged or manually changed ledgers, historical-binary access to newer migrations, and project-wide data preservation are not guaranteed. |
 | REQ-COMP-003 | Foundation acceptance covers manual offline paired restore, but production deployment can still launch an older candidate without proving that restore occurred, and the UI overstates runtime-artifact rollback. Enforcement and truthful messaging are tracked in task 44016. |

@@ -9512,6 +9512,7 @@ class ProdDeployControllerOptions:
     backend: str | None = None
     prepared_artifact: Path | None = None
     paired_database_upgrade: bool = False
+    current_schema_upgrade: bool = False
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -10162,7 +10163,9 @@ def _prepare_local_candidate(
 
 _DEPLOY_TERMINAL_STATES = {
     "committed", "precondition_failed", "activation_failed_rolled_back",
-    "activation_failed_rollback_failed", "ordinary_activation_failed_rollback_failed", "rejected_concurrent",
+    "activation_failed_rollback_failed", "activation_failed_database_committed",
+    "ordinary_activation_failed_forward_only",
+    "ordinary_activation_failed_rollback_failed", "rejected_concurrent",
 }
 _RESTART_TERMINAL_STATES = {
     "committed", "precondition_failed", "restart_failed", "rejected_concurrent",
@@ -10210,7 +10213,11 @@ def _status_is_terminal_for_owner(
                  or (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None))
         ):
             return False
-        return status.get("transaction_id") == owner and status.get("state") in terminal_states
+        return (
+            status.get("transaction_id") == owner
+            and status.get("state") in terminal_states
+            and not status.get("finalization_pending", False)
+        )
     except (OSError, json.JSONDecodeError):
         return False
 
@@ -10224,7 +10231,11 @@ def _transaction_has_paired_manifest(transaction: Path) -> bool:
         return True
     except (OSError, json.JSONDecodeError):
         return True
-    return not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None
+    return (
+        not isinstance(payload, dict)
+        or payload.get("paired_database_upgrade") is not None
+        or payload.get("current_schema_upgrade") is not None
+    )
 
 
 def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transaction_id: str) -> None:
@@ -10293,12 +10304,51 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     if not isinstance(manifest, dict):
         manifest = {}
     paired = manifest.get("paired_database_upgrade") is not None or manifest.get("source_kind") == "prepared_artifact" or status.get("source_kind") == "prepared_artifact"
-    if paired and status.get("transaction_id") == owner and status.get("state") == "committed" and status.get("finalization_pending"):
+    current_schema = manifest.get("current_schema_upgrade") is not None
+    ordinary_forward = manifest.get("ordinary_forward_migration") is not None
+    owner_status = status.get("transaction_id") == owner
+    if not ordinary_forward and owner_status and status.get("state") in {
+        "candidate_may_migrate",
+        "ordinary_activation_failed_forward_only",
+    } and status.get("finalization_pending"):
         return (
-            f"paired commit {owner} has pending publication/cleanup; login/reboot persistence is unconfirmed. "
+            f"ordinary forward activation {owner} may have committed migration or initialization writes. "
+            "Its retained manifest is required for recovery but is missing, unreadable, or incomplete. "
+            "Do not remove the claim, start the predecessor, deploy, or restart; restore the exact retained evidence or qualify a forward repair."
+        )
+    if ordinary_forward and owner_status and status.get("state") in {
+        "candidate_may_migrate",
+        "ordinary_activation_failed_forward_only",
+    }:
+        return (
+            f"ordinary forward activation {owner} may have committed migration 126/127 or coordinator-home initialization. "
+            "Do not start the predecessor or remove the claim. Preserve the retained candidate and evidence; "
+            f"after explicit forward-recovery authorization run ./dev.py prod resume-forward {owner}."
+        )
+    if current_schema and status.get("transaction_id") == owner and status.get("state") == "migration_started":
+        return (
+            f"current-schema offline migration {owner} was invoked and predecessor recovery is forbidden. "
+            "Preserve the claim, candidate, backup/proof, and diagnostics. If the retained proof has the exact target commit, "
+            f"use ./dev.py prod finalize-current {owner}; otherwise qualify a compatible forward repair."
+        )
+    if current_schema and status.get("transaction_id") == owner and status.get("state") == "activation_failed_database_committed":
+        return (
+            f"current-schema migration {owner} committed database writes before activation failed. "
+            "Predecessor rollback and snapshot replay are forbidden. Preserve the claim, candidate, backup/proof, and diagnostics; "
+            "qualify a compatible candidate repair before changing production state."
+        )
+    if paired and status.get("transaction_id") == owner and status.get("state") == "committed" and status.get("finalization_pending"):
+        command = "finalize-current" if current_schema else "finalize-paired"
+        action = (
+            "it verifies the committed migrated database and may start only the exact retained candidate before publication/cleanup"
+            if current_schema
+            else "it verifies the running committed candidate and only retries publication/cleanup"
+        )
+        return (
+            f"prepared commit {owner} has pending publication/cleanup; login/reboot persistence is unconfirmed. "
             "Do not remove its active marker, redeploy, or invoke database rollback. "
-            f"After confirming the old helper is absent, run ./dev.py prod finalize-paired {owner}; "
-            "it verifies the running committed candidate and only retries publication/cleanup."
+            f"After confirming the old helper is absent, run ./dev.py prod {command} {owner}; "
+            f"{action}."
         )
     if paired and status.get("transaction_id") == owner and status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None:
         return (
@@ -10309,12 +10359,18 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         )
     resolved = status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed", "activation_failed_rolled_back"}
     if paired and not resolved:
+        command = "recover-current" if current_schema else "recover-paired"
+        boundary = (
+            "Current-schema recovery may restore the predecessor only when exact ledger and logical digest prove that no migration write committed. "
+            if current_schema
+            else "Recovery must verify the paired legacy proof. "
+        )
         return (
-            f"paired recovery for {owner} is unverified. Do not remove its active marker or start any runtime. "
+            f"prepared recovery for {owner} is unverified. Do not remove its active marker or start any runtime. "
             "Preserve the private snapshot/proof and matching predecessor binary/config. "
-            "Recovery must confirm stopped service and exclusive database ownership, verify the paired proof, "
-            "restore the matching database/runtime/config, and verify predecessor identity before releasing this claim. "
-            "Use prod recover-paired with the retained transaction; if its proof fails, keep the service stopped."
+            f"{boundary}Recovery must confirm stopped service and exclusive database ownership, restore only when authorized, "
+            f"and verify predecessor identity before releasing this claim. Use prod {command} with the retained transaction; "
+            "if its proof fails, keep the service stopped."
         )
     return None
 
@@ -10510,20 +10566,25 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
-def cmd_prod_finalize_paired(transaction_id: str) -> None:
+def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = False) -> None:
+    mode_name = "current-schema" if current_schema else "paired"
+    mode_key = "current_schema_upgrade" if current_schema else "paired_database_upgrade"
+    helper_command = "finalize-current" if current_schema else "finalize-paired"
     if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
-        raise SystemExit("paired finalization requires macOS and a safe transaction ID")
+        raise SystemExit(f"{mode_name} finalization requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
     payload = json.loads(manifest_path.read_text())
     status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
     owner = _deploy_claim_owner()
-    if status.get("transaction_id") != transaction_id or status.get("state") != "committed" or payload.get("paired_database_upgrade") is None:
-        raise SystemExit("finalization requires the retained committed paired transaction")
+    allowed_states = {"committed", "migration_started"} if current_schema else {"committed"}
+    if status.get("transaction_id") != transaction_id or status.get("state") not in allowed_states or payload.get(mode_key) is None:
+        raise SystemExit(f"finalization requires retained committed {mode_name} database evidence")
     if owner != transaction_id and (owner is not None or status.get("finalization_pending")):
-        raise SystemExit("paired finalization claim mismatch")
-    helper = Path(payload["paired_database_upgrade"]["controller_helper_path"])
-    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != payload["paired_database_upgrade"].get("controller_helper_sha256"):
+        raise SystemExit(f"{mode_name} finalization claim mismatch")
+    upgrade = payload[mode_key]
+    helper = Path(upgrade["controller_helper_path"])
+    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != upgrade.get("controller_helper_sha256"):
         raise SystemExit("retained helper checksum mismatch")
     interpreter = subprocess.run([sys.executable, "-c", "import fcntl, plistlib, ssl, urllib.request"], capture_output=True, text=True)
     if interpreter.returncode != 0:
@@ -10532,15 +10593,55 @@ def cmd_prod_finalize_paired(transaction_id: str) -> None:
     absence = subprocess.run([sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
     if absence.returncode != 0:
         raise SystemExit("previous activation helper absence is unconfirmed")
-    result = subprocess.run([sys.executable, str(helper), "finalize-paired", "--manifest", str(manifest_path), "--helper-label", label, "--uid", str(os.getuid())], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(helper), helper_command, "--manifest", str(manifest_path), "--helper-label", label, "--uid", str(os.getuid())], capture_output=True, text=True)
     if result.returncode != 0:
-        raise SystemExit(f"paired finalization refused/failed; claim retained: {result.stderr.strip()}")
-    print(f"Paired finalization complete: {transaction_id}; no runtime/database action.")
+        raise SystemExit(f"{mode_name} finalization refused/failed; claim retained: {result.stderr.strip()}")
+    action = "candidate start/publication only; no database mutation" if current_schema else "no runtime/database action"
+    print(f"{mode_name.capitalize()} finalization complete: {transaction_id}; {action}.")
 
 
-def cmd_prod_recover_paired(transaction_id: str) -> None:
+def cmd_prod_resume_forward(transaction_id: str) -> None:
     if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
-        raise SystemExit("paired recovery requires macOS and a safe transaction ID")
+        raise SystemExit("forward recovery requires macOS and a safe transaction ID")
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    manifest_path = staging / "manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    forward = payload.get("ordinary_forward_migration")
+    if (
+        not isinstance(forward, dict)
+        or status.get("transaction_id") != transaction_id
+        or status.get("state") not in {"candidate_may_migrate", "ordinary_activation_failed_forward_only"}
+        or _deploy_claim_owner() != transaction_id
+    ):
+        raise SystemExit("forward recovery requires a retained unresolved ordinary transaction")
+    helper = Path(forward["helper_path"])
+    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != forward.get("helper_sha256"):
+        raise SystemExit("retained forward helper binding is invalid")
+    label = payload["helper_label"]
+    absence = subprocess.run(
+        [sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())],
+        capture_output=True,
+        text=True,
+    )
+    if absence.returncode != 0:
+        raise SystemExit("previous activation helper absence is unconfirmed")
+    result = subprocess.run(
+        [sys.executable, str(helper), "resume-forward", "--manifest", str(manifest_path), "--helper-label", label, "--uid", str(os.getuid())],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"forward recovery failed; claim retained: {result.stderr.strip()}")
+    print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
+
+
+def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False) -> None:
+    mode_name = "current-schema" if current_schema else "paired"
+    mode_key = "current_schema_upgrade" if current_schema else "paired_database_upgrade"
+    helper_command = "recover-current" if current_schema else "recover-paired"
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
+        raise SystemExit(f"{mode_name} recovery requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
     try:
@@ -10550,7 +10651,18 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
     if not isinstance(recovery_status, dict):
         recovery_status = {}
     if recovery_status.get("transaction_id") == transaction_id and recovery_status.get("state") == "committed":
-        raise SystemExit("committed paired transactions cannot enter database rollback; inspect pending publication/cleanup guidance in prod status")
+        raise SystemExit(f"committed {mode_name} transactions cannot enter database rollback; inspect pending publication/cleanup guidance in prod status")
+    if (
+        current_schema
+        and recovery_status.get("transaction_id") == transaction_id
+        and recovery_status.get("state") in {
+            "migration_started",
+            "activation_failed_database_committed",
+        }
+    ):
+        raise SystemExit(
+            "current-schema offline migration was invoked or may have committed writes; predecessor recovery is forbidden"
+        )
     if not manifest_path.exists() or recovery_status.get("state") in {"preparing", "prepared"}:
         with _launchd_claim_lock():
             status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
@@ -10572,11 +10684,11 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
                 raise SystemExit("pre-manifest helper absence is unconfirmed")
             if manifest_path.exists():
                 abandoned = json.loads(manifest_path.read_text())
-                paired = abandoned.get("paired_database_upgrade")
-                if paired is not None:
-                    proof = Path(paired["proof_path"])
-                    backup = Path(paired["backup_path"])
-                    database = Path(paired["database_path"])
+                upgrade = abandoned.get(mode_key)
+                if upgrade is not None:
+                    proof = Path(upgrade["proof_path"])
+                    backup = Path(upgrade["backup_path"])
+                    database = Path(upgrade["database_path"])
                     reserve = database.parent / f".{database.name}.restore-{transaction_id}"
                     if backup.parent != staging or proof.parent != staging or proof.exists() or proof.is_symlink():
                         raise SystemExit("abandonment allocation context is ambiguous")
@@ -10596,15 +10708,15 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
             )
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
             _release_launchd_deploy_claim_unlocked(transaction_id)
-        print("Interrupted pre-handoff paired preparation verified; runtime/database untouched and ownership released.")
+        print(f"Interrupted pre-handoff {mode_name} preparation verified; runtime/database untouched and ownership released.")
         return
     payload = json.loads(manifest_path.read_text())
-    paired = payload.get("paired_database_upgrade")
-    if not isinstance(paired, dict) or _paired_recovery_refusal(transaction_id) is None or _deploy_claim_owner() != transaction_id:
-        raise SystemExit("no matching failed paired transaction owns recovery")
-    helper = Path(paired["controller_helper_path"])
-    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != paired["controller_helper_sha256"]:
-        raise SystemExit("retained paired controller helper binding is invalid")
+    upgrade = payload.get(mode_key)
+    if not isinstance(upgrade, dict) or _paired_recovery_refusal(transaction_id) is None or _deploy_claim_owner() != transaction_id:
+        raise SystemExit(f"no matching failed {mode_name} transaction owns recovery")
+    helper = Path(upgrade["controller_helper_path"])
+    if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != upgrade["controller_helper_sha256"]:
+        raise SystemExit(f"retained {mode_name} controller helper binding is invalid")
     label = payload["helper_label"]
     interpreter = Path(sys.executable).resolve()
     probe = subprocess.run([str(interpreter), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"], capture_output=True)
@@ -10612,14 +10724,14 @@ def cmd_prod_recover_paired(transaction_id: str) -> None:
         raise SystemExit("active Python interpreter cannot run paired SQLite recovery")
     observed = subprocess.run([str(interpreter), str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
     if observed.returncode != 0:
-        raise SystemExit("paired helper absence is unconfirmed; inspect it before recovery")
+        raise SystemExit(f"{mode_name} helper absence is unconfirmed; inspect it before recovery")
     plist = plistlib.loads(_helper_plist(label, helper, manifest_path, staging / "recovery.log", Path(sys.executable)))
-    plist["ProgramArguments"][2] = "recover-paired"
+    plist["ProgramArguments"][2] = helper_command
     helper_plist = staging / "recovery-helper.plist"
     helper_plist.write_bytes(plistlib.dumps(plist))
     helper_plist.chmod(0o600)
     subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)], check=True)
-    print(f"Verified paired recovery handed to retained controller for {transaction_id}; inspect prod status. Claim remains until matching restore and predecessor verification succeed.")
+    print(f"Verified {mode_name} recovery handed to retained controller for {transaction_id}; inspect prod status. Claim remains until matching restore and predecessor verification succeed.")
 
 
 def _restart_helper_plist(
@@ -10679,7 +10791,12 @@ def launchd_prod_deploy(
     controller = controller or ProdDeployControllerOptions()
     if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
-    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if controller.paired_database_upgrade and LAUNCHD_PLIST_PATH.is_file() else None
+    if controller.current_schema_upgrade and (
+        controller.paired_database_upgrade or controller.prepared_artifact is None
+        or controller.expected_full_commit is None or release is not None
+    ):
+        raise SystemExit("--current-schema-upgrade requires --prepared-artifact and --expected-full-commit, excludes --paired-database-upgrade and --release")
+    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if (controller.paired_database_upgrade or controller.current_schema_upgrade) and LAUNCHD_PLIST_PATH.is_file() else None
     launchd_env, _env_file = _launchd_candidate_env(controller)
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
@@ -10724,7 +10841,7 @@ def launchd_prod_deploy(
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         if installed_config_hash is not None and _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
             raise SystemExit("installed configuration changed before claim acquisition")
-        if controller.paired_database_upgrade and installed_config_hash is not None:
+        if (controller.paired_database_upgrade or controller.current_schema_upgrade) and installed_config_hash is not None:
             launchd_env, _env_file = _launchd_candidate_env(controller)
             _preflight_prod_bind_auth(launchd_env, socket_activated=True)
             if _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
@@ -10736,8 +10853,8 @@ def launchd_prod_deploy(
         _fsync_directory(staging.parent)
         staging.chmod(0o700)
         if controller.prepared_artifact is not None:
-            if release or not controller.paired_database_upgrade or controller.expected_full_commit is None:
-                raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together and exclude --release")
+            if release or controller.paired_database_upgrade == controller.current_schema_upgrade or controller.expected_full_commit is None:
+                raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together and exclude --release")
             prepared = _prepare_prepared_artifact(controller.prepared_artifact, controller.expected_full_commit)
         else:
             prepared = (
@@ -10829,6 +10946,20 @@ def launchd_prod_deploy(
             if subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip():
                 raise SystemExit("prepared-artifact deployment requires a clean controller checkout")
         _materialize_helper(controller_source_commit or source_commit, helper, "local_head" if controller_source_commit else source_kind)
+        migration_registry = None
+        ordinary_forward_migration = (
+            prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT
+            and previous_identity is not None
+        )
+        if controller.current_schema_upgrade or ordinary_forward_migration:
+            migration_registry = staging / "migrations.rs"
+            _materialize_source_file(
+                source_commit,
+                "crates/phoenix-db/src/migrations.rs",
+                migration_registry,
+                "local_head" if controller.current_schema_upgrade else source_kind,
+            )
+            migration_registry.chmod(0o600)
         python_executable = Path(sys.executable).resolve()
         protocol = subprocess.run(
             [str(python_executable), str(helper), "--protocol-version"],
@@ -10905,6 +11036,23 @@ def launchd_prod_deploy(
                 "controller_helper_sha256": _file_sha256(helper) if controller_source_commit else None,
                 "controller_helper_path": str(helper) if controller_source_commit else None,
             } if controller.paired_database_upgrade else None),
+            **({"current_schema_upgrade": {
+                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                "backup_path": str(staging / "database-backup.sqlite3"),
+                "proof_path": str(staging / "database-backup-proof.json"),
+                "controller_source_commit": controller_source_commit,
+                "controller_helper_sha256": _file_sha256(helper),
+                "controller_helper_path": str(helper),
+                "migration_registry_sha256": _file_sha256(migration_registry),
+                "migration_registry_path": str(migration_registry),
+            }} if controller.current_schema_upgrade else {}),
+            **({"ordinary_forward_migration": {
+                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                "helper_sha256": _file_sha256(helper),
+                "helper_path": str(helper),
+                "migration_registry_sha256": _file_sha256(migration_registry),
+                "migration_registry_path": str(migration_registry),
+            }} if ordinary_forward_migration else {}),
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_json_atomic(staging / "manifest.json", manifest)
@@ -10913,6 +11061,8 @@ def launchd_prod_deploy(
             candidate_binary, candidate_plist, helper, helper_plist, staging / "manifest.json",
         ]
         retained_artifacts.extend(path for path in (rollback_binary, rollback_plist) if path.exists())
+        if migration_registry is not None:
+            retained_artifacts.append(migration_registry)
         for artifact in retained_artifacts:
             with artifact.open("rb") as stream:
                 os.fsync(stream.fileno())
@@ -10934,7 +11084,19 @@ def launchd_prod_deploy(
         if result.returncode != 0:
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
     except BaseException as exc:
-        if controller is not None and controller.paired_database_upgrade and bootstrap_attempted:
+        if (
+            bootstrap_attempted
+            and (
+                ordinary_forward_migration
+                or (
+                    controller is not None
+                    and (
+                        controller.paired_database_upgrade
+                        or controller.current_schema_upgrade
+                    )
+                )
+            )
+        ):
             raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         terminal_status_written = False
@@ -11392,15 +11554,19 @@ def cmd_prod_deploy(
 ):
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
-    supplied = (controller.prepared_artifact is not None, controller.paired_database_upgrade)
-    if controller.expected_full_commit is not None and release is None and not any(supplied):
-        raise SystemExit("--expected-full-commit requires all prepared paired options or an exact release controller")
-    if any(supplied) and (not all(supplied) or controller.expected_full_commit is None):
-        raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together")
+    upgrade_modes = (controller.paired_database_upgrade, controller.current_schema_upgrade)
+    if all(upgrade_modes):
+        raise SystemExit("--paired-database-upgrade and --current-schema-upgrade are mutually exclusive")
+    if controller.expected_full_commit is not None and release is None and controller.prepared_artifact is None and not any(upgrade_modes):
+        raise SystemExit("--expected-full-commit requires all prepared upgrade options or an exact release controller")
+    if (controller.prepared_artifact is not None or any(upgrade_modes)) and (
+        controller.prepared_artifact is None or controller.expected_full_commit is None or not any(upgrade_modes)
+    ):
+        raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together")
     if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):
-        raise SystemExit("prepared artifact paired deployment is supported only by macOS launchd")
+        raise SystemExit("prepared artifact upgrade is supported only by macOS launchd")
     if controller.prepared_artifact is not None and release:
-        raise SystemExit("prepared artifact paired deployment excludes --release")
+        raise SystemExit("prepared artifact upgrade excludes --release")
     env = controller.require_backend()
     if controller.enabled and not release and controller.prepared_artifact is None:
         raise SystemExit("controller mode requires --release")
@@ -11784,11 +11950,19 @@ def main():
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
     deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
-    deploy_parser.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
+    upgrade_group = deploy_parser.add_mutually_exclusive_group()
+    upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
+    upgrade_group.add_argument("--current-schema-upgrade", action="store_true", help="Explicit current-schema prepared-artifact database upgrade")
     recover_parser = prod_sub.add_parser("recover-paired", help="Verify and restore a retained failed paired transaction")
     recover_parser.add_argument("transaction_id")
     finalize_parser = prod_sub.add_parser("finalize-paired", help="Finalize retained committed paired publication/cleanup without runtime or database changes")
     finalize_parser.add_argument("transaction_id")
+    recover_current_parser = prod_sub.add_parser("recover-current", help="Recover a retained failed current-schema transaction only when no migration write committed")
+    recover_current_parser.add_argument("transaction_id")
+    finalize_current_parser = prod_sub.add_parser("finalize-current", help="Finalize a committed current-schema candidate without rerunning offline migration or snapshot restore")
+    finalize_current_parser.add_argument("transaction_id")
+    resume_forward_parser = prod_sub.add_parser("resume-forward", help="Resume only the exact retained forward candidate after predecessor rollback became unsafe")
+    resume_forward_parser.add_argument("transaction_id")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
@@ -11963,6 +12137,7 @@ def main():
                     transaction_id=args.transaction_id,
                     prepared_artifact=args.prepared_artifact,
                     paired_database_upgrade=args.paired_database_upgrade,
+                    current_schema_upgrade=args.current_schema_upgrade,
                     backend=args.controller_backend,
                 ),
             )
@@ -11970,6 +12145,12 @@ def main():
             cmd_prod_recover_paired(args.transaction_id)
         elif args.prod_command == "finalize-paired":
             cmd_prod_finalize_paired(args.transaction_id)
+        elif args.prod_command == "recover-current":
+            cmd_prod_recover_paired(args.transaction_id, current_schema=True)
+        elif args.prod_command == "finalize-current":
+            cmd_prod_finalize_paired(args.transaction_id, current_schema=True)
+        elif args.prod_command == "resume-forward":
+            cmd_prod_resume_forward(args.transaction_id)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":
