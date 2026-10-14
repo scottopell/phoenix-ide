@@ -243,27 +243,12 @@ test('required invalid JSON, wrong aggregate, byte overlimit, HTTP/content-type 
   }
 });
 
-test('required deadline and disposal terminate bounded sealed drain without late snapshots', async () => {
-  for (const reason of ['deadline', 'disposed']) {
-    const f = recorderFixture({ deadlineMs: 10 }); const req = f.request(); f.page.emit('request', req);
-    let complete;
-    f.respond(req, () => new Promise(resolve => { complete = resolve; }));
-    await new Promise(resolve => setImmediate(resolve));
-    const drained = f.recorder.sealAndDrain(); assert.equal(f.page.listenerCount('response'), 0);
-    if (reason === 'disposed') f.page.emit('close');
-    const drain = await drained; assert.equal(drain.partial, false); assert.equal(drain.pending_required, 0);
-    assert.equal(f.recorder.captureErrors[0].reason, reason); assert.throws(() => f.recorder.assertQualified());
-    complete(JSON.stringify(aggregateBody)); await new Promise(resolve => setImmediate(resolve));
-    assert.equal(f.snapshots.length, 0);
-  }
-});
-
 test('sealed drain includes all outstanding required responses, preserves raw and parsed identity', async () => {
   const f = recorderFixture(); let complete;
   const req = f.request(); f.page.emit('request', req);
   f.respond(req, () => new Promise(resolve => { complete = resolve; }));
   await new Promise(resolve => setImmediate(resolve));
-  const drained = f.recorder.sealAndDrain(); assert.equal(f.page.listenerCount('response'), 0);
+  const drained = f.recorder.sealAndDrain(); assert.equal(f.page.listenerCount('response'), 1);
   f.respond(f.request('/api/models'), () => assert.fail('sealed listener'));
   complete(JSON.stringify(aggregateBody)); const drain = await drained;
   assert.equal(drain.partial, false); assert.equal(drain.required_outcomes[0].outcome, 'captured');
@@ -273,8 +258,10 @@ test('sealed drain includes all outstanding required responses, preserves raw an
 });
 
 test('missing required outcome fails; requestfailed transport remains distinct from 200 capture failure; app errors always fail', async () => {
-  const f = recorderFixture(); const req = f.request(); f.page.emit('request', req);
-  await f.recorder.sealAndDrain(); assert.equal(f.recorder.captureErrors[0].reason, 'missing_response');
+  const clock = controlledClock();
+  const f = recorderFixture({ clock }); const req = f.request(); f.page.emit('request', req);
+  const drained = f.recorder.sealAndDrain(); clock.advance(11000);
+  await drained; assert.equal(f.recorder.captureErrors[0].reason, 'deadline');
   assert.throws(() => f.recorder.assertQualified());
   const fault = recorderFixture({ expectedRequestFailure: entry => entry.url === 'http://127.0.0.1:1234' + aggregate.endpoint && entry.method === 'GET' }); const failedReq = fault.request(); fault.page.emit('request', failedReq);
   fault.page.emit('requestfailed', failedReq); const drain = await fault.recorder.sealAndDrain();
@@ -328,4 +315,116 @@ test('runtime seals before qualification, rechecks after cleanup and preserves f
   assert.match(script, /result\.application_page_errors = recorder\?\.applicationErrors/);
   assert.match(script, /result\.cdp_capture_errors = recorder\?\.captureErrors/);
   assert.match(script, /result\.cleanup_error = String\(error\); process\.exitCode = 1/);
+});
+
+function controlledClock() {
+  let time = 0, serial = 0;
+  const timers = new Map();
+  return { now: () => time,
+    setTimeout(fn, delay) { const id = ++serial; timers.set(id, { fn, at: time + delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    advance(ms) {
+      const end = time + ms;
+      for (;;) {
+        const next = [...timers].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+        if (!next) break;
+        time = next[1].at; timers.delete(next[0]); next[1].fn();
+      }
+      time = end;
+    }, pending: () => [...timers.values()].map(t => t.at) };
+}
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('preseal response arrivals captured during drain; unknown postseal identities typed outside capture', { timeout: 2000 }, async () => {
+  const clock = controlledClock(), f = recorderFixture({ clock });
+  const req = f.request(); f.page.emit('request', req);
+  const drained = f.recorder.sealAndDrain(); assert.equal(f.recorder.sealAndDrain(), drained);
+  assert.throws(() => f.recorder.assertQualified(), /completed drain/);
+  const partial = f.recorder.partialInventory(); assert.equal(partial.partial, true);
+  assert.equal(partial.pending_metadata[0].request_ordinal, 1);
+  const unknown = f.request(); f.page.emit('request', unknown);
+  f.respond(unknown, () => assert.fail('outside body')); f.page.emit('requestfailed', unknown);
+  assert.equal(f.recorder.requests.length, 1); assert.equal(f.recorder.failed.length, 0);
+  assert.deepEqual(f.receipts.filter(r => r.file === 'browser-outside-capture.jsonl').map(r => r.value.policy.kind), ['outside_capture', 'outside_capture']);
+  clock.advance(5000); f.respond(req); const summary = await drained;
+  assert.equal(summary.partial, false); assert.equal(summary.pending_required, 0);
+  assert.equal(f.snapshots.length, 1); assert.equal(clock.pending().length, 0); f.recorder.assertQualified();
+});
+
+test('one absolute seal deadline caps late bodies and awaiting responses, no timer reset or late capture', { timeout: 2000 }, async () => {
+  const clock = controlledClock(), f = recorderFixture({ clock }); const requests = [f.request(), f.request()];
+  requests.forEach(req => f.page.emit('request', req));
+  const drained = f.recorder.sealAndDrain(); clock.advance(10990); let complete;
+  f.respond(requests[0], () => new Promise(resolve => { complete = resolve; })); await flush();
+  assert.deepEqual(clock.pending(), [11000, 11000]);
+  clock.advance(10); const summary = await drained;
+  assert.equal(summary.pending_body_tasks, 0); assert.equal(summary.pending_required, 0);
+  assert.deepEqual(f.recorder.captureErrors.map(e => e.reason), ['deadline', 'deadline']);
+  assert.throws(() => f.recorder.assertQualified());
+  complete(JSON.stringify(aggregateBody)); f.respond(requests[1]); await flush(); assert.equal(f.snapshots.length, 0);
+});
+
+test('postseal close fails awaiting response and reading body immediately as disposed', { timeout: 2000 }, async () => {
+  const clock = controlledClock(), f = recorderFixture({ clock }); const req = f.request(), other = f.request();
+  f.page.emit('request', req); f.page.emit('request', other); let complete;
+  f.respond(req, () => new Promise(resolve => { complete = resolve; })); await flush();
+  const drained = f.recorder.sealAndDrain(); f.page.emit('close'); await drained;
+  assert.deepEqual(f.recorder.captureErrors.map(e => e.reason), ['disposed', 'disposed']);
+  assert.equal(clock.now(), 0); assert.equal(clock.pending().length, 0);
+  complete(JSON.stringify(aggregateBody)); await flush(); assert.equal(f.snapshots.length, 0); assert.throws(() => f.recorder.assertQualified());
+});
+
+test('postseal known requestfailed completes bounded drain; only exact expected fault qualifies', { timeout: 2000 }, async () => {
+  for (const expected of [false, true]) {
+    const clock = controlledClock(), f = recorderFixture({ clock, expectedRequestFailure: () => expected });
+    const req = f.request(); f.page.emit('request', req); const drained = f.recorder.sealAndDrain();
+    f.page.emit('requestfailed', req); const summary = await drained;
+    assert.equal(summary.required_outcomes[0].outcome, 'request_failed'); assert.equal(clock.pending().length, 0);
+    if (expected) f.recorder.assertQualified(); else assert.throws(() => f.recorder.assertQualified());
+  }
+  const f = recorderFixture({ clock: controlledClock() }); const req = f.request(); f.page.emit('request', req);
+  const drained = f.recorder.sealAndDrain(); f.respond(req, async () => { throw new Error('preseal body rejected'); });
+  await drained; assert.equal(f.recorder.captureErrors[0].reason, 'body_transport'); assert.throws(() => f.recorder.assertQualified());
+});
+
+test('body capture deadline applies before seal too (real clock only guards test liveness)', { timeout: 2000 }, async () => {
+  const clock = controlledClock(), f = recorderFixture({ clock }); const req = f.request(); f.page.emit('request', req);
+  f.respond(req, () => new Promise(() => {})); await flush(); clock.advance(11000); await flush();
+  await f.recorder.sealAndDrain(); assert.equal(f.recorder.captureErrors[0].reason, 'deadline'); assert.throws(() => f.recorder.assertQualified());
+});
+
+test('chat ACK retains exact actual URL/status/body/canonical ID and rejects duplicate or steering', async () => {
+  const { validateChatAck } = await import('./qualify-history-opening-realserver.mjs');
+  const body = { queued: true, steering: false, already_persisted: false };
+  const receipt = { url: 'http://127.0.0.1:1/api/conversations/successor/chat', status: 200,
+    raw: JSON.stringify(body), body, canonical_message_id: 'successor:key' };
+  validateChatAck(receipt, 'successor', 'key');
+  for (const mutation of [{ url: receipt.url.replace('successor', 'foreign') }, { status: 201 },
+    { canonical_message_id: 'foreign:key' }, { body: { ...body, already_persisted: true } },
+    { body: { ...body, steering: true } }, { body: { ...body, queued: false } }]) {
+    assert.throws(() => validateChatAck({ ...receipt, ...mutation }, 'successor', 'key'));
+  }
+});
+
+
+test('manual full-edge oracle rejects each field independently for fixture and registered pending/accepted evidence', async () => {
+  const { validateOwnedAggregate } = await import('./qualify-history-opening-realserver.mjs');
+  const fields = ['product_conversation_id', 'predecessor_transcript_row_id', 'successor_transcript_row_id', 'continuation_message_id'];
+  for (const status of ['fixture', 'pending', 'accepted']) {
+    const a = structuredClone(aggregate), data = structuredClone(aggregateBody);
+    if (status !== 'fixture') {
+      a.opening_evidence = { successor: { ...a.manual_opening.edge, client_turn_key: 'key' } };
+      data.latest_opening = status === 'pending' ? { status, edge: { ...a.manual_opening.edge },
+        opening_authority: 'user_authorized_instruction', client_turn_key: 'key' }
+        : { ...a.manual_opening, accepted_message_id: 'successor:key' };
+    }
+    validateOwnedAggregate(a, data, 'http://127.0.0.1:1' + a.endpoint);
+    for (const field of fields) {
+      const bad = structuredClone(data); bad.latest_opening.edge[field] = 'foreign';
+      assert.throws(() => validateOwnedAggregate(a, bad, 'http://127.0.0.1:1' + a.endpoint), field);
+    }
+  }
+  const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  assert.match(script, /validateOwnedAggregate\([^;]*fetchedLatestAccepted, restoredResponse.url\(\)\)/);
+  assert.match(script, /openingMatches\(fetchedLatestAccepted.latest_opening, entered, 'accepted'\)/);
 });

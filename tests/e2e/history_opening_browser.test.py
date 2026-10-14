@@ -200,6 +200,54 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["successor_transcript_row_id"], "successor")
         with self.assertRaises(AssertionError): opening.shipping.member_boundaries(["root", "successor"], [[], []])
 
+    def test_normal_server_completion_requires_zero_and_owned_cleanup(self):
+        from unittest.mock import Mock
+        home = self.root / "removed-driver-home"
+        control = self.root / "removed-control.sock"
+        server = Mock(returncode=0)
+        receipt = opening.normal_server_completion(server, self.root, {"home": str(home)}, control)
+        server.wait.assert_called_once_with(timeout=65)
+        self.assertEqual(receipt["status"], "success")
+        self.assertEqual(json.loads((self.root / "server-completion.json").read_text()), receipt)
+
+    def test_normal_server_completion_signal_nonzero_and_timeout_fail(self):
+        from unittest.mock import Mock
+        for code, status in [(-15, "signal_exit"), (1, "nonzero_exit"), (None, "timeout")]:
+            server = Mock(returncode=code)
+            if code is None:
+                server.wait.side_effect = opening.shipping.subprocess.TimeoutExpired("owned-fake", 65)
+            with self.subTest(code=code), self.assertRaises((RuntimeError, TimeoutError)):
+                opening.normal_server_completion(server, self.root, {"home": str(self.root / "missing")}, self.root / "missing.sock")
+            receipt = json.loads((self.root / "server-completion.json").read_text())
+            self.assertEqual(receipt["status"], status)
+            self.assertEqual(receipt["returncode"], code)
+            server.wait.assert_called_once_with(timeout=65)
+
+    def test_normal_server_completion_cleanup_overrides_success_or_signal(self):
+        from unittest.mock import Mock
+        home = self.root / "owned-driver-home"
+        control = self.root / "owned-control.sock"
+        for remaining in (home, control):
+            remaining.mkdir() if remaining == home else remaining.touch()
+            for code in (0, -15):
+                with self.subTest(remaining=remaining, code=code), self.assertRaisesRegex(RuntimeError, "owned resources"):
+                    opening.normal_server_completion(Mock(returncode=code), self.root, {"home": str(home)}, control)
+                receipt = json.loads((self.root / "server-completion.json").read_text())
+                self.assertEqual(receipt["status"], "cleanup_failed")
+                self.assertEqual(receipt["exit_status"], "success" if code == 0 else "signal_exit")
+            remaining.rmdir() if remaining == home else remaining.unlink()
+
+    def test_normal_wait_precedes_final_forcecleanup_and_result_requires_receipt(self):
+        import ast
+        source = Path(opening.__file__).read_text()
+        qualify = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "qualify")
+        normal = next(n for n in ast.walk(qualify) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "normal_server_completion")
+        owned = next(n for n in ast.walk(qualify) if isinstance(n, ast.With) and 'as server' in ast.unparse(n.items[0]))
+        self.assertGreater(normal.lineno, owned.lineno)
+        self.assertLess(normal.lineno, owned.end_lineno)
+        self.assertIn('"status": "force_cleanup_required"', source)
+        self.assertIn('"server_completion":', source)
+
     def test_no_compiler_or_shipping_server_invocation(self):
         source = Path(opening.__file__).read_text()
         self.assertNotIn("h._server()", source)

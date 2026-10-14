@@ -153,6 +153,8 @@ def equal_text_fixture(fixture, aggregate):
     assert edge["predecessor_transcript_row_id"] == predecessor
     assert edge["successor_transcript_row_id"] == successor
     boundary = next(b for b in latest["boundaries"] if b["message_id"] == edge["continuation_message_id"])
+    assert boundary["predecessor_transcript_row_id"] == predecessor
+    assert boundary["successor_transcript_row_id"] == successor
     assert boundary["represented_successor_opening_message_id"] is None
     boundary_message = next(m for m in member_messages[-2] if m["message_id"] == boundary["message_id"])
     opening_message = next(m for m in member_messages[-1] if m["message_id"] == opening_id)
@@ -164,6 +166,34 @@ def equal_text_fixture(fixture, aggregate):
     if aggregate["kind"] == "global":
         result["route"] = f"/global/{successor}"
     return result
+
+
+SERVER_COMPLETION_TIMEOUT = 65
+
+
+def normal_server_completion(server, case, startup, control):
+    """Called before owned_process's forced process-group cleanup."""
+    receipt = {"status": "failed", "normal_wait_timeout_seconds": SERVER_COMPLETION_TIMEOUT,
+               "owned_home": startup["home"], "control": str(control), "returncode": None}
+    try:
+        try:
+            server.wait(timeout=SERVER_COMPLETION_TIMEOUT)
+        except shipping.subprocess.TimeoutExpired:
+            receipt["status"] = "timeout"
+            raise TimeoutError("instrumented server normal drain exceeded 65 seconds")
+        receipt["returncode"] = server.returncode
+        receipt["status"] = ("success" if server.returncode == 0 else
+                             "signal_exit" if server.returncode < 0 else "nonzero_exit")
+        receipt["socket_removed"] = not control.exists()
+        receipt["owned_home_removed"] = not Path(startup["home"]).exists()
+        if not receipt["socket_removed"] or not receipt["owned_home_removed"]:
+            receipt["exit_status"] = receipt["status"]
+            receipt["status"] = "cleanup_failed"
+        if receipt["status"] != "success":
+            raise RuntimeError("instrumented server did not complete normally with owned resources removed")
+    finally:
+        shipping.write_json(case / "server-completion.json", receipt)
+    return receipt
 
 
 def qualify(app, exe, output):
@@ -225,8 +255,12 @@ def qualify(app, exe, output):
                                 assert driver.returncode == 0, "opening browser assertions failed; see case logs"
                         result = json.loads((case / "browser-result.json").read_text())
                         assert result["status"] == "passed_assertions" and result["checks"]
+                        normal_server_completion(server, case, startup, control)
                     finally:
-                        # Node normally releases exactly once; Stop is a distinct failure cleanup command.
+                        # A failed setup/browser never acquires normal-completion credit.
+                        if not (case / "server-completion.json").exists():
+                            shipping.write_json(case / "server-completion.json", {
+                                "status": "force_cleanup_required", "returncode": server.poll()})
                         if control.exists():
                             import socket
                             with contextlib.suppress(OSError, ValueError):
@@ -272,6 +306,8 @@ def main():
         signal.alarm(0)
         result["cases"] = {kind: {
             "verified_runtime_startup": (output / kind / "startup.json").is_file(),
+            "server_completion": json.loads((output / kind / "server-completion.json").read_text())
+                if (output / kind / "server-completion.json").is_file() else {"status": "not_completed"},
             "browser": json.loads((output / kind / "browser-result.json").read_text())
                 if (output / kind / "browser-result.json").is_file() else {"status": "not_completed"}}
             for kind in ("ordinary", "global")}

@@ -117,6 +117,13 @@ export function validateOwnedAggregate(a, data, url) {
       requested_transcript_row_id: data.requested_transcript_row_id, latest_transcript_row_id: data.latest_transcript_row_id };
   } catch (error) { fail(error.message); }
 }
+export function validateChatAck(receipt, successor, key) {
+  assert.equal(new URL(receipt.url).pathname, `/api/conversations/${successor}/chat`);
+  assert.equal(receipt.status, 200);
+  assert.equal(receipt.canonical_message_id, `${successor}:${key}`);
+  assert.deepEqual(receipt.body, { queued: true, steering: false, already_persisted: false });
+  assert.deepEqual(JSON.parse(receipt.raw), receipt.body);
+}
 export function faultTarget(method, url, state, kind) {
   const parsed = new URL(url, 'http://127.0.0.1:1');
   const path = parsed.pathname;
@@ -223,11 +230,22 @@ export function capturePolicy(aggregate, method, url) {
 export function installAggregateRecorder(page, aggregate, record, snapshots, {
   deadlineMs = REQUIRED_BODY_DEADLINE_MS, maxBytes = REQUIRED_BODY_MAX_BYTES,
   expectedRequestFailure = () => false,
+  clock = { now: () => performance.now(), setTimeout, clearTimeout },
 } = {}) {
   aggregate = { ...aggregate, members: [...aggregate.members] };
   const requests = [], failed = [], applicationErrors = [], captureErrors = [];
   const identities = new WeakMap(), required = new Map(), tasks = new Set();
-  let ordinal = 0, navigationEpoch = 0, sealed = false, drain;
+  let ordinal = 0, navigationEpoch = 0, sealed = false, drain, drainDeadline, drainTimer, drainComplete = false;
+  let wake;
+  const notify = () => { wake?.(); wake = undefined; };
+  const pending = () => [...required.values()].filter(s => ['awaiting_response', 'reading_body'].includes(s.outcome));
+  const inventory = (partial) => ({ sealed, partial, pending_required: pending().length, pending_body_tasks: tasks.size,
+    pending_metadata: pending().map(s => ({ ...s.metadata, outcome: s.outcome })),
+    drain_deadline: drainDeadline ?? null,
+    required_outcomes: [...required.values()].map(({ metadata, outcome, expected_transport_failure }) => ({ ...metadata, outcome, expected_transport_failure })),
+    application_page_errors: applicationErrors, cdp_capture_errors: captureErrors });
+  const outside = (req, event) => record('browser-outside-capture.jsonl', { policy: { kind: 'outside_capture' },
+    event, reason: 'unknown_post_seal_request', url: req.url(), method: req.method() });
   const identity = req => {
     if (!identities.has(req)) identities.set(req, Object.freeze({
       request_ordinal: ++ordinal, identity_source: 'playwright_request_local_ordinal',
@@ -242,18 +260,21 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     record('browser-responses.jsonl', entry);
   };
   const onRequest = req => {
+    if (sealed) { outside(req, 'request'); return; }
     const metadata = identity(req), policy = capturePolicy(aggregate, metadata.method, metadata.url);
     const entry = { ...metadata, body: req.postData(), policy };
     requests.push(entry); record('browser-requests.jsonl', entry);
     if (policy.kind === 'required_aggregate_json') required.set(metadata.request_ordinal, { metadata, outcome: 'awaiting_response', expected_transport_failure: expectedRequestFailure(entry) });
   };
   const onFailed = req => {
+    if (sealed && !identities.has(req)) { outside(req, 'requestfailed'); return; }
     const entry = { ...identity(req), failure: req.failure(), outcome: 'request_failed' };
     failed.push(entry); record('browser-failed.jsonl', entry);
     const state = required.get(entry.request_ordinal);
     if (state?.outcome === 'awaiting_response') {
       state.outcome = 'request_failed';
       record('browser-required-transport.jsonl', { ...entry, expected_transport_failure: state.expected_transport_failure });
+      notify();
     }
   };
   const onPageError = error => {
@@ -262,8 +283,13 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   };
   const onNavigation = frame => { if (frame === page.mainFrame()) navigationEpoch++; };
   const onResponse = response => {
-    if (sealed || !new URL(response.url()).pathname.startsWith('/api/')) return;
-    const req = response.request(), requestIdentity = identity(req);
+    if (!new URL(response.url()).pathname.startsWith('/api/')) return;
+    const req = response.request();
+    if (sealed && !identities.has(req)) { outside(req, 'response'); return; }
+    const requestIdentity = identity(req);
+    if (sealed && clock.now() >= drainDeadline) { terminatePending('deadline'); return; }
+    const prior = required.get(requestIdentity.request_ordinal);
+    if (prior && prior.outcome !== 'awaiting_response') return;
     const metadata = Object.freeze({ ...requestIdentity, url: response.url(), status: response.status(),
       type: response.headers()['content-type'] ?? '', response_at: performance.now(),
       response_navigation_epoch: navigationEpoch });
@@ -273,20 +299,25 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
       record('browser-responses.jsonl', { ...metadata, policy, outcome: 'metadata_only', consumer: 'api_metadata_no_response_body' });
       return;
     }
-    const state = { metadata, outcome: 'reading_body' };
+    const state = { ...prior, metadata, outcome: 'reading_body' };
     required.set(metadata.request_ordinal, state);
     let timer, abort;
     const disposed = new Promise((_, reject) => { abort = reject; });
-    state.dispose = () => abort(Object.assign(new Error('page disposed during required receipt'), { captureReason: 'disposed' }));
+    state.dispose = (reason = 'disposed') => abort(Object.assign(new Error(`required receipt ${reason}`), { captureReason: reason }));
     const task = (async () => {
       let raw;
       try {
         assert.equal(metadata.status, 200, 'required aggregate HTTP status');
         assert.match(metadata.type, /application\/json/i, 'required aggregate JSON content type');
-        const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(
-          new Error(`required body deadline ${deadlineMs}ms`), { captureReason: 'deadline' })), deadlineMs); });
+        const bodyDeadline = clock.now() + deadlineMs;
+        const remaining = Math.max(0, Math.min(bodyDeadline, drainDeadline ?? Infinity) - clock.now());
+        const timeout = new Promise((_, reject) => { timer = clock.setTimeout(() => reject(Object.assign(
+          new Error(`required body deadline ${remaining}ms`), { captureReason: 'deadline' })), remaining); });
         try { raw = await Promise.race([Promise.resolve().then(() => response.text()), timeout, disposed]); }
         catch (error) { error.captureReason ??= 'body_transport'; throw error; }
+        if (clock.now() >= Math.min(bodyDeadline, drainDeadline ?? Infinity)) {
+          throw Object.assign(new Error('required receipt absolute deadline'), { captureReason: 'deadline' });
+        }
         const bytes = Buffer.byteLength(raw);
         if (bytes > maxBytes) {
           state.outcome = 'capture_failed';
@@ -305,41 +336,48 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
       } catch (error) {
         state.outcome = 'capture_failed';
         emitFailure(metadata, error.captureReason ?? 'required_contract', error);
-      } finally { clearTimeout(timer); delete state.dispose; }
+      } finally { clock.clearTimeout(timer); delete state.dispose; }
     })();
     tasks.add(task);
-    task.then(() => tasks.delete(task), error => {
+    task.then(() => { tasks.delete(task); notify(); }, error => {
       tasks.delete(task); state.outcome = 'capture_failed';
-      captureErrors.push({ ...metadata, reason: 'recorder_write', error: String(error) });
+      captureErrors.push({ ...metadata, reason: 'recorder_write', error: String(error) }); notify();
     });
   };
-  const onClose = () => { for (const state of required.values()) state.dispose?.(); };
+  const terminatePending = reason => {
+    for (const state of pending()) {
+      if (state.outcome === 'awaiting_response') {
+        state.outcome = 'capture_failed'; emitFailure(state.metadata, reason, `required request ${reason} before response`);
+      } else state.dispose?.(reason);
+    }
+    notify();
+  };
+  const onClose = () => terminatePending('disposed');
   page.on('request', onRequest); page.on('requestfailed', onFailed); page.on('response', onResponse);
   page.on('pageerror', onPageError); page.on('framenavigated', onNavigation); page.on('close', onClose);
   return { requests, failed, applicationErrors, captureErrors,
+    partialInventory() { return inventory(true); },
     registerOpening(evidence) { aggregate.opening_evidence ??= {}; aggregate.opening_evidence[evidence.successor_transcript_row_id] = { ...evidence }; },
     registerMember(id) { assert.ok(typeof id === 'string' && id.length > 0); aggregate.members.push(id); },
     sealAndDrain() {
       if (drain) return drain;
       sealed = true;
-      page.off('response', onResponse); page.off('request', onRequest);
+      drainDeadline = clock.now() + deadlineMs;
+      page.off('request', onRequest);
+      drainTimer = clock.setTimeout(() => terminatePending('deadline'), deadlineMs);
       drain = (async () => {
-        await Promise.all([...tasks]);
-        for (const state of required.values()) {
-          if (state.outcome === 'awaiting_response') {
-            state.outcome = 'capture_failed'; emitFailure(state.metadata, 'missing_response', 'required request has no response or requestfailed outcome');
-          }
-        }
-        const summary = { sealed: true, partial: false, pending_required: tasks.size,
-          required_outcomes: [...required.values()].map(({ metadata, outcome, expected_transport_failure }) => ({ ...metadata, outcome, expected_transport_failure })),
-          application_page_errors: applicationErrors, cdp_capture_errors: captureErrors };
+        while (pending().length || tasks.size) await new Promise(resolveWake => { wake = resolveWake; });
+        clock.clearTimeout(drainTimer);
+        page.off('response', onResponse); page.off('requestfailed', onFailed);
+        drainComplete = true;
+        const summary = inventory(false);
         record('browser-capture-drain.jsonl', summary);
         return summary;
       })();
       return drain;
     },
     assertQualified() {
-      assert.ok(sealed && tasks.size === 0, 'sealed completed drain required');
+      assert.ok(sealed && drainComplete && tasks.size === 0 && pending().length === 0, 'sealed completed drain required');
       assert.deepEqual(applicationErrors, [], 'application page errors');
       assert.deepEqual(captureErrors, [], 'required API/CDP capture errors');
       assert.ok([...required.values()].every(s => s.outcome === 'captured'
@@ -363,7 +401,12 @@ async function run() {
   let browser, page, continuation, recorder;
   const snapshots = [], events = [];
   let requests = [], failed = [];
-  const hardStop = setTimeout(() => { writeFileSync(resolve(output, 'browser-result.json'), JSON.stringify({ ...result, error: 'wall deadline' })); process.exit(1); }, 170000);
+  const hardStop = setTimeout(() => {
+    const capture = recorder?.partialInventory() ?? { partial: true, pending_metadata: [] };
+    appendFileSync(resolve(output, 'browser-capture-drain.jsonl'), JSON.stringify(capture) + '\n');
+    writeFileSync(resolve(output, 'browser-result.json'), JSON.stringify({ ...result, status: 'failed', partial: true, capture, error: 'wall deadline' }));
+    process.exit(1);
+  }, 170000);
   async function poll(fn, label, ms = 10000) {
     const end = performance.now() + ms;
     for (;;) { const value = await fn(); if (value) return value; assert.ok(performance.now() < end, label); await new Promise(r => setTimeout(r, 40)); }
@@ -491,7 +534,11 @@ async function run() {
     await page.locator(COMPOSER_SELECTOR).fill(text); await page.locator(COMPOSER_SELECTOR).press('Enter');
     const req = await posted; assert.equal(new URL(req.url()).pathname, `/api/conversations/${latest}/chat`);
     const body = req.postDataJSON(); assert.equal(body.text, text);
-    const ack = await req.response(); assert.ok(ack?.ok()); const ackData = await ack.json(); assert.equal(ackData.queued, true); assert.notEqual(ackData.steering, true);
+    const ack = await req.response(); assert.ok(ack?.ok()); const ackRaw = await ack.text();
+    const chatAck = { url: ack.url(), status: ack.status(), raw: ackRaw, body: JSON.parse(ackRaw),
+      canonical_message_id: `${latest}:${body.message_id}` };
+    checked('actual successor chat ACK receipt', chatAck);
+    validateChatAck(chatAck, latest, body.message_id);
     await poll(async () => (await http('GET', `/api/conversations/${latest}`)).messages.some(m => m.message_id === `${latest}:${body.message_id}`), 'actual composer message persisted');
     checked('accepted SSE unblocks exact successor composer despite actual aggregate GET failure', { accepted_cursor: acceptedCursor, fault: faultObservation, chat_message_id: body.message_id });
     const reconnectStart = events.length, requestStart = requests.length, url = page.url();
@@ -517,6 +564,9 @@ async function run() {
     const chapter = page.locator('#conversation-nav [role="button"]').filter({ hasText: 'opening-probe' });
     assert.equal(await chapter.count(), 1); await chapter.click();
     const restoredResponse = await restoredAggregate;
+    const fetchedLatestAccepted = JSON.parse(await restoredResponse.text());
+    validateOwnedAggregate({ ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } }, fetchedLatestAccepted, restoredResponse.url());
+    assert.ok(openingMatches(fetchedLatestAccepted.latest_opening, entered, 'accepted'), 'restored full accepted edge');
     checked('new chapter ownership acquisition uses restored real aggregate transport', {
       url: restoredResponse.url(), status: restoredResponse.status(), fault_active_during_acceptance_and_reconnect: true,
       fault_restored_before_new_pin_acquisition: true });

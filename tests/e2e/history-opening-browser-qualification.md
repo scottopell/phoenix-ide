@@ -124,8 +124,11 @@ The instrumented recorder uses a discriminated capture policy:
   byte count and parsed identity are retained. Invalid JSON/wrong identity/body
   unavailability/overlimit/disposal or the 11-second body deadline fail qualification.
 - **Metadata-only API consumer**: all other API responses, including stream
-  response headers and telemetry acknowledgments. No response-body read is
-  attempted. Browser request payloads, including telemetry POSTs, remain in
+  response headers and telemetry acknowledgments. No recorder response-body
+  read is attempted. The actual successor chat ACK is separately read/retained
+  by the behavioral driver in `assertions.jsonl` (URL, status, raw/parsed body,
+  exact canonical message ID); a fresh randomized turn requires queued true,
+  steering false and already_persisted false. Browser request payloads, including telemetry POSTs, remain in
   `browser-requests.jsonl`. Telemetry ack bodies are not owned history evidence;
   this harness imports no telemetry readiness or telemetry qualification claim.
 
@@ -137,11 +140,18 @@ metadata in `browser-capture-errors.jsonl` and response outcomes. Absent respons
 status/content type/time are explicitly null on missing-response/requestfailed
 outcomes. Application `pageerror` events have a separate file and result array.
 
-End-of-case seal removes the response/request producer before draining all
-outstanding required tasks under their deadlines. `browser-capture-drain.jsonl`
+End-of-case seal freezes new request identities once. Response/requestfailed
+listeners remain active only for already-known Request identities until all
+required awaiting-response states and body tasks terminate. A shared absolute
+11-second drain deadline caps all outstanding work; a body read is also bounded
+by its own 11-second deadline, never reset by later arrivals. Unknown post-seal
+responses/failures are typed `outside_capture` receipts, not new required work.
+Page close fails both awaiting-response and body work immediately as `disposed`. `browser-capture-drain.jsonl`
 records terminal outcomes and `partial:false`, even when qualification fails;
 that field means receipt drain is complete, **not** that assertions passed.
-Missing required responses fail. A real requestfailed transport outcome is not a
+Missing required responses fail at the shared deadline. A hard wall exit saves
+`partial:true` and pending metadata/body-task inventory, then exits nonzero; it
+never reports a complete drain. A real requestfailed transport outcome is not a
 body-capture error; only an exact aggregate GET while the owned roster fault is
 active is an expected exception, and the original failed-endpoint behavioral
 assertion remains mandatory. A status200 body failure is never forgiven by that
@@ -256,3 +266,50 @@ and restored chapter acquisition. Global acceptance-transition cursor remains
 unobserved in the retained shipping SSE (only accepted Init + later messages).
 Generated-authority acceptance, shipping/provider/production and device/engine
 claims remain outside this evidence. Offline success does not waive these gates.
+
+
+## Remaining-findings audit of local 428 (pre-dispatch, no runtime)
+
+This correction owns only the harness/recorder/tests/documentation. No push,
+remote CI dispatch, build, dependency install, browser/server execution, runtime
+change, production operation, app source or generated DTO edit occurred. The
+roadmap body was read for orientation; no roadmap/remote record was written.
+Earlier audit results above remain historical, not evidence of this source.
+
+| Remaining finding | Disposition | Current validation / residual |
+|---|---|---|
+| Seal dropped pre-seal response arrivals | Corrected: freeze identities once, retain response/requestfailed handlers for known pre-seal objects; unknown arrivals get explicit `outside_capture`, never a synthesized identity or required state. | Deterministic installed-handler tests cover late known response success, unknown response/failure, known expected/unexpected failure and body rejection. |
+| Drain was only a snapshot of body tasks | Corrected: awaiting-response states and dynamically arriving bodies both participate, with one absolute 11-second seal deadline plus each body's bound. Close aborts both states. | Adapter-controlled timers assert the exact absolute deadline, late-body noncapture and zero remaining timers/tasks. Real-clock test timeout is only a liveness guard, not the behavioral oracle. |
+| Hard stop omitted incomplete capture state | Corrected: `partial:true` receipt and result inventory include pending metadata, outcomes, body task count and absolute deadline before nonzero exit. Complete drain is recorded only after all states/tasks terminate. | Partial-inventory regression plus source hard-stop wiring; no hard-stop child/runtime was executed. |
+| Python could count forced SIGTERM as normal server completion | Corrected: after successful browser/Stop, wait at most 65 seconds **inside** `owned_process`, before its forced-cleanup finally. Require actual libtest returncode zero, removed IPC socket, removed driver-owned HOME from the validated startup receipt. | Fake-process success, timeout, positive/signal exit and resource-cleanup override tests. `server-completion.json` retains success/timeout/nonzero/signal/cleanup failure; failures before normal wait are `force_cleanup_required`, never success. Outer `result.json` includes each completion receipt. |
+| Full manual edge and restored acquisition | Existing four-field manual fixture/Pending oracle retained; restored `fetchedLatestAccepted` body now independently validates ownership and full accepted edge against committed IPC evidence, not its own roundtrip. | Each of four edge fields mutated for fixture/Pending/accepted; Global acquisition uses all owned aliases. URL alone cannot qualify a foreign body. Python stable-product and persisted adjacent-boundary checks retained and endpoints asserted explicitly. |
+| Actual chat ACK retained only as generic metadata | Corrected: driver saves real raw/parsed ACK, actual URL/status and exact canonical ID in assertions before validation. Fresh-key duplicate (`already_persisted:true`) and steering responses fail. | ACK field mutations fail; queued/steering/duplicate contract inspected in pinned/current `ChatResponse` implementation. Real ACK execution remains required. |
+| Mock server can fail after Stop rejects a worker | No bypass added. Exact pinned ignored driver polls actual `run_server`, uses existing Stop/gate cleanup and drops its driver-owned TempDir before test process return. The new zero-exit gate exposes server/worker failure instead of forgiving it. | Read-only driver source audit only; a normal Stop returning nonzero is a genuine qualification failure requiring investigation, not a forced-cleanup pass. |
+
+### Fresh authentic replay and source hashes
+
+New local output, **not** replacement of any old artifact:
+`.phoenix/evidence/continuous-history/pre-dispatch428-drain-audit/`.
+`ordinary/manifest.json` and `global/manifest.json` hash the corrected recorder,
+shared helper, replay CLI, exact pinned generated DTOs, original inputs and new
+outputs. `source-audit.json` additionally hashes Python, Node tests, this document,
+and the read-only pinned ignored driver. Same authentic source JSONL/IPC/SSE inputs
+and CLI flags as above were rerun with `--output` changed to these fresh
+`ordinary/` and `global/` directories; original full raw bodies remain unchanged.
+
+Executed validation:
+
+- Installed-handler authentic replay: **25 ordinary + 14 Global bodies**.
+- Combined shared/opening/authentic replay Node tests: **43 passed, zero skips**.
+- Compiler-free Python opening: **16 passed**; shipping: **14 passed** (offline uv).
+- Three driver/CLI syntax checks, `UV_OFFLINE=1 ./dev.py check --lanes task`, and
+  `git diff --check`: passed. Rust/UI/build/E2E lanes were deliberately not run.
+
+The successful replay exercises corrected ordinary and Global wire projections;
+it does not exercise newly authored normal-server completion, real browser drain
+ordering, held gate, ACK, transport drop, composer or physical anchors at runtime.
+Independent parent source review remains next. The retained Global SSE still has
+**zero acceptance-transition frames** (eight accepted Init frames and six later
+message cursors); generated authority, real providers, shipping/production,
+physical devices and other engines remain unqualified. No new lifecycle or
+public control surface was added.
