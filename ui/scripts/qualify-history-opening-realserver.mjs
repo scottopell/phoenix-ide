@@ -8,6 +8,21 @@ import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate } from './qualify-history-realserver.mjs';
 
+export function acceptedWireCursor(event, observedEvents) {
+  const payload = JSON.parse(event.data);
+  assert.ok(Number.isSafeInteger(payload.sequence_id) && payload.sequence_id >= 0, 'actual accepted wire sequence required');
+  const index = observedEvents.indexOf(event);
+  assert.ok(index >= 0 && typeof event.requestId === 'string', 'accepted owning CDP request required');
+  const init = observedEvents.slice(0, index).findLast(candidate => candidate.requestId === event.requestId && candidate.eventName === 'init');
+  assert.ok(init, 'accepted event must belong to an observed Init request');
+  const initial = JSON.parse(init.data);
+  assert.match(initial.stream_incarnation, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.ok(Number.isSafeInteger(initial.sequence_id) && payload.sequence_id > initial.sequence_id, 'accepted wire cursor must advance its owning Init');
+  return { request_id: event.requestId, stream_incarnation: initial.stream_incarnation,
+    init_sequence_id: initial.sequence_id, sequence_id: payload.sequence_id,
+    transport_event_id: event.eventId };
+}
+
 export function persistedMessageSelector(id) {
   assert.ok(typeof id === 'string' && id.length > 0, 'exact persisted message identity required');
   return `#messages [id=${JSON.stringify(`message-${id}`)}], #messages [data-message-id=${JSON.stringify(id)}]`;
@@ -247,7 +262,7 @@ async function run() {
     const accepted = await poll(() => events.slice(acceptedStart).find(e => {
       const value = JSON.parse(e.data); return ['message', 'message_updated'].includes(e.eventName) && openingMatches(value.opening, entered, 'accepted');
     }), 'actual accepted opening SSE', 10000);
-    const event = JSON.parse(accepted.data); assert.ok(accepted.eventId, 'actual accepted cursor');
+    const event = JSON.parse(accepted.data); const acceptedCursor = acceptedWireCursor(accepted, events);
     assert.equal(event.message?.message_id ?? event.message_id, acceptedId);
     await poll(() => failed.find(r => faultTarget(r.method, r.url, JSON.parse(readFileSync(fault)), 'roster')), 'actual failed owned roster GET');
     await page.locator('[role="alert"]').first().waitFor({ state: 'visible' });
@@ -275,7 +290,7 @@ async function run() {
     assert.ok(await page.locator(persistedMessageSelector(acceptedId)).count() <= 1);
     const finalRow = await http('GET', `/api/conversations/${latest}`);
     assert.equal(finalRow.messages.filter(m => m.message_id === acceptedId).length, 1);
-    checked('same-page transport SSE drop/reconnect preserves accepted full-edge identity', { accepted_cursor: accepted.eventId, reconnect, requests: requests.slice(requestStart) });
+    checked('same-page transport SSE drop/reconnect preserves accepted full-edge identity', { accepted_cursor: acceptedCursor, reconnect, requests: requests.slice(requestStart) });
     await page.screenshot({ path: resolve(output, 'accepted-reconnected.png') });
     // An explicit chapter selection may move the reader; verify its persisted ID after the click.
     const chapter = page.locator('#conversation-nav [role="button"]').filter({ hasText: 'opening-probe' });

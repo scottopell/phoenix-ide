@@ -4,7 +4,22 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, chmodSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector } from './qualify-history-opening-realserver.mjs';
+import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector, acceptedWireCursor } from './qualify-history-opening-realserver.mjs';
+
+test('accepted cursor uses owning Init incarnation and advancing JSON sequence, not invented transport ID', () => {
+  const incarnation = '04bd47cf-71be-473f-b66c-818211975b81';
+  const init = { requestId: '14019.119', eventName: 'init', eventId: '', data: JSON.stringify({ stream_incarnation: incarnation, sequence_id: 0 }) };
+  const event = { requestId: init.requestId, eventName: 'message', eventId: '', data: JSON.stringify({ sequence_id: 1 }) };
+  assert.deepEqual(acceptedWireCursor(event, [init, event]), { request_id: init.requestId, stream_incarnation: incarnation,
+    init_sequence_id: 0, sequence_id: 1, transport_event_id: '' });
+  assert.throws(() => acceptedWireCursor(event, [event]));
+  assert.throws(() => acceptedWireCursor(event, [{ ...init, requestId: 'foreign' }, event]));
+  for (const sequence_id of [0, -1, null, '1', 1.5]) {
+    const invalid = { ...event, data: JSON.stringify({ sequence_id }) };
+    assert.throws(() => acceptedWireCursor(invalid, [init, invalid]));
+  }
+  assert.throws(() => acceptedWireCursor(event, [event, init]));
+});
 
 test('exact persisted message selector covers real user ID and agent attribute without text fallback', () => {
   const id = 'successor:reserved-key';
