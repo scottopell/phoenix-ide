@@ -651,6 +651,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_owned_work_scope_home",
         sql: include_str!("migrations/coordinator_home.sql"),
     },
+    Migration {
+        version: 128,
+        name: "persist_completed_continuation_intent_metadata",
+        sql: include_str!("migrations/completed_continuation_intent_metadata.sql"),
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -14143,6 +14148,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (128, "persist_completed_continuation_intent_metadata"),
             (127, "coordinator_owned_work_scope_home"),
             (126, "retire_wake_feature_preserving_history"),
             (125, "support_ipv6_federation_peer_hosts"),
@@ -14158,7 +14164,6 @@ mod tests {
             (115, "federation_enrollments"),
             (114, "persist_instance_identity"),
             (113, "settle_historical_continuation_openings"),
-            (112, "input_source_tool_call"),
         ];
         assert_eq!(
             ledger

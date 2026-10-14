@@ -575,6 +575,14 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::import_peer_connection),
         )
         .route(
+            "/api/federation/owner-continue/forward",
+            post(super::federation::forward_owner_continue).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/federation/owner-continue",
+            post(super::federation::continue_owner).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/api/federation/enrollments/:caller_instance_id/revoke",
             post(super::federation::revoke_enrollment),
         )
@@ -5605,82 +5613,20 @@ async fn cancel_steering_message(
 ///   - 404 if the parent id does not exist
 ///   - 409 if the parent is not in `ContextExhausted` state
 ///   - 500 on DB/transaction failure
-fn continuation_expansion_policy(
-    authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
-) -> crate::send_chat_service::MessageExpansionPolicy {
-    match authority {
-        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => {
-            crate::send_chat_service::MessageExpansionPolicy::LiteralText
-        }
-        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => {
-            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
-        }
-    }
-}
-
 async fn dispatch_continuation_handoff(
     state: &AppState,
     intent: crate::db::ContinuationDispatchIntent,
 ) -> (ContinueConversationStatus, Option<String>) {
-    let parent_id = intent.parent_conversation_id.clone();
-    let conversation_id = intent.successor_conversation_id.clone();
-    let expansion_policy = continuation_expansion_policy(intent.opening_authority);
-    let dispatch = crate::send_chat_service::SendChatApplicationService::new(
-        state.db.clone(),
-        state.runtime.clone(),
-    )
-    .send(crate::send_chat_service::SendChatRequest {
-        conversation_id: conversation_id.clone(),
-        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-        text: intent.handoff,
-        message_id: intent.message_id.as_str().to_string(),
-        images: Vec::new(),
-        files: Vec::new(),
-        user_agent: intent.user_agent,
-        expansion_policy,
-    })
-    .await;
-    match dispatch {
-        Ok(crate::send_chat_service::SendChatOutcome::Delivered) => {
-            // Channel delivery is not durable acceptance. The outbox intent stays
-            // pending until the message INSERT trigger consumes it, so a crash
-            // before executor persistence remains replayable.
+    match crate::continuation_service::ContinuationApplicationService::new(state.runtime.clone())
+        .dispatch_intent(intent)
+        .await
+    {
+        crate::continuation_service::ContinuationDispatchStatus::Accepted
+        | crate::continuation_service::ContinuationDispatchStatus::AlreadySettled => {
             (ContinueConversationStatus::Accepted, None)
         }
-        Ok(crate::send_chat_service::SendChatOutcome::AlreadyPersisted) => {
-            if let Err(error) = state
-                .db
-                .delete_continuation_dispatch_intent(&parent_id)
-                .await
-            {
-                tracing::warn!(
-                    parent_id,
-                    continuation_id = conversation_id,
-                    error = %error,
-                    "handoff is durable but continuation intent cleanup failed",
-                );
-            }
-            (ContinueConversationStatus::Accepted, None)
-        }
-        Ok(crate::send_chat_service::SendChatOutcome::QueuedAsSteering) => {
-            // The opening message is not persisted yet. Its INSERT trigger consumes
-            // this intent and records the completed handoff atomically.
-            (ContinueConversationStatus::Accepted, None)
-        }
-        Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
-            (ContinueConversationStatus::DispatchFailed, Some(message))
-        }
-        Err(error) => {
-            tracing::warn!(
-                parent_id,
-                continuation_id = conversation_id,
-                error = %error,
-                "continuation created but opening handoff dispatch failed",
-            );
-            (
-                ContinueConversationStatus::DispatchFailed,
-                Some(error.to_string()),
-            )
+        crate::continuation_service::ContinuationDispatchStatus::Failed(error) => {
+            (ContinueConversationStatus::DispatchFailed, Some(error))
         }
     }
 }
@@ -9918,22 +9864,6 @@ pub(crate) mod hard_delete_cascade_tests {
                 AutomaticContinuationPhase::SuccessorReserved,
             ),
             None
-        );
-    }
-
-    #[test]
-    fn continuation_dispatch_preserves_persisted_opening_authority() {
-        use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
-
-        assert_eq!(
-            continuation_expansion_policy(ContinuationOpeningAuthority::UserAuthorizedInstruction),
-            crate::send_chat_service::MessageExpansionPolicy::LiteralText
-        );
-        assert_eq!(
-            continuation_expansion_policy(
-                ContinuationOpeningAuthority::GeneratedPredecessorContext
-            ),
-            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
         );
     }
 
@@ -18251,6 +18181,95 @@ mod lifecycle_handler_tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn owner_continue_requires_owner_auth_and_rejects_peer_credentials() {
+        use tower::ServiceExt as _;
+
+        let mut state = make_test_state().await;
+        let owner_password = "owner-password";
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                owner_password.to_string(),
+            )
+            .unwrap(),
+        );
+        let caller = phoenix_core::domain::instance_identity::InstanceId::new();
+        let peer_token = format!("phx_peer_{}", "a".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                "peer",
+                &phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    peer_token.as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+        let body = serde_json::json!({
+            "destination_instance_id": phoenix_core::domain::instance_identity::InstanceId::new(),
+            "product_conversation_id": phoenix_core::domain::product_conversation::ProductConversationId::new(),
+            "current_predecessor_conversation_id": "remote-predecessor",
+            "expected_work_scope": { "kind": "unattached" },
+            "handoff": "continue exactly once",
+            "message_id": "owner-continue-message"
+        })
+        .to_string();
+
+        for credential in [None, Some(peer_token.as_str())] {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/api/federation/owner-continue")
+                .header(axum::http::header::CONTENT_TYPE, "application/json");
+            if let Some(credential) = credential {
+                builder = builder.header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {credential}"),
+                );
+            }
+            let response = create_router(state.clone())
+                .oneshot(builder.body(Body::from(body.clone())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        for credential in [None, Some(peer_token.as_str())] {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/api/federation/owner-continue/forward")
+                .header(axum::http::header::CONTENT_TYPE, "application/json");
+            if let Some(credential) = credential {
+                builder = builder.header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {credential}"),
+                );
+            }
+            let response = create_router(state.clone())
+                .oneshot(builder.body(Body::from(body.clone())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let owner_response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/owner-continue")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {owner_password}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

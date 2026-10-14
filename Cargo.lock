@@ -3196,6 +3196,7 @@ dependencies = [
  "rand 0.10.1",
  "rcgen",
  "reqwest 0.13.4",
+ "roxmltree",
  "rust-embed",
  "rustls",
  "rustls-pki-types",
