@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: caa8138cad185530b4c5ddb17b5082502f21bb01
+          ref: 77ab7a42db1a74f6eb841bcf0c9c4669fb9ce4b0
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -248,9 +248,9 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = caa8138cad185530b4c5ddb17b5082502f21bb01
-          test "$(git rev-parse HEAD^{tree})" = 94fd6cdc6f5e7518feb72f004402cd04e53f36cf
-          test "$(git merge-base HEAD 84fbebb0781067cbe843f61c53093dcc0f0d64f2)" = 84fbebb0781067cbe843f61c53093dcc0f0d64f2
+          test "$(git rev-parse HEAD)" = 77ab7a42db1a74f6eb841bcf0c9c4669fb9ce4b0
+          test "$(git rev-parse HEAD^{tree})" = b1ed4d13258e94d43ac533731b0c5c28fcdeaf38
+          test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
@@ -267,7 +267,7 @@ jobs:
           pathlib.Path('../opening-codegen-receipt.json').write_text(json.dumps({
               'app_source': subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
               'app_tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),
-              'app_base': subprocess.check_output(['git','merge-base','HEAD','84fbebb0781067cbe843f61c53093dcc0f0d64f2'],text=True).strip(),
+              'app_base': subprocess.check_output(['git','merge-base','HEAD','7af06a4004b97b534d468b6ca2f42c145c8d4fb9'],text=True).strip(),
               'telemetry_modules': telemetry,
               'harness_source': '${{ github.event.pull_request.head.sha }}',
               'rustc': subprocess.check_output(['rustc','--version'],text=True).strip(),
@@ -329,6 +329,39 @@ jobs:
           node --test ui/scripts/qualify-history-opening-realserver.selftest.mjs
           node --test ui/scripts/history-joint-telemetry.selftest.mjs
           node --check ui/scripts/qualify-history-opening-realserver.mjs
+      - name: Full UI source qualification at exact pinned app (no filtered retry)
+        shell: bash
+        working-directory: pinned-app
+        run: |
+          set -o pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          root=Path.cwd(); out=root.parent
+          sha=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
+          git=lambda *args:subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
+          receipt={'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
+                   'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+                   'harness_source':subprocess.check_output(['git','-C',str(out/'harness'),'rev-parse','HEAD'],text=True).strip(),
+                   'command':'PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui',
+                   'vitest_config_sha256':sha(root/'ui/vitest.config.ts'),
+                   'ui_lock_sha256':sha(root/'ui/pnpm-lock.yaml'),
+                   'scope':'full pinned app UI lane; no test filtering or retry; no runtime/overhead clearance'}
+          (out/'pinned-app-full-ui-receipt.json').write_text(json.dumps(receipt,indent=2))
+          PY
+          set +e
+          PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui 2>&1 | tee "$GITHUB_WORKSPACE/pinned-app-full-ui.log"
+          ui_status=${PIPESTATUS[0]}
+          set -e
+          python3 - "$ui_status" <<'PY'
+          import json,sys
+          from pathlib import Path
+          path=Path.cwd().parent/'pinned-app-full-ui-receipt.json'
+          receipt=json.loads(path.read_text()); receipt['exit_status']=int(sys.argv[1])
+          receipt['result_counts_authority']='retained full console log, not inferred or fabricated'
+          path.write_text(json.dumps(receipt,indent=2))
+          PY
+          exit "$ui_status"
       - name: Prepare owned Chromium for instrumented actual-server witness
         working-directory: pinned-app/ui
         run: pnpm exec playwright install --with-deps chromium
@@ -358,6 +391,8 @@ jobs:
             opening-instrumented-unit.log
             opening-instrumented-selector.log
             opening-browser-evidence/
+            pinned-app-full-ui.log
+            pinned-app-full-ui-receipt.json
 
   check-ui:
     name: check (ui/specs)

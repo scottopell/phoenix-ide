@@ -937,3 +937,39 @@ current report whose request ID is also explicitly correlated in that report.
 A two-request UNIT regression accepts the report's own trace and rejects both
 borrowing another journey's trace and adding that foreign request ID alongside
 it. The blocked checkpoint was not pushed or activated.
+
+## Actual-main source advance for the single hosted attempt
+
+The source candidate advances to `77ab7a42db1a74f6eb841bcf0c9c4669fb9ce4b0`,
+tree `b1ed4d13258e94d43ac533731b0c5c28fcdeaf38`, with exact parents
+`caa8138cad185530b4c5ddb17b5082502f21bb01` and actual pinned main
+`7af06a4004b97b534d468b6ca2f42c145c8d4fb9`. The merge has no textual
+conflicts. Four imported files are byte-identical to that main: retirement
+cleanup, production Bash waiter/reader-drain extraction, and owned-home E2E
+path canonicalization. Source audit verifies reader completion still precedes
+terminal transition and waiter release; this is production code, not a test-only
+change. No observer, receiver, opening, ADR or migration delta is introduced by
+this base advance. All three donor hashes remain unchanged. ADR 101/102 remains
+unchanged until an actual subsequent landing requires a separately identified
+renumbering.
+
+The existing Ubuntu-hosted instrumented job adds one full pinned-app UI lane
+step: `PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui`.
+It uses standard full-suite scheduling/configuration and tsc/eslint, not a
+render-fixture-only rerun or no-file-parallelism override. It gates capture,
+retains the full console log even on failure, and binds command/exit status,
+app/tree/base/harness plus Vitest-config/lock hashes in a separate receipt.
+Counts are authoritative in the actual retained log, never invented by the
+receipt. The standard harness UI job alone is not pinned-app qualification.
+The previously failing return-navigation fixture and reaction tests remain in
+the unfiltered suite; no causal repair is claimed before that hosted execution.
+Genuine codegen, all eleven instrumentation guards with one ignored driver,
+actual ordinary/Global joint capture/export/drain, and binary/build/module
+receipts remain required by the same existing job. Existing wall budgets are
+unchanged, and no retry-until-green behavior is added.
+
+This packet is source preparation only. Local restricted dev.py checks,
+rustfmt parsing, Python source compilation and compiler-free harness tests do
+not execute the six Rust guards or provide full-app UI/runtime receipts. A
+single exact-head hosted push/run requires coordinator admission; no local
+build, capture or deployment was performed during base integration.

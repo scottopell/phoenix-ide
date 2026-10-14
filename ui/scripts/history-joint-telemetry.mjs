@@ -4,8 +4,8 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = 'caa8138cad185530b4c5ddb17b5082502f21bb01';
-export const APP_BASE_PIN = '84fbebb0781067cbe843f61c53093dcc0f0d64f2';
+export const APP_PIN = '77ab7a42db1a74f6eb841bcf0c9c4669fb9ce4b0';
+export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
 export const TELEMETRY_MODULE_SHA256 = 'd0a52f49d583ae55ede9320d6f2ef1bd581fdd2f17dff9f6f989e9a6f75adb83';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
 export const TELEMETRY_SPA_SELECTOR = 'a.statebar-slug[href="/"][title="Back to conversations"]:visible';

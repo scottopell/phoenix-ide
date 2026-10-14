@@ -111,6 +111,22 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("command = [str(destination), 'opening_qualifier::', '--nocapture', '--test-threads=1']", workflow)
         self.assertIn("'11 passed; 0 failed; 1 ignored'", workflow)
 
+    def test_existing_hosted_job_qualifies_full_pinned_app_ui_before_capture(self):
+        workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()
+        start = workflow.index("      - name: Full UI source qualification at exact pinned app")
+        stop = workflow.index("      - name: Prepare owned Chromium", start)
+        step = workflow[start:stop]
+        self.assertIn("working-directory: pinned-app", step)
+        self.assertIn("PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes ui", step)
+        self.assertIn("ui_status=${PIPESTATUS[0]}", step)
+        self.assertIn('exit "$ui_status"', step)
+        self.assertNotIn("--no-file-parallelism", step)
+        self.assertNotIn("renderFixture.test", step)
+        self.assertIn("vitest_config_sha256", step)
+        self.assertIn("pinned-app-full-ui.log", workflow)
+        self.assertIn("pinned-app-full-ui-receipt.json", workflow)
+        self.assertIn("runs-on: ubuntu-latest", workflow[workflow.index("  qualify-history-realserver:"):start])
+
     def test_each_identity_dimension_fails_closed(self):
         for key in self.value:
             saved = self.value[key]
