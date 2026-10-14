@@ -13,12 +13,12 @@ const completed = {
   occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
 } satisfies EventPresentation;
 
-function eventMessage(id: string, sequence: number, presentation: EventPresentation, text: string): EnrichedMessage & { content: { text: string } } {
+function eventMessage(id: string, sequence: number, presentation: EventPresentation, text: string) {
   return {
     message_id: id, conversation_id: 'source-member', sequence_id: sequence, message_type: 'user',
     origin: { kind: 'subscription_event', event_id: presentation.event_id }, event_presentation: presentation,
     content: { text }, display_data: null, usage_data: null, created_at: '2026-10-12T08:53:20.123Z',
-  };
+  } satisfies EnrichedMessage;
 }
 
 export function makeCompactEventsScenario(global: boolean): ProductConversationScenario {
