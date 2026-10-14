@@ -13,7 +13,7 @@ test('fault remains active through acceptance and same-page reconnect, but new p
   const click = script.indexOf('await chapter.click()');
   const physical = script.indexOf("checked('accepted manual opening renders once");
   assert.ok(reconnect >= 0 && reconnect < restored && restored < click && click < physical);
-  assert.match(script, /const restoredAggregate = page\.waitForResponse/);
+  assert.match(script, /const restoredAggregate = a\.kind === 'ordinary' \? page\.waitForResponse/);
   assert.match(script, /const restoredResponse = await restoredAggregate/);
   assert.match(script, /await rendered\.waitFor\(\{ state: 'visible' \}\); assert\.equal\(await rendered\.count\(\), 1\)/);
 });

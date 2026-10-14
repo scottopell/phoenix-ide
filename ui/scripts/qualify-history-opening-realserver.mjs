@@ -143,6 +143,76 @@ export function validateChatAck(receipt, successor, key) {
   }
   assert.deepEqual(JSON.parse(receipt.raw), receipt.body);
 }
+export function globalChapterReferencePath(a) {
+  assert.equal(a.kind, 'global');
+  return a.endpoint + '?message_limit=100&boundary_representation=original_messages';
+}
+export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, reconnect, streamUrls, row, ack, chatRequest, instruction }) {
+  assert.equal(a.kind, 'global');
+  const latest = evidence.successor_transcript_row_id, id = `${latest}:${evidence.client_turn_key}`;
+  assert.equal(evidence.edge, 'committed_intent_before_first_message_persistence');
+  const owned = { ...a, members: [...a.members, latest], opening_evidence: { [latest]: evidence } };
+  assert.equal(cached.status, 200); assert.equal(cached.method, 'GET');
+  assert.equal(cached.outcome, 'body_received', 'complete received cache body');
+  assert.notEqual(cached.truncated, true, 'cache explicitly truncated');
+  assert.equal(typeof cached.raw, 'string');
+  assert.ok(Buffer.byteLength(cached.raw) <= REQUIRED_BODY_MAX_BYTES, 'cache body bound');
+  assert.equal(Buffer.byteLength(cached.raw), cached.body_bytes, 'cache byte count');
+  assert.equal(createHash('sha256').update(cached.raw).digest('hex'), cached.raw_sha256, 'cache raw SHA256');
+  assert.deepEqual(JSON.parse(cached.raw), cached.data, 'cache raw/data parity');
+  validateOwnedAggregate(owned, cached.data, cached.url);
+  assert.deepEqual(cached.data.segments.map(s => s.transcript_row_id), owned.members);
+  assert.ok(openingMatches(cached.data.latest_opening, evidence, 'pending'));
+  for (const event of [accepted, reconnect]) {
+    assert.equal(new URL(streamUrls.get(event.requestId)).pathname, `/api/conversations/${latest}/stream`);
+    assert.ok(openingMatches(JSON.parse(event.data).opening, evidence, 'accepted'));
+  }
+  assert.ok(['message', 'message_updated'].includes(accepted.eventName));
+  const published = JSON.parse(accepted.data);
+  assert.equal(published.message?.message_id ?? published.message_id, id);
+  assert.equal(reconnect.eventName, 'init'); assert.notEqual(reconnect.requestId, accepted.requestId);
+  const init = JSON.parse(reconnect.data);
+  assert.equal(init.conversation.id, latest); assert.equal(init.transcript_coverage, 'complete');
+  assert.equal(init.messages.filter(m => m.message_id === id).length, 1, 'unique reconnect opening');
+  for (const message of [published.message, init.messages.find(m => m.message_id === id)]) {
+    assert.ok(message, 'full accepted/reconnect message required');
+    assert.equal(message.conversation_id, latest, 'accepted/reconnect message owner');
+    assert.equal(message.message_type, 'user', 'accepted/reconnect message shape');
+    assert.deepEqual(message.content, { text: instruction }, 'accepted/reconnect instruction bytes');
+  }
+  assert.equal(row.conversation.id, latest);
+  const persisted = row.messages.filter(m => m.message_id === id);
+  assert.equal(persisted.length, 1, 'unique durable opening'); assert.equal(persisted[0].conversation_id, latest);
+  assert.equal(persisted[0].message_type, 'user'); assert.deepEqual(persisted[0].content, { text: instruction }, 'durable instruction bytes');
+  validateChatAck(ack, latest, chatRequest.message_id);
+  const composer = row.messages.filter(m => m.message_id === ack.canonical_message_id);
+  assert.equal(composer.length, 1, 'durable composer ACK');
+  assert.equal(composer[0].conversation_id, latest, 'durable ACK owner');
+  assert.equal(composer[0].message_type, 'user', 'durable ACK shape');
+  assert.deepEqual(composer[0].content, { text: chatRequest.text }, 'durable ACK request bytes');
+  return { latest, acceptedId: id, execution_owner_stream: streamUrls.get(reconnect.requestId), cached_request_ordinal: cached.request_ordinal };
+}
+export function validateGlobalChapterSelection(a, evidence, url, physical) {
+  const latest = evidence.successor_transcript_row_id, id = `${latest}:${evidence.client_turn_key}`, parsed = new URL(url);
+  assert.ok([a.product_conversation_id, ...a.members, latest].some(alias => parsed.pathname === `/global/${alias}`), 'known Global alias');
+  assert.deepEqual(parsed.searchParams.getAll('source_transcript'), [latest]);
+  assert.equal(parsed.hash, `#message-${encodeURIComponent(id)}`);
+  assert.equal(physical.count, 1); assert.equal(physical.visible, true);
+  assert.equal(physical.persistedMessageID, id);
+}
+export function validateGlobalChapterReference(a, evidence, data, url) {
+  assert.equal(new URL(url).pathname, a.endpoint);
+  const query = new URL(url).searchParams;
+  assert.equal(query.get('message_limit'), '100'); assert.equal(query.get('boundary_representation'), 'original_messages');
+  const latest = evidence.successor_transcript_row_id;
+  const owned = { ...a, members: a.members.includes(latest) ? a.members : [...a.members, latest],
+    opening_evidence: { ...a.opening_evidence, [latest]: evidence } };
+  validateOwnedAggregate(owned, data, url);
+  assert.deepEqual(data.segments.map(s => s.transcript_row_id), owned.members);
+  assert.ok(openingMatches(data.latest_opening, evidence, 'accepted'));
+  const boundary = aggregateBoundaries(data).find(b => b.message_id === evidence.continuation_message_id);
+  assert.ok(boundary); assert.equal(boundary.represented_successor_opening_message_id, null);
+}
 export function faultTarget(method, url, state, kind) {
   const parsed = new URL(url, 'http://127.0.0.1:1');
   const path = parsed.pathname;
@@ -418,7 +488,7 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
         }
         parsed_identity = validateOwnedAggregate(aggregate, data, metadata.url);
         assert.ok(snapshots.length < 300, 'aggregate snapshot bound');
-        snapshots.push({ ...metadata, raw, data, parsed_identity, raw_sha256, committed_evidence_source: state.committed_evidence_source ?? null });
+        snapshots.push({ ...metadata, outcome: 'body_received', body_bytes: bytes, raw, data, parsed_identity, raw_sha256, committed_evidence_source: state.committed_evidence_source ?? null });
         state.outcome = 'captured';
         record('browser-responses.jsonl', { ...metadata, outcome: 'captured', parsed_identity, raw_sha256, body_bytes: bytes, committed_evidence_source: state.committed_evidence_source ?? null });
       } catch (error) {
@@ -709,7 +779,8 @@ async function run() {
     recorder.reserveOpening({ kind: 'expected_manual_pending', product_conversation_id: a.manual_opening.edge.product_conversation_id,
       predecessor_transcript_row_id: gate.predecessor, client_turn_key: gate.key, opening_authority: 'user_authorized_instruction' });
     // POST acknowledgement may precede message persistence; only Entered certifies committed Pending.
-    continuation = http('POST', `/api/conversations/${gate.predecessor}/continue`, { handoff: 'opening-probe [[perf:1]] [[ttft:0]]', message_id: gate.key });
+    const instruction = 'opening-probe [[perf:1]] [[ttft:0]]';
+    continuation = http('POST', `/api/conversations/${gate.predecessor}/continue`, { handoff: instruction, message_id: gate.key });
     continuation.catch(() => {});
     const entered = await poll(async () => { const reply = await command({ command: 'entered' }); return reply.state === 'entered' && reply.evidence; }, 'committed Pending IPC', 10000);
     assert.equal(entered.predecessor_transcript_row_id, gate.predecessor); assert.equal(entered.client_turn_key, gate.key);
@@ -871,24 +942,50 @@ async function run() {
     checked('same-page transport SSE drop/reconnect preserves accepted full-edge identity', { accepted_cursor: acceptedCursor, reconnect, requests: requests.slice(requestStart) });
     await page.screenshot({ path: resolve(output, 'accepted-reconnected.png') });
     updateFault(fault, { failRoster: false });
-    const restoredAggregate = page.waitForResponse(response => response.request().method() === 'GET'
+    const chapterRequestStart = requests.length, chapterSnapshotStart = snapshots.length;
+    // Only ordinary routing requires a fresh browser acquisition. Global may reuse verified roster + live SSE.
+    const restoredAggregate = a.kind === 'ordinary' ? page.waitForResponse(response => response.request().method() === 'GET'
       && capturePolicy({ ...a, members: [...a.members, latest] }, 'GET', response.url()).kind === 'required_aggregate_json'
-      && response.ok());
-    // An explicit chapter selection may move the reader; verify its persisted ID after the click.
+      && response.ok()) : null;
     const chapter = page.locator('#conversation-nav [role="button"]').filter({ hasText: 'opening-probe' });
     assert.equal(await chapter.count(), 1); await chapter.click();
-    const restoredResponse = await restoredAggregate;
-    const fetchedLatestAccepted = JSON.parse(await restoredResponse.text());
-    validateOwnedAggregate({ ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } }, fetchedLatestAccepted, restoredResponse.url());
-    assert.ok(openingMatches(fetchedLatestAccepted.latest_opening, entered, 'accepted'), 'restored full accepted edge');
-    checked('new chapter ownership acquisition uses restored real aggregate transport', {
-      url: restoredResponse.url(), status: restoredResponse.status(), fault_active_during_acceptance_and_reconnect: true,
-      fault_restored_before_new_pin_acquisition: true });
+    if (restoredAggregate) {
+      const restoredResponse = await restoredAggregate;
+      const fetchedLatestAccepted = JSON.parse(await restoredResponse.text());
+      validateOwnedAggregate({ ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } }, fetchedLatestAccepted, restoredResponse.url());
+      assert.ok(openingMatches(fetchedLatestAccepted.latest_opening, entered, 'accepted'), 'restored full accepted edge');
+      checked('ordinary chapter ownedGuard acquisition uses restored real aggregate transport', {
+        url: restoredResponse.url(), status: restoredResponse.status(), fault_active_during_acceptance_and_reconnect: true,
+        fault_restored_before_new_pin_acquisition: true });
+    }
     await page.waitForURL(value => value.hash === `#message-${encodeURIComponent(acceptedId)}`);
     const rendered = page.locator(persistedMessageSelector(acceptedId));
     await rendered.waitFor({ state: 'visible' }); assert.equal(await rendered.count(), 1);
     const physical = await rendered.evaluate(el => { const box = el.getBoundingClientRect(); const view = document.querySelector('#messages').getBoundingClientRect(); return box.height > 0 && box.bottom > view.top && box.top < view.bottom; });
     assert.equal(physical, true);
+    if (a.kind === 'global') {
+      validateGlobalChapterSelection(a, entered, page.url(), { count: await rendered.count(), visible: physical, persistedMessageID: acceptedId });
+      const referencePath = globalChapterReferencePath(a);
+      const reference = await http('GET', referencePath);
+      validateGlobalChapterReference(a, entered, reference, api + referencePath);
+      const currentRow = await http('GET', `/api/conversations/${latest}`);
+      const cached = snapshots.slice(start, chapterSnapshotStart).find(s => s.data.latest_transcript_row_id === latest && openingMatches(s.data.latest_opening, entered, 'pending'));
+      assert.ok(cached, 'actual verified browser Pending full-roster cache');
+      const authority = validateGlobalCacheAuthority(a, { evidence: entered, cached, accepted, reconnect, streamUrls: streamRequests, row: currentRow, ack: chatAck, chatRequest: body, instruction });
+      record('global-chapter-reference.jsonl', { acquisition: 'INDEPENDENT_reference_NOT_browser_acquisition', method: 'GET', path: referencePath, authority });
+      await recorder.sealAndDrain(); recorder.assertQualified();
+      const browserSlice = requests.slice(chapterRequestStart);
+      const acquired = snapshots.slice(chapterSnapshotStart);
+      for (const snapshot of acquired) {
+        validateOwnedAggregate({ ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } }, snapshot.data, snapshot.url);
+        assert.equal(snapshot.data.latest_transcript_row_id, latest);
+        assert.ok(openingMatches(snapshot.data.latest_opening, entered, 'accepted'));
+      }
+      checked('Global cache-backed chapter selection with observed browser request slice', {
+        url: page.url(), authority, browser_requests: browserSlice, captured_owned_body_count: acquired.length,
+        owned_browser_get_count: browserSlice.filter(r => capturePolicy({ ...a, members: [...a.members, latest] }, r.method, r.url).kind === 'required_aggregate_json').length,
+        independent_reference_path: referencePath, fault_restored_before_click: true });
+    }
     checked('accepted manual opening renders once with exact persisted identity after real chapter click', { acceptedId });
     await recorder.sealAndDrain(); recorder.assertQualified();
     result.status = 'passed_assertions';
