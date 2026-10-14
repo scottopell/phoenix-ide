@@ -192,8 +192,10 @@ export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, re
   assert.deepEqual(composer[0].content, { text: chatRequest.text }, 'durable ACK request bytes');
   return { latest, acceptedId: id, execution_owner_stream: streamUrls.get(reconnect.requestId), cached_request_ordinal: cached.request_ordinal };
 }
-export function validateGlobalChapterSelection(a, evidence, url, physical) {
+export function validateGlobalChapterSelection(a, evidence, url, physical, preClickPathname) {
   const latest = evidence.successor_transcript_row_id, id = `${latest}:${evidence.client_turn_key}`, parsed = new URL(url);
+  assert.equal(typeof preClickPathname, 'string', 'actual pre-click pathname required');
+  assert.equal(parsed.pathname, preClickPathname, 'chapter preserves exact pre-click route alias');
   assert.ok([a.product_conversation_id, ...a.members, latest].some(alias => parsed.pathname === `/global/${alias}`), 'known Global alias');
   assert.deepEqual(parsed.searchParams.getAll('source_transcript'), [latest]);
   assert.equal(parsed.hash, `#message-${encodeURIComponent(id)}`);
@@ -942,6 +944,7 @@ async function run() {
     checked('same-page transport SSE drop/reconnect preserves accepted full-edge identity', { accepted_cursor: acceptedCursor, reconnect, requests: requests.slice(requestStart) });
     await page.screenshot({ path: resolve(output, 'accepted-reconnected.png') });
     updateFault(fault, { failRoster: false });
+    const chapterPreClickUrl = page.url();
     const chapterRequestStart = requests.length, chapterSnapshotStart = snapshots.length;
     // Only ordinary routing requires a fresh browser acquisition. Global may reuse verified roster + live SSE.
     const restoredAggregate = a.kind === 'ordinary' ? page.waitForResponse(response => response.request().method() === 'GET'
@@ -964,7 +967,7 @@ async function run() {
     const physical = await rendered.evaluate(el => { const box = el.getBoundingClientRect(); const view = document.querySelector('#messages').getBoundingClientRect(); return box.height > 0 && box.bottom > view.top && box.top < view.bottom; });
     assert.equal(physical, true);
     if (a.kind === 'global') {
-      validateGlobalChapterSelection(a, entered, page.url(), { count: await rendered.count(), visible: physical, persistedMessageID: acceptedId });
+      validateGlobalChapterSelection(a, entered, page.url(), { count: await rendered.count(), visible: physical, persistedMessageID: acceptedId }, new URL(chapterPreClickUrl).pathname);
       const referencePath = globalChapterReferencePath(a);
       const reference = await http('GET', referencePath);
       validateGlobalChapterReference(a, entered, reference, api + referencePath);
@@ -982,7 +985,8 @@ async function run() {
         assert.ok(openingMatches(snapshot.data.latest_opening, entered, 'accepted'));
       }
       checked('Global cache-backed chapter selection with observed browser request slice', {
-        url: page.url(), authority, browser_requests: browserSlice, captured_owned_body_count: acquired.length,
+        pre_click_url: chapterPreClickUrl, url: page.url(), exact_pathname_preserved: true,
+        authority, browser_requests: browserSlice, captured_owned_body_count: acquired.length,
         owned_browser_get_count: browserSlice.filter(r => capturePolicy({ ...a, members: [...a.members, latest] }, r.method, r.url).kind === 'required_aggregate_json').length,
         independent_reference_path: referencePath, fault_restored_before_click: true });
     }

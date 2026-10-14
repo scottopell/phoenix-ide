@@ -85,7 +85,21 @@ for (const [name, url, box] of [
   ['wrong_hash', selection.replace(encodeURIComponent(id), 'foreign'), physical], ['wrong_route', selection.replace(`/global/${a.members[0]}`, '/global/foreign'), physical],
   ['duplicate_pin', selection.replace('#', `&source_transcript=${latest}#`), physical], ['duplicate_physical_ID', selection, { ...physical, count: 2 }],
   ['invisible', selection, { ...physical, visible: false }], ['wrong_physical_ID', selection, { ...physical, persistedMessageID: 'foreign' }],
-]) test(`selection ${name} (UNIT ONLY physical observation)`, () => name === 'valid' ? validateGlobalChapterSelection(a, evidence, url, box) : assert.throws(() => validateGlobalChapterSelection(a, evidence, url, box)));
+]) test(`selection ${name} (UNIT ONLY physical observation)`, () => name === 'valid' ? validateGlobalChapterSelection(a, evidence, url, box, new URL(selection).pathname) : assert.throws(() => validateGlobalChapterSelection(a, evidence, url, box, new URL(selection).pathname)));
+test('actual chapter must preserve pre-click alias, not switch to another known member/product/latest alias', () => {
+  const before = new URL(selection).pathname;
+  validateGlobalChapterSelection(a, evidence, selection, physical, before);
+  for (const alias of [a.product_conversation_id, ...a.members.slice(1), latest]) {
+    const changed = new URL(selection); changed.pathname = `/global/${alias}`;
+    if (changed.pathname === before) continue;
+    assert.throws(() => validateGlobalChapterSelection(a, evidence, changed.href, physical, before), /exact pre-click route alias/);
+  }
+  assert.throws(() => validateGlobalChapterSelection(a, evidence, selection, physical), /actual pre-click pathname required/);
+  const driver = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  assert.ok(driver.indexOf('const chapterPreClickUrl = page.url()') < driver.indexOf('await chapter.click()'));
+  assert.match(driver, /new URL\(chapterPreClickUrl\)\.pathname/);
+});
+
 test('independent reference requires original projection at the real coordinator endpoint; retained Pending is not Accepted', () => {
   const url = 'http://127.0.0.1:1' + globalChapterReferencePath(a);
   assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url));
