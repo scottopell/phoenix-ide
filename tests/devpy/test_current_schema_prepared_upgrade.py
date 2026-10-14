@@ -350,6 +350,124 @@ sys.exit({7 if partial else 0})
         with self.assertRaisesRegex(helper.ActivationError, "context mismatch"):
             helper._snapshot_proof(manifest)
 
+    def test_current_initial_start_rechecks_exclusivity(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        Path(manifest.target_plist).write_bytes(Path(manifest.rollback_plist).read_bytes())
+        reservation = helper.DatabaseCapacityReservation(
+            Path(manifest.current_schema_upgrade.backup_path),
+            self.root / "restore.sqlite3",
+            database.stat().st_size,
+        )
+
+        class StoppedLaunchctl:
+            def __init__(self) -> None:
+                self.started = 0
+                self.disruption_started = False
+
+            def stop(self) -> int | None:
+                self.disruption_started = True
+                return 71
+
+            def inspect(self):
+                return "not_loaded", None
+
+            def start(self, old_pid, plist_path=None) -> None:
+                self.started += 1
+
+        launchctl = StoppedLaunchctl()
+        exclusive_calls = 0
+
+        def exclusive(_manifest):
+            nonlocal exclusive_calls
+            exclusive_calls += 1
+            if exclusive_calls == 2:
+                raise helper.ActivationError("database reopened before initial start")
+
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper, "validate_current_schema_database", return_value=tuple(compiled_ledger(123))
+        ), mock.patch.object(
+            helper, "reserve_database_capacity", return_value=reservation
+        ), mock.patch.object(helper, "create_database_backup"), mock.patch.object(
+            helper, "_reservation_still_sufficient"
+        ), mock.patch.object(
+            helper, "run_current_schema_migration"
+        ), mock.patch.object(helper, "assert_database_exclusive", side_effect=exclusive), mock.patch.object(
+            helper, "Launchctl", return_value=launchctl
+        ):
+            state = helper.activate(manifest)
+
+        self.assertEqual(state, "committed")
+        self.assertEqual(launchctl.started, 0)
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertTrue(status["finalization_pending"])
+        self.assertIn("database reopened", status["committed_diagnostic"])
+
+    def test_completed_current_finalization_does_not_restart_stopped_service(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        target_plist = Path(manifest.target_plist)
+        target_plist.unlink(missing_ok=True)
+        os.link(manifest.candidate_plist, target_plist)
+        helper.write_status(manifest, "committed")
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        proof = {"migration_committed_at": "2026-01-01T00:00:00+00:00"}
+
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(helper.subprocess, "run", return_value=absence), mock.patch.object(
+            helper, "service_absence_confirmed", return_value=True
+        ), mock.patch.object(helper, "_snapshot_proof", return_value=proof), mock.patch.object(
+            helper, "validate_current_schema_database"
+        ), mock.patch.object(helper, "Launchctl") as launchctl:
+            state = helper.finalize_paired(manifest, current_schema=True)
+
+        self.assertEqual(state, "committed")
+        launchctl.assert_not_called()
+
+    def test_current_pre_stop_failure_releases_both_capacity_files(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        backup = Path(manifest.current_schema_upgrade.backup_path)
+        restore = helper._restore_capacity_path(manifest, database)
+        reservation = helper.DatabaseCapacityReservation(
+            backup, restore, database.stat().st_size
+        )
+        backup.touch(mode=0o600)
+        restore.touch(mode=0o600)
+        validations = 0
+
+        def validate(*_args, **_kwargs):
+            nonlocal validations
+            validations += 1
+            if validations == 2:
+                raise helper.ActivationError("database changed before stop")
+            return tuple(compiled_ledger(123))
+
+        class NotYetStopped:
+            disruption_started = False
+
+            def stop(self) -> int | None:
+                raise AssertionError("pre-stop validation should fail first")
+
+        launchctl = NotYetStopped()
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper, "validate_current_schema_database", side_effect=validate
+        ), mock.patch.object(
+            helper, "reserve_database_capacity", return_value=reservation
+        ), mock.patch.object(helper, "Launchctl", return_value=launchctl):
+            with self.assertRaisesRegex(helper.ActivationError, "changed before stop"):
+                helper.activate(manifest)
+
+        self.assertFalse(backup.exists())
+        self.assertFalse(restore.exists())
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+
     def test_unreadable_ordinary_ledger_fails_before_candidate_start(self) -> None:
         database = self.database()
         manifest = self.ordinary_manifest(database)

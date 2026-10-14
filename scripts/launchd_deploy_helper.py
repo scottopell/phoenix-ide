@@ -1531,6 +1531,8 @@ def activate(manifest: Manifest) -> str:
                     ordinary_candidate_started = True
                 launchctl.start(old_pid)
             else:
+                if manifest.current_schema_upgrade is not None:
+                    assert_database_exclusive(manifest)
                 launchctl.start(old_pid, plist_path=manifest.candidate_plist)
             wait_for_identity(manifest, manifest.expected)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
@@ -1595,6 +1597,8 @@ def activate(manifest: Manifest) -> str:
                 )
                 return "activation_failed_database_committed"
             if not disrupted:
+                if capacity_reservation is not None and not database_snapshot:
+                    abandon_capacity_reservation(manifest, capacity_reservation)
                 write_status(manifest, "precondition_failed", failure=failure)
                 raise
             try:
@@ -1673,6 +1677,30 @@ def captured_paired_plist(manifest: Manifest) -> Optional[Path]:
         if not path.is_symlink() and path.is_file() and sha256(path) == manifest.rollback_plist_sha256
     ]
     return max(matches, key=lambda path: path.stat().st_mtime_ns) if matches else None
+
+
+def abandon_capacity_reservation(
+    manifest: Manifest, reservation: DatabaseCapacityReservation
+) -> None:
+    """Delete both unsnapshotted capacity files before a pre-stop failure is terminal."""
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("prepared database upgrade is not configured")
+    expected_backup = Path(upgrade.backup_path)
+    expected_restore = _restore_capacity_path(manifest, Path(upgrade.database_path))
+    if (
+        reservation.backup_path != expected_backup
+        or reservation.restore_path != expected_restore
+    ):
+        raise ActivationError("capacity reservation does not belong to this transaction")
+    parents = set()
+    for path in (reservation.backup_path, reservation.restore_path):
+        if path.is_symlink():
+            raise ActivationError("capacity reservation is a symlink")
+        path.unlink(missing_ok=True)
+        parents.add(path.parent)
+    for parent in parents:
+        fsync_dir(parent)
 
 
 def release_capacity_reservation(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
@@ -1775,6 +1803,10 @@ def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
                 _current_schema_registry(manifest),
                 migrated=True,
             )
+        if owner is None and not status.get("finalization_pending"):
+            if not Path(manifest.target_plist).samefile(private):
+                raise ActivationError("completed publication identity mismatch")
+            return "committed"
         launchctl = Launchctl(manifest)
         state, pid = launchctl.inspect()
         if state not in {"running", "active"} or pid is None:
@@ -1784,10 +1816,6 @@ def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
             launchctl.start(None, plist_path=str(private))
         require_loaded_plist(manifest, launchctl, private)
         wait_for_identity(manifest, manifest.expected)
-        if owner is None and not status.get("finalization_pending"):
-            if not Path(manifest.target_plist).samefile(private):
-                raise ActivationError("completed publication identity mismatch")
-            return "committed"
         write_status(manifest, "committed", finalization_pending=True, committed_diagnostic="prepared finalization retry pending")
         try:
             reservation = _restore_capacity_path(manifest, Path(upgrade.database_path))

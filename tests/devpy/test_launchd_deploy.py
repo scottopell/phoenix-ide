@@ -1804,6 +1804,51 @@ class PreparationTests(unittest.TestCase):
                     self.assertNotIn("remove the marker", str(error.exception))
                     self.assertEqual(active.read_text(), "broken-pair\n")
 
+    def test_forward_only_claim_survives_unreadable_retained_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "forward"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text("invalid-json")
+            active = root / "active"
+            active.write_text("forward\n")
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "forward",
+                        "state": "ordinary_activation_failed_forward_only",
+                        "finalization_pending": True,
+                    }
+                )
+            )
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                self.assertFalse(
+                    self.dev._status_is_terminal_for_owner(
+                        status, "forward", self.dev._DEPLOY_TERMINAL_STATES
+                    )
+                )
+                for admission in (
+                    self.dev._claim_launchd_deploy,
+                    self.dev._claim_launchd_restart,
+                ):
+                    with self.subTest(admission=admission.__name__), self.assertRaises(
+                        SystemExit
+                    ) as error:
+                        admission("new-operation")
+                    self.assertIn("Do not remove", str(error.exception))
+                    self.assertEqual(active.read_text(), "forward\n")
+
     def test_checkpointed_terminal_claim_public_recovery_remains_publication_only(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

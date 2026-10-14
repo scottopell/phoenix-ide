@@ -10213,7 +10213,11 @@ def _status_is_terminal_for_owner(
                  or (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None))
         ):
             return False
-        return status.get("transaction_id") == owner and status.get("state") in terminal_states
+        return (
+            status.get("transaction_id") == owner
+            and status.get("state") in terminal_states
+            and not status.get("finalization_pending", False)
+        )
     except (OSError, json.JSONDecodeError):
         return False
 
@@ -10302,7 +10306,17 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     paired = manifest.get("paired_database_upgrade") is not None or manifest.get("source_kind") == "prepared_artifact" or status.get("source_kind") == "prepared_artifact"
     current_schema = manifest.get("current_schema_upgrade") is not None
     ordinary_forward = manifest.get("ordinary_forward_migration") is not None
-    if ordinary_forward and status.get("transaction_id") == owner and status.get("state") in {
+    owner_status = status.get("transaction_id") == owner
+    if not ordinary_forward and owner_status and status.get("state") in {
+        "candidate_may_migrate",
+        "ordinary_activation_failed_forward_only",
+    } and status.get("finalization_pending"):
+        return (
+            f"ordinary forward activation {owner} may have committed migration or initialization writes. "
+            "Its retained manifest is required for recovery but is missing, unreadable, or incomplete. "
+            "Do not remove the claim, start the predecessor, deploy, or restart; restore the exact retained evidence or qualify a forward repair."
+        )
+    if ordinary_forward and owner_status and status.get("state") in {
         "candidate_may_migrate",
         "ordinary_activation_failed_forward_only",
     }:
