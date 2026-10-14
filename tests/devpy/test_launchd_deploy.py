@@ -2118,7 +2118,7 @@ class PreparationTests(unittest.TestCase):
                 os.utime(ordinary, (100 + i, 100 + i))
             for name, content in (
                 ("paired", json.dumps({"paired_database_upgrade": {"backup_path": "private"}})),
-                ("current", json.dumps({"current_schema_upgrade": {"backup_path": "private"}})),
+                ("current-historical", json.dumps({"current_schema_upgrade": {"backup_path": "private"}})),
                 ("unreadable", "invalid-json"),
                 ("unknown", None),
             ):
@@ -2127,11 +2127,11 @@ class PreparationTests(unittest.TestCase):
                 if content is not None:
                     (transaction / "manifest.json").write_text(content)
                 os.utime(transaction, (1, 1))
-            self.dev._prune_launchd_deploy_transactions(root, "current")
+            self.dev._prune_launchd_deploy_transactions(root, "new-current")
             self.assertEqual(
                 sorted(p.name for p in root.iterdir()),
                 [
-                    "current",
+                    "current-historical",
                     "ordinary-3",
                     "ordinary-4",
                     "ordinary-5",
