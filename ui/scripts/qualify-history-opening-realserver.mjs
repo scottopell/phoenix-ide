@@ -967,7 +967,8 @@ async function run() {
     const physical = await rendered.evaluate(el => { const box = el.getBoundingClientRect(); const view = document.querySelector('#messages').getBoundingClientRect(); return box.height > 0 && box.bottom > view.top && box.top < view.bottom; });
     assert.equal(physical, true);
     if (a.kind === 'global') {
-      validateGlobalChapterSelection(a, entered, page.url(), { count: await rendered.count(), visible: physical, persistedMessageID: acceptedId }, new URL(chapterPreClickUrl).pathname);
+      const chapterValidatedUrl = page.url();
+      validateGlobalChapterSelection(a, entered, chapterValidatedUrl, { count: await rendered.count(), visible: physical, persistedMessageID: acceptedId }, new URL(chapterPreClickUrl).pathname);
       const referencePath = globalChapterReferencePath(a);
       const reference = await http('GET', referencePath);
       validateGlobalChapterReference(a, entered, reference, api + referencePath);
@@ -984,8 +985,22 @@ async function run() {
         assert.equal(snapshot.data.latest_transcript_row_id, latest);
         assert.ok(openingMatches(snapshot.data.latest_opening, entered, 'accepted'));
       }
+      const chapterFinalPhysical = await page.evaluate(({ selector }) => {
+        const nodes = [...document.querySelectorAll(selector)];
+        const node = nodes.length === 1 ? nodes[0] : null;
+        const view = document.querySelector('#messages')?.getBoundingClientRect();
+        const box = node?.getBoundingClientRect();
+        const identity = node?.getAttribute('data-message-id') ?? (node?.id?.startsWith('message-') ? node.id.slice('message-'.length) : null);
+        return { url: window.location.href, browser_at_millis: Date.now(), count: nodes.length,
+          persistedMessageID: identity, visible: !!(box && view && box.width > 0 && box.height > 0
+            && box.bottom > view.top && box.top < view.bottom) };
+      }, { selector: persistedMessageSelector(acceptedId) });
+      const chapterReceiptUrl = chapterFinalPhysical.url;
+      validateGlobalChapterSelection(a, entered, chapterReceiptUrl, chapterFinalPhysical, new URL(chapterPreClickUrl).pathname);
+      assert.equal(chapterReceiptUrl, chapterValidatedUrl, 'selected chapter URL remains stable through independent reference and capture drain');
       checked('Global cache-backed chapter selection with observed browser request slice', {
-        pre_click_url: chapterPreClickUrl, url: page.url(), exact_pathname_preserved: true,
+        pre_click_url: chapterPreClickUrl, validated_url: chapterValidatedUrl, url: chapterReceiptUrl,
+        final_atomic_physical: chapterFinalPhysical, exact_pathname_preserved: true,
         authority, browser_requests: browserSlice, captured_owned_body_count: acquired.length,
         owned_browser_get_count: browserSlice.filter(r => capturePolicy({ ...a, members: [...a.members, latest] }, r.method, r.url).kind === 'required_aggregate_json').length,
         independent_reference_path: referencePath, fault_restored_before_click: true });

@@ -100,6 +100,43 @@ test('actual chapter must preserve pre-click alias, not switch to another known 
   assert.match(driver, /new URL\(chapterPreClickUrl\)\.pathname/);
 });
 
+test('selection receipt revalidates the actual final URL after async reference/drain and records measured URLs', () => {
+  const driver = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  assert.match(driver, /const chapterValidatedUrl = page\.url\(\)/);
+  assert.match(driver, /const chapterReceiptUrl = chapterFinalPhysical\.url/);
+  assert.match(driver, /url: window\.location\.href, browser_at_millis: Date\.now\(\), count: nodes\.length/);
+  assert.match(driver, /validateGlobalChapterSelection\(a, entered, chapterReceiptUrl/);
+  assert.match(driver, /assert\.equal\(chapterReceiptUrl, chapterValidatedUrl, 'selected chapter URL remains stable/);
+  assert.match(driver, /validated_url: chapterValidatedUrl, url: chapterReceiptUrl/);
+  const finalRead = driver.indexOf('const chapterFinalPhysical = await page.evaluate(');
+  const receipt = driver.indexOf("checked('Global cache-backed chapter selection");
+  assert.ok(driver.lastIndexOf('await recorder.sealAndDrain()', finalRead) < finalRead && finalRead < receipt);
+  assert.doesNotMatch(driver.slice(receipt, receipt + 300), /url: page\.url\(\)/);
+  const changed = new URL(selection); changed.pathname = `/global/${a.members[1]}`;
+  assert.throws(() => validateGlobalChapterSelection(a, evidence, changed.href, physical, new URL(selection).pathname), /exact pre-click route alias/);
+});
+
+test('final receipt uses the actual atomic URL/identity/viewport producer after asynchronous route changes (UNIT ONLY DOM)', () => {
+  const driver = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  const start = driver.indexOf('const chapterFinalPhysical = await page.evaluate(') + 'const chapterFinalPhysical = await page.evaluate('.length;
+  const end = driver.indexOf(', { selector: persistedMessageSelector(acceptedId) });', start);
+  assert.ok(start > 0 && end > start);
+  const produce = new Function('document', 'window', `return (${driver.slice(start, end)});`);
+  const node = { id: `message-${id}`, getAttribute: () => null, getBoundingClientRect: () => ({ top: 10, bottom: 30, width: 100, height: 20 }) };
+  const document = { querySelectorAll: () => [node], querySelector: () => ({ getBoundingClientRect: () => ({ top: 0, bottom: 100 }) }) };
+  const window = { location: { href: selection } };
+  const callback = produce(document, window);
+  const measured = callback({ selector: 'exact-ID' });
+  validateGlobalChapterSelection(a, evidence, measured.url, measured, new URL(selection).pathname);
+  const changed = new URL(selection); changed.pathname = `/global/${a.members[1]}`; window.location.href = changed.href;
+  const later = callback({ selector: 'exact-ID' });
+  assert.equal(later.url, changed.href);
+  assert.throws(() => validateGlobalChapterSelection(a, evidence, later.url, later, new URL(selection).pathname), /exact pre-click route alias/);
+  document.querySelectorAll = () => [node, { ...node }];
+  const duplicate = callback({ selector: 'exact-ID' });
+  assert.throws(() => validateGlobalChapterSelection(a, evidence, duplicate.url, duplicate, new URL(changed.href).pathname));
+});
+
 test('independent reference requires original projection at the real coordinator endpoint; retained Pending is not Accepted', () => {
   const url = 'http://127.0.0.1:1' + globalChapterReferencePath(a);
   assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url));
