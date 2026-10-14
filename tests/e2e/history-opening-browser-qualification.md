@@ -810,3 +810,12 @@ run was performed. The immutable `target/history-hidden-geometry-repair` source
 and retained evidence were not modified; real temporal stream destruction,
 page-URL preservation, final selection/reference/capture drain, atomic DOM
 identity, and normal cleanup remain runtime obligations.
+
+Independent review of local `599a028a2` blocked dispatch on an omitted-replay-tail
+false green: a preserve Init claiming tip15 after cursor14 with no replay passed.
+The follow-up preserve-only guard requires its claimed tip to equal the last
+replayed event sequence, or the request cursor when replay is empty, matching the
+pinned producer. Two negative cases reject empty and nonempty replay short of the
+claimed tip. This does not constrain message-bearing complete/tail snapshots.
+Final exact-HEAD rereview is required before one hosted successor; no dispatch or
+qualification follows from the offline correction alone.

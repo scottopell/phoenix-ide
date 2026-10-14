@@ -180,6 +180,13 @@ const preserveNegatives = {
   cursor_after_tip: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.sequence_id = 13; payload.last_sequence_id = 13; }), /reconnect cursor cannot exceed tip/],
   truncated: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.pending_truncated = true; }), /reconnect pending events not truncated/],
   nonempty_preserve_messages: [factsValue => changeEvent832(factsValue, 'reconnect', payload => { payload.messages = [factsValue.row.messages[0]]; }), /preserve reconnect messages must be empty/],
+  empty_replay_missing_tip: [factsValue => changeEvent832(factsValue, 'reconnect', payload => {
+    payload.sequence_id = 15; payload.last_sequence_id = 15;
+  }), /preserve replay must reach claimed tip/],
+  nonempty_replay_missing_tip: [factsValue => changeEvent832(factsValue, 'reconnect', payload => {
+    payload.sequence_id = 16; payload.last_sequence_id = 16;
+    payload.pending_events = [{ type: 'agent_done', sequence_id: 15 }];
+  }), /preserve replay must reach claimed tip/],
   pending_order: [factsValue => changeEvent832(factsValue, 'reconnect', payload => {
     payload.sequence_id = 16; payload.last_sequence_id = 16;
     payload.pending_events = [{ type: 'agent_done', sequence_id: 16 }, { type: 'state_change', sequence_id: 15 }];

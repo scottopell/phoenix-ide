@@ -234,6 +234,7 @@ export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, se
   const coverage = init.transcript_coverage;
   if (coverage === 'preserve') {
     assert.deepEqual(init.messages, [], 'preserve reconnect messages must be empty');
+    assert.equal(init.last_sequence_id, priorPendingSequence, 'preserve replay must reach claimed tip');
     assert.ok(Number.isSafeInteger(init.pending_anchor_sequence_id) && init.pending_anchor_sequence_id >= 0,
       'preserve reconnect anchor required');
     assert.ok(init.pending_anchor_sequence_id <= requestCursor, 'preserve reconnect anchor cannot exceed cursor');
