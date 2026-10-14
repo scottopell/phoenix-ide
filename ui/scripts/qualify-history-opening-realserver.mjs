@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { appendFileSync, readFileSync, writeFileSync, renameSync, statSync, lstatSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { resolve, dirname } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate, aggregateBoundaries } from './qualify-history-realserver.mjs';
 import { historicalMessageIdentities, observePhysicalHistoricalRow, physicalBaselineMatches, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
+import { prepareJointTelemetry, runJointTelemetryStage } from './history-joint-telemetry.mjs';
 
 export function ownedWireCursor(event, observedEvents) {
   const payload = JSON.parse(event.data);
@@ -768,6 +769,7 @@ async function run() {
   const app = resolve(process.env.APP_ROOT), output = resolve(process.env.HISTORY_OUTPUT);
   const ui = loopback(process.env.HISTORY_BASE_URL), api = loopback(process.env.HISTORY_API_URL);
   const a = JSON.parse(readFileSync(process.env.HISTORY_FIXTURE, 'utf8'));
+  const jointTelemetry = prepareJointTelemetry({ env: process.env, appRoot: app });
   const fault = ownedFile(process.env.HISTORY_FAULT), control = process.env.HISTORY_CONTROL;
   const result = { status: 'failed', evidence_class: 'instrumented_runtime_not_shipping_proof', checks: [],
     uncovered: ['Generated authority cannot be selected by pinned manual POST; not qualified.', 'Shipping binary/providers/production/physical devices not exercised.'] };
@@ -779,12 +781,14 @@ async function run() {
   let browser, page, continuation, recorder;
   const snapshots = [], events = [];
   let requests = [], failed = [];
-  const hardStop = setTimeout(() => {
+  const deadlineStarted = performance.now();
+  const wallFailure = () => {
     const capture = recorder?.partialInventory() ?? { partial: true, pending_metadata: [] };
     appendFileSync(resolve(output, 'browser-capture-drain.jsonl'), JSON.stringify(capture) + '\n');
     writeFileSync(resolve(output, 'browser-result.json'), JSON.stringify({ ...result, status: 'failed', partial: true, capture, error: 'wall deadline' }));
     process.exit(1);
-  }, 170000);
+  };
+  let hardStop = setTimeout(wallFailure, 170000);
   async function poll(fn, label, ms = 10000) {
     const end = performance.now() + ms;
     for (;;) { const value = await fn(); if (value) return value; assert.ok(performance.now() < end, label); await new Promise(r => setTimeout(r, 40)); }
@@ -1103,6 +1107,25 @@ async function run() {
     }
     checked('accepted manual opening renders once with exact persisted identity after real chapter click', { acceptedId });
     await recorder.sealAndDrain(); recorder.assertQualified();
+    if (jointTelemetry) {
+      const historyPhysical = await rendered.evaluate((el, selector) => {
+        const nodes = [...document.querySelectorAll(selector)];
+        const box = el.getBoundingClientRect(), view = document.querySelector('#messages').getBoundingClientRect();
+        return { url: window.location.href, browser_at_millis: Date.now(), count: nodes.length,
+          persistedMessageID: el.getAttribute('data-message-id') ?? el.id.slice('message-'.length),
+          visible: el.checkVisibility({ visibilityProperty: true }) && box.width > 0 && box.height > 0 && box.bottom > view.top && box.top < view.bottom };
+      }, persistedMessageSelector(acceptedId));
+      assert.equal(historyPhysical.persistedMessageID, acceptedId);
+      assert.equal(historyPhysical.url, page.url());
+      record('joint-history-physical.jsonl', historyPhysical);
+      clearTimeout(hardStop);
+      hardStop = setTimeout(wallFailure, Math.min(310000, Math.max(1, 480000 - (performance.now() - deadlineStarted))));
+      result.joint_telemetry = await runJointTelemetryStage({ config: jointTelemetry, browser, baseURL: ui,
+        outputDir: output, historyPhysical, harnessPath: fileURLToPath(import.meta.url),
+        historyGlobalOwnedGetCount: a.kind === 'global' ? requests.slice(chapterRequestStart).filter(r =>
+          capturePolicy({ ...a, members: [...a.members, latest] }, r.method, r.url).kind === 'required_aggregate_json').length : null });
+      record('joint-telemetry-source-receipt.jsonl', result.joint_telemetry);
+    }
     result.status = 'passed_assertions';
   } catch (error) {
     result.error = String(error.stack ?? error); process.exitCode = 1;

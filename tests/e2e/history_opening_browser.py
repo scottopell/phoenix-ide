@@ -5,9 +5,11 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent d4c2772 checkout, independently built ignored
+Inputs are a clean independent c825370 checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
-receipt.json with ui_files and ui_lock_sha256 measured AFTER the UI build.
+receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
+Opt-in hosted joint mode runtime-imports three hash-attested telemetry harness
+modules from immutable APP_ROOT; history-only behavior remains the default.
 Source/toolchain provenance is the build owner's attestation, not hash proof.
 Only compiler-free selftests may be run locally for this change.
 """
@@ -15,20 +17,34 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import signal
+import socket
+import sqlite3
+import sys
 import tempfile
 import time
+from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "d4c2772a95aa46da608b356c8fe7be074de1b7aa"
+PIN = "c825370814d22f0e03faf72d18f37df97bb59329"
+TREE_PIN = "ac4539bb02bff27c8094264322b6f5a8398e5011"
+BASE_PIN = "84fbebb0781067cbe843f61c53093dcc0f0d64f2"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
+TELEMETRY_MODULES = {
+    "ui/scripts/qualify-view-telemetry.mjs": "d0a52f49d583ae55ede9320d6f2ef1bd581fdd2f17dff9f6f989e9a6f75adb83",
+    "tests/e2e/view_telemetry_sink.py": "15d822cfe895097009249c6d4b6674dcf1826b5c6129bdd633545c2b4a91881b",
+    "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",
+}
+TELEMETRY_KEYS = frozenset({"PHOENIX_TRACE_EXPORTER", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+                            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_SERVICE_NAME"})
 
 
 def identity(app, exe, receipt_path):
@@ -37,17 +53,25 @@ def identity(app, exe, receipt_path):
         raise ValueError("independent app checkout required")
     if shipping.git(app, "rev-parse", "HEAD") != PIN:
         raise ValueError("app full source SHA mismatch")
+    if shipping.git(app, "rev-parse", "HEAD^{tree}") != TREE_PIN:
+        raise ValueError("app source tree mismatch")
+    if shipping.git(app, "merge-base", PIN, BASE_PIN) != BASE_PIN:
+        raise ValueError("integrated app base mismatch")
     if shipping.git(app, "status", "--porcelain", "--untracked-files=no"):
         raise ValueError("app tracked source dirty")
     if not exe.is_file() or exe.resolve() != exe or not os.access(exe, os.X_OK):
         raise ValueError("standalone non-symlink executable required")
     receipt = json.loads(receipt_path.read_text())
-    measured = {"app_source": PIN, "app_tree": shipping.git(app, "rev-parse", "HEAD^{tree}"),
+    modules = {relative: shipping.digest(app / relative) for relative in TELEMETRY_MODULES}
+    if modules != TELEMETRY_MODULES:
+        raise ValueError("telemetry runtime module hash mismatch")
+    measured = {"app_source": PIN, "app_tree": TREE_PIN, "app_base": BASE_PIN,
         "harness_source": shipping.git(ROOT, "rev-parse", "HEAD"),
         "executable_sha256": shipping.digest(exe),
         "cargo_lock_sha256": shipping.digest(app / "Cargo.lock"),
         "ui_lock_sha256": shipping.digest(app / "ui/pnpm-lock.yaml"),
-        "ui_files": shipping.ui_hashes(app), "evidence_class": CLASS, "ignored_driver": DRIVER}
+        "ui_files": shipping.ui_hashes(app), "telemetry_modules": modules,
+        "evidence_class": CLASS, "ignored_driver": DRIVER}
     if any(receipt.get(k) != v for k, v in measured.items()):
         raise ValueError("instrumented receipt source/tree/harness/hash/lock/UI mismatch")
     if not isinstance(receipt.get("rustc"), str) or not receipt["rustc"].startswith("rustc "):
@@ -58,6 +82,7 @@ def identity(app, exe, receipt_path):
     return measured | {"rustc": receipt["rustc"], "receipt_sha256": shipping.digest(receipt_path),
         "harness_files": {str(p.relative_to(ROOT)): shipping.digest(p) for p in
             [Path(__file__), SCRIPT, Path(shipping.__file__), ROOT / "ui/scripts/qualify-history-realserver.mjs"]},
+        "runtime_imports": {str((app / relative).resolve()): digest for relative, digest in modules.items()},
         "source_provenance": "independent build-owner attestation"}
 
 
@@ -94,6 +119,162 @@ def readiness(proc, url, expected_hash=None, timeout=30):
             pass
         time.sleep(.1)
     raise TimeoutError("actual HTTP readiness deadline")
+
+
+def load_telemetry_modules(app):
+    e2e = app / "tests/e2e"
+    sink_path = e2e / "view_telemetry_sink.py"
+    assertion_path = e2e / "assert_view_telemetry.py"
+    if {relative: shipping.digest(app / relative) for relative in TELEMETRY_MODULES} != TELEMETRY_MODULES:
+        raise ValueError("telemetry module identity changed before runtime import")
+    previous = sys.modules.get("view_telemetry_sink")
+    old_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(e2e))
+        sink_spec = importlib.util.spec_from_file_location("view_telemetry_sink", sink_path)
+        if sink_spec is None or sink_spec.loader is None:
+            raise ImportError("telemetry sink import spec unavailable")
+        sink = importlib.util.module_from_spec(sink_spec)
+        sys.modules["view_telemetry_sink"] = sink
+        sink_spec.loader.exec_module(sink)
+        assertion_spec = importlib.util.spec_from_file_location(
+            "joint_assert_view_telemetry", assertion_path)
+        if assertion_spec is None or assertion_spec.loader is None:
+            raise ImportError("telemetry assertion import spec unavailable")
+        assertion = importlib.util.module_from_spec(assertion_spec)
+        assertion_spec.loader.exec_module(assertion)
+        return sink, assertion
+    except Exception:
+        if previous is None:
+            sys.modules.pop("view_telemetry_sink", None)
+        else:
+            sys.modules["view_telemetry_sink"] = previous
+        raise
+    finally:
+        sys.path[:] = old_path
+
+
+def _telemetry_sensitive(key):
+    upper = key.upper()
+    return (key == "PHOENIX_TRACE_EXPORTER" or upper.startswith("OTEL_")
+            or upper.startswith("DD_") or "OTLP_HEADER" in upper)
+
+
+def telemetry_environment(base, receiver):
+    clean = {key: value for key, value in base.items() if not _telemetry_sensitive(key)}
+    supplied = dict(receiver.env)
+    if set(supplied) != TELEMETRY_KEYS:
+        raise ValueError("receiver must own exactly four telemetry environment keys")
+    endpoint = urlparse(supplied["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"])
+    if (endpoint.scheme != "http" or endpoint.hostname != "127.0.0.1" or endpoint.username
+            or endpoint.password or endpoint.query or endpoint.fragment or endpoint.path != "/v1/traces"
+            or endpoint.port is None):
+        raise ValueError("receiver supplied a foreign telemetry endpoint")
+    expected = {"PHOENIX_TRACE_EXPORTER": "otlp",
+                "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": receiver.endpoint,
+                "OTEL_SERVICE_NAME": receiver.service}
+    if supplied != expected:
+        raise ValueError("receiver telemetry environment values mismatch")
+    result = clean | supplied
+    if {key for key in result if _telemetry_sensitive(key)} != TELEMETRY_KEYS:
+        raise ValueError("unexpected inherited telemetry environment")
+    return result
+
+
+def receiver_startup_check(receiver, run_id, services):
+    endpoint = urlparse(receiver.endpoint)
+    expected_service = f"phoenix-view-qualification-{run_id}"
+    if (endpoint.scheme != "http" or endpoint.hostname != "127.0.0.1"
+            or endpoint.path != "/v1/traces" or endpoint.port is None
+            or receiver.service != expected_service or receiver.service in services):
+        raise ValueError("owned unique loopback receiver required")
+    with socket.create_connection((endpoint.hostname, endpoint.port), timeout=2):
+        pass
+    services.add(receiver.service)
+    return {"endpoint": receiver.endpoint, "service_name": receiver.service,
+            "startup_checked_before_app": True}
+
+
+def receiver_is_stopped(receiver):
+    endpoint = urlparse(receiver.endpoint)
+    try:
+        connection = socket.create_connection((endpoint.hostname, endpoint.port), timeout=.25)
+    except OSError:
+        return True
+    connection.close()
+    return False
+
+
+def actual_server_identity(startup, fixture):
+    deployment = fixture.request("GET", "/api/deployment")
+    source = deployment.get("build", {}).get("git_sha")
+    if source != PIN or startup.get("git_sha") != source:
+        raise ValueError("actual deployment source identity mismatch")
+    db = Path(startup["db"]).resolve(strict=True)
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as connection:
+        rows = connection.execute(
+            "SELECT singleton_key, instance_id FROM instance_identity").fetchall()
+    if len(rows) != 1 or rows[0][0] != 1 or not isinstance(rows[0][1], str):
+        raise ValueError("one authoritative isolated server identity required")
+    try:
+        parsed = shipping.uuid.UUID(rows[0][1])
+    except (ValueError, AttributeError) as error:
+        raise ValueError("invalid authoritative server identity") from error
+    if parsed.version != 4 or str(parsed) != rows[0][1]:
+        raise ValueError("invalid authoritative server identity")
+    return {"appSource": source, "frontendSource": source,
+            "serverInstanceId": rows[0][1]}
+
+
+def validate_joint_aggregates(aggregates):
+    if not isinstance(aggregates, list) or len(aggregates) != 2:
+        raise ValueError("two telemetry aggregates required")
+    by_kind = {aggregate.get("kind"): aggregate for aggregate in aggregates}
+    if set(by_kind) != {"ordinary", "global"} or len(by_kind) != len(aggregates):
+        raise ValueError("one ordinary and one Global telemetry aggregate required")
+    ordinary, global_ = by_kind["ordinary"], by_kind["global"]
+    for aggregate in aggregates:
+        if (not isinstance(aggregate.get("product_conversation_id"), str)
+                or not aggregate["product_conversation_id"]
+                or not isinstance(aggregate.get("route"), str)
+                or not isinstance(aggregate.get("members"), list)
+                or len(aggregate["members"]) < 2
+                or aggregate.get("latest_transcript_row_id") != aggregate["members"][-1]):
+            raise ValueError("telemetry aggregate identity is incomplete")
+    root = global_["members"][0]
+    latest = global_["latest_transcript_row_id"]
+    if (len({ordinary["product_conversation_id"], global_["product_conversation_id"]}) != 2
+            or len({global_["product_conversation_id"], root, latest}) != 3
+            or global_["route"] != f"/global/{latest}"
+            or global_["endpoint"] != f"/api/global/coordinator/history/{root}"):
+        raise ValueError("Global telemetry product/root/latest identity mismatch")
+    try:
+        json.dumps(aggregates, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("telemetry fixtures must be finite JSON") from error
+    return aggregates
+
+
+def joint_fixture(identity_value, aggregates):
+    aggregates = validate_joint_aggregates(aggregates)
+    ordinary = next(aggregate for aggregate in aggregates if aggregate["kind"] == "ordinary")
+    value = {"identity": identity_value, "aggregates": aggregates,
+             "lifecycle": {"route": ordinary["route"],
+                           "productConversationId": ordinary["product_conversation_id"],
+                           "spaSelector": 'a.statebar-slug[href="/"][title="Back to conversations"]:visible'},
+             "forbidden": []}
+    json.dumps(value, allow_nan=False)
+    return value
+
+
+def telemetry_browser_result(path):
+    if not path.is_file():
+        raise RuntimeError("joint telemetry producer receipt is missing")
+    result = json.loads(path.read_text())
+    if not isinstance(result, dict) or not isinstance(result.get("journeys"), list):
+        raise ValueError("joint telemetry producer receipt is invalid")
+    return result
 
 
 def exhausted_summary(state):
@@ -196,80 +377,195 @@ def normal_server_completion(server, case, startup, control):
     return receipt
 
 
-def qualify(app, exe, output):
+def qualify(app, exe, output, joint_telemetry=False):
     h = shipping.load_app_harness(app)
-    safe = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT") if k in os.environ}
-    # /tmp keeps Unix paths short and is the Rust driver's system temp root on Linux/macOS.
+    telemetry = load_telemetry_modules(app) if joint_telemetry else None
+    safe = {"PATH": os.environ["PATH"]}
+    services = set()
     with tempfile.TemporaryDirectory(prefix="ho-", dir="/tmp") as short:
         temp = Path(short).resolve()
         os.chmod(temp, 0o700)
         for kind in ("ordinary", "global"):
             case = output / kind
             case.mkdir()
-            with tempfile.TemporaryDirectory(prefix=kind + "-", dir=temp) as owned:
-                work = Path(owned)
-                os.chmod(work, 0o700)
-                control = work / "c.sock"
-                port = h._free_port()
-                base = f"http://127.0.0.1:{port}"
-                env = safe | {"HOME": str(work), "TMPDIR": str(temp), "PHOENIX_PORT": str(port),
-                              "PHOENIX_TEST_OPENING_CONTROL": str(control)}
-                command = [str(exe), DRIVER, "--exact", "--ignored", "--test-threads=1", "--nocapture"]
-                with shipping.owned_process(command, work, env, case / "instrumented-runtime.log") as server:
-                    try:
-                        readiness(server, base + "/api/models")
-                        startup = startup_identity(case / "instrumented-runtime.log", exe, work, port)
-                        shipping.write_json(case / "startup.json", startup)
-                        fixture = shipping.Fixture(h, base, case)
-                        try:
-                            cwd = work / "cwd"
-                            cwd.mkdir(mode=0o700)
-                            aggregate = fixture.build(kind, cwd)
-                            aggregate = equal_text_fixture(fixture, aggregate)
-                        finally:
-                            fixture.client.close()
-                        shipping.write_json(case / "fixture.json", aggregate)
-                        preview_port = h._free_port()
-                        ui = f"http://127.0.0.1:{preview_port}"
-                        fault = work / "fault.json"
-                        shipping.write_json(fault, {"aggregatePath": aggregate["endpoint"], "failRoster": False,
-                            "streamPath": "", "drop": 0})
-                        config = work / "preview.mjs"
-                        options = {"root": str(app / "ui"), "build": {"outDir": str(app / "ui/dist")},
-                            "preview": {"host": "127.0.0.1", "port": preview_port, "strictPort": True}}
-                        config.write_text("import { previewTransport } from " + json.dumps(SCRIPT.as_uri()) + ";\n"
-                            + "const config = " + json.dumps(options) + ";\n"
-                            + "config.preview.proxy = previewTransport(" + json.dumps(base) + ","
-                            + json.dumps(str(fault)) + "," + json.dumps(str(case / "preview-transport.jsonl"))
-                            + "); export default config;\n")
-                        node_env = safe | {"HOME": str(work), "APP_ROOT": str(app), "HISTORY_BASE_URL": ui,
-                            "HISTORY_API_URL": base, "HISTORY_OUTPUT": str(case), "HISTORY_FIXTURE": str(case / "fixture.json"),
-                            "HISTORY_CONTROL": str(control), "HISTORY_FAULT": str(fault),
-                            "PLAYWRIGHT_BROWSERS_PATH": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() /
-                                ("Library/Caches/ms-playwright" if os.sys.platform == "darwin" else ".cache/ms-playwright")))}
-                        with shipping.owned_process(["node", str(app / "ui/node_modules/vite/bin/vite.js"),
-                                "preview", "--config", str(config)], work, node_env, case / "preview.log") as preview:
-                            readiness(preview, ui, shipping.digest(app / "ui/dist/index.html"))
-                            with shipping.owned_process(["node", str(SCRIPT)], work, node_env, case / "browser.log") as driver:
-                                driver.wait(timeout=180)
-                                assert driver.returncode == 0, "opening browser assertions failed; see case logs"
-                        result = json.loads((case / "browser-result.json").read_text())
-                        assert result["status"] == "passed_assertions" and result["checks"]
-                        normal_server_completion(server, case, startup, control)
-                    finally:
-                        # A failed setup/browser never acquires normal-completion credit.
-                        if not (case / "server-completion.json").exists():
-                            shipping.write_json(case / "server-completion.json", {
-                                "status": "force_cleanup_required", "returncode": server.poll()})
-                        if control.exists():
-                            import socket
-                            with contextlib.suppress(OSError, ValueError):
-                                with socket.socket(socket.AF_UNIX) as client:
-                                    client.settimeout(2)
-                                    client.connect(str(control))
-                                    client.sendall(b'{"command":"stop"}\n')
-                                    client.recv(4096)
-                control.unlink(missing_ok=True)
+            run_id = f"history-{kind}-{shipping.uuid.uuid4().hex[:16]}"
+            receiver_context = (telemetry[0].telemetry_sink(case, run_id)
+                                if telemetry else contextlib.nullcontext(None))
+            receiver = server = None
+            app_stopped = receiver_stopped = False
+            lifecycle_errors = []
+            try:
+                with receiver_context as receiver:
+                    receiver_receipt = (receiver_startup_check(receiver, run_id, services)
+                                        if receiver else None)
+                    with tempfile.TemporaryDirectory(prefix=kind + "-", dir=temp) as owned:
+                        work = Path(owned)
+                        os.chmod(work, 0o700)
+                        control = work / "c.sock"
+                        port = h._free_port()
+                        base = f"http://127.0.0.1:{port}"
+                        env = safe | {"HOME": str(work), "TMPDIR": str(temp),
+                                      "PHOENIX_PORT": str(port),
+                                      "PHOENIX_TEST_OPENING_CONTROL": str(control)}
+                        if receiver:
+                            env = telemetry_environment(env, receiver)
+                            shipping.write_json(case / "telemetry-receiver-startup.json",
+                                                receiver_receipt)
+                        command = [str(exe), DRIVER, "--exact", "--ignored",
+                                   "--test-threads=1", "--nocapture"]
+                        with shipping.owned_process(
+                                command, work, env,
+                                case / "instrumented-runtime.log") as server:
+                            try:
+                                readiness(server, base + "/api/models")
+                                startup = startup_identity(
+                                    case / "instrumented-runtime.log", exe, work, port)
+                                shipping.write_json(case / "startup.json", startup)
+                                fixture = shipping.Fixture(h, base, case)
+                                try:
+                                    cwd = work / "cwd"
+                                    cwd.mkdir(mode=0o700)
+                                    aggregate = equal_text_fixture(
+                                        fixture, fixture.build(kind, cwd))
+                                    if receiver:
+                                        other_kind = ("global" if kind == "ordinary"
+                                                      else "ordinary")
+                                        other_cwd = work / f"telemetry-{other_kind}-cwd"
+                                        other_cwd.mkdir(mode=0o700)
+                                        other = fixture.build(other_kind, other_cwd)
+                                        other = other | {
+                                            "latest_transcript_row_id": other["members"][-1]}
+                                        fixtures = joint_fixture(
+                                            actual_server_identity(startup, fixture),
+                                            [aggregate, other])
+                                        telemetry_input = {
+                                            "runId": run_id,
+                                            "serviceName": receiver.service,
+                                            "fixtures": fixtures,
+                                        }
+                                        shipping.write_json(
+                                            case / "telemetry-fixture.json", telemetry_input)
+                                finally:
+                                    fixture.client.close()
+                                shipping.write_json(case / "fixture.json", aggregate)
+                                preview_port = h._free_port()
+                                ui = f"http://127.0.0.1:{preview_port}"
+                                fault = work / "fault.json"
+                                shipping.write_json(fault, {
+                                    "aggregatePath": aggregate["endpoint"],
+                                    "failRoster": False, "streamPath": "", "drop": 0})
+                                config = work / "preview.mjs"
+                                options = {
+                                    "root": str(app / "ui"),
+                                    "build": {"outDir": str(app / "ui/dist")},
+                                    "preview": {"host": "127.0.0.1",
+                                                "port": preview_port,
+                                                "strictPort": True}}
+                                config.write_text(
+                                    "import { previewTransport } from "
+                                    + json.dumps(SCRIPT.as_uri()) + ";\n"
+                                    + "const config = " + json.dumps(options) + ";\n"
+                                    + "config.preview.proxy = previewTransport("
+                                    + json.dumps(base) + "," + json.dumps(str(fault))
+                                    + "," + json.dumps(str(
+                                        case / "preview-transport.jsonl"))
+                                    + "); export default config;\n")
+                                node_env = safe | {
+                                    "HOME": str(work), "APP_ROOT": str(app),
+                                    "HISTORY_BASE_URL": ui, "HISTORY_API_URL": base,
+                                    "HISTORY_OUTPUT": str(case),
+                                    "HISTORY_FIXTURE": str(case / "fixture.json"),
+                                    "HISTORY_CONTROL": str(control),
+                                    "HISTORY_FAULT": str(fault),
+                                    "PLAYWRIGHT_BROWSERS_PATH": os.environ.get(
+                                        "PLAYWRIGHT_BROWSERS_PATH",
+                                        str(Path.home() / (
+                                            "Library/Caches/ms-playwright"
+                                            if os.sys.platform == "darwin"
+                                            else ".cache/ms-playwright")))}
+                                if receiver:
+                                    node_env |= {
+                                        "HISTORY_TELEMETRY_JOINT": "1",
+                                        "HISTORY_TELEMETRY_FIXTURE": str(
+                                            case / "telemetry-fixture.json"),
+                                        "HISTORY_TELEMETRY_MODULE": str(
+                                            app / "ui/scripts/qualify-view-telemetry.mjs"),
+                                        "HISTORY_TELEMETRY_MODULE_SHA256":
+                                            TELEMETRY_MODULES[
+                                                "ui/scripts/qualify-view-telemetry.mjs"]}
+                                with shipping.owned_process(
+                                        ["node", str(app /
+                                            "ui/node_modules/vite/bin/vite.js"),
+                                         "preview", "--config", str(config)],
+                                        work, node_env, case / "preview.log") as preview:
+                                    readiness(preview, ui, shipping.digest(
+                                        app / "ui/dist/index.html"))
+                                    with shipping.owned_process(
+                                            ["node", str(SCRIPT)], work, node_env,
+                                            case / "browser.log") as driver:
+                                        driver.wait(timeout=500 if receiver else 180)
+                                        assert driver.returncode == 0, (
+                                            "opening browser assertions failed; see case logs")
+                                result = json.loads(
+                                    (case / "browser-result.json").read_text())
+                                assert result["status"] == "passed_assertions" and result["checks"]
+                                if receiver:
+                                    telemetry_result = case / "telemetry/telemetry-browser-result.json"
+                                    telemetry_browser_result(telemetry_result)
+                                    receiver.assert_receipt(telemetry_result)
+                                completion = normal_server_completion(
+                                    server, case, startup, control)
+                                app_stopped = (completion["status"] == "success"
+                                               and server.poll() == 0)
+                            finally:
+                                if not (case / "server-completion.json").exists():
+                                    shipping.write_json(
+                                        case / "server-completion.json", {
+                                            "status": "force_cleanup_required",
+                                            "returncode": server.poll()})
+                                if control.exists():
+                                    with contextlib.suppress(OSError, ValueError):
+                                        with socket.socket(socket.AF_UNIX) as client:
+                                            client.settimeout(2)
+                                            client.connect(str(control))
+                                            client.sendall(b'{"command":"stop"}\n')
+                                            client.recv(4096)
+                        completion_path = case / "server-completion.json"
+                        if completion_path.is_file():
+                            app_stopped = (json.loads(completion_path.read_text()).get(
+                                "status") == "success" and server.poll() == 0)
+                        control.unlink(missing_ok=True)
+                if receiver:
+                    receiver_stopped = receiver_is_stopped(receiver)
+                    if not app_stopped:
+                        lifecycle_errors.append(
+                            "app lacked normal completion before receiver shutdown")
+                    if not receiver_stopped:
+                        lifecycle_errors.append("receiver remained reachable after shutdown")
+                    drain = {"run_id": run_id, "service_name": receiver.service,
+                             "app_stopped": app_stopped,
+                             "receiver_stopped": receiver_stopped,
+                             "errors": lifecycle_errors}
+                    shipping.write_json(case / "telemetry-drain.json", drain)
+                    if lifecycle_errors:
+                        raise RuntimeError("joint telemetry teardown failed")
+                    final = telemetry[1].assertPhoenixTelemetry(
+                        receiver.output, receiver.service, run_id,
+                        case / "telemetry/telemetry-browser-result.json",
+                        drain_receipt=drain)
+                    shipping.write_json(case / "telemetry-final.json", final)
+            except Exception as error:
+                lifecycle_errors.append(f"{type(error).__name__}: {error}")
+                if receiver is not None:
+                    receiver_stopped = receiver_is_stopped(receiver)
+                    drain_path = case / "telemetry-drain.json"
+                    if not drain_path.exists():
+                        shipping.write_json(drain_path, {
+                            "run_id": run_id, "service_name": receiver.service,
+                            "app_stopped": app_stopped,
+                            "receiver_stopped": receiver_stopped,
+                            "errors": lifecycle_errors})
+                raise
 
 
 def main():
@@ -277,6 +573,8 @@ def main():
     parser.add_argument("--app-root", required=True, type=Path)
     parser.add_argument("--instrumented-exe", required=True, type=Path)
     parser.add_argument("--instrumented-receipt", required=True, type=Path)
+    parser.add_argument("--joint-telemetry", action="store_true",
+                        help="hosted-only joint history plus telemetry evidence")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--timeout", type=int, default=1100)
     args = parser.parse_args()
@@ -285,6 +583,7 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     result = {"status": "failed", "evidence_class": CLASS, "runtime_executed": False,
+              "joint_telemetry": args.joint_telemetry,
               "uncovered": ["Shipping binary, real providers, production, physical devices.",
                 "Generated authority: pinned manual ContinueConversationRequest cannot select opening_authority."]}
     start = time.monotonic()
@@ -296,7 +595,7 @@ def main():
         app, exe = args.app_root.resolve(), args.instrumented_exe.absolute()
         before = identity(app, exe, args.instrumented_receipt)
         shipping.write_json(output / "identity.json", before)
-        qualify(app, exe, output)
+        qualify(app, exe, output, args.joint_telemetry)
         assert identity(app, exe, args.instrumented_receipt) == before, "artifact identity changed"
         result["status"] = "passed_assertions"
     except Exception as error:
@@ -309,7 +608,10 @@ def main():
             "server_completion": json.loads((output / kind / "server-completion.json").read_text())
                 if (output / kind / "server-completion.json").is_file() else {"status": "not_completed"},
             "browser": json.loads((output / kind / "browser-result.json").read_text())
-                if (output / kind / "browser-result.json").is_file() else {"status": "not_completed"}}
+                if (output / kind / "browser-result.json").is_file() else {"status": "not_completed"},
+            "telemetry": json.loads((output / kind / "telemetry-final.json").read_text())
+                if (output / kind / "telemetry-final.json").is_file()
+                else {"status": "not_enabled_or_completed"}}
             for kind in ("ordinary", "global")}
         result["runtime_executed"] = any(case["verified_runtime_startup"] for case in result["cases"].values())
         result["elapsed_seconds"] = time.monotonic() - start

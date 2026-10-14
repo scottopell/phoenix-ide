@@ -833,3 +833,59 @@ Authentic832 uses the first successful retained driver poll as an explicitly
 offline call-order adapter. Missing/foreign/cross-generation/unsafe floor and
 cursor-below-floor negatives reject, while a UNIT-only later-row extension does
 not raise the earlier floor. Final rereview remains mandatory before dispatch.
+
+## Integrated joint harness preparation — source only, not runtime qualification
+
+The joint candidate app is `c825370814d22f0e03faf72d18f37df97bb59329`,
+tree `ac4539bb02bff27c8094264322b6f5a8398e5011`, parent integrated
+`85ab23b66c78e63fb12687918d00400edf67e6e8`, based on pinned main
+`84fbebb0781067cbe843f61c53093dcc0f0d64f2`. Historical `d4`/`ee8`
+receipts remain historical and do not qualify this candidate. The six new pure
+Rust exporter-environment tests have not been compiled or executed locally.
+The existing five instrumentation guards are retained in the future hosted
+selector alongside those six; the actual-server driver remains ignored there.
+The earlier hosted `0f` render-fixture failure is unresolved; isolated local
+fixture passes are not a causal repair or broad-suite qualification.
+
+The test-only app seam snapshots an optional all-or-none validated exporter
+quartet before the full ambient scrub and restores only that quartet afterward.
+Unrelated ambient variables are ignored/not projected, then scrubbed; they are
+not parser-rejected. Endpoint validation proves literal loopback shape, **not
+receiver ownership**. The joint Python owner must start and probe its receiver
+before the app and bind the endpoint/service/run to that actual receiver.
+
+Joint activation is explicit (`--joint-telemetry`). The harness verifies app
+source/tree/base, binary/locks/UI receipt, and all three unchanged app-owned
+module hashes before runtime imports. It does not copy donor code or infer app
+identity from a donor checkout path. The receiver dependency is explicitly
+`opentelemetry-proto==1.39.0`. Finite ordinary and Global fixtures and lifecycle
+route/product identity come from the new isolated server; old artifact UUIDs
+are never used as live fixture identities.
+
+The existing history stage keeps its 170-second deadline. Only after its strict
+capture seal/drain and exact physical message receipt may the joint telemetry
+stage start on a separate context/page, leaving the original page unchanged.
+The stock telemetry module retains natural 0.25 sampling, finite fresh-context
+bounds, the actual exactly-one-visible SPA home-link guard, and its own main
+285-second bound. The combined Node driver is bounded by 480 seconds and the
+Python owner by 500 seconds, below the app's existing 600-second driver budget.
+Stock current ready reports must retain accepted anchor results and all four
+current marks matching their exported journey expectations. This is a
+crosscheck of the installed read-only owning probe/report contract, **not** a
+new telemetry-lifecycle physical-target witness from generic DOM checks. The
+independent physical history receipt remains separately scoped.
+
+The app must stop normally and close its listener/remove owned HOME/socket
+before receiver shutdown/join. The owner records observed app/receiver stop
+booleans and runs the final telemetry assertion only after teardown; forced
+cleanup is a failed receipt. Browser capture drain is not substituted for
+telemetry receiver drain. Global known-member history selection remains
+cache-backed (possibly zero new owned aggregate GETs); telemetry cold contexts
+do not turn that chapter action into a fresh browser acquisition. Stock
+acceptance stays partial and overhead clearance stays false.
+
+No push, CI build, server, telemetry module import, capture, merge, deployment,
+or readiness was performed as part of this source-only wiring. Runtime and
+Rust qualification require separate resource/host admission and exact-HEAD
+source review. ADR numbering on frozen source is unchanged by speculative
+installer/federation landing; integration renumbering must carry a new identity.

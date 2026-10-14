@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).parent))
 import history_opening_browser as opening
+REAL_DIGEST = opening.shipping.digest
 
 
 class OpeningQualificationTests(unittest.TestCase):
@@ -29,15 +30,22 @@ class OpeningQualificationTests(unittest.TestCase):
         (self.app / "ui/dist/index.html").write_text("independent built UI")
         (self.app / "Cargo.lock").write_text("lock")
         (self.app / "ui/pnpm-lock.yaml").write_text("ui lock")
+        for relative in opening.TELEMETRY_MODULES:
+            path = self.app / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("hash-attested candidate module")
         self.exe = self.root / "libtest"
         self.exe.write_text("independent artifact (identity selftest only)")
         self.exe.chmod(0o700)
         self.receipt = self.root / "receipt.json"
-        self.value = {"app_source": opening.PIN, "app_tree": "a" * 40, "harness_source": "b" * 40,
+        self.value = {"app_source": opening.PIN, "app_tree": opening.TREE_PIN,
+            "app_base": opening.BASE_PIN, "harness_source": "b" * 40,
             "executable_sha256": opening.shipping.digest(self.exe), "evidence_class": opening.CLASS,
             "cargo_lock_sha256": opening.shipping.digest(self.app / "Cargo.lock"),
             "ui_lock_sha256": opening.shipping.digest(self.app / "ui/pnpm-lock.yaml"),
-            "ui_files": opening.shipping.ui_hashes(self.app), "rustc": "rustc 1.95.0 (build attestation)",
+            "ui_files": opening.shipping.ui_hashes(self.app),
+            "telemetry_modules": opening.TELEMETRY_MODULES,
+            "rustc": "rustc 1.95.0 (build attestation)",
             "focused_test_exit": 0, "ignored_driver": opening.DRIVER,
             "compiler_artifact_selector": ["cargo", "test", "--no-run", "--message-format=json"]}
         self.write()
@@ -48,11 +56,21 @@ class OpeningQualificationTests(unittest.TestCase):
     def git(self, root, *args):
         if args == ("rev-parse", "--show-toplevel"): return str(root)
         if args[0] == "status": return ""
-        if args[-1] == "HEAD^{tree}": return "a" * 40
+        if args == ("rev-parse", "HEAD^{tree}"): return opening.TREE_PIN
+        if args == ("merge-base", opening.PIN, opening.BASE_PIN): return opening.BASE_PIN
         return opening.PIN if root == self.app else "b" * 40
 
+    def digest(self, path):
+        path = Path(path)
+        try:
+            relative = str(path.relative_to(self.app))
+        except ValueError:
+            relative = None
+        return opening.TELEMETRY_MODULES.get(relative, REAL_DIGEST(path))
+
     def identity(self):
-        with patch.object(opening.shipping, "git", self.git):
+        with patch.object(opening.shipping, "git", self.git), \
+                patch.object(opening.shipping, "digest", self.digest):
             return opening.identity(self.app, self.exe, self.receipt)
 
     def test_independent_hash_and_build_metadata(self):
@@ -84,6 +102,14 @@ class OpeningQualificationTests(unittest.TestCase):
         self.write()
         with self.assertRaises(ValueError):
             self.identity()
+        self.assertIn(opening.PIN, workflow)
+        self.assertIn(opening.TREE_PIN, workflow)
+        self.assertIn(opening.BASE_PIN, workflow)
+        self.assertIn("'telemetry_modules': telemetry", workflow)
+        self.assertIn("uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.py", workflow)
+        self.assertIn("--joint-telemetry", workflow)
+        self.assertIn("command = [str(destination), 'opening_qualifier::', '--nocapture', '--test-threads=1']", workflow)
+        self.assertIn("'11 passed; 0 failed; 1 ignored'", workflow)
 
     def test_each_identity_dimension_fails_closed(self):
         for key in self.value:
@@ -103,10 +129,12 @@ class OpeningQualificationTests(unittest.TestCase):
             def git(root, *args):
                 if (arg == "HEAD" and args == ("rev-parse", "HEAD") and root == self.app) or args[0] == arg: return value
                 return self.git(root, *args)
-            with patch.object(opening.shipping, "git", git), self.assertRaises(ValueError):
+            with patch.object(opening.shipping, "git", git), \
+                    patch.object(opening.shipping, "digest", self.digest), self.assertRaises(ValueError):
                 opening.identity(self.app, self.exe, self.receipt)
         link = self.root / "linked-exe"; link.symlink_to(self.exe)
-        with patch.object(opening.shipping, "git", self.git), self.assertRaises(ValueError):
+        with patch.object(opening.shipping, "git", self.git), \
+                patch.object(opening.shipping, "digest", self.digest), self.assertRaises(ValueError):
             opening.identity(self.app, link, self.receipt)
 
     def test_startup_requires_exact_compiled_and_owned_identity(self):
@@ -247,6 +275,138 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertLess(normal.lineno, owned.end_lineno)
         self.assertIn('"status": "force_cleanup_required"', source)
         self.assertIn('"server_completion":', source)
+
+    def test_source_tree_base_and_runtime_module_hashes_fail_closed(self):
+        for wanted in (("rev-parse", "HEAD^{tree}"),
+                       ("merge-base", opening.PIN, opening.BASE_PIN)):
+            def wrong_git(root, *args):
+                return "0" * 40 if args == wanted else self.git(root, *args)
+            with self.subTest(git=wanted), patch.object(opening.shipping, "git", wrong_git), \
+                    patch.object(opening.shipping, "digest", self.digest), self.assertRaises(ValueError):
+                opening.identity(self.app, self.exe, self.receipt)
+        changed = next(iter(opening.TELEMETRY_MODULES))
+        def wrong_digest(path):
+            try:
+                relative = str(Path(path).relative_to(self.app))
+            except ValueError:
+                relative = None
+            return "0" * 64 if relative == changed else self.digest(path)
+        with patch.object(opening.shipping, "git", self.git), \
+                patch.object(opening.shipping, "digest", wrong_digest), self.assertRaises(ValueError):
+            opening.identity(self.app, self.exe, self.receipt)
+
+    def test_telemetry_environment_drops_ambient_and_requires_owned_quartet(self):
+        run_id = "history-ordinary-1234"
+        receiver = types.SimpleNamespace(
+            endpoint="http://127.0.0.1:4318/v1/traces",
+            service=f"phoenix-view-qualification-{run_id}")
+        receiver.env = {"PHOENIX_TRACE_EXPORTER": "otlp",
+                        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+                        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": receiver.endpoint,
+                        "OTEL_SERVICE_NAME": receiver.service}
+        value = opening.telemetry_environment({"PATH": "/bin", "OTEL_SDK_DISABLED": "true",
+            "DD_API_KEY": "ambient", "VENDOR_OTLP_HEADERS": "secret"}, receiver)
+        self.assertEqual(set(value), {"PATH"} | opening.TELEMETRY_KEYS)
+        for key, bad in [("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"),
+                         ("OTEL_SERVICE_NAME", "shared-service")]:
+            changed = dict(receiver.env); changed[key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                opening.telemetry_environment({"PATH": "/bin"},
+                    types.SimpleNamespace(endpoint=receiver.endpoint, service=receiver.service,
+                                          env=changed))
+        changed = dict(receiver.env); changed["OTEL_EXPORTER_OTLP_HEADERS"] = "secret"
+        with self.assertRaises(ValueError):
+            opening.telemetry_environment({"PATH": "/bin"},
+                types.SimpleNamespace(endpoint=receiver.endpoint, service=receiver.service,
+                                      env=changed))
+
+    def test_joint_fixture_uses_actual_ordinary_and_unique_global_identities(self):
+        ordinary = {"kind": "ordinary", "route": "/conversation/ordinary-latest",
+            "endpoint": "/api/product-conversations/ordinary-product",
+            "members": ["ordinary-root", "ordinary-latest"],
+            "latest_transcript_row_id": "ordinary-latest",
+            "product_conversation_id": "ordinary-product"}
+        global_ = {"kind": "global", "route": "/global/global-latest",
+            "endpoint": "/api/global/coordinator/history/global-root",
+            "members": ["global-root", "global-latest"],
+            "latest_transcript_row_id": "global-latest",
+            "product_conversation_id": "global-product"}
+        identity = {"appSource": opening.PIN, "frontendSource": opening.PIN,
+                    "serverInstanceId": "server"}
+        result = opening.joint_fixture(identity, [global_, ordinary])
+        self.assertEqual(set(result), {"identity", "aggregates", "lifecycle", "forbidden"})
+        self.assertEqual(result["lifecycle"]["route"], ordinary["route"])
+        self.assertEqual(result["lifecycle"]["productConversationId"], "ordinary-product")
+        self.assertIn("statebar-slug", result["lifecycle"]["spaSelector"])
+        for field, bad in [("route", "/global/old-root"),
+                           ("product_conversation_id", "global-root")]:
+            broken = dict(global_); broken[field] = bad
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                opening.joint_fixture(identity, [ordinary, broken])
+        broken = dict(global_); broken["persisted_rows"] = float("nan")
+        with self.assertRaises(ValueError):
+            opening.joint_fixture(identity, [ordinary, broken])
+
+    def test_actual_server_identity_uses_deployment_and_typed_owned_database(self):
+        database = self.root / "identity.db"
+        import sqlite3
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE instance_identity (singleton_key INTEGER, instance_id TEXT)")
+            instance = str(opening.shipping.uuid.uuid4())
+            connection.execute("INSERT INTO instance_identity VALUES (1, ?)", (instance,))
+        fixture = types.SimpleNamespace(request=lambda method, path: {
+            "build": {"git_sha": opening.PIN}})
+        startup = {"git_sha": opening.PIN, "db": str(database)}
+        self.assertEqual(opening.actual_server_identity(startup, fixture), {
+            "appSource": opening.PIN, "frontendSource": opening.PIN,
+            "serverInstanceId": instance})
+        with sqlite3.connect(database) as connection:
+            connection.execute("UPDATE instance_identity SET instance_id = 'not-typed'")
+        with self.assertRaises(ValueError):
+            opening.actual_server_identity(startup, fixture)
+        fixture.request = lambda method, path: {"build": {"git_sha": "0" * 40}}
+        with self.assertRaises(ValueError):
+            opening.actual_server_identity(startup, fixture)
+
+    def test_joint_source_orders_app_then_receiver_stop_before_final_assertion(self):
+        import ast
+        qualify = next(node for node in ast.parse(Path(opening.__file__).read_text()).body
+                       if isinstance(node, ast.FunctionDef) and node.name == "qualify")
+        calls = [node for node in ast.walk(qualify) if isinstance(node, ast.Call)]
+        startup = next(node for node in calls if isinstance(node.func, ast.Name)
+                       and node.func.id == "receiver_startup_check")
+        normal = next(node for node in calls if isinstance(node.func, ast.Name)
+                      and node.func.id == "normal_server_completion")
+        stopped = next(node for node in calls if isinstance(node.func, ast.Name)
+                       and node.func.id == "receiver_is_stopped")
+        final = next(node for node in calls if isinstance(node.func, ast.Attribute)
+                     and node.func.attr == "assertPhoenixTelemetry")
+        receiver_with = next(node for node in ast.walk(qualify) if isinstance(node, ast.With)
+                             and any(isinstance(item.context_expr, ast.Name)
+                                     and item.context_expr.id == "receiver_context"
+                                     for item in node.items))
+        self.assertLess(startup.lineno, normal.lineno)
+        self.assertLess(normal.lineno, receiver_with.end_lineno)
+        self.assertGreater(stopped.lineno, receiver_with.end_lineno)
+        self.assertGreater(final.lineno, stopped.lineno)
+        source = ast.unparse(qualify)
+        self.assertIn("'app_stopped': app_stopped", source)
+        self.assertIn("'receiver_stopped': receiver_stopped", source)
+        self.assertIn("telemetry/telemetry-browser-result.json", source)
+        self.assertNotIn("'app_stopped': True", source)
+        self.assertNotIn("'receiver_stopped': True", source)
+
+    def test_missing_or_invalid_joint_browser_producer_receipt_fails(self):
+        path = self.root / "telemetry" / "telemetry-browser-result.json"
+        with self.assertRaisesRegex(RuntimeError, "producer receipt is missing"):
+            opening.telemetry_browser_result(path)
+        path.parent.mkdir()
+        path.write_text(json.dumps({"runId": "missing-journeys"}))
+        with self.assertRaisesRegex(ValueError, "producer receipt is invalid"):
+            opening.telemetry_browser_result(path)
+        expected = {"runId": "run", "journeys": []}
+        path.write_text(json.dumps(expected))
+        self.assertEqual(opening.telemetry_browser_result(path), expected)
 
     def test_no_compiler_or_shipping_server_invocation(self):
         source = Path(opening.__file__).read_text()

@@ -211,8 +211,9 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: d4c2772a95aa46da608b356c8fe7be074de1b7aa
+          ref: c825370814d22f0e03faf72d18f37df97bb59329
           path: pinned-app
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -247,7 +248,9 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = d4c2772a95aa46da608b356c8fe7be074de1b7aa
+          test "$(git rev-parse HEAD)" = c825370814d22f0e03faf72d18f37df97bb59329
+          test "$(git rev-parse HEAD^{tree})" = ac4539bb02bff27c8094264322b6f5a8398e5011
+          test "$(git merge-base HEAD 84fbebb0781067cbe843f61c53093dcc0f0d64f2)" = 84fbebb0781067cbe843f61c53093dcc0f0d64f2
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
@@ -257,9 +260,15 @@ jobs:
           root = pathlib.Path.cwd()
           files = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in sorted((root / 'ui/src/generated').glob('*.ts'))}
+          telemetry = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                       for path in [root/'ui/scripts/qualify-view-telemetry.mjs',
+                                    root/'tests/e2e/view_telemetry_sink.py',
+                                    root/'tests/e2e/assert_view_telemetry.py']}
           pathlib.Path('../opening-codegen-receipt.json').write_text(json.dumps({
               'app_source': subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
               'app_tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),
+              'app_base': subprocess.check_output(['git','merge-base','HEAD','84fbebb0781067cbe843f61c53093dcc0f0d64f2'],text=True).strip(),
+              'telemetry_modules': telemetry,
               'harness_source': '${{ github.event.pull_request.head.sha }}',
               'rustc': subprocess.check_output(['rustc','--version'],text=True).strip(),
               'cargo_lock_sha256': hashlib.sha256((root/'Cargo.lock').read_bytes()).hexdigest(),
@@ -311,22 +320,24 @@ jobs:
                           'ignored_driver':'opening_qualifier::actual_server_opening_qualifier'})
           (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
           assert completed.returncode == 0, 'instrumentation guard tests failed; see retained log'
-          assert '5 passed; 0 failed; 1 ignored' in completed.stdout, completed.stdout
+          assert '11 passed; 0 failed; 1 ignored' in completed.stdout, completed.stdout
           PY
       - name: Compiler-free instrumented harness regressions
         working-directory: harness
         run: |
-          uv run tests/e2e/history_opening_browser.test.py
+          uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.test.py
           node --test ui/scripts/qualify-history-opening-realserver.selftest.mjs
+          node --test ui/scripts/history-joint-telemetry.selftest.mjs
           node --check ui/scripts/qualify-history-opening-realserver.mjs
       - name: Prepare owned Chromium for instrumented actual-server witness
         working-directory: pinned-app/ui
         run: pnpm exec playwright install --with-deps chromium
-      - name: Instrumented Pending-to-Accepted and aggregate-failure reconnect witness (not shipping)
+      - name: Joint instrumented history and telemetry witness (not shipping)
         working-directory: harness
         run: |
           chmod 700 ../opening-instrumented-libtest
-          uv run tests/e2e/history_opening_browser.py \
+          uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.py \
+            --joint-telemetry \
             --app-root "$GITHUB_WORKSPACE/pinned-app" \
             --instrumented-exe "$GITHUB_WORKSPACE/opening-instrumented-libtest" \
             --instrumented-receipt "$GITHUB_WORKSPACE/opening-instrumented-receipt.json" \
