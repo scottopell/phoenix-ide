@@ -8285,8 +8285,8 @@ mod tests {
                 process_resource(super::RetiredResourceKind::BrowserSession, scope);
             identities.push(super::CloseProcessStepIdentities {
                 bash: vec![bash_id.clone()],
-                terminal: vec![],
-                browser: vec![],
+                terminal: vec![terminal_id.clone()],
+                browser: vec![browser_id.clone()],
             });
             bash.push(bash_resource.clone());
             tmux.push(vec![tmux_resource.clone()]);
@@ -8363,12 +8363,18 @@ mod tests {
     }
 
     async fn assert_process_step_successes(fixture: &ProcessStepFixture, expected: usize) {
-        let successes = fixture
+        let all_successes = fixture
             .manager
             .db()
             .list_close_process_step_successes(&fixture.run)
             .await
             .unwrap();
+        let successes: Vec<_> = all_successes
+            .iter()
+            .filter(|success| {
+                success.resource_kind == super::CloseProcessResourceKind::BashProcessGroup
+            })
+            .collect();
         assert_eq!(successes.len(), expected, "{successes:?}");
         for (scope, identities) in fixture.scopes.iter().zip(&fixture.identities) {
             for identity in &identities.bash {
@@ -8414,6 +8420,49 @@ mod tests {
         assert_eq!(
             failures[0].occurrence.failure_occurrence_id,
             fixture.run.failure_occurrence_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_step_all_successes_persist_and_repeat_dispatches_nothing() {
+        let fixture = process_step_fixture(false).await;
+        let mut first = ScriptedProcessStepExecutor::new(successful_process_steps());
+        run_scope(&fixture, 0, &mut first).await.unwrap();
+        first.assert_finished();
+        assert_eq!(
+            first.calls,
+            [
+                ProcessStepCall::Bash,
+                ProcessStepCall::Tmux,
+                ProcessStepCall::Terminal,
+                ProcessStepCall::Browser
+            ]
+        );
+        let saved = fixture
+            .manager
+            .db()
+            .list_close_process_step_successes(&fixture.run)
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 3);
+        for kind in [
+            super::CloseProcessResourceKind::BashProcessGroup,
+            super::CloseProcessResourceKind::PtySession,
+            super::CloseProcessResourceKind::BrowserSession,
+        ] {
+            assert!(saved.iter().any(|receipt| receipt.resource_kind == kind));
+        }
+        let mut repeat = ScriptedProcessStepExecutor::new([]);
+        run_scope(&fixture, 0, &mut repeat).await.unwrap();
+        assert!(repeat.calls.is_empty());
+        assert_eq!(
+            fixture
+                .manager
+                .db()
+                .list_close_process_step_successes(&fixture.run)
+                .await
+                .unwrap(),
+            saved
         );
     }
 
