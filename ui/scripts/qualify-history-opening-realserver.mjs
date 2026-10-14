@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import { resolve, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate, aggregateBoundaries } from './qualify-history-realserver.mjs';
 
 export function ownedWireCursor(event, observedEvents) {
@@ -51,10 +51,24 @@ export function openingMatches(value, evidence, status) {
       : value.accepted_message_id === `${evidence.successor_transcript_row_id}:${evidence.client_turn_key}`
         && value.presentation === 'separate_message');
 }
-export function validateOwnedAggregate(a, data, url) {
+export function validateOwnedAggregate(a, data, url, structuralReservation = null) {
   const fail = message => { throw Object.assign(new Error(message), { captureReason: 'wrong_aggregate' }); };
   try {
     assert.ok(belongsToAggregate(a, { url, data }), 'stable product/root/request ownership');
+    if (structuralReservation) {
+      const r = structuralReservation, o = data.latest_opening;
+      assert.equal(r.kind, 'expected_manual_pending');
+      assert.equal(o?.status, 'pending', 'only Pending may stage');
+      assert.equal(o.opening_authority, r.opening_authority);
+      assert.equal(o.edge.product_conversation_id, r.product_conversation_id);
+      assert.equal(o.edge.predecessor_transcript_row_id, r.predecessor_transcript_row_id);
+      assert.equal(o.client_turn_key, r.client_turn_key);
+      assert.equal(data.segments?.length, a.members.length + 1, 'one reserved future member only');
+      assert.ok(!a.members.includes(o.edge.successor_transcript_row_id), 'future successor required');
+      assert.ok(EDGE_FIELDS.every(k => typeof o.edge[k] === 'string' && o.edge[k].length > 0));
+      a = { ...a, members: [...a.members, o.edge.successor_transcript_row_id],
+        opening_evidence: { ...a.opening_evidence, [o.edge.successor_transcript_row_id]: { ...o.edge, client_turn_key: r.client_turn_key } } };
+    }
     const segments = data.segments;
     assert.ok(Array.isArray(segments) && segments.length > 0 && segments.length <= a.members.length);
     assert.deepEqual(segments.map(s => s.transcript_row_id), a.members.slice(0, segments.length), 'ordered full roster');
@@ -233,16 +247,17 @@ export function capturePolicy(aggregate, method, url) {
 // Playwright request ordinals are local identities, not CDP Network.requestId.
 export function installAggregateRecorder(page, aggregate, record, snapshots, {
   deadlineMs = REQUIRED_BODY_DEADLINE_MS, maxBytes = REQUIRED_BODY_MAX_BYTES,
-  expectedRequestFailure = () => false,
+  expectedRequestFailure = () => false, requestStamp = () => null,
   clock = { now: () => performance.now(), setTimeout, clearTimeout },
 } = {}) {
-  aggregate = { ...aggregate, members: [...aggregate.members] };
+  aggregate = { ...aggregate, members: [...aggregate.members], opening_evidence: { ...aggregate.opening_evidence } };
+  let reservation = null, reservationEpoch = 0;
   const requests = [], failed = [], applicationErrors = [], captureErrors = [];
   const identities = new WeakMap(), required = new Map(), tasks = new Set();
   let ordinal = 0, navigationEpoch = 0, sealed = false, drain, drainDeadline, drainTimer, drainComplete = false;
   let wake;
   const notify = () => { wake?.(); wake = undefined; };
-  const pending = () => [...required.values()].filter(s => ['awaiting_response', 'reading_body'].includes(s.outcome));
+  const pending = () => [...required.values()].filter(s => ['awaiting_response', 'reading_body', 'awaiting_independent_committed_evidence'].includes(s.outcome));
   const inventory = (partial) => ({ sealed, partial, pending_required: pending().length, pending_body_tasks: tasks.size,
     pending_metadata: pending().map(s => ({ ...s.metadata, outcome: s.outcome })),
     drain_deadline: drainDeadline ?? null,
@@ -253,7 +268,8 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   const identity = req => {
     if (!identities.has(req)) identities.set(req, Object.freeze({
       request_ordinal: ++ordinal, identity_source: 'playwright_request_local_ordinal',
-      navigation_epoch: navigationEpoch, url: req.url(), method: req.method(), at: performance.now(),
+      navigation_epoch: navigationEpoch, url: req.url(), method: req.method(), at: clock.now(),
+      raw_request_stamp: structuredClone(requestStamp(req)),
       status: null, type: null, response_at: null,
     }));
     return identities.get(req);
@@ -268,7 +284,7 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     const metadata = identity(req), policy = capturePolicy(aggregate, metadata.method, metadata.url);
     const entry = { ...metadata, body: req.postData(), policy };
     requests.push(entry); record('browser-requests.jsonl', entry);
-    if (policy.kind === 'required_aggregate_json') required.set(metadata.request_ordinal, { metadata, outcome: 'awaiting_response', expected_transport_failure: expectedRequestFailure(entry) });
+    if (policy.kind === 'required_aggregate_json') required.set(metadata.request_ordinal, { metadata, reservation, outcome: 'awaiting_response', expected_transport_failure: expectedRequestFailure(entry) });
   };
   const onFailed = req => {
     if (sealed && !identities.has(req)) { outside(req, 'requestfailed'); return; }
@@ -295,9 +311,9 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     const prior = required.get(requestIdentity.request_ordinal);
     if (prior && prior.outcome !== 'awaiting_response') return;
     const metadata = Object.freeze({ ...requestIdentity, url: response.url(), status: response.status(),
-      type: response.headers()['content-type'] ?? '', response_at: performance.now(),
+      type: response.headers()['content-type'] ?? '', response_at: clock.now(), reservation_epoch: prior?.reservation?.epoch ?? null,
       response_navigation_epoch: navigationEpoch });
-    const policy = capturePolicy(aggregate, metadata.method, metadata.url);
+    const policy = prior ? { kind: 'required_aggregate_json' } : { kind: 'metadata_only' };
     record('browser-responses.jsonl', { ...metadata, policy, outcome: 'response_metadata' });
     if (policy.kind === 'metadata_only') {
       record('browser-responses.jsonl', { ...metadata, policy, outcome: 'metadata_only', consumer: 'api_metadata_no_response_body' });
@@ -305,17 +321,18 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     }
     const state = { ...prior, metadata, outcome: 'reading_body' };
     required.set(metadata.request_ordinal, state);
-    let timer, abort;
+    let timer, abort, timeout;
     const disposed = new Promise((_, reject) => { abort = reject; });
     state.dispose = (reason = 'disposed') => abort(Object.assign(new Error(`required receipt ${reason}`), { captureReason: reason }));
+    const bodyDeadline = clock.now() + deadlineMs;
     const task = (async () => {
       let raw;
       try {
+        assert.equal(requestIdentity.url, metadata.url, 'original request URL ownership');
         assert.equal(metadata.status, 200, 'required aggregate HTTP status');
         assert.match(metadata.type, /application\/json/i, 'required aggregate JSON content type');
-        const bodyDeadline = clock.now() + deadlineMs;
         const remaining = Math.max(0, Math.min(bodyDeadline, drainDeadline ?? Infinity) - clock.now());
-        const timeout = new Promise((_, reject) => { timer = clock.setTimeout(() => reject(Object.assign(
+        timeout = new Promise((_, reject) => { timer = clock.setTimeout(() => reject(Object.assign(
           new Error(`required body deadline ${remaining}ms`), { captureReason: 'deadline' })), remaining); });
         try { raw = await Promise.race([Promise.resolve().then(() => response.text()), timeout, disposed]); }
         catch (error) { error.captureReason ??= 'body_transport'; throw error; }
@@ -328,19 +345,35 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
           emitFailure(metadata, 'over_limit', `required body ${bytes} exceeds ${maxBytes} bytes`, { body_bytes: bytes, max_bytes: maxBytes });
           return;
         }
-        record('browser-responses.jsonl', { ...metadata, outcome: 'body_received', raw, body_bytes: bytes });
+        const raw_sha256 = createHash('sha256').update(raw).digest('hex');
+        state.raw_sha256 = raw_sha256;
+        record('browser-responses.jsonl', { ...metadata, outcome: 'body_received', raw, raw_sha256, body_bytes: bytes });
         let data;
         try { data = JSON.parse(raw); }
         catch (error) { error.captureReason = 'parse'; throw error; }
-        const parsed_identity = validateOwnedAggregate(aggregate, data, metadata.url);
+        let parsed_identity;
+        const future = data.segments?.some(s => !aggregate.members.includes(s.transcript_row_id));
+        if (future) {
+          assert.ok(prior?.reservation, 'unreserved future aggregate');
+          assert.ok(pending().filter(s => s.candidate).length < 300, 'staged receipt bound');
+          parsed_identity = validateOwnedAggregate(aggregate, data, metadata.url, prior.reservation);
+          state.candidate = data.latest_opening;
+          state.outcome = 'awaiting_independent_committed_evidence';
+          record('browser-responses.jsonl', { ...metadata, raw_sha256, body_bytes: bytes,
+            outcome: state.outcome, validation: 'structural_candidate', absolute_deadline: bodyDeadline });
+          const committed = new Promise(resolve => { state.commit = resolve; });
+          await Promise.race([committed, timeout, disposed]);
+          assert.ok(clock.now() < Math.min(bodyDeadline, drainDeadline ?? Infinity), 'required receipt absolute deadline');
+        }
+        parsed_identity = validateOwnedAggregate(aggregate, data, metadata.url);
         assert.ok(snapshots.length < 300, 'aggregate snapshot bound');
-        snapshots.push({ ...metadata, raw, data, parsed_identity });
+        snapshots.push({ ...metadata, raw, data, parsed_identity, raw_sha256, committed_evidence_source: state.committed_evidence_source ?? null });
         state.outcome = 'captured';
-        record('browser-responses.jsonl', { ...metadata, outcome: 'captured', parsed_identity, body_bytes: bytes });
+        record('browser-responses.jsonl', { ...metadata, outcome: 'captured', parsed_identity, raw_sha256, body_bytes: bytes, committed_evidence_source: state.committed_evidence_source ?? null });
       } catch (error) {
         state.outcome = 'capture_failed';
-        emitFailure(metadata, error.captureReason ?? 'required_contract', error);
-      } finally { clock.clearTimeout(timer); delete state.dispose; }
+        emitFailure(metadata, error.captureReason ?? 'required_contract', error, { raw_sha256: state.raw_sha256 ?? null });
+      } finally { clock.clearTimeout(timer); delete state.dispose; delete state.commit; }
     })();
     tasks.add(task);
     task.then(() => { tasks.delete(task); notify(); }, error => {
@@ -361,8 +394,50 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   page.on('pageerror', onPageError); page.on('framenavigated', onNavigation); page.on('close', onClose);
   return { requests, failed, applicationErrors, captureErrors,
     partialInventory() { return inventory(true); },
-    registerOpening(evidence) { aggregate.opening_evidence ??= {}; aggregate.opening_evidence[evidence.successor_transcript_row_id] = { ...evidence }; },
-    registerMember(id) { assert.ok(typeof id === 'string' && id.length > 0); aggregate.members.push(id); },
+    /** @param {{kind:'expected_manual_pending', product_conversation_id:string, predecessor_transcript_row_id:string, client_turn_key:string, opening_authority:'user_authorized_instruction'}} expected */
+    reserveOpening(expected) {
+      assert.ok(!sealed && !reservation, 'one prearmed reservation only');
+      assert.equal(expected.kind, 'expected_manual_pending');
+      assert.equal(expected.product_conversation_id, aggregate.manual_opening.edge.product_conversation_id);
+      assert.equal(expected.predecessor_transcript_row_id, aggregate.members.at(-1));
+      assert.equal(expected.opening_authority, 'user_authorized_instruction');
+      assert.ok(typeof expected.client_turn_key === 'string' && expected.client_turn_key.length > 0);
+      reservation = Object.freeze({ ...expected, epoch: ++reservationEpoch });
+      record('browser-authority.jsonl', { outcome: 'prearmed_reservation', reservation });
+    },
+    registerCommittedOpening(evidence, source) {
+      try {
+        assert.ok(reservation, 'independent prearmed reservation required');
+        assert.equal(evidence.edge, 'committed_intent_before_first_message_persistence', 'full committed IPC Pending evidence required');
+        assert.ok(source?.kind === 'owned_ipc' && source.command === 'entered', 'independent IPC source receipt required');
+        assert.equal(source.evidence?.edge, 'committed_intent_before_first_message_persistence', 'source Pending evidence required');
+        assert.ok(sameEdge(source.evidence, evidence) && source.evidence.client_turn_key === evidence.client_turn_key, 'IPC source receipt identity');
+        assert.ok(EDGE_FIELDS.every(k => typeof evidence[k] === 'string' && evidence[k].length > 0));
+        for (const k of ['product_conversation_id', 'predecessor_transcript_row_id', 'client_turn_key']) assert.equal(evidence[k], reservation[k]);
+        assert.equal(evidence.predecessor_transcript_row_id, aggregate.members.at(-1));
+        assert.ok(!aggregate.members.includes(evidence.successor_transcript_row_id));
+        for (const state of required.values()) if (state.candidate) {
+          assert.notEqual(state.outcome, 'capture_failed', 'failed staged receipt cannot be revived');
+          assert.ok(clock.now() < Math.min(state.metadata.response_at + deadlineMs, drainDeadline ?? Infinity), 'IPC evidence arrived late');
+          assert.ok(openingMatches(state.candidate, evidence, 'pending'), 'candidate exact full committed edge/key');
+        }
+        aggregate = { ...aggregate, members: [...aggregate.members, evidence.successor_transcript_row_id],
+          opening_evidence: { ...aggregate.opening_evidence, [evidence.successor_transcript_row_id]: Object.freeze({ ...evidence }) } };
+        record('browser-authority.jsonl', { outcome: 'independent_committed_opening', evidence, source, reservation_epoch: reservation.epoch });
+        for (const state of pending()) if (state.candidate) { state.committed_evidence_source = structuredClone(source); state.commit?.(); }
+      } catch (error) { terminatePending('independent_evidence_mismatch'); throw error; }
+    },
+    registerKnownOpening(evidence) {
+      assert.ok(ordinal === 0 && !sealed && !reservation, 'known facts must precede all requests and reservations');
+      assert.ok(EDGE_FIELDS.every(k => typeof evidence[k] === 'string' && evidence[k].length > 0));
+      assert.equal(evidence.product_conversation_id, aggregate.manual_opening.edge.product_conversation_id);
+      assert.equal(evidence.predecessor_transcript_row_id, aggregate.members.at(-1));
+      assert.ok(typeof evidence.client_turn_key === 'string' && evidence.client_turn_key.length > 0);
+      assert.ok(!aggregate.members.includes(evidence.successor_transcript_row_id));
+      aggregate = { ...aggregate, members: [...aggregate.members, evidence.successor_transcript_row_id],
+        opening_evidence: { ...aggregate.opening_evidence, [evidence.successor_transcript_row_id]: { ...evidence } } };
+      record('browser-authority.jsonl', { outcome: 'explicit_known_fact_not_held_gate_evidence', evidence });
+    },
     sealAndDrain() {
       if (drain) return drain;
       sealed = true;
@@ -512,6 +587,8 @@ async function run() {
     checked('manual equal-text accepted opening remains separate', { edge: oldEdge, opening_id: openingId, boundary_id: oldEdge.continuation_message_id });
 
     assert.equal((await command({ command: 'arm', predecessor: gate.predecessor, client_turn_key: gate.key })).state, 'armed'); gate.armed = true;
+    recorder.reserveOpening({ kind: 'expected_manual_pending', product_conversation_id: a.manual_opening.edge.product_conversation_id,
+      predecessor_transcript_row_id: gate.predecessor, client_turn_key: gate.key, opening_authority: 'user_authorized_instruction' });
     // POST acknowledgement may precede message persistence; only Entered certifies committed Pending.
     continuation = http('POST', `/api/conversations/${gate.predecessor}/continue`, { handoff: 'opening-probe [[perf:1]] [[ttft:0]]', message_id: gate.key });
     continuation.catch(() => {});
@@ -520,7 +597,7 @@ async function run() {
     assert.equal(entered.product_conversation_id, a.manual_opening.edge.product_conversation_id);
     assert.equal(entered.edge, 'committed_intent_before_first_message_persistence');
     const latest = entered.successor_transcript_row_id, acceptedId = `${latest}:${gate.key}`;
-    recorder.registerMember(latest); recorder.registerOpening(entered);
+    recorder.registerCommittedOpening(entered, { kind: 'owned_ipc', command: 'entered', evidence: entered });
     const pending = await http('GET', a.endpoint + '?boundary_representation=original_messages');
     validateOwnedAggregate({ ...a, members: [...a.members, latest], opening_evidence: { [latest]: entered } }, pending, api + a.endpoint + '?boundary_representation=original_messages');
     assert.equal(pending.latest_transcript_row_id, latest); assert.ok(openingMatches(pending.latest_opening, entered, 'pending'));

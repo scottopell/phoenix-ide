@@ -390,3 +390,87 @@ read for orientation only. **Independent next source review is required before
 one hosted run.** Global's new user-scroll/failure/restore sequence, held-gate SSE
 acceptance/composer/reconnect and normal server completion remain runtime gates,
 not offline passes. Shipping/provider/device claims remain excluded.
+
+## Response-before-IPC authority correction on parent 40 (offline only)
+
+The actual ordinary `instrumented40-artifact` request **51** received five members,
+latest successor `122a…`, and Pending key `13e2…` while the independent fixture
+still knew four members. Full Entered IPC subsequently confirmed that edge.
+The prior immediate roster rejection was a witness authority-ordering bug; the
+failed runtime and forced cleanup are **not qualified** by this correction.
+Prior 5fb ordinary COMPLETE evidence retains its original scope. App source
+`d4c2772a95aa46da608b356c8fe7be074de1b7aa` remains unchanged.
+
+Before POST, the installed recorder now receives a typed expected-manual-Pending
+reservation from the existing manual product identity and independently armed
+predecessor/key. The reservation is not committed membership. Exactly the known
+roster prefix plus one future latest Pending successor can pass full structural
+parse/projection/handoff validation and enter
+`awaiting_independent_committed_evidence` (`structural_candidate`, not qualified).
+Accepted, unreserved, foreign, unknown-prefix, two-extra-member, wrong-key and
+wrong-authority bodies fail immediately. Full Entered IPC atomically registers
+successor and opening only after matching reservation and every staged full
+four-field edge/key. There is no member-only release method. CLI preexisting
+facts use explicitly labeled `registerKnownOpening`, permitted only before all
+requests/reservations; they cannot release staged authority.
+
+Every staged receipt retains its original request identity, reservation epoch,
+response metadata, raw bytes/hash, and original body deadline. Independent source
+receipt provenance accompanies eventual captured evidence. Body read plus stage
+share the original absolute **11s** response deadline, retain the **2MiB** body
+bound, and are additionally capped by the shared **11s** seal deadline. Registration,
+refresh, and seal never renew the original deadline; missing/mismatched/late IPC
+fails qualification, including final drain. Up to 300 staged receipts are allowed.
+
+### Actual compiler-free commands/results
+
+```sh
+E=.phoenix/evidence/continuous-history
+# Output directories must be new. Both invocations were executed successfully.
+for pair in '40 ordinary' '5fb global'; do
+  set -- $pair
+  d="$E/instrumented$1-artifact/opening-browser-evidence"
+  node ui/scripts/replay-history-opening-recorder.mjs \
+    --fixture "$d/$2/fixture.json" --kind "$2" \
+    --responses "$d/$2/browser-responses.jsonl" --identity "$d/identity.json" \
+    --source-root target/history-hidden-geometry-repair \
+    --sse "$d/$2/browser-sse.jsonl" --ipc "$d/$2/ipc.jsonl" --race yes \
+    --output "$E/authority-race40-offline/$2"
+done
+HISTORY_RACE_EVIDENCE="$E" \
+HISTORY_GLOBAL_5FB_EVIDENCE="$E/instrumented5fb-artifact/opening-browser-evidence/global" \
+HISTORY_PINNED_SOURCE=target/history-hidden-geometry-repair \
+HISTORY_OFFLINE_EVIDENCE="$E/pre-dispatch428-drain-audit/final-with-pinned-ack" \
+node --test ui/scripts/qualify-history-realserver.selftest.mjs \
+  ui/scripts/qualify-history-opening-realserver.selftest.mjs \
+  ui/scripts/replay-history-opening-recorder.selftest.mjs \
+  ui/scripts/global-history-prefix.selftest.mjs \
+  ui/scripts/history-opening-authority-race.selftest.mjs
+python3 -B tests/e2e/history_opening_browser.test.py
+PHOENIX_CHECK_WORKERS=1 ./dev.py check --lanes task,spec-shape,spec-anchors
+git diff --check
+```
+
+| Executed check | Result and scope |
+|---|---|
+| Actual40 ordinary installed-handler race replay | **25 raw bodies captured**; request51 stages before full independent IPC registration and resolves with unchanged bytes/identity. |
+| Actual5fb Global installed-handler race replay | **3 raw bodies captured**; actual coordinator-history Pending request95 stages with base-four fixture, then actual Entered IPC resolves. No renamed ordinary or shipping synthetic Pending. |
+| Existing authentic old replays | **25 ordinary + 14 shipping Global = 39** raw bodies preserved through installed handler. Shipping Global still has no observed Pending transition. |
+| Node regressions | **48 passed, zero skips**: existing46 guards plus two authentic race cases. Both domains cover immediate structural negatives, all four IPC edge fields/key/commit marker, missing/late evidence and deterministic original-deadline final-drain liveness without sleeps. |
+| Python opening wrapper | **16 passed**. |
+| Restricted dev.py check | Task, spec-shape, dev.py unit tests and spec-anchors **all passed**. No compiler lane. |
+
+Manifest, input/output hashes, retained source-line/raw hashes, authority receipts,
+staging/captured metadata, and drain inventory are retained under
+`.phoenix/evidence/continuous-history/authority-race40-offline/`.
+An initial CLI attempt pointed at `target/history-shipping-d4` and correctly
+rejected its **8a273c** HEAD before producing output; the successful commands above
+use the independently verified, tracked-clean d4 checkout. No authority check was
+weakened to accept that mismatch.
+
+**Independent exact-source review remains required before one successor run.**
+No push, hosted dispatch, browser/server runtime, build, production, dependency,
+public-control, or app/generated-DTO change was performed. Offline replay is not
+normal runtime completion, Global fault/anchor/reconnect acceptance, shipping,
+provider, or physical-device qualification. The current40 forced cleanup remains
+failed/incomplete runtime evidence, not a retroactive pass.

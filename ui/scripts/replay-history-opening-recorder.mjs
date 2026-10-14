@@ -28,7 +28,7 @@ export async function replayInstalled(a, rows, { openingEvidence = [], record = 
   const page = new EventEmitter(), snapshots = [], receipts = [];
   page.mainFrame = () => page;
   const recorder = installAggregateRecorder(page, a, (file, value) => { receipts.push({ file, value }); record(file, value); }, snapshots);
-  for (const evidence of openingEvidence) { recorder.registerMember(evidence.successor_transcript_row_id); recorder.registerOpening(evidence); }
+  for (const evidence of openingEvidence) { recorder.registerKnownOpening(evidence); }
   const provenance = [];
   for (const row of rows) {
     const r = retainedResponse(row);
@@ -46,6 +46,41 @@ export async function replayInstalled(a, rows, { openingEvidence = [], record = 
   const drain = await recorder.sealAndDrain();
   recorder.assertQualified();
   assert.equal(snapshots.length, rows.length, 'every retained required body captured');
+  return { drain, provenance, snapshots, receipts };
+}
+export async function replayReservationRace(a, rows, ipcRows, { record = () => {} } = {}) {
+  const arm = ipcRows.find(r => r.value.command?.command === 'arm' && r.value.reply?.state === 'armed');
+  const entered = ipcRows.find(r => r.value.command?.command === 'entered' && r.value.reply?.state === 'entered');
+  assert.ok(arm && entered?.value.reply.evidence, 'independent arm and full Entered receipts required');
+  const evidence = entered.value.reply.evidence;
+  const page = new EventEmitter(), snapshots = [], receipts = [], provenance = [];
+  page.mainFrame = () => page;
+  const recorder = installAggregateRecorder(page, a, (file, value) => { receipts.push({ file, value }); record(file, value); }, snapshots,
+    { requestStamp: req => req.stamp });
+  recorder.reserveOpening({ kind: 'expected_manual_pending', product_conversation_id: a.manual_opening.edge.product_conversation_id,
+    predecessor_transcript_row_id: arm.value.command.predecessor, client_turn_key: arm.value.command.client_turn_key,
+    opening_authority: 'user_authorized_instruction' });
+  let registered = false;
+  for (const row of rows) {
+    const r = retainedResponse(row);
+    const stamp = { ...row.source, retained_request_ordinal: row.value.request_ordinal ?? null,
+      retained_metadata: Object.fromEntries(Object.entries(row.value).filter(([key]) => !['raw', 'body', 'response'].includes(key))), raw_sha256: sha(r.raw) };
+    const req = { stamp, url: () => r.url, method: () => r.method, postData: () => null, failure: () => null };
+    page.emit('request', req);
+    page.emit('response', { request: () => req, url: () => r.url, status: () => r.status,
+      headers: () => ({ 'content-type': r.type }), text: async () => r.raw });
+    await new Promise(resolve => setImmediate(resolve));
+    if (!registered && recorder.partialInventory().pending_metadata.some(s => s.outcome === 'awaiting_independent_committed_evidence')) {
+      assert.equal(snapshots.some(s => s.raw === r.raw), false, 'staging is not qualification');
+      recorder.registerCommittedOpening(evidence, { kind: 'owned_ipc', command: 'entered', evidence, ...entered.source });
+      registered = true;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    provenance.push({ ...stamp, replay_request_ordinal: provenance.length + 1, adapter: 'offline EventEmitter, not browser runtime' });
+  }
+  assert.ok(registered, 'authentic response-before-registration Pending required');
+  const drain = await recorder.sealAndDrain(); recorder.assertQualified();
+  assert.equal(snapshots.length, rows.length);
   return { drain, provenance, snapshots, receipts };
 }
 export function replayAcceptedEvents(rows, product) {
@@ -74,7 +109,7 @@ async function main() {
   const args = process.argv.slice(2), options = { responses: [] };
   for (let i = 0; i < args.length; i += 2) {
     assert.ok(args[i].startsWith('--') && args[i + 1], 'usage: --fixture PATH --kind ordinary|global --responses PATH [repeat] --identity PATH --source-root PATH --sse PATH [--ipc PATH] --output NEW_DIR');
-    const key = args[i].slice(2); assert.ok(['fixture', 'kind', 'responses', 'identity', 'source-root', 'sse', 'ipc', 'output'].includes(key), 'unknown option');
+    const key = args[i].slice(2); assert.ok(['fixture', 'kind', 'responses', 'identity', 'source-root', 'sse', 'ipc', 'output', 'race'].includes(key), 'unknown option');
     if (key === 'responses') options.responses.push(args[i + 1]); else { assert.equal(options[key], undefined, 'duplicate option'); options[key] = args[i + 1]; }
   }
   for (const key of ['fixture', 'kind', 'identity', 'source-root', 'sse', 'output']) assert.ok(options[key], `missing ${key}`);
@@ -102,6 +137,7 @@ async function main() {
       && (r.outcome === undefined || r.outcome === 'body_received');
   });
   for (const row of family) retainedResponse(row);
+  if (options.race === 'yes') assert.ok(a.manual_opening && options.ipc, 'race requires independently preexisting manual fixture and IPC');
   if (!a.manual_opening) {
     const row = family.find(row => { const data = JSON.parse(retainedResponse(row).raw); return data.canonical_root?.transcript_row_id === a.members[0]
       && data.latest_transcript_row_id === a.members.at(-1) && data.latest_opening?.status === 'accepted'; });
@@ -112,7 +148,7 @@ async function main() {
   }
   a.product_conversation_id ??= a.manual_opening.edge.product_conversation_id;
   // Shipping replay can include a later accepted successor. Derive it only from a full authentic accepted aggregate.
-  for (const row of family) {
+  for (const row of options.race === 'yes' ? [] : family) {
     const data = JSON.parse(retainedResponse(row).raw), opening = data.latest_opening;
     if (data.canonical_root?.transcript_row_id !== a.members[0] || data.product_conversation_id !== a.product_conversation_id) continue;
     const ids = data.segments?.map(s => s.transcript_row_id);
@@ -129,14 +165,15 @@ async function main() {
   }
   const candidates = family.filter(row => capturePolicy({ ...a, members: [...a.members, ...unique.map(e => e.successor_transcript_row_id)] }, row.value.method ?? 'GET', retainedResponse(row).url).kind === 'required_aggregate_json');
   assert.ok(candidates.length > 0 && candidates.length < 300);
-  const replay = await replayInstalled(a, candidates, { openingEvidence: unique });
+  const replay = options.race === 'yes' ? await replayReservationRace(a, candidates, ipcRows)
+    : await replayInstalled(a, candidates, { openingEvidence: unique });
   const sse = replayAcceptedEvents(readJsonLines(options.sse), a.product_conversation_id);
   const output = resolve(options.output); mkdirSync(output, { recursive: false });
   const json = (file, value) => writeFileSync(`${output}/${file}`, JSON.stringify(value, null, 2) + '\n');
   json('replay-fixture.json', { ...a, replay_registered_opening_evidence: unique }); json('transformations.json', transformations); json('provenance.json', replay.provenance);
   json('installed-recorder-receipts.json', replay.receipts); json('drain.json', replay.drain); json('accepted-cursors.json', sse);
   const inputs = [options.fixture, options.identity, options.sse, ...options.responses, ...(options.ipc ? [options.ipc] : [])];
-  json('manifest.json', { status: 'passed_offline_installed_recorder_replay', runtime_executed: false, kind: a.kind,
+  json('manifest.json', { status: 'passed_offline_installed_recorder_replay', runtime_executed: false, kind: a.kind, response_before_ipc_replay: options.race === 'yes',
     source_sha: PIN, source_tree: identity.app_tree, source_provenance: identity.source_provenance,
     input_hashes: Object.fromEntries(inputs.map(p => [resolve(p), sha(readFileSync(p))])), generated_dto_hashes: dtos,
     recorder_sha256: sha(readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url))),
