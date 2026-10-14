@@ -282,10 +282,20 @@ jobs:
           import json,subprocess
           from pathlib import Path
           command=['cargo','test','-p','phoenix-db','coordinator_continuation_commit_admits_automatic_work','--','--nocapture','--test-threads=1']
-          completed=subprocess.run(command,capture_output=True,text=True,timeout=900)
           out=Path.cwd().parent
-          (out/'opening-coordinator-home-fixture.log').write_text(completed.stdout+completed.stderr)
           git=lambda *args:subprocess.check_output(['git',*args],text=True).strip()
+          try:
+              completed=subprocess.run(command,capture_output=True,text=True,timeout=900)
+          except subprocess.TimeoutExpired as error:
+              text=lambda value:value.decode('utf-8','replace') if isinstance(value,bytes) else (value or '')
+              (out/'opening-coordinator-home-fixture.log').write_text(text(error.stdout)+text(error.stderr))
+              (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
+                  'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
+                  'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+                  'command':command,'exit_status':None,'timed_out':True,'timeout_seconds':900,
+                  'scope':'failed actual DB fixture timeout, not qualification'},indent=2))
+              raise
+          (out/'opening-coordinator-home-fixture.log').write_text(completed.stdout+completed.stderr)
           (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
               'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
               'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',

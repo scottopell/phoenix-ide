@@ -155,6 +155,24 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("opening-coordinator-home-fixture.log", workflow[end:])
         self.assertIn("opening-coordinator-home-fixture-receipt.json", workflow[end:])
 
+    def test_fixture_timeout_retains_partial_log_and_failed_receipt_before_reraise(self):
+        import textwrap, subprocess
+        workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()
+        snippet = workflow.split("      - name: Execute owned Coordinator continuation admission fixture", 1)[1]
+        snippet = textwrap.dedent(snippet.split("          python3 - <<'PY'\n", 1)[1].split("          PY", 1)[0])
+        case = Path(self.temp.name) / "timeout-app"
+        case.mkdir()
+        error = subprocess.TimeoutExpired(["UNIT_NO_CARGO"], 900, output=b"partial stdout", stderr=b"partial stderr")
+        with patch("subprocess.run", side_effect=error), patch("subprocess.check_output", return_value="unit-source\n"), patch.object(Path, "cwd", return_value=case):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                exec(compile(snippet, "UNIT_ONLY_no_cargo_fixture_step", "exec"), {})
+        log = case.parent / "opening-coordinator-home-fixture.log"
+        receipt = json.loads((case.parent / "opening-coordinator-home-fixture-receipt.json").read_text())
+        self.assertEqual(log.read_text(), "partial stdoutpartial stderr")
+        self.assertTrue(receipt["timed_out"])
+        self.assertIsNone(receipt["exit_status"])
+        self.assertEqual(receipt["timeout_seconds"], 900)
+
     def test_each_identity_dimension_fails_closed(self):
         for key in self.value:
             saved = self.value[key]
