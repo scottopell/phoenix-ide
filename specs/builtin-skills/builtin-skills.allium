@@ -224,6 +224,9 @@ rule PhoenixApiDestinationAuthority {
     ensures: action.destination_credential_is_bound_to_selected_destination = true
     ensures: action.destination_target_and_state_are_current = true
     ensures: action.destination_is_nonlocal = false or action.nonlocal_credential_hop_uses_authenticated_encryption = true
+    ensures: action.destination_is_nonlocal = false or action.api_executes_in_destination_context = true
+    ensures: action.destination_is_nonlocal = false or action.destination_credential_is_nonserialized = true
+    ensures: action.local_curl_recipe_used_for_nonlocal_destination = false
     ensures: action.consumes_destination_cwd = false or action.destination_cwd_is_authoritative = true
     ensures: action.uses_local_message_tool_for_remote_destination = false
     ensures: action.remote_continue_depends_on_federated_messaging = false

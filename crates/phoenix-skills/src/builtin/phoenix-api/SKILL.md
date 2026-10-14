@@ -10,8 +10,8 @@ Use this skill only when the user has authorized a Phoenix lifecycle action. The
 
 - Use scoped Bash in an active WorkScope and the documented Phoenix HTTP API; do not invent endpoints or guarantees.
 - An active local WorkScope authorizes local execution only. Separately establish the selected destination's identity, authentication, current target, and lifecycle state from authoritative, user-authorized sources. Require destination cwd provenance only when the operation consumes cwd.
-- Preserve normal Phoenix authorization. Use only a user-identified credential source bound to that destination—never an inherited local credential for a nonlocal destination; never print, persist, or place credentials in arguments or output, and require authenticated encryption for nonlocal transport.
-- Apply the reference's existing lifecycle, target-resolution, and retry rules regardless of transport. Use local-only tools and cwd only for the local destination.
+- Preserve normal Phoenix authorization. Use only a user-identified credential source bound to that destination; never serialize credentials into arguments or output, and require authenticated encryption for nonlocal transport.
+- Apply the reference's existing lifecycle, target-resolution, and retry rules regardless of transport. Copyable curl recipes, local-only tools, and local cwd target only the local destination; nonlocal API calls must execute in the destination context with a nonserialized destination credential, or stop.
 - Resolve the current `ProductConversation` and its writable transcript before a transcript-targeted mutation. Do not infer a target from a stale transcript ID.
 - Generate the request identity once. Reuse it for an exact retry only where the endpoint documents idempotency; never generate a fresh identity for an uncertain retry.
 - Treat an HTTP success or an `accepted`/`queued` response as acceptance, not proof that asynchronous work completed. Re-read the documented state surface and report what Phoenix actually observed.

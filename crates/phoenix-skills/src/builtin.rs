@@ -301,7 +301,7 @@ mod tests {
 
         assert!(skill.contains("audience: global-coordinator"));
         assert!(skill.contains("user has authorized"));
-        assert!(skill.contains("never print, persist"));
+        assert!(skill.contains("never serialize credentials"));
         assert!(skill.contains("acceptance, not proof"));
         assert!(reference.contains("GET /api/auth/status"));
         assert!(reference.contains("writable_transcript_row_id"));
@@ -327,9 +327,13 @@ mod tests {
         ));
         assert!(skill.contains("user-identified credential source"));
         assert!(skill.contains("bound to that destination"));
-        assert!(skill.contains("never an inherited local credential for a nonlocal destination"));
         assert!(skill.contains("authenticated encryption for nonlocal transport"));
-        assert!(skill.contains("Use local-only tools and cwd only for the local destination"));
+        assert!(skill.contains(
+            "Copyable curl recipes, local-only tools, and local cwd target only the local destination"
+        ));
+        assert!(skill.contains(
+            "nonlocal API calls must execute in the destination context with a nonserialized destination credential"
+        ));
         assert!(skill.contains("destination cwd provenance only when the operation consumes cwd"));
         assert!(skill.contains(
             "existing lifecycle, target-resolution, and retry rules regardless of transport"
@@ -343,19 +347,21 @@ mod tests {
             reference.contains("destination cwd provenance only when the operation consumes cwd")
         );
         assert!(reference.contains("Transport grants no destination authority"));
-        assert!(reference.contains("nonlocal credential hop requires authenticated encryption"));
+        assert!(reference.contains("user-authorized, authenticated encrypted transport"));
         assert!(reference.contains("credential source bound to the selected destination"));
-        assert!(reference.contains("per-request `PHOENIX_API_CREDENTIAL`"));
-        assert!(reference
-            .contains("never reuse an inherited `PHOENIX_PASSWORD` for a nonlocal destination"));
-        assert!(!reference.contains("'Authorization: Bearer ' \"$PHOENIX_PASSWORD\""));
+        assert!(reference.contains("The copyable curl recipes are local-only"));
+        assert!(reference.contains(
+            "origin and ambient `PHOENIX_PASSWORD` belong to the Phoenix server owning the active WorkScope"
+        ));
+        assert!(reference.contains("execute in the destination context"));
+        assert!(reference.contains("without serializing it into the Bash command"));
         assert!(reference.contains("This creation recipe is local-only"));
         assert!(reference.contains("never send the local executor's `$PWD` as a remote cwd"));
         assert!(reference.contains("base64-of-the-local-workscope-origin"));
         assert!(reference.contains("It resolves only on the local Phoenix instance"));
         assert!(reference.contains("never substitute it for remote steering"));
         assert!(reference.contains(
-            "Remote Continue through the selected destination's existing API is independent of federated message steering"
+            "Remote Continue executes that existing API in the selected destination's context and is independent of federated message steering"
         ));
         assert!(reference.contains("^https://"));
         assert!(reference.contains("^http://(localhost|127\\.0\\.0\\.1|\\[::1\\])"));
