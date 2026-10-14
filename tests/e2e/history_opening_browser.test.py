@@ -39,7 +39,7 @@ class OpeningQualificationTests(unittest.TestCase):
             "ui_lock_sha256": opening.shipping.digest(self.app / "ui/pnpm-lock.yaml"),
             "ui_files": opening.shipping.ui_hashes(self.app), "rustc": "rustc 1.95.0 (build attestation)",
             "focused_test_exit": 0, "ignored_driver": opening.DRIVER,
-            "compiler_artifact_selector": ["cargo", "test", "-p", "phoenix_ide", "--lib", "--no-run", "--message-format=json"]}
+            "compiler_artifact_selector": ["cargo", "test", "--no-run", "--message-format=json"]}
         self.write()
 
     def write(self):

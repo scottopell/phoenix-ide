@@ -53,7 +53,7 @@ def identity(app, exe, receipt_path):
     if not isinstance(receipt.get("rustc"), str) or not receipt["rustc"].startswith("rustc "):
         raise ValueError("build rustc attestation required")
     if receipt.get("focused_test_exit") != 0 or receipt.get("compiler_artifact_selector") != [
-            "cargo", "test", "-p", "phoenix_ide", "--lib", "--no-run", "--message-format=json"]:
+            "cargo", "test", "--no-run", "--message-format=json"]:
         raise ValueError("instrumented build selector/focused tests missing")
     return measured | {"rustc": receipt["rustc"], "receipt_sha256": shipping.digest(receipt_path),
         "harness_files": {str(p.relative_to(ROOT)): shipping.digest(p) for p in

@@ -191,10 +191,10 @@ jobs:
         run: ./dev.py check --lanes e2e
 
   qualify-history-realserver:
-    name: genuine opening contract codegen (no runtime qualification)
+    name: typed codegen and isolated instrumented opening witness (not shipping)
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qualification/continuation-opening-codegen' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     env:
       APP_ROOT: ${{ github.workspace }}/pinned-app
       APP_BUILD_RECEIPT: ${{ github.workspace }}/history-build.json
@@ -272,8 +272,12 @@ jobs:
           python3 - <<'PY'
           import hashlib, json, pathlib, shutil, subprocess
           root = pathlib.Path.cwd()
-          selector = ['cargo', 'test', '-p', 'phoenix_ide', '--lib', '--no-run', '--message-format=json']
-          selected = subprocess.run(selector, capture_output=True, text=True, timeout=120)
+          selector = ['cargo', 'test', '--no-run', '--message-format=json']
+          try:
+              selected = subprocess.run(selector, capture_output=True, text=True, timeout=900)
+          except subprocess.TimeoutExpired as error:
+              (root.parent/'opening-instrumented-selector.log').write_bytes((error.stdout or b'')+(error.stderr or b''))
+              raise
           (root.parent/'opening-instrumented-selector.log').write_text(selected.stdout+selected.stderr)
           assert selected.returncode == 0, 'libtest artifact metadata selection failed'
           artifacts = [json.loads(line) for line in selected.stdout.splitlines() if line.startswith('{')]
@@ -299,12 +303,34 @@ jobs:
                           'executable_sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),
                           'compiled_executable_path':str(executable.relative_to(root)),
                           'compiler_artifact_selector':selector,
+                          'ui_lock_sha256':hashlib.sha256((root/'ui/pnpm-lock.yaml').read_bytes()).hexdigest(),
+                          'ui_files':{str(path.relative_to(root)):hashlib.sha256(path.read_bytes()).hexdigest()
+                                      for path in sorted((root/'ui/dist').rglob('*'))
+                                      if path.is_file() and path.name != '.gitkeep'},
                           'focused_test_command':command[1:], 'focused_test_exit':completed.returncode,
                           'ignored_driver':'opening_qualifier::actual_server_opening_qualifier'})
           (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
           assert completed.returncode == 0, 'instrumentation guard tests failed; see retained log'
           assert '5 passed; 0 failed; 1 ignored' in completed.stdout, completed.stdout
           PY
+      - name: Compiler-free instrumented harness regressions
+        working-directory: harness
+        run: |
+          uv run tests/e2e/history_opening_browser.test.py
+          node --test ui/scripts/qualify-history-opening-realserver.selftest.mjs
+          node --check ui/scripts/qualify-history-opening-realserver.mjs
+      - name: Prepare owned Chromium for instrumented actual-server witness
+        working-directory: pinned-app/ui
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Instrumented Pending-to-Accepted and aggregate-failure reconnect witness (not shipping)
+        working-directory: harness
+        run: |
+          chmod 700 ../opening-instrumented-libtest
+          uv run tests/e2e/history_opening_browser.py \
+            --app-root "$GITHUB_WORKSPACE/pinned-app" \
+            --instrumented-exe "$GITHUB_WORKSPACE/opening-instrumented-libtest" \
+            --instrumented-receipt "$GITHUB_WORKSPACE/opening-instrumented-receipt.json" \
+            --output "$GITHUB_WORKSPACE/opening-browser-evidence" --timeout 1100
       - name: Retain receipts on success or failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -320,6 +346,7 @@ jobs:
             opening-instrumented-receipt.json
             opening-instrumented-unit.log
             opening-instrumented-selector.log
+            opening-browser-evidence/
 
   check-ui:
     name: check (ui/specs)
