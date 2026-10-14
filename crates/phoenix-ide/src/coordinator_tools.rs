@@ -429,7 +429,7 @@ impl Tool for WorkScopeCoordinatorBash {
 
     fn description(&self) -> String {
         format!(
-            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run call must include work_scope_id copied from an authoritative active WorkScope row obtained through query_database. Phoenix resolves the canonical working directory from that persisted WorkScope, preferring worktree_path then cwd. There is no default repository or working directory. peek, wait, and kill use the handle and do not need work_scope_id.",
+            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run call must include work_scope_id copied from an authoritative active WorkScope row obtained from authoritative Coordinator home context or query_database. Phoenix resolves the canonical working directory from that persisted WorkScope, preferring worktree_path then cwd. No implicit target is selected; the Coordinator owns a non-project home and project operations require the selected worker scope. peek, wait, and kill use the handle and do not need work_scope_id.",
             BashTool.description()
         )
     }
@@ -439,7 +439,7 @@ impl Tool for WorkScopeCoordinatorBash {
         language: phoenix_core::llm_language::LlmLanguage,
     ) -> String {
         format!(
-            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run needs work_scope_id from an authoritative active WorkScope row obtained through query_database. Phoenix resolves canonical cwd from persisted WorkScope data, preferring worktree_path then cwd. No default repo or cwd. peek, wait, kill use handle without work_scope_id.",
+            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run needs work_scope_id from an authoritative active WorkScope row obtained from authoritative Coordinator home context or query_database. Phoenix resolves canonical cwd from persisted WorkScope data, preferring worktree_path then cwd. No default repo or cwd. peek, wait, kill use handle without work_scope_id.",
             BashTool.description_for_language(language)
         )
     }
@@ -2098,6 +2098,53 @@ mod tests {
         assert!(!output.is_success());
         assert!(output.output().contains("requires work_scope_id"));
         assert!(fixture_dir.path().exists());
+        assert!(registry.snapshot_live_pgids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_bash_executes_owned_home_with_zero_ordinary_conversations() {
+        let (tool, context, db, fixture) = tool_and_context().await;
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        let ordinary: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ordinary, 0);
+        let output = tool.run(json!({"op":"run", "cmd":"pwd; printf kept > evidence.txt", "work_scope_id":scope.work_scope_id.as_str(), "wait_seconds":10}), context).await;
+        assert!(output.is_success(), "{}", output.output());
+        assert!(output.output().contains(home.to_str().unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(home.join("evidence.txt")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn coordinator_bash_rejects_replaced_home_before_spawn() {
+        let (tool, context, db, fixture) = tool_and_context().await;
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let scope = db
+            .initialize_coordinator_work_scope(home.to_str().unwrap())
+            .await
+            .unwrap();
+        std::fs::remove_dir(&home).unwrap();
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &home).unwrap();
+        let registry = context.bash_handle_registry().clone();
+        let output = tool.run(json!({"op":"run", "cmd":"touch unauthorized", "work_scope_id":scope.work_scope_id.as_str()}), context).await;
+        assert!(!output.is_success());
+        assert!(!outside.join("unauthorized").exists());
         assert!(registry.snapshot_live_pgids().await.is_empty());
     }
 

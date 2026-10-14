@@ -1982,6 +1982,8 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     dev_env_file = _load_env_file(env, ".phoenix-ide.dev.env")
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
+    if not env.get("PHOENIX_DATA_DIR"):
+        env["PHOENIX_DATA_DIR"] = str(db_path.with_suffix(".data"))
     # Bind loopback so the dev server is never network-reachable: on a remote or
     # shared dev host (or a port-forwarded sandbox) a 0.0.0.0 bind would expose an
     # unauthenticated agent that runs arbitrary commands. A loopback bind also
@@ -2307,6 +2309,8 @@ def _migrate_seed_database(*, build: bool, release: bool) -> None:
         raise RuntimeError(f"Phoenix binary not found after build: {binary}")
     env = os.environ.copy()
     env["PHOENIX_DB_PATH"] = str(get_db_path())
+    if not env.get("PHOENIX_DATA_DIR"):
+        env["PHOENIX_DATA_DIR"] = str(get_db_path().with_suffix(".data"))
     subprocess.run(
         [str(binary), "--migrate-only"],
         cwd=ROOT,

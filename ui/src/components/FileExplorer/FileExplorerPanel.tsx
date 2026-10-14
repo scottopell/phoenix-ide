@@ -20,9 +20,11 @@ import { GroundingSection, GroundingState } from '../GroundingPanel';
 import { useViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 import { api, type ConversationGitStatusResponse, type SkillEntry, type TaskEntry, type WorkScopeInventory } from '../../api';
 import './FileExplorerPanel.css';
+import { ORDINARY_GROUNDING, type GroundingContext } from './groundingContext';
 import { checkoutLabel } from './gitStatusPresentation';
 
 interface Props {
+  grounding?: GroundingContext;
   collapsed: boolean;
   onToggle: () => void;
   rootPath?: string | null | undefined;
@@ -117,7 +119,7 @@ function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusRes
   );
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope, executionCapable = false, canOpenWorkspaceDiff = false }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope, executionCapable = false, canOpenWorkspaceDiff = false, grounding = ORDINARY_GROUNDING }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const { openDiffFullscreen } = useViewerSlotCommands();
   const [refreshKey, setRefreshKey] = useState(0);
@@ -152,7 +154,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   }, [conversationId, rootPath]);
 
   const loadGitStatus = useCallback(async () => {
-    if (!conversationId || !rootPath) {
+    if (grounding.kind === 'coordinator_home' || !conversationId || !rootPath) {
       setGitStatus(null);
       return;
     }
@@ -170,7 +172,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         });
       }
     }
-  }, [conversationId, rootPath]);
+  }, [conversationId, rootPath, grounding.kind]);
 
   useEffect(() => {
     void loadGitStatus();
@@ -189,7 +191,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   }, [loadGitStatus]);
 
   const currentTaskId = extractTaskId(branchName);
-  const workScopeCount = useSeededLiveCount(workScopeKey, conversationId, liveWorkScope);
+  const workScopeCount = useSeededLiveCount(grounding.kind === 'ordinary' ? workScopeKey : undefined, grounding.kind === 'ordinary' ? conversationId : undefined, grounding.kind === 'ordinary' ? liveWorkScope : undefined);
   const liveAttentionCount = liveWorkScope ? workScopeLiveCount(liveWorkScope) : workScopeCount;
   const hasFileRoot = !!rootPath;
   const projectName = rootPath ? (rootPath.split('/').filter(Boolean).slice(-1)[0] || rootPath) : 'Read-only';
@@ -199,6 +201,21 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
     openFile(filePath, rootDir);
   }, [openFile]);
 
+  if (grounding.kind === 'coordinator_home') {
+    return <aside className={`fe-panel fe-panel--${collapsed ? 'collapsed' : 'expanded'}`} aria-label="Coordinator home grounding" style={width !== undefined ? { width } : undefined}>
+      <div className="fe-header">
+        <button className="fe-toggle" onClick={onToggle} aria-label={collapsed ? 'Expand grounding panel' : 'Collapse grounding panel'}>{collapsed ? '▶' : '◀'}</button>
+        <span className="fe-title">{collapsed ? 'Files' : 'Coordinator home'}</span>
+        {!collapsed && rootPath && <button className="fe-refresh" onClick={handleRefresh} aria-label="Refresh file tree">↻</button>}
+      </div>
+      {!collapsed && <>
+        <div className="fe-subtitle" title={rootPath ?? undefined}>{rootPath ?? 'Home unavailable'}</div>
+        <div className="fe-subtitle">Scope: {grounding.workScopeId ?? 'unavailable'}</div>
+        {rootPath && <div className="fe-tree-scroll"><FileTree key={`${conversationId ?? ''}\0${rootPath}`} rootPath={rootPath} onFileSelect={handleFileSelect} activeFile={activeFile} conversationId={conversationId} refreshKey={refreshKey} /></div>}
+        <FileTreeContextMenu />
+      </>}
+    </aside>;
+  }
   if (collapsed) {
     return (
       <aside className="fe-panel fe-panel--collapsed" aria-label="Conversation grounding panel collapsed">

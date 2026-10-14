@@ -120,6 +120,12 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn coordinator_home_scope(
+        &self,
+    ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
+        Ok(None)
+    }
+
     async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String>;
 
     async fn accepted_continuation_handoff_message_id(
@@ -1576,6 +1582,15 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn coordinator_home_scope(
+        &self,
+    ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
+        self.db
+            .coordinator_work_scope()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String> {
         self.db
             .has_pending_continuation_opening(conv_id)

@@ -178,6 +178,8 @@ export interface Conversation {
   project_name?: string | null;
   parent_conversation_id?: string | null;
   product_conversation_id?: string;
+  runtime_role?: 'user' | 'sub_agent' | 'coordinator';
+  work_scope_id?: string | null;
   /** Slug of the sub-agent's parent conversation, resolved server-side for the
    *  breadcrumb link (mirrors `seed_parent_slug`). `null`/absent when this is
    *  not a sub-agent or the parent has been deleted; the UI renders unlinked
