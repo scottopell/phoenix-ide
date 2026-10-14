@@ -8,6 +8,11 @@ import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate } from './qualify-history-realserver.mjs';
 
+export function persistedMessageSelector(id) {
+  assert.ok(typeof id === 'string' && id.length > 0, 'exact persisted message identity required');
+  return `#messages [id=${JSON.stringify(`message-${id}`)}], #messages [data-message-id=${JSON.stringify(id)}]`;
+}
+
 const EDGE_FIELDS = ['product_conversation_id', 'predecessor_transcript_row_id', 'successor_transcript_row_id', 'continuation_message_id'];
 export function sameEdge(a, b) {
   return !!a && !!b && EDGE_FIELDS.every(key => typeof a[key] === 'string' && a[key].length > 0 && a[key] === b[key]);
@@ -197,7 +202,7 @@ async function run() {
     const boundaryMessage = predecessor.messages.find(m => m.message_id === oldEdge.continuation_message_id);
     assert.ok(boundaryMessage); assert.equal(boundaryMessage.content.summary, openingMessage.content.text);
     await page.goto(ui + sourceLink(a, gate.predecessor, openingId), { waitUntil: 'domcontentloaded' });
-    await page.locator(`[data-message-id=${JSON.stringify(openingId)}]`).first().waitFor({ state: 'visible' });
+    await page.locator(persistedMessageSelector(openingId)).first().waitFor({ state: 'visible' });
     checked('manual equal-text accepted opening remains separate', { edge: oldEdge, opening_id: openingId, boundary_id: boundary.message_id });
 
     assert.equal((await command({ command: 'arm', predecessor: gate.predecessor, client_turn_key: gate.key })).state, 'armed'); gate.armed = true;
@@ -227,9 +232,9 @@ async function run() {
     const middle = a.occurrences.filter(k => k[0] === 1)[20][2];
     await page.goto(ui + sourceLink(a, a.members[1], middle), { waitUntil: 'domcontentloaded' });
     await poll(() => snapshots.slice(start).find(s => belongsToAggregate(a, s) && s.data.latest_transcript_row_id === latest && openingMatches(s.data.latest_opening, entered, 'pending')), 'browser Pending aggregate');
-    await page.locator(`[data-message-id=${JSON.stringify(middle)}]`).first().waitFor({ state: 'visible' });
+    await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible' });
     await poll(composerReadonly, 'Pending composer readonly');
-    assert.equal(await page.locator(`[data-message-id=${JSON.stringify(acceptedId)}]`).count(), 0);
+    assert.equal(await page.locator(persistedMessageSelector(acceptedId)).count(), 0);
     const before = await poll(() => anchor(), 'historical physical anchor');
     const pin = new URL(page.url()).searchParams.get('source_transcript'); assert.equal(pin, a.members[1]);
     assert.equal(requests.some(r => r.method === 'POST' && new URL(r.url).pathname.endsWith('/chat')), false);
@@ -267,7 +272,7 @@ async function run() {
     await poll(async () => await page.locator(COMPOSER_SELECTOR).isEditable(), 'reconnected composer stays enabled');
     await sameAnchor(before, 'reconnect retains physical anchor');
     // Exact identity, not text heuristics: at most one occurrence in aggregate DOM/navigation.
-    assert.ok(await page.locator(`#messages [data-message-id=${JSON.stringify(acceptedId)}]`).count() <= 1);
+    assert.ok(await page.locator(persistedMessageSelector(acceptedId)).count() <= 1);
     const finalRow = await http('GET', `/api/conversations/${latest}`);
     assert.equal(finalRow.messages.filter(m => m.message_id === acceptedId).length, 1);
     checked('same-page transport SSE drop/reconnect preserves accepted full-edge identity', { accepted_cursor: accepted.eventId, reconnect, requests: requests.slice(requestStart) });
@@ -276,7 +281,7 @@ async function run() {
     const chapter = page.locator('#conversation-nav [role="button"]').filter({ hasText: 'opening-probe' });
     assert.equal(await chapter.count(), 1); await chapter.click();
     await page.waitForURL(value => value.hash === `#message-${encodeURIComponent(acceptedId)}`);
-    const rendered = page.locator(`#messages [data-message-id=${JSON.stringify(acceptedId)}]`);
+    const rendered = page.locator(persistedMessageSelector(acceptedId));
     await rendered.waitFor({ state: 'visible' }); assert.equal(await rendered.count(), 1);
     const physical = await rendered.evaluate(el => { const box = el.getBoundingClientRect(); const view = document.querySelector('#messages').getBoundingClientRect(); return box.height > 0 && box.bottom > view.top && box.top < view.bottom; });
     assert.equal(physical, true);

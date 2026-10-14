@@ -4,7 +4,18 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, chmodSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc } from './qualify-history-opening-realserver.mjs';
+import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector } from './qualify-history-opening-realserver.mjs';
+
+test('exact persisted message selector covers real user ID and agent attribute without text fallback', () => {
+  const id = 'successor:reserved-key';
+  assert.equal(persistedMessageSelector(id), '#messages [id="message-successor:reserved-key"], #messages [data-message-id="successor:reserved-key"]');
+  assert.throws(() => persistedMessageSelector(''));
+  assert.throws(() => persistedMessageSelector(null));
+  const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  assert.match(script, /page\.locator\(persistedMessageSelector\(openingId\)\)/);
+  assert.match(script, /page\.locator\(persistedMessageSelector\(acceptedId\)\)/);
+  assert.doesNotMatch(script, /page\.locator\(`[^`]*data-message-id=/);
+});
 
 const edge = { product_conversation_id: 'product', predecessor_transcript_row_id: 'predecessor', successor_transcript_row_id: 'successor', continuation_message_id: 'boundary', client_turn_key: 'key' };
 const pending = { status: 'pending', edge, client_turn_key: 'key', opening_authority: 'user_authorized_instruction' };
