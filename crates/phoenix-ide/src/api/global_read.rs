@@ -1659,6 +1659,7 @@ fn resolved_work_scope_from_columns(
         _ => None,
     };
     let environment_kind = match raw_environment {
+        Some("coordinator_home") => Some(ResolvedEnvironmentKind::CoordinatorHome),
         Some("allocated_worktree") => Some(ResolvedEnvironmentKind::AllocatedWorktree),
         Some("unowned_cwd") => Some(ResolvedEnvironmentKind::UnownedCwd),
         Some("none") => Some(ResolvedEnvironmentKind::None),

@@ -1104,7 +1104,11 @@ def scenario_coordinator_home(_base_url: str) -> None:
             assert _get_conv(base_url, predecessor)['conversation']['work_scope_id'] == scope
             assert _get_conv(base_url, conv_id)['conversation']['work_scope_id'] == scope
             assert _get_conv(base_url, conv_id)['conversation']['cwd'] == cwd
-            worker = _new_conv(base_url, '[[scenario:plain_text]] separate ordinary work')
+            worker_root = root / 'ordinary-worker'
+            worker_root.mkdir()
+            sentinel = worker_root / 'worker-sentinel.txt'
+            sentinel.write_text('separate-worker-bytes')
+            worker = _new_conv_in(base_url, str(worker_root), '[[scenario:plain_text]] separate ordinary work')
             _poll_to_idle_with_messages(base_url, worker['id'], lambda m: 'analyzed the situation' in _agent_text(m), 'separate worker', timeout=SCENARIO_TIMEOUT_SECONDS)
             assert worker['cwd'] != cwd
             stop()
@@ -1124,7 +1128,8 @@ def scenario_coordinator_home(_base_url: str) -> None:
             outside = root / 'data' / 'outside.txt'
             outside.write_text('not in home')
             denied = httpx.get(f"{base_url}/api/files/read", params={'path': str(outside)}, timeout=10)
-            assert denied.status_code == 403, denied.text
+            assert denied.status_code == 404, denied.text
+            assert sentinel.read_text() == 'separate-worker-bytes'
         finally:
             stop()
 
