@@ -356,8 +356,9 @@ test('wired lifecycle stage rejects precompleted, preterminal and late duplicate
     if (mode !== 'precompleted') assert.ok(trials[0].reports.length > 0, 'failure reports are preserved');
   }
 });
-test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_late_duplicate', 'initial_late_private', 'pagehide_late_duplicate', 'pagehide_late_private', 'initial_timeout'])('main driver executes lifecycle stage with complete success/failure inventory: %s', async mode => {
-  if (mode === 'initial_timeout') vi.useFakeTimers();
+test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_late_duplicate', 'initial_late_private', 'pagehide_late_duplicate', 'pagehide_late_private', 'initial_timeout', 'initial_stall', 'initial_transportfail', 'initial_dual', 'initial_unsampled', 'initial_overflow'])('main driver executes lifecycle stage with complete success/failure inventory: %s', async mode => {
+  const timedFailure = ['initial_timeout', 'initial_stall', 'initial_transportfail', 'initial_dual'].includes(mode);
+  if (timedFailure) vi.useFakeTimers();
   const outputDir = mkdtempSync(join(tmpdir(), 'cvt-main-contract-'));
   const lifecycle = lifecycleBrowserFixture(mode);
   let contexts = 0;
@@ -374,8 +375,9 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
     const pagehide = index === 48;
     const callbacks = {};
     let readiness;
-    const requestId = `initial-request-${index}`;
-    const report = { open_id: `initial-journey-${index}`, frontend_source: identity.frontendSource, frontend_source_dirty: false,
+    let diagnosticBinding;
+    const requestId = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+    const report = { open_id: `10000000-0000-4000-8000-${String(index).padStart(12, '0')}`, frontend_source: identity.frontendSource, frontend_source_dirty: false,
       presentation_evidence: 'commit_frame_estimate', sample_rate: 0.25, visible: true, route: index % 2 ? 'global' : 'ordinary', trigger: 'navigation',
       observer_inspection_count: 2, observer_scan_limited: false, background_ms: 0, background_interval_count: 0,
       admitted_count: 1, sampled_count: 1, transport_dropped_count: 0, transport_failed_count: 0,
@@ -383,21 +385,33 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
       marks: pagehide ? { meaningful_transcript: null, breadcrumb_presented: null, breadcrumb_enabled: null, anchor_settled: null }
         : { meaningful_transcript: 1, breadcrumb_presented: 2, breadcrumb_enabled: 2, anchor_settled: 3 }, breadcrumb_ready_minus_meaningful_ms: pagehide ? null : 1 };
     const post = () => {
-      callbacks.request?.({ url: () => `${baseURL}/api/telemetry/conversation-view`, method: () => 'POST', postData: () => JSON.stringify(report) });
-      callbacks.response?.({ url: () => `${baseURL}/api/telemetry/conversation-view`, status: () => 204 });
+      const request = { url: () => `${baseURL}/api/telemetry/conversation-view`, method: () => 'POST', postData: () => JSON.stringify(report) };
+      callbacks.request?.(request);
+      callbacks.response?.({ request: () => request, url: request.url, status: () => 204 });
     };
     const candidate = { context: () => owned, on: (event, fn) => { callbacks[event] = fn; }, bringToFront: async () => {}, evaluate: async () => 'visible',
       goto: async url => {
         if (url === 'about:blank') { post(); readiness?.(); }
         else {
-          callbacks.request?.({ url: () => `${baseURL}/api/product-conversations/product/history?open_id=${requestId}`, method: () => 'GET' });
-          if (!pagehide) post();
+          if (mode === 'initial_unsampled' && index === 1) throw new Error('stop after verified unsampled trial');
+          const unsampled = mode === 'initial_unsampled' && index === 0;
+          diagnosticBinding?.({}, { version: 1, kind: 'admission', route: report.route, sampled: !unsampled, open_id: unsampled ? null : report.open_id });
+          if (mode === 'initial_overflow' && index === 0) for (let n = 0; n < 65; n++) diagnosticBinding?.({}, { version: 1, kind: 'mark', open_id: report.open_id, mark: 'shell', ms: 0 });
+          if (index === 0 && ['initial_stall', 'initial_dual', 'initial_transportfail'].includes(mode)) {
+            diagnosticBinding?.({}, { version: 1, kind: 'mark', open_id: report.open_id, mark: 'shell', ms: 0 });
+            if (mode === 'initial_transportfail') for (const state of ['attempted', 'failed']) diagnosticBinding?.({}, { version: 1, kind: 'submission', open_id: report.open_id, state, status: null });
+          }
+          const finiteRequest = { url: () => `${baseURL}/api/product-conversations/20000000-0000-4000-8000-000000000001?open_id=${requestId}`, method: () => 'GET' };
+          callbacks.request?.(finiteRequest);
+          callbacks.response?.({ url: finiteRequest.url, request: () => finiteRequest, status: () => 200 });
+          if (!pagehide && !(index === 0 && ['initial_stall', 'initial_dual', 'initial_transportfail', 'initial_unsampled'].includes(mode))) post();
         }
       }, waitForFunction: async () => { if (pagehide || (index === 0 && mode === 'initial_timeout')) await new Promise(resolve => { readiness = resolve; }); } };
     let pages = 0;
     let contextClosed;
-    const owned = { on: (event, fn) => { if (event === 'close') contextClosed = fn; }, newPage: async () => ++pages === 1 ? candidate : { bringToFront: async () => {}, close: async () => {} },
+    const owned = { exposeBinding: async (_name, fn) => { diagnosticBinding = fn; }, addInitScript: async () => {}, on: (event, fn) => { if (event === 'close') contextClosed = fn; }, newPage: async () => ++pages === 1 ? candidate : { bringToFront: async () => {}, close: async () => {} },
       newCDPSession: async () => ({ send: async method => method === 'Performance.getMetrics' ? { metrics: [{ name: 'ScriptDuration', value: 1 }] } : {} }), close: async () => {
+        if (index === 0 && mode === 'initial_dual') throw new Error('synthetic close failure');
         if (index === 0 && mode === 'initial_late_duplicate') post();
         if (index === 0 && mode === 'initial_timeout') readiness?.();
         if (pagehide && mode === 'pagehide_late_duplicate') post();
@@ -416,10 +430,36 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
         lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a[href="/c/successor"]' }, forbidden: ['PRIVATE_CANARY'] } });
     if (mode !== 'normal') {
       const rejection = assert.rejects(execution);
-      if (mode === 'initial_timeout') await vi.advanceTimersByTimeAsync(285000);
+      if (timedFailure) await vi.advanceTimersByTimeAsync(mode === 'initial_timeout' ? 285000 : 5020);
       await rejection;
       const receipt = JSON.parse(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8'));
       assert.ok(receipt.failure);
+      if (['initial_stall', 'initial_transportfail', 'initial_dual'].includes(mode)) {
+        const trial = receipt.trials[0];
+        assert.match(receipt.failure, /one sampled initial journey report required/);
+        assert.equal(receipt.failure, trial.failure);
+        assert.equal(trial.sampled, true);
+        assert.equal(trial.posts, 0);
+        assert.ok(trial.producer_events.some(e => e.kind === 'mark'));
+        assert.ok(trial.cleanup_failure);
+        if (mode === 'initial_dual') assert.equal(trial.cleanup_failure, 'synthetic close failure');
+        if (mode === 'initial_transportfail') assert.deepEqual(trial.producer_events.filter(e => e.kind === 'submission').map(e => e.state), ['attempted', 'failed']);
+        return;
+      }
+      if (mode === 'initial_unsampled') {
+        assert.equal(receipt.trials[0].sampled, false);
+        assert.equal(receipt.trials[0].correlatedRequests, 1);
+        assert.equal(receipt.trials[0].posts, 0);
+        assert.equal(receipt.trials[0].request_facts[0].response_status, 200);
+        assert.equal(receipt.trials[0].request_facts[0].request_failed, false);
+        assert.ok(!receipt.trials[0].failure);
+        return;
+      }
+      if (mode === 'initial_overflow') {
+        assert.equal(receipt.trials[0].producer_events.length, 64);
+        assert.deepEqual(receipt.trials[0].capture_errors, ['diagnostic event bound']);
+        return;
+      }
       if (mode === 'initial_timeout') {
         assert.match(receipt.failure, /absolute browser qualification deadline/);
         assert.equal(receipt.trials.length, 1);
@@ -463,7 +503,7 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
     assert.equal(result.capabilities.pending_background, 'actual_hidden_response_then_visible_readiness');
     assert.equal(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8').includes('bfcache_resume-resume'), true);
     assert.equal(new Set(result.journeys.map(journey => journey.open_id)).size, 54);
-  } finally { rmSync(outputDir, { recursive: true, force: true }); if (mode === 'initial_timeout') vi.useRealTimers(); }
+  } finally { rmSync(outputDir, { recursive: true, force: true }); if (timedFailure) vi.useRealTimers(); }
 });
 test('wired lifecycle receipts reject private payload before writing and record context/callback failures', async () => {
   for (const mode of ['private', 'context_failure', 'callback_failure', 'wrong_resume']) {

@@ -1,3 +1,4 @@
+import { emitViewDiagnostic } from './conversationViewDiagnostics';
 import { ConversationViewJourney, type JourneyReport, type JourneyTrigger } from './conversationViewJourney';
 import type { ResponseSizeBucket } from './conversationViewResponse';
 import { generateUUID } from '../utils/uuid';
@@ -36,11 +37,12 @@ export interface ViewJourneyPayload extends ViewIdentity, JourneyReport {
 }
 class SampledRecord {
   readonly #owner: object;
-  readonly openId = generateUUID();
+  readonly openId: string;
   readonly measurement: ConversationViewJourney;
   readonly identity: ViewIdentity;
 
-  constructor(owner: object, identity: ViewIdentity, measurement: ConversationViewJourney) {
+  constructor(owner: object, identity: ViewIdentity, measurement: ConversationViewJourney, openId: string) {
+    this.openId = openId;
     this.#owner = owner;
     this.identity = identity;
     this.measurement = measurement;
@@ -96,12 +98,17 @@ export class ViewJourneyReporter {
 
   begin(identity: ViewIdentity, clock?: () => number): SampledViewJourney | null {
     this.#admitted = increment(this.#admitted);
-    if (this.#random() >= this.#sampleRate) return null;
+    if (this.#random() >= this.#sampleRate) {
+      emitViewDiagnostic({ kind: 'admission', route: identity.route === 'global' ? 'global' : 'ordinary', open_id: null, sampled: false });
+      return null;
+    }
     this.#sampled = increment(this.#sampled);
     const clean = cleanIdentity(identity);
-    const measurement = new ConversationViewJourney(clock);
+    const openId = generateUUID();
+    emitViewDiagnostic({ kind: 'admission', route: clean.route, open_id: openId, sampled: true });
+    const measurement = new ConversationViewJourney(clock, event => emitViewDiagnostic({ ...event, open_id: openId }));
     measurement.visibility(clean.visible);
-    return new SampledRecord(this.#owner, clean, measurement);
+    return new SampledRecord(this.#owner, clean, measurement, openId);
   }
 
   report(journey: SampledViewJourney, outcome: JourneyReport['outcome']): void {
@@ -111,11 +118,13 @@ export class ViewJourneyReporter {
     }
     const report = journey.measurement.finish(outcome);
     if (!report) return;
+    emitViewDiagnostic({ kind: 'terminal', open_id: journey.openId, outcome: report.outcome });
     if (!opaqueId.test(journey.openId)) {
       this.#dropped = increment(this.#dropped);
       return;
     }
     if (this.#busy) {
+      emitViewDiagnostic({ kind: 'submission', open_id: journey.openId, state: 'busy_drop', status: null });
       this.#dropped = increment(this.#dropped);
       return;
     }
@@ -130,12 +139,17 @@ export class ViewJourneyReporter {
     this.#busy = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3000);
-    void Promise.resolve().then(() => this.#send('/api/telemetry/conversation-view', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload), keepalive: true, signal: controller.signal,
-    })).then(response => {
+    void Promise.resolve().then(() => {
+      emitViewDiagnostic({ kind: 'submission', open_id: journey.openId, state: 'attempted', status: null });
+      return this.#send('/api/telemetry/conversation-view', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload), keepalive: true, signal: controller.signal,
+      });
+    }).then(response => {
+      emitViewDiagnostic({ kind: 'submission', open_id: journey.openId, state: 'response', status: response.status });
       if (!response.ok) this.#failed = increment(this.#failed);
     }).catch(() => {
+      emitViewDiagnostic({ kind: 'submission', open_id: journey.openId, state: 'failed', status: null });
       this.#failed = increment(this.#failed);
     }).finally(() => {
       clearTimeout(timeout);

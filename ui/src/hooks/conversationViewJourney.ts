@@ -29,7 +29,10 @@ const MAX_CORRELATIONS = 16;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const traceId = /^[0-9a-f]{32}$/i;
 
+type JourneyObservation = { kind: 'mark'; mark: JourneyMark; ms: number } | { kind: 'anchor'; result: AnchorResult } | { kind: 'request'; request_id: string };
+
 export class ConversationViewJourney {
+  readonly #observe: (event: JourneyObservation) => void;
   readonly #clock: () => number;
   readonly #startedAt: number;
   readonly #marks = Object.fromEntries(JOURNEY_MARKS.map(mark => [mark, null])) as Record<JourneyMark, number | null>;
@@ -44,20 +47,28 @@ export class ConversationViewJourney {
   #saturated = false;
   #anchorResult: AnchorResult | null = null;
 
-  constructor(clock: () => number = () => performance.now()) {
+  constructor(clock: () => number = () => performance.now(), observe: (event: JourneyObservation) => void = () => {}) {
+    this.#observe = observe;
     this.#clock = clock;
     this.#startedAt = clock();
     Object.freeze(this);
   }
 
   mark(mark: Exclude<JourneyMark, 'anchor_settled'>): void {
-    if (!this.#finished && observableMarks.includes(mark) && this.#marks[mark] === null) this.#marks[mark] = this.#elapsed();
+    if (!this.#finished && observableMarks.includes(mark) && this.#marks[mark] === null) {
+      this.#marks[mark] = this.#elapsed();
+      this.#observe({ kind: 'mark', mark, ms: this.#marks[mark] });
+    }
   }
 
   anchor(result: AnchorResult): void {
     if (this.#finished || this.#anchorResult !== null || !['applied', 'tail_pinned', 'empty', 'target_missing', 'superseded'].includes(result)) return;
     this.#anchorResult = result;
-    if (result === 'applied' || result === 'tail_pinned' || result === 'empty') this.#marks.anchor_settled = this.#elapsed();
+    this.#observe({ kind: 'anchor', result });
+    if (result === 'applied' || result === 'tail_pinned' || result === 'empty') {
+      this.#marks.anchor_settled = this.#elapsed();
+      this.#observe({ kind: 'mark', mark: 'anchor_settled', ms: this.#marks.anchor_settled });
+    }
   }
 
   correlate(kind: CorrelationKind, id: string): void {
@@ -69,6 +80,7 @@ export class ConversationViewJourney {
       return;
     }
     this.#correlations.push({ kind, id });
+    if (kind === 'request') this.#observe({ kind: 'request', request_id: id });
   }
 
   observerInspection(): void {
