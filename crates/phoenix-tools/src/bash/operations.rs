@@ -850,7 +850,7 @@ fn start_io_tasks(
     tokio::spawn(async move {
         run_waiter(
             h,
-            child,
+            async move { child.wait().await },
             stdout_join,
             stderr_join,
             WaiterContext {
@@ -1106,16 +1106,18 @@ impl LiveBashProgressReporter {
     }
 }
 
-async fn run_waiter(
+async fn run_waiter<F>(
     handle: Arc<Handle>,
-    mut child: tokio::process::Child,
+    child_exit: F,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     context: WaiterContext,
-) {
+) where
+    F: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+{
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
-    let exit_status = child.wait().await;
+    let exit_status = child_exit.await;
 
     let cause = match exit_status {
         Ok(status) => exit_status_to_cause(status),
@@ -1146,13 +1148,6 @@ async fn run_waiter(
     panic_guard.disarm();
 }
 
-/// Drain the stdout/stderr reader tasks and perform the Live→Tombstoned
-/// transition. Split out of `run_waiter` so the no-terminalize-before-drain
-/// invariant (the ring must capture any kernel-buffered final chunk,
-/// including an unterminated tail, before the handle tombstones) can be
-/// exercised directly against fake readers — no real child process needed,
-/// since everything this function depends on from the process side already
-/// arrived as `cause`/`finished_at`.
 async fn drain_then_transition_to_terminal(
     handle: &Arc<Handle>,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
@@ -2405,14 +2400,12 @@ mod tests {
             sandbox_scratch_dir: None,
             progress_reporter: None,
         };
-        let mut finalize = Box::pin(drain_then_transition_to_terminal(
-            &handle,
+        let mut finalize = Box::pin(run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
             Some(stdout_join),
             None,
-            FinalCause::Exited { exit_code: Some(0) },
-            Instant::now(),
-            SystemTime::now(),
-            &context,
+            context,
         ));
         let pending = std::future::poll_fn(|cx| {
             std::task::Poll::Ready(finalize.as_mut().poll(cx).is_pending())
@@ -2437,6 +2430,50 @@ mod tests {
                 .map(|l| String::from_utf8_lossy(&l.bytes).to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_bounds_reader_drain_when_a_descendant_keeps_pipe_open() {
+        use std::future::Future as _;
+        let handle = live_handle();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let reader_handle = handle.clone();
+        let reader = tokio::spawn(async move {
+            read_pipe_to_ring(
+                GatedReader {
+                    gate: Some(gate),
+                    chunk: Some(b"late".to_vec()),
+                },
+                reader_handle,
+                None,
+            )
+            .await;
+        });
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        let mut waiter = Box::pin(run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            Some(reader),
+            None,
+            context,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                waiter.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert!(!handle.state().await.is_terminal());
+        tokio::time::advance(READER_DRAIN_TIMEOUT).await;
+        waiter.await;
+        assert!(handle.state().await.is_terminal());
+        drop(release);
     }
 
     #[tokio::test]

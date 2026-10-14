@@ -420,12 +420,6 @@ mod tests {
         );
     }
 
-    // `fast_exit_preserves_trailing_output_no_reader_race` (regression for
-    // the no-terminalize-before-drain invariant) moved to
-    // `bash::operations::tests` as a deterministic, process-free test
-    // against `drain_then_transition_to_terminal` directly — see that
-    // module for the current coverage of this property.
-
     #[tokio::test]
     async fn run_wait_seconds_elapses_returns_still_running_with_handle() {
         let tool = BashTool;
