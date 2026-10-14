@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { tailSamplesReady, olderRequest, failedOlderRequest, retryMatches, offlineOlderWitness } from './qualify-history-realserver.mjs';
+import { acceptedManualOpening, tailSamplesReady, olderRequest, failedOlderRequest, retryMatches, offlineOlderWitness } from './qualify-history-realserver.mjs';
 import { loopback, sourceLink, anchorMatches, occurrences, belongsToAggregate, APPEND_PROBE, CONTINUATION_PROBE, probeText, boundedDiagnosticJson, COMPOSER_SELECTOR, pinRejection } from './qualify-history-realserver.mjs';
 
 test('only literal HTTP loopback ports are accepted', () => {
@@ -163,4 +163,41 @@ test('offline orchestration registers first, wheels once over measured extent, r
     assert.deepEqual(calls, ['offline:true', 'hover', 'wheel', ...(mode === 'wheel-error' ? [] : ['poll']), 'offline:false']);
     assert.equal(page.listenerCount('requestfailed'), 0);
   }
+});
+
+test('manual opening readiness requires accepted DTO, exact edge, separate presentation and persisted identity', () => {
+  const snapshot = { product_conversation_id: 'pc', latest_transcript_row_id: 'new', writable_transcript_row_id: 'new',
+    latest_opening: { status: 'accepted', accepted_message_id: 'opening', opening_authority: 'user_authorized_instruction',
+      presentation: 'separate_message', edge: { product_conversation_id: 'pc', predecessor_transcript_row_id: 'old',
+        successor_transcript_row_id: 'new', continuation_message_id: 'boundary' } },
+    boundaries: [{ message_id: 'boundary', predecessor_transcript_row_id: 'old', successor_transcript_row_id: 'new',
+      represented_successor_opening_message_id: null }],
+    segments: [{ transcript_row_id: 'new', messages: [{ message_id: 'opening', content: 'same as boundary' }] }] };
+  assert.equal(acceptedManualOpening(snapshot, 'old', 'new'), true);
+  const ordinary = structuredClone(snapshot);
+  delete ordinary.boundaries;
+  ordinary.latest_opening.accepted_message_id = 'new:opening';
+  ordinary.segments = [{ transcript_row_id: 'old', segment_ordinal: 0, messages: [],
+    handoff: { kind: 'completed', predecessor_transcript_row_id: 'old', successor_transcript_row_id: 'new',
+      continuation_message_id: 'boundary', accepted_successor_message_id: 'new:opening',
+      summary: 'same as boundary', opening_authority: 'user_authorized_instruction' } },
+    { transcript_row_id: 'new', segment_ordinal: 1, handoff: null, messages: [{ message_id: 'new:opening' }] }];
+  assert.equal(acceptedManualOpening(ordinary, 'old', 'new'), true);
+  ordinary.segments[0].handoff.opening_authority = 'generated_predecessor_context';
+  assert.equal(acceptedManualOpening(ordinary, 'old', 'new'), false);
+  for (const change of [
+    { product_conversation_id: undefined },
+    { latest_opening: undefined, latest_opening_pending: false },
+    { latest_opening: { status: 'none' } },
+    { latest_opening: { ...snapshot.latest_opening, status: 'pending' } },
+    { writable_transcript_row_id: null }, { latest_transcript_row_id: 'old' },
+    { segments: [] }, { boundaries: [] },
+    { boundaries: [{ ...snapshot.boundaries[0], represented_successor_opening_message_id: 'opening' }] },
+    ...[{ presentation: 'boundary' }, { opening_authority: 'generated_predecessor_context' },
+      { accepted_message_id: 'boundary' }, { accepted_message_id: 'foreign' }].map(change =>
+      ({ latest_opening: { ...snapshot.latest_opening, ...change } })),
+    ...[{ product_conversation_id: 'foreign' }, { predecessor_transcript_row_id: 'foreign' },
+      { successor_transcript_row_id: 'foreign' }, { continuation_message_id: 'foreign' }].map(change =>
+      ({ latest_opening: { ...snapshot.latest_opening, edge: { ...snapshot.latest_opening.edge, ...change } } })),
+  ]) assert.equal(acceptedManualOpening({ ...snapshot, ...change }, 'old', 'new'), false, JSON.stringify(change));
 });

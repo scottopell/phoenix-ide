@@ -50,6 +50,28 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "authoritative member"):
             hb.complete_occurrences([dropped], [full["segments"][0]["messages"]])
 
+    def test_workflow_checkout_and_build_guard_match_full_application_pin(self):
+        workflow = (hb.ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertEqual(len(hb.PIN), 40)
+        self.assertIn(f"ref: {hb.PIN}\n          path: pinned-app", workflow)
+        self.assertIn(f'test "$(git rev-parse HEAD)" = {hb.PIN}', workflow)
+
+    def test_manual_equal_text_opening_is_not_a_represented_generated_opening(self):
+        messages = [
+            [{"sequence_id": 1, "message_id": "boundary", "content": "same"}],
+            [{"sequence_id": 1, "message_id": "opening", "content": "same"}],
+        ]
+        full = {"segments": [{"segment_ordinal": n, "messages": member}
+                             for n, member in enumerate(messages)],
+                "boundaries": [{"represented_successor_opening_message_id": None}]}
+        self.assertEqual(hb.complete_occurrences([full], messages),
+                         [(0, 1, "boundary"), (1, 1, "opening")])
+        dropped = {**full, "segments": full["segments"][:1]}
+        with self.assertRaisesRegex(AssertionError, "authoritative member"):
+            hb.complete_occurrences([dropped], messages)
+        generated = {**dropped, "boundaries": [{"represented_successor_opening_message_id": "opening"}]}
+        self.assertEqual(hb.complete_occurrences([generated], messages), [(0, 1, "boundary")])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
