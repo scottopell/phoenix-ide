@@ -4857,6 +4857,20 @@ fn inspect_retained_before_deletion(
 }
 
 #[cfg(unix)]
+fn resume_final_worktree_tombstone(
+    tombstone: &CloseWorktreeFinalTombstone,
+    identity: &WorktreeIdentity,
+    confirmed: &CloseRetirementSnapshot,
+) -> FinalTombstoneRecovery {
+    resume_final_worktree_tombstone_with_writer_probe(
+        tombstone,
+        identity,
+        confirmed,
+        quarantine_has_external_writer,
+    )
+}
+
+#[cfg(unix)]
 #[allow(
     clippy::useless_conversion,
     reason = "libc stat device width differs across supported Unix targets"
@@ -4865,11 +4879,15 @@ fn inspect_retained_before_deletion(
     clippy::too_many_lines,
     reason = "exhaustive recovery keeps every persisted tombstone state and authority check visible"
 )]
-fn resume_final_worktree_tombstone(
+fn resume_final_worktree_tombstone_with_writer_probe<F>(
     tombstone: &CloseWorktreeFinalTombstone,
     identity: &WorktreeIdentity,
     confirmed: &CloseRetirementSnapshot,
-) -> FinalTombstoneRecovery {
+    writer_probe: F,
+) -> FinalTombstoneRecovery
+where
+    F: FnOnce(&Path) -> Result<bool, String>,
+{
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
@@ -5045,7 +5063,7 @@ fn resume_final_worktree_tombstone(
     };
     let object = tombstone.root.join("object");
     match object.try_exists() {
-        Ok(true) => match quarantine_has_external_writer(&object) {
+        Ok(true) => match writer_probe(&object) {
             Ok(true) => {
                 return FinalTombstoneRecovery::Residual(
                     "external writer holds final tombstone object; preserved".into(),
@@ -6893,10 +6911,10 @@ mod tests {
         planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
         remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
         remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
-        remove_quarantine_then_administrative_dir_with_hooks, resume_final_worktree_tombstone,
-        rotate_inspection_generation, run_bounded_git_status_until, snapshot_for,
-        staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
-        CloseLeaseFailure, ExactWorktreeRemoval, FinalTombstoneRecovery,
+        remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
+        run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
+        staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
+        ExactWorktreeRemoval, FinalTombstoneRecovery,
     };
     use crate::db::{CloseCleanupResourceDisposition, CloseWorktreeFinalTombstone};
     use phoenix_core::domain::close::{
@@ -9021,6 +9039,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn resume_tombstone_with_no_external_writer(
+        tombstone: &CloseWorktreeFinalTombstone,
+        identity: &WorktreeIdentity,
+        confirmed: &phoenix_core::domain::close::CloseRetirementSnapshot,
+    ) -> FinalTombstoneRecovery {
+        super::resume_final_worktree_tombstone_with_writer_probe(
+            tombstone,
+            identity,
+            confirmed,
+            |_| Ok(false),
+        )
+    }
+
+    #[cfg(unix)]
     fn test_worktree_snapshot(
         identity: &WorktreeIdentity,
         path: &Path,
@@ -9088,7 +9120,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            resume_final_worktree_tombstone(&recorded, &identity, &confirmed),
+            resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed),
             FinalTombstoneRecovery::Residual(_)
         ));
         assert!(recorded.root.join("object/original").exists());
@@ -9097,13 +9129,29 @@ mod tests {
         std::fs::create_dir(recorded.root.join("object/cache")).unwrap();
         std::fs::write(recorded.root.join("object/cache/unique"), "unique").unwrap();
         assert!(matches!(
-            resume_final_worktree_tombstone(&recorded, &identity, &confirmed),
+            resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed),
             FinalTombstoneRecovery::Residual(_)
         ));
         assert!(recorded.root.join("object/cache/unique").exists());
         std::fs::remove_dir_all(recorded.root.join("object/cache")).unwrap();
         std::fs::remove_file(recorded.root.join("object/.gitignore")).unwrap();
-        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
+        for observation in [Ok(true), Err("writer observation unavailable".to_string())] {
+            let retained = super::resume_final_worktree_tombstone_with_writer_probe(
+                &recorded,
+                &identity,
+                &confirmed,
+                |object| {
+                    assert_eq!(object, recorded.root.join("object"));
+                    observation
+                },
+            );
+            assert!(matches!(retained, FinalTombstoneRecovery::Residual(_)));
+            assert_eq!(
+                std::fs::read_to_string(recorded.root.join("object/original")).unwrap(),
+                "original\n"
+            );
+        }
+        let recovery = resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed);
         assert!(
             matches!(recovery, FinalTombstoneRecovery::Completed),
             "{recovery:?}"
@@ -9159,7 +9207,7 @@ mod tests {
         std::fs::create_dir(&recorded.root).unwrap();
         std::fs::write(recorded.root.join("replacement-marker"), "preserve\n").unwrap();
 
-        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
+        let recovery = resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed);
         assert!(matches!(
             recovery,
             FinalTombstoneRecovery::Residual(detail) if detail.contains("root was replaced")
@@ -9189,7 +9237,7 @@ mod tests {
             object_inode: None,
         };
 
-        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
+        let recovery = resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed);
         assert!(
             matches!(recovery, FinalTombstoneRecovery::Completed),
             "{recovery:?}"
@@ -9221,7 +9269,7 @@ mod tests {
         std::fs::rename(&target, recorded.root.join("object")).unwrap();
 
         assert!(matches!(
-            resume_final_worktree_tombstone(&recorded, &identity, &confirmed),
+            resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed),
             FinalTombstoneRecovery::Residual(detail) if detail.contains("unbound object remains")
         ));
         assert!(recorded.root.join("object").exists());
@@ -9250,7 +9298,7 @@ mod tests {
         std::fs::remove_dir_all(&target).unwrap();
         std::fs::remove_dir(&recorded.root).unwrap();
 
-        let recovery = resume_final_worktree_tombstone(&recorded, &identity, &confirmed);
+        let recovery = resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed);
         assert!(
             matches!(recovery, FinalTombstoneRecovery::Completed),
             "{recovery:?}"
