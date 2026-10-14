@@ -6,7 +6,7 @@ This authenticated reference is for the live Phoenix deployment the user named. 
 
 Every HTTP command must run through Global's Bash tool with an explicit active local `work_scope_id` admitted from authoritative Coordinator home context or WorkScope rows. That WorkScope authorizes local execution only. Separately establish the selected destination's identity, authentication, current `ProductConversation` or transcript, and lifecycle state from authoritative, user-authorized sources. Require destination cwd provenance only when the operation consumes cwd.
 
-Transport grants no destination authority. Use only a user-identified credential source for the selected destination, keep credentials secret as specified below, and apply the operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged.
+Transport grants no destination authority. Use only a user-identified credential source for the selected destination. Keep credentials out of arguments, output, and files; any nonlocal credential hop requires authenticated encryption. Apply the operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged.
 
 For the documented Bash recipes, Global interprets each response structurally and retains the request identity and exact intent. Treat payloads as data, not shell syntax. Do not install dependencies or substitute ad-hoc text parsing.
 
@@ -21,7 +21,8 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
    CA_CERT_PATH_B64='' # optional base64 of an authoritative selected-destination CA path
    if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
    ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
-   [[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
+   [[ "$ORIGIN" =~ ^https://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ||
+      "$ORIGIN" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
    CURL_TLS=(--globoff)
    if [[ -n "$CA_CERT_PATH_B64" ]]; then
      CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
@@ -50,6 +51,8 @@ https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PR
 Omit the `--header` line when auth is disabled or the request is already authenticated.
 
 ## Create one ProductConversation
+
+This creation recipe is local-only: its origin must be the Phoenix server that owns the active WorkScope and resolves `$PWD`. For another destination, stop; never send the local executor's `$PWD` as a remote cwd.
 
 `POST /api/product-conversations/new` accepts exactly:
 
@@ -91,16 +94,17 @@ Global now has the retained UUID, encoded scoped cwd, exact live model/effort, e
 
 ### 3. Copyable POST transport
 
-Set only base64-alphabet literals in this scoped Bash command. `ORIGIN_B64` is the selected destination origin; `INTENT_B64` is the complete exact JSON from step 2. The request body is streamed on stdin, not argv. The body and HTTP status are emitted separately so Global can interpret the response structurally.
+Set only base64-alphabet literals in this scoped Bash command. `ORIGIN_B64` is the local WorkScope-owning Phoenix origin; `INTENT_B64` is the complete exact JSON from step 2. The request body is streamed on stdin, not argv. The body and HTTP status are emitted separately so Global can interpret the response structurally.
 
 ```bash
 set -u
-ORIGIN_B64='base64-of-the-selected-destination-origin'
-CA_CERT_PATH_B64='' # optional base64 of an authoritative selected-destination CA path
+ORIGIN_B64='base64-of-the-local-workscope-origin'
+CA_CERT_PATH_B64='' # optional base64 of its authoritative CA path
 INTENT_B64='base64-of-the-complete-exact-json-intent'
 if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
 ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
-[[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
+[[ "$ORIGIN" =~ ^https://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ||
+   "$ORIGIN" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$ ]] || exit
 CURL_TLS=(--globoff)
 if [[ -n "$CA_CERT_PATH_B64" ]]; then
   CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
@@ -163,12 +167,12 @@ Current read routes accept a ProductConversation ID, transcript-row ID, or slug 
 - `GET /api/product-conversations/{reference}/route` returns a canonical transcript route target.
 - `GET /api/conversations/{transcript_row_id}` returns exact transcript state and messages.
 
-For message steering, use `send_conversation_message` with non-empty literal text. Do not use `POST /api/conversations/{id}/chat`: that browser route expands slash commands and file references. Delivered/queued is acceptance only; read state separately when observation is required.
+For local message steering, use `send_conversation_message` with non-empty literal text. It resolves only on the local Phoenix instance; never substitute it for remote steering. Do not use `POST /api/conversations/{id}/chat`: that browser route expands slash commands and file references. Delivered/queued is acceptance only; read state separately when observation is required.
 
 For cancel, re-resolve and call `POST /api/conversations/{writable_transcript_row_id}/cancel`. The response always has `ok`; `no_op` is omitted when false. Therefore `{ "ok": true }` means cancellation found in-flight work, while `{ "ok": true, "no_op": true }` means nothing cancellable was observed. Cancel has no caller idempotency key or uniform operation receipt.
 
-For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript. Call `POST /api/conversations/{latest_transcript_row_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. Reuse the same `message_id` for an uncertain exact retry. Preserve the successor even for `dispatch_failed`, then re-read aggregate and transcript state. A History aggregate requires a separate Open follow-up, not `/continue`.
+Remote Continue through the selected destination's existing API is independent of federated message steering. For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript. Call `POST /api/conversations/{latest_transcript_row_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. Reuse the same `message_id` for an uncertain exact retry. Preserve the successor even for `dispatch_failed`, then re-read aggregate and transcript state. A History aggregate requires a separate Open follow-up, not `/continue`.
 
 ## Honest gaps
 
-Current APIs do not provide a general Coordinator lifecycle endpoint, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded image upload/creation transport, bounded creation lookup by request ID, bounded state-only conversation projection, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.
+Current APIs do not provide a general Coordinator lifecycle endpoint, destination-aware remote literal-message steering, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded image upload/creation transport, bounded creation lookup by request ID, bounded state-only conversation projection, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.

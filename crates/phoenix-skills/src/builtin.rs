@@ -326,6 +326,8 @@ mod tests {
             "selected destination's identity, authentication, current target, and lifecycle state"
         ));
         assert!(skill.contains("user-identified credential source"));
+        assert!(skill.contains("authenticated encryption for nonlocal transport"));
+        assert!(skill.contains("Use local-only tools and cwd only for the local destination"));
         assert!(skill.contains("destination cwd provenance only when the operation consumes cwd"));
         assert!(skill.contains(
             "existing lifecycle, target-resolution, and retry rules regardless of transport"
@@ -339,6 +341,18 @@ mod tests {
             reference.contains("destination cwd provenance only when the operation consumes cwd")
         );
         assert!(reference.contains("Transport grants no destination authority"));
+        assert!(reference.contains("nonlocal credential hop requires authenticated encryption"));
+        assert!(reference.contains("This creation recipe is local-only"));
+        assert!(reference.contains("never send the local executor's `$PWD` as a remote cwd"));
+        assert!(reference.contains("base64-of-the-local-workscope-origin"));
+        assert!(reference.contains("It resolves only on the local Phoenix instance"));
+        assert!(reference.contains("never substitute it for remote steering"));
+        assert!(reference.contains(
+            "Remote Continue through the selected destination's existing API is independent of federated message steering"
+        ));
+        assert!(reference.contains("^https://"));
+        assert!(reference.contains("^http://(127\\.0\\.0\\.1|\\[::1\\])"));
+        assert!(!reference.contains("^https?://"));
         assert!(reference.contains(
             "operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged"
         ));
