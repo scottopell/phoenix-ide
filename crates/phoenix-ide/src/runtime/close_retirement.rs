@@ -179,14 +179,32 @@ struct CloseProcessStepFailure {
     reason: String,
 }
 
+#[derive(Debug)]
+struct CloseObservedProcessRetirement {
+    identities: Vec<OpaqueIdentity>,
+    outcome: CloseProcessStepOutcome,
+}
+
+#[derive(Debug)]
+struct CloseObservedTmuxRetirement {
+    resources: Vec<RetiredResourceIdentity>,
+    outcome: RetirementOutcome,
+}
+
 #[async_trait::async_trait]
 trait CloseProcessStepExecutor {
-    async fn retire_bash(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure>;
-    async fn retire_tmux(&mut self)
-        -> Result<RetirementOutcome, (RetirementFailureReason, String)>;
-    async fn retire_terminal(&mut self)
-        -> Result<CloseProcessStepOutcome, CloseProcessStepFailure>;
-    async fn retire_browser(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure>;
+    async fn retire_bash(
+        &mut self,
+    ) -> Result<CloseObservedProcessRetirement, CloseProcessStepFailure>;
+    async fn retire_tmux(
+        &mut self,
+    ) -> Result<CloseObservedTmuxRetirement, (RetirementFailureReason, String)>;
+    async fn retire_terminal(
+        &mut self,
+    ) -> Result<CloseObservedProcessRetirement, CloseProcessStepFailure>;
+    async fn retire_browser(
+        &mut self,
+    ) -> Result<CloseObservedProcessRetirement, CloseProcessStepFailure>;
 }
 
 #[derive(Debug, Default)]
@@ -196,23 +214,87 @@ struct CloseProcessStepIdentities {
     browser: Vec<String>,
 }
 
+fn verify_observed_process_identities(
+    observed: &[OpaqueIdentity],
+    expected: &[String],
+) -> Result<(), String> {
+    let observed_set: BTreeSet<&str> = observed.iter().map(OpaqueIdentity::as_str).collect();
+    if observed_set.len() != observed.len() {
+        return Err("process retirement observed duplicate identities".to_string());
+    }
+    let expected_set: BTreeSet<&str> = expected.iter().map(String::as_str).collect();
+    if expected_set.len() != expected.len() {
+        return Err("process retirement expected duplicate identities".into());
+    }
+    if observed_set != expected_set {
+        return Err(format!(
+            "observed process identities {observed_set:?} do not match expected {expected_set:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_process_observation_or_fail(
+    observed: &CloseObservedProcessRetirement,
+    expected: &[String],
+    kind: RetiredResourceKind,
+) -> Result<(), CloseLeaseFailure> {
+    verify_observed_process_identities(&observed.identities, expected).map_err(|detail| {
+        let captured = observed
+            .identities
+            .iter()
+            .map(|identity| opaque_resource(kind, identity.as_str().to_string()))
+            .collect();
+        CloseLeaseFailure::process_epoch(kind, captured, detail)
+    })
+}
+
+fn new_tmux_receipt_resources(
+    observed: &[RetiredResourceIdentity],
+    expected: &[RetiredResourceIdentity],
+) -> Result<Vec<RetiredResourceIdentity>, String> {
+    for (index, resource) in expected.iter().enumerate() {
+        if resource.kind() != RetiredResourceKind::TmuxServer
+            || expected[..index].contains(resource)
+        {
+            return Err("expected tmux targets must be distinct tmux resources".into());
+        }
+    }
+    for (index, resource) in observed.iter().enumerate() {
+        if observed[..index].contains(resource) {
+            return Err("tmux retirement observed duplicate resources".to_string());
+        }
+    }
+    if let Some(missing) = expected
+        .iter()
+        .find(|resource| !observed.contains(resource))
+    {
+        return Err(format!(
+            "expected tmux resource {missing:?} was not carried by the observed retirement"
+        ));
+    }
+    Ok(observed
+        .iter()
+        .filter(|resource| expected.contains(resource))
+        .cloned()
+        .collect())
+}
+
 async fn persist_close_process_step(
     db: &crate::db::Database,
     run: &CloseRunRef,
     scope: &WorkScopeId,
     resource_kind: CloseProcessResourceKind,
-    identities: Vec<String>,
-    outcome: CloseProcessStepOutcome,
+    observed: &CloseObservedProcessRetirement,
 ) -> Result<(), CloseLeaseFailure> {
     let observed_at_us = chrono::Utc::now().timestamp_micros();
-    for identity in identities {
+    for identity in &observed.identities {
         db.record_close_process_step_success(&CloseProcessStepSuccess {
             run: run.clone(),
             scope: scope.clone(),
             resource_kind,
-            identity: OpaqueIdentity::parse(identity)
-                .expect("registry stable instance identity is non-empty"),
-            outcome,
+            identity: identity.clone(),
+            outcome: observed.outcome,
             observed_at_us,
         })
         .await
@@ -242,20 +324,24 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
         CloseProcessResourceKind::BashProcessGroup,
         &identities.bash,
     ) {
-        let outcome = executor.retire_bash().await.map_err(|failure| {
+        let observed = executor.retire_bash().await.map_err(|failure| {
             CloseLeaseFailure::process_epoch(
                 RetiredResourceKind::BashProcessGroup,
                 failure.resources,
                 failure.reason,
             )
         })?;
+        verify_process_observation_or_fail(
+            &observed,
+            &identities.bash,
+            RetiredResourceKind::BashProcessGroup,
+        )?;
         persist_close_process_step(
             db,
             run,
             scope,
             CloseProcessResourceKind::BashProcessGroup,
-            identities.bash.clone(),
-            outcome,
+            &observed,
         )
         .await?;
     }
@@ -275,17 +361,24 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
         })
     });
     if !tmux_already_complete {
-        let outcome = executor
+        let observed = executor
             .retire_tmux()
             .await
             .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
-        for resource in tmux_resources {
+        let receipts =
+            new_tmux_receipt_resources(&observed.resources, tmux_resources).map_err(|detail| {
+                CloseLeaseFailure::Tmux {
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail,
+                }
+            })?;
+        for resource in receipts {
             db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: run.attempt_id.clone(),
                 snapshot: snapshot.clone(),
                 scope: scope.clone(),
-                resource: resource.clone(),
-                outcome: outcome.clone(),
+                resource,
+                outcome: observed.outcome.clone(),
                 detail: Some("exact registry permit retirement".to_string()),
             })
             .await
@@ -299,20 +392,24 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
         CloseProcessResourceKind::PtySession,
         &identities.terminal,
     ) {
-        let outcome = executor.retire_terminal().await.map_err(|failure| {
+        let observed = executor.retire_terminal().await.map_err(|failure| {
             CloseLeaseFailure::process_epoch(
                 RetiredResourceKind::PtySession,
                 failure.resources,
                 failure.reason,
             )
         })?;
+        verify_process_observation_or_fail(
+            &observed,
+            &identities.terminal,
+            RetiredResourceKind::PtySession,
+        )?;
         persist_close_process_step(
             db,
             run,
             scope,
             CloseProcessResourceKind::PtySession,
-            identities.terminal.clone(),
-            outcome,
+            &observed,
         )
         .await?;
     }
@@ -323,20 +420,24 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
         CloseProcessResourceKind::BrowserSession,
         &identities.browser,
     ) {
-        let outcome = executor.retire_browser().await.map_err(|failure| {
+        let observed = executor.retire_browser().await.map_err(|failure| {
             CloseLeaseFailure::process_epoch(
                 RetiredResourceKind::BrowserSession,
                 failure.resources,
                 failure.reason,
             )
         })?;
+        verify_process_observation_or_fail(
+            &observed,
+            &identities.browser,
+            RetiredResourceKind::BrowserSession,
+        )?;
         persist_close_process_step(
             db,
             run,
             scope,
             CloseProcessResourceKind::BrowserSession,
-            identities.browser.clone(),
-            outcome,
+            &observed,
         )
         .await?;
     }
@@ -351,7 +452,9 @@ struct LiveCloseProcessStepExecutor<'a> {
 
 #[async_trait::async_trait]
 impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
-    async fn retire_bash(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure> {
+    async fn retire_bash(
+        &mut self,
+    ) -> Result<CloseObservedProcessRetirement, CloseProcessStepFailure> {
         let outcome = self
             .manager
             .bash_handles()
@@ -379,15 +482,21 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
                 )
             })
             .collect::<Vec<_>>();
-        require_absent(outcome).map_err(|reason| CloseProcessStepFailure {
+        let outcome = require_absent(outcome).map_err(|reason| CloseProcessStepFailure {
             resources: failed_resources,
             reason,
+        })?;
+        Ok(CloseObservedProcessRetirement {
+            identities: lease_process_identities(self.lease.bash.exact_process_groups.iter().map(
+                phoenix_tools::bash::registry::BashRetirementTarget::stable_resource_identity,
+            )),
+            outcome,
         })
     }
 
     async fn retire_tmux(
         &mut self,
-    ) -> Result<RetirementOutcome, (RetirementFailureReason, String)> {
+    ) -> Result<CloseObservedTmuxRetirement, (RetirementFailureReason, String)> {
         let outcome = self
             .manager
             .tmux_registry()
@@ -399,13 +508,23 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
                     error.to_string(),
                 )
             })?;
-        tmux_retirement_outcome(outcome)
+        let outcome = tmux_retirement_outcome(outcome)?;
+        Ok(CloseObservedTmuxRetirement {
+            resources: self
+                .lease
+                .resources
+                .iter()
+                .filter(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
+                .cloned()
+                .collect(),
+            outcome,
+        })
     }
 
     async fn retire_terminal(
         &mut self,
-    ) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure> {
-        require_terminal_absent(
+    ) -> Result<CloseObservedProcessRetirement, CloseProcessStepFailure> {
+        let outcome = require_terminal_absent(
             self.manager
                 .terminals
                 .complete_retirement(&self.lease.terminal)
@@ -420,11 +539,23 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
                 .cloned()
                 .collect(),
             reason,
+        })?;
+        Ok(CloseObservedProcessRetirement {
+            identities: lease_process_identities(
+                self.lease
+                    .terminal
+                    .instance
+                    .iter()
+                    .map(phoenix_terminal::session::TerminalInstanceIdentity::stable_identity),
+            ),
+            outcome,
         })
     }
 
-    async fn retire_browser(&mut self) -> Result<CloseProcessStepOutcome, CloseProcessStepFailure> {
-        require_browser_absent(
+    async fn retire_browser(
+        &mut self,
+    ) -> Result<CloseObservedProcessRetirement, CloseProcessStepFailure> {
+        let outcome = require_browser_absent(
             self.manager
                 .browser_sessions()
                 .complete_retirement(&self.lease.browser)
@@ -439,6 +570,12 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
                 .cloned()
                 .collect(),
             reason,
+        })?;
+        Ok(CloseObservedProcessRetirement {
+            identities: lease_process_identities(self.lease.browser.instances.iter().map(
+                phoenix_tools::browser::session::BrowserSessionInstanceIdentity::stable_identity,
+            )),
+            outcome,
         })
     }
 }
@@ -5443,13 +5580,6 @@ enum RetryTargetObservation {
     Present(ExternalWriterEvidence),
 }
 
-/// Pure admission decision over already-observed retry targets.
-///
-/// Rejects (no new run admitted) when any candidate is observed holding a
-/// positive external writer, or when observing any candidate fails (a probe
-/// error is fail-closed, not proof of absence). Admits only when every observed
-/// candidate is absent or carries no positive writer evidence. The candidate
-/// order is original worktree, then quarantine, then the final-tombstone object.
 fn probe_retry_worktree_writers_with<F>(
     original: &Path,
     quarantine: &Path,
@@ -7033,6 +7163,18 @@ fn opaque_resource(kind: RetiredResourceKind, value: String) -> RetiredResourceI
     .expect("registry resource kind accepts opaque stable identity")
 }
 
+/// Parses stable registry instance identities retained in the live lease into
+/// opaque identities for the observed retirement. The lease is the same
+/// capability the executor called the registry with, so these identities are the
+/// exact instances retired.
+fn lease_process_identities(identities: impl Iterator<Item = String>) -> Vec<OpaqueIdentity> {
+    identities
+        .map(|identity| {
+            OpaqueIdentity::parse(identity).expect("registry stable instance identity is non-empty")
+        })
+        .collect()
+}
+
 fn require_absent(outcome: BashRetirementOutcome) -> Result<CloseProcessStepOutcome, String> {
     match outcome {
         BashRetirementOutcome::StaleGeneration(_) => {
@@ -8078,10 +8220,61 @@ mod tests {
 
     #[derive(Debug)]
     enum ScriptedObservation {
-        Bash(Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure>),
-        Tmux(Result<super::RetirementOutcome, (super::RetirementFailureReason, String)>),
-        Terminal(Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure>),
-        Browser(Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure>),
+        Bash(Result<super::CloseObservedProcessRetirement, super::CloseProcessStepFailure>),
+        Tmux(Result<super::CloseObservedTmuxRetirement, (super::RetirementFailureReason, String)>),
+        Terminal(Result<super::CloseObservedProcessRetirement, super::CloseProcessStepFailure>),
+        Browser(Result<super::CloseObservedProcessRetirement, super::CloseProcessStepFailure>),
+    }
+
+    fn opaque_ids(ids: &[String]) -> Vec<super::OpaqueIdentity> {
+        ids.iter()
+            .map(|id| super::OpaqueIdentity::parse(id.clone()).unwrap())
+            .collect()
+    }
+
+    /// Builds the observed process retirement a scripted executor "saw",
+    /// carrying exactly the supplied identities. Tests pass the fixture's
+    /// expected identities here for a matching observation, or a deliberately
+    /// different set to exercise mismatch handling.
+    fn observed_process(
+        ids: &[String],
+        outcome: super::CloseProcessStepOutcome,
+    ) -> super::CloseObservedProcessRetirement {
+        super::CloseObservedProcessRetirement {
+            identities: opaque_ids(ids),
+            outcome,
+        }
+    }
+
+    fn observed_bash(ids: &[String]) -> ScriptedObservation {
+        ScriptedObservation::Bash(Ok(observed_process(
+            ids,
+            super::CloseProcessStepOutcome::Retired,
+        )))
+    }
+
+    fn observed_terminal(ids: &[String]) -> ScriptedObservation {
+        ScriptedObservation::Terminal(Ok(observed_process(
+            ids,
+            super::CloseProcessStepOutcome::Retired,
+        )))
+    }
+
+    fn observed_browser(ids: &[String]) -> ScriptedObservation {
+        ScriptedObservation::Browser(Ok(observed_process(
+            ids,
+            super::CloseProcessStepOutcome::Retired,
+        )))
+    }
+
+    fn observed_tmux(
+        resources: &[super::RetiredResourceIdentity],
+        outcome: super::RetirementOutcome,
+    ) -> ScriptedObservation {
+        ScriptedObservation::Tmux(Ok(super::CloseObservedTmuxRetirement {
+            resources: resources.to_vec(),
+            outcome,
+        }))
     }
 
     #[derive(Default)]
@@ -8117,7 +8310,7 @@ mod tests {
     impl super::CloseProcessStepExecutor for ScriptedProcessStepExecutor {
         async fn retire_bash(
             &mut self,
-        ) -> Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure> {
+        ) -> Result<super::CloseObservedProcessRetirement, super::CloseProcessStepFailure> {
             match self.next(ProcessStepCall::Bash) {
                 ScriptedObservation::Bash(observation) => observation,
                 other => panic!("unexpected scripted observation: {other:?}"),
@@ -8126,7 +8319,8 @@ mod tests {
 
         async fn retire_tmux(
             &mut self,
-        ) -> Result<super::RetirementOutcome, (super::RetirementFailureReason, String)> {
+        ) -> Result<super::CloseObservedTmuxRetirement, (super::RetirementFailureReason, String)>
+        {
             match self.next(ProcessStepCall::Tmux) {
                 ScriptedObservation::Tmux(observation) => observation,
                 other => panic!("unexpected scripted observation: {other:?}"),
@@ -8135,7 +8329,7 @@ mod tests {
 
         async fn retire_terminal(
             &mut self,
-        ) -> Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure> {
+        ) -> Result<super::CloseObservedProcessRetirement, super::CloseProcessStepFailure> {
             match self.next(ProcessStepCall::Terminal) {
                 ScriptedObservation::Terminal(observation) => observation,
                 other => panic!("unexpected scripted observation: {other:?}"),
@@ -8144,7 +8338,7 @@ mod tests {
 
         async fn retire_browser(
             &mut self,
-        ) -> Result<super::CloseProcessStepOutcome, super::CloseProcessStepFailure> {
+        ) -> Result<super::CloseObservedProcessRetirement, super::CloseProcessStepFailure> {
             match self.next(ProcessStepCall::Browser) {
                 ScriptedObservation::Browser(observation) => observation,
                 other => panic!("unexpected scripted observation: {other:?}"),
@@ -8152,16 +8346,21 @@ mod tests {
         }
     }
 
-    fn retired() -> ScriptedObservation {
-        ScriptedObservation::Bash(Ok(super::CloseProcessStepOutcome::Retired))
+    /// Bash observation reporting the fixture's exact expected identities for a
+    /// scope, so the runner's identity check passes.
+    fn retired(fixture: &ProcessStepFixture, index: usize) -> ScriptedObservation {
+        observed_bash(&fixture.identities[index].bash)
     }
 
-    fn successful_process_steps() -> Vec<ScriptedObservation> {
+    fn successful_process_steps(
+        fixture: &ProcessStepFixture,
+        index: usize,
+    ) -> Vec<ScriptedObservation> {
         vec![
-            retired(),
-            ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
-            ScriptedObservation::Terminal(Ok(super::CloseProcessStepOutcome::Retired)),
-            ScriptedObservation::Browser(Ok(super::CloseProcessStepOutcome::Retired)),
+            retired(fixture, index),
+            observed_tmux(&fixture.tmux[index], super::RetirementOutcome::Retired),
+            observed_terminal(&fixture.identities[index].terminal),
+            observed_browser(&fixture.identities[index].browser),
         ]
     }
 
@@ -8458,7 +8657,7 @@ mod tests {
     #[tokio::test]
     async fn process_step_all_successes_persist_and_repeat_dispatches_nothing() {
         let fixture = process_step_fixture(false).await;
-        let mut first = ScriptedProcessStepExecutor::new(successful_process_steps());
+        let mut first = ScriptedProcessStepExecutor::new(successful_process_steps(&fixture, 0));
         run_scope(&fixture, 0, &mut first).await.unwrap();
         first.assert_finished();
         assert_eq!(
@@ -8538,7 +8737,7 @@ mod tests {
     async fn process_step_bash_success_survives_tmux_failure() {
         let fixture = process_step_fixture(false).await;
         let mut executor = ScriptedProcessStepExecutor::new([
-            retired(),
+            retired(&fixture, 0),
             ScriptedObservation::Tmux(Err((
                 super::RetirementFailureReason::RemovalFailed,
                 "tmux teardown failed".into(),
@@ -8583,8 +8782,8 @@ mod tests {
     async fn process_step_bash_and_tmux_success_survive_pty_failure() {
         let fixture = process_step_fixture(false).await;
         let observations = vec![
-            retired(),
-            ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
+            retired(&fixture, 0),
+            observed_tmux(&fixture.tmux[0], super::RetirementOutcome::Retired),
             ScriptedObservation::Terminal(Err(super::CloseProcessStepFailure {
                 resources: vec![fixture.terminal[0].clone()],
                 reason: "terminal relay remains attached".into(),
@@ -8644,7 +8843,7 @@ mod tests {
     #[tokio::test]
     async fn process_step_earlier_scope_success_survives_later_scope_failure() {
         let fixture = process_step_fixture(true).await;
-        let mut first = ScriptedProcessStepExecutor::new(successful_process_steps());
+        let mut first = ScriptedProcessStepExecutor::new(successful_process_steps(&fixture, 0));
         run_scope(&fixture, 0, &mut first).await.unwrap();
         assert_eq!(
             first.calls,
@@ -8658,7 +8857,7 @@ mod tests {
         first.assert_finished();
 
         let mut later = ScriptedProcessStepExecutor::new([
-            retired(),
+            retired(&fixture, 1),
             ScriptedObservation::Tmux(Err((
                 super::RetirementFailureReason::RemovalFailed,
                 "later scope tmux failed".into(),
@@ -8715,11 +8914,11 @@ mod tests {
                 .unwrap();
             let observations = if fail_tmux_evidence {
                 vec![
-                    retired(),
-                    ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
+                    retired(&fixture, 0),
+                    observed_tmux(&fixture.tmux[0], super::RetirementOutcome::Retired),
                 ]
             } else {
-                vec![retired()]
+                vec![retired(&fixture, 0)]
             };
             let mut executor = ScriptedProcessStepExecutor::new(observations);
             let error = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
@@ -8753,8 +8952,8 @@ mod tests {
     async fn process_step_successes_survive_failure_transaction_rollback() {
         let fixture = process_step_fixture(false).await;
         let observations = vec![
-            retired(),
-            ScriptedObservation::Tmux(Ok(super::RetirementOutcome::Retired)),
+            retired(&fixture, 0),
+            observed_tmux(&fixture.tmux[0], super::RetirementOutcome::Retired),
             ScriptedObservation::Terminal(Err(super::CloseProcessStepFailure {
                 resources: vec![fixture.terminal[0].clone()],
                 reason: "terminal relay remains attached".into(),
@@ -8807,6 +9006,197 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn verify_observed_process_identities_requires_exact_set_match() {
+        let expected = vec!["bash-a".to_string(), "bash-b".to_string()];
+        let observed = opaque_ids(&expected);
+        assert!(super::verify_observed_process_identities(&observed, &expected).is_ok());
+        // Order does not matter.
+        let reordered = opaque_ids(&["bash-b".into(), "bash-a".into()]);
+        assert!(super::verify_observed_process_identities(&reordered, &expected).is_ok());
+        // A different member is a mismatch.
+        let wrong = opaque_ids(&["bash-a".into(), "bash-c".into()]);
+        assert!(super::verify_observed_process_identities(&wrong, &expected).is_err());
+        // A strict subset is a mismatch.
+        let partial = opaque_ids(&["bash-a".into()]);
+        assert!(super::verify_observed_process_identities(&partial, &expected).is_err());
+        // A duplicate in the observation is rejected.
+        let duplicated = opaque_ids(&["bash-a".into(), "bash-a".into()]);
+        assert!(super::verify_observed_process_identities(&duplicated, &expected).is_err());
+    }
+
+    #[test]
+    fn new_tmux_receipt_resources_filters_to_observed_membership() {
+        use phoenix_core::domain::close::RetiredResourceKind::TmuxServer;
+        let a = super::opaque_resource(TmuxServer, "tmux-a".to_string());
+        let b = super::opaque_resource(TmuxServer, "tmux-b".to_string());
+        let c = super::opaque_resource(TmuxServer, "tmux-c".to_string());
+        // Expected is a subset of observed; only expected resources earn receipts,
+        // and none absent from the observation are minted.
+        let receipts = super::new_tmux_receipt_resources(
+            &[a.clone(), b.clone(), c.clone()],
+            std::slice::from_ref(&a),
+        )
+        .unwrap();
+        assert_eq!(receipts, vec![a.clone()]);
+        // An expected resource not carried by the observation is a mismatch.
+        assert!(super::new_tmux_receipt_resources(
+            std::slice::from_ref(&a),
+            std::slice::from_ref(&b)
+        )
+        .is_err());
+        // A duplicate in the observation is rejected.
+        assert!(super::new_tmux_receipt_resources(
+            &[a.clone(), a.clone()],
+            std::slice::from_ref(&a)
+        )
+        .is_err());
+    }
+
+    /// A bash observation that names a different identity than the sealed
+    /// inventory must refuse the receipt, classify the failure as
+    /// `IdentityNotProven`, and not run any later process step.
+    #[tokio::test]
+    async fn process_step_mismatched_bash_identity_refuses_receipt_and_later_steps() {
+        let fixture = process_step_fixture(false).await;
+        let mut executor = ScriptedProcessStepExecutor::new([
+            observed_bash(&["impostor-bash-identity".to_string()]),
+            observed_tmux(&fixture.tmux[0], super::RetirementOutcome::Retired),
+        ]);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert!(
+            failure.to_string().contains("do not match expected"),
+            "{failure}"
+        );
+        // The runner stopped before tmux: only bash was dispatched.
+        assert_eq!(executor.calls, [ProcessStepCall::Bash]);
+        assert!(matches!(
+            executor.observations.front(),
+            Some(ScriptedObservation::Tmux(_))
+        ));
+        // No receipt for any kind.
+        assert_process_step_successes(&fixture, 0).await;
+        assert!(fixture
+            .manager
+            .db()
+            .list_close_process_step_successes(&fixture.run)
+            .await
+            .unwrap()
+            .is_empty());
+        // Re-running still refuses and leaves no receipt.
+        let mut repeat = ScriptedProcessStepExecutor::new([observed_bash(&[
+            "impostor-bash-identity".to_string(),
+        ])]);
+        run_scope(&fixture, 0, &mut repeat).await.unwrap_err();
+        assert!(fixture
+            .manager
+            .db()
+            .list_close_process_step_successes(&fixture.run)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A terminal observation carrying a strict subset of the sealed identities
+    /// is a partial observation: no receipt, and the browser step never runs.
+    #[tokio::test]
+    async fn process_step_partial_terminal_identity_refuses_receipt_and_later_steps() {
+        let fixture = process_step_fixture(false).await;
+        let mut executor = ScriptedProcessStepExecutor::new([
+            retired(&fixture, 0),
+            observed_tmux(&fixture.tmux[0], super::RetirementOutcome::Retired),
+            // An empty observation is a strict subset of the single expected id.
+            observed_terminal(&[]),
+            observed_browser(&fixture.identities[0].browser),
+        ]);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert!(
+            failure.to_string().contains("do not match expected"),
+            "{failure}"
+        );
+        assert_eq!(
+            executor.calls,
+            [
+                ProcessStepCall::Bash,
+                ProcessStepCall::Tmux,
+                ProcessStepCall::Terminal
+            ]
+        );
+        // Browser was never dispatched.
+        assert!(matches!(
+            executor.observations.front(),
+            Some(ScriptedObservation::Browser(_))
+        ));
+        // Bash + tmux already persisted; terminal and browser did not.
+        let successes = fixture
+            .manager
+            .db()
+            .list_close_process_step_successes(&fixture.run)
+            .await
+            .unwrap();
+        assert!(successes
+            .iter()
+            .all(|receipt| receipt.resource_kind
+                == super::CloseProcessResourceKind::BashProcessGroup));
+    }
+
+    /// A duplicated identity in the observation is refused even when it covers
+    /// the expected set, so no receipt is minted and no later step runs.
+    #[tokio::test]
+    async fn process_step_duplicate_browser_identity_refuses_receipt() {
+        let fixture = process_step_fixture(false).await;
+        let mut duplicated = fixture.identities[0].browser.clone();
+        duplicated.push(fixture.identities[0].browser[0].clone());
+        let mut executor = ScriptedProcessStepExecutor::new([
+            retired(&fixture, 0),
+            observed_tmux(&fixture.tmux[0], super::RetirementOutcome::Retired),
+            observed_terminal(&fixture.identities[0].terminal),
+            observed_browser(&duplicated),
+        ]);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert!(failure.to_string().contains("duplicate"), "{failure}");
+        executor.assert_finished();
+        let successes = fixture
+            .manager
+            .db()
+            .list_close_process_step_successes(&fixture.run)
+            .await
+            .unwrap();
+        assert!(!successes.iter().any(
+            |receipt| receipt.resource_kind == super::CloseProcessResourceKind::BrowserSession
+        ));
+    }
+
+    /// A tmux observation that omits an expected (pending) resource is refused
+    /// as `IdentityNotProven`: no evidence minted, no later step runs.
+    #[tokio::test]
+    async fn process_step_tmux_observation_missing_expected_resource_refuses_receipt() {
+        let fixture = process_step_fixture(false).await;
+        let mut executor = ScriptedProcessStepExecutor::new([
+            retired(&fixture, 0),
+            // The executor observed no tmux resource, but one is expected.
+            observed_tmux(&[], super::RetirementOutcome::Retired),
+            observed_terminal(&fixture.identities[0].terminal),
+        ]);
+        let failure = run_scope(&fixture, 0, &mut executor).await.unwrap_err();
+        assert!(failure.to_string().contains("tmux"), "{failure}");
+        assert_eq!(
+            executor.calls,
+            [ProcessStepCall::Bash, ProcessStepCall::Tmux]
+        );
+        assert!(matches!(
+            executor.observations.front(),
+            Some(ScriptedObservation::Terminal(_))
+        ));
+        let evidence = fixture
+            .manager
+            .db()
+            .list_close_retirement_evidence(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(evidence.is_empty());
     }
 
     #[test]
