@@ -40,6 +40,17 @@ artifact/source and owned paths; readiness is an actual HTTP GET. Fixtures reuse
 the shipping harness's exact `Fixture.build`, HTTP/SSE helpers, hashing and owned
 process-group cleanup by import, not copied implementations.
 
+After `Fixture.build`, the instrumented harness exhausts its final member and
+GETs the persisted `ConvState` (`type: context_exhausted`, `summary: string`).
+It POSTs that exact summary as the manual handoff, without performance tokens or
+fabricated replacement text, and waits for actual SSE settlement and persistence
+of the accepted opening identity. It exhausts the new successor for the later
+one-shot armed continuation. Fresh member GETs and aggregate pages then replace
+the fixture's members, latest row, boundary count, accepted manual-opening metadata
+and occurrence coverage; the >201 occurrences and older anchor must survive.
+The Node assertion still compares actual persisted boundary and opening content
+before arming. This setup repair has compiler-free tests only, not a runtime pass.
+
 ## What an executed pass asserts
 
 - Existing equal-text manual continuation has a completed separate-message

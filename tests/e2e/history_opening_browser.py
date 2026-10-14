@@ -96,6 +96,72 @@ def readiness(proc, url, expected_hash=None, timeout=30):
     raise TimeoutError("actual HTTP readiness deadline")
 
 
+def exhausted_summary(state):
+    """ConvState is internally tagged by type; ContextExhausted carries summary: String."""
+    if (not isinstance(state, dict) or state.get("type") != "context_exhausted"
+            or not isinstance(state.get("summary"), str) or not state["summary"].strip()):
+        raise ValueError("persisted ContextExhausted state with nonempty summary required")
+    return state["summary"]
+
+
+def equal_text_fixture(fixture, aggregate):
+    predecessor = aggregate["members"][-1]
+    fixture.send(predecessor, "[[scenario:context_window_exceeded]] [[ttft:0]]", True)
+    persisted = fixture.request("GET", f"/api/conversations/{predecessor}")
+    summary = exhausted_summary(persisted["conversation"]["state"])
+    key = str(shipping.uuid.uuid4())
+    response = fixture.request("POST", f"/api/conversations/{predecessor}/continue",
+                               {"handoff": summary, "message_id": key})
+    successor = response["conversation_id"]
+    assert response["status"] == "accepted" and successor not in aggregate["members"], response
+    opening_id = f"{successor}:{key}"
+    fixture.wait(successor, message_id=opening_id)
+    fixture.send(successor, "[[scenario:context_window_exceeded]] [[ttft:0]]", True)
+
+    members = aggregate["members"] + [successor]
+    member_messages = [fixture.request("GET", f"/api/conversations/{row}")["messages"]
+                       for row in members]
+    pages, cursor, cursors = [], None, set()
+    for _ in range(8):
+        query = {"message_limit": 100, "boundary_representation": "original_messages"}
+        if cursor:
+            query["before"] = cursor
+        page = fixture.request("GET", aggregate["endpoint"] + "?" + shipping.urlencode(query))
+        pages.append(page)
+        if not page["has_older"]:
+            break
+        cursor = page["before"]
+        assert cursor and cursor not in cursors, "cursor did not advance"
+        cursors.add(cursor)
+    else:
+        raise AssertionError("equal-text fixture paging exceeded eight pages")
+    keys = shipping.complete_occurrences(pages, member_messages)
+    assert len(keys) > 201 and len(pages) >= 3
+    assert any(key[2] == aggregate["old_message"] for key in keys), "older anchor lost"
+    latest = pages[0]
+    assert latest["latest_transcript_row_id"] == successor
+    assert len(latest["boundaries"]) == len(aggregate["boundaries"]) + 1
+    opening = latest["latest_opening"]
+    assert (opening["status"], opening["opening_authority"], opening["presentation"]) == (
+        "accepted", "user_authorized_instruction", "separate_message")
+    assert opening["accepted_message_id"] == opening_id
+    edge = opening["edge"]
+    assert edge["predecessor_transcript_row_id"] == predecessor
+    assert edge["successor_transcript_row_id"] == successor
+    boundary = next(b for b in latest["boundaries"] if b["message_id"] == edge["continuation_message_id"])
+    assert boundary["represented_successor_opening_message_id"] is None
+    boundary_message = next(m for m in member_messages[-2] if m["message_id"] == boundary["message_id"])
+    opening_message = next(m for m in member_messages[-1] if m["message_id"] == opening_id)
+    assert opening_message["message_type"] == "user"
+    assert boundary_message["content"]["summary"] == opening_message["content"]["text"] == summary
+    result = aggregate | {"members": members, "latest_transcript_row_id": successor,
+        "persisted_rows": sum(map(len, member_messages)), "page_count": len(pages),
+        "occurrences": keys, "boundaries": latest["boundaries"], "manual_opening": opening}
+    if aggregate["kind"] == "global":
+        result["route"] = f"/global/{successor}"
+    return result
+
+
 def qualify(app, exe, output):
     h = shipping.load_app_harness(app)
     safe = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT") if k in os.environ}
@@ -125,8 +191,7 @@ def qualify(app, exe, output):
                             cwd = work / "cwd"
                             cwd.mkdir(mode=0o700)
                             aggregate = fixture.build(kind, cwd)
-                            predecessor = aggregate["members"][-1]
-                            fixture.send(predecessor, "[[scenario:context_window_exceeded]] [[ttft:0]]", True)
+                            aggregate = equal_text_fixture(fixture, aggregate)
                         finally:
                             fixture.client.close()
                         shipping.write_json(case / "fixture.json", aggregate)

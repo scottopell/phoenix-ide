@@ -111,6 +111,53 @@ class OpeningQualificationTests(unittest.TestCase):
                     raise RuntimeError("child failed")
             stop.assert_called_once_with(child)
 
+    def test_typed_exhausted_summary_preserves_exact_text(self):
+        summary = "  actual summary\nwith punctuation: \"quoted\" \u2603  "
+        self.assertEqual(opening.exhausted_summary(json.loads(json.dumps({
+            "type": "context_exhausted", "summary": summary}))), summary)
+
+    def test_exhausted_summary_rejects_invalid_or_guessed_shapes(self):
+        for state in [None, "context_exhausted", '{"type":"context_exhausted","summary":"x"}',
+                      [], {}, {"type": "idle", "summary": "x"},
+                      {"type": "context_exhausted"}, {"type": "context_exhausted", "summary": None},
+                      {"type": "context_exhausted", "summary": 42},
+                      {"type": "context_exhausted", "summary": ""},
+                      {"type": "context_exhausted", "summary": " \n"},
+                      {"ContextExhausted": {"summary": "x"}}]:
+            with self.subTest(state=state), self.assertRaises(ValueError):
+                opening.exhausted_summary(state)
+
+    def test_equal_text_post_and_sse_use_exact_persisted_summary(self):
+        from unittest.mock import Mock
+        fixture = Mock()
+        summary = "  actual summary\nnot FAST or fabricated  "
+        fixture.request.side_effect = [
+            {"conversation": {"state": {"type": "context_exhausted", "summary": summary}}},
+            {"status": "accepted", "conversation_id": "successor"},
+            RuntimeError("stop before member refresh")]
+        aggregate = {"members": ["old", "predecessor"]}
+        with patch.object(opening.shipping.uuid, "uuid4", return_value="key"):
+            with self.assertRaisesRegex(RuntimeError, "stop before member refresh"):
+                opening.equal_text_fixture(fixture, aggregate)
+        self.assertEqual(fixture.request.call_args_list[1].args, (
+            "POST", "/api/conversations/predecessor/continue", {"handoff": summary, "message_id": "key"}))
+        fixture.wait.assert_called_once_with("successor", message_id="successor:key")
+        self.assertEqual([call.args[0] for call in fixture.send.call_args_list], ["predecessor", "successor"])
+        self.assertTrue(all(call.args[2] is True for call in fixture.send.call_args_list))
+
+    def test_source_ast_keeps_fixture_refresh_before_browser_and_gate(self):
+        import ast
+        tree = ast.parse(Path(opening.__file__).read_text())
+        qualify = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "qualify")
+        calls = [node for node in ast.walk(qualify) if isinstance(node, ast.Call)]
+        refresh = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == "equal_text_fixture")
+        fixture_write = next(node for node in calls if isinstance(node.func, ast.Attribute)
+            and node.func.attr == "write_json" and 'fixture.json' in ast.unparse(node))
+        self.assertLess(refresh.lineno, fixture_write.lineno)
+        source = opening.SCRIPT.read_text()
+        self.assertLess(source.index('boundaryMessage.content.summary, openingMessage.content.text'),
+                        source.index("command: 'arm'"))
+
     def test_no_compiler_or_shipping_server_invocation(self):
         source = Path(opening.__file__).read_text()
         self.assertNotIn("h._server()", source)
