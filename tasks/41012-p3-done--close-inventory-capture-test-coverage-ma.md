@@ -53,3 +53,8 @@ orchestrator calls the same boundary before resource effects. This slice does
 not claim to test live Git deletion or host watcher shutdown; those are not
 inventory properties. Later work must cover evidence-to-effect sequencing at
 the production boundary rather than restore the broad integration fixture.
+
+The removed test also exercised handler-to-worktree cleanup and branch
+preservation. This inventory property deliberately does not claim that live
+qualification; it asserts the exact targets returned to production retirement
+instead. Separate adapter safety tests remain.

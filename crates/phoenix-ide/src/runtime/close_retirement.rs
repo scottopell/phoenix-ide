@@ -7594,7 +7594,7 @@ mod tests {
             "inventory must be incomplete before capture"
         );
 
-        let manager = super::RuntimeManager::new(
+        let mut manager = super::RuntimeManager::new(
             db.clone(),
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
             crate::platform::PlatformCapability::None {
@@ -7604,7 +7604,13 @@ mod tests {
             None,
         );
 
-        manager
+        manager.tmux_registry =
+            Arc::new(phoenix_tools::tmux::registry::TmuxRegistry::with_backend(
+                std::path::PathBuf::from("/inert/tmux"),
+                phoenix_tools::tmux::fake_backend::FakeTmuxBackend::unavailable(),
+                None,
+            ));
+        let prepared = manager
             .prepare_close_retirement_targets(&attempt_id, &snapshot)
             .await
             .expect("production capture must succeed from committed DB state alone");
@@ -7650,10 +7656,17 @@ mod tests {
             &LossItemIdentity::Worktree(worktree.clone())
         );
 
-        manager
+        assert_eq!(prepared, expected);
+        for target in &prepared {
+            assert_eq!(target.attempt_id, attempt_id);
+            assert_eq!(target.scope, scope);
+            assert_eq!(target.snapshot, snapshot);
+        }
+        let repeated = manager
             .prepare_close_retirement_targets(&attempt_id, &snapshot)
             .await
             .expect("repeat capture against the sealed snapshot must be idempotent");
+        assert_eq!(repeated, prepared);
         let expected_again = db
             .list_close_expected_retirement_resources(attempt_id.as_str())
             .await
