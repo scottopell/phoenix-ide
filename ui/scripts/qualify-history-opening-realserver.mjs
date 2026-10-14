@@ -992,7 +992,7 @@ async function run() {
         const box = node?.getBoundingClientRect();
         const identity = node?.getAttribute('data-message-id') ?? (node?.id?.startsWith('message-') ? node.id.slice('message-'.length) : null);
         return { url: window.location.href, browser_at_millis: Date.now(), count: nodes.length,
-          persistedMessageID: identity, visible: !!(box && view && box.width > 0 && box.height > 0
+          persistedMessageID: identity, visible: !!(node?.checkVisibility({ visibilityProperty: true }) && box && view && box.width > 0 && box.height > 0
             && box.bottom > view.top && box.top < view.bottom) };
       }, { selector: persistedMessageSelector(acceptedId) });
       const chapterReceiptUrl = chapterFinalPhysical.url;

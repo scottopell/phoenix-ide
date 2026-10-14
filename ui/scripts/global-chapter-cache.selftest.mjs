@@ -122,7 +122,8 @@ test('final receipt uses the actual atomic URL/identity/viewport producer after 
   const end = driver.indexOf(', { selector: persistedMessageSelector(acceptedId) });', start);
   assert.ok(start > 0 && end > start);
   const produce = new Function('document', 'window', `return (${driver.slice(start, end)});`);
-  const node = { id: `message-${id}`, getAttribute: () => null, getBoundingClientRect: () => ({ top: 10, bottom: 30, width: 100, height: 20 }) };
+  const node = { id: `message-${id}`, getAttribute: () => null, checkVisibility: options => options.visibilityProperty === true,
+    getBoundingClientRect: () => ({ top: 10, bottom: 30, width: 100, height: 20 }) };
   const document = { querySelectorAll: () => [node], querySelector: () => ({ getBoundingClientRect: () => ({ top: 0, bottom: 100 }) }) };
   const window = { location: { href: selection } };
   const callback = produce(document, window);
@@ -135,6 +136,11 @@ test('final receipt uses the actual atomic URL/identity/viewport producer after 
   document.querySelectorAll = () => [node, { ...node }];
   const duplicate = callback({ selector: 'exact-ID' });
   assert.throws(() => validateGlobalChapterSelection(a, evidence, duplicate.url, duplicate, new URL(changed.href).pathname));
+  window.location.href = selection;
+  document.querySelectorAll = () => [{ ...node, checkVisibility: () => false }];
+  const hidden = callback({ selector: 'exact-ID' });
+  assert.equal(hidden.visible, false);
+  assert.throws(() => validateGlobalChapterSelection(a, evidence, hidden.url, hidden, new URL(selection).pathname));
 });
 
 test('independent reference requires original projection at the real coordinator endpoint; retained Pending is not Accepted', () => {
