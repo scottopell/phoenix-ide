@@ -1,3 +1,4 @@
+import { captureDiagnostic, samplingDecision, initialFailure, requestFact } from './view-telemetry-diagnostics.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
@@ -651,12 +652,40 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
         const reports = [];
         const statuses = [];
         const captureErrors = [];
+        const diagnosticEvents = [];
+        const requestFacts = [];
+        const requestOwners = new Map();
+        let primaryError;
+        let diagnosticPhase = 'open';
         try {
+          await owned.exposeBinding('__phoenixViewDiagnostic', (_source, event) => {
+            if (diagnosticEvents.length >= 64) { if (!captureErrors.length) captureErrors.push('diagnostic event bound'); return; }
+            try { diagnosticEvents.push({ ...captureDiagnostic(event), observed_phase: diagnosticPhase }); }
+            catch { if (!captureErrors.length) captureErrors.push('invalid diagnostic event'); }
+          });
+          await owned.addInitScript(() => {
+            const pending = [];
+            let count = 0;
+            let deliveryFailed = false;
+            window.addEventListener('phoenix:view-diagnostic', event => {
+              if (count++ > 64) return;
+              pending.push(window.__phoenixViewDiagnostic(event.detail).catch(() => { deliveryFailed = true; }));
+            });
+            window.__phoenixViewDiagnosticDrain = async () => {
+              await Promise.all(pending);
+              if (deliveryFailed) throw new Error('producer diagnostic delivery failed');
+            };
+          });
           const candidate = await owned.newPage();
           const cdp = await owned.newCDPSession(candidate);
           await cdp.send('Performance.enable');
           await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
           candidate.on('request', request => {
+            const fact = requestFact(request, baseURL);
+            if (fact) {
+              if (requestFacts.length >= 32) { if (!captureErrors.length) captureErrors.push('request fact bound'); }
+              else { requestFacts.push({ ordinal: requestFacts.length, observed_phase: diagnosticPhase, ...fact }); requestOwners.set(request, requestFacts.at(-1)); }
+            }
             const url = new URL(request.url());
             if (url.origin === new URL(baseURL).origin && url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
               if (trial.posts >= 2) { if (!captureErrors.length) captureErrors.push('report count bound'); return; }
@@ -665,11 +694,18 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
               trial.payloadBytes += Buffer.byteLength(body);
               if (Buffer.byteLength(body) > 8192) { if (!captureErrors.length) captureErrors.push('report byte bound'); }
               else {
-                try { reports.push(captureReport(body, fixtures.forbidden ?? [])); } catch { if (!captureErrors.length) captureErrors.push('invalid or unsafe report JSON'); }
+                try {
+                  const report = captureReport(body, fixtures.forbidden ?? []);
+                  reports.push(report);
+                  const reportRequest = requestOwners.get(request);
+                  if (reportRequest) reportRequest.report_index = reports.length - 1;
+                } catch { if (!captureErrors.length) captureErrors.push('invalid or unsafe report JSON'); }
               }
-            } else if (url.origin === new URL(baseURL).origin && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/')) && url.searchParams.has('open_id')) requests.push(url.searchParams.get('open_id'));
+            } else if (url.origin === new URL(baseURL).origin && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/')) && url.searchParams.has('open_id')) { if (requests.length < 32) requests.push(url.searchParams.get('open_id')); else if (!captureErrors.length) captureErrors.push('correlated request bound'); }
           });
+          candidate.on('requestfailed', request => { const fact = requestOwners.get(request); if (fact) fact.request_failed = true; });
           candidate.on('response', response => {
+            const fact = requestOwners.get(response.request()); if (fact) fact.response_status = response.status();
             if (new URL(response.url()).origin === new URL(baseURL).origin && new URL(response.url()).pathname === '/api/telemetry/conversation-view' && statuses.length < 2) statuses.push(response.status());
           });
           const before = await cdp.send('Performance.getMetrics');
@@ -686,7 +722,11 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
           assert.deepEqual(captureErrors, []);
           trial.metrics = Object.fromEntries(after.metrics.filter(m => ['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'JSHeapUsedSize'].includes(m.name)).map(m => [m.name, m.value]));
           trial.metric_method = 'navigation-scoped post-readiness raw counters; no aboutblank subtraction';
-          trial.sampled = requests.length > 0;
+          await candidate.evaluate(() => window.__phoenixViewDiagnosticDrain());
+          assert.deepEqual(captureErrors, []);
+          const admission = samplingDecision(diagnosticEvents, aggregate.kind);
+          trial.sampled = admission.sampled;
+          trial.admitted_open_id = admission.open_id;
           trial.correlatedRequests = requests.length;
           if (trial.sampled) {
             const reportDeadline = Date.now() + 5000;
@@ -694,6 +734,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
             assert.equal(reports.length, 1, 'one sampled initial journey report required');
             assert.deepEqual(statuses, [204], 'actual collector acceptance required');
             const report = reports[0];
+            assert.equal(report.open_id, trial.admitted_open_id, 'report must belong to producer admission');
             negativeTemplate ??= report;
             assertRequestCorrelation(requests, report);
             assert.equal(report.outcome, 'ready');
@@ -724,16 +765,20 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
             result.capabilities.tab_visibility = result.visibilityWitness.status;
           }
           assert.ok(trial.posts <= 1, 'no per-frame or repeated POST');
-        } catch (error) { trial.failure = error.message; throw error; }
+        } catch (error) { primaryError = error; trial.failure = error.message; throw error; }
         finally {
           try {
+            diagnosticPhase = 'closing';
             await boundedObservation(owned.close(), 5000, 'initial context final drain');
+            trial.context_closed = true;
+            trial.close_time_producer_delivery = 'not_proven';
+            samplingDecision(diagnosticEvents, trial.route);
             assert.deepEqual(captureErrors, [], 'late initial capture failure');
             assert.equal(trial.posts, trial.sampled ? 1 : 0, 'late initial duplicate or unexpected POST');
             assert.equal(reports.length, trial.sampled ? 1 : 0);
             assert.deepEqual(statuses, trial.sampled ? [204] : []);
-          } catch (error) { trial.failure ??= error.message; throw error; }
-          finally { trial.reports = reports; result.trials.push(trial); }
+          } catch (error) { throw initialFailure(trial, primaryError, error); }
+          finally { trial.reports = reports; trial.response_statuses = statuses; trial.request_facts = requestFacts; trial.producer_events = diagnosticEvents; trial.capture_errors = captureErrors; result.trials.push(trial); }
         }
         if (Object.values(summarizeTrials(result.trials).strata).every(s => s.status === 'raw_cohorts_ready_for_review')) break;
       }
@@ -767,7 +812,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
     try {
       await boundedObservation(Promise.all([...ownedContexts].map(owned => owned.close())), 5000, 'outer context cleanup');
       if (result.failure && execution) await boundedObservation(execution.catch(() => {}), 5000, 'outer operation drain');
-    } catch { result.failure ??= 'outer cleanup or operation drain failed'; cleanupFailed = true; }
+    } catch { result.cleanup_failure = 'outer cleanup or operation drain failed'; result.failure ??= result.cleanup_failure; cleanupFailed = true; }
     writeFileSync(receiptPath, JSON.stringify(result, null, 2));
     if (cleanupFailed && !failedBeforeCleanup) throw new Error('outer cleanup or operation drain failed');
   }
