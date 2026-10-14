@@ -322,3 +322,18 @@ AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, 
 AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
 
 **Rationale:** Automatic continuation configuration is aggregate-scoped so a continuation cannot silently replace the configured identity, and its write response does not claim that existing exhausted work was scheduled.
+
+---
+
+### REQ-API-030: Local Task Approval Authority
+
+WHEN the owner approves the task represented by a local conversation's exact current `AwaitingTaskApproval` state
+THE SYSTEM SHALL require owner authentication on that same Phoenix server
+AND SHALL serialize the decision through conversation mutation admission
+AND SHALL require an active Git-backed WorkScope authority, task lifecycle admission, and a non-sub-agent runtime role
+AND SHALL preserve the submitted `continue_in_current_conversation` or `start_fresh_work_conversation` handoff choice without transferring or widening approval authority.
+
+WHEN the referenced conversation is foreign, absent, close-fenced, unavailable, in another state, lacks active Git-backed WorkScope authority, belongs to a sub-agent, or has already consumed the approval decision
+THE SYSTEM SHALL reject the request without emitting another approval decision.
+
+An accepted response SHALL mean that the approval decision was admitted to the local state machine. It SHALL NOT mean that task execution or completion succeeded. Federation peer credentials and remote owner Continue SHALL NOT grant task-approval authority.
