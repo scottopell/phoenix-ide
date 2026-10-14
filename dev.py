@@ -10227,7 +10227,11 @@ def _transaction_has_paired_manifest(transaction: Path) -> bool:
         return True
     except (OSError, json.JSONDecodeError):
         return True
-    return not isinstance(payload, dict) or payload.get("paired_database_upgrade") is not None
+    return (
+        not isinstance(payload, dict)
+        or payload.get("paired_database_upgrade") is not None
+        or payload.get("current_schema_upgrade") is not None
+    )
 
 
 def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transaction_id: str) -> None:

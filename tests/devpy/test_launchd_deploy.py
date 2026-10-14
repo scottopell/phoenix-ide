@@ -2116,14 +2116,32 @@ class PreparationTests(unittest.TestCase):
                 ordinary.mkdir()
                 (ordinary / "manifest.json").write_text(json.dumps({"paired_database_upgrade": None}))
                 os.utime(ordinary, (100 + i, 100 + i))
-            for name, content in (("paired", json.dumps({"paired_database_upgrade": {"backup_path": "private"}})), ("unreadable", "invalid-json"), ("unknown", None)):
+            for name, content in (
+                ("paired", json.dumps({"paired_database_upgrade": {"backup_path": "private"}})),
+                ("current", json.dumps({"current_schema_upgrade": {"backup_path": "private"}})),
+                ("unreadable", "invalid-json"),
+                ("unknown", None),
+            ):
                 transaction = root / name
                 transaction.mkdir()
                 if content is not None:
                     (transaction / "manifest.json").write_text(content)
                 os.utime(transaction, (1, 1))
             self.dev._prune_launchd_deploy_transactions(root, "current")
-            self.assertEqual(sorted(p.name for p in root.iterdir()), ["ordinary-3", "ordinary-4", "ordinary-5", "ordinary-6", "ordinary-7", "paired", "unknown", "unreadable"])
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir()),
+                [
+                    "current",
+                    "ordinary-3",
+                    "ordinary-4",
+                    "ordinary-5",
+                    "ordinary-6",
+                    "ordinary-7",
+                    "paired",
+                    "unknown",
+                    "unreadable",
+                ],
+            )
 
     def test_claim_release_is_transaction_owned(self):
         with tempfile.TemporaryDirectory() as td, \

@@ -582,10 +582,7 @@ def ordinary_forward_policy_applies(manifest: Manifest) -> bool:
     if ordinary is None:
         return False
     database = Path(ordinary.database_path)
-    try:
-        ledger = database_ledger(database)
-    except ActivationError:
-        return False
+    ledger = database_ledger(database)
     if not ledger or ledger[-1][0] != CURRENT_SCHEMA_BASELINE_VERSION:
         return False
     registry = verify_staged(
@@ -1783,6 +1780,7 @@ def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
         if state not in {"running", "active"} or pid is None:
             if not current_schema or state != "not_loaded":
                 raise ActivationError("committed candidate is not running")
+            assert_database_exclusive(manifest)
             launchctl.start(None, plist_path=str(private))
         require_loaded_plist(manifest, launchctl, private)
         wait_for_identity(manifest, manifest.expected)

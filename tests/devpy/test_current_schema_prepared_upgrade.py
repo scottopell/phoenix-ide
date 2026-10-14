@@ -350,6 +350,56 @@ sys.exit({7 if partial else 0})
         with self.assertRaisesRegex(helper.ActivationError, "context mismatch"):
             helper._snapshot_proof(manifest)
 
+    def test_unreadable_ordinary_ledger_fails_before_candidate_start(self) -> None:
+        database = self.database()
+        manifest = self.ordinary_manifest(database)
+        with mock.patch.object(
+            helper,
+            "database_ledger",
+            side_effect=helper.ActivationError("ledger unreadable"),
+        ), mock.patch.object(helper, "Launchctl") as launchctl:
+            with self.assertRaisesRegex(helper.ActivationError, "ledger unreadable"):
+                helper.activate(manifest)
+
+        launchctl.assert_not_called()
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+
+    def test_current_finalization_requires_exclusivity_before_start(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        helper.write_status(manifest, "committed", finalization_pending=True)
+
+        class StoppedCandidate:
+            def __init__(self) -> None:
+                self.started = 0
+
+            def inspect(self):
+                return "not_loaded", None
+
+            def start(self, old_pid, plist_path=None) -> None:
+                self.started += 1
+
+        launchctl = StoppedCandidate()
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        proof = {"migration_committed_at": "2026-01-01T00:00:00+00:00"}
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(helper.subprocess, "run", return_value=absence), mock.patch.object(
+            helper, "service_absence_confirmed", return_value=True
+        ), mock.patch.object(helper, "_snapshot_proof", return_value=proof), mock.patch.object(
+            helper, "validate_current_schema_database"
+        ), mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(
+            helper,
+            "assert_database_exclusive",
+            side_effect=helper.ActivationError("database owner remains"),
+        ):
+            with self.assertRaisesRegex(helper.ActivationError, "database owner remains"):
+                helper.finalize_paired(manifest, current_schema=True)
+
+        self.assertEqual(launchctl.started, 0)
+
     def test_ordinary_forward_failure_never_launches_incompatible_predecessor(self) -> None:
         database = self.database()
         manifest = self.ordinary_manifest(database)
