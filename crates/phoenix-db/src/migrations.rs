@@ -19456,7 +19456,8 @@ mod tests {
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
                     (126, 'temporarily_skip_wake_feature_retirement'),
-                    (127, 'temporarily_skip_coordinator_owned_work_scope_home')",
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
+                    (128, 'temporarily_skip_completed_continuation_intent_metadata')",
         )
         .execute(&pool)
         .await
