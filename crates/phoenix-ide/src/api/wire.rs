@@ -231,8 +231,8 @@ fn merge_bash_displays_into_content(content: &mut Value, display_data: &Value) {
 
 /// Wire-format `SseEvent`. Single source of truth for what each variant looks
 /// like on the `data:` line of an SSE frame. Every broadcast-side
-/// [`SseEvent`] goes through `From<SseEvent>` into `SseWireEvent` and then
-/// through `serde_json::to_string`.
+/// [`SseEvent`] is explicitly projected with event presentations into
+/// `SseWireEvent`, then serialized through `serde_json::to_string`.
 ///
 /// `#[serde(tag = "type", rename_all = "snake_case")]` puts the discriminant
 /// on the wire as the `type` field — matches the old `json!()` shape and what
@@ -477,6 +477,17 @@ impl SseWireEvent {
 }
 
 impl SseWireEvent {
+    /// Observability-only JSON size of the base event with redacted presentations.
+    /// Excludes database-backed private presentation data and SSE framing; this is
+    /// an approximation of delivery size, not a sendable wire projection.
+    pub(crate) fn replay_payload_size(event: &SseEvent) -> Result<usize, serde_json::Error> {
+        let wire = Self::with_presentations(
+            event.clone(),
+            &super::event_presentation::EventPresentations::redacted(),
+        );
+        serde_json::to_vec(&wire).map(|bytes| bytes.len())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn with_presentations(
         event: SseEvent,
@@ -856,12 +867,54 @@ impl From<&Message> for EnrichedMessage {
         super::event_presentation::EventPresentations::redacted().enrich(message)
     }
 }
-// Replay-ring byte accounting has no database access; HTTP uses with_presentations.
+#[cfg(test)]
 impl From<SseEvent> for SseWireEvent {
     fn from(event: SseEvent) -> Self {
         Self::with_presentations(
             event,
             &super::event_presentation::EventPresentations::redacted(),
         )
+    }
+}
+
+#[cfg(test)]
+mod replay_payload_size_tests {
+    use super::*;
+    use crate::api::event_presentation::{event_messages, EventPresentations};
+
+    #[test]
+    fn base_event_size_matches_serialized_fixture() {
+        let event = SseEvent::AgentDone { sequence_id: 17 };
+        let fixture: SseWireEvent = event.clone().into();
+        assert_eq!(
+            SseWireEvent::replay_payload_size(&event).unwrap(),
+            serde_json::to_vec(&fixture).unwrap().len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn accounting_excludes_private_projection_without_changing_event() {
+        let (db, mut messages) = super::super::event_presentation::tests::fixture(1).await;
+        let event = SseEvent::Message {
+            message: messages.remove(0),
+        };
+        let redacted: SseWireEvent = event.clone().into();
+        let redacted_json = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(
+            redacted_json["message"]["event_presentation"]["reason"],
+            "redacted"
+        );
+        let size = SseWireEvent::replay_payload_size(&event).unwrap();
+        assert_eq!(size, serde_json::to_vec(&redacted).unwrap().len());
+
+        let presentations = EventPresentations::load(&db, event_messages(&event)).await;
+        let projected = SseWireEvent::with_presentations(event.clone(), &presentations);
+        let projected_json = serde_json::to_value(&projected).unwrap();
+        assert_eq!(
+            projected_json["message"]["event_presentation"]["status"],
+            "available"
+        );
+        assert_ne!(size, serde_json::to_vec(&projected).unwrap().len());
+        assert_eq!(size, SseWireEvent::replay_payload_size(&event).unwrap());
     }
 }

@@ -1014,18 +1014,15 @@ impl ReplayRing {
         Some((self.anchor_seq, false, highest_present, replayed))
     }
 
-    /// Aggregate serialised JSON byte length across current ring entries.
-    /// Lazy / on-demand — iterates and serialises each entry via the
-    /// `SseWireEvent` conversion (matching the production wire path).
+    /// Aggregate base/redacted JSON byte length across current ring entries.
+    /// Lazy / on-demand; excludes database-backed private presentations and
+    /// SSE framing, so approximates delivery size.
     /// NOT a hot-path metric: call from the truncation log line or the
     /// `replay_ring_bytes()` ops accessor, not from per-event append.
     fn total_bytes(&self) -> usize {
         self.entries
             .iter()
-            .map(|e| {
-                let wire: crate::api::wire::SseWireEvent = e.event.clone().into();
-                serde_json::to_vec(&wire).map(|v| v.len()).unwrap_or(0)
-            })
+            .map(|e| crate::api::wire::SseWireEvent::replay_payload_size(&e.event).unwrap_or(0))
             .sum()
     }
 }
