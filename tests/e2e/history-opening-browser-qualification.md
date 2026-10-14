@@ -642,8 +642,9 @@ unchanged `pinned_source_transcript` and separately measured `physical_source_ro
 are both recorded; the latter may legitimately be a different historical member
 following the user's upward hardware wheel.
 
-The exact installed, self-contained DOM probe selects the first fully visible
-virtual row with a fully visible positive-size persisted-message descendant.
+The exact installed, self-contained DOM probe selects the first eligible fully
+visible virtual row with an unambiguous, fully visible positive-size
+persisted-message descendant in DOM order.
 It resolves an exact `data-message-id` or a DOM ID with only the documented outer
 `message-` wrapper removed against fixture occurrences. Source authority is the
 occurrence ordinal's known historical member, **never an ID-prefix/text guess**.
@@ -657,8 +658,10 @@ Failure to certify is a hard failure, within the retained20s prefix budget.
 Before release, the receipt includes virtual key/offset, exact persisted ID,
 source row, element ID/data-message-id, row/message/viewport bounds, URL, source
 pin and layout dimensions, four consecutive stable frames (≤2px), and
-`checkedGatePending`. Existing `anchor()` and virtual-key/offset `anchorMatches`
-remain in the acceptance/reconnect subsequence. Both checks additionally require
+`checkedGatePending`. Virtual-key/offset `anchorMatches` remains in the
+acceptance/reconnect subsequence; Global derives that key/offset from the same
+physical observer evaluation as the selected child, not a separate `anchor()`
+evaluation. Ordinary `anchor()` behavior is unchanged. Both checks additionally require
 the declared exact persisted child/source to remain physically visible with
 message offset≤2px; a surviving agent-group virtual key alone is insufficient.
 The prefix error is checked again after both. Fault restoration still occurs
@@ -688,3 +691,53 @@ remain runtime obligations. No runtime, browser, server, compiler/build, hosted
 dispatch, dependency change, UI writer, push or production action was performed.
 Shipping app d4 is unchanged. This is a locally tested harness correction, not a
 new runtime pass or retroactive qualification of3ec.
+
+
+## Physical-baseline ambiguity blocker correction (parent 5540239f2)
+
+Independent review of local554 was **not cleared**: the first provider attempt
+returned HTTP500; the explicit GPT5.6 Sol retry found a blocking ambiguity.
+The observer returned a first match without proving unique selected physical
+identity/key, and Global followup separately evaluated a generic anchor and a
+persisted child, potentially combining observations from recycled rows.
+
+The corrective successor selects the first eligible known historical candidate
+in DOM order among distinct visible messages. It does **not** require all known
+visible candidates collectively to number one. For the selected candidate,
+all document instances of its virtual key must be exactly one DOM row, and all
+wrapped-ID/data-message-id matches of its persisted ID must be exactly one
+physical element, that very descendant owned by the selected row. Element Sets
+deduplicate two exact attributes on one element but never aliases on separate
+nodes. Conflicting attributes still count against uniqueness. Hidden, offscreen,
+zero-height and outside-scroller duplicates count; followup cannot substitute
+another identity or accept the first of multiple matches.
+
+Renderer inspection found `UserMessage` has one wrapped DOM ID; `AgentMessage`
+puts its wrapped ID and data-message-id on the same element. Compact tool groups
+can have an ID on a wrapper and data-message-id on tool descendants. Those
+multiple physical nodes are deliberately ineligible, not false-green aliases;
+the observer may select the next unambiguous historical message instead. No
+renderer or shipping app d4 change, user-only restriction, runtime fixture fake,
+private control, timer relaxation, or generic-row fallback is introduced.
+
+Initial baseline and each of its four stable frames read key/row offset and
+child/identity/source/message offset in one synchronous page evaluation. Global
+acceptance/reconnect likewise use that one physical observer result for both
+virtual and persisted-child comparisons. Ordinary followup retains its existing
+generic anchor. The original four-frame/2px checks and prefix budget are intact.
+
+Bounded offline validation: **139 Node tests passed, zero skipped** (117 retained,
+22 added uniqueness/atomic-followup regressions), including exact retained3ec
+fixture mapping. All fabricated geometry is explicitly **UNIT ONLY**, not real
+browser-box proof. Three edited modules passed Node syntax checks; the Python
+opening wrapper passed all16 tests. The restricted offline single-worker
+`./dev.py check --lanes task,spec-shape,spec-anchors` passed task validation,
+spec shape, dev.py unit tests and spec anchors. `git diff --check` passed. Logs are
+harness-local under `.phoenix/evidence/continuous-history/physical-ambiguity554-offline/`.
+
+**Independent final exact-HEAD rereview is still required.** This records a
+blocking review followed by an implemented local correction, not reviewer
+clearance or runtime acceptance. No push, build/compiler, server/browser run,
+hosted dispatch, provider destruction, deployment or physical-device action.
+Actual runtime DOM uniqueness/stability and the existing acceptance/reconnect/
+cleanup obligations remain unperformed.

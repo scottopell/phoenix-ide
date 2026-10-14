@@ -34,9 +34,27 @@ export function observePhysicalHistoricalRow({ known, expected = null }) {
       && b.top >= clip.top && b.bottom <= clip.bottom && b.left >= clip.left && b.right <= clip.right;
   };
   const identities = new Map(known.map(k => [k.persistedMessageID, k.sourceRow]));
+  const allRows = [...document.querySelectorAll('[data-virtual-key]')];
+  const rowKeys = new Map();
+  for (const row of allRows) {
+    const key = row.dataset.virtualKey;
+    if (!rowKeys.has(key)) rowKeys.set(key, new Set());
+    rowKeys.get(key).add(row);
+  }
+  const identityElements = new Map();
+  for (const el of document.querySelectorAll('[id], [data-message-id]')) {
+    const id = el.getAttribute('id');
+    const wrappedID = id?.startsWith('message-') ? id.slice('message-'.length) : null;
+    // Count physical elements, including hidden/zero-size instances and conflicting aliases.
+    for (const identity of [wrappedID, el.getAttribute('data-message-id')]) {
+      if (!identity) continue;
+      if (!identityElements.has(identity)) identityElements.set(identity, new Set());
+      identityElements.get(identity).add(el);
+    }
+  }
   for (const row of scroller.querySelectorAll('[data-virtual-key]')) {
     const key = row.dataset.virtualKey, rowBounds = bounds(row);
-    if (!key || (expected && key !== expected.key) || !fullyVisible(row, rowBounds)) continue;
+    if (!key || rowKeys.get(key)?.size !== 1 || (expected && key !== expected.key) || !fullyVisible(row, rowBounds)) continue;
     for (const child of row.querySelectorAll('[id], [data-message-id]')) {
       if (child.closest('[data-virtual-key]') !== row) continue;
       // MessageList/MessageComponents wrap persisted IDs with exactly one `message-` for DOM IDs.
@@ -46,6 +64,8 @@ export function observePhysicalHistoricalRow({ known, expected = null }) {
       const persistedMessageID = dataMessageID || wrappedID;
       const sourceRow = identities.get(persistedMessageID);
       if (!sourceRow || (expected && (persistedMessageID !== expected.persistedMessageID || sourceRow !== expected.sourceRow))) continue;
+      const matches = identityElements.get(persistedMessageID);
+      if (matches?.size !== 1 || !matches.has(child)) continue;
       const messageBounds = bounds(child);
       if (!fullyVisible(child, messageBounds)) continue;
       return { key, offset: rowBounds.top - viewport.top, persistedMessageID, sourceRow,

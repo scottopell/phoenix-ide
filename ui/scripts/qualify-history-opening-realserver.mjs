@@ -658,8 +658,8 @@ async function run() {
   async function sameAnchor(before, label) {
     let frames = 0;
     const after = await poll(async () => { await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-      const value = await anchor(before.key);
       const physical = before.persistedMessageID ? await physicalRow(before) : null;
+      const value = before.persistedMessageID ? physical : await anchor(before.key);
       frames = anchorMatches(before, value) && (!before.persistedMessageID || physicalBaselineMatches(before, physical)) ? frames + 1 : 0;
       return frames >= 4 && { ...value, ...(physical ?? {}) }; }, label);
     checked(label, { before, after, tolerance_css_px: 2 });

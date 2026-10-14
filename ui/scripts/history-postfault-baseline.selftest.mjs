@@ -8,14 +8,23 @@ import { historicalMessageIdentities, observePhysicalHistoricalRow, holdPostFaul
 const fixture = { kind: 'global', members: ['root', 'middle'], occurrences: [[0, 2, 'root:known'], [1, 3, 'middle:known']] };
 const known = historicalMessageIdentities(fixture);
 const box = (top = 110, height = 50) => ({ top, bottom: top + height, height, left: 10, right: 310, width: 300 });
-function dom({ id = 'message-root:known', data = null, key = 'agent-group-unknown', childBox = box(120, 20), rowBox = box(), nested = false, hidden = false, empty = false, scrollTop = 0 } = {}) {
-  const row = { dataset: { virtualKey: key }, getBoundingClientRect: () => rowBox, getClientRects: () => [rowBox] };
-  const child = { getAttribute: name => name === 'id' ? id : data, getBoundingClientRect: () => childBox,
-    getClientRects: () => [childBox], closest: () => nested ? {} : row };
-  row.querySelectorAll = () => empty ? [] : [child];
-  const scroller = { getBoundingClientRect: () => box(100, 729), querySelectorAll: () => [row], scrollTop, scrollHeight: 21806, clientHeight: 729 };
-  const context = { document: { querySelector: () => scroller }, innerHeight: 900, innerWidth: 1360,
-    getComputedStyle: () => ({ display: 'block', visibility: hidden ? 'hidden' : 'visible' }),
+function dom(options = {}) {
+  const { scrollTop = 0, extraRows = [], outsideChildren = [] } = options;
+  const makeRow = ({ id = 'message-root:known', data = null, key = 'agent-group-unknown', childBox = box(120, 20), rowBox = box(), nested = false, hidden = false, empty = false, children = null } = {}) => {
+    const row = { dataset: { virtualKey: key }, hidden, getBoundingClientRect: () => rowBox, getClientRects: () => [rowBox] };
+    const makeChild = ({ id: childID = id, data: childData = data, childBox: b = childBox, hidden: childHidden = hidden } = {}) => ({
+      getAttribute: name => name === 'id' ? childID : childData, getBoundingClientRect: () => b,
+      hidden: childHidden, getClientRects: () => [b], closest: () => nested ? {} : row,
+    });
+    row.children = empty ? [] : children ? children.map(makeChild) : [makeChild()];
+    row.querySelectorAll = () => row.children;
+    return row;
+  };
+  const rows = [makeRow(options), ...extraRows.map(makeRow)];
+  const allChildren = [...rows.flatMap(row => row.children), ...outsideChildren.map(({ id, data = null }) => ({ getAttribute: name => name === 'id' ? id : data }))];
+  const scroller = { getBoundingClientRect: () => box(100, 729), querySelectorAll: () => rows, scrollTop, scrollHeight: 21806, clientHeight: 729 };
+  const context = { document: { querySelector: () => scroller, querySelectorAll: selector => selector === '[data-virtual-key]' ? rows : allChildren }, innerHeight: 900, innerWidth: 1360,
+    getComputedStyle: el => ({ display: 'block', visibility: el.hidden ? 'hidden' : 'visible' }),
     location: { href: 'http://127.0.0.1:123/global/root?source_transcript=middle#message-middle%3Aknown' }, URL };
   return expected => runInNewContext(`(${observePhysicalHistoricalRow.toString()})`, context)({ known, expected });
 }
@@ -77,7 +86,7 @@ test('driver declares postfault baseline before release and retains independent 
   assert.match(action, /checkedGatePending: true/); assert.match(action, /gate.releaseAttempted, false/);
   assert.match(action, /const before = a.kind === 'global' \? postfaultbaseline/);
   assert.doesNotMatch(action, /savedTop|scrollIntoView|scrollTop\s*=|__react|dispatchEvent/);
-  assert.match(source, /const value = await anchor\(before.key\)/);
+  assert.match(source, /const value = before.persistedMessageID \? physical : await anchor\(before.key\)/);
   assert.match(source, /anchorMatches\(before, value\)/); assert.match(source, /physicalBaselineMatches\(before, physical\)/);
   assert.match(source, /await sameAnchor\(before, 'acceptance retains physical anchor'\)/);
   assert.match(source, /await sameAnchor\(before, 'reconnect retains physical anchor'\)/);
@@ -93,4 +102,66 @@ test('actual3ec retained fixture maps every exact persisted ID to its known hist
     assert.equal(identity.sourceRow, a.members[a.occurrences[i][0]]);
   });
   assert.ok(identities.some(identity => !identity.persistedMessageID.includes(':')));
+});
+
+const duplicateCases = {
+  children_same_wrapped_ID: { children: [{}, {}] },
+  children_same_data_ID: { children: [{}, { id: null, data: 'root:known' }] },
+  matching_rows_same_key: { extraRows: [{}] },
+  empty_row_same_key: { extraRows: [{ empty: true }] },
+  same_ID_other_row: { extraRows: [{ key: 'other-row' }] },
+  hidden_recycled_row_same_key: { extraRows: [{ id: 'message-foreign:known', hidden: true }] },
+  zero_height_recycled_child_same_ID: { children: [{}, { childBox: box(120, 0) }] },
+  conflicting_alias_elsewhere: { outsideChildren: [{ id: 'message-middle:known', data: 'root:known' }] },
+};
+for (const [name, options] of Object.entries(duplicateCases)) {
+  test(`initial physical selection rejects duplicate ${name}`, () => assert.equal(dom(options)(), null));
+  test(`expected physical selection rejects duplicate ${name}`, () => assert.equal(dom(options)(dom()()), null));
+}
+
+test('many distinct visible known candidates deterministically choose first in DOM order', () => {
+  const first = dom({ extraRows: [{ id: 'message-middle:known', key: 'second' }] })();
+  assert.equal(first.persistedMessageID, 'root:known');
+  assert.equal(first.key, 'agent-group-unknown');
+  const reversed = dom({ id: 'message-middle:known', key: 'first', extraRows: [{ key: 'second' }] })();
+  assert.equal(reversed.persistedMessageID, 'middle:known');
+});
+
+test('one element with both exact identity attributes counts once, initially and in followup', () => {
+  const read = dom({ data: 'root:known' });
+  const first = read();
+  assert.equal(first.persistedMessageID, 'root:known');
+  assert.ok(physicalBaselineMatches(first, read(first)));
+});
+
+test('first eligible unambiguous candidate skips duplicated identity but followup cannot substitute', () => {
+  const read = dom({ children: [{}, {}], extraRows: [{ key: 'second', id: 'message-middle:known' }] });
+  assert.equal(read().persistedMessageID, 'middle:known');
+  assert.equal(read(dom()()), null);
+});
+
+test('zero-height duplicate row key rejects despite distinct identity', () => {
+  const read = dom({ extraRows: [{ id: 'message-middle:known', rowBox: box(110, 0) }] });
+  assert.equal(read(), null); assert.equal(read(dom()()), null);
+});
+
+for (const physicalCase of [true, false]) test(`sameAnchor observes ${physicalCase ? 'Global physical' : 'ordinary generic'} anchor without mixed evaluations`, async () => {
+  const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('  async function sameAnchor(before, label) {');
+  const end = source.indexOf('  const composerReadonly', start);
+  const before = physicalCase ? dom()() : { key: 'ordinary-key', offset: 10 };
+  let physicalReads = 0, genericReads = 0, frames = 0, receipt;
+  const sameAnchor = runInNewContext(`(${source.slice(start, end).trim()})`, {
+    page: { evaluate: async () => { frames++; }, locator: () => ({ filter: () => ({ waitFor: async () => {} }) }) },
+    physicalRow: async expected => { physicalReads++; assert.equal(expected, before); return dom()(expected); },
+    anchor: async key => { genericReads++; assert.equal(key, before.key); assert.equal(physicalCase, false, 'generic recycled row must never mix with physical child'); return before; },
+    anchorMatches: (b, a) => !!a && b.key === a.key && Math.abs(b.offset - a.offset) <= 2,
+    physicalBaselineMatches, GLOBAL_PREFIX_ERROR_TEXT: 'error',
+    poll: async fn => { for (let i = 0; i < 4; i++) { const result = await fn(); if (result) return result; } assert.fail('four stable observations required'); },
+    checked: (_, value) => { receipt = value; },
+  });
+  await sameAnchor(before, 'unit atomic observer');
+  assert.equal(frames, 4); assert.equal(physicalReads, physicalCase ? 4 : 0); assert.equal(genericReads, physicalCase ? 0 : 4);
+  assert.equal(receipt.after.key, before.key);
+  if (physicalCase) assert.ok(physicalBaselineMatches(before, receipt.after));
 });
