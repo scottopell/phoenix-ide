@@ -317,6 +317,27 @@ mod tests {
     }
 
     #[test]
+    fn phoenix_api_embeds_authorized_ssh_remote_local_contract() {
+        let skill = embedded_skill("phoenix-api").unwrap();
+        let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
+
+        assert!(skill.contains("local WorkScope authorizes transport execution"));
+        assert!(skill.contains("verified host-key SSH"));
+        assert!(skill.contains("destination process memory"));
+        assert!(reference.contains("User-authorized SSH remote-local transport"));
+        assert!(reference.contains("StrictHostKeyChecking=yes"));
+        assert!(reference.contains("EnvironmentVariables.PHOENIX_PASSWORD"));
+        assert!(reference.contains("remote loopback (`127.0.0.1` or `[::1]`)"));
+        assert!(reference.contains("never substitutes for destination lifecycle authority"));
+        assert!(reference
+            .contains("does not require the local WorkScope to belong to the destination server"));
+        assert!(reference.contains("same message identity and exact intent"));
+        assert!(reference.contains("Never redirect, fall back locally"));
+        assert!(!reference.contains("StrictHostKeyChecking=no"));
+        assert!(!reference.contains("sshpass"));
+    }
+
+    #[test]
     fn extract_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         extract_to(tmp.path()).unwrap();
