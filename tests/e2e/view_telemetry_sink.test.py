@@ -12,8 +12,8 @@ import time
 import urllib.request
 import urllib.error
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
-from unittest.mock import patch
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 
 spec = importlib.util.spec_from_file_location("sink", Path(__file__).with_name("view_telemetry_sink.py"))
@@ -181,6 +181,147 @@ class SinkTests(unittest.TestCase):
             finally:
                 process.terminate()
                 process.communicate(timeout=3)
+
+    def test_optional_lifetime_validation_precedes_receiver_creation(self):
+        with patch.object(sink, "make_server") as create:
+            for invalid in (True, False, 0, -1, 651, 300.0, "650", None):
+                with self.subTest(lifetime=invalid), self.assertRaises(ValueError):
+                    with sink.telemetry_sink("unused", "run", lifetime_seconds=invalid):
+                        self.fail("invalid lifetime admitted")
+            create.assert_not_called()
+
+    def test_receiver_lifetime_liveness_and_expiration_without_network(self):
+        for lifetime in (None, 650):
+            for expired in (False, True):
+                with self.subTest(lifetime=lifetime, expired=expired), tempfile.TemporaryDirectory() as directory:
+                    alive = [False]
+                    server = Mock(server_port=12345)
+                    server.shutdown.side_effect = lambda: alive.__setitem__(0, False)
+                    thread = Mock()
+                    thread.start.side_effect = lambda: alive.__setitem__(0, True)
+                    thread.is_alive.side_effect = lambda: alive[0]
+                    timer = Mock()
+                    timer.is_alive.return_value = False
+                    with patch.object(sink, "make_server", return_value=server), patch.object(sink.threading, "Thread", return_value=thread), patch.object(sink.threading, "Timer", return_value=timer) as clock:
+                        kwargs = {} if lifetime is None else {"lifetime_seconds": lifetime}
+                        with sink.telemetry_sink(directory, "lifetime", **kwargs) as handle:
+                            self.assertEqual(clock.call_args.args[0], 300 if lifetime is None else lifetime)
+                            self.assertTrue(handle.is_serving())
+                            self.assertFalse(handle.expired)
+                            if expired:
+                                clock.call_args.args[1]()
+                                self.assertFalse(handle.is_serving())
+                                self.assertTrue(handle.expired)
+                                self.assertIn("receiver_lifetime_expired", json.loads((handle.output / "capture.json").read_text())["errors"])
+                                with self.assertRaises(ValueError):
+                                    sink.final_index(handle.output)
+                            else:
+                                # Caller observes this after normal app stop, before receiver exit.
+                                self.assertTrue(handle.is_serving())
+                        self.assertFalse(handle.is_serving())
+                        self.assertEqual(handle.expired, expired)
+                        timer.cancel.assert_called_once()
+                        server.server_close.assert_called_once()
+                        thread.join.assert_called_once()
+                        timer.join.assert_called_once()
+                        self.assertTrue(0 <= thread.join.call_args.kwargs["timeout"] <= 4)
+                        self.assertTrue(0 <= timer.join.call_args.kwargs["timeout"] <= 4)
+
+    def test_expiry_callback_is_drained_before_final_persistence_without_network(self):
+        real_thread = sink.threading.Thread
+        entered = sink.threading.Event()
+        release = sink.threading.Event()
+        joining = sink.threading.Event()
+        exited = sink.threading.Event()
+        failures = []
+        writes = []
+        original_finish = sink.Capture.finish
+
+        def finish(capture):
+            if sink.threading.current_thread().name == "controlled-expiry":
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError("test expiry release deadline")
+            original_finish(capture)
+            writes.append(sink.threading.current_thread().name)
+
+        class Timer:
+            daemon = True
+            def __init__(self, seconds, callback):
+                self.worker = real_thread(target=callback, name="controlled-expiry")
+            def start(self):
+                self.worker.start()
+            def cancel(self):
+                pass  # Cancellation cannot stop an already-running callback.
+            def join(self, timeout):
+                joining.set()
+                self.worker.join(timeout)
+            def is_alive(self):
+                return self.worker.is_alive()
+
+        with tempfile.TemporaryDirectory() as directory:
+            serving = Mock()
+            serving.is_alive.return_value = False
+            server = Mock(server_port=12345)
+            def own_context():
+                try:
+                    with sink.telemetry_sink(directory, "callback-drain"):
+                        if not entered.wait(3):
+                            raise RuntimeError("test callback admission deadline")
+                except Exception as error:
+                    failures.append(error)
+                finally:
+                    exited.set()
+            with patch.object(sink, "make_server", return_value=server), patch.object(sink.threading, "Thread", return_value=serving), patch.object(sink.threading, "Timer", Timer), patch.object(sink.Capture, "finish", finish):
+                owner = real_thread(target=own_context, name="controlled-owner")
+                owner.start()
+                try:
+                    self.assertTrue(joining.wait(3))
+                    self.assertFalse(exited.is_set(), "owner must wait for active expiry write")
+                finally:
+                    release.set()
+                    owner.join(3)
+                self.assertFalse(owner.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(writes, ["controlled-expiry", "controlled-owner"])
+                index = json.loads((Path(directory) / "view-telemetry-callback-drain" / "capture.json").read_text())
+                self.assertEqual(index["errors"], ["receiver_lifetime_expired"])
+
+    def test_transport_rejection_serializes_with_expiry_persistence_without_network(self):
+        entered = sink.threading.Event()
+        lock = sink.threading.Lock()
+        class ObservedLock:
+            def __enter__(self):
+                entered.set()
+                lock.acquire()
+            def __exit__(self, *_):
+                lock.release()
+        with tempfile.TemporaryDirectory() as directory:
+            capture = sink.Capture(Path(directory) / "capture")
+            capture.lock = ObservedLock()
+            with patch.object(sink, "HTTPServer") as create:
+                sink.make_server(capture)
+            handler_type = create.call_args.args[1]
+            handler = object.__new__(handler_type)
+            handler.connection = Mock()
+            handler.headers = {"Content-Length": str(sink.MAX_BODY + 1)}
+            handler.send_error = Mock()
+            lock.acquire()  # Simulate expiry retaining the shared persistence lock.
+            worker = sink.threading.Thread(target=handler.do_POST)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                self.assertEqual(capture.errors, [])
+                handler.send_error.assert_not_called()
+                capture.errors.append("receiver_lifetime_expired")
+                capture.finish()
+            finally:
+                lock.release()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            handler.send_error.assert_called_once_with(400, "bounded synthetic export rejected")
+            self.assertEqual(capture.errors, ["receiver_lifetime_expired"])
+            self.assertEqual(json.loads((capture.output / "capture.json").read_text())["errors"], capture.errors)
 
     def test_context_contract_isolated_env_semantic_receipt_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:

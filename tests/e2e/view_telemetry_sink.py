@@ -228,9 +228,10 @@ def make_server(capture):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
             except Exception:
-                if not capture.errors:
-                    capture.errors.append("transport_rejected")
-                    capture.finish()
+                with capture.lock:
+                    if not capture.errors:
+                        capture.errors.append("transport_rejected")
+                        capture.finish()
                 self.send_error(400, "bounded synthetic export rejected")
     return HTTPServer(("127.0.0.1", 0), Handler)
 
@@ -255,6 +256,16 @@ class TelemetrySink:
     endpoint: str
     service: str
     output: Path
+    _thread: threading.Thread
+    _expired: threading.Event
+    _closed: threading.Event
+
+    @property
+    def expired(self):
+        return self._expired.is_set()
+
+    def is_serving(self):
+        return self._thread.is_alive() and not self.expired and not self._closed.is_set()
 
     @property
     def env(self):
@@ -280,6 +291,8 @@ class TelemetrySink:
                 raise ValueError("missing candidate expectation identity")
         deadline = time.monotonic() + timeout
         while True:
+            if not self.is_serving():
+                raise ValueError("receiver not serving through app drain")
             try:
                 index = final_index(self.output)
                 retrieved = []
@@ -296,28 +309,47 @@ class TelemetrySink:
 
 
 @contextmanager
-def telemetry_sink(output_dir, run_id):
+def telemetry_sink(output_dir, run_id, *, lifetime_seconds=300):
     """Existing harness owns app/export drain; this context owns only loopback receiver."""
+    if type(lifetime_seconds) is not int or not 1 <= lifetime_seconds <= 650:
+        raise ValueError("invalid receiver lifetime")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", run_id):
         raise ValueError("invalid synthetic run identity")
     capture = Capture(Path(output_dir) / f"view-telemetry-{run_id}")
     server = make_server(capture)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    stop = threading.Timer(300, server.shutdown)
+    expired = threading.Event()
+    closed = threading.Event()
+
+    def expire():
+        expired.set()
+        try:
+            with capture.lock:
+                if "receiver_lifetime_expired" not in capture.errors:
+                    capture.errors.append("receiver_lifetime_expired")
+                capture.finish()
+        finally:
+            server.shutdown()
+
+    stop = threading.Timer(lifetime_seconds, expire)
     stop.daemon = True
     stop.start()
-    handle = TelemetrySink(f"http://127.0.0.1:{server.server_port}/v1/traces", f"phoenix-view-qualification-{run_id}", capture.output)
+    handle = TelemetrySink(f"http://127.0.0.1:{server.server_port}/v1/traces", f"phoenix-view-qualification-{run_id}", capture.output, thread, expired, closed)
     try:
         yield handle
     finally:
+        closed.set()
         stop.cancel()
         server.shutdown()
+        deadline = time.monotonic() + 4
+        stop.join(timeout=max(0, deadline - time.monotonic()))
+        thread.join(timeout=max(0, deadline - time.monotonic()))
         server.server_close()
-        thread.join(timeout=4)
-        capture.finish()
-        if thread.is_alive():
+        if stop.is_alive() or thread.is_alive():
             raise RuntimeError("sink teardown deadline exceeded")
+        with capture.lock:
+            capture.finish()
 
 
 if __name__ == "__main__":
