@@ -144,6 +144,17 @@ class OpeningQualificationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             scope["_resolve_check_lanes"](gate=False, lanes="ui")
 
+    def test_owned_home_fixture_is_executed_not_only_compiled_by_codegen(self):
+        workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()
+        start = workflow.index("      - name: Execute owned Coordinator continuation admission fixture")
+        end = workflow.index("      - name: Verify and retain instrumented libtest", start)
+        step = workflow[start:end]
+        self.assertIn("'cargo','test','-p','phoenix-db','coordinator_continuation_commit_admits_automatic_work'", step)
+        self.assertIn("'1 passed; 0 failed'", step)
+        self.assertIn("completed.returncode == 0", step)
+        self.assertIn("opening-coordinator-home-fixture.log", workflow[end:])
+        self.assertIn("opening-coordinator-home-fixture-receipt.json", workflow[end:])
+
     def test_each_identity_dimension_fails_closed(self):
         for key in self.value:
             saved = self.value[key]

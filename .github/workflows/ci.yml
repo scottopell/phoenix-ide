@@ -274,6 +274,26 @@ jobs:
               'cargo_lock_sha256': hashlib.sha256((root/'Cargo.lock').read_bytes()).hexdigest(),
               'codegen_command': './dev.py codegen', 'generated_files': files}, indent=2))
           PY
+      - name: Execute owned Coordinator continuation admission fixture
+        shell: bash
+        working-directory: pinned-app
+        run: |
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+          command=['cargo','test','-p','phoenix-db','coordinator_continuation_commit_admits_automatic_work','--','--nocapture','--test-threads=1']
+          completed=subprocess.run(command,capture_output=True,text=True,timeout=900)
+          out=Path.cwd().parent
+          (out/'opening-coordinator-home-fixture.log').write_text(completed.stdout+completed.stderr)
+          git=lambda *args:subprocess.check_output(['git',*args],text=True).strip()
+          (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
+              'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
+              'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+              'command':command,'exit_status':completed.returncode,
+              'scope':'actual DB owned-home continuation admission test, not app/browser qualification'},indent=2))
+          assert completed.returncode == 0, 'owned Coordinator fixture failed; see retained log'
+          assert '1 passed; 0 failed' in completed.stdout, completed.stdout
+          PY
       - name: Verify and retain instrumented libtest executable (not shipping runtime)
         shell: bash
         working-directory: pinned-app
@@ -385,6 +405,8 @@ jobs:
           path: |
             opening-codegen-receipt.json
             opening-codegen.log
+            opening-coordinator-home-fixture.log
+            opening-coordinator-home-fixture-receipt.json
             pinned-app/ui/src/generated/
             opening-instrumented-libtest
             opening-instrumented-receipt.json
