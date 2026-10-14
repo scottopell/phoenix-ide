@@ -363,6 +363,84 @@ pub enum ProductConversationCloseUnavailableReasonView {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
+#[allow(clippy::struct_field_names)]
+pub struct ContinuationOpeningEdgeView {
+    pub product_conversation_id: String,
+    pub predecessor_transcript_row_id: String,
+    pub successor_transcript_row_id: String,
+    pub continuation_message_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ContinuationOpeningPresentationView {
+    Boundary,
+    SeparateMessage,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ContinuationOpeningView {
+    None,
+    Pending {
+        edge: ContinuationOpeningEdgeView,
+        client_turn_key: String,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    },
+    Accepted {
+        edge: ContinuationOpeningEdgeView,
+        accepted_message_id: String,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+        presentation: ContinuationOpeningPresentationView,
+    },
+}
+
+impl From<crate::db::ContinuationOpeningRead> for ContinuationOpeningView {
+    fn from(read: crate::db::ContinuationOpeningRead) -> Self {
+        use crate::db::{ContinuationOpeningPresentation, ContinuationOpeningRead};
+        let edge_view = |edge: crate::db::ContinuationOpeningEdge| ContinuationOpeningEdgeView {
+            product_conversation_id: edge.product_conversation_id.to_string(),
+            predecessor_transcript_row_id: edge.predecessor_transcript_row_id,
+            successor_transcript_row_id: edge.successor_transcript_row_id,
+            continuation_message_id: edge.continuation_message_id,
+        };
+        match read {
+            ContinuationOpeningRead::None => Self::None,
+            ContinuationOpeningRead::Pending {
+                edge,
+                client_turn_key,
+                opening_authority,
+            } => Self::Pending {
+                edge: edge_view(edge),
+                client_turn_key: client_turn_key.to_string(),
+                opening_authority,
+            },
+            ContinuationOpeningRead::Accepted {
+                edge,
+                accepted_message_id,
+                opening_authority,
+                presentation,
+            } => Self::Accepted {
+                edge: edge_view(edge),
+                accepted_message_id,
+                opening_authority,
+                presentation: match presentation {
+                    ContinuationOpeningPresentation::Boundary => {
+                        ContinuationOpeningPresentationView::Boundary
+                    }
+                    ContinuationOpeningPresentation::SeparateMessage => {
+                        ContinuationOpeningPresentationView::SeparateMessage
+                    }
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationSnapshotMetadataView {
     pub product_conversation_id: String,
     pub close: Option<ProductConversationCloseView>,
@@ -372,7 +450,7 @@ pub struct ProductConversationSnapshotMetadataView {
     pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
     pub latest_transcript_row_id: String,
     pub writable_transcript_row_id: Option<String>,
-    pub latest_opening_pending: bool,
+    pub latest_opening: ContinuationOpeningView,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
     pub work_identity: Option<ProductConversationWorkIdentityView>,
@@ -432,7 +510,7 @@ pub struct CoordinatorConversationSnapshotView {
     pub canonical_root: ProductConversationTranscriptRowView,
     pub latest_transcript_row_id: String,
     pub writable_transcript_row_id: Option<String>,
-    pub latest_opening_pending: bool,
+    pub latest_opening: ContinuationOpeningView,
     pub updated_at: String,
     pub segments: Vec<ConversationHistorySegmentView>,
     pub boundaries: Vec<ConversationHistoryBoundaryView>,

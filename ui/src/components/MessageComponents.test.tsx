@@ -240,7 +240,7 @@ function emitInit(
   conversation: unknown = baseConversation,
   replay: { anchor: number; tip: number } = { anchor: 100, tip: 100 },
 ) {
-  source.emit('init', {
+  source.emit('init', { opening: null,
     type: 'init',
     sequence_id: 100,
     transcript_generation: 1,
@@ -3117,7 +3117,7 @@ describe('SubAgentStatus inline activity', () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
     act(() => {
       emitInit(FakeEventSource.instances[0]!, [], [], childConversation);
-      FakeEventSource.instances[0]!.emit('message', {
+      FakeEventSource.instances[0]!.emit('message', { opening: null,
         sequence_id: 101,
         message: {
           message_id: 'child-live-message',
@@ -3167,7 +3167,7 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{
+    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{ opening: null,
       type: 'message',
       sequence_id: pendingTool.sequence_id,
       message: { ...pendingTool, origin: { kind: 'unknown_historical' } },
@@ -3200,7 +3200,7 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => FakeEventSource.instances[0]!.emit('error', {
+    act(() => FakeEventSource.instances[0]!.emit('error', { opening: null,
       type: 'error',
       sequence_id: 2,
       message: 'Child auth expired',

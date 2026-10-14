@@ -315,7 +315,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
           eventSourceInitCount += 1;
           record('EventSourceInits', eventSourceInitCount);
           record('EventSourceLastInitializedInstance', this.instanceId);
-          const init = {
+          const init = { opening: null,
             sequence_id: 1,
             conversation: this.isSource ? sourceConversation : conversation,
             transcript_generation: 1,

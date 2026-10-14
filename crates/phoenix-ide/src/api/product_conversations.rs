@@ -546,8 +546,8 @@ async fn get_coordinator_history_snapshot(
         .conversation;
     let writable = (accepts_user_message_direct_or_steering(&latest.state)
         && latest.continued_in_conv_id.is_none()
-        && !snapshot.latest_opening_pending)
-        .then(|| latest.id.clone());
+        && !snapshot.latest_opening.is_pending())
+    .then(|| latest.id.clone());
     Ok(Json(CoordinatorConversationSnapshotView {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: format!("/global/{}", aggregate.latest_transcript_row_id),
@@ -559,7 +559,7 @@ async fn get_coordinator_history_snapshot(
         },
         latest_transcript_row_id: aggregate.latest_transcript_row_id.clone(),
         writable_transcript_row_id: writable,
-        latest_opening_pending: snapshot.latest_opening_pending,
+        latest_opening: snapshot.latest_opening.into(),
         updated_at: aggregate.updated_at.to_rfc3339(),
         segments: aggregate
             .segments
@@ -794,7 +794,7 @@ async fn snapshot_view(
 ) -> Result<OrdinarySnapshotResponse, AppError> {
     let crate::db::ProductConversationSnapshotRead {
         mut aggregate,
-        latest_opening_pending,
+        latest_opening,
         close,
         requested_transcript_row_id,
         messages: page,
@@ -803,7 +803,7 @@ async fn snapshot_view(
         .product_conversation
         .ordinary_lifecycle()
         .expect("ordinary aggregate read returned Coordinator");
-    let writable = close.is_none() && !latest_opening_pending;
+    let writable = close.is_none() && !latest_opening.is_pending();
     let close = match close {
         Some(projection) => {
             use phoenix_core::domain::close::CloseCompletionOutcome;
@@ -869,7 +869,7 @@ async fn snapshot_view(
         } else {
             None
         },
-        latest_opening_pending,
+        latest_opening: latest_opening.into(),
         updated_at: aggregate.updated_at.to_rfc3339(),
         presentation: presentation(
             root_title,
@@ -2524,7 +2524,7 @@ mod tests {
                 serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                     .unwrap();
             assert_eq!(pending["latest_transcript_row_id"], successor.id);
-            assert_eq!(pending["latest_opening_pending"], true);
+            assert_eq!(pending["latest_opening"]["status"], "pending");
             assert!(pending["writable_transcript_row_id"].is_null());
             state
                 .db
@@ -2555,7 +2555,7 @@ mod tests {
             let ready: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                     .unwrap();
-            assert_eq!(ready["latest_opening_pending"], false);
+            assert_eq!(ready["latest_opening"]["status"], "accepted");
             assert_eq!(ready["writable_transcript_row_id"], successor.id);
             assert_eq!(
                 ready["boundaries"][0]["represented_successor_opening_message_id"],

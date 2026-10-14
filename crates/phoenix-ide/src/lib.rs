@@ -3,12 +3,17 @@
 //! A Rust backend implementing a conversation state machine for
 //! interacting with LLM agents.
 
+#[cfg(test)]
+#[path = "opening_qualifier_tests.rs"]
+mod opening_qualifier;
+
 mod analytics;
 mod api;
 mod chain_qa;
 mod chain_runtime;
 mod continuation_service;
 mod conversation_cwd;
+mod coordinator_home;
 mod coordinator_tools;
 mod coordinator_watch_delivery;
 mod discovery;
@@ -725,6 +730,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(path = %db_path, "Opening database");
     let db = open_database_with_migrations(&runtime_env).await?;
+    coordinator_home::initialize(&db, &runtime_env)
+        .await
+        .map_err(std::io::Error::other)?;
     db.clear_direct_turn_retirements().await?;
     let terminal_obligated_conversations = db.terminal_obligated_conversation_ids().await?;
     db.abandon_all_unactivated_sub_agent_batches(chrono::Utc::now())

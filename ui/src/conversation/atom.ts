@@ -1,4 +1,6 @@
 import * as v from 'valibot';
+import type { ContinuationOpeningView } from '../generated/ContinuationOpeningView';
+import { reconcileOpening } from './opening';
 import type { ConversationState, Message, Conversation, QueuedSteeringMessage } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
 import type { BashToolProgress } from '../generated/sse';
@@ -75,6 +77,7 @@ export interface PendingMessagePatchState {
 }
 
 export interface ConversationAtom {
+  opening: ContinuationOpeningView | null;
   conversationId: string | null;
   conversation: Conversation | null;
   phase: ConversationState;
@@ -178,6 +181,7 @@ export interface ConversationAtom {
 }
 
 export interface InitPayload {
+  opening: ContinuationOpeningView | null;
   conversation: Conversation;
   messages: Message[];
   steeringMessages: QueuedSteeringMessage[];
@@ -226,9 +230,10 @@ export interface InitPayload {
 // in-flight `await api.foo(...)` resolves after the user has navigated away.
 export type SSEAction =
   | { type: 'sse_init'; payload: InitPayload; epoch?: number; connectionId?: symbol }
-  | { type: 'sse_message'; message: Message; sequenceId: number; epoch?: number }
+  | { type: 'sse_message'; opening: ContinuationOpeningView | null; message: Message; sequenceId: number; epoch?: number }
   | {
       type: 'sse_message_updated';
+      opening: ContinuationOpeningView | null;
       sequenceId: number;
       messageId: string;
       transcriptGeneration?: number;
@@ -371,6 +376,7 @@ export type SSEAction =
     }
   | {
       type: 'set_initial_data';
+      opening?: ContinuationOpeningView | null;
       conversationId: string;
       conversation: Conversation;
       messages: Message[];
@@ -402,6 +408,7 @@ export type SSEAction =
 export function createInitialAtom(): ConversationAtom {
   return {
     conversationId: null,
+    opening: null,
     conversation: null,
     phase: { type: 'idle' },
     phaseLastAppliedEventSeq: 0,
@@ -694,9 +701,26 @@ function phaseIsTerminalFailure(phase: ConversationState): boolean {
   return phase.type === 'error' || phase.type === 'recoverable_continuation_failure';
 }
 
+function observeOpening(current: ContinuationOpeningView | null, incoming: ContinuationOpeningView | null, conversationId: string | null, messageId?: string): ContinuationOpeningView | null {
+  if (incoming && incoming.status !== 'none') {
+    if (incoming.edge.successor_transcript_row_id !== conversationId) return current;
+    if (messageId && incoming.status === 'accepted' && incoming.accepted_message_id !== messageId) return current;
+  }
+  return reconcileOpening(current, incoming);
+}
+
+function generationAfterObservation(
+  local: number | null,
+  incoming: number | null | undefined,
+): number | null {
+  if (incoming == null) return local;
+  return local === null ? incoming : Math.max(local, incoming);
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
+      atom = { ...atom, opening: observeOpening(atom.opening, action.opening, atom.conversationId, action.message.message_id) };
       const steeringMessages = atom.steeringMessages.filter(
         (message) => message.message_id !== action.message.message_id,
       );
@@ -716,6 +740,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       return withDerivedMessageSyncState(nextAtom, [...nextAtom.messages, nextMessage]);
     }
     case 'sse_message_updated': {
+      atom = { ...atom, opening: observeOpening(atom.opening, action.opening, atom.conversationId, action.messageId) };
       const patch: PendingMessagePatch = {
         eventSeq: action.sequenceId,
         ...(action.displayData !== undefined && { displayData: action.displayData }),
@@ -727,7 +752,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         const next = storePendingMessagePatch(atom, action.messageId, patch);
         return {
           ...next,
-          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+          transcriptGeneration: generationAfterObservation(atom.transcriptGeneration, action.transcriptGeneration),
         };
       }
       const existingPending = atom.pendingMessagePatches[action.messageId] ?? {
@@ -745,7 +770,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       if (!applied.applied) {
         return {
           ...atom,
-          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+          transcriptGeneration: generationAfterObservation(atom.transcriptGeneration, action.transcriptGeneration),
           pendingMessagePatches: nextPendingMessagePatches,
         };
       }
@@ -753,7 +778,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       newMessages[idx] = applied.message;
       return {
         ...atom,
-        transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+        transcriptGeneration: generationAfterObservation(atom.transcriptGeneration, action.transcriptGeneration),
         messages: newMessages,
         pendingMessagePatches: nextPendingMessagePatches,
       };
@@ -1073,6 +1098,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
       return conversationReducer(atom, {
         type: 'sse_message',
         message: res.output.message,
+        opening: res.output.opening,
         sequenceId: res.output.sequence_id,
       });
     }
@@ -1089,6 +1115,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_message_updated',
         sequenceId: data.sequence_id,
         messageId: data.message_id,
+        opening: data.opening,
         ...(data.transcript_generation != null && { transcriptGeneration: data.transcript_generation }),
         ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
         ...(data.content != null && { content: data.content as Message['content'] }),
@@ -1373,6 +1400,7 @@ export function conversationReducer(
       let next: ConversationAtom = {
         ...atom,
         conversationId: p.conversation.id,
+        opening: observeOpening(ownsIncomingTranscript ? atom.opening : null, p.opening, p.conversation.id),
         conversation: p.conversation,
         phase: p.phase,
         phaseLastAppliedEventSeq: initPhaseAuthoritySeq,
@@ -1382,7 +1410,10 @@ export function conversationReducer(
         lastAppliedEventSeq: phase1Floor,
         bufferedEventEnvelopes: {},
         eventGap: null,
-        transcriptGeneration: p.transcriptGeneration,
+        transcriptGeneration: generationAfterObservation(
+          ownsIncomingTranscript ? atom.transcriptGeneration : null,
+          p.transcriptGeneration,
+        ),
         transcriptCoverage: nextTranscriptCoverage,
         pendingMessagePatches: isFreshConnect || streamIncarnationChanged
           ? {}
@@ -1554,6 +1585,7 @@ export function conversationReducer(
       const base = action.reset ? createInitialAtom() : atom;
       return {
         ...base,
+        opening: observeOpening(atom.conversationId === action.conversationId ? atom.opening : null, action.opening ?? null, action.conversationId),
         conversationId: action.conversationId,
         conversation: action.conversation,
         messages: action.messages,

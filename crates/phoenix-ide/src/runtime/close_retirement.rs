@@ -8332,9 +8332,7 @@ mod tests {
         );
         let (snapshot, _) = inspect_worktree(&identity).await.unwrap();
         let runtime = tokio::runtime::Handle::current();
-        let retry_runtime = runtime.clone();
-        let retry_identity = identity.clone();
-        let retry_snapshot = snapshot.clone();
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
         let late_path = linked.join("late-write");
         let result = tokio::task::spawn_blocking(move || {
             inspect_and_remove_exact_worktree_with_hook(
@@ -8367,21 +8365,11 @@ mod tests {
         assert!(listing.status.success());
         assert!(String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
 
-        std::fs::remove_dir_all(&linked).unwrap();
-        let retry_quarantine = worktree_quarantine_path(&retry_identity).unwrap();
-        let retry = tokio::task::spawn_blocking(move || {
-            inspect_and_remove_exact_worktree_with_hook(
-                &retry_runtime,
-                &retry_identity,
-                &retry_snapshot,
-                |_| {},
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(matches!(retry, ExactWorktreeRemoval::Retired));
-        assert!(!retry_quarantine.exists());
+        assert_eq!(
+            std::fs::read_to_string(quarantine.join("confirmed-loss")).unwrap(),
+            "confirmed\n"
+        );
+        assert!(quarantine.join(".git").exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]

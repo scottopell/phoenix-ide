@@ -459,7 +459,7 @@ describe('conversation message history clients', () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => ({ segments: [], has_older: false, before: null }),
+      json: async () => ({ latest_opening: { status: 'none' }, segments: [], has_older: false, before: null }),
     } as unknown as Response);
 
     await api.getProductConversationSnapshot('pc-1', { message_limit: 100, before: 'cursor-1' });
@@ -604,7 +604,7 @@ describe('conversation-view response transport', () => {
   const open = 'a74e65c7-3bd0-43d5-87ed-1e2b3cfb7200';
   const trace = '1234567890abcdef1234567890abcdef';
   it.each(['ordinary', 'global', 'alias'] as const)('threads finite %s response correlation without changing data', async kind => {
-    const payload = { synthetic: 'private transcript body' };
+    const payload = { synthetic: 'private transcript body', latest_opening: { status: 'none' } };
     const response = new Response(JSON.stringify(payload), { headers: { traceparent: `00-${trace}-1234567890abcdef-01`, 'content-length': '42' } });
     const send = vi.fn().mockResolvedValue(response);
     vi.stubGlobal('fetch', send);
@@ -625,14 +625,14 @@ describe('conversation-view response transport', () => {
     await expect(api.getCoordinatorHistory('root', { open_id: open, onTelemetry: observer })).rejects.toMatchObject({ status: 404 });
     expect(observer).toHaveBeenCalledExactlyOnceWith({ trace_id: trace, size_bucket: 'unknown' });
     expect(response.bodyUsed).toBe(false);
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}')));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ latest_opening: { status: 'none' } }))));
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
-    await expect(api.getProductConversationSnapshot('product', { onTelemetry: () => { throw new Error('private observer'); } })).resolves.toEqual({});
+    await expect(api.getProductConversationSnapshot('product', { onTelemetry: () => { throw new Error('private observer'); } })).resolves.toEqual({ latest_opening: { status: 'none' } });
     expect(JSON.stringify(debug.mock.calls)).not.toContain('private observer');
     debug.mockRestore();
   });
   it('does not turn a Global older-page read into another correlated initial-open server span', async () => {
-    const send = vi.fn().mockResolvedValue(new Response('{}'));
+    const send = vi.fn().mockResolvedValue(new Response(JSON.stringify({ latest_opening: { status: 'none' } })));
     vi.stubGlobal('fetch', send);
     await api.getCoordinatorHistory('root', { before: 'opaque-cursor', open_id: open, onTelemetry: vi.fn() });
     expect(send.mock.calls[0]![0]).not.toContain('open_id');

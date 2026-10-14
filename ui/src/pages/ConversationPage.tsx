@@ -1,3 +1,4 @@
+import { conversationGroundingContext } from '../components/FileExplorer/groundingContext';
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData } from '../api';
@@ -1882,9 +1883,11 @@ function ConversationPageContent({
     }
   }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const fileRootPath = routePrefix === '/global' || isArchived || !conversation
+  const grounding = conversationGroundingContext(conversation, routePrefix === '/global');
+  const isCoordinatorHome = grounding.kind === 'coordinator_home';
+  const fileRootPath = isArchived || !conversation
     ? null
-    : (conversation.worktree_path ?? conversation.cwd);
+    : (isCoordinatorHome ? conversation.cwd : (conversation.worktree_path ?? conversation.cwd));
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
@@ -2441,7 +2444,7 @@ function ConversationPageContent({
           </button>
         </div>
       )}
-      {!isArchived && <WorkControlBar
+      {!isArchived && !isCoordinatorHome && <WorkControlBar
         mutationEnabled={mutationEnabled}
         conversationId={conversation.id}
         convModeLabel={conversation.conv_mode_label}
@@ -2714,6 +2717,7 @@ function ConversationPageContent({
       {/* Mobile file browser overlay */}
       {fileRootPath && (
         <FileBrowserOverlay
+          grounding={grounding}
           isOpen={showFileBrowser}
           rootPath={fileRootPath}
           conversationId={conversation.id}

@@ -3,6 +3,7 @@ import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import { ContinuationOpeningSchema } from './conversation/opening';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
 import type { SqliteReportWindow } from './generated/SqliteReportWindow';
@@ -183,6 +184,8 @@ export interface Conversation {
   project_name?: string | null;
   parent_conversation_id?: string | null;
   product_conversation_id?: string;
+  runtime_role?: 'user' | 'sub_agent' | 'coordinator';
+  work_scope_id?: string | null;
   /** Slug of the sub-agent's parent conversation, resolved server-side for the
    *  breadcrumb link (mirrors `seed_parent_slug`). `null`/absent when this is
    *  not a sub-agent or the parent has been deleted; the UI renders unlinked
@@ -1861,7 +1864,8 @@ export const api = {
     const response = await fetch(`/api/global/coordinator/history/${encodeURIComponent(reference)}?${params}`);
     observeViewResponse(response, options?.onTelemetry);
     if (!response.ok) throw new ApiResponseError('Unable to read Global conversation history', response.status);
-    return response.json();
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getProductConversationHistorySnapshot(
@@ -1875,7 +1879,8 @@ export const api = {
     const response = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}?${params}`);
     observeViewResponse(response, options?.onTelemetry);
     if (!response.ok) throw new ApiResponseError('Unable to read product conversation history', response.status);
-    return response.json();
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getProductConversationSnapshot(
@@ -1903,7 +1908,8 @@ export const api = {
         : 'Failed to fetch product conversation snapshot';
       throw new ApiResponseError(detail, resp.status);
     }
-    return resp.json();
+    const snapshot = await resp.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {

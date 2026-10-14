@@ -197,6 +197,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     conversation,
     messages,
     steeringMessages: raw.steering_messages,
+    opening: raw.opening,
     phase,
     contextWindow: {
       used: raw.context_window_size ?? 0,
@@ -455,6 +456,7 @@ export function useConnection({
             stampedDispatch({
               type: 'sse_message',
               message: msg,
+              opening: res.data.opening,
               sequenceId: msg.sequence_id,
             });
           });
@@ -472,6 +474,7 @@ export function useConnection({
               type: 'sse_message_updated',
               sequenceId: data.sequence_id,
               messageId: data.message_id,
+              opening: data.opening,
               ...(data.transcript_generation != null && { transcriptGeneration: data.transcript_generation }),
               ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
               ...(data.content != null && { content: data.content as import('../api').Message['content'] }),

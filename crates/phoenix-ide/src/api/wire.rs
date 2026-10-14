@@ -296,6 +296,7 @@ pub enum SseWireEvent {
         /// event. Q3 resolution in `sse_wire.allium`.
         pending_truncated: bool,
         transcript_coverage: crate::runtime::TranscriptCoverage,
+        opening: Option<super::types::ContinuationOpeningView>,
     },
     /// A newly-persisted message joins the conversation. The envelope
     /// `sequence_id` equals `message.sequence_id` by construction.
@@ -306,9 +307,11 @@ pub enum SseWireEvent {
         /// `Message` type at the valibot boundary.
         #[ts(type = "unknown")]
         message: EnrichedMessage,
+        opening: Option<super::types::ContinuationOpeningView>,
     },
     /// In-place mutation of an existing message's mutable fields.
     MessageUpdated {
+        opening: Option<super::types::ContinuationOpeningView>,
         sequence_id: i64,
         message_id: String,
         #[ts(type = "unknown | null")]
@@ -496,6 +499,7 @@ impl From<SseEvent> for SseWireEvent {
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
+                opening,
             } => {
                 let (messages, transcript_coverage) = transcript.into_parts();
                 SseWireEvent::Init {
@@ -517,9 +521,10 @@ impl From<SseEvent> for SseWireEvent {
                     pending_anchor_sequence_id,
                     pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
                     pending_truncated,
+                    opening,
                 }
             }
-            SseEvent::Message { message } => {
+            SseEvent::Message { message, opening } => {
                 // The envelope `sequence_id` equals `message.sequence_id` —
                 // this is what the client already expects (see
                 // `ui/src/sseSchemas.ts` `SseMessageDataSchema`).
@@ -527,9 +532,11 @@ impl From<SseEvent> for SseWireEvent {
                 SseWireEvent::Message {
                     sequence_id,
                     message: EnrichedMessage::from(message),
+                    opening,
                 }
             }
             SseEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,
@@ -537,6 +544,7 @@ impl From<SseEvent> for SseWireEvent {
                 content,
                 duration_ms,
             } => SseWireEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,

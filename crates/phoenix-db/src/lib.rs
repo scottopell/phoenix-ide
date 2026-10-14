@@ -9,6 +9,7 @@ use phoenix_core::domain::tool_result_identity::{
 mod close_foundation;
 mod coordinator_query;
 mod coordinator_watches;
+mod coordinator_work_scope;
 mod federation_enrollment;
 mod federation_peers;
 pub use coordinator_watches::{
@@ -76,12 +77,13 @@ pub(crate) use git_repository_reconciliation::{
 };
 pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
-    CoordinatorConversationSnapshotRead, ProductConversationAggregate,
-    ProductConversationCloseAvailability, ProductConversationCloseUnavailableReason,
-    ProductConversationHandoff, ProductConversationListLifecycle,
-    ProductConversationListProjection, ProductConversationSegment,
-    ProductConversationSegmentCeiling, ProductConversationSnapshotRead, ProductConversationSource,
-    ProductConversationSourceKind, ProductConversationTranscriptRow,
+    ContinuationOpeningEdge, ContinuationOpeningPresentation, ContinuationOpeningRead,
+    ContinuationOpeningUpdateRead, CoordinatorConversationSnapshotRead,
+    ProductConversationAggregate, ProductConversationCloseAvailability,
+    ProductConversationCloseUnavailableReason, ProductConversationHandoff,
+    ProductConversationListLifecycle, ProductConversationListProjection,
+    ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSnapshotRead,
+    ProductConversationSource, ProductConversationSourceKind, ProductConversationTranscriptRow,
     ProductConversationWorkIdentity, ResolvedProductConversation,
 };
 pub use retrieval::{
@@ -216,6 +218,8 @@ impl std::error::Error for ProjectSeedIdError {}
 
 #[derive(Error, Debug)]
 pub enum DbError {
+    #[error("Coordinator WorkScope: {0}")]
+    CoordinatorWorkScope(String),
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("Conversation not found: {0}")]
@@ -228,6 +232,8 @@ pub enum DbError {
     MessageConflict(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
+    #[error("transcript changed during opening observation read")]
+    TranscriptSnapshotChanged,
     #[error("Serialization error: {0}")]
     Serialization(String),
     #[error("Continuation precondition failed: {0}")]
@@ -1945,6 +1951,7 @@ impl Database {
         context: EnvironmentContext,
         now: &str,
     ) -> DbResult<()> {
+        Self::reject_coordinator_scope_mutation_tx(tx, scope_id).await?;
         let (kind, cwd, worktree_path, branch_name, base_branch) =
             Self::environment_columns(context);
         let observed_fingerprint = worktree_path
@@ -2058,6 +2065,9 @@ impl Database {
                 branch_name,
                 base_branch,
             ),
+            EnvironmentContext::CoordinatorHome { cwd } => {
+                ("coordinator_home", Some(cwd), None, None, None)
+            }
             EnvironmentContext::UnownedCwd { cwd } => ("unowned_cwd", Some(cwd), None, None, None),
             EnvironmentContext::None => ("none", None, None, None, None),
         }
@@ -2243,6 +2253,18 @@ impl Database {
         }
         let scope_id = precondition.scope_id();
         let mut tx = self.pool.begin().await?;
+        let coordinator_owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_work_scope WHERE work_scope_id = ?1)",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if coordinator_owned {
+            tx.rollback().await?;
+            return Ok(WorkScopeRetirementOutcome::Blocked(
+                WorkScopeRetirementBlocker::CoordinatorOwned,
+            ));
+        }
         if let Some(attempt_id) = close_attempt_id {
             let authorized: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
@@ -4554,6 +4576,10 @@ impl Database {
     ) -> DbResult<Conversation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result: DbResult<String> = async {
+            let owned = Self::coordinator_work_scope_tx(&mut tx).await?;
+            if let Some(owned) = owned {
+                Self::reconcile_coordinator_work_scope_tx(&mut tx, &owned.work_scope_id).await?;
+            }
             if let Some(id) = sqlx::query_scalar(
                 "SELECT id FROM conversations WHERE coordinator_head = 1",
             )
@@ -4579,7 +4605,7 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
                 "INSERT INTO conversations (id, product_conversation_id, slug, title, coordinator_head, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
-                 VALUES (?1, ?8, ?2, 'Coordinator', 1, 0, ?3, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
+                 VALUES (?1, ?8, ?2, 'Coordinator', 1, 0, ?3, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', (SELECT work_scope_id FROM coordinator_work_scope WHERE singleton = 1))",
             )
             .bind(&id)
             .bind(slug)
@@ -8382,6 +8408,7 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let cm = conv_mode_columns(mode);
         let mut tx = self.pool.begin().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut tx, id).await?;
         let row = sqlx::query(
             "SELECT c.work_scope_id AS work_scope_id, e.cwd
              FROM conversations c
@@ -8396,6 +8423,8 @@ impl Database {
         let cwd = new_cwd.unwrap_or(&persisted_cwd);
         let scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
             .map_err(|error| DbError::Serialization(error.to_string()))?;
+
+        Self::reject_coordinator_scope_mutation_tx(&mut tx, &scope_id).await?;
 
         let result = sqlx::query(
             "UPDATE conversations
@@ -8553,6 +8582,8 @@ impl Database {
             );
         }
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut tx, id).await?;
         let result = sqlx::query(
             "UPDATE work_scopes
              SET cwd = ?1, updated_at = ?2
@@ -8561,11 +8592,12 @@ impl Database {
         .bind(cwd)
         .bind(&now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -8663,6 +8695,11 @@ impl Database {
                 })?,
                 branch_name,
                 base_branch,
+            },
+            "coordinator_home" => EnvironmentContext::CoordinatorHome {
+                cwd: cwd.ok_or_else(|| {
+                    DbError::CoordinatorWorkScope("Coordinator home is missing cwd".to_string())
+                })?,
             },
             "unowned_cwd" => EnvironmentContext::UnownedCwd {
                 cwd: cwd.ok_or_else(|| {
@@ -9366,7 +9403,17 @@ impl Database {
                 })
             })
             .transpose()?;
-        let continuation_work_scope_id = if matches!(parent.conv_mode, ConvMode::Direct) {
+        let continuation_work_scope_id = if parent.runtime_role == RuntimeRole::Coordinator {
+            let owned = Self::coordinator_work_scope_tx(&mut tx)
+                .await?
+                .map(|record| record.work_scope_id);
+            if owned != parent.attached_work_scope_id {
+                return Err(DbError::CoordinatorWorkScope(
+                    "Coordinator continuation must retain its owned scope".to_string(),
+                ));
+            }
+            owned
+        } else if matches!(parent.conv_mode, ConvMode::Direct) {
             let (scope_id, authority_kind, environment) =
                 Self::new_scope_for_conversation(&parent.cwd, &cm);
             Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
@@ -10652,6 +10699,9 @@ impl Database {
         id: &str,
         update: &ConversationCreationMetadataUpdate,
     ) -> DbResult<()> {
+        let mut connection = self.pool.acquire().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut connection, id).await?;
+        drop(connection);
         let base_slug = update.slug.clone();
         let mut candidate_slug = base_slug.clone();
         let mut attempts = 0u8;
@@ -10748,6 +10798,9 @@ impl Database {
         expected_stage: CreationStage,
         next_stage: CreationStage,
     ) -> DbResult<CreationCasOutcome> {
+        let mut connection = self.pool.acquire().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut connection, id).await?;
+        drop(connection);
         let cm = conv_mode_columns(mode);
         let base_slug = update.slug.clone();
         let mut candidate_slug = base_slug.clone();
@@ -11068,6 +11121,17 @@ impl Database {
         connection: &mut sqlx::SqliteConnection,
         work_scope_id: &str,
     ) -> DbResult<()> {
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_work_scope WHERE work_scope_id = ?1)",
+        )
+        .bind(work_scope_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if owned {
+            return Err(DbError::CoordinatorWorkScope(
+                "Coordinator-owned WorkScope cannot be deleted".to_string(),
+            ));
+        }
         sqlx::query(
             "DELETE FROM product_conversation_work_scopes
              WHERE work_scope_id = ?1
@@ -11152,6 +11216,7 @@ impl Database {
         observer: sqlite_telemetry::ParentSqliteObserver<'_>,
         creation_cleanup_claim: Option<(&CreationCleanupJob, i64, &str)>,
     ) -> DbResult<Option<String>> {
+        Self::reject_coordinator_conversation_mutation_conn(connection, conversation_id).await?;
         let membership: Option<String> =
             sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id = ?1")
                 .bind(conversation_id)

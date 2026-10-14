@@ -3344,7 +3344,17 @@ where
             .get_conversation(conversation_id)
             .await
             .map_err(|e| AppError::NotFound(e.to_string()))?;
-        let value = read_value(db, conversation_id, attempt).await?;
+        let value = match read_value(db, conversation_id, attempt).await {
+            Err(AppError::TranscriptSnapshotChanged) => {
+                tracing::debug!(
+                    conversation_id,
+                    attempt,
+                    "retrying changed opening snapshot"
+                );
+                continue;
+            }
+            result => result?,
+        };
         bump_transcript_generation_for_test(db, conversation_id).await?;
         let after = db
             .get_conversation(conversation_id)
@@ -4393,10 +4403,20 @@ async fn get_system_prompt(
     );
     let system_prompt = if is_coordinator {
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
-        crate::system_prompt::build_coordinator_system_prompt(
+        let mut prompt = crate::system_prompt::build_coordinator_system_prompt(
             conversation.llm_language,
             catalog.as_ref(),
-        )
+        );
+        crate::coordinator_home::append_context(
+            &mut prompt,
+            state
+                .runtime
+                .db()
+                .coordinator_work_scope()
+                .await
+                .map_err(|error| error.to_string()),
+        );
+        prompt
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
@@ -4666,7 +4686,7 @@ async fn stream_conversation(
     let stable = stable_transcript_read(db, &id, |db, id, attempt| {
         let query = query.clone();
         Box::pin(async move {
-            read_stream_init_messages_with_tail(
+            let value = read_stream_init_messages_with_tail(
                 db,
                 id,
                 &query,
@@ -4674,18 +4694,34 @@ async fn stream_conversation(
                 attempt,
                 get_stream_last_sequence_id(db, id).await,
             )
-            .await
+            .await?;
+            let generation = db
+                .get_conversation(id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .transcript_generation;
+            let opening = db
+                .read_continuation_opening_at_snapshot(id, generation, value.3)
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+            Ok((value, opening))
         })
     })
     .await?;
     let conversation = stable.conversation;
+    let (stream_value, opening) = stable.value;
     let (
         last_sequence_id,
         db_message_selection,
         messages,
         _server_message_tail,
         transcript_coverage,
-    ) = stable.value;
+    ) = stream_value;
     init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
     init_trace.record_message_count(messages.len());
     let highest_message_seq = match db_message_selection {
@@ -4786,6 +4822,7 @@ async fn stream_conversation(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
@@ -4803,6 +4840,7 @@ async fn stream_conversation(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         id,
         init_event,
         broadcast_rx,
@@ -5018,7 +5056,9 @@ async fn cancel_conversation(
             | AppError::TypedBadRequest { .. }
             | AppError::Forbidden(_)
             | AppError::UnprocessableEntity(_) => ("request_error", false),
-            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+            AppError::Internal(_)
+            | AppError::TypedInternal { .. }
+            | AppError::TranscriptSnapshotChanged => ("server_error", true),
         };
         span.record("outcome", outcome);
         if is_server_error {
@@ -7125,6 +7165,35 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     };
 
+    match runtime.db().coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context
+            else {
+                return CascadeProjectsReport {
+                    error: Some("Invalid Coordinator home ownership".into()),
+                    ..Default::default()
+                };
+            };
+            let worker = PathBuf::from(&worktree_path);
+            let worker = worker.canonicalize().unwrap_or(worker);
+            let home = PathBuf::from(cwd);
+            if home.starts_with(&worker) || worker.starts_with(&home) {
+                return CascadeProjectsReport {
+                    error: Some("Cleanup refused: worker path overlaps Coordinator home".into()),
+                    ..Default::default()
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return CascadeProjectsReport {
+                error: Some(format!(
+                    "Cannot establish Coordinator home retention: {error}"
+                )),
+                ..Default::default()
+            }
+        }
+    }
     let mut report = CascadeProjectsReport {
         worktree_path: Some(worktree_path.clone()),
         branch_name: Some(branch_name.clone()),
@@ -7672,6 +7741,22 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
+    match state.db.coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            if let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context {
+                match crate::coordinator_home::validate_home(std::path::Path::new(&cwd)) {
+                    Ok(path) => roots.push(path),
+                    Err(error) => {
+                        tracing::warn!(%error, "Coordinator home excluded from file allowlist");
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "Coordinator home ownership lookup failed for file allowlist");
+        }
+    }
     for skill_root in state.runtime_env.skill_viewer_roots() {
         if let Ok(dir) = fs::canonicalize(skill_root) {
             roots.push(dir);
@@ -9082,6 +9167,7 @@ async fn get_shared_conversation(
 /// SSE stream for a shared conversation. Validates token, then subscribes.
 ///
 /// REQ-AUTH-006 + REQ-AUTH-007: Token-validated, supports multiple simultaneous viewers.
+#[allow(clippy::too_many_lines)]
 async fn shared_sse_stream(
     State(state): State<AppState>,
     Path(token): Path<String>,
@@ -9175,7 +9261,24 @@ async fn shared_sse_stream(
         crate::runtime::TranscriptCoverage::Tail => crate::runtime::InitTranscript::Tail(messages),
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
+    let opening = state
+        .runtime
+        .db()
+        .read_continuation_opening_at_snapshot(
+            &conversation_id,
+            conversation.transcript_generation,
+            match &transcript {
+                crate::runtime::InitTranscript::Complete(messages)
+                | crate::runtime::InitTranscript::Tail(messages) => {
+                    messages.iter().map(|message| message.sequence_id).max()
+                }
+                crate::runtime::InitTranscript::Preserve => None,
+            },
+        )
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
@@ -9194,6 +9297,7 @@ async fn shared_sse_stream(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         conversation_id,
         init_event,
         broadcast_rx,
@@ -9217,6 +9321,7 @@ pub(crate) enum AppError {
     /// 403 — the action is restricted to a caller on the server host.
     Forbidden(String),
     Internal(String),
+    TranscriptSnapshotChanged,
     TypedInternal {
         message: String,
         error_type: String,
@@ -9259,6 +9364,10 @@ impl IntoResponse for AppError {
             AppError::Forbidden(ref msg) => {
                 tracing::debug!(error = %msg, "403 Forbidden");
                 (StatusCode::FORBIDDEN, Json(ErrorResponse::new(msg.clone()))).into_response()
+            }
+            AppError::TranscriptSnapshotChanged => {
+                AppError::Internal("transcript changed during opening observation read".into())
+                    .into_response()
             }
             AppError::Internal(ref msg) => {
                 tracing::error!(error = %msg, "500 Internal Server Error");
@@ -12105,6 +12214,47 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn stable_read_retries_typed_opening_snapshot_mismatch() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "opening-snapshot-retry",
+            "opening-snapshot-retry",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stable = stable_transcript_read(&db, "opening-snapshot-retry", |db, id, attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                db.read_continuation_opening_at_snapshot(
+                    id,
+                    generation,
+                    if attempt == 1 { Some(1) } else { None },
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+                Ok(attempt)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(stable.attempts, 2);
+        assert_eq!(stable.value, 2);
+    }
+
+    #[tokio::test]
     async fn stable_stream_read_keeps_latest_selection_after_none_generation_race() {
         let state = make_test_state().await;
         state
@@ -13186,7 +13336,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("live message after subscribe");
         match live {
-            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
     }
