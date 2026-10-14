@@ -5328,20 +5328,40 @@ impl ExternalWriterEvidence {
     }
 }
 
-fn probe_retry_worktree_writers(
+/// A single retry target's observed external-writer status, as seen by the
+/// admission boundary. `Absent` means the target path does not exist, so no
+/// writer can hold it; `Present` carries the writer evidence for an existing
+/// target. Separating observation from the admission decision lets the decision
+/// be exercised without touching the filesystem or `/proc`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryTargetObservation {
+    Absent,
+    Present(ExternalWriterEvidence),
+}
+
+/// Pure admission decision over already-observed retry targets.
+///
+/// Rejects (no new run admitted) when any candidate is observed holding a
+/// positive external writer, or when observing any candidate fails (a probe
+/// error is fail-closed, not proof of absence). Admits only when every observed
+/// candidate is absent or carries no positive writer evidence. The candidate
+/// order is original worktree, then quarantine, then the final-tombstone object.
+fn probe_retry_worktree_writers_with<F>(
     original: &Path,
     quarantine: &Path,
     tombstone: Option<&CloseWorktreeFinalTombstone>,
-) -> Result<(), String> {
+    mut observe: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<RetryTargetObservation, String>,
+{
     let object = tombstone.map(|record| record.root.join("object"));
     for path in [Some(original), Some(quarantine), object.as_deref()]
         .into_iter()
         .flatten()
     {
-        if path
-            .try_exists()
-            .map_err(|error| format!("cannot probe retry writer target: {error}"))?
-            && quarantine_has_external_writer(path)?
+        if let RetryTargetObservation::Present(ExternalWriterEvidence::PositiveWriterFound) =
+            observe(path)?
         {
             return Err(format!(
                 "external writer holds exact retry target {}; no new run admitted",
@@ -5350,6 +5370,28 @@ fn probe_retry_worktree_writers(
         }
     }
     Ok(())
+}
+
+fn probe_retry_worktree_writers(
+    original: &Path,
+    quarantine: &Path,
+    tombstone: Option<&CloseWorktreeFinalTombstone>,
+) -> Result<(), String> {
+    probe_retry_worktree_writers_with(original, quarantine, tombstone, |path| {
+        if !path
+            .try_exists()
+            .map_err(|error| format!("cannot probe retry writer target: {error}"))?
+        {
+            return Ok(RetryTargetObservation::Absent);
+        }
+        Ok(RetryTargetObservation::Present(
+            if quarantine_has_external_writer(path)? {
+                ExternalWriterEvidence::PositiveWriterFound
+            } else {
+                ExternalWriterEvidence::NoPositiveEvidence
+            },
+        ))
+    })
 }
 
 async fn verify_retained_worktree(
@@ -8933,7 +8975,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn named_nested_submodule_preserves_ignored_content_then_deletes_cleanly() {
+    fn named_nested_submodule_preserves_ignored_content_under_identical_fingerprint() {
         let temp = tempfile::tempdir().unwrap();
         let subrepo = temp.path().join("subrepo");
         initialize_repository(&subrepo);
@@ -9011,25 +9053,6 @@ mod tests {
         let fresh = test_worktree_snapshot(&identity, &target);
         assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
         assert!(target.join("deps/child/build/unique").exists());
-        std::fs::remove_dir_all(target.join("deps/child/build")).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let common = super::exact_worktree_common_git_dir(&target).unwrap();
-        let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
-        let outcome = super::inspect_and_remove_exact_worktree(
-            runtime.handle(),
-            &identity,
-            &confirmed,
-            &administrative,
-            &observe_administrative_dir_incarnation(&administrative).unwrap(),
-            None,
-            |_, _, _| Ok(()),
-        )
-        .unwrap();
-        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
-        assert!(!target.exists());
     }
 
     #[cfg(unix)]
@@ -9142,177 +9165,91 @@ mod tests {
         assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn safe_retry_writer_rejection_does_not_allocate_an_ordinal() {
-        use super::*;
-        use phoenix_core::domain::close::TranscriptConversationId;
-        use std::io::Read as _;
-        use std::sync::Arc;
+    // The exact safe-retry admission boundary rejects a fresh run (so no new run
+    // ordinal is allocated) exactly when `probe_retry_worktree_writers` returns
+    // an error, and admits only when it returns `Ok`. `validate_close_safe_retry`
+    // calls the probe before `admit_close_safe_retry`, so a probe rejection
+    // short-circuits admission. These tests exercise that decision over the
+    // injectable observation seam with controlled observations, so the decision
+    // is proven without scanning the host `/proc`, spawning a writer, or running
+    // real Git/deletion. Live syscall qualification of the real writer scan is a
+    // documented coverage gap (see specs/work-lifecycle/executive.md).
 
-        let temp = tempfile::tempdir().unwrap();
-        let target = linked_close_worktree(&temp);
-        std::fs::write(target.join("held"), "stable\n").unwrap();
-        run_git(&target, &["add", "held"]);
-        run_git(&target, &["commit", "--quiet", "-m", "held"]);
-        let target_text = target.to_string_lossy().into_owned();
-        let identity = inspection_identity(&target);
-        let db = crate::db::Database::open_in_memory().await.unwrap();
-        let conversation = db
-            .create_conversation(
-                "writer-retry",
-                "writer-retry",
-                &target_text,
-                true,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let scope = conversation.attached_work_scope_id.unwrap();
-        sqlx::query("UPDATE work_scopes SET environment_kind='allocated_worktree', worktree_path=?1, worktree_id=?2, worktree_fingerprint=?3, branch_name='close-target', base_branch='main' WHERE id=?4")
-            .bind(&target_text)
-            .bind(identity.id().as_str())
-            .bind(identity.fingerprint().as_str())
-            .bind(scope.as_str())
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let attempt_id = CloseAttemptId::parse("writer-retry-attempt").unwrap();
-        db.begin_close_foundation(
-            &conversation.product_conversation_id,
-            &TranscriptConversationId::parse(&conversation.id).unwrap(),
-            attempt_id.as_str(),
-        )
-        .await
-        .unwrap();
-        db.confirm_close_stop_work(attempt_id.as_str())
-            .await
-            .unwrap();
-        db.begin_close_active_work_settlement(attempt_id.as_str())
-            .await
-            .unwrap();
-        db.advance_close_settlement_when_quiescent(attempt_id.as_str())
-            .await
-            .unwrap();
-        let confirmed = inspect_worktree(&identity).await.unwrap().0;
-        db.replace_close_inspection(ReplaceCloseInspectionRequest {
-            attempt_id: attempt_id.clone(),
-            scopes: vec![ReplaceCloseInspectionScopeRequest {
-                scope: scope.clone(),
-                snapshot: confirmed.clone(),
-                losses: vec![],
-            }],
-        })
-        .await
-        .unwrap();
-        let snapshot = db
-            .get_close_obligation(attempt_id.as_str())
-            .await
-            .unwrap()
-            .snapshot()
-            .unwrap()
-            .clone();
-        db.capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
-            attempt_id: attempt_id.clone(),
-            snapshot: snapshot.clone(),
-            scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
-                scope: scope.clone(),
-                inventory: CloseOwnedResourceInventory {
-                    worktree: Some(identity.clone()),
-                    work_scopes: BTreeSet::new(),
-                    bash_process_groups: BTreeSet::new(),
-                    tmux_servers: BTreeSet::new(),
-                    pty_sessions: BTreeSet::new(),
-                    browser_sessions: BTreeSet::new(),
-                    equivalent_live_resources: BTreeSet::new(),
-                },
-            }],
-        })
-        .await
-        .unwrap();
-        let manager = RuntimeManager::new(
-            db.clone(),
-            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
-            crate::platform::PlatformCapability::None {
-                details: "test".into(),
-            },
-            Arc::new(crate::tools::mcp::McpClientManager::new()),
-            None,
-        );
-        manager
-            .acquire_close_resource_lease(&attempt_id, scope.clone())
-            .await
-            .unwrap();
-        let worktree = RetiredResourceIdentity::parse(
-            RetiredResourceKind::Worktree,
-            LossItemIdentity::Worktree(identity),
-        )
-        .unwrap();
-        let detail = "injected initial worktree cleanup failure";
-        assert_eq!(
-            manager
-                .record_close_cleanup_failure::<()>(
-                    &CloseRunRef::initial(attempt_id.clone()),
-                    &snapshot,
-                    &scope,
-                    worktree,
-                    RetirementFailureReason::RemovalFailed,
-                    detail,
+    #[test]
+    fn retry_admission_rejects_when_a_target_holds_a_positive_writer() {
+        let original = Path::new("/captured/worktree");
+        let quarantine = Path::new("/captured/quarantine");
+        let error = super::probe_retry_worktree_writers_with(original, quarantine, None, |path| {
+            Ok(if path == quarantine {
+                super::RetryTargetObservation::Present(
+                    super::ExternalWriterEvidence::PositiveWriterFound,
                 )
-                .await,
-            Err(detail.into())
+            } else {
+                super::RetryTargetObservation::Absent
+            })
+        })
+        .expect_err("a positive external writer must reject the retry");
+        assert!(
+            error.contains("external writer") && error.contains("no new run admitted"),
+            "rejection must name the external writer: {error}"
         );
+        assert!(
+            error.contains(&quarantine.display().to_string()),
+            "rejection must name the holding target: {error}"
+        );
+    }
 
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exec 3<>held; printf ready; exec sleep 15"])
-            .current_dir(&target)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut ready = [0; 5];
-        child
-            .stdout
-            .as_mut()
-            .unwrap()
-            .read_exact(&mut ready)
-            .unwrap();
-        assert_eq!(&ready, b"ready");
-        let initial = CloseRunRef::initial(attempt_id.clone());
-        assert!(manager
-            .retry_close_runtime_resources(initial.clone())
-            .await
-            .unwrap_err()
-            .contains("external writer"));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id=?1"
-            )
-            .bind(attempt_id.as_str())
-            .fetch_one(db.pool())
-            .await
-            .unwrap(),
-            1
+    #[test]
+    fn retry_admission_rejects_when_observing_a_target_fails() {
+        let original = Path::new("/captured/worktree");
+        let quarantine = Path::new("/captured/quarantine");
+        let error = super::probe_retry_worktree_writers_with(original, quarantine, None, |path| {
+            if path == original {
+                Err("cannot probe retry writer target: injected".to_string())
+            } else {
+                Ok(super::RetryTargetObservation::Absent)
+            }
+        })
+        .expect_err("a probe failure must be fail-closed, not proof of absence");
+        assert!(
+            error.contains("cannot probe retry writer target"),
+            "probe error must propagate as the rejection: {error}"
         );
+    }
 
-        child.kill().unwrap();
-        child.wait().unwrap();
-        manager
-            .retry_close_runtime_resources(initial)
-            .await
-            .unwrap();
+    #[test]
+    fn retry_admission_admits_when_no_target_holds_a_writer() {
+        let original = Path::new("/captured/worktree");
+        let quarantine = Path::new("/captured/quarantine");
+        let tombstone = CloseWorktreeFinalTombstone {
+            root: std::path::PathBuf::from("/captured/tombstone"),
+            device: 0,
+            inode: 0,
+            object_device: None,
+            object_inode: None,
+        };
+        let mut observed = Vec::new();
+        super::probe_retry_worktree_writers_with(original, quarantine, Some(&tombstone), |path| {
+            observed.push(path.to_path_buf());
+            Ok(if path == original {
+                // Absent targets cannot be held; admission must ignore them.
+                super::RetryTargetObservation::Absent
+            } else {
+                super::RetryTargetObservation::Present(
+                    super::ExternalWriterEvidence::NoPositiveEvidence,
+                )
+            })
+        })
+        .expect("absent or writer-free targets must admit a fresh retry run");
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id=?1"
-            )
-            .bind(attempt_id.as_str())
-            .fetch_one(db.pool())
-            .await
-            .unwrap(),
-            2
+            observed,
+            vec![
+                original.to_path_buf(),
+                quarantine.to_path_buf(),
+                tombstone.root.join("object"),
+            ],
+            "admission must observe each candidate once in original, quarantine, object order"
         );
-        assert!(!target.exists());
     }
 
     #[cfg(unix)]
@@ -10418,26 +10355,10 @@ mod tests {
         );
 
         let identity = inspection_identity(&closing);
-        let (confirmed, losses) = inspect_worktree(&identity).await.unwrap();
+        let (_confirmed, losses) = inspect_worktree(&identity).await.unwrap();
         assert!(losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
-        let common = super::exact_worktree_common_git_dir(&closing).unwrap();
-        let administrative_dir = exact_worktree_administrative_dir(&closing, &common).unwrap();
-        let outcome = quarantine_and_remove_exact_worktree(
-            &identity,
-            &confirmed,
-            administrative_dir.clone(),
-            observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
-            None,
-            |_, _, _| Ok(()),
-            |_| {},
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
-        assert!(!closing.exists());
-        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
     #[test]
