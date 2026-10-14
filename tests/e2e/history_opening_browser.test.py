@@ -61,6 +61,30 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("attestation", value["source_provenance"])
         self.assertIn("tests/e2e/history_browser.py", value["harness_files"])
 
+    def test_actual_workflow_ui_hash_producer_matches_identity_consumer(self):
+        import ast
+        import hashlib
+        import textwrap
+        assets = self.app / "ui/dist/assets"
+        assets.mkdir()
+        (assets / "owned.js").write_bytes(b"built asset")
+        (self.app / "ui/dist/.gitkeep").write_bytes(b"excluded")
+        workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()
+        start = workflow.index("'ui_files':{") + len("'ui_files':")
+        end = workflow.index("},", start) + 1
+        expression = ast.parse(textwrap.dedent(workflow[start:end]), mode="eval")
+        producer = eval(compile(expression, "actual-ci-ui-hash-producer", "eval"),
+                        {"root": self.app, "hashlib": hashlib})
+        self.assertEqual(producer, opening.shipping.ui_hashes(self.app))
+        self.assertEqual(set(producer), {"index.html", "assets/owned.js"})
+        self.value["ui_files"] = producer
+        self.write()
+        self.identity()
+        self.value["ui_files"] = {"ui/dist/" + key: value for key, value in producer.items()}
+        self.write()
+        with self.assertRaises(ValueError):
+            self.identity()
+
     def test_each_identity_dimension_fails_closed(self):
         for key in self.value:
             saved = self.value[key]

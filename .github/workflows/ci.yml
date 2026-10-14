@@ -304,7 +304,7 @@ jobs:
                           'compiled_executable_path':str(executable.relative_to(root)),
                           'compiler_artifact_selector':selector,
                           'ui_lock_sha256':hashlib.sha256((root/'ui/pnpm-lock.yaml').read_bytes()).hexdigest(),
-                          'ui_files':{str(path.relative_to(root)):hashlib.sha256(path.read_bytes()).hexdigest()
+                          'ui_files':{str(path.relative_to(root/'ui/dist')):hashlib.sha256(path.read_bytes()).hexdigest()
                                       for path in sorted((root/'ui/dist').rglob('*'))
                                       if path.is_file() and path.name != '.gitkeep'},
                           'focused_test_command':command[1:], 'focused_test_exit':completed.returncode,
