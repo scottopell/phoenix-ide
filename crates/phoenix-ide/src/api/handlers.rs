@@ -12169,9 +12169,14 @@ pub(crate) mod hard_delete_cascade_tests {
         .unwrap();
         let stable = stable_transcript_read(&db, "opening-snapshot-retry", |db, id, attempt| {
             Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
                 db.read_continuation_opening_at_snapshot(
                     id,
-                    0,
+                    generation,
                     if attempt == 1 { Some(1) } else { None },
                 )
                 .await
