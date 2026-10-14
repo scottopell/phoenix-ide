@@ -28,7 +28,12 @@ impl ResolvedResourceAuthority {
             Some(EnvironmentContext::AllocatedWorktree { worktree_path, .. }) => {
                 Some(worktree_path)
             }
-            Some(EnvironmentContext::None | EnvironmentContext::UnownedCwd { .. }) | None => None,
+            Some(
+                EnvironmentContext::None
+                | EnvironmentContext::UnownedCwd { .. }
+                | EnvironmentContext::CoordinatorHome { .. },
+            )
+            | None => None,
         }
     }
 

@@ -10,8 +10,10 @@ import { checkoutLabel } from './gitStatusPresentation';
 import { api, type ConversationGitStatusResponse } from '../../api';
 import { useViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 import './FileBrowserOverlay.css';
+import { ORDINARY_GROUNDING, type GroundingContext } from './groundingContext';
 
 interface Props {
+  grounding?: GroundingContext;
   isOpen: boolean;
   rootPath: string;
   conversationId: string;
@@ -27,11 +29,12 @@ function mobileGitSummary(status: ConversationGitStatusResponse | null): string 
   return `${checkoutLabel(status.checkout_status)} · ${status.counts.changed_paths === 0 ? 'clean' : `${status.counts.changed_paths} changes`}`;
 }
 
-export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, onFileSelect, canOpenWorkspaceDiff = false }: Props) {
+export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, onFileSelect, canOpenWorkspaceDiff = false, grounding = ORDINARY_GROUNDING }: Props) {
   const [gitStatus, setGitStatus] = useState<ConversationGitStatusResponse | null>(null);
   const requestRef = useRef<AbortController | null>(null);
   const { openDiffFullscreen } = useViewerSlotCommands();
   const loadGitStatus = useCallback(async () => {
+    if (grounding.kind === 'coordinator_home') return;
     requestRef.current?.abort();
     const controller = new AbortController();
     requestRef.current = controller;
@@ -44,7 +47,7 @@ export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, 
         reason: error instanceof Error ? error.message : 'Git status is unavailable.',
       });
     }
-  }, [conversationId]);
+  }, [conversationId, grounding.kind]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -65,7 +68,7 @@ export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, 
         <div className="file-browser-header">
           <div className="file-browser-heading">
             <div className="file-browser-path" title={rootPath}>{displayPath}</div>
-            {canOpenWorkspaceDiff ? <button
+            {grounding.kind === 'coordinator_home' ? <div>Coordinator home · Scope: {grounding.workScopeId ?? 'unavailable'}</div> : canOpenWorkspaceDiff ? <button
               type="button"
               className="file-browser-git-summary"
               onClick={() => {

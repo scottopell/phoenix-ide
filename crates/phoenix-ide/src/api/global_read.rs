@@ -897,6 +897,29 @@ impl GlobalReadService {
         &self,
         requested_work_scope_id: &str,
     ) -> Result<ValidatedCoordinatorBashSpawnTarget, CoordinatorWorkScopeTargetError> {
+        if let Some(home) = self
+            .db
+            .coordinator_work_scope()
+            .await
+            .map_err(|_| CoordinatorWorkScopeTargetError::Persistence)?
+        {
+            if home.work_scope_id.as_str() == requested_work_scope_id {
+                let phoenix_core::work_scope::EnvironmentContext::CoordinatorHome { cwd } =
+                    home.context
+                else {
+                    return Err(CoordinatorWorkScopeTargetError::Authority);
+                };
+                let path = crate::coordinator_home::validate_home(std::path::Path::new(&cwd))
+                    .map_err(|_| CoordinatorWorkScopeTargetError::Read)?;
+                return Ok(ValidatedCoordinatorBashSpawnTarget {
+                    path,
+                    work_scope_id: home.work_scope_id,
+                    owner_name: "Global Coordinator".into(),
+                    owner_product_conversation_id: None,
+                    project_path: None,
+                });
+            }
+        }
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
             "SELECT environment.id, environment.worktree_path, environment.cwd
              FROM work_scopes environment

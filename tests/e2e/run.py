@@ -1043,6 +1043,73 @@ def _user_message_images(message: dict) -> list[dict]:
 # ----------------------- scenarios -----------------------
 
 
+def scenario_coordinator_home(_base_url: str) -> None:
+    """Disposable server: actual scoped tool dispatch and persistent home, no worker bootstrap."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory(prefix="phoenix-coordinator-home-") as directory:
+        root = Path(directory)
+        env = _server_env(root)
+        proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+        def stop():
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            log_file.close()
+        def binding():
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                row = db.execute("SELECT s.id,s.cwd FROM coordinator_work_scope c JOIN work_scopes s ON s.id=c.work_scope_id WHERE s.environment_kind='coordinator_home' AND s.lifecycle='active'").fetchone()
+                assert row is not None
+                return row
+        try:
+            scope, cwd = binding()
+            assert Path(cwd) == (root / "data" / "coordinator").resolve()
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                assert db.execute("SELECT COUNT(*) FROM product_conversation_work_scopes").fetchone()[0] == 0
+            response = httpx.post(f"{base_url}/api/global/coordinator", timeout=10)
+            response.raise_for_status()
+            coordinator = response.json()['conversation']
+            assert coordinator['cwd'] == cwd
+            conv_id = coordinator['id']
+            _send_chat_and_stream(base_url, conv_id, f"[[coordinator_home_bash:{scope}]]", SCENARIO_TIMEOUT_SECONDS)
+            final = _get_conv(base_url, conv_id)
+            results = [m.get('content', {}) for m in final['messages'] if m.get('message_type') == 'tool_result']
+            assert any(r.get('is_error') is False and cwd in str(r) for r in results), results
+            read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
+            read.raise_for_status()
+            assert read.json()['content'] == 'coordinator-home-proof'
+            listing = httpx.get(f"{base_url}/api/files/list", params={'path': cwd}, timeout=10)
+            listing.raise_for_status()
+            assert 'e2e-home-evidence.txt' in listing.text
+            for bad in ['missing', 'not-an-active-scope']:
+                before = len(_get_conv(base_url, conv_id)['messages'])
+                _send_chat_and_stream(base_url, conv_id, f"[[coordinator_home_bash:{bad}]]", SCENARIO_TIMEOUT_SECONDS)
+                results = [m.get('content', {}) for m in _get_conv(base_url, conv_id)['messages'][before:] if m.get('message_type') == 'tool_result']
+                assert any(r.get('is_error') is True for r in results), results
+            worker = _new_conv(base_url, '[[scenario:plain_text]] separate ordinary work')
+            _poll_to_idle_with_messages(base_url, worker['id'], lambda m: 'analyzed the situation' in _agent_text(m), 'separate worker', timeout=SCENARIO_TIMEOUT_SECONDS)
+            assert worker['cwd'] != cwd
+            stop()
+            proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+            assert binding() == (scope, cwd)
+            response = httpx.get(f"{base_url}/api/global/coordinator", timeout=10)
+            response.raise_for_status()
+            assert response.json()['conversation']['id'] == conv_id
+            read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
+            read.raise_for_status()
+            assert read.json()['content'] == 'coordinator-home-proof'
+            assert _get_conv(base_url, worker['id'])['conversation']['cwd'] == worker['cwd']
+            outside = root / 'data' / 'outside.txt'
+            outside.write_text('not in home')
+            denied = httpx.get(f"{base_url}/api/files/read", params={'path': str(outside)}, timeout=10)
+            assert denied.status_code == 403, denied.text
+        finally:
+            stop()
+
+
 def scenario_text_streaming(base_url: str) -> None:
     word_count = 8
     conv_id = _new_conv_and_stream(
@@ -1579,6 +1646,7 @@ def scenario_perf_stream(base_url: str) -> None:
 
 
 SCENARIOS = [
+    ("coordinator_home", scenario_coordinator_home),
     ("list_models", scenario_list_models),
     ("text_streaming", scenario_text_streaming),
     ("multi_tool", scenario_multi_tool),

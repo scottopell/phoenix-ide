@@ -909,6 +909,14 @@ impl Database {
                     .to_string(),
             ));
         }
+        if matches!(
+            input.environment,
+            EnvironmentContext::CoordinatorHome { .. }
+        ) {
+            return Err(DbError::CoordinatorWorkScope(
+                "Coordinator home is not an ordinary creation environment".to_string(),
+            ));
+        }
         let git_facts_match_environment = !matches!(
             (&input.environment, &input.git_publication),
             (EnvironmentContext::AllocatedWorktree { .. }, None)
@@ -964,6 +972,11 @@ impl Database {
                 Some(worktree_path.as_str())
             }
             EnvironmentContext::UnownedCwd { cwd } => Some(cwd.as_str()),
+            EnvironmentContext::CoordinatorHome { .. } => {
+                return Err(DbError::CoordinatorWorkScope(
+                    "Coordinator home cannot be published as ordinary work".to_string(),
+                ));
+            }
             EnvironmentContext::None => None,
         })
         .bind(

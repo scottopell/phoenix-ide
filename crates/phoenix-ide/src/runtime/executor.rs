@@ -8151,6 +8151,23 @@ where
                 explore_bash_capability,
             )
         };
+        if is_coordinator {
+            match self.db.coordinator_work_scope().await {
+                Ok(Some(home)) => match crate::coordinator_home::context(&home) {
+                    Ok(orientation) => system_prompt.push_str(&orientation),
+                    Err(error) => system_prompt.push_str(&format!(
+                        "\n\nCoordinator home unavailable: {error}. Do not guess a cwd or scope."
+                    )),
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "Coordinator home context lookup failed");
+                    system_prompt.push_str(
+                        "\n\nCoordinator home metadata unavailable; do not guess a cwd or scope.",
+                    );
+                }
+            }
+        }
         if is_sub_agent
             && matches!(
                 self.context.resource_authority,
