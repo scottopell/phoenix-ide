@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
@@ -35,6 +36,13 @@ function message(presentation: EventPresentation | null): Message {
 }
 
 describe('compact conversation events', () => {
+  it('uses the theme link token without inheriting the faded meta-message wrapper', () => {
+    const css = readFileSync(`${process.cwd()}/src/components/ConversationEventCard.css`, 'utf8');
+    expect(css).toMatch(/\.message\.meta\.conversation-event-message\s*\{\s*opacity:\s*1;/);
+    expect(css).toMatch(/\.conversation-event-title\s*\{[^}]*color:\s*var\(--accent-blue\)/);
+    expect(css).toMatch(/\.conversation-event-title:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--accent-blue\)/);
+  });
+
   it('shows a truthful title, outcome and accessible local occurrence time, not raw IDs', () => {
     const { container } = mount();
     expect(screen.getByRole('link', { name: 'Fix routing' })).toHaveAttribute('href', '/c/product-1');

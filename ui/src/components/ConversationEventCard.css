@@ -1,3 +1,4 @@
+.message.meta.conversation-event-message { opacity: 1; }
 .conversation-event-card { min-width: 0; font-size: 0.875rem; }
 .conversation-event-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.65rem; }
 .conversation-event-title { min-width: 0; overflow-wrap: anywhere; color: var(--accent-blue); }
