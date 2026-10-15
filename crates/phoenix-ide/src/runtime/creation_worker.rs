@@ -3486,7 +3486,10 @@ mod product_creation_delivery_replay_tests {
             }
         });
         tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
-        let first_renewal = renewals.recv().await.unwrap();
+        let first_renewal = tokio::time::timeout(Duration::from_secs(1), renewals.recv())
+            .await
+            .expect("claim guard must renew within the bounded wait")
+            .expect("claim guard renewal channel must remain open");
         let first_lease = first_renewal + SHORT_CLAIM_LEASE;
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
