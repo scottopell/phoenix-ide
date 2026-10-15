@@ -19,12 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
-pub(crate) struct PublishedProductCreation {
-    pub product_conversation_id: String,
-    pub transcript_row_id: String,
-}
-
 const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,93 +72,31 @@ fn staging_cleanup_diagnostic(
     }
 }
 
-pub(crate) async fn process_product_creation_request(
-    manager: &Arc<RuntimeManager>,
-    request_id: &str,
-) -> Result<PublishedProductCreation, String> {
-    if let Some(job) = manager
+async fn checkpoint_product_creation_stage(
+    manager: &RuntimeManager,
+    claimed: &crate::db::ClaimedProductCreationJob,
+    current_stage: &mut crate::db::ProductCreationProvisioningStage,
+    stage: crate::db::ProductCreationProvisioningStage,
+) -> Result<(), String> {
+    let stage = if stage.rank() < current_stage.rank() {
+        *current_stage
+    } else {
+        stage
+    };
+    if manager
         .db()
-        .get_product_creation_job(request_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        if job.status == "delivery_pending" {
-            if job
-                .delivery_retry_at
-                .is_some_and(|retry_at| retry_at > chrono::Utc::now())
-            {
-                return Err(
-                    "product creation objective delivery is awaiting its retry deadline"
-                        .to_string(),
-                );
-            }
-            let claim = crate::db::ProductCreationClaim {
-                worker_id: job
-                    .claim_worker_id
-                    .clone()
-                    .ok_or_else(|| "delivery_pending job missing claim worker id".to_string())?,
-                token: job
-                    .claim_token
-                    .clone()
-                    .ok_or_else(|| "delivery_pending job missing claim token".to_string())?,
-                generation: job.claim_generation,
-                lease_until: job
-                    .claim_lease_until
-                    .ok_or_else(|| "delivery_pending job missing claim lease".to_string())?,
-            };
-            let claimed = crate::db::ClaimedProductCreationJob {
-                claim,
-                job: job.clone(),
-            };
-            return deliver_product_creation_objective(manager, &claimed).await;
-        }
-        if job.status == "delivery_failed" {
-            return Err(
-                "product creation delivery previously failed and requires explicit retry"
-                    .to_string(),
-            );
-        }
-        if job.status == "published" {
-            if let (Some(product_id), Some(conversation_id)) =
-                (job.published_product_id, job.published_conversation_id)
-            {
-                return Ok(PublishedProductCreation {
-                    product_conversation_id: product_id.to_string(),
-                    transcript_row_id: conversation_id,
-                });
-            }
-        }
-    }
-    let worker_id = format!("product-creation-worker-{}", uuid::Uuid::new_v4());
-    let token = uuid::Uuid::new_v4().to_string();
-    let Some(claimed) = manager
-        .db()
-        .claim_product_creation(
-            request_id,
-            &worker_id,
-            &token,
-            chrono::Utc::now(),
-            chrono::Duration::seconds(30),
+        .advance_product_creation_provisioning_stage(
+            &claimed.job.request_id,
+            &claimed.claim,
+            stage,
         )
         .await
-        .map_err(|e| e.to_string())?
-    else {
-        return Err("product creation is already being processed or awaiting retry".to_string());
-    };
-    match process_product_creation_until_closed(manager, claimed.clone()).await {
-        Ok(published) => Ok(published),
-        Err(error) => {
-            cleanup_and_retry_unpublished_product_creation(
-                manager,
-                request_id,
-                &claimed.claim,
-                &claimed.job,
-                &error,
-            )
-            .await
-            .map_err(|db_error| format!("{error}; retry persistence failed: {db_error}"))?;
-            Err(error)
-        }
+        .map_err(|error| error.to_string())?
+    {
+        *current_stage = stage;
+        Ok(())
+    } else {
+        Err("product creation claim was lost or stage transition was rejected".to_string())
     }
 }
 
@@ -172,8 +104,13 @@ pub(crate) async fn process_product_creation_request(
 async fn process_claimed_product_creation(
     manager: &Arc<RuntimeManager>,
     claimed: &crate::db::ClaimedProductCreationJob,
-) -> Result<PublishedProductCreation, String> {
+) -> Result<(), String> {
+    use crate::db::ProductCreationProvisioningStage as Stage;
+
     let job = &claimed.job;
+    let mut current_stage = job.provisioning_stage;
+    checkpoint_product_creation_stage(manager, claimed, &mut current_stage, Stage::ValidateIntent)
+        .await?;
     let cwd = tokio::task::spawn_blocking({
         let cwd = job.intent.cwd.clone();
         let home = manager.runtime_home().to_path_buf();
@@ -185,6 +122,13 @@ async fn process_claimed_product_creation(
     })
     .await
     .map_err(|error| format!("directory creation join failed: {error}"))??;
+    checkpoint_product_creation_stage(
+        manager,
+        claimed,
+        &mut current_stage,
+        Stage::ResolveRepository,
+    )
+    .await?;
     let repo_root = tokio::task::spawn_blocking({
         let cwd = cwd.clone();
         move || discover_product_repository(Path::new(&cwd))
@@ -202,6 +146,13 @@ async fn process_claimed_product_creation(
         staging_oid,
     ) = if let Some(repo_root) = repo_root {
         let repo_root = repo_root.trim().to_string();
+        checkpoint_product_creation_stage(
+            manager,
+            claimed,
+            &mut current_stage,
+            Stage::ResolveStartingPin,
+        )
+        .await?;
         let (oid, logical_base) = if let (Some(oid), Some(base)) = (
             job.pin_exact_checkout_oid.clone(),
             job.pin_logical_base.clone(),
@@ -238,6 +189,13 @@ async fn process_claimed_product_creation(
                 ),
             }
         };
+        checkpoint_product_creation_stage(
+            manager,
+            claimed,
+            &mut current_stage,
+            Stage::MaterializeWorktree,
+        )
+        .await?;
         let planned_path =
             deterministic_worktree_path(&repo_root, job.product_conversation_id.as_str());
         let reservation_id = format!("{}:worktree", job.request_id);
@@ -389,6 +347,20 @@ async fn process_claimed_product_creation(
             Some(oid),
         )
     } else {
+        checkpoint_product_creation_stage(
+            manager,
+            claimed,
+            &mut current_stage,
+            Stage::ResolveStartingPin,
+        )
+        .await?;
+        checkpoint_product_creation_stage(
+            manager,
+            claimed,
+            &mut current_stage,
+            Stage::MaterializeWorktree,
+        )
+        .await?;
         (
             cwd.clone(),
             ConvMode::Direct,
@@ -399,6 +371,14 @@ async fn process_claimed_product_creation(
             None,
         )
     };
+
+    checkpoint_product_creation_stage(
+        manager,
+        claimed,
+        &mut current_stage,
+        Stage::FinalizeAttachments,
+    )
+    .await?;
 
     let product_id = job.product_conversation_id.clone();
     let conversation_id = uuid::Uuid::new_v4().to_string();
@@ -444,6 +424,8 @@ async fn process_claimed_product_creation(
                     repository_root,
                 }
             });
+    checkpoint_product_creation_stage(manager, claimed, &mut current_stage, Stage::CommitMetadata)
+        .await?;
     let published = manager
         .db()
         .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
@@ -469,7 +451,7 @@ async fn process_claimed_product_creation(
         claim: claimed.claim.clone(),
         job: delivery,
     };
-    deliver_product_creation_objective(manager, &claimed).await
+    deliver_product_creation_objective_inner(manager, &claimed).await
 }
 
 async fn expand_product_creation_objective(
@@ -530,9 +512,8 @@ async fn persist_retryable_delivery_failure(
 async fn complete_already_accepted_product_creation_delivery(
     manager: &Arc<RuntimeManager>,
     claimed: &crate::db::ClaimedProductCreationJob,
-    product_id: &phoenix_core::domain::close::ProductConversationId,
     conversation_id: &str,
-) -> Result<Option<PublishedProductCreation>, String> {
+) -> Result<bool, String> {
     let job = &claimed.job;
     let steering_fingerprint = manager
         .db()
@@ -570,37 +551,48 @@ async fn complete_already_accepted_product_creation_delivery(
                     "product creation delivery claim was lost before completion".to_string()
                 );
             }
-            return Ok(Some(PublishedProductCreation {
-                product_conversation_id: product_id.to_string(),
-                transcript_row_id: conversation_id.to_string(),
-            }));
+            return Ok(true);
         }
     }
-    Ok(None)
+    Ok(false)
 }
 
 async fn deliver_product_creation_objective(
     manager: &Arc<RuntimeManager>,
     claimed: &crate::db::ClaimedProductCreationJob,
-) -> Result<PublishedProductCreation, String> {
+) -> Result<(), String> {
+    run_product_creation_until_closed(
+        manager,
+        claimed,
+        deliver_product_creation_objective_inner(manager, claimed),
+    )
+    .await
+}
+
+async fn deliver_product_creation_objective_inner(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+) -> Result<(), String> {
+    let mut current_stage = claimed.job.provisioning_stage;
+    checkpoint_product_creation_stage(
+        manager,
+        claimed,
+        &mut current_stage,
+        crate::db::ProductCreationProvisioningStage::BootstrapInitialTurn,
+    )
+    .await?;
     let job = &claimed.job;
-    let product_id = job
-        .published_product_id
-        .clone()
+    job.published_product_id
+        .as_ref()
         .ok_or_else(|| "delivery obligation lacked product id".to_string())?;
     let conversation_id = job
         .published_conversation_id
         .clone()
         .ok_or_else(|| "delivery obligation lacked conversation id".to_string())?;
-    if let Some(completed) = complete_already_accepted_product_creation_delivery(
-        manager,
-        claimed,
-        &product_id,
-        &conversation_id,
-    )
-    .await?
+    if complete_already_accepted_product_creation_delivery(manager, claimed, &conversation_id)
+        .await?
     {
-        return Ok(completed);
+        return Ok(());
     }
     let images = job
         .intent
@@ -613,6 +605,13 @@ async fn deliver_product_creation_objective(
         .collect();
     let expanded =
         expand_product_creation_objective(manager, &conversation_id, &job.intent.objective).await?;
+    checkpoint_product_creation_stage(
+        manager,
+        claimed,
+        &mut current_stage,
+        crate::db::ProductCreationProvisioningStage::BootstrapInitialTurn,
+    )
+    .await?;
     let enqueue_result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         enqueue_product_creation_objective(
@@ -659,10 +658,7 @@ async fn deliver_product_creation_objective(
     if !completed {
         return Err("product creation delivery claim was lost before completion".to_string());
     }
-    Ok(PublishedProductCreation {
-        product_conversation_id: product_id.to_string(),
-        transcript_row_id: conversation_id,
-    })
+    Ok(())
 }
 
 async fn cleanup_and_retry_unpublished_product_creation(
@@ -932,42 +928,60 @@ async fn reconcile_product_creation_cleanup(
 async fn process_product_creation_until_closed(
     manager: &Arc<RuntimeManager>,
     claimed: crate::db::ClaimedProductCreationJob,
-) -> Result<PublishedProductCreation, String> {
-    let request_id = claimed.job.request_id.clone();
-    let claim = claimed.claim.clone();
+) -> Result<(), String> {
+    run_product_creation_until_closed(
+        manager,
+        &claimed,
+        process_claimed_product_creation(manager, &claimed),
+    )
+    .await
+}
+
+async fn run_product_creation_until_closed(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+    processing: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+        "product creation rejected after fatal local authority closure".to_string()
+    })?;
+    let request_id = &claimed.job.request_id;
+    let claim = &claimed.claim;
     let mut fatal = manager.fatal_local_authority_receiver();
-    let mut processing = std::pin::pin!(process_claimed_product_creation(manager, &claimed));
+    if !manager
+        .db()
+        .renew_product_creation_claim(
+            request_id,
+            claim,
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err("product creation claim was lost before processing".to_string());
+    }
+    let mut processing = std::pin::pin!(processing);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     heartbeat.tick().await;
     loop {
         tokio::select! {
-            result = &mut processing => return result,
+            biased;
             _ = crate::tls::wait_for_fatal_local_authority(&mut fatal) => {
                 return Err("product creation stopped after fatal local authority closure".to_string());
             }
+            result = &mut processing => return result,
             _ = heartbeat.tick() => {
                 let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
                     "product creation claim renewal rejected after fatal local authority closure".to_string()
                 })?;
                 let renewed = manager.db().renew_product_creation_claim(
-                    &request_id,
-                    &claim,
+                    request_id,
+                    claim,
                     chrono::Utc::now(),
                     chrono::Duration::seconds(30),
                 ).await.map_err(|error| error.to_string())?;
                 if !renewed {
-                    let current = manager
-                        .db()
-                        .get_product_creation_job(&request_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    if current.is_some_and(|job| {
-                        job.status != "claimed"
-                            && job.published_product_id.is_some()
-                            && job.published_conversation_id.is_some()
-                    }) {
-                        return (&mut processing).await;
-                    }
                     return Err("product creation claim was lost during heartbeat renewal".to_string());
                 }
             }
@@ -2435,20 +2449,51 @@ pub(crate) struct RepositoryMutationLock {
 
 impl RepositoryMutationLock {
     pub(crate) fn acquire(repo_root: &Path) -> Result<Self, (String, ErrorKind)> {
-        let (file, lock_path) = Self::open_file(repo_root)?;
-        file.lock_exclusive().map_err(|error| {
-            (
-                format!("could not lock repository {}: {error}", lock_path.display()),
-                ErrorKind::ServerError,
-            )
-        })?;
-        Ok(Self { file })
+        Self::acquire_with_timeout(repo_root, Duration::from_secs(30))
     }
 
-    fn open_file(repo_root: &Path) -> Result<(std::fs::File, PathBuf), (String, ErrorKind)> {
-        let common_dir = crate::git_ops::run_git(
+    fn acquire_with_timeout(
+        repo_root: &Path,
+        timeout: Duration,
+    ) -> Result<Self, (String, ErrorKind)> {
+        let deadline = std::time::Instant::now() + timeout;
+        let (file, lock_path) = Self::open_file(repo_root, timeout)?;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err((
+                    "repository mutation lock acquisition timed out".to_string(),
+                    ErrorKind::ServerError,
+                ));
+            }
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    return Err((
+                        format!("could not lock repository {}: {error}", lock_path.display()),
+                        ErrorKind::ServerError,
+                    ));
+                }
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err((
+                    "repository mutation lock acquisition timed out".to_string(),
+                    ErrorKind::ServerError,
+                ));
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(25)));
+        }
+    }
+
+    fn open_file(
+        repo_root: &Path,
+        timeout: Duration,
+    ) -> Result<(std::fs::File, PathBuf), (String, ErrorKind)> {
+        let common_dir = run_git_with_timeout(
             repo_root,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            timeout,
         )
         .map_err(|error| (error, ErrorKind::ServerError))?;
         let lock_path = PathBuf::from(common_dir.trim()).join("phoenix-creation.lock");
@@ -2797,6 +2842,476 @@ mod product_creation_delivery_replay_tests {
         ))
     }
 
+    async fn stop_test_creation_worker(manager: Arc<RuntimeManager>) {
+        let stopped = Arc::downgrade(&manager);
+        manager.signal_fatal_local_authority("test_creation_scheduler_shutdown");
+        drop(manager);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stopped.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("creation worker must release its runtime manager before test teardown");
+    }
+
+    async fn advance_product_metadata_for_test(
+        db: &Database,
+        claimed: &crate::db::ClaimedProductCreationJob,
+    ) {
+        use phoenix_db::ProductCreationProvisioningStage as Stage;
+        for stage in [
+            Stage::ResolveRepository,
+            Stage::ResolveStartingPin,
+            Stage::MaterializeWorktree,
+            Stage::FinalizeAttachments,
+            Stage::CommitMetadata,
+        ] {
+            assert!(db
+                .advance_product_creation_provisioning_stage(
+                    &claimed.job.request_id, &claimed.claim, stage,
+                )
+                .await
+                .unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_checkpoints_skip_completed_phases_without_regressing_durable_stage() {
+        use phoenix_db::ProductCreationProvisioningStage as Stage;
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        db.accept_product_creation(
+            "later-stage",
+            &ProductCreationIntent {
+                origin: phoenix_db::ProductCreationOrigin::UserApi,
+                cwd: "/tmp/later-stage".to_string(),
+                objective: "inspect".to_string(),
+                model: None,
+                effort: None,
+                llm_language: LlmLanguage::Caveman,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "later-stage", "worker", "token", chrono::Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for stage in [
+            Stage::ResolveRepository,
+            Stage::ResolveStartingPin,
+            Stage::MaterializeWorktree,
+            Stage::FinalizeAttachments,
+        ] {
+            assert!(db
+                .advance_product_creation_provisioning_stage("later-stage", &claimed.claim, stage)
+                .await
+                .unwrap());
+        }
+        assert!(db
+            .schedule_product_creation_retry("later-stage", &claimed.claim, "retry", chrono::Utc::now())
+            .await
+            .unwrap());
+        let retry = db.get_product_creation_job("later-stage").await.unwrap().unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "later-stage", "replacement", "replacement-token", retry.retry_at.unwrap(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut current_stage = claimed.job.provisioning_stage;
+        let before = claimed.job.clone();
+        for stage in [
+            Stage::ValidateIntent,
+            Stage::ResolveRepository,
+            Stage::ResolveStartingPin,
+            Stage::MaterializeWorktree,
+            Stage::FinalizeAttachments,
+        ] {
+            checkpoint_product_creation_stage(&manager, &claimed, &mut current_stage, stage)
+                .await
+                .unwrap();
+            assert_eq!(current_stage, Stage::FinalizeAttachments);
+            assert_eq!(db.get_product_creation_job("later-stage").await.unwrap().unwrap(), before);
+        }
+        checkpoint_product_creation_stage(
+            &manager,
+            &claimed,
+            &mut current_stage,
+            Stage::CommitMetadata,
+        )
+        .await
+        .unwrap();
+        assert_eq!(current_stage, Stage::CommitMetadata);
+        let advanced = db.get_product_creation_job("later-stage").await.unwrap().unwrap();
+        assert_eq!(advanced.provisioning_stage, Stage::CommitMetadata);
+        assert!(advanced.stage_updated_at >= before.stage_updated_at);
+    }
+
+    async fn accept_and_claim_product_at(
+        db: &Database,
+        request_id: &str,
+        cwd: &Path,
+    ) -> crate::db::ClaimedProductCreationJob {
+        db.accept_product_creation(
+            request_id,
+            &ProductCreationIntent {
+                origin: phoenix_db::ProductCreationOrigin::UserApi,
+                cwd: cwd.to_string_lossy().into_owned(),
+                objective: "inspect".to_string(),
+                model: None,
+                effort: None,
+                llm_language: LlmLanguage::Caveman,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        db.claim_product_creation(
+            request_id,
+            "worker",
+            "token",
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn skipped_retry_checkpoint_rejects_replaced_and_cancelled_claims() {
+        use phoenix_db::ProductCreationProvisioningStage as Stage;
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let mut old = accept_and_claim_product_at(&db, "skipped-fence", Path::new("/tmp")).await;
+        advance_product_metadata_for_test(&db, &old).await;
+        old.job = db.get_product_creation_job("skipped-fence").await.unwrap().unwrap();
+        assert!(db.schedule_product_creation_retry(
+            "skipped-fence", &old.claim, "retry", chrono::Utc::now(),
+        ).await.unwrap());
+        let retry = db.get_product_creation_job("skipped-fence").await.unwrap().unwrap();
+        let replacement = db.claim_product_creation(
+            "skipped-fence", "replacement", "new-token", retry.retry_at.unwrap(),
+            chrono::Duration::seconds(30),
+        ).await.unwrap().unwrap();
+        let mut stage = old.job.provisioning_stage;
+        assert!(checkpoint_product_creation_stage(
+            &manager, &old, &mut stage, Stage::ResolveStartingPin,
+        ).await.is_err());
+        assert_eq!(stage, Stage::CommitMetadata);
+        assert_eq!(db.get_product_creation_job("skipped-fence").await.unwrap().unwrap(), replacement.job);
+
+        assert!(db.cancel_product_creation("skipped-fence", chrono::Utc::now()).await.unwrap());
+        let cancelled = db.get_product_creation_job("skipped-fence").await.unwrap().unwrap();
+        let mut stage = replacement.job.provisioning_stage;
+        assert!(checkpoint_product_creation_stage(
+            &manager, &replacement, &mut stage, Stage::ValidateIntent,
+        ).await.is_err());
+        assert_eq!(db.get_product_creation_job("skipped-fence").await.unwrap().unwrap(), cancelled);
+    }
+
+    fn initialized_product_repository() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.name", "Product Creation Test"],
+            vec!["config", "user.email", "product-creation@example.invalid"],
+            vec!["-c", "commit.gpgSign=false", "commit", "--allow-empty", "-m", "main pin"],
+            vec!["tag", "protected-tag"],
+            vec!["checkout", "-b", "user-work"],
+            vec!["-c", "commit.gpgSign=false", "commit", "--allow-empty", "-m", "user work"],
+        ] {
+            crate::git_ops::run_git(repo.path(), &args).unwrap();
+        }
+        repo
+    }
+
+    fn product_repository_refs(repo: &Path) -> String {
+        crate::git_ops::run_git(
+            repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags"],
+        ).unwrap()
+    }
+
+    #[tokio::test]
+    async fn product_worker_materializes_persisted_pin_detached_without_changing_refs() {
+        let repo = initialized_product_repository();
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let mut claimed = accept_and_claim_product_at(&db, "git-pin", repo.path()).await;
+        let (oid, base) = strict_product_creation_pin(repo.path()).unwrap();
+        assert_eq!(base, "main");
+        assert_ne!(crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap().trim(), oid);
+        assert!(matches!(
+            db.pin_product_creation_once("git-pin", &claimed.claim, &oid, &base, "fresh").await.unwrap(),
+            crate::db::ProductCreationPinOutcome::Pinned(_)
+        ));
+        claimed.job = db.get_product_creation_job("git-pin").await.unwrap().unwrap();
+        // Move main after pin persistence so re-resolving the branch cannot pass this test.
+        crate::git_ops::run_git(repo.path(), &["update-ref", "refs/heads/main", "HEAD"]).unwrap();
+        let before = product_repository_refs(repo.path());
+        let worktree = deterministic_worktree_path(
+            repo.path().to_str().unwrap(), claimed.job.product_conversation_id.as_str(),
+        );
+        let result = process_product_creation_until_closed(&manager, claimed).await;
+        let job = db.get_product_creation_job("git-pin").await.unwrap().unwrap();
+        assert!(job.published_conversation_id.is_some(), "{result:?}");
+        assert_eq!(job.pin_exact_checkout_oid.as_deref(), Some(oid.as_str()));
+        validate_detached_task_worktree(&worktree, &oid).unwrap();
+        assert_eq!(crate::git_ops::run_git(&worktree, &["rev-parse", "HEAD"]).unwrap().trim(), oid);
+        assert!(crate::git_ops::run_git(&worktree, &["symbolic-ref", "-q", "HEAD"]).is_err());
+        assert_eq!(product_repository_refs(repo.path()), before);
+        assert_eq!(crate::git_ops::run_git(repo.path(), &["symbolic-ref", "HEAD"]).unwrap().trim(), "refs/heads/user-work");
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_repository_lock_fences_late_pin_and_stage() {
+        use phoenix_db::ProductCreationProvisioningStage as Stage;
+        let repo = initialized_product_repository();
+        let before_refs = product_repository_refs(repo.path());
+        let lock = RepositoryMutationLock::acquire(repo.path()).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let claimed = accept_and_claim_product_at(&db, "cancel-lock", repo.path()).await;
+        let worktree = deterministic_worktree_path(
+            repo.path().to_str().unwrap(), claimed.job.product_conversation_id.as_str(),
+        );
+        let worker = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let claimed = claimed.clone();
+            async move { process_product_creation_until_closed(&manager, claimed).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let job = db.get_product_creation_job("cancel-lock").await.unwrap().unwrap();
+                if job.provisioning_stage == Stage::ResolveStartingPin {
+                    break;
+                }
+                assert!(!worker.is_finished(), "worker exited before the pin lock barrier");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(!worker.is_finished());
+        assert!(db.cancel_product_creation("cancel-lock", chrono::Utc::now()).await.unwrap());
+        let cancelled = db.get_product_creation_job("cancel-lock").await.unwrap().unwrap();
+        assert!(cancelled.claim_generation > claimed.claim.generation);
+        drop(lock);
+        assert!(tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().is_err());
+        assert_eq!(db.get_product_creation_job("cancel-lock").await.unwrap().unwrap(), cancelled);
+        assert_eq!(cancelled.provisioning_stage, Stage::ResolveStartingPin);
+        assert!(cancelled.pin_exact_checkout_oid.is_none());
+        assert!(cancelled.staging_path.is_none());
+        assert!(cancelled.published_conversation_id.is_none());
+        assert!(cancelled.published_product_id.is_none());
+        assert!(db.get_product_creation_resource_reservations("cancel-lock").await.unwrap().is_empty());
+        assert!(!worktree.exists());
+        assert_eq!(product_repository_refs(repo.path()), before_refs);
+        let mut stage = Stage::ResolveStartingPin;
+        assert!(checkpoint_product_creation_stage(
+            &manager, &claimed, &mut stage, Stage::MaterializeWorktree,
+        ).await.is_err());
+        assert_eq!(db.get_product_creation_job("cancel-lock").await.unwrap().unwrap(), cancelled);
+    }
+
+    #[tokio::test]
+    async fn direct_product_creation_advances_noop_phases_in_sequence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let directory = tempfile::tempdir().unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE observed_creation_stages (stage TEXT NOT NULL);
+             CREATE TRIGGER observe_creation_stage AFTER UPDATE OF provisioning_stage
+             ON product_creation_jobs WHEN NEW.provisioning_stage <> OLD.provisioning_stage
+             BEGIN
+                 INSERT INTO observed_creation_stages VALUES (NEW.provisioning_stage);
+             END;",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.accept_product_creation(
+            "direct-stages",
+            &ProductCreationIntent {
+                origin: phoenix_db::ProductCreationOrigin::UserApi,
+                cwd: directory.path().to_string_lossy().into_owned(),
+                objective: "inspect".to_string(),
+                model: None,
+                effort: None,
+                llm_language: LlmLanguage::Caveman,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "direct-stages", "worker", "token", chrono::Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _delivery_result = process_claimed_product_creation(&manager, &claimed).await;
+        let stages: Vec<String> = sqlx::query_scalar(
+            "SELECT stage FROM observed_creation_stages ORDER BY rowid",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert!(stages.starts_with(&[
+            "resolve_repository".to_string(),
+            "resolve_starting_pin".to_string(),
+            "materialize_worktree".to_string(),
+            "finalize_attachments".to_string(),
+            "commit_metadata".to_string(),
+            "bootstrap_initial_turn".to_string(),
+        ]), "{stages:?}");
+        let job = db.get_product_creation_job("direct-stages").await.unwrap().unwrap();
+        let conversation = db.get_conversation(job.published_conversation_id.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(conversation.conv_mode, ConvMode::Direct);
+        assert!(job.stage_updated_at >= claimed.job.stage_updated_at);
+    }
+
+    #[tokio::test]
+    async fn scheduler_discovers_accepted_job_without_request_wake() {
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        manager.start_creation_worker().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let unusable_cwd = directory.path().join("not-a-directory");
+        std::fs::write(&unusable_cwd, "occupied").unwrap();
+        db.accept_product_creation(
+            "no-request-wake",
+            &ProductCreationIntent {
+                origin: phoenix_db::ProductCreationOrigin::UserApi,
+                cwd: unusable_cwd.to_string_lossy().into_owned(),
+                objective: "inspect".to_string(),
+                model: None,
+                effort: None,
+                llm_language: LlmLanguage::Caveman,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let job = db
+                    .get_product_creation_job("no-request-wake")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if job.status == "retry_scheduled" || job.status == "failed" {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        stop_test_creation_worker(manager).await;
+        let observed = observed.expect("scheduler must discover a committed row without a wake");
+        assert!(observed.claim_generation > 0);
+        assert!(observed.published_conversation_id.is_none());
+        assert_eq!(
+            observed.provisioning_stage,
+            phoenix_db::ProductCreationProvisioningStage::ValidateIntent
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_recovers_expired_product_claim_without_another_request() {
+        let db = Database::open_in_memory().await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let unusable_cwd = directory.path().join("not-a-directory");
+        std::fs::write(&unusable_cwd, "occupied").unwrap();
+        db.accept_product_creation(
+            "expired-product-claim",
+            &ProductCreationIntent {
+                origin: phoenix_db::ProductCreationOrigin::UserApi,
+                cwd: unusable_cwd.to_string_lossy().into_owned(),
+                objective: "inspect".to_string(),
+                model: None,
+                effort: None,
+                llm_language: LlmLanguage::Caveman,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let expired = db
+            .claim_product_creation(
+                "expired-product-claim",
+                "lost-worker",
+                "lost-token",
+                chrono::Utc::now() - chrono::Duration::seconds(60),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let manager = test_runtime_manager(db.clone());
+        manager.start_creation_worker().await.unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let job = db
+                    .get_product_creation_job("expired-product-claim")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if job.status == "retry_scheduled" || job.status == "failed" {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        stop_test_creation_worker(manager).await;
+        let observed = observed.expect("scheduler must replace the expired generation");
+        assert!(observed.claim_generation > expired.claim.generation);
+        assert!(observed.published_conversation_id.is_none());
+    }
+
+    #[test]
+    fn product_provisioning_uses_detached_exact_pin_and_no_branch_mutations() {
+        let source = include_str!("creation_worker.rs");
+        let provision = source
+            .split("async fn process_claimed_product_creation(")
+            .nth(1)
+            .unwrap()
+            .split_once("async fn expand_product_creation_objective(")
+            .unwrap()
+            .0;
+        assert!(provision.contains("\"--detach\""));
+        assert!(provision.contains("branch_name: None"));
+        assert!(provision.contains("&oid,"));
+        for forbidden in ["\"commit\"", "\"tag\"", "\"branch\"", "\"checkout\"", "\"-b\""] {
+            assert!(!provision.contains(forbidden), "{forbidden}");
+        }
+        let pin = source
+            .split("fn strict_product_creation_pin(")
+            .nth(1)
+            .unwrap()
+            .split_once("fn materialize_approved_task_snapshot(")
+            .unwrap()
+            .0;
+        assert!(pin.contains("\"--no-tags\""));
+        assert!(pin.contains("refs/remotes/origin/"));
+        assert!(pin.contains("refs/heads/main"));
+        assert!(pin.contains("Duration::from_secs(30)"));
+    }
+
     async fn seed_retry_identity_delivery(
         db: &Database,
         cwd: &str,
@@ -2834,6 +3349,7 @@ mod product_creation_delivery_replay_tests {
         let publish_claim_lease_until = provisioning.claim.lease_until;
         let conversation =
             stale_delivery_conversation(conversation_id, &accepted_product_id, &intent.cwd);
+        advance_product_metadata_for_test(db, &provisioning).await;
         assert!(db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: request_id.to_string(),
@@ -2848,6 +3364,173 @@ mod product_creation_delivery_replay_tests {
             .await
             .unwrap());
         (intent, accepted_product_id, publish_claim_lease_until)
+    }
+
+    async fn seed_live_delivery(
+        db: &Database,
+        cwd: &Path,
+        request_id: &str,
+        conversation_id: &str,
+    ) -> crate::db::ClaimedProductCreationJob {
+        seed_retry_identity_delivery(db, cwd.to_str().unwrap(), request_id, conversation_id).await;
+        let job = db.get_product_creation_job(request_id).await.unwrap().unwrap();
+        crate::db::ClaimedProductCreationJob {
+            claim: crate::db::ProductCreationClaim {
+                worker_id: job.claim_worker_id.clone().unwrap(),
+                token: job.claim_token.clone().unwrap(),
+                generation: job.claim_generation,
+                lease_until: job.claim_lease_until.unwrap(),
+            },
+            job,
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_claim_renewal_preserves_identity_and_expiry_fences() {
+        let db = Database::open_in_memory().await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let delivery = seed_live_delivery(&db, directory.path(), "renew-delivery", "renew-root").await;
+        let now = chrono::Utc::now();
+        assert!(db.renew_product_creation_claim(
+            "renew-delivery", &delivery.claim, now, chrono::Duration::seconds(30),
+        ).await.unwrap());
+        for wrong_field in 0..3 {
+            let mut stale = delivery.claim.clone();
+            match wrong_field {
+                0 => stale.generation += 1,
+                1 => stale.worker_id.push_str("-wrong"),
+                _ => stale.token.push_str("-wrong"),
+            }
+            assert!(!db.renew_product_creation_claim(
+                "renew-delivery", &stale, now + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            ).await.unwrap());
+        }
+        let expiry = db.get_product_creation_job("renew-delivery").await.unwrap().unwrap().claim_lease_until.unwrap();
+        assert_eq!(expiry.timestamp_micros(), (now + chrono::Duration::seconds(30)).timestamp_micros());
+        assert!(!db.renew_product_creation_claim(
+            "renew-delivery", &delivery.claim, expiry, chrono::Duration::seconds(30),
+        ).await.unwrap());
+        let replacement = db.claim_next_product_creation_delivery(
+            "replacement", "new-token", expiry, chrono::Duration::seconds(30),
+        ).await.unwrap().unwrap();
+        assert!(replacement.claim.generation > delivery.claim.generation);
+        assert!(!db.renew_product_creation_claim(
+            "renew-delivery", &delivery.claim, expiry, chrono::Duration::seconds(30),
+        ).await.unwrap());
+        assert!(db.renew_product_creation_claim(
+            "renew-delivery", &replacement.claim, expiry + chrono::Duration::seconds(1),
+            chrono::Duration::seconds(30),
+        ).await.unwrap());
+        assert!(db.schedule_product_creation_delivery_retry(
+            "renew-delivery", &replacement.claim, "retry", expiry + chrono::Duration::seconds(2),
+        ).await.unwrap());
+        assert!(!db.renew_product_creation_claim(
+            "renew-delivery", &replacement.claim, expiry + chrono::Duration::seconds(3),
+            chrono::Duration::seconds(30),
+        ).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn slow_delivery_keeps_thirty_second_lease_live_through_enqueue() {
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let delivery = seed_live_delivery(&db, directory.path(), "slow-delivery", "slow-root").await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                run_product_creation_until_closed(&manager, &delivery, async {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    deliver_product_creation_objective_inner(&manager, &delivery).await
+                }).await
+            }
+        });
+        started_rx.await.unwrap();
+        let first_lease = db.get_product_creation_job("slow-delivery").await.unwrap().unwrap().claim_lease_until.unwrap();
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        let current = db.get_product_creation_job("slow-delivery").await.unwrap().unwrap();
+        assert!(chrono::Utc::now() > first_lease);
+        assert!(current.claim_lease_until.unwrap() > chrono::Utc::now());
+        assert_eq!(current.status, "delivery_pending");
+        assert!(!worker.is_finished());
+        assert!(db.claim_next_product_creation_delivery(
+            "competitor", "competitor-token", chrono::Utc::now(), chrono::Duration::seconds(30),
+        ).await.unwrap().is_none());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().unwrap();
+        let completed = db.get_product_creation_job("slow-delivery").await.unwrap().unwrap();
+        assert_eq!(completed.status, "published");
+        assert_eq!(completed.provisioning_stage, phoenix_db::ProductCreationProvisioningStage::FinalizePublication);
+        let (committed, queued) = global_objective_artifact_counts(&db, "slow-delivery").await;
+        assert_eq!(committed + queued, 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_heartbeat_stops_replaced_claim_instead_of_awaiting_unfenced_work() {
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let delivery = seed_live_delivery(&db, directory.path(), "replace-delivery", "replace-root").await;
+        let old_claim = delivery.claim.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                run_product_creation_until_closed(&manager, &delivery, async {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    deliver_product_creation_objective_inner(&manager, &delivery).await
+                }).await
+            }
+        });
+        started_rx.await.unwrap();
+        sqlx::query("UPDATE product_creation_jobs SET claim_lease_until_unix_micros = ?1 WHERE request_id = 'replace-delivery'")
+            .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).timestamp_micros())
+            .execute(db.pool()).await.unwrap();
+        let replacement = db.claim_next_product_creation_delivery(
+            "replacement", "replacement-token", chrono::Utc::now(), chrono::Duration::seconds(30),
+        ).await.unwrap().unwrap();
+        assert!(replacement.claim.generation > old_claim.generation);
+        let error = tokio::time::timeout(Duration::from_secs(12), worker).await.unwrap().unwrap().unwrap_err();
+        assert_eq!(error, "product creation claim was lost during heartbeat renewal");
+        assert!(release_tx.send(()).is_err(), "lost-claim work must have been dropped");
+        assert_eq!(db.get_product_creation_job("replace-delivery").await.unwrap().unwrap(), replacement.job);
+        assert_eq!(global_objective_artifact_counts(&db, "replace-delivery").await, (0, 0));
+        assert!(db.get_conversation("replace-root").await.unwrap().archived);
+    }
+
+    #[tokio::test]
+    async fn fatal_authority_closure_drops_pending_delivery_without_late_enqueue() {
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = test_runtime_manager(db.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let delivery = seed_live_delivery(&db, directory.path(), "fatal-delivery", "fatal-root").await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                run_product_creation_until_closed(&manager, &delivery, async {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    deliver_product_creation_objective_inner(&manager, &delivery).await
+                }).await
+            }
+        });
+        started_rx.await.unwrap();
+        let before = db.get_product_creation_job("fatal-delivery").await.unwrap().unwrap();
+        manager.signal_fatal_local_authority("test_product_delivery_closure");
+        let error = tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().unwrap_err();
+        assert_eq!(error, "product creation stopped after fatal local authority closure");
+        assert!(release_tx.send(()).is_err());
+        assert_eq!(db.get_product_creation_job("fatal-delivery").await.unwrap().unwrap(), before);
+        assert_eq!(global_objective_artifact_counts(&db, "fatal-delivery").await, (0, 0));
+        assert!(db.get_conversation("fatal-root").await.unwrap().archived);
     }
 
     async fn claim_delivery_attempt(
@@ -3093,14 +3776,9 @@ mod product_creation_delivery_replay_tests {
             Some(conversation_id)
         );
 
-        let published = deliver_product_creation_objective(manager, &retried)
+        deliver_product_creation_objective(manager, &retried)
             .await
             .unwrap();
-        assert_eq!(
-            published.product_conversation_id,
-            accepted_product_id.to_string()
-        );
-        assert_eq!(published.transcript_row_id, conversation_id);
         let origin: String = sqlx::query_scalar("SELECT origin_kind FROM steering_messages WHERE message_id = ?1 UNION ALL SELECT origin_kind FROM messages WHERE message_id = ?1 LIMIT 1").bind(request_id).fetch_one(db.pool()).await.unwrap();
         assert_eq!(origin, "user_api");
 
@@ -3200,6 +3878,7 @@ mod product_creation_delivery_replay_tests {
             &provisioning.job.product_conversation_id,
             &intent.cwd,
         );
+        advance_product_metadata_for_test(&db, &provisioning).await;
         assert!(db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-stale-delivery".to_string(),
@@ -3259,10 +3938,7 @@ mod product_creation_delivery_replay_tests {
         let error = deliver_product_creation_objective(&manager, &stale_delivery)
             .await
             .unwrap_err();
-        assert_eq!(
-            error,
-            "product creation delivery claim was lost before completion"
-        );
+        assert_eq!(error, "product creation claim was lost before processing");
         let still_pending = db
             .get_product_creation_job("req-stale-delivery")
             .await
@@ -4043,6 +4719,30 @@ mod repository_lock_tests {
     use fs2::FileExt;
 
     #[test]
+    fn blocked_repository_mutation_lock_times_out_and_releases_waiter() {
+        let repo = tempfile::tempdir().unwrap();
+        let status = phoenix_core::git::command()
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let first = RepositoryMutationLock::acquire(repo.path()).unwrap();
+        let started = std::time::Instant::now();
+        let result = RepositoryMutationLock::acquire_with_timeout(
+            repo.path(),
+            std::time::Duration::from_millis(100),
+        );
+        let Err((error, _)) = result else {
+            panic!("blocked repository lock unexpectedly acquired");
+        };
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(first);
+        assert!(RepositoryMutationLock::acquire(repo.path()).is_ok());
+    }
+
+    #[test]
     fn repository_mutation_lock_serializes_live_holders() {
         let repo = tempfile::tempdir().unwrap();
         let status = phoenix_core::git::command()
@@ -4053,8 +4753,11 @@ mod repository_lock_tests {
         assert!(status.success());
         let repo_path = repo.path().to_string_lossy().to_string();
         let first = RepositoryMutationLock::acquire(std::path::Path::new(&repo_path)).unwrap();
-        let (second, _) =
-            RepositoryMutationLock::open_file(std::path::Path::new(&repo_path)).unwrap();
+        let (second, _) = RepositoryMutationLock::open_file(
+            std::path::Path::new(&repo_path),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
 
         assert!(second.try_lock_exclusive().is_err());
         drop(first);

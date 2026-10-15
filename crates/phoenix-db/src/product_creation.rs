@@ -89,12 +89,79 @@ impl ProductCreationIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductCreationProvisioningStage {
+    ValidateIntent,
+    ResolveRepository,
+    ResolveStartingPin,
+    MaterializeWorktree,
+    FinalizeAttachments,
+    CommitMetadata,
+    BootstrapInitialTurn,
+    FinalizePublication,
+}
+
+impl ProductCreationProvisioningStage {
+    pub fn predecessor(self) -> Option<Self> {
+        match self {
+            Self::ValidateIntent => None,
+            Self::ResolveRepository => Some(Self::ValidateIntent),
+            Self::ResolveStartingPin => Some(Self::ResolveRepository),
+            Self::MaterializeWorktree => Some(Self::ResolveStartingPin),
+            Self::FinalizeAttachments => Some(Self::MaterializeWorktree),
+            Self::CommitMetadata => Some(Self::FinalizeAttachments),
+            Self::BootstrapInitialTurn => Some(Self::CommitMetadata),
+            Self::FinalizePublication => Some(Self::BootstrapInitialTurn),
+        }
+    }
+
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self.predecessor() {
+            None => 0,
+            Some(previous) => previous.rank() + 1,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ValidateIntent => "validate_intent",
+            Self::ResolveRepository => "resolve_repository",
+            Self::ResolveStartingPin => "resolve_starting_pin",
+            Self::MaterializeWorktree => "materialize_worktree",
+            Self::FinalizeAttachments => "finalize_attachments",
+            Self::CommitMetadata => "commit_metadata",
+            Self::BootstrapInitialTurn => "bootstrap_initial_turn",
+            Self::FinalizePublication => "finalize_publication",
+        }
+    }
+
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        match row.try_get::<String, _>("provisioning_stage")?.as_str() {
+            "validate_intent" => Ok(Self::ValidateIntent),
+            "resolve_repository" => Ok(Self::ResolveRepository),
+            "resolve_starting_pin" => Ok(Self::ResolveStartingPin),
+            "materialize_worktree" => Ok(Self::MaterializeWorktree),
+            "finalize_attachments" => Ok(Self::FinalizeAttachments),
+            "commit_metadata" => Ok(Self::CommitMetadata),
+            "bootstrap_initial_turn" => Ok(Self::BootstrapInitialTurn),
+            "finalize_publication" => Ok(Self::FinalizePublication),
+            value => Err(sqlx::Error::Decode(
+                format!("invalid product creation stage: {value}").into(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductCreationJobRecord {
     pub request_id: String,
     pub product_conversation_id: ProductConversationId,
     pub intent: ProductCreationIntent,
     pub status: String,
+    pub provisioning_stage: ProductCreationProvisioningStage,
+    pub stage_updated_at: DateTime<Utc>,
     pub accepted_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub attempt_count: i64,
@@ -275,6 +342,8 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
             images,
         },
         status: row.try_get("status")?,
+        provisioning_stage: ProductCreationProvisioningStage::from_row(&row)?,
+        stage_updated_at: unix_micros_to_datetime(row.try_get("stage_updated_at_unix_micros")?)?,
         accepted_at: unix_micros_to_datetime(row.try_get("accepted_at_unix_micros")?)?,
         updated_at: unix_micros_to_datetime(row.try_get("updated_at_unix_micros")?)?,
         attempt_count: row.try_get("attempt_count")?,
@@ -345,6 +414,7 @@ impl Database {
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
             "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.model, j.effort, j.llm_language, j.status,
+                    j.provisioning_stage, j.stage_updated_at_unix_micros,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,
                     j.claim_lease_until_unix_micros, j.retry_at_unix_micros,
@@ -403,6 +473,7 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query(
             "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
+                    provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token,
                     claim_lease_until_unix_micros, retry_at_unix_micros,
@@ -438,8 +509,8 @@ impl Database {
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
                 request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
-                accepted_at_unix_micros, updated_at_unix_micros
-            ) VALUES (?1, ?2, ?3, ?4, ?9, ?5, ?6, ?7, 'accepted', ?8, ?8)",
+                accepted_at_unix_micros, updated_at_unix_micros, stage_updated_at_unix_micros
+            ) VALUES (?1, ?2, ?3, ?4, ?9, ?5, ?6, ?7, 'accepted', ?8, ?8, ?8)",
         )
         .bind(request_id)
         .bind(accepted_product_conversation_id.as_str())
@@ -511,7 +582,8 @@ impl Database {
                  OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
              ) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, model, effort,
-                 llm_language, status, accepted_at_unix_micros, updated_at_unix_micros,
+                 llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
+                 accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
                  claim_lease_until_unix_micros, retry_at_unix_micros, delivery_attempt_count,
                  delivery_retry_at_unix_micros, pin_exact_checkout_oid, pin_logical_base,
@@ -578,7 +650,8 @@ impl Database {
                  LIMIT 1
              )
              RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, model, effort,
-                 llm_language, status, accepted_at_unix_micros, updated_at_unix_micros,
+                 llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
+                 accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
                  claim_lease_until_unix_micros, retry_at_unix_micros, delivery_attempt_count,
                  delivery_retry_at_unix_micros, pin_exact_checkout_oid, pin_logical_base,
@@ -677,6 +750,43 @@ impl Database {
         } else {
             Ok(ProductCreationPinOutcome::Conflict(current))
         }
+    }
+
+    pub async fn advance_product_creation_provisioning_stage(
+        &self,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        stage: ProductCreationProvisioningStage,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = unix_micros_now();
+        let updated = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET stage_updated_at_unix_micros = CASE
+                     WHEN provisioning_stage = ?1 THEN stage_updated_at_unix_micros ELSE ?2 END,
+                 updated_at_unix_micros = CASE
+                     WHEN provisioning_stage = ?1 THEN updated_at_unix_micros
+                     ELSE MAX(updated_at_unix_micros, ?2) END,
+                 provisioning_stage = ?1
+             WHERE request_id = ?3 AND status IN ('claimed', 'delivery_pending')
+               AND claim_generation = ?4 AND claim_worker_id = ?5 AND claim_token = ?6
+               AND claim_lease_until_unix_micros > ?2
+               AND stage_updated_at_unix_micros <= ?2
+               AND (provisioning_stage = ?1 OR
+                    (provisioning_stage = ?7 AND
+                     ?1 NOT IN ('bootstrap_initial_turn', 'finalize_publication')))",
+        )
+        .bind(stage.as_str())
+        .bind(now)
+        .bind(request_id)
+        .bind(claim.generation)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
+        .bind(stage.predecessor().map(ProductCreationProvisioningStage::as_str))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     pub async fn product_creation_claim_is_live(
@@ -780,7 +890,8 @@ impl Database {
             "UPDATE product_creation_jobs
              SET claim_lease_until_unix_micros = ?1,
                  updated_at_unix_micros = ?2
-             WHERE request_id = ?3 AND status = 'claimed' AND claim_generation = ?4
+             WHERE request_id = ?3 AND status IN ('claimed', 'delivery_pending')
+               AND claim_generation = ?4
                AND claim_worker_id = ?5 AND claim_token = ?6
                AND claim_lease_until_unix_micros > ?2",
         )
@@ -883,13 +994,15 @@ impl Database {
         &self,
         input: &ProductCreationPublishInput,
     ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = unix_micros_now();
-        let mut tx = self.pool.begin().await?;
         let claimed: Option<(String, String)> = sqlx::query_as(
             "SELECT request_id, product_conversation_id FROM product_creation_jobs
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
                AND claim_worker_id = ?3 AND claim_token = ?4
-               AND claim_lease_until_unix_micros > ?5",
+               AND claim_lease_until_unix_micros > ?5
+               AND provisioning_stage = 'commit_metadata'
+               AND stage_updated_at_unix_micros <= ?5",
         )
         .bind(&input.request_id)
         .bind(input.claim.generation)
@@ -961,10 +1074,13 @@ impl Database {
                  staging_repo_root = ?3, staging_exact_oid = ?4,
                  published_product_id = ?5, published_conversation_id = ?6,
                  delivery_retry_at_unix_micros = ?7, last_error = NULL,
-                 updated_at_unix_micros = ?8
+                 provisioning_stage = 'bootstrap_initial_turn', stage_updated_at_unix_micros = ?8,
+                 updated_at_unix_micros = MAX(updated_at_unix_micros, ?8)
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?9
                AND claim_worker_id = ?10 AND claim_token = ?11
-               AND claim_lease_until_unix_micros > ?8",
+               AND claim_lease_until_unix_micros > ?8
+               AND provisioning_stage = 'commit_metadata'
+               AND stage_updated_at_unix_micros <= ?8",
         )
         .bind(&input.request_id)
         .bind(match &input.environment {
@@ -1223,14 +1339,16 @@ impl Database {
         {
             return Ok(false);
         }
-        let now = unix_micros_now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = unix_micros_now();
         let published_conversation_id: Option<String> = sqlx::query_scalar(
             "SELECT published_conversation_id
              FROM product_creation_jobs
              WHERE request_id = ?1 AND status = 'delivery_pending'
                AND claim_generation = ?2 AND claim_worker_id = ?3 AND claim_token = ?4
-               AND claim_lease_until_unix_micros > ?5",
+               AND claim_lease_until_unix_micros > ?5
+               AND provisioning_stage = 'bootstrap_initial_turn'
+               AND stage_updated_at_unix_micros <= ?5",
         )
         .bind(request_id)
         .bind(claim.generation)
@@ -1261,12 +1379,15 @@ impl Database {
             "UPDATE product_creation_jobs
              SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
                  claim_lease_until_unix_micros = NULL, delivery_retry_at_unix_micros = NULL,
-                 updated_at_unix_micros = ?1
+                 provisioning_stage = 'finalize_publication', stage_updated_at_unix_micros = ?1,
+                 updated_at_unix_micros = MAX(updated_at_unix_micros, ?1)
              WHERE request_id = ?2 AND status = 'delivery_pending'
                AND claim_generation = ?3 AND claim_worker_id = ?4 AND claim_token = ?5
-               AND claim_lease_until_unix_micros > ?1",
+               AND claim_lease_until_unix_micros > ?1
+               AND provisioning_stage = 'bootstrap_initial_turn'
+               AND stage_updated_at_unix_micros <= ?1",
         )
-        .bind(now)
+        .bind(unix_micros_now())
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
@@ -1607,6 +1728,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
+                    provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token, claim_lease_until_unix_micros,
                     retry_at_unix_micros, cleanup_worker_id, cleanup_token, cleanup_lease_until_unix_micros,
@@ -1858,7 +1980,10 @@ impl Database {
     pub async fn next_product_creation_deadline(&self) -> DbResult<Option<DateTime<Utc>>> {
         let deadline: Option<i64> = sqlx::query_scalar(
             "SELECT MIN(deadline) FROM (
-                 SELECT retry_at_unix_micros AS deadline FROM product_creation_jobs WHERE status = 'retry_scheduled'
+                 SELECT accepted_at_unix_micros AS deadline
+                 FROM product_creation_jobs WHERE status = 'accepted'
+                 UNION ALL SELECT retry_at_unix_micros
+                 FROM product_creation_jobs WHERE status = 'retry_scheduled'
                  UNION ALL SELECT claim_lease_until_unix_micros FROM product_creation_jobs WHERE status = 'claimed'
                  UNION ALL SELECT CASE
                      WHEN delivery_retry_at_unix_micros IS NULL THEN claim_lease_until_unix_micros
@@ -1912,6 +2037,26 @@ mod product_creation_tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
 
+    async fn advance_to_metadata(
+        db: &Database,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+    ) {
+        use ProductCreationProvisioningStage as Stage;
+        for stage in [
+            Stage::ResolveRepository,
+            Stage::ResolveStartingPin,
+            Stage::MaterializeWorktree,
+            Stage::FinalizeAttachments,
+            Stage::CommitMetadata,
+        ] {
+            assert!(db
+                .advance_product_creation_provisioning_stage(request_id, claim, stage)
+                .await
+                .unwrap());
+        }
+    }
+
     fn intent(request_cwd: &str, objective: &str) -> ProductCreationIntent {
         ProductCreationIntent {
             origin: ProductCreationOrigin::UserApi,
@@ -1962,6 +2107,359 @@ mod product_creation_tests {
             chain_name: None,
             llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_jobs_and_expired_claims_have_durable_scheduler_deadlines() {
+        let db = Database::open_in_memory().await.unwrap();
+        assert!(db.next_product_creation_deadline().await.unwrap().is_none());
+        db.accept_product_creation("deadline-request", &intent("/repo/deadline", "inspect"))
+            .await
+            .unwrap();
+        let accepted = db
+            .get_product_creation_job("deadline-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.next_product_creation_deadline().await.unwrap(),
+            Some(accepted.accepted_at)
+        );
+        let expired_at = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap()
+            - chrono::Duration::seconds(1);
+        let old = db
+            .claim_product_creation(
+                "deadline-request",
+                "old-worker",
+                "old-token",
+                expired_at - chrono::Duration::seconds(30),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.next_product_creation_deadline().await.unwrap(),
+            Some(expired_at)
+        );
+        let recovered = db
+            .claim_next_product_creation(
+                "recovery-worker",
+                "recovery-token",
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.job.request_id, accepted.request_id);
+        assert!(recovered.claim.generation > old.claim.generation);
+        assert_eq!(
+            recovered.job.product_conversation_id,
+            accepted.product_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_stage_is_relational_claim_fenced_and_retained_on_failure() {
+        use ProductCreationProvisioningStage as Stage;
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("stage-request", &intent("/repo/stage", "inspect"))
+            .await
+            .unwrap();
+        let accepted = db
+            .get_product_creation_job("stage-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted.provisioning_stage,
+            ProductCreationProvisioningStage::ValidateIntent
+        );
+        assert_eq!(accepted.stage_updated_at, accepted.accepted_at);
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "stage-request",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stale = claimed.claim.clone();
+        stale.generation += 1;
+        assert!(!db
+            .advance_product_creation_provisioning_stage(
+                "stage-request",
+                &stale,
+                ProductCreationProvisioningStage::ResolveRepository,
+            )
+            .await
+            .unwrap());
+        for stage in [Stage::ResolveStartingPin, Stage::CommitMetadata] {
+            assert!(!db
+                .advance_product_creation_provisioning_stage("stage-request", &claimed.claim, stage)
+                .await
+                .unwrap());
+        }
+        assert_eq!(
+            db.get_product_creation_job("stage-request").await.unwrap().unwrap(),
+            claimed.job,
+        );
+        for stage in [Stage::ResolveRepository, Stage::ResolveStartingPin] {
+            assert!(db
+                .advance_product_creation_provisioning_stage("stage-request", &claimed.claim, stage)
+                .await
+                .unwrap());
+        }
+        let advanced = db.get_product_creation_job("stage-request").await.unwrap().unwrap();
+        assert!(advanced.stage_updated_at >= accepted.stage_updated_at);
+        assert!(!db
+            .advance_product_creation_provisioning_stage(
+                "stage-request", &claimed.claim, Stage::ResolveRepository,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .advance_product_creation_provisioning_stage(
+                "stage-request", &claimed.claim, Stage::ResolveStartingPin,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_product_creation_job("stage-request").await.unwrap().unwrap(),
+            advanced,
+        );
+        assert!(db
+            .schedule_product_creation_retry("stage-request", &claimed.claim, "fetch failed", now)
+            .await
+            .unwrap());
+        let failed = db
+            .get_product_creation_job("stage-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.provisioning_stage,
+            ProductCreationProvisioningStage::ResolveStartingPin
+        );
+        assert_eq!(failed.stage_updated_at, advanced.stage_updated_at);
+        assert_eq!(failed.last_error.as_deref(), Some("fetch failed"));
+        for assignment in [
+            "provisioning_stage = 'invented'",
+            "provisioning_stage = NULL",
+            "stage_updated_at_unix_micros = 'not-a-timestamp'",
+            "stage_updated_at_unix_micros = -1",
+        ] {
+            assert!(sqlx::query(&format!(
+                "UPDATE product_creation_jobs SET {assignment} WHERE request_id = 'stage-request'"
+            ))
+            .execute(db.pool())
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_advancement_rejects_expired_unreplaced_claim_and_future_stage_timestamp() {
+        use ProductCreationProvisioningStage as Stage;
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("stage-clock", &intent("/repo/stage", "inspect"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let claimed = db
+            .claim_product_creation(
+                "stage-clock", "worker", "token", now, chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let future = now + chrono::Duration::minutes(1);
+        sqlx::query(
+            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = ?1
+             WHERE request_id = 'stage-clock'",
+        )
+        .bind(future.timestamp_micros())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let before = db.get_product_creation_job("stage-clock").await.unwrap().unwrap();
+        assert!(!db
+            .advance_product_creation_provisioning_stage("stage-clock", &claimed.claim, Stage::ResolveRepository)
+            .await
+            .unwrap());
+        assert_eq!(db.get_product_creation_job("stage-clock").await.unwrap().unwrap(), before);
+        sqlx::query(
+            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = ?1,
+                 claim_lease_until_unix_micros = ?2 WHERE request_id = 'stage-clock'",
+        )
+        .bind(claimed.job.stage_updated_at.timestamp_micros())
+        .bind((now - chrono::Duration::seconds(1)).timestamp_micros())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let expired = db.get_product_creation_job("stage-clock").await.unwrap().unwrap();
+        for stage in [Stage::ValidateIntent, Stage::ResolveRepository] {
+            assert!(!db
+                .advance_product_creation_provisioning_stage("stage-clock", &claimed.claim, stage)
+                .await
+                .unwrap());
+        }
+        assert_eq!(db.get_product_creation_job("stage-clock").await.unwrap().unwrap(), expired);
+        assert_eq!(expired.claim_generation, claimed.claim.generation);
+    }
+
+    #[tokio::test]
+    async fn publication_requires_metadata_predecessor_and_monotonic_stage_timestamp() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("stage-publish", &intent("/repo/direct", "inspect"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "stage-publish", "worker", "token", Utc::now(), chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let input = ProductCreationPublishInput {
+            request_id: "stage-publish".to_string(),
+            claim: claimed.claim.clone(),
+            conversation: published_conversation(
+                "stage-published-conversation", claimed.job.product_conversation_id.clone(),
+                WorkScopeId::new(), "/repo/direct",
+            ),
+            authority_kind: AuthorityKind::Direct,
+            environment: EnvironmentContext::UnownedCwd { cwd: "/repo/direct".to_string() },
+            git_publication: None,
+        };
+        assert!(!db.publish_product_creation_atomically(&input).await.unwrap());
+        assert_eq!(db.get_product_creation_job("stage-publish").await.unwrap().unwrap(), claimed.job);
+        advance_to_metadata(&db, "stage-publish", &claimed.claim).await;
+        assert!(!db
+            .advance_product_creation_provisioning_stage(
+                "stage-publish", &claimed.claim, ProductCreationProvisioningStage::BootstrapInitialTurn,
+            )
+            .await
+            .unwrap());
+        let ready = db.get_product_creation_job("stage-publish").await.unwrap().unwrap();
+        sqlx::query(
+            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = ?1
+             WHERE request_id = 'stage-publish'",
+        )
+        .bind((Utc::now() + chrono::Duration::minutes(1)).timestamp_micros())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(!db.publish_product_creation_atomically(&input).await.unwrap());
+        sqlx::query(
+            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = ?1
+             WHERE request_id = 'stage-publish'",
+        )
+        .bind(ready.stage_updated_at.timestamp_micros())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db.publish_product_creation_atomically(&input).await.unwrap());
+        let published = db.get_product_creation_job("stage-publish").await.unwrap().unwrap();
+        assert_eq!(published.provisioning_stage, ProductCreationProvisioningStage::BootstrapInitialTurn);
+        assert!(published.stage_updated_at >= ready.stage_updated_at);
+        assert!(!db
+            .advance_product_creation_provisioning_stage(
+                "stage-publish", &claimed.claim, ProductCreationProvisioningStage::FinalizePublication,
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn replaced_or_cancelled_claim_cannot_publish_late_results_or_advance_stage() {
+        let db = Database::open_in_memory().await.unwrap();
+        for cancelled in [false, true] {
+            let request_id = if cancelled {
+                "cancelled-late"
+            } else {
+                "replaced-late"
+            };
+            db.accept_product_creation(request_id, &intent("/repo/late", "inspect"))
+                .await
+                .unwrap();
+            let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+            let old = db
+                .claim_product_creation(
+                    request_id,
+                    "old-worker",
+                    "old-token",
+                    now - chrono::Duration::seconds(60),
+                    chrono::Duration::seconds(30),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let current = db
+                .claim_product_creation(
+                    request_id,
+                    "current-worker",
+                    "current-token",
+                    now,
+                    chrono::Duration::seconds(30),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            if cancelled {
+                assert!(db.cancel_product_creation(request_id, now).await.unwrap());
+            }
+            let claim = if cancelled { &current.claim } else { &old.claim };
+            let before = db
+                .get_product_creation_job(request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!db
+                .advance_product_creation_provisioning_stage(
+                    request_id,
+                    claim,
+                    ProductCreationProvisioningStage::ResolveRepository,
+                )
+                .await
+                .unwrap());
+            let scope = WorkScopeId::new();
+            let input = ProductCreationPublishInput {
+                request_id: request_id.to_string(),
+                claim: claim.clone(),
+                conversation: published_conversation(
+                    request_id,
+                    before.product_conversation_id.clone(),
+                    scope.clone(),
+                    "/repo/late",
+                ),
+                authority_kind: AuthorityKind::Direct,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: "/repo/late".to_string(),
+                },
+                git_publication: None,
+            };
+            assert!(!db.publish_product_creation_atomically(&input).await.unwrap());
+            assert_eq!(
+                db.get_product_creation_job(request_id).await.unwrap().unwrap(),
+                before
+            );
+            for (table, id) in [("conversations", request_id), ("work_scopes", scope.as_str())] {
+                let count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE id = ?1"
+                ))
+                    .bind(id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(count, 0, "late result inserted into {table}");
+            }
         }
     }
 
@@ -2374,6 +2872,7 @@ mod product_creation_tests {
             WorkScopeId::new(),
             "/repo/a",
         );
+        advance_to_metadata(&db, "req-language", &publish_claim.claim).await;
         assert!(db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-language".to_string(),
@@ -2483,6 +2982,7 @@ mod product_creation_tests {
             WorkScopeId::new(),
             "/repo/a",
         );
+        advance_to_metadata(&db, "req-delivery", &claim.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery".to_string(),
             claim: claim.claim.clone(),
@@ -3120,6 +3620,7 @@ mod product_creation_tests {
             "/repo/a",
         );
         let delivery_claim_at = claim.claim.lease_until + chrono::Duration::seconds(1);
+        advance_to_metadata(&db1, "req-delivery-claim", &claim.claim).await;
         db1.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery-claim".to_string(),
             claim: claim.claim,
@@ -3208,6 +3709,7 @@ mod product_creation_tests {
         );
         conv.archived = true;
 
+        advance_to_metadata(&db, "req-delivery-complete", &claim.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery-complete".to_string(),
             claim: claim.claim.clone(),
@@ -3373,6 +3875,46 @@ mod product_creation_tests {
             return;
         }
 
+        let before_completion = db
+            .get_product_creation_job("req-delivery-complete")
+            .await
+            .unwrap()
+            .unwrap();
+        for (stage, timestamp) in [
+            ("commit_metadata", before_completion.stage_updated_at.timestamp_micros()),
+            ("bootstrap_initial_turn", (Utc::now() + chrono::Duration::minutes(1)).timestamp_micros()),
+        ] {
+            sqlx::query(
+                "UPDATE product_creation_jobs SET provisioning_stage = ?1,
+                     stage_updated_at_unix_micros = ?2 WHERE request_id = 'req-delivery-complete'",
+            )
+            .bind(stage)
+            .bind(timestamp)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let before = db.get_product_creation_job("req-delivery-complete").await.unwrap().unwrap();
+            assert!(!db
+                .complete_product_creation_delivery(
+                    "req-delivery-complete",
+                    &delivery.claim,
+                    &SteeringAcceptanceFingerprint::Exact("product-create:req-delivery-complete".to_string()),
+                    &delivery.job.intent,
+                )
+                .await
+                .unwrap());
+            assert_eq!(db.get_product_creation_job("req-delivery-complete").await.unwrap().unwrap(), before);
+            assert!(db.get_conversation("conv-delivery-complete").await.unwrap().archived);
+        }
+        sqlx::query(
+            "UPDATE product_creation_jobs SET provisioning_stage = 'bootstrap_initial_turn',
+                 stage_updated_at_unix_micros = ?1 WHERE request_id = 'req-delivery-complete'",
+        )
+        .bind(before_completion.stage_updated_at.timestamp_micros())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
         assert!(db
             .complete_product_creation_delivery(
                 "req-delivery-complete",
@@ -3408,6 +3950,11 @@ mod product_creation_tests {
         assert!(completed.claim_token.is_none());
         assert!(completed.claim_lease_until.is_none());
         assert!(completed.delivery_retry_at.is_none());
+        assert_eq!(
+            completed.provisioning_stage,
+            ProductCreationProvisioningStage::FinalizePublication
+        );
+        assert!(completed.stage_updated_at >= before_completion.stage_updated_at);
     }
 
     #[tokio::test]
@@ -3428,6 +3975,7 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
+        advance_to_metadata(&db, "req-published-lifecycle", &claimed.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-published-lifecycle".to_string(),
             claim: claimed.claim,
@@ -3482,6 +4030,7 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         let product_id = claimed.job.product_conversation_id.clone();
+        advance_to_metadata(&db, "req-delivery-close", &claimed.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery-close".to_string(),
             claim: claimed.claim,
@@ -3647,6 +4196,7 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         let expected_published_product_id = accepted.product_conversation_id.to_string();
+        advance_to_metadata(&db, "req-delivery", &delivery_claim.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery".to_string(),
             claim: delivery_claim.claim.clone(),
@@ -3717,6 +4267,7 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
+        advance_to_metadata(&db, "req-published", &published_claim.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-published".to_string(),
             claim: published_claim.claim,
@@ -3882,6 +4433,7 @@ mod product_creation_tests {
         db.create_conversation("conv-dup", "conv-dup", "/repo/original", true, None, None)
             .await
             .unwrap();
+        advance_to_metadata(&db, "req-3", &claimed.claim).await;
         let outcome = db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-3".to_string(),
@@ -3933,6 +4485,7 @@ mod product_creation_tests {
             WorkScopeId::new(),
             "/repo/a",
         );
+        advance_to_metadata(&db, "req-live-publish", &claim.claim).await;
         sqlx::query(
             "UPDATE product_creation_jobs SET claim_lease_until_unix_micros = ?2 WHERE request_id = ?1",
         )
@@ -3982,6 +4535,7 @@ mod product_creation_tests {
         let scope = WorkScopeId::new();
         let conv =
             published_conversation("conv-owner", product_id.clone(), scope.clone(), "/repo/a");
+        advance_to_metadata(&db, "req-4", &claimed.claim).await;
         let ok = db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-4".to_string(),
@@ -4034,6 +4588,7 @@ mod product_creation_tests {
             scope.clone(),
             "/repo/hidden",
         );
+        advance_to_metadata(&db, "req-cascade", &claim.claim).await;
         assert!(db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-cascade".to_string(),
@@ -4132,6 +4687,7 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
+        advance_to_metadata(&db, "req-a", &claim_a.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-a".to_string(),
             claim: claim_a.claim,
@@ -4164,6 +4720,7 @@ mod product_creation_tests {
             shared_scope.clone(),
             "/repo/b",
         );
+        advance_to_metadata(&db, "req-b", &claim_b.claim).await;
         let err = db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-b".to_string(),
@@ -4245,6 +4802,7 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         let conversation_id = "conv-current-root";
+        advance_to_metadata(&db, "req-current-root", &claim.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-current-root".to_string(),
             claim: claim.claim,
@@ -4327,6 +4885,7 @@ mod product_creation_tests {
                 WorkScopeId::new(),
                 cwd,
             );
+            advance_to_metadata(&db, &req, &claim.claim).await;
             db.publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: req,
                 claim: claim.claim,

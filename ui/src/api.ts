@@ -91,6 +91,7 @@ export type { ProductConversationSnapshotView } from './generated/ProductConvers
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
+import type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
 export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
 export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
 export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
@@ -781,9 +782,52 @@ export interface CreateProductConversationRequest {
 }
 
 export interface CreateProductConversationResponse {
+  request_id: string;
   product_conversation_id: string;
-  canonical_route: string;
 }
+
+export type ProductCreationProvisioningStage =
+  | 'validate_intent' | 'resolve_repository' | 'resolve_starting_pin'
+  | 'materialize_worktree' | 'finalize_attachments' | 'commit_metadata'
+  | 'bootstrap_initial_turn' | 'finalize_publication';
+
+export type ProductConversationCreationObservation =
+  | {
+    kind: 'pending';
+    request_id: string;
+    product_conversation_id: string;
+    status: 'accepted' | 'claimed' | 'retry_scheduled' | 'cancelling' | 'deletion_pending' | 'delivery_pending';
+    provisioning_stage: ProductCreationProvisioningStage;
+    stage_updated_at: string;
+    retry_at: string | null;
+    allowed_actions: ProductConversationCreationAllowedActionView[];
+  }
+  | {
+    kind: 'failed';
+    request_id: string;
+    product_conversation_id: string;
+    status: 'failed' | 'cleanup_ambiguous' | 'delivery_failed';
+    provisioning_stage: ProductCreationProvisioningStage;
+    stage_updated_at: string;
+    error: string | null;
+    allowed_actions: ProductConversationCreationAllowedActionView[];
+  }
+  | {
+    kind: 'cancelled';
+    request_id: string;
+    product_conversation_id: string;
+    provisioning_stage: ProductCreationProvisioningStage;
+    stage_updated_at: string;
+    error: string | null;
+    allowed_actions: ProductConversationCreationAllowedActionView[];
+  }
+  | {
+    kind: 'published';
+    request_id: string;
+    product_conversation_id: string;
+    transcript_row_id: string;
+    canonical_route: string;
+  };
 
 export interface RecentManagementRootSuggestion {
   path: string;
@@ -1632,15 +1676,10 @@ export const api = {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
-      if (err.error_type === 'product_creation_retry_scheduled') {
-        const retryable = new Error(err.error || 'Product creation will retry') as Error & { retryable?: boolean };
-        retryable.retryable = true;
-        throw retryable;
-      }
       if (resp.status === 422) {
         throw new ExpansionError(err as ExpansionErrorDetail);
       }
-      throw new Error(err.error || 'Failed to create product conversation');
+      throw new ApiResponseError(err.error || 'Failed to create product conversation', resp.status, err.error_type);
     }
     return resp.json();
   },
@@ -1796,6 +1835,21 @@ export const api = {
       : await fetch('/api/product-conversations');
     if (!resp.ok) {
       throw new Error('Failed to fetch product conversations');
+    }
+    return resp.json();
+  },
+
+  async getProductConversationCreation(
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<ProductConversationCreationObservation> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}`, {
+      ...(signal ? { signal } : {}),
+      cache: 'no-store',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      throw new ApiResponseError(err.error || 'Failed to fetch product conversation creation', resp.status);
     }
     return resp.json();
   },

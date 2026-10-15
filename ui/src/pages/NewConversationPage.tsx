@@ -30,6 +30,8 @@ function recoveryStatusLabel(status: string): string {
     case 'claimed': return 'Starting';
     case 'retry_scheduled': return 'Retrying';
     case 'cancelling': return 'Cancelling';
+    case 'deletion_pending': return 'Deleting';
+    case 'cleanup_ambiguous': return 'Cleanup needs attention';
     case 'failed': return 'Failed';
     case 'cancelled': return 'Cancelled';
     case 'delivery_failed': return 'Needs retry';
@@ -80,6 +82,7 @@ function NewConversationFileChips({ files, onRemove }: { files: File[]; onRemove
 function ProductCreationRecoveryList({
   rows,
   busyRequestId,
+  startOverBlocked,
   actionErrors,
   onAction,
   canLoadMore,
@@ -87,6 +90,7 @@ function ProductCreationRecoveryList({
 }: {
   rows: ProductConversationCreationRecoveryRow[];
   busyRequestId: string | null;
+  startOverBlocked: boolean;
   actionErrors: Record<string, { action: ProductConversationCreationAllowedActionView; message: string }>;
   onAction: (row: ProductConversationCreationRecoveryRow, action: ProductConversationCreationAllowedActionView) => void;
   canLoadMore: boolean;
@@ -126,7 +130,8 @@ function ProductCreationRecoveryList({
                     key={action}
                     type="button"
                     className={`product-creation-recovery__action${action === 'delete' ? ' product-creation-recovery__action--danger' : ''}`}
-                    disabled={isBusy}
+                    disabled={isBusy || (action === 'start_over' && startOverBlocked)}
+                    title={action === 'start_over' && startOverBlocked ? 'Resolve the current creation before starting over from another attempt' : undefined}
                     onClick={() => onAction(row, action)}
                   >
                     {recoveryActionLabel(action)}
@@ -288,6 +293,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     let stopped = false;
     let timeout: number | undefined;
     let discoveryAttempt = 0;
+    if (conv.creating) return;
     const schedule = () => {
       const canAdvance = recoveryRowsProjection.current.some((row) =>
         RECOVERY_ADVANCING_STATUSES.has(row.status));
@@ -302,7 +308,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       stopped = true;
       if (timeout !== undefined) window.clearTimeout(timeout);
     };
-  }, [refreshRecoveryRows]);
+  }, [conv.creating, refreshRecoveryRows]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -375,9 +381,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   };
 
   const createStatusText = conv.creating
-    ? conv.dirStatus === 'will-create'
-      ? 'Creating folder…'
-      : 'Creating conversation…'
+    ? conv.creationObservation?.kind === 'pending'
+      ? `${recoveryStatusLabel(conv.creationObservation.status)}…`
+      : 'Waiting for conversation publication…'
     : null;
   // Until an LLM is configured, the only meaningful action is the sign-in
   // CTA inside ConversationSettings. Hide the message composer + actions so
@@ -385,11 +391,12 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const llmReady = conv.models === null || conv.models.llm_configured;
 
   const handleRecoveryAction = async (
-    row: ProductConversationCreationRecoveryRow,
+    row: ProductConversationCreationRecoveryRow | Pick<ProductConversationCreationRecoveryRow, 'request_id'>,
     action: ProductConversationCreationAllowedActionView,
   ) => {
     if (action === 'start_over') {
-      conv.startOverFromCreation({
+      if (!('cwd' in row)) return;
+      conv.startOverFromCreation(row.request_id, {
         cwd: row.cwd,
         objective: row.objective,
         model: row.model ?? null,
@@ -418,10 +425,56 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         },
       }));
     } finally {
-      await refreshRecoveryRows();
+      conv.resumeCreationObservation(row.request_id);
       setRecoveryBusyRequestId(null);
+      await refreshRecoveryRows();
     }
   };
+
+  const exactObservation = conv.creationObservation?.kind === 'published'
+    ? null : conv.creationObservation;
+  const exactRow = recoveryRows.find((row) => row.request_id === exactObservation?.request_id);
+  const exactError = exactObservation && recoveryActionErrors[exactObservation.request_id];
+  const exactRecovery = exactObservation && (
+    <section className="product-creation-recovery" aria-label="Current creation result">
+      <strong>{exactObservation.kind === 'cancelled'
+        ? 'Cancelled'
+        : recoveryStatusLabel(exactObservation.status)}</strong>
+      {'error' in exactObservation && exactObservation.error && (
+        <div className="product-creation-recovery__error">{exactObservation.error}</div>
+      )}
+      {exactError && (
+        <div className="product-creation-recovery__error" role="alert">{exactError.message}</div>
+      )}
+      <div className="product-creation-recovery__actions">
+        {exactObservation.allowed_actions.map((action) => (
+          <button
+            key={action}
+            type="button"
+            className={`product-creation-recovery__action${action === 'delete' ? ' product-creation-recovery__action--danger' : ''}`}
+            disabled={recoveryBusyRequestId === exactObservation.request_id || (action === 'start_over' && !exactRow)}
+            title={action === 'start_over' && !exactRow ? 'Waiting for the original creation details' : undefined}
+            onClick={() => void handleRecoveryAction(exactRow ?? exactObservation, action)}
+          >
+            {recoveryActionLabel(action)}
+          </button>
+        ))}
+        {(exactObservation.kind === 'failed' || exactObservation.kind === 'cancelled')
+          && exactObservation.allowed_actions.length === 0 && (
+          <button
+            type="button"
+            className="product-creation-recovery__action"
+            disabled={recoveryBusyRequestId === exactObservation.request_id}
+            title="Stop observing locally without deleting the server record"
+            onClick={() => conv.forgetCreationObservation(exactObservation.request_id)}
+          >
+            Forget locally / New conversation
+          </button>
+        )}
+      </div>
+    </section>
+  );
+  const visibleRecoveryRows = recoveryRows.filter((row) => row.request_id !== exactObservation?.request_id);
 
   const inputPlaceholder = 'What would you like to work on?';
 
@@ -451,9 +504,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       <main className="new-conv-main" data-app-scroll-owner>
         {/* Desktop: workbench card */}
         <div className="new-conv-card desktop-only">
+          {exactRecovery}
           <ProductCreationRecoveryList
-            rows={recoveryRows}
+            rows={visibleRecoveryRows}
             busyRequestId={recoveryBusyRequestId}
+            startOverBlocked={conv.activeCreationRequestId !== null || conv.creating}
             actionErrors={recoveryActionErrors}
             onAction={handleRecoveryAction}
             canLoadMore={recoveryNextCursor !== null}
@@ -530,9 +585,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
         {/* Mobile: keep existing layout */}
         <div className="new-conv-content mobile-only">
+          {exactRecovery}
           <ProductCreationRecoveryList
-            rows={recoveryRows}
+            rows={visibleRecoveryRows}
             busyRequestId={recoveryBusyRequestId}
+            startOverBlocked={conv.activeCreationRequestId !== null || conv.creating}
             actionErrors={recoveryActionErrors}
             onAction={handleRecoveryAction}
             canLoadMore={recoveryNextCursor !== null}

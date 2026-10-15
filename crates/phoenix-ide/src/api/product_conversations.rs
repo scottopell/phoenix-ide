@@ -523,7 +523,7 @@ fn decode_recovery_cursor(cursor: &str) -> Result<(i64, String), AppError> {
     Ok((updated_at, request_id.to_string()))
 }
 
-fn creation_allowed_actions(
+pub(super) fn creation_allowed_actions(
     status: &str,
     delivery_retryable: bool,
 ) -> Vec<ProductConversationCreationAllowedActionView> {
@@ -533,8 +533,12 @@ fn creation_allowed_actions(
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
             actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
-        "delivery_failed" if delivery_retryable => {
-            actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
+        "delivery_failed" => {
+            if delivery_retryable {
+                actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
+            }
+            actions.push(ProductConversationCreationAllowedActionView::Delete);
+            actions.push(ProductConversationCreationAllowedActionView::StartOver);
         }
         "failed" | "cancelled" => {
             actions.push(ProductConversationCreationAllowedActionView::Delete);
@@ -553,13 +557,33 @@ mod creation_allowed_actions_tests {
     use super::{creation_allowed_actions, ProductConversationCreationAllowedActionView};
 
     #[test]
-    fn terminal_publication_has_no_retry_but_transient_delivery_failure_does() {
-        assert!(creation_allowed_actions("delivery_failed", false).is_empty());
-        assert!(creation_allowed_actions("published", false).is_empty());
+    fn permanent_delivery_failure_offers_safe_recovery_without_retry() {
+        assert_eq!(
+            creation_allowed_actions("delivery_failed", false),
+            vec![
+                ProductConversationCreationAllowedActionView::Delete,
+                ProductConversationCreationAllowedActionView::StartOver,
+            ]
+        );
+    }
+
+    #[test]
+    fn transient_delivery_failure_offers_retry_and_safe_recovery() {
         assert_eq!(
             creation_allowed_actions("delivery_failed", true),
-            vec![ProductConversationCreationAllowedActionView::RetryDelivery]
+            vec![
+                ProductConversationCreationAllowedActionView::RetryDelivery,
+                ProductConversationCreationAllowedActionView::Delete,
+                ProductConversationCreationAllowedActionView::StartOver,
+            ]
         );
+    }
+
+    #[test]
+    fn published_creation_has_no_recovery_actions() {
+        for delivery_retryable in [false, true] {
+            assert!(creation_allowed_actions("published", delivery_retryable).is_empty());
+        }
     }
 }
 

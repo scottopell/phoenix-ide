@@ -4,6 +4,8 @@ import { MemoryRouter } from 'react-router-dom';
 import { NewConversationPage } from './NewConversationPage';
 import { recoveryDiscoveryDelay } from './recoveryPolling';
 import { ConversationProvider } from '../conversation';
+import type { ProductConversationCreationObservation } from '../api';
+import { ApiResponseError } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({ apiMock: {
   listModels: vi.fn().mockResolvedValue({ models: [{ id: 'claude-3-5-sonnet' }], default: 'claude-3-5-sonnet', llm_configured: true }),
@@ -15,12 +17,14 @@ const { apiMock } = vi.hoisted(() => ({ apiMock: {
   listConversations: vi.fn().mockResolvedValue([]),
   listArchivedConversations: vi.fn().mockResolvedValue([]),
   listProductConversationCreations: vi.fn().mockResolvedValue({ product_creations: [] }),
+  getProductConversationCreation: vi.fn<(requestId: string, signal?: AbortSignal) => Promise<ProductConversationCreationObservation>>(),
   cancelProductConversationCreation: vi.fn().mockResolvedValue(undefined),
   retryProductConversationDelivery: vi.fn().mockResolvedValue(undefined),
   deleteProductConversationCreation: vi.fn().mockResolvedValue(undefined),
 } }));
 
-vi.mock('../api', () => ({
+vi.mock('../api', async () => ({
+  ...await vi.importActual<typeof import('../api')>('../api'),
   api: apiMock,
   ExpansionError: class ExpansionError extends Error {},
 }));
@@ -289,6 +293,179 @@ describe('NewConversationPage', () => {
     expect(delays.filter((delay) => delay === 5000)).toHaveLength(initialFiveSecondTimers + 1);
 
     setTimeout.mockRestore();
+  });
+
+  it('resumes exact-request observation and pauses list discovery polling until it settles', async () => {
+    vi.useFakeTimers();
+    let resolveObservation!: (value: ProductConversationCreationObservation) => void;
+    const observation = new Promise<ProductConversationCreationObservation>((resolve) => { resolveObservation = resolve; });
+    apiMock.getProductConversationCreation.mockReturnValueOnce(observation);
+    localStorage.setItem('phoenix-pending-product-create-request', JSON.stringify({
+      version: 2, kind: 'accepted', requestId: 'resumed-request', productConversationId: 'resumed-product',
+    }));
+    const page = renderPage();
+    try {
+      await act(async () => {
+        await Promise.all([
+          apiMock.getEnv.mock.results.at(-1)?.value,
+          apiMock.listProductConversationCreations.mock.results.at(-1)?.value,
+        ]);
+      });
+      expect(apiMock.getProductConversationCreation).toHaveBeenCalledWith('resumed-request', expect.any(AbortSignal));
+      expect(screen.getAllByText('Waiting for conversation publication…').length).toBeGreaterThan(0);
+      const listReads = apiMock.listProductConversationCreations.mock.calls.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+      expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(1);
+      expect(apiMock.listProductConversationCreations).toHaveBeenCalledTimes(listReads);
+      await act(async () => {
+        resolveObservation({
+          kind: 'failed', request_id: 'resumed-request', product_conversation_id: 'resumed-product', status: 'failed',
+          provisioning_stage: 'resolve_starting_pin', stage_updated_at: '2026-01-01T00:00:00Z',
+          error: 'Repository pinning failed', allowed_actions: ['delete', 'start_over'],
+        });
+        await observation;
+      });
+      expect(screen.getAllByText('Repository pinning failed').length).toBeGreaterThan(0);
+    } finally {
+      page.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['failed', 'cancelled'] as const)('uses exact %s actions for retry/delete even when discovery is unavailable', async (kind) => {
+    localStorage.setItem('phoenix-pending-product-create-request', JSON.stringify({
+      version: 2, kind: 'accepted', requestId: 'exact-request', productConversationId: 'exact-product',
+    }));
+    const fields = {
+      request_id: 'exact-request', product_conversation_id: 'exact-product',
+      provisioning_stage: 'bootstrap_initial_turn', stage_updated_at: '2026-01-01T00:00:00Z',
+      error: 'Exact terminal result',
+    } as const;
+    const observation: ProductConversationCreationObservation = kind === 'failed'
+      ? { ...fields, kind, status: 'delivery_failed', allowed_actions: ['retry_delivery', 'delete'] }
+      : { ...fields, kind, allowed_actions: ['delete'] };
+    apiMock.getProductConversationCreation.mockResolvedValue(observation);
+    apiMock.listProductConversationCreations.mockRejectedValue(new Error('Discovery unavailable'));
+    renderPage();
+    await screen.findAllByLabelText('Current creation result');
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start over' })).not.toBeInTheDocument();
+    if (kind === 'failed') {
+      fireEvent.click(screen.getAllByRole('button', { name: 'Retry' })[0]!);
+      await waitFor(() => expect(apiMock.retryProductConversationDelivery).toHaveBeenCalledExactlyOnceWith('exact-request'));
+      await waitFor(() => expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getAllByRole('button', { name: 'Delete' })[0]).toBeEnabled());
+    }
+    apiMock.getProductConversationCreation.mockRejectedValueOnce(new ApiResponseError('Not found', 404));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[0]!);
+    await waitFor(() => expect(apiMock.deleteProductConversationCreation).toHaveBeenCalledExactlyOnceWith('exact-request'));
+    await waitFor(() => expect(screen.queryByLabelText('Current creation result')).not.toBeInTheDocument());
+    expect(localStorage.getItem('phoenix-pending-product-create-request')).toBeNull();
+  });
+
+  it.each(['retry_delivery', 'cancel', 'delete'] as const)('resumes exact observation after a lost %s action response', async (action) => {
+    localStorage.setItem('phoenix-pending-product-create-request', JSON.stringify({
+      version: 2, kind: 'accepted', requestId: 'exact-request', productConversationId: 'exact-product',
+    }));
+    const fields = {
+      request_id: 'exact-request', product_conversation_id: 'exact-product',
+      provisioning_stage: 'bootstrap_initial_turn', stage_updated_at: '2026-01-01T00:00:00Z',
+    } as const;
+    const initial: ProductConversationCreationObservation = action === 'cancel'
+      ? { ...fields, kind: 'pending', status: 'accepted', retry_at: null, allowed_actions: ['cancel'] }
+      : { ...fields, kind: 'failed', status: 'delivery_failed', error: 'Delivery failed', allowed_actions: [action] };
+    apiMock.getProductConversationCreation.mockResolvedValueOnce(initial);
+    if (action === 'delete') {
+      apiMock.getProductConversationCreation.mockRejectedValueOnce(new ApiResponseError('Deleted', 404));
+    } else if (action === 'cancel') {
+      apiMock.getProductConversationCreation.mockResolvedValueOnce({ ...fields, kind: 'cancelled', error: null, allowed_actions: ['delete'] });
+    } else {
+      apiMock.getProductConversationCreation.mockResolvedValueOnce({ ...fields, kind: 'pending', status: 'delivery_pending', retry_at: null, allowed_actions: ['delete'] });
+    }
+    const actionApi = action === 'retry_delivery' ? apiMock.retryProductConversationDelivery
+      : action === 'cancel' ? apiMock.cancelProductConversationCreation : apiMock.deleteProductConversationCreation;
+    actionApi.mockRejectedValueOnce(new TypeError('Action response lost'));
+    apiMock.listProductConversationCreations.mockRejectedValue(new Error('Discovery unavailable'));
+    renderPage();
+    const label = action === 'retry_delivery' ? 'Retry' : action === 'cancel' ? 'Cancel' : 'Delete';
+    fireEvent.click((await screen.findAllByRole('button', { name: label }))[0]!);
+    await waitFor(() => expect(actionApi).toHaveBeenCalledExactlyOnceWith('exact-request'));
+    await waitFor(() => expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(2));
+    expect(apiMock.getProductConversationCreation.mock.calls.every(([id]) => id === 'exact-request')).toBe(true);
+    if (action === 'delete') {
+      await waitFor(() => expect(screen.queryByLabelText('Current creation result')).not.toBeInTheDocument());
+      expect(localStorage.getItem('phoenix-pending-product-create-request')).toBeNull();
+      expect(screen.getAllByText('This conversation creation was removed from the server. You can start a new conversation.').length).toBeGreaterThan(0);
+    } else {
+      expect((await screen.findAllByText(action === 'cancel' ? 'Cancelled' : 'Finishing')).length).toBeGreaterThan(0);
+      expect(localStorage.getItem('phoenix-pending-product-create-request')).not.toBeNull();
+    }
+  });
+
+  it('visibly disables unrelated Start over while exact creation is active', async () => {
+    localStorage.setItem('phoenix-pending-product-create-request', JSON.stringify({
+      version: 2, kind: 'accepted', requestId: 'active-request', productConversationId: 'active-product',
+    }));
+    apiMock.getProductConversationCreation.mockResolvedValue({
+      kind: 'pending', request_id: 'active-request', product_conversation_id: 'active-product', status: 'claimed',
+      provisioning_stage: 'resolve_repository', stage_updated_at: '2026-01-01T00:00:00Z', retry_at: null, allowed_actions: ['cancel'],
+    });
+    apiMock.listProductConversationCreations.mockResolvedValue({ product_creations: [{
+      request_id: 'other-request', status: 'failed', cwd: '/other', objective: 'Other objective',
+      model: 'claude-3-5-sonnet', effort: null, images: [], llm_language: 'English',
+      updated_at: '2026-01-01T00:00:00Z', last_error: null, allowed_actions: ['start_over'],
+    }] });
+    renderPage();
+    const buttons = await screen.findAllByRole('button', { name: 'Start over' });
+    expect(buttons.every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    expect(buttons[0]).toHaveAttribute('title', 'Resolve the current creation before starting over from another attempt');
+    fireEvent.click(buttons[0]!);
+    expect(localStorage.getItem('phoenix-pending-product-create-request')).toContain('active-request');
+    expect(screen.queryByDisplayValue('Other objective')).not.toBeInTheDocument();
+  });
+
+  it.each(['failed', 'cancelled'] as const)('offers a local release for an actionless exact %s result', async (kind) => {
+    localStorage.setItem('phoenix-pending-product-create-request', JSON.stringify({
+      version: 2, kind: 'accepted', requestId: 'exact-request', productConversationId: 'exact-product',
+    }));
+    localStorage.setItem('phoenix-new-conversation-draft', 'Retained objective');
+    const fields = {
+      request_id: 'exact-request', product_conversation_id: 'exact-product',
+      provisioning_stage: 'resolve_repository', stage_updated_at: '2026-01-01T00:00:00Z', error: 'Terminal record', allowed_actions: [],
+    } as const;
+    apiMock.getProductConversationCreation.mockResolvedValue(kind === 'failed'
+      ? { ...fields, kind, status: 'failed', allowed_actions: [] }
+      : { ...fields, kind, allowed_actions: [] });
+    renderPage();
+    const forget = (await screen.findAllByRole('button', { name: 'Forget locally / New conversation' }))[0]!;
+    expect(screen.getAllByRole('button', { name: 'Send' }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    fireEvent.click(forget);
+    await waitFor(() => expect(screen.queryByLabelText('Current creation result')).not.toBeInTheDocument());
+    expect(localStorage.getItem('phoenix-pending-product-create-request')).toBeNull();
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeEnabled());
+    expect(apiMock.deleteProductConversationCreation).not.toHaveBeenCalled();
+    expect(apiMock.cancelProductConversationCreation).not.toHaveBeenCalled();
+  });
+
+  it('does not offer stale discovery actions instead of the exact terminal allowed_actions', async () => {
+    localStorage.setItem('phoenix-pending-product-create-request', JSON.stringify({
+      version: 2, kind: 'accepted', requestId: 'exact-request', productConversationId: 'exact-product',
+    }));
+    apiMock.getProductConversationCreation.mockResolvedValue({
+      kind: 'cancelled', request_id: 'exact-request', product_conversation_id: 'exact-product',
+      provisioning_stage: 'resolve_repository', stage_updated_at: '2026-01-01T00:00:00Z',
+      error: null, allowed_actions: ['delete'],
+    });
+    apiMock.listProductConversationCreations.mockResolvedValue({ product_creations: [{
+      request_id: 'exact-request', status: 'accepted', cwd: '/repo', objective: 'stale row',
+      model: 'claude-3-5-sonnet', effort: null, images: [], llm_language: 'English',
+      updated_at: '2026-01-01T00:00:00Z', last_error: null, allowed_actions: ['cancel', 'start_over'],
+    }] });
+    renderPage();
+    await screen.findAllByLabelText('Current creation result');
+    expect(screen.getAllByRole('button', { name: 'Delete' })).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start over' })).not.toBeInTheDocument();
   });
 
   it('start over prefills the composer from a recovery row', async () => {

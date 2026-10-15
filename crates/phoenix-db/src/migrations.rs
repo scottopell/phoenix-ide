@@ -651,6 +651,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_owned_work_scope_home",
         sql: include_str!("migrations/coordinator_home.sql"),
     },
+    Migration {
+        version: 128,
+        name: "product_creation_provisioning_stage",
+        sql: MIGRATION_128,
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -1770,6 +1775,25 @@ CREATE TRIGGER durable_turns_source_call_update BEFORE UPDATE ON durable_turns
 WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
  (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
 BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+";
+
+const MIGRATION_128: &str = r"
+ALTER TABLE product_creation_jobs ADD COLUMN provisioning_stage TEXT NOT NULL
+    DEFAULT 'validate_intent'
+    CHECK (provisioning_stage IN ('validate_intent', 'resolve_repository', 'resolve_starting_pin',
+        'materialize_worktree', 'finalize_attachments', 'commit_metadata',
+        'bootstrap_initial_turn', 'finalize_publication'));
+ALTER TABLE product_creation_jobs ADD COLUMN stage_updated_at_unix_micros INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(stage_updated_at_unix_micros) = 'integer' AND stage_updated_at_unix_micros >= 0);
+UPDATE product_creation_jobs
+SET provisioning_stage = CASE
+        WHEN status = 'published' THEN 'finalize_publication'
+        WHEN status IN ('delivery_pending', 'delivery_failed') THEN 'bootstrap_initial_turn'
+        WHEN staging_path IS NOT NULL THEN 'materialize_worktree'
+        WHEN pin_exact_checkout_oid IS NOT NULL THEN 'resolve_starting_pin'
+        ELSE 'validate_intent'
+    END,
+    stage_updated_at_unix_micros = updated_at_unix_micros;
 ";
 
 const MIGRATION_111: &str = r"
@@ -14138,11 +14162,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn migration_128_backfills_relational_stages_and_enforces_constraints() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE product_creation_jobs (
+                request_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                updated_at_unix_micros INTEGER NOT NULL,
+                staging_path TEXT, pin_exact_checkout_oid TEXT
+             );
+             INSERT INTO product_creation_jobs VALUES
+                ('accepted', 'accepted', 11, NULL, NULL),
+                ('pinned', 'retry_scheduled', 12, NULL, 'oid'),
+                ('staged', 'failed', 13, '/worktree', 'oid'),
+                ('delivery', 'delivery_failed', 14, '/worktree', 'oid'),
+                ('published', 'published', 15, '/worktree', 'oid');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_128).execute(&pool).await.unwrap();
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT request_id, provisioning_stage, stage_updated_at_unix_micros
+             FROM product_creation_jobs ORDER BY updated_at_unix_micros",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("accepted".to_string(), "validate_intent".to_string(), 11),
+                ("pinned".to_string(), "resolve_starting_pin".to_string(), 12),
+                ("staged".to_string(), "materialize_worktree".to_string(), 13),
+                ("delivery".to_string(), "bootstrap_initial_turn".to_string(), 14),
+                ("published".to_string(), "finalize_publication".to_string(), 15),
+            ]
+        );
+        assert!(sqlx::query(
+            "UPDATE product_creation_jobs SET provisioning_stage = 'unknown'"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = -1"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (128, "product_creation_provisioning_stage"),
             (127, "coordinator_owned_work_scope_home"),
             (126, "retire_wake_feature_preserving_history"),
             (125, "support_ipv6_federation_peer_hosts"),
@@ -19451,7 +19527,8 @@ mod tests {
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
                     (126, 'temporarily_skip_wake_feature_retirement'),
-                    (127, 'temporarily_skip_coordinator_owned_work_scope_home')",
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
+                    (128, 'temporarily_skip_product_creation_provisioning_stage')",
         )
         .execute(&pool)
         .await
@@ -20316,7 +20393,8 @@ mod tests {
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
                     (126, 'temporarily_skip_wake_feature_retirement'),
-                    (127, 'temporarily_skip_coordinator_owned_work_scope_home')",
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
+                    (128, 'temporarily_skip_product_creation_provisioning_stage')",
         )
         .execute(pool)
         .await

@@ -27,6 +27,11 @@ Ordinary creation with omitted model uses the registry product default independe
 | REQ-CCR-008 Deletion | Modelled | Hidden deletion-pending tombstone test; explicit ambiguity retention remains unimplemented |
 | REQ-CCR-009 Durable Scheduling | Not implemented | Deadline-aware production scheduler required |
 | REQ-CCR-010 Deterministic Verification | Partial | Generated protocol schedules exist, but immutable-pin and atomic-publication coverage still need implementation |
+| REQ-CCR-011 Provisioning-Stage Migration | Authored; unvalidated | `MIGRATION_128` maps status, staging, and pin evidence and copies the row update timestamp; `migration_128_backfills_relational_stages_and_enforces_constraints` is the regression. Policy: ADR-104. No test execution claimed. |
+
+## Provisioning Checkpoint Follow-Up
+
+`Database::advance_product_creation_provisioning_stage` and the product worker checkpoint helper have authored changes for exact-next-stage, live-claim fencing, monotonic stage timestamps, retry floors, and direct-path no-op stage traversal. Publication and delivery completion require their immediate predecessor stages. Focused database and worker regressions have been added or updated, but have not been run. This does not change the broader merge gate or establish runtime, migration, or end-to-end acceptance.
 
 ## Rehomed Project Requirements
 

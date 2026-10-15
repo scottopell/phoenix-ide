@@ -66,6 +66,12 @@ use tokio::sync::{
 };
 use tracing::Instrument;
 
+#[cfg(not(test))]
+const CREATION_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const CREATION_RECONCILE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
 /// Shared slot carrying the trace identity of whatever triggered a
 /// conversation's next turn: the HTTP request span that delivered the user
 /// event, or the parent's `conversation.turn` span for sub-agents. Written by
@@ -3626,30 +3632,21 @@ impl RuntimeManager {
                         Some(chrono::Utc::now() + chrono::Duration::seconds(1))
                     }
                 };
-                if let Some(deadline) = next_deadline {
-                    let delay = (deadline - chrono::Utc::now())
+                let delay = next_deadline.map_or(CREATION_RECONCILE_INTERVAL, |deadline| {
+                    (deadline - chrono::Utc::now())
                         .to_std()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    tokio::select! {
-                        biased;
-                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                        }
-                        () = tokio::time::sleep(delay) => {}
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
+                        .unwrap_or(std::time::Duration::ZERO)
+                        .min(CREATION_RECONCILE_INTERVAL)
+                });
+                tokio::select! {
+                    biased;
+                    _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
                         }
                     }
+                    () = tokio::time::sleep(delay) => {}
                 }
             }
             tracing::info!("Conversation creation worker stopped");

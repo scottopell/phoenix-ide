@@ -85,6 +85,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
 | [070](070_trusted-input-provenance-and-global-watches.md) | Trusted input provenance and explicit Global conversation watches | Accepted | REQ-GR-007, REQ-GR-014, REQ-GR-015 |
 | [071](071_historical-input-retries-retain-unknown-provenance.md) | Historical input retries retain unknown provenance | Accepted | REQ-GR-014, REQ-DWF-039, REQ-COMP-001 |
+| [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-011, REQ-COMP-001/002/005 |
 
 | [072](072_source-input-links-pin-originating-tool-invocations.md) | Source input links pin originating tool invocations | Accepted | REQ-GR-014, REQ-COMP-001 |
 
@@ -150,6 +151,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
 | Retiring wake execution and preserving wake history | 098, within 034's compatibility scope; 006/011/012 are historical only |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
+| Migrating product creation provisioning stages or changing checkpoint progression | 072, then 044, 043, 034, and 007 |
 | Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 044, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
@@ -243,6 +245,7 @@ ADR-000 (adopt spEARS v2 for new work)
               ├── ADR-046 (ProductConversation owns aggregate presentation without duplicating transcript authority)
               ├── ADR-043 (Creation staging uses a private locked namespace)
               ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
+              │   └── ADR-104 (Product creation stages backfill from durable evidence)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
                   ├── ADR-033 (Database rollback is offline and Foundation observations use relational scalar storage)
                   └── ADR-035 (Repository authority activation is consumer-triggered and offline)

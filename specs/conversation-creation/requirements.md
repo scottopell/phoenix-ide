@@ -199,6 +199,12 @@ WHEN a structurally valid creation request is accepted
 THE SYSTEM SHALL atomically persist exactly one durable creation job identity for that request, its complete creation intent, and any stable replay handle before acknowledging acceptance
 AND SHALL NOT publish a user-visible ready conversation, transcript row, attached `WorkScope`, objective, navigation side effect, or initial message until the creation job reaches one whole publishable outcome
 AND filesystem, Git, attachment finalization, runtime bootstrap, and any queued post-publication work SHALL occur after acceptance
+AND the acceptance acknowledgement SHALL return the durable request identity and reserved ProductConversation identity without waiting for that after-acceptance work to complete
+
+WHEN acceptance is acknowledged before publication
+THE SYSTEM SHALL expose the exact durable request's progress and recovery outcome by request identity
+AND the client SHALL remain on a creation or recovery surface until that exact request publishes atomically, fails, or is cancelled
+AND SHALL navigate to the conversation route only after observing atomic publication
 
 WHEN the same request is retried with the same request identifier and the same creation intent
 THE SYSTEM SHALL replay the original acceptance result rather than creating a second job
@@ -217,6 +223,22 @@ AND the durable job identity SHALL remain the request identifier accepted under 
 
 WHEN a worker reports a result after losing its claim
 THE SYSTEM SHALL reject the result without changing job, conversation publication, message publication, pin selection, or resource ownership state
+
+WHEN a worker checkpoints a provisioning stage
+THE SYSTEM SHALL require a live matching claim using a current microsecond clock sample taken by the persistence layer after acquiring write authority
+AND SHALL allow an unchanged same-stage checkpoint or the exact next stage in this order: `validate_intent`, `resolve_repository`, `resolve_starting_pin`, `materialize_worktree`, `finalize_attachments`, `commit_metadata`, `bootstrap_initial_turn`, `finalize_publication`
+AND SHALL reject stage skips, regressions, and transitions whose clock sample precedes the stored stage timestamp
+AND SHALL preserve the stored timestamp for an idempotent same-stage checkpoint
+AND SHALL advance through no-op stages for direct, non-Git creation rather than skipping them
+AND SHALL retain the recorded stage when a replacement worker revisits earlier phases for reconciliation
+
+WHEN creation metadata is published
+THE SYSTEM SHALL require `commit_metadata` as the predecessor and atomically advance to `bootstrap_initial_turn`
+
+WHEN objective delivery completes creation
+THE SYSTEM SHALL require `bootstrap_initial_turn` as the predecessor and atomically advance to `finalize_publication`
+
+THE SYSTEM SHALL reserve those two transitions for their publication and completion transactions rather than an independent stage checkpoint
 
 ### REQ-CCR-003: Crash Reconciliation
 
@@ -312,3 +334,22 @@ WHEN the creation protocol is verified
 THE SYSTEM SHALL exercise generated operation schedules containing concurrent claims, lease expiry, late results, crashes, retries, cancellation, deletion, immutable pin selection, atomic publication, and ambiguous external-effect completion
 AND SHALL check lifecycle and ownership invariants after every generated operation
 AND SHALL retain minimized failing schedules as deterministic regressions
+
+### REQ-CCR-011: Provisioning-Stage Migration Preserves Durable Evidence
+
+WHEN a forward migration adds provisioning-stage fields to product creation rows that lack them
+THE SYSTEM SHALL preserve the rows, request and product identities, accepted intent, status, claims, pins, and staging facts
+AND SHALL derive `provisioning_stage` from durable row evidence in this precedence order:
+
+1. `published` status maps to `finalize_publication`.
+2. `delivery_pending` or `delivery_failed` status maps to `bootstrap_initial_turn`.
+3. A non-null staging path maps to `materialize_worktree`.
+4. A non-null exact checkout pin maps to `resolve_starting_pin`.
+5. All remaining rows map to `validate_intent`.
+
+THE SYSTEM SHALL copy each row's `updated_at_unix_micros` into `stage_updated_at_unix_micros` without substituting migration time
+AND SHALL treat a backfilled stage as the phase justified by that evidence, not as proof that an unacknowledged external effect completed
+AND SHALL retain claim-fenced reconciliation and sequential advancement when work resumes
+AND SHALL NOT infer additional completed phases from repository state, error text, or elapsed time
+
+This forward transformation grants no downgrade, mixed-version writer, or live database replacement guarantee beyond [the compatibility requirements](../compatibility/requirements.md).
