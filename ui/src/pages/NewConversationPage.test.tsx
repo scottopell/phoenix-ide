@@ -479,6 +479,23 @@ describe('NewConversationPage', () => {
     expect(apiMock.cancelProductConversationCreation).not.toHaveBeenCalled();
   });
 
+  it('offers local release without deleting a cleanup-ambiguous server record', async () => {
+    seedAcceptedCreation('exact-request', 'exact-product');
+    apiMock.getProductConversationCreation.mockResolvedValue({
+      kind: 'failed', request_id: 'exact-request', product_conversation_id: 'exact-product',
+      status: 'cleanup_ambiguous', provisioning_stage: 'resolve_repository',
+      stage_updated_at: '2026-01-01T00:00:00Z', error: 'Ownership remains ambiguous',
+      allowed_actions: ['delete'],
+    });
+    renderPage();
+    expect((await screen.findAllByRole('button', { name: 'Delete' })).length).toBeGreaterThan(0);
+    const forget = (await screen.findAllByRole('button', { name: 'Forget locally / New conversation' }))[0]!;
+    fireEvent.click(forget);
+    await waitFor(() => expect(screen.queryByLabelText('Current creation result')).not.toBeInTheDocument());
+    expect(storedCreation()).toBeNull();
+    expect(apiMock.deleteProductConversationCreation).not.toHaveBeenCalled();
+  });
+
   it('does not offer stale discovery actions instead of the exact terminal allowed_actions', async () => {
     seedAcceptedCreation('exact-request', 'exact-product');
     apiMock.getProductConversationCreation.mockResolvedValue({

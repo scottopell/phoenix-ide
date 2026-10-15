@@ -460,7 +460,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
           </button>
         ))}
         {(exactObservation.kind === 'failed' || exactObservation.kind === 'cancelled')
-          && exactObservation.allowed_actions.length === 0 && (
+          && (exactObservation.allowed_actions.length === 0
+            || (exactObservation.kind === 'failed' && exactObservation.status === 'cleanup_ambiguous')) && (
           <button
             type="button"
             className="product-creation-recovery__action"

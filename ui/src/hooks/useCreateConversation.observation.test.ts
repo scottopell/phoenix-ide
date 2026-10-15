@@ -315,6 +315,42 @@ describe('exact-request creation observation', () => {
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([408, 425, 429])('keeps a transient replay %i bound to the original request', async (status) => {
+    apiMock.createProductConversation.mockRejectedValueOnce(new TypeError('Lost response'))
+      .mockRejectedValueOnce(new ApiResponseError('Replay remains ambiguous', status));
+    apiMock.getProductConversationCreation.mockRejectedValueOnce(new ApiResponseError('Not yet found', 404))
+      .mockResolvedValue(published);
+    const hook = mountCreation();
+    await prepareCreation(hook);
+    await act(async () => { await hook.result.current.handleSend(); });
+    expect(apiMock.createProductConversation).toHaveBeenCalledTimes(2);
+    expect(apiMock.createProductConversation.mock.calls[1]![0]).toEqual(apiMock.createProductConversation.mock.calls[0]![0]);
+    expect(hook.result.current.canSend).toBe(false);
+    expect(storedCreation()?.['kind']).toBe('uncertain');
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(hook.navigate).toHaveBeenCalledExactlyOnceWith('/c/canonical-product-1');
+    expect(generateUUIDMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries exact release after a recovery-storage delete abort', async () => {
+    seedStoredCreation('request-1', {
+      version: 3, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
+    });
+    creationStoreMock.clearProductCreationRequest.mockRejectedValueOnce(new Error('IndexedDB abort'));
+    apiMock.getProductConversationCreation.mockRejectedValue(new ApiResponseError('Removed', 404));
+    const hook = mountCreation();
+    await act(async () => {});
+    expect(hook.result.current.creating).toBe(true);
+    expect(hook.result.current.canSend).toBe(false);
+    expect(hook.result.current.error).toContain('exact request remains active');
+    expect(storedCreation()).not.toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(storedCreation()).toBeNull();
+    expect(hook.result.current.creating).toBe(false);
+    expect(hook.result.current.canSend).toBe(true);
+    expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(2);
+  });
+
   it.each(['initial', 'replay'])('releases and rotates a conflicting %s POST identity instead of looping on 409', async (phase) => {
     generateUUIDMock.mockReturnValueOnce('request-1').mockReturnValue('request-2');
     if (phase === 'replay') {

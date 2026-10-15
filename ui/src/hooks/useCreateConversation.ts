@@ -80,6 +80,13 @@ function clearNewConversationDraft(): void {
   }
 }
 
+function isDefiniteCreationRejection(error: unknown): boolean {
+  return error instanceof ExpansionError
+    || (error instanceof ApiResponseError
+      && error.status >= 400 && error.status < 500
+      && error.status !== 408 && error.status !== 425 && error.status !== 429);
+}
+
 function immutableCreationIntent(request: Omit<CreateProductConversationRequest, 'request_id'>): string {
   return JSON.stringify({
     cwd: request.cwd,
@@ -206,10 +213,20 @@ export function useCreateConversation(navigate: (path: string) => void) {
   }, [models, selectedEffort, selectedModel, selectEffort]);
   useEffect(() => { writeNewConversationDraft(draft); }, [draft]);
 
-  const releaseCreation = useCallback(async (message: string | null, rotate = true) => {
+  const releaseCreation = useCallback(async (message: string | null, rotate = true): Promise<boolean> => {
     const active = activeRequestRef.current;
-    if (active) await clearProductCreationRequest(creationRequestId(active));
-    if (!mountedRef.current || activeRequestRef.current !== active) return;
+    try {
+      if (active) await clearProductCreationRequest(creationRequestId(active));
+    } catch (storageError) {
+      if (!mountedRef.current || activeRequestRef.current !== active) return false;
+      if (active) {
+        setObservedRequest(active);
+        setCreating(true);
+      }
+      setError(`Unable to clear creation recovery state; this exact request remains active. ${storageError instanceof Error ? storageError.message : ''}`);
+      return false;
+    }
+    if (!mountedRef.current || activeRequestRef.current !== active) return false;
     activeRequestRef.current = null;
     setObservedRequest(null);
     setCreationObservation(null);
@@ -219,6 +236,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setRequestId(generateUUID());
       replayIntentRef.current = null;
     }
+    return true;
   }, []);
 
   const submitCreationRequest = useCallback(async (uncertain: Extract<PendingCreationRequest, { kind: 'uncertain' }>, surfaceExpansionError = false) => {
@@ -236,12 +254,12 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setObservedRequest(accepted);
     } catch (err) {
       if (!isCurrent()) return;
-      if (err instanceof ExpansionError || (err instanceof ApiResponseError && err.status >= 400 && err.status < 500)) {
+      if (isDefiniteCreationRejection(err)) {
         const conflict = err instanceof ApiResponseError && err.status === 409;
-        await releaseCreation(conflict
+        const released = await releaseCreation(conflict
           ? 'This request ID conflicts with an existing creation. Submit again to use a new request ID.'
-          : err.message, conflict);
-        if (surfaceExpansionError && err instanceof ExpansionError) throw err;
+          : err instanceof Error ? err.message : 'Conversation creation was rejected.', conflict);
+        if (released && surfaceExpansionError && err instanceof ExpansionError) throw err;
       } else {
         setError(`Creation acceptance is uncertain; checking this exact request. ${err instanceof Error ? err.message : ''}`);
         setObservedRequest(uncertain);
@@ -303,8 +321,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
         if (err instanceof ApiResponseError && err.status === 404) {
           const active = activeRequestRef.current;
           if (active?.kind === 'accepted') {
-            await releaseCreation('This conversation creation was removed from the server. You can start a new conversation.');
-            return;
+            const released = await releaseCreation('This conversation creation was removed from the server. You can start a new conversation.');
+            if (released) return;
           }
           if (active?.kind === 'uncertain') {
             // A late initial POST can commit after this GET: replay only the stored intent.
@@ -333,7 +351,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const forgetCreationObservation = useCallback((requestId: string) => {
     if (!activeRequestRef.current || creationRequestId(activeRequestRef.current) !== requestId) return;
     if (!creationObservation || (creationObservation.kind !== 'failed' && creationObservation.kind !== 'cancelled')
-      || creationObservation.allowed_actions.length !== 0) return;
+      || (creationObservation.allowed_actions.length !== 0
+        && !(creationObservation.kind === 'failed' && creationObservation.status === 'cleanup_ambiguous'))) return;
     void releaseCreation('Stopped observing this terminal creation locally. The server record has not been deleted. You can start a new conversation.');
   }, [creationObservation, releaseCreation]);
 
