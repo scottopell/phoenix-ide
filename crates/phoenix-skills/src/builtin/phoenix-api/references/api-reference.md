@@ -120,21 +120,20 @@ printf '%s' "$INTENT_B64" | base64 "${B64_DEC[@]}" |
 
 Omit the bearer-header line when auth is disabled or already satisfied. Keep `INTENT_B64` out of command output because it contains the objective. The 10-second connect and 30-second transfer deadlines bound every request. A POST deadline after connection may mean the server accepted the intent, so treat curl timeout as ambiguous and follow same-ID reconciliation; do not leave the handle running or mint another UUID.
 
-A successful response proves durable creation/publication and returns:
+HTTP 202 proves durable acceptance and returns:
 
-- `product_conversation_id`: stable ProductConversation identity;
-- `transcript_row_id`: the created root transcript row;
-- `canonical_route`: the product UI route.
+- `request_id`: the exact creation identity to observe or replay;
+- `product_conversation_id`: the reserved stable ProductConversation identity.
 
-It does **not** prove opening-turn dispatch or model activity completed.
+Acceptance does **not** prove publication, opening-turn dispatch, or model activity. Observe only the accepted request with `GET /api/product-conversations/creation/{request_id}`. A `published` response atomically supplies `transcript_row_id` and `canonical_route`; do not dereference or report the reserved product as published before that response.
+
+Use bounded exact-request observation: wait between reads, stop after the caller's declared deadline, and report the last tagged status without inventing completion. The listing route `GET /api/product-conversations/creation` is supplemental discovery, not authority for an accepted request.
 
 ## Ambiguous-response reconciliation
 
-A semantic 4xx such as 400, 401, 403, 404, or 409 rejects the request; correct or authorize it rather than retrying unchanged. HTTP 408, 425, 429, any 5xx, or a transport failure after dispatch is ambiguous/transient: preserve the exact UUID and intent for bounded same-ID replay. Phoenix's auth lockout 429 currently emits no `Retry-After`; wait the observable 60-second lockout window before the single replay rather than retrying immediately.
+A POST response with a semantic 4xx such as 400, 401, 403, 404, or 409 rejects that response; correct or authorize it rather than retrying unchanged. HTTP 408, 425, 429, any 5xx, or a transport failure after dispatch is ambiguous/transient: preserve the exact UUID and intent. Phoenix's auth lockout 429 currently emits no `Retry-After`; wait the observable 60-second lockout window before replay rather than retrying immediately.
 
-For ambiguity, retain the same request UUID and `INTENT_B64`, then repeat the step-3 POST at most once with those exact bytes. Server idempotency returns the existing result for the same intent or a conflict for changed intent; never mint another UUID.
-
-`GET /api/product-conversations/creation` can supplement recovery when its complete JSON is observable. Its rows echo `cwd`, `objective`, `model`, `effort`, normalized `llm_language`, and ordered `images`; compare every field before accepting a match and follow `next_cursor` when present. The handler stores `llm_language:null` as the configured default and, on every replay, replaces the submitted language with that stored value before comparing intent. The stored normalized language always wins: a changed explicit replay language is ignored rather than accepted as a change. Report the stored value and never claim a replay changed language; all other intent stays unchanged. However, image-bearing pages can exceed scoped Bash's output ring. Truncated or invalid JSON is inconclusive and must never be interpreted as absence. The public API has no bounded request-ID lookup, so report that observability gap rather than adding polling, filesystem output, database access, or unsafe text filtering.
+For an ambiguous POST, first query `GET /api/product-conversations/creation/{request_id}`. If it returns the accepted request, continue bounded observation. If it returns 404, the original POST may still commit after the read: repeat the step-3 POST at most once with the same UUID and exact `INTENT_B64`, then resume exact-request observation. A transient replay response remains ambiguous; never release the original request identity or mint another UUID. Server idempotency returns the existing acceptance for identical intent and HTTP 409 for any changed intent, including a changed explicit `llm_language`.
 
 Creation recovery routes are scoped to that request identity:
 
@@ -146,15 +145,16 @@ These are not general conversation retry APIs. Deletion acceptance is not observ
 
 ## Verify creation separately from activity
 
-After a successful POST:
+After exact observation returns `published`:
 
-1. Read `GET /api/product-conversations/{product_conversation_id}`. When its complete JSON is observable, this independently verifies stable product identity/publication and returns `latest_transcript_row_id`, `writable_transcript_row_id`, lifecycle, and route data.
-2. Read `GET /api/conversations/{latest_transcript_row_id}`. When complete, this separately exposes exact transcript state, messages, and `agent_working`.
-3. Report `request_id`, `product_conversation_id`, root `transcript_row_id`, current `latest_transcript_row_id`, `canonical_route`, `conversation.state.type`, and `agent_working` without conflating them.
+1. Retain the published response's `request_id`, `product_conversation_id`, root `transcript_row_id`, and `canonical_route`.
+2. Read `GET /api/product-conversations/{product_conversation_id}`. When its complete JSON is observable, this independently verifies the published aggregate and returns `latest_transcript_row_id`, `writable_transcript_row_id`, lifecycle, and route data.
+3. Read `GET /api/conversations/{latest_transcript_row_id}`. When complete, this separately exposes exact transcript state, messages, and `agent_working`.
+4. Report the identities and activity state without conflating acceptance, publication, dispatch, generation, or turn completion.
 
-Both reads can exceed Bash's result cap after large model output or message history. Validate the response as complete JSON before using it. Truncation is inconclusive: report that creation succeeded but activity/state verification is unavailable through the current unbounded read APIs. Never infer state from a partial body.
+The aggregate and transcript reads can exceed Bash's result cap after large model output or message history. Validate each response as complete JSON before using it. Truncation is inconclusive: report that publication succeeded but activity/state verification is unavailable through the current unbounded read APIs. Never infer state from a partial body.
 
-The root transcript returned by creation is identity/history. After continuation it can differ from the current transcript. Creation success does not imply dispatch success, active generation, or turn completion.
+The root transcript returned by publication is identity/history. After continuation it can differ from the current transcript.
 
 ## Resolve and act on existing conversations
 
@@ -173,4 +173,4 @@ Remote Continue executes that existing API in the selected destination's context
 
 ## Honest gaps
 
-Current APIs do not provide a general Coordinator lifecycle endpoint, destination-aware remote literal-message steering, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded image upload/creation transport, bounded creation lookup by request ID, bounded state-only conversation projection, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.
+Current APIs do not provide a general Coordinator lifecycle endpoint, destination-aware remote literal-message steering, unified mutation receipt, existing-turn retry route, cancel idempotency key, remote-server cwd resolver, bounded image upload/creation transport, bounded state-only conversation projection, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.

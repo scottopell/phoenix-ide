@@ -1386,8 +1386,12 @@ mod tests {
             "objective.trim()",
             "Reject larger text objectives before UUID generation",
             "INTENT_B64",
+            "HTTP 202 proves durable acceptance",
             "repeat the step-3 POST at most once",
-            "GET /api/product-conversations/creation",
+            "GET /api/product-conversations/creation/{request_id}",
+            "A `published` response",
+            "transient replay response remains ambiguous",
+            "changed explicit `llm_language`",
             "product_conversation_id",
             "root `transcript_row_id`",
             "current `latest_transcript_row_id`",
@@ -1416,8 +1420,6 @@ mod tests {
             "HTTP 408, 425, 429",
             "60-second lockout window",
             "`no_op` is omitted when false",
-            "stored normalized language always wins",
-            "`llm_language` is the explicit exception",
         ] {
             assert!(
                 trusted.contains(required),
