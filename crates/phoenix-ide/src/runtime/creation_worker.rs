@@ -2848,7 +2848,7 @@ mod product_creation_delivery_replay_tests {
         drop(manager);
         tokio::time::timeout(Duration::from_secs(5), async {
             while stopped.strong_count() != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -3097,7 +3097,7 @@ mod product_creation_delivery_replay_tests {
                     break;
                 }
                 assert!(!worker.is_finished(), "worker exited before the pin lock barrier");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         }).await.unwrap();
         assert!(!worker.is_finished());
@@ -3188,6 +3188,7 @@ mod product_creation_delivery_replay_tests {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
         manager.start_creation_worker().await.unwrap();
+        // test-timing-allow: insertion must follow the worker entering its no-deadline wait so the reconciliation sweep, not a retained wake, discovers it
         tokio::time::sleep(Duration::from_millis(100)).await;
         let directory = tempfile::tempdir().unwrap();
         let unusable_cwd = directory.path().join("not-a-directory");
@@ -3216,7 +3217,7 @@ mod product_creation_delivery_replay_tests {
                 if job.status == "retry_scheduled" || job.status == "failed" {
                     break job;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await;
@@ -3273,7 +3274,7 @@ mod product_creation_delivery_replay_tests {
                 if job.status == "retry_scheduled" || job.status == "failed" {
                     break job;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await;
@@ -3451,6 +3452,7 @@ mod product_creation_delivery_replay_tests {
         });
         started_rx.await.unwrap();
         let first_lease = db.get_product_creation_job("slow-delivery").await.unwrap().unwrap().claim_lease_until.unwrap();
+        // test-timing-allow: elapsed wall time beyond the 30-second lease is the behavior under test
         tokio::time::sleep(Duration::from_secs(31)).await;
         let current = db.get_product_creation_job("slow-delivery").await.unwrap().unwrap();
         assert!(chrono::Utc::now() > first_lease);

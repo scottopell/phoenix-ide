@@ -299,11 +299,11 @@ describe('exact-request creation observation', () => {
   it('does not POST when uncertain intent cannot be persisted for reload recovery', async () => {
     const hook = mountCreation();
     await prepareCreation(hook);
-    const originalSetItem = Storage.prototype.setItem;
-    const setItem = vi.spyOn(Storage.prototype, 'setItem');
-    setItem.mockImplementation(function (this: Storage, key, value) {
+    const originalSetItem = localStorage.setItem.bind(localStorage);
+    const setItem = vi.spyOn(localStorage, 'setItem');
+    setItem.mockImplementation((key, value) => {
       if (key === storageKey) throw new Error('Storage quota exceeded');
-      return originalSetItem.call(this, key, value);
+      return originalSetItem(key, value);
     });
     try {
       await act(async () => { await hook.result.current.handleSend(); });

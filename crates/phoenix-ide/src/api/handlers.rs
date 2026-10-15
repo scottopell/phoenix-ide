@@ -2065,11 +2065,21 @@ async fn get_product_conversation_creation(
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
         .ok_or_else(|| AppError::NotFound("product creation request not found".to_string()))?;
-    product_creation_status_response(job).map(Json)
+    let delivery_retryable = if job.status == "delivery_failed" {
+        state
+            .db
+            .product_creation_delivery_retryable(&request_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+    } else {
+        false
+    };
+    product_creation_status_response(job, delivery_retryable).map(Json)
 }
 
 fn product_creation_status_response(
     job: crate::db::ProductCreationJobRecord,
+    delivery_retryable: bool,
 ) -> Result<super::types::ProductConversationCreationStatusResponse, AppError> {
     use super::types::{
         ProductConversationCreationFailureStatus as Failure,
@@ -2099,7 +2109,7 @@ fn product_creation_status_response(
                 .map(|at| at.to_rfc3339()),
             allowed_actions: super::product_conversations::creation_allowed_actions(
                 &job.status,
-                job.delivery_retryable,
+                delivery_retryable,
             ),
         });
     }
@@ -2124,7 +2134,7 @@ fn product_creation_status_response(
     }
     let allowed_actions = super::product_conversations::creation_allowed_actions(
         &job.status,
-        job.delivery_retryable,
+        delivery_retryable,
     );
     if job.status == "cancelled" {
         return Ok(Response::Cancelled {
@@ -2480,10 +2490,9 @@ mod product_creation_acceptance_tests {
             for status in statuses {
                 let mut projected_job = job.clone();
                 projected_job.status = (*status).to_string();
-                projected_job.delivery_retryable = false;
                 projected_job.last_error = Some("provisioning stopped".to_string());
                 let projected = serde_json::to_value(
-                    product_creation_status_response(projected_job).unwrap(),
+                    product_creation_status_response(projected_job, false).unwrap(),
                 )
                 .unwrap();
                 assert_eq!(projected["kind"], kind);
@@ -2512,9 +2521,10 @@ mod product_creation_acceptance_tests {
         }
         let mut retryable = job.clone();
         retryable.status = "delivery_failed".to_string();
-        retryable.delivery_retryable = true;
-        let projected =
-            serde_json::to_value(product_creation_status_response(retryable).unwrap()).unwrap();
+        let projected = serde_json::to_value(
+            product_creation_status_response(retryable, true).unwrap(),
+        )
+        .unwrap();
         assert_eq!(projected["kind"], "failed");
         assert_eq!(projected["status"], "delivery_failed");
         assert_eq!(
@@ -2525,7 +2535,7 @@ mod product_creation_acceptance_tests {
         assert!(projected.get("transcript_row_id").is_none());
         let mut unknown = job;
         unknown.status = "unknown".to_string();
-        assert!(product_creation_status_response(unknown).is_err());
+        assert!(product_creation_status_response(unknown, false).is_err());
     }
 
     #[tokio::test]
@@ -2581,7 +2591,8 @@ mod product_creation_acceptance_tests {
         let mut cancelled = job.clone();
         cancelled.status = "cancelled".to_string();
         let recovery =
-            serde_json::to_value(product_creation_status_response(cancelled).unwrap()).unwrap();
+            serde_json::to_value(product_creation_status_response(cancelled, false).unwrap())
+                .unwrap();
         assert_eq!(recovery["kind"], "cancelled");
         assert_eq!(
             recovery["allowed_actions"],
@@ -2590,11 +2601,12 @@ mod product_creation_acceptance_tests {
         assert!(recovery.get("transcript_row_id").is_none());
         let mut published = job;
         published.status = "published".to_string();
-        assert!(product_creation_status_response(published.clone()).is_err());
+        assert!(product_creation_status_response(published.clone(), false).is_err());
         published.published_product_id = Some(published.product_conversation_id.clone());
         published.published_conversation_id = Some("canonical-transcript".to_string());
         let ready =
-            serde_json::to_value(product_creation_status_response(published).unwrap()).unwrap();
+            serde_json::to_value(product_creation_status_response(published, false).unwrap())
+                .unwrap();
         assert_eq!(ready["kind"], "published");
         assert_eq!(ready["transcript_row_id"], "canonical-transcript");
         assert_eq!(

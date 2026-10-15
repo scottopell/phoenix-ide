@@ -103,6 +103,7 @@ pub enum ProductCreationProvisioningStage {
 }
 
 impl ProductCreationProvisioningStage {
+    #[must_use]
     pub fn predecessor(self) -> Option<Self> {
         match self {
             Self::ValidateIntent => None,
@@ -1248,6 +1249,30 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
+    pub async fn product_creation_delivery_retryable(
+        &self,
+        request_id: &str,
+    ) -> DbResult<bool> {
+        let retryable: bool = sqlx::query_scalar(
+            "SELECT CASE WHEN j.status = 'delivery_failed' AND EXISTS (
+               SELECT 1 FROM product_conversations product
+               WHERE product.id = j.published_product_id
+                 AND product.kind = 'ordinary'
+                 AND product.ordinary_lifecycle = 'open'
+             ) AND NOT EXISTS (
+               SELECT 1 FROM close_obligations obligation
+               WHERE obligation.product_conversation_id = j.published_product_id
+                 AND (obligation.phase <> 'completed' OR obligation.close_outcome = 'close_incomplete')
+             ) THEN 1 ELSE 0 END
+             FROM product_creation_jobs j
+             WHERE j.request_id = ?1",
+        )
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(retryable)
+    }
+
     pub async fn list_product_creation_recovery_jobs(
         &self,
         cursor: Option<(i64, String)>,
@@ -2249,18 +2274,16 @@ mod product_creation_tests {
         );
         assert_eq!(failed.stage_updated_at, advanced.stage_updated_at);
         assert_eq!(failed.last_error.as_deref(), Some("fetch failed"));
-        for assignment in [
-            "provisioning_stage = 'invented'",
-            "provisioning_stage = NULL",
-            "stage_updated_at_unix_micros = 'not-a-timestamp'",
-            "stage_updated_at_unix_micros = -1",
+        for statement in [
+            "UPDATE product_creation_jobs SET provisioning_stage = 'invented' WHERE request_id = 'stage-request'",
+            "UPDATE product_creation_jobs SET provisioning_stage = NULL WHERE request_id = 'stage-request'",
+            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = 'not-a-timestamp' WHERE request_id = 'stage-request'",
+            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = -1 WHERE request_id = 'stage-request'",
         ] {
-            assert!(sqlx::query(&format!(
-                "UPDATE product_creation_jobs SET {assignment} WHERE request_id = 'stage-request'"
-            ))
-            .execute(db.pool())
-            .await
-            .is_err());
+            assert!(sqlx::query(statement)
+                .execute(db.pool())
+                .await
+                .is_err());
         }
     }
 
@@ -2450,16 +2473,20 @@ mod product_creation_tests {
                 db.get_product_creation_job(request_id).await.unwrap().unwrap(),
                 before
             );
-            for (table, id) in [("conversations", request_id), ("work_scopes", scope.as_str())] {
-                let count: i64 = sqlx::query_scalar(&format!(
-                    "SELECT COUNT(*) FROM {table} WHERE id = ?1"
-                ))
-                    .bind(id)
+            let conversation_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ?1")
+                    .bind(request_id)
                     .fetch_one(db.pool())
                     .await
                     .unwrap();
-                assert_eq!(count, 0, "late result inserted into {table}");
-            }
+            assert_eq!(conversation_count, 0, "late result inserted a conversation");
+            let scope_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes WHERE id = ?1")
+                    .bind(scope.as_str())
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(scope_count, 0, "late result inserted a work scope");
         }
     }
 

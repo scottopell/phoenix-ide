@@ -37,6 +37,7 @@ CURRENT_SCHEMA_BASELINE_VERSION = 123
 CURRENT_SCHEMA_REQUIRED_MIGRATIONS = {
     126: "retire_wake_feature_preserving_history",
     127: "coordinator_owned_work_scope_home",
+    128: "product_creation_provisioning_stage",
 }
 MINIMUM_FREE_AFTER_RESERVATION_BYTES = 20 * 1024 * 1024 * 1024
 

@@ -190,6 +190,14 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.assertEqual(ledger[-1], compiled_ledger(123)[-1])
         self.assertEqual(ledger, tuple(compiled_ledger(123)))
 
+    def test_qualified_registry_ends_at_product_creation_stage_migration(self) -> None:
+        registry = helper.migration_registry(self.registry)
+        self.assertEqual(
+            registry[-1],
+            (128, "product_creation_provisioning_stage"),
+        )
+        self.assertEqual(registry, tuple(compiled_ledger()))
+
     def test_unknown_newer_and_name_mismatched_ledgers_fail_closed(self) -> None:
         newer = self.database(through=124)
         with self.assertRaisesRegex(helper.ActivationError, "supported current baseline"):
@@ -290,7 +298,7 @@ sys.exit({7 if partial else 0})
         self.assertEqual(proof["source_logical_digest"], proof["backup_logical_digest"])
         self.assertEqual(proof["sha256"], helper.sha256(Path(current.backup_path)))
 
-    def test_ordinary_nonqualified_schema_does_not_impose_127_ceiling(self) -> None:
+    def test_ordinary_nonqualified_schema_does_not_impose_128_ceiling(self) -> None:
         database = self.database(through=122)
         manifest = self.ordinary_manifest(database)
         ordinary = manifest.ordinary_forward_migration
@@ -298,7 +306,7 @@ sys.exit({7 if partial else 0})
         source = registry.read_text()
         source = source.replace(
             "\n];",
-            '\n    Migration { version: 128, name: "future", sql: "SELECT 1" },\n];',
+            '\n    Migration { version: 129, name: "future", sql: "SELECT 1" },\n];',
             1,
         )
         registry.write_text(source)
@@ -624,7 +632,7 @@ sys.exit({7 if partial else 0})
             state = helper.activate(manifest)
 
         self.assertEqual(state, "ordinary_activation_failed_forward_only")
-        self.assertEqual(helper.database_ledger(database)[-1][0], 127)
+        self.assertEqual(helper.database_ledger(database)[-1][0], 128)
         with sqlite3.connect(database) as connection:
             self.assertEqual(
                 connection.execute(
