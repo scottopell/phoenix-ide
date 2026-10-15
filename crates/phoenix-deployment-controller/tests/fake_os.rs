@@ -373,6 +373,36 @@ fn pid_reuse_is_absence_of_owned_identity_not_signal_authority() {
 }
 
 #[test]
+fn malformed_pid_reuse_observation_cannot_launder_owned_identity_absence() {
+    let root = identity(350, 25, 1);
+    let unrelated = identity(999, 26, 1);
+    let state = admitted_attempt(root);
+    let (state, _) = state
+        .ownership_scan_completed()
+        .expect("empty child discovery enters cleanup")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .identity_observed(root, IdentityObservation::PidReused(unrelated))
+        .expect("malformed adapter evidence remains typed uncertainty")
+        .persisted()
+        .into_parts();
+    let closeout = state
+        .deadline_reached(MonotonicTick::new(30))
+        .expect("malformed evidence cannot yield verified cleanup");
+    assert_eq!(
+        closeout.checkpoint().phase(),
+        Phase::AdministrativeCloseoutRequired
+    );
+}
+
+#[test]
+fn candidate_identities_accept_complete_uppercase_hex() {
+    assert!(FullCommitSha::parse(&"A".repeat(40)).is_ok());
+    assert!(ArtifactDigest::parse(&"F".repeat(64)).is_ok());
+}
+
+#[test]
 fn recovery_reobserves_owned_identities_before_repeating_mutation() {
     let root = identity(400, 30, 1);
     let mut os = FakeOs::new([FakeProcess {

@@ -125,8 +125,14 @@ impl OwnedProcessTree {
             IdentityObservation::SameIdentity { current_parent } => {
                 OwnedIdentityStatus::Present { current_parent }
             }
-            IdentityObservation::ExactIdentityAbsent | IdentityObservation::PidReused(_) => {
+            IdentityObservation::ExactIdentityAbsent => OwnedIdentityStatus::VerifiedAbsent,
+            IdentityObservation::PidReused(replacement)
+                if replacement.pid() == identity.pid() && replacement != identity =>
+            {
                 OwnedIdentityStatus::VerifiedAbsent
+            }
+            IdentityObservation::PidReused(_) => {
+                OwnedIdentityStatus::Uncertain(ObservationFailure::Malformed)
             }
             IdentityObservation::Unresolved(failure) => OwnedIdentityStatus::Uncertain(failure),
         };
