@@ -91,8 +91,10 @@ export type { ProductConversationSnapshotView } from './generated/ProductConvers
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
-import type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
+import type { ProductConversationCreateAcceptedResponse } from './generated/ProductConversationCreateAcceptedResponse';
+import type { ProductConversationCreationStatusResponse } from './generated/ProductConversationCreationStatusResponse';
 export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
+export type { ProductCreationProvisioningStage } from './generated/ProductCreationProvisioningStage';
 export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
 export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
 import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
@@ -781,53 +783,9 @@ export interface CreateProductConversationRequest {
   images?: ImageData[];
 }
 
-export interface CreateProductConversationResponse {
-  request_id: string;
-  product_conversation_id: string;
-}
+export type CreateProductConversationResponse = ProductConversationCreateAcceptedResponse;
 
-export type ProductCreationProvisioningStage =
-  | 'validate_intent' | 'resolve_repository' | 'resolve_starting_pin'
-  | 'materialize_worktree' | 'finalize_attachments' | 'commit_metadata'
-  | 'bootstrap_initial_turn' | 'finalize_publication';
-
-export type ProductConversationCreationObservation =
-  | {
-    kind: 'pending';
-    request_id: string;
-    product_conversation_id: string;
-    status: 'accepted' | 'claimed' | 'retry_scheduled' | 'cancelling' | 'deletion_pending' | 'delivery_pending';
-    provisioning_stage: ProductCreationProvisioningStage;
-    stage_updated_at: string;
-    retry_at: string | null;
-    allowed_actions: ProductConversationCreationAllowedActionView[];
-  }
-  | {
-    kind: 'failed';
-    request_id: string;
-    product_conversation_id: string;
-    status: 'failed' | 'cleanup_ambiguous' | 'delivery_failed';
-    provisioning_stage: ProductCreationProvisioningStage;
-    stage_updated_at: string;
-    error: string | null;
-    allowed_actions: ProductConversationCreationAllowedActionView[];
-  }
-  | {
-    kind: 'cancelled';
-    request_id: string;
-    product_conversation_id: string;
-    provisioning_stage: ProductCreationProvisioningStage;
-    stage_updated_at: string;
-    error: string | null;
-    allowed_actions: ProductConversationCreationAllowedActionView[];
-  }
-  | {
-    kind: 'published';
-    request_id: string;
-    product_conversation_id: string;
-    transcript_row_id: string;
-    canonical_route: string;
-  };
+export type ProductConversationCreationObservation = ProductConversationCreationStatusResponse;
 
 export interface RecentManagementRootSuggestion {
   path: string;

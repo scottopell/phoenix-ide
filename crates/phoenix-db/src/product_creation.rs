@@ -2,6 +2,7 @@
 
 use super::*;
 use phoenix_core::domain::product_conversation::ProductConversationId;
+pub use phoenix_core::domain::product_creation::ProductCreationProvisioningStage;
 use phoenix_core::llm_language::LlmLanguage;
 
 const PRODUCT_CREATION_MAX_ATTEMPTS: i64 = 4;
@@ -89,69 +90,23 @@ impl ProductCreationIntent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProductCreationProvisioningStage {
-    ValidateIntent,
-    ResolveRepository,
-    ResolveStartingPin,
-    MaterializeWorktree,
-    FinalizeAttachments,
-    CommitMetadata,
-    BootstrapInitialTurn,
-    FinalizePublication,
-}
+fn provisioning_stage_from_row(
+    row: &SqliteRow,
+) -> Result<ProductCreationProvisioningStage, sqlx::Error> {
+    use ProductCreationProvisioningStage as Stage;
 
-impl ProductCreationProvisioningStage {
-    #[must_use]
-    pub fn predecessor(self) -> Option<Self> {
-        match self {
-            Self::ValidateIntent => None,
-            Self::ResolveRepository => Some(Self::ValidateIntent),
-            Self::ResolveStartingPin => Some(Self::ResolveRepository),
-            Self::MaterializeWorktree => Some(Self::ResolveStartingPin),
-            Self::FinalizeAttachments => Some(Self::MaterializeWorktree),
-            Self::CommitMetadata => Some(Self::FinalizeAttachments),
-            Self::BootstrapInitialTurn => Some(Self::CommitMetadata),
-            Self::FinalizePublication => Some(Self::BootstrapInitialTurn),
-        }
-    }
-
-    #[must_use]
-    pub fn rank(self) -> u8 {
-        match self.predecessor() {
-            None => 0,
-            Some(previous) => previous.rank() + 1,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ValidateIntent => "validate_intent",
-            Self::ResolveRepository => "resolve_repository",
-            Self::ResolveStartingPin => "resolve_starting_pin",
-            Self::MaterializeWorktree => "materialize_worktree",
-            Self::FinalizeAttachments => "finalize_attachments",
-            Self::CommitMetadata => "commit_metadata",
-            Self::BootstrapInitialTurn => "bootstrap_initial_turn",
-            Self::FinalizePublication => "finalize_publication",
-        }
-    }
-
-    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
-        match row.try_get::<String, _>("provisioning_stage")?.as_str() {
-            "validate_intent" => Ok(Self::ValidateIntent),
-            "resolve_repository" => Ok(Self::ResolveRepository),
-            "resolve_starting_pin" => Ok(Self::ResolveStartingPin),
-            "materialize_worktree" => Ok(Self::MaterializeWorktree),
-            "finalize_attachments" => Ok(Self::FinalizeAttachments),
-            "commit_metadata" => Ok(Self::CommitMetadata),
-            "bootstrap_initial_turn" => Ok(Self::BootstrapInitialTurn),
-            "finalize_publication" => Ok(Self::FinalizePublication),
-            value => Err(sqlx::Error::Decode(
-                format!("invalid product creation stage: {value}").into(),
-            )),
-        }
+    match row.try_get::<String, _>("provisioning_stage")?.as_str() {
+        "validate_intent" => Ok(Stage::ValidateIntent),
+        "resolve_repository" => Ok(Stage::ResolveRepository),
+        "resolve_starting_pin" => Ok(Stage::ResolveStartingPin),
+        "materialize_worktree" => Ok(Stage::MaterializeWorktree),
+        "finalize_attachments" => Ok(Stage::FinalizeAttachments),
+        "commit_metadata" => Ok(Stage::CommitMetadata),
+        "bootstrap_initial_turn" => Ok(Stage::BootstrapInitialTurn),
+        "finalize_publication" => Ok(Stage::FinalizePublication),
+        value => Err(sqlx::Error::Decode(
+            format!("invalid product creation stage: {value}").into(),
+        )),
     }
 }
 
@@ -343,7 +298,7 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
             images,
         },
         status: row.try_get("status")?,
-        provisioning_stage: ProductCreationProvisioningStage::from_row(&row)?,
+        provisioning_stage: provisioning_stage_from_row(&row)?,
         stage_updated_at: unix_micros_to_datetime(row.try_get("stage_updated_at_unix_micros")?)?,
         accepted_at: unix_micros_to_datetime(row.try_get("accepted_at_unix_micros")?)?,
         updated_at: unix_micros_to_datetime(row.try_get("updated_at_unix_micros")?)?,

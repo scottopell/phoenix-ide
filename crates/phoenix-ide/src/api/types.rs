@@ -58,20 +58,22 @@ pub struct CreateProductConversationRequest {
     pub images: Vec<ImageAttachment>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationCreateAcceptedResponse {
     pub request_id: String,
     pub product_conversation_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProductConversationCreationStatusResponse {
     Pending {
         request_id: String,
         product_conversation_id: String,
         status: ProductConversationCreationPendingStatus,
-        provisioning_stage: phoenix_db::ProductCreationProvisioningStage,
+        provisioning_stage: phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
         stage_updated_at: String,
         retry_at: Option<String>,
         allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
@@ -80,7 +82,7 @@ pub enum ProductConversationCreationStatusResponse {
         request_id: String,
         product_conversation_id: String,
         status: ProductConversationCreationFailureStatus,
-        provisioning_stage: phoenix_db::ProductCreationProvisioningStage,
+        provisioning_stage: phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
         stage_updated_at: String,
         error: Option<String>,
         allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
@@ -88,7 +90,7 @@ pub enum ProductConversationCreationStatusResponse {
     Cancelled {
         request_id: String,
         product_conversation_id: String,
-        provisioning_stage: phoenix_db::ProductCreationProvisioningStage,
+        provisioning_stage: phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
         stage_updated_at: String,
         error: Option<String>,
         allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
@@ -101,7 +103,8 @@ pub enum ProductConversationCreationStatusResponse {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum ProductConversationCreationPendingStatus {
     Accepted,
@@ -112,7 +115,8 @@ pub enum ProductConversationCreationPendingStatus {
     DeliveryPending,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum ProductConversationCreationFailureStatus {
     Failed,
