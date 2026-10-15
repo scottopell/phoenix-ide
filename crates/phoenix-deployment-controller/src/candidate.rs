@@ -2,6 +2,8 @@
 pub struct FullCommitSha([u8; 20]);
 
 impl FullCommitSha {
+    /// # Errors
+    /// Returns [`InvalidHexIdentity`] unless `value` is exactly 40 hexadecimal characters.
     pub fn parse(value: &str) -> Result<Self, InvalidHexIdentity> {
         Ok(Self(parse_hex::<20>(value)?))
     }
@@ -16,6 +18,8 @@ impl FullCommitSha {
 pub struct ArtifactDigest([u8; 32]);
 
 impl ArtifactDigest {
+    /// # Errors
+    /// Returns [`InvalidHexIdentity`] unless `value` is exactly 64 hexadecimal characters.
     pub fn parse(value: &str) -> Result<Self, InvalidHexIdentity> {
         Ok(Self(parse_hex::<32>(value)?))
     }

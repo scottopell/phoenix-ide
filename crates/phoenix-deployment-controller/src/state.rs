@@ -280,6 +280,8 @@ impl DeploymentAttempt {
         }
     }
 
+    /// # Errors
+    /// Returns an error outside resource sampling or for a non-increasing sample sequence.
     pub fn record_resource_sample(
         self,
         sample: ResourceSample,
@@ -324,6 +326,8 @@ impl DeploymentAttempt {
         }
     }
 
+    /// # Errors
+    /// Returns an error outside ownership discovery or when the parent is not owned.
     pub fn child_discovered(
         self,
         parent: ProcessIdentity,
@@ -351,6 +355,8 @@ impl DeploymentAttempt {
         ))
     }
 
+    /// # Errors
+    /// Returns an error when the phase cannot accept evidence or the discovery is unknown.
     pub fn child_observed(
         self,
         discovery: CandidateDiscovery,
@@ -379,6 +385,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless the attempt awaits birth evidence.
     pub fn retry_unresolved_discoveries(self) -> Result<Transition, TransitionError> {
         let attempt = self.into_ownership()?;
         if attempt.phase != OwnershipPhase::AwaitingBirthEvidence {
@@ -398,6 +406,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless ownership discovery is active.
     pub fn ownership_scan_completed(self) -> Result<Transition, TransitionError> {
         let mut attempt = self.into_ownership()?;
         if !matches!(
@@ -422,6 +432,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns an error when the phase cannot accept evidence or the identity is not owned.
     pub fn identity_observed(
         self,
         identity: ProcessIdentity,
@@ -444,6 +456,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns an error unless cleanup is active and every discovery has stable evidence.
     pub fn request_owned_signals(self, signal: Signal) -> Result<Transition, TransitionError> {
         let attempt = self.into_ownership()?;
         if !matches!(
@@ -467,6 +481,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless owned-tree cleanup is active.
     pub fn cleanup_signals_settled(self) -> Result<Transition, TransitionError> {
         let mut attempt = self.into_ownership()?;
         if attempt.phase != OwnershipPhase::Cleaning {
@@ -481,6 +497,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless verification or recovery is active.
     pub fn verification_completed(self, now: MonotonicTick) -> Result<Transition, TransitionError> {
         let mut attempt = self.into_ownership()?;
         if !matches!(
@@ -518,6 +536,8 @@ impl DeploymentAttempt {
         }
     }
 
+    /// # Errors
+    /// Returns an error before the deadline, without unresolved risk, or outside ownership work.
     pub fn deadline_reached(self, now: MonotonicTick) -> Result<Transition, TransitionError> {
         let attempt = self.into_ownership()?;
         if now < attempt.context.deadline {
@@ -529,6 +549,8 @@ impl DeploymentAttempt {
         Ok(to_administrative_closeout(attempt))
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless the attempt has active work.
     pub fn interrupt(self) -> Result<Transition, TransitionError> {
         let Self::Active(active) = self else {
             return Err(TransitionError::WrongPhase);
@@ -543,6 +565,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless the attempt is interrupted.
     pub fn recover(self) -> Result<Transition, TransitionError> {
         let Self::Interrupted(interrupted) = self else {
             return Err(TransitionError::WrongPhase);
@@ -577,6 +601,8 @@ impl DeploymentAttempt {
         }
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] when invocation cannot be recorded safely.
     pub fn record_migration_invoked(
         mut self,
         candidate: RetainedCandidateIdentity,
@@ -584,7 +610,7 @@ impl DeploymentAttempt {
         match &mut self {
             Self::Active(active) => {
                 active.context_mut().compatibility =
-                    CompatibilityBoundary::CandidateMigrationInvoked(candidate)
+                    CompatibilityBoundary::CandidateMigrationInvoked(candidate);
             }
             Self::Ready(attempt) => {
                 attempt.context.compatibility =
@@ -602,6 +628,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless forward recovery is active.
     pub fn record_candidate_verification(
         self,
         verification: CandidateVerification,
@@ -616,6 +644,8 @@ impl DeploymentAttempt {
         })
     }
 
+    /// # Errors
+    /// Returns an error unless closeout is required and acceptance names this attempt.
     pub fn accept_administrative_risk(
         self,
         acceptance: AdministrativeRiskAcceptance,
@@ -678,12 +708,12 @@ impl DeploymentAttempt {
     #[must_use]
     pub fn resource_evidence(&self) -> Option<&SustainedResourceEvidence> {
         match self {
-            Self::Active(ActiveAttempt::Ownership(attempt)) => Some(&attempt.resources),
-            Self::Ready(attempt) => Some(&attempt.resources),
-            Self::Interrupted(InterruptedAttempt {
+            Self::Active(ActiveAttempt::Ownership(attempt))
+            | Self::Interrupted(InterruptedAttempt {
                 resume: ActiveAttempt::Ownership(attempt),
                 ..
             }) => Some(&attempt.resources),
+            Self::Ready(attempt) => Some(&attempt.resources),
             Self::AdministrativeCloseoutRequired(attempt) => Some(&attempt.resources),
             Self::AdministrativelyClosed(attempt) => Some(&attempt.resources),
             Self::Active(ActiveAttempt::ResourceSampling(_))
@@ -699,12 +729,12 @@ impl DeploymentAttempt {
     #[must_use]
     pub fn ownership_tree(&self) -> Option<&OwnedProcessTree> {
         match self {
-            Self::Active(ActiveAttempt::Ownership(attempt)) => Some(&attempt.tree),
-            Self::Ready(attempt) => Some(&attempt.tree),
-            Self::Interrupted(InterruptedAttempt {
+            Self::Active(ActiveAttempt::Ownership(attempt))
+            | Self::Interrupted(InterruptedAttempt {
                 resume: ActiveAttempt::Ownership(attempt),
                 ..
             }) => Some(&attempt.tree),
+            Self::Ready(attempt) => Some(&attempt.tree),
             Self::AdministrativeCloseoutRequired(attempt) => Some(&attempt.tree),
             Self::AdministrativelyClosed(attempt) => Some(&attempt.tree),
             Self::Active(ActiveAttempt::ResourceSampling(_))

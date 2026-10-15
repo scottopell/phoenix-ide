@@ -45,6 +45,8 @@ impl OwnedProcessTree {
         }
     }
 
+    /// # Errors
+    /// Returns [`UnknownParent`] unless `verified_parent` is already an owned identity.
     pub fn discover_child(
         &mut self,
         verified_parent: ProcessIdentity,
@@ -66,6 +68,8 @@ impl OwnedProcessTree {
         Ok(discovery)
     }
 
+    /// # Errors
+    /// Returns [`UnknownDiscovery`] unless the complete discovery epoch matches an unresolved entry.
     pub fn record_child_observation(
         &mut self,
         discovery: CandidateDiscovery,
@@ -106,6 +110,8 @@ impl OwnedProcessTree {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns [`UnknownOwnedIdentity`] unless `identity` was acquired as part of this owned tree.
     pub fn record_identity_observation(
         &mut self,
         identity: ProcessIdentity,

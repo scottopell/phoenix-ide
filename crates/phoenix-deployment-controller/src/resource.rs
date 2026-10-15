@@ -11,6 +11,8 @@ pub enum MemoryPressure {
 pub struct CpuContentionBasisPoints(u16);
 
 impl CpuContentionBasisPoints {
+    /// # Errors
+    /// Returns [`InvalidCpuContention`] when `value` exceeds 10,000 basis points.
     pub fn new(value: u16) -> Result<Self, InvalidCpuContention> {
         if value > 10_000 {
             return Err(InvalidCpuContention);
@@ -124,6 +126,8 @@ impl ResourceWindow {
         }
     }
 
+    /// # Errors
+    /// Returns [`NonIncreasingSampleSequence`] when the sample does not follow the previously recorded sequence.
     pub fn record(
         &mut self,
         sample: ResourceSample,

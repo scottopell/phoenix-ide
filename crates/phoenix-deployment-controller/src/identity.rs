@@ -27,6 +27,8 @@ pub struct BirthToken {
 }
 
 impl BirthToken {
+    /// # Errors
+    /// Returns [`InvalidBirthToken`] when `nanos` is outside a subsecond range.
     pub fn new(seconds: u64, nanos: u32) -> Result<Self, InvalidBirthToken> {
         if nanos >= 1_000_000_000 {
             return Err(InvalidBirthToken);
@@ -130,6 +132,8 @@ pub struct StableChildEvidence {
 }
 
 impl StableChildEvidence {
+    /// # Errors
+    /// Returns [`ChildEvidenceMismatch`] when PID, parent identity, or protected-PID rules do not bind the observation to the discovery.
     pub fn new(
         discovery: CandidateDiscovery,
         identity: ProcessIdentity,
