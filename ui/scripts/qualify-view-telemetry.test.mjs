@@ -76,7 +76,10 @@ test('pending pagehide case requires actual incomplete report, not relabeled rea
     const listeners = {};
     let finishReadiness;
     let closed = false;
-    const report = { open_id: 'journey', outcome, marks: { meaningful_transcript: null }, correlations: [{ kind: 'request', id: 'request' }] };
+    let binding;
+    const producerId = '10000000-0000-4000-8000-000000000001';
+    const requestId = '20000000-0000-4000-8000-000000000001';
+    const report = { open_id: producerId, outcome, marks: { meaningful_transcript: null }, correlations: [{ kind: 'request', id: requestId }] };
     const page = {
       on: (event, callback) => { listeners[event] = callback; },
       waitForFunction: () => new Promise(resolve => { finishReadiness = resolve; }),
@@ -85,10 +88,15 @@ test('pending pagehide case requires actual incomplete report, not relabeled rea
           listeners.request({ url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', method: () => 'POST', postData: () => JSON.stringify(report) });
           listeners.response({ url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', status: () => 204 });
           finishReadiness();
-        } else queueMicrotask(() => listeners.request({ url: () => 'http://127.0.0.1:8123/api/product-conversations/product/history?open_id=request', method: () => 'GET' }));
+        } else queueMicrotask(() => {
+          binding({}, { version: 1, kind: 'admission', route: 'ordinary', sampled: true, open_id: producerId });
+          binding({}, { version: 1, kind: 'request', open_id: producerId, request_id: requestId });
+          listeners.request({ url: () => `http://127.0.0.1:8123/api/product-conversations/product/history?open_id=${requestId}`, method: () => 'GET' });
+        });
       },
     };
-    const browser = { newContext: async () => ({ newPage: async () => page, newCDPSession: async () => ({ send: async () => {} }), close: async () => { closed = true; } }) };
+    page.evaluate = async () => {};
+    const browser = { newContext: async () => ({ exposeBinding: async (_name, fn) => { binding = fn; }, addInitScript: async () => {}, newPage: async () => page, newCDPSession: async () => ({ send: async () => {} }), close: async () => { closed = true; } }) };
     const args = { browser, storageState: { cookies: [], origins: [] }, baseURL: 'http://127.0.0.1:8123', route: '/c/product', attempts: 1 };
     if (outcome === 'incomplete') assert.equal((await runPendingPagehideCheck(args)).status, 'observed_incomplete');
     else await assert.rejects(runPendingPagehideCheck(args));
@@ -400,6 +408,7 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
           if (mode === 'initial_unsampled' && index === 1) throw new Error('stop after verified unsampled trial');
           const unsampled = mode === 'initial_unsampled' && index === 0;
           diagnosticBinding?.({}, { version: 1, kind: 'admission', route: report.route, sampled: !unsampled, open_id: unsampled ? null : report.open_id });
+          if (!unsampled) diagnosticBinding?.({}, { version: 1, kind: 'request', open_id: report.open_id, request_id: requestId });
           if (mode === 'initial_overflow' && index === 0) for (let n = 0; n < 65; n++) diagnosticBinding?.({}, { version: 1, kind: 'mark', open_id: report.open_id, mark: 'shell', ms: 0 });
           if (index === 0 && ['initial_stall', 'initial_dual', 'initial_transportfail'].includes(mode)) {
             diagnosticBinding?.({}, { version: 1, kind: 'mark', open_id: report.open_id, mark: 'shell', ms: 0 });
@@ -694,6 +703,7 @@ test.each(['missing_response', 'navigation_and_cleanup', 'callback_and_persisten
   const post = { url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', method: () => 'POST', postData: () => JSON.stringify(report) };
   let trial;
   let ready;
+  let binding;
   const candidate = { on: (event, fn) => { callbacks[event] = fn; },
     goto: async url => {
       if (url === 'about:blank') {
@@ -704,10 +714,12 @@ test.each(['missing_response', 'navigation_and_cleanup', 'callback_and_persisten
         contextCallbacks.requestfailed?.(post);
         return;
       }
+      binding({}, { version: 1, kind: 'admission', route: 'ordinary', sampled: true, open_id: id });
+      binding({}, { version: 1, kind: 'request', open_id: id, request_id: id });
       callbacks.request({ url: () => `http://127.0.0.1:8123/api/product-conversations/${id}?open_id=${id}`, method: () => 'GET' });
       if (mode !== 'missing_response') throw primary;
-    }, waitForFunction: () => new Promise(resolve => { ready = resolve; }) };
-  const owned = { on: (event, fn) => { contextCallbacks[event] = fn; }, newPage: async () => candidate,
+    }, evaluate: async () => {}, waitForFunction: () => new Promise(resolve => { ready = resolve; }) };
+  const owned = { exposeBinding: async (_name, fn) => { binding = fn; }, addInitScript: async () => {}, on: (event, fn) => { contextCallbacks[event] = fn; }, newPage: async () => candidate,
     newCDPSession: async () => ({ send: async () => {}, on: (event, fn) => { cdpCallbacks[event] = fn; } }),
     close: async () => { contextCallbacks.close?.(); if (mode === 'navigation_and_cleanup') throw new Error('close failed'); } };
   try {
@@ -730,5 +742,43 @@ test.each(['missing_response', 'navigation_and_cleanup', 'callback_and_persisten
       assert.equal(trial.callback_failure, 'callback failed');
       assert.equal(trial.persistence_failure, 'pagehide trial receipt persistence failed');
     }
+  } finally { vi.useRealTimers(); }
+});
+
+test.each(['unsampled', 'missing', 'foreign_request', 'overflow', 'sampled_no_post'])('pagehide explicit producer evidence %s is never inferred from legacy GET', async mode => {
+  vi.useFakeTimers();
+  const id = '00000000-0000-4000-8000-000000000001';
+  const other = '00000000-0000-4000-8000-000000000002';
+  let binding; let ready; let trial; let blankNavigations = 0;
+  const callbacks = {};
+  const page = { on: (event, fn) => { callbacks[event] = fn; }, evaluate: async () => {},
+    waitForFunction: () => new Promise(resolve => { ready = resolve; }),
+    goto: async url => {
+      if (url === 'about:blank') { blankNavigations++; ready(); return; }
+      queueMicrotask(() => {
+        if (mode !== 'missing') binding({}, { version: 1, kind: 'admission', route: 'ordinary', sampled: mode !== 'unsampled', open_id: mode === 'unsampled' ? null : id });
+        if (!['missing', 'unsampled'].includes(mode)) binding({}, { version: 1, kind: 'request', open_id: id, request_id: mode === 'foreign_request' ? other : id });
+        if (mode === 'overflow') for (let n = 0; n < 65; n++) binding({}, { version: 1, kind: 'mark', open_id: id, mark: 'shell', ms: 0 });
+        callbacks.request({ url: () => `http://127.0.0.1:8123/api/product-conversations/${id}?open_id=${id}`, method: () => 'GET' });
+        if (mode === 'missing') ready();
+      });
+    } };
+  const owned = { exposeBinding: async (_name, fn) => { binding = fn; }, addInitScript: async () => {}, on: () => {}, newPage: async () => page,
+    newCDPSession: async () => ({ send: async () => {} }), close: async () => {} };
+  try {
+    const operation = runPendingPagehideCheck({ browser: { newContext: async () => owned }, storageState: {}, baseURL: 'http://127.0.0.1:8123', route: '/c/product', attempts: 1, onTrial: value => { trial = value; } });
+    const outcome = operation.then(value => ({ value }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(4020);
+    const { value, error } = await outcome;
+    if (mode === 'unsampled') {
+      assert.equal(error, undefined); assert.equal(value.status, 'inconclusive_sampling_budget');
+      assert.equal(trial.sampled, false); assert.equal(trial.status, 'unsampled'); assert.equal(blankNavigations, 0);
+    } else {
+      assert.ok(error);
+      if (mode === 'sampled_no_post') { assert.match(error.message, /sampled pagehide must report once/); assert.equal(blankNavigations, 1); }
+      else assert.equal(blankNavigations, 0);
+    }
+    assert.equal(trial.requestId, id);
+    assert.ok(trial.producer_events.length <= 64);
   } finally { vi.useRealTimers(); }
 });

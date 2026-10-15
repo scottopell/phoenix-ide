@@ -170,10 +170,15 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
     let owned;
     let canceled = false;
     let primaryError;
-    const trial = { attempt, sampled: false, reports: [], statuses: [], event: 'actual_cross_document_pagehide', transport_facts: [] };
+    const trial = { attempt, sampled: false, reports: [], statuses: [], event: 'actual_cross_document_pagehide', transport_facts: [], producer_events: [] };
     const postOrdinals = new Map();
     let transportOverflow = false;
     let phase = 'opening';
+    let signalAdmissionRequest;
+    let diagnosticFailure;
+    const signalIfAttributed = () => {
+      if (trial.requestId && trial.producer_events.some(event => event.kind === 'admission')) signalAdmissionRequest?.();
+    };
     const transportFact = fact => {
       if (trial.transport_facts.length >= 32) { transportOverflow = true; return; }
       trial.transport_facts.push({ ...fact, observed_phase: phase });
@@ -186,6 +191,25 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
         }
         return created;
       }), 5000, 'pagehide context');
+      await owned.exposeBinding('__phoenixPagehideDiagnostic', (_source, event) => {
+        if (trial.producer_events.length >= 64) { diagnosticFailure = 'pagehide producer event bound'; return; }
+        try { trial.producer_events.push({ ...captureDiagnostic(event), observed_phase: phase }); }
+        catch { diagnosticFailure = 'invalid pagehide producer diagnostic'; }
+        signalIfAttributed();
+      });
+      await owned.addInitScript(() => {
+        const pending = [];
+        let count = 0;
+        let failed = false;
+        window.addEventListener('phoenix:view-diagnostic', event => {
+          if (count++ > 64) return;
+          pending.push(window.__phoenixPagehideDiagnostic(event.detail).catch(() => { failed = true; }));
+        });
+        window.__phoenixPagehideDiagnosticDrain = async () => {
+          await Promise.all(pending);
+          if (failed) throw new Error('pagehide producer diagnostic delivery failed');
+        };
+      });
       const postOrdinal = request => {
         const url = new URL(request.url());
         if (url.origin !== new URL(baseURL).origin || url.pathname !== '/api/telemetry/conversation-view' || request.method() !== 'POST') return null;
@@ -232,15 +256,13 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
           const ordinal = postOrdinal(request);
           if (ordinal !== null) transportFact({ kind: 'page_requestfailed', ordinal });
         });
-        let signal;
-        const requestSeen = new Promise(resolveRequest => { signal = resolveRequest; });
+        const requestSeen = new Promise(resolveRequest => { signalAdmissionRequest = resolveRequest; });
         candidate.on('request', request => {
           const url = new URL(request.url());
           if (url.origin === new URL(baseURL).origin && url.searchParams.has('open_id')
             && (url.pathname.startsWith('/api/product-conversations/') || url.pathname.startsWith('/api/global/coordinator/history/'))) {
-            trial.sampled = true;
             trial.requestId = url.searchParams.get('open_id');
-            signal();
+            signalIfAttributed();
           }
           if (url.origin === new URL(baseURL).origin && url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
             const ordinal = postOrdinal(request);
@@ -260,8 +282,14 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
         const readiness = candidate.waitForFunction(visibleReadiness, undefined, { timeout: 10000 }).then(() => 'ready', () => 'readiness_unavailable');
         const winner = await Promise.race([requestSeen.then(() => 'request'), readiness]);
         await navigation;
+        await candidate.evaluate(() => window.__phoenixPagehideDiagnosticDrain());
+        assert.ok(!diagnosticFailure, diagnosticFailure);
+        const admission = samplingDecision(trial.producer_events, route.startsWith('/global/') ? 'global' : 'ordinary');
+        trial.sampled = admission.sampled;
+        trial.admitted_open_id = admission.open_id;
         assert.notEqual(winner, 'readiness_unavailable', 'case readiness unavailable before sampled request');
-        if (winner === 'request') {
+        if (winner === 'request' && admission.sampled) {
+          assert.ok(trial.producer_events.some(event => event.kind === 'request' && event.open_id === admission.open_id && event.request_id === trial.requestId), 'pagehide finite request must belong to admitted producer');
           phase = 'pagehide_navigation';
           await candidate.goto('about:blank');
           phase = 'response_observation';
@@ -272,11 +300,15 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
           assert.equal(trial.reports.length, 1, 'sampled pagehide must report once');
           assert.deepEqual(trial.statuses, [204]);
           const report = trial.reports[0];
+          assert.equal(report.open_id, admission.open_id, 'pagehide report belongs to producer admission');
           assert.equal(report.outcome, 'incomplete', 'pagehide outcome is incomplete, not synthetic cancellation');
           assertRequestCorrelation([trial.requestId], report);
           assert.equal(report.marks.meaningful_transcript, null, 'incomplete case must precede presentation');
           trial.status = 'observed_incomplete';
-        } else trial.status = 'unsampled_or_already_ready';
+        } else {
+          if (!admission.sampled) assert.equal(trial.reports.length, 0, 'unsampled admission cannot emit report');
+          trial.status = admission.sampled ? 'sampled_already_ready' : 'unsampled';
+        }
       })();
       await boundedObservation(operation, Math.max(1, caseDeadline - Date.now()), 'absolute pagehide stage');
     } catch (error) {
@@ -290,6 +322,12 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
         trial.context_close_returned = Boolean(owned);
         trial.transport_overflow = transportOverflow;
         assert.equal(transportOverflow, false, 'pagehide transport fact bound');
+        assert.ok(!diagnosticFailure, diagnosticFailure);
+        samplingDecision(trial.producer_events, route.startsWith('/global/') ? 'global' : 'ordinary');
+        if (trial.status === 'unsampled') {
+          assert.equal(trial.reports.length, 0, 'unsampled pagehide cannot emit report');
+          assert.deepEqual(trial.statuses, []);
+        }
         assert.ok(!trial.failure, 'pagehide late capture failure');
         if (trial.status === 'observed_incomplete') {
           assert.equal(trial.reports.length, 1, 'late pagehide duplicate');
@@ -617,7 +655,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
           await navigation;
           if (ledgerFailure) throw ledgerFailure;
           if (winner === 'ready') {
-            trial.status = 'inconclusive_unsampled_or_already_ready';
+            trial.status = 'inconclusive_readiness_preceded_finite_request_sampling_unknown';
           } else {
             assert.equal(winner, 'pending', 'actual pending admission required');
             if (kind === 'pending_background') {
@@ -641,7 +679,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
                 const until = Math.min(deadline, Date.now() + 5000);
                 while (trial.reports.length === preceding && Date.now() < until) await new Promise(resolveWait => setTimeout(resolveWait, 20));
                 const resumed = trial.reports.slice(preceding);
-                if (!resumed.length) trial.status = 'actual_bfcache_restore_resume_sampling_inconclusive';
+                if (!resumed.length) trial.status = 'actual_bfcache_restore_no_resume_report_sampling_unknown';
                 else {
                   assert.equal(resumed.length, 1);
                   assert.notEqual(resumed[0].open_id, initial.open_id, 'fresh resumed journey identity required');
