@@ -191,44 +191,46 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
         }
         return created;
       }), 5000, 'pagehide context');
-      await owned.exposeBinding('__phoenixPagehideDiagnostic', (_source, event) => {
-        if (trial.producer_events.length >= 64) { diagnosticFailure = 'pagehide producer event bound'; return; }
-        try { trial.producer_events.push({ ...captureDiagnostic(event), observed_phase: phase }); }
-        catch { diagnosticFailure = 'invalid pagehide producer diagnostic'; }
-        signalIfAttributed();
-      });
-      await owned.addInitScript(() => {
-        const pending = [];
-        let count = 0;
-        let failed = false;
-        window.addEventListener('phoenix:view-diagnostic', event => {
-          if (count++ > 64) return;
-          pending.push(window.__phoenixPagehideDiagnostic(event.detail).catch(() => { failed = true; }));
-        });
-        window.__phoenixPagehideDiagnosticDrain = async () => {
-          await Promise.all(pending);
-          if (failed) throw new Error('pagehide producer diagnostic delivery failed');
-        };
-      });
-      const postOrdinal = request => {
-        const url = new URL(request.url());
-        if (url.origin !== new URL(baseURL).origin || url.pathname !== '/api/telemetry/conversation-view' || request.method() !== 'POST') return null;
-        if (!postOrdinals.has(request)) {
-          if (postOrdinals.size >= 2) { transportOverflow = true; return null; }
-          postOrdinals.set(request, postOrdinals.size);
-        }
-        return postOrdinals.get(request);
-      };
-      owned.on?.('response', response => {
-        const ordinal = postOrdinal(response.request());
-        if (ordinal !== null) transportFact({ kind: 'context_response', ordinal, status: response.status() });
-      });
-      for (const event of ['requestfinished', 'requestfailed']) owned.on?.(event, request => {
-        const ordinal = postOrdinal(request);
-        if (ordinal !== null) transportFact({ kind: `context_${event}`, ordinal });
-      });
-      owned.on?.('close', () => transportFact({ kind: 'context_closed' }));
       const operation = (async () => {
+        await owned.exposeBinding('__phoenixPagehideDiagnostic', (_source, event) => {
+          if (trial.producer_events.length >= 64) { diagnosticFailure = 'pagehide producer event bound'; return; }
+          try { trial.producer_events.push({ ...captureDiagnostic(event), observed_phase: phase }); }
+          catch { diagnosticFailure = 'invalid pagehide producer diagnostic'; }
+          signalIfAttributed();
+        });
+        assert.ok(!canceled, 'pagehide diagnostic binding completed after cancellation');
+        await owned.addInitScript(() => {
+          const pending = [];
+          let count = 0;
+          let failed = false;
+          window.addEventListener('phoenix:view-diagnostic', event => {
+            if (count++ > 64) return;
+            pending.push(window.__phoenixPagehideDiagnostic(event.detail).catch(() => { failed = true; }));
+          });
+          window.__phoenixPagehideDiagnosticDrain = async () => {
+            await Promise.all(pending);
+            if (failed) throw new Error('pagehide producer diagnostic delivery failed');
+          };
+        });
+        assert.ok(!canceled, 'pagehide diagnostic initialization completed after cancellation');
+        const postOrdinal = request => {
+          const url = new URL(request.url());
+          if (url.origin !== new URL(baseURL).origin || url.pathname !== '/api/telemetry/conversation-view' || request.method() !== 'POST') return null;
+          if (!postOrdinals.has(request)) {
+            if (postOrdinals.size >= 2) { transportOverflow = true; return null; }
+            postOrdinals.set(request, postOrdinals.size);
+          }
+          return postOrdinals.get(request);
+        };
+        owned.on?.('response', response => {
+          const ordinal = postOrdinal(response.request());
+          if (ordinal !== null) transportFact({ kind: 'context_response', ordinal, status: response.status() });
+        });
+        for (const event of ['requestfinished', 'requestfailed']) owned.on?.(event, request => {
+          const ordinal = postOrdinal(request);
+          if (ordinal !== null) transportFact({ kind: `context_${event}`, ordinal });
+        });
+        owned.on?.('close', () => transportFact({ kind: 'context_closed' }));
         const candidate = await owned.newPage();
         const cdp = await owned.newCDPSession(candidate);
         await cdp.send('Network.enable');
