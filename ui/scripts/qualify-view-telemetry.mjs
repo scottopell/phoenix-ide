@@ -169,7 +169,15 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
   for (let attempt = 0; attempt < attempts && Date.now() < caseDeadline; attempt++) {
     let owned;
     let canceled = false;
-    const trial = { attempt, sampled: false, reports: [], statuses: [], event: 'actual_cross_document_pagehide' };
+    let primaryError;
+    const trial = { attempt, sampled: false, reports: [], statuses: [], event: 'actual_cross_document_pagehide', transport_facts: [] };
+    const postOrdinals = new Map();
+    let transportOverflow = false;
+    let phase = 'opening';
+    const transportFact = fact => {
+      if (trial.transport_facts.length >= 32) { transportOverflow = true; return; }
+      trial.transport_facts.push({ ...fact, observed_phase: phase });
+    };
     try {
       owned = await boundedObservation(browser.newContext({ storageState, viewport: { width: 1280, height: 900 } }).then(async created => {
         if (canceled) {
@@ -178,11 +186,52 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
         }
         return created;
       }), 5000, 'pagehide context');
+      const postOrdinal = request => {
+        const url = new URL(request.url());
+        if (url.origin !== new URL(baseURL).origin || url.pathname !== '/api/telemetry/conversation-view' || request.method() !== 'POST') return null;
+        if (!postOrdinals.has(request)) {
+          if (postOrdinals.size >= 2) { transportOverflow = true; return null; }
+          postOrdinals.set(request, postOrdinals.size);
+        }
+        return postOrdinals.get(request);
+      };
+      owned.on?.('response', response => {
+        const ordinal = postOrdinal(response.request());
+        if (ordinal !== null) transportFact({ kind: 'context_response', ordinal, status: response.status() });
+      });
+      for (const event of ['requestfinished', 'requestfailed']) owned.on?.(event, request => {
+        const ordinal = postOrdinal(request);
+        if (ordinal !== null) transportFact({ kind: `context_${event}`, ordinal });
+      });
+      owned.on?.('close', () => transportFact({ kind: 'context_closed' }));
       const operation = (async () => {
         const candidate = await owned.newPage();
         const cdp = await owned.newCDPSession(candidate);
         await cdp.send('Network.enable');
         await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 200, downloadThroughput: 1000000, uploadThroughput: 1000000 });
+        candidate.on('close', () => transportFact({ kind: 'page_closed' }));
+        candidate.on('crash', () => transportFact({ kind: 'page_crashed' }));
+        const cdpPosts = new Map();
+        cdp.on?.('Network.requestWillBeSent', event => {
+          const url = new URL(event.request.url);
+          if (url.origin !== new URL(baseURL).origin || url.pathname !== '/api/telemetry/conversation-view' || event.request.method !== 'POST') return;
+          if (cdpPosts.size >= 2) { transportOverflow = true; return; }
+          cdpPosts.set(event.requestId, cdpPosts.size);
+          transportFact({ kind: 'cdp_post', cdp_ordinal: cdpPosts.get(event.requestId) });
+        });
+        cdp.on?.('Network.responseReceived', event => {
+          if (cdpPosts.has(event.requestId)) transportFact({ kind: 'cdp_response', cdp_ordinal: cdpPosts.get(event.requestId), status: event.response.status });
+        });
+        cdp.on?.('Network.loadingFailed', event => {
+          if (cdpPosts.has(event.requestId)) transportFact({ kind: 'cdp_failed', cdp_ordinal: cdpPosts.get(event.requestId), canceled: event.canceled === true });
+        });
+        cdp.on?.('Network.loadingFinished', event => {
+          if (cdpPosts.has(event.requestId)) transportFact({ kind: 'cdp_finished', cdp_ordinal: cdpPosts.get(event.requestId) });
+        });
+        candidate.on('requestfailed', request => {
+          const ordinal = postOrdinal(request);
+          if (ordinal !== null) transportFact({ kind: 'page_requestfailed', ordinal });
+        });
         let signal;
         const requestSeen = new Promise(resolveRequest => { signal = resolveRequest; });
         candidate.on('request', request => {
@@ -194,6 +243,8 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
             signal();
           }
           if (url.origin === new URL(baseURL).origin && url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') {
+            const ordinal = postOrdinal(request);
+            if (ordinal !== null) transportFact({ kind: 'page_request', ordinal, report_index: trial.reports.length });
             if (trial.reports.length >= 2) { trial.failure ??= 'pagehide report count bound'; return; }
             const body = request.postData() ?? '';
             if (Buffer.byteLength(body) > 8192) trial.failure = 'report byte bound';
@@ -211,7 +262,9 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
         await navigation;
         assert.notEqual(winner, 'readiness_unavailable', 'case readiness unavailable before sampled request');
         if (winner === 'request') {
+          phase = 'pagehide_navigation';
           await candidate.goto('about:blank');
+          phase = 'response_observation';
           await readiness.catch(() => {});
           const deadline = Date.now() + 4000;
           while (!trial.statuses.length && Date.now() < deadline) await new Promise(resolveWait => setTimeout(resolveWait, 20));
@@ -227,31 +280,46 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
       })();
       await boundedObservation(operation, Math.max(1, caseDeadline - Date.now()), 'absolute pagehide stage');
     } catch (error) {
-      trial.failure = error.message;
-      throw error;
+      primaryError = error;
+      trial.failure ??= error.message;
     } finally {
       canceled = true;
+      phase = 'context_closing';
       try {
         if (owned) await boundedObservation(owned.close(), 5000, 'pagehide context final drain');
+        trial.context_close_returned = Boolean(owned);
+        trial.transport_overflow = transportOverflow;
+        assert.equal(transportOverflow, false, 'pagehide transport fact bound');
         assert.ok(!trial.failure, 'pagehide late capture failure');
         if (trial.status === 'observed_incomplete') {
           assert.equal(trial.reports.length, 1, 'late pagehide duplicate');
           assert.deepEqual(trial.statuses, [204]);
         }
-      } catch (error) { trial.failure ??= error.message; throw error; }
-      finally {
-        trials.push(trial);
-        const stage = { status: trial.status ?? 'failed', scope: 'pagehide_incomplete_only_not_canceled_resume_or_background', trials };
-        try { onTrial(trial, stage); }
-        catch (error) { trial.failure ??= error.message; throw error; }
-        finally {
-          if (outputDir) {
-            mkdirSync(outputDir, { recursive: true });
-            writeFileSync(resolve(outputDir, 'telemetry-pagehide-trials.json'), JSON.stringify(stage, null, 2));
-          }
+      } catch (error) {
+        trial.cleanup_failure = error.message;
+        primaryError ??= error;
+        trial.failure ??= error.message;
+      }
+      trials.push(trial);
+      const stage = { status: trial.status ?? 'failed', scope: 'pagehide_incomplete_only_not_canceled_resume_or_background', trials };
+      try { onTrial(trial, stage); }
+      catch (error) {
+        trial.callback_failure = error.message;
+        primaryError ??= error;
+        trial.failure ??= error.message;
+      }
+      if (outputDir) {
+        try {
+          mkdirSync(outputDir, { recursive: true });
+          writeFileSync(resolve(outputDir, 'telemetry-pagehide-trials.json'), JSON.stringify(stage, null, 2));
+        } catch {
+          trial.persistence_failure = 'pagehide trial receipt persistence failed';
+          primaryError ??= new Error(trial.persistence_failure);
+          trial.failure ??= trial.persistence_failure;
         }
       }
     }
+    if (primaryError) throw primaryError;
     if (trial.status === 'observed_incomplete') return { status: 'observed_incomplete', trials };
   }
   return { status: 'inconclusive_sampling_budget', trials };

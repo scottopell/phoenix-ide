@@ -684,3 +684,51 @@ test('status assertion survives private response-disposal and context-close fail
     return true;
   });
 });
+
+test.each(['missing_response', 'navigation_and_cleanup', 'callback_and_persistence'])('pagehide %s preserves first error and bounded independent observations', async mode => {
+  vi.useFakeTimers();
+  const callbacks = {}; const contextCallbacks = {}; const cdpCallbacks = {};
+  const primary = new Error('original navigation failure');
+  const id = '00000000-0000-4000-8000-000000000001';
+  const report = { open_id: id, route: 'ordinary', trigger: 'navigation', outcome: 'incomplete', correlations: [{ kind: 'request', id }], total_ms: 1, marks: {} };
+  const post = { url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', method: () => 'POST', postData: () => JSON.stringify(report) };
+  let trial;
+  let ready;
+  const candidate = { on: (event, fn) => { callbacks[event] = fn; },
+    goto: async url => {
+      if (url === 'about:blank') {
+        ready();
+        callbacks.request(post);
+        cdpCallbacks['Network.requestWillBeSent']?.({ requestId: 'PRIVATE_CDP_ID', request: { url: post.url(), method: 'POST' } });
+        cdpCallbacks['Network.loadingFailed']?.({ requestId: 'PRIVATE_CDP_ID', canceled: true, errorText: 'PRIVATE' });
+        contextCallbacks.requestfailed?.(post);
+        return;
+      }
+      callbacks.request({ url: () => `http://127.0.0.1:8123/api/product-conversations/${id}?open_id=${id}`, method: () => 'GET' });
+      if (mode !== 'missing_response') throw primary;
+    }, waitForFunction: () => new Promise(resolve => { ready = resolve; }) };
+  const owned = { on: (event, fn) => { contextCallbacks[event] = fn; }, newPage: async () => candidate,
+    newCDPSession: async () => ({ send: async () => {}, on: (event, fn) => { cdpCallbacks[event] = fn; } }),
+    close: async () => { contextCallbacks.close?.(); if (mode === 'navigation_and_cleanup') throw new Error('close failed'); } };
+  try {
+    const check = runPendingPagehideCheck({ browser: { newContext: async () => owned }, baseURL: 'http://127.0.0.1:8123', storageState: {}, route: '/c/product', attempts: 1,
+      outputDir: mode === 'callback_and_persistence' ? '/dev/null/impossible' : undefined,
+      onTrial: value => { trial = value; if (mode === 'callback_and_persistence') throw new Error('callback failed'); } });
+    const result = check.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(4020);
+    const error = await result;
+    if (mode === 'missing_response') {
+      assert.match(error.message, /deep-equal/);
+      assert.deepEqual(trial.statuses, []);
+      assert.equal(trial.reports.length, 1);
+      assert.ok(trial.transport_facts.some(f => f.kind === 'context_requestfailed'));
+      assert.ok(trial.transport_facts.some(f => f.kind === 'cdp_failed' && f.canceled));
+      assert.equal(JSON.stringify(trial).includes('PRIVATE'), false);
+    } else assert.equal(error, primary);
+    assert.ok(trial.cleanup_failure);
+    if (mode === 'callback_and_persistence') {
+      assert.equal(trial.callback_failure, 'callback failed');
+      assert.equal(trial.persistence_failure, 'pagehide trial receipt persistence failed');
+    }
+  } finally { vi.useRealTimers(); }
+});
