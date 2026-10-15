@@ -24,7 +24,7 @@ impl GuardianExecutor for NoEffects {
     ) -> ExecutedEffect {
         panic!("unbound transport cannot execute")
     }
-    fn poll_observation_only(&self, _: &()) -> ChildSlotObservation {
+    fn poll_observation_only(&self, (): &()) -> ChildSlotObservation {
         ChildSlotObservation::Running
     }
 }
@@ -66,7 +66,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
                 &mut server,
                 Instant::now() + Duration::from_secs(3),
             )
-            .unwrap()
+            .unwrap();
         });
         let mut client = GuardianClient::connect(&directory).unwrap();
         let hello = client.hello().unwrap();
@@ -113,7 +113,8 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
         let mut oversized = UnixStream::connect(directory.join("guardian.sock")).unwrap();
         oversized
             .write_all(
-                &((phoenix_deployment_controller::guardian_ipc::MAX_FRAME_BYTES + 1) as u32)
+                &u32::try_from(phoenix_deployment_controller::guardian_ipc::MAX_FRAME_BYTES + 1)
+                    .unwrap()
                     .to_be_bytes(),
             )
             .unwrap();
