@@ -534,6 +534,19 @@ async fn actual_server_opening_qualifier() {
     std::env::set_var("PHOENIX_TLS", "off");
     std::env::set_var("PHOENIX_ENABLE_MOCK_MODEL", "1");
     std::env::set_var("PHOENIX_LOG_STDOUT", "1");
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let password = uuid::Uuid::new_v4().to_string();
+    let credential = home.path().join("qualification-password");
+    let mut credential_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&credential)
+        .unwrap();
+    credential_file.write_all(password.as_bytes()).unwrap();
+    drop(credential_file);
+    std::env::set_var("PHOENIX_PASSWORD", password);
     if let Some(trace_exporter) = &trace_exporter {
         for (key, value) in trace_exporter.env_pairs() {
             std::env::set_var(key, value);
@@ -549,7 +562,7 @@ async fn actual_server_opening_qualifier() {
     };
     eprintln!(
         "OPENING_QUALIFIER {}",
-        json!({"git_sha":env!("PHOENIX_GIT_SHA"), "exe":std::env::current_exe().unwrap(), "home":home.path(), "db":home.path().join(".phoenix-ide/phoenix.db"), "bind":"127.0.0.1", "port":port, "instrumented_test_binary":true})
+        json!({"git_sha":env!("PHOENIX_GIT_SHA"), "exe":std::env::current_exe().unwrap(), "home":home.path(), "db":home.path().join(".phoenix-ide/phoenix.db"), "bind":"127.0.0.1", "port":port, "credential_file":credential, "instrumented_test_binary":true})
     );
     let server = crate::run_server();
     tokio::pin!(server);
