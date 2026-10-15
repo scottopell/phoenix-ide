@@ -290,6 +290,42 @@ fn reload_interrupted(store: &mut TestStore, id: u128) -> DeploymentAttempt {
     commit(store, *transition)
 }
 
+fn loaded_revision(store: &mut TestStore, id: u128) -> PersistenceRevision {
+    store
+        .load_attempt(AttemptId::new(id))
+        .unwrap()
+        .unwrap()
+        .persistence_revision()
+}
+
+fn commit_root_termination(
+    store: &mut TestStore,
+    recovered_state: DeploymentAttempt,
+) -> CommittedTransition {
+    let state = commit(
+        store,
+        recovered_state.record_resource_sample(sample(0)).unwrap(),
+    );
+    let state = commit(store, state.child_scan_completed(root()).unwrap());
+    let state = commit(store, state.ownership_scan_completed().unwrap());
+    let state = commit(
+        store,
+        state
+            .identity_observed(
+                root(),
+                IdentityObservation::SameIdentity {
+                    current_parent: None,
+                },
+            )
+            .unwrap(),
+    );
+    state
+        .request_owned_signals(Signal::Terminate, MonotonicTick::new(1))
+        .unwrap()
+        .persist(store)
+        .unwrap()
+}
+
 fn apply_observation_round(
     policy: &mut PolicyLoop,
     store: &mut TestStore,
@@ -875,12 +911,12 @@ fn duplicate_wrong_stale_rejected() {
     let mut policy = PolicyLoop::from_committed(transition.persist(&mut store).unwrap());
     let ticket = policy.issue_next().unwrap();
     let stale_key = ticket.key();
-    let stale = execute(&mut FakeOs::default(), ticket);
+    let stale_result = execute(&mut FakeOs::default(), ticket);
     policy.interrupt(&mut store).unwrap();
     policy.recover(&mut store).unwrap();
     let snapshot = policy.summary();
     assert!(matches!(
-        policy.apply(stale, &mut store),
+        policy.apply(stale_result, &mut store),
         Err(LoopError::NotIssued(_))
     ));
     assert_eq!(policy.summary(), snapshot);
@@ -2649,28 +2685,7 @@ fn historical_sampling_recovery_cannot_reactivate_a_later_interruption() {
         assert_eq!(guardian.state(), GuardianState::Active);
         assert_eq!(guardian.reconciliation_floor(), None);
 
-        let state = commit(
-            &mut store,
-            recovered_state.record_resource_sample(sample(0)).unwrap(),
-        );
-        let state = commit(&mut store, state.child_scan_completed(root()).unwrap());
-        let state = commit(&mut store, state.ownership_scan_completed().unwrap());
-        let state = commit(
-            &mut store,
-            state
-                .identity_observed(
-                    root(),
-                    IdentityObservation::SameIdentity {
-                        current_parent: None,
-                    },
-                )
-                .unwrap(),
-        );
-        let unbound_signal = state
-            .request_owned_signals(Signal::Terminate, MonotonicTick::new(1))
-            .unwrap()
-            .persist(&mut store)
-            .unwrap();
+        let unbound_signal = commit_root_termination(&mut store, recovered_state);
         let signal_revision = unbound_signal.checkpoint().persistence_revision().unwrap();
         assert!(signal_revision > installed_revision);
         assert!(matches!(
@@ -2684,11 +2699,7 @@ fn historical_sampling_recovery_cannot_reactivate_a_later_interruption() {
         assert!(floor > signal_revision);
         let current = begin_loaded_reconciliation(&mut store, &mut guardian, second);
         assert_eq!(guardian.reconciliation_floor(), Some(floor));
-        let durable_revision = store
-            .load_attempt(AttemptId::new(124))
-            .unwrap()
-            .unwrap()
-            .persistence_revision();
+        let durable_revision = loaded_revision(&mut store, 124);
 
         if let Some(historical) = held_recovery {
             assert!(matches!(
@@ -2715,14 +2726,7 @@ fn historical_sampling_recovery_cannot_reactivate_a_later_interruption() {
         assert!(
             PolicyLoop::from_committed_for_guardian(unbound_signal, &guardian, current).is_err()
         );
-        assert_eq!(
-            store
-                .load_attempt(AttemptId::new(124))
-                .unwrap()
-                .unwrap()
-                .persistence_revision(),
-            durable_revision
-        );
+        assert_eq!(loaded_revision(&mut store, 124), durable_revision);
         assert!(audit.borrow().is_empty());
         assert_eq!(guardian.retained_results().len(), 0);
         assert_eq!(guardian.inventory().collect::<Vec<_>>(), slots);
