@@ -157,7 +157,7 @@ pub enum RecoveryDisposition {
 /// continuation. It cannot request process mutation.
 #[derive(Debug)]
 pub struct StableAttempt {
-    checkpoint: DeploymentAttempt,
+    checkpoint: Box<DeploymentAttempt>,
 }
 
 impl StableAttempt {
@@ -192,7 +192,7 @@ impl StableAttempt {
         self,
         candidate: RetainedCandidateIdentity,
     ) -> Result<Transition, TransitionError> {
-        self.checkpoint.record_migration_invoked(candidate)
+        (*self.checkpoint).record_migration_invoked(candidate)
     }
 
     /// # Errors
@@ -202,7 +202,7 @@ impl StableAttempt {
         self,
         acceptance: AdministrativeRiskAcceptance,
     ) -> Result<Transition, TransitionError> {
-        self.checkpoint.accept_administrative_risk(acceptance)
+        (*self.checkpoint).accept_administrative_risk(acceptance)
     }
 }
 
@@ -249,7 +249,7 @@ impl LoadedAttempt {
             | DeploymentAttempt::AdministrativeCloseoutRequired(_)
             | DeploymentAttempt::AdministrativelyClosed(_)) => {
                 Ok(RecoveryDisposition::Stable(StableAttempt {
-                    checkpoint: attempt,
+                    checkpoint: Box::new(attempt),
                 }))
             }
         }
@@ -1150,7 +1150,7 @@ impl DeploymentAttempt {
             }
             Self::ForwardRecovery(attempt) => attempt.context.revision = Some(revision),
             Self::AdministrativeCloseoutRequired(attempt) => {
-                attempt.context.revision = Some(revision)
+                attempt.context.revision = Some(revision);
             }
             Self::AdministrativelyClosed(attempt) => attempt.context.revision = Some(revision),
         }

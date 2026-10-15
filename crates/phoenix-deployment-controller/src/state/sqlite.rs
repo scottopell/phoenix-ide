@@ -96,7 +96,7 @@ impl ControllerSqliteStore {
     /// Opens only the caller-selected path; no application database discovery occurs.
     ///
     /// # Errors
-    /// Rejects unknown schemas, nonempty unversioned databases, and SQLite failures.
+    /// Rejects unknown schemas, nonempty unversioned databases, and `SQLite` failures.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::initialize(Connection::open(path)?)
     }
@@ -104,7 +104,7 @@ impl ControllerSqliteStore {
     /// Creates an isolated, ephemeral controller database.
     ///
     /// # Errors
-    /// Returns an error if SQLite initialization fails.
+    /// Returns an error if `SQLite` initialization fails.
     pub fn in_memory() -> Result<Self> {
         Self::initialize(Connection::open_in_memory()?)
     }
