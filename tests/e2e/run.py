@@ -1286,7 +1286,7 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
                 raise AssertionError(f"product creation did not publish: {creation!r}")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out waiting for product publication: {creation!r}")
-            time.sleep(POLL_INTERVAL_SECONDS)
+            time.sleep(0.05)
 
         assert creation["product_conversation_id"] == product_conversation_id
         canonical_route = creation["canonical_route"]
