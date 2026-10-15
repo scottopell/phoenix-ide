@@ -85,6 +85,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
             )
         ));
         drop(client);
+        // test-timing-allow: bounded delay lets the single-threaded fixture observe EOF.
         std::thread::sleep(Duration::from_millis(80));
         let mut raw = UnixStream::connect(directory.join("guardian.sock")).unwrap();
         same_uid(&raw).unwrap();
@@ -109,6 +110,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
         );
         raw.write_all(&0_u32.to_be_bytes()).unwrap();
         drop(raw);
+        // test-timing-allow: bounded delay lets the fixture fence the malformed frame.
         std::thread::sleep(Duration::from_millis(80));
         let mut oversized = UnixStream::connect(directory.join("guardian.sock")).unwrap();
         oversized
@@ -119,6 +121,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
             )
             .unwrap();
         drop(oversized);
+        // test-timing-allow: bounded delay lets the fixture fence the oversized frame.
         std::thread::sleep(Duration::from_millis(80));
         let mut replacement = GuardianClient::connect(&directory).unwrap();
         assert_eq!(
