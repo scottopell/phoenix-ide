@@ -14,6 +14,7 @@ const { apiMock, generateUUIDMock, creationStoreMock, creationStoreState } = vi.
   generateUUIDMock: vi.fn(() => 'request-1'),
   creationStoreMock: {
     activeProductCreationRequestId: vi.fn<() => string | null>(),
+    activateProductCreationRequest: vi.fn(),
     readProductCreationRequest: vi.fn(),
     storeProductCreationRequest: vi.fn(),
     clearProductCreationRequest: vi.fn(),
@@ -104,12 +105,14 @@ describe('exact-request creation observation', () => {
     creationStoreState.activeRequestId = null;
     creationStoreState.records.clear();
     creationStoreMock.activeProductCreationRequestId.mockReset().mockImplementation(() => creationStoreState.activeRequestId);
+    creationStoreMock.activateProductCreationRequest.mockReset().mockImplementation((requestId: string) => {
+      creationStoreState.activeRequestId = requestId;
+    });
     creationStoreMock.readProductCreationRequest.mockReset().mockImplementation(async (requestId: string) =>
       creationStoreState.records.get(requestId) ?? null);
     creationStoreMock.storeProductCreationRequest.mockReset().mockImplementation(async (stored: { kind: string; request?: { request_id: string }; requestId?: string }) => {
       const storedRequestId = stored.kind === 'uncertain' ? stored.request!.request_id : stored.requestId!;
       creationStoreState.records.set(storedRequestId, stored);
-      creationStoreState.activeRequestId = storedRequestId;
     });
     creationStoreMock.clearProductCreationRequest.mockReset().mockImplementation(async (requestId: string) => {
       creationStoreState.records.delete(requestId);
@@ -236,6 +239,38 @@ describe('exact-request creation observation', () => {
     expect(storedCreation()).toEqual({
       version: 3, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
     });
+  });
+
+  it('does not POST a persisted intent after its creation page unmounts', async () => {
+    generateUUIDMock.mockReset().mockReturnValueOnce('request-1').mockReturnValue('request-2');
+    const persistence = deferred<void>();
+    creationStoreMock.storeProductCreationRequest.mockImplementationOnce(async (stored: { request: { request_id: string } }) => {
+      await persistence.promise;
+      creationStoreState.records.set(stored.request.request_id, stored);
+    });
+    const original = mountCreation();
+    await prepareCreation(original);
+    let abandoned!: Promise<void>;
+    act(() => { abandoned = original.result.current.handleSend(); });
+    expect(apiMock.createProductConversation).not.toHaveBeenCalled();
+    original.unmount();
+
+    const replacement = mountCreation();
+    await prepareCreation(replacement);
+    await act(async () => {
+      persistence.resolve();
+      await abandoned;
+    });
+    expect(apiMock.createProductConversation).not.toHaveBeenCalled();
+    expect(creationStoreState.records.has('request-1')).toBe(false);
+    expect(creationStoreState.activeRequestId).toBeNull();
+
+    apiMock.createProductConversation.mockResolvedValueOnce({
+      request_id: 'request-2', product_conversation_id: 'product-2',
+    });
+    await act(async () => { await replacement.result.current.handleSend(); });
+    expect(apiMock.createProductConversation).toHaveBeenCalledOnce();
+    expect(apiMock.createProductConversation.mock.calls[0]![0].request_id).toBe('request-2');
   });
 
   it('recovers the complete uncertain intent after unmount before acceptance, ignoring late old callbacks', async () => {

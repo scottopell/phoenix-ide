@@ -113,6 +113,10 @@ export function activeProductCreationRequestId(): string | null {
   }
 }
 
+export function activateProductCreationRequest(requestId: string): void {
+  sessionStorage.setItem(ACTIVE_REQUEST_KEY, requestId);
+}
+
 export function clearActiveProductCreationRequestId(requestId: string): void {
   if (activeProductCreationRequestId() === requestId) sessionStorage.removeItem(ACTIVE_REQUEST_KEY);
 }
@@ -136,7 +140,6 @@ export async function storeProductCreationRequest(pending: PendingCreationReques
   const transaction = database.transaction(REQUEST_STORE, 'readwrite');
   transaction.objectStore(REQUEST_STORE).put(pending, requestId);
   await transactionComplete(transaction);
-  sessionStorage.setItem(ACTIVE_REQUEST_KEY, requestId);
 }
 
 export async function clearProductCreationRequest(requestId: string): Promise<void> {

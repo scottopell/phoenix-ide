@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   activeProductCreationRequestId,
+  activateProductCreationRequest,
   clearActiveProductCreationRequestId,
   clearProductCreationRequest,
   parsePendingCreationRequest,
@@ -107,6 +108,8 @@ describe('product creation recovery records', () => {
     const localWrite = vi.spyOn(localStorage, 'setItem');
 
     await storeProductCreationRequest(stored);
+    expect(activeProductCreationRequestId()).toBeNull();
+    activateProductCreationRequest('request-1');
 
     expect(await readProductCreationRequest('request-1')).toEqual(stored);
     expect(localWrite).not.toHaveBeenCalled();

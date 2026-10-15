@@ -5,6 +5,7 @@ import type { CreateProductConversationRequest, ImageData, ModelEffort, ModelsRe
 import type { DirStatus } from '../components/SettingsFields';
 import {
   activeProductCreationRequestId,
+  activateProductCreationRequest,
   clearProductCreationRequest,
   creationRequestId,
   readProductCreationRequest,
@@ -127,6 +128,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [error, setError] = useState<string | null>(null);
   const [observedRequest, setObservedRequest] = useState<PendingCreationRequest | null>(null);
   const activeRequestRef = useRef<PendingCreationRequest | null>(null);
+  const submissionInFlightRef = useRef(false);
   const [creationObservation, setCreationObservation] = useState<ProductConversationCreationObservation | null>(null);
   const [observationVersion, setObservationVersion] = useState(0);
   const [creating, setCreating] = useState(initialActiveRequestId !== null);
@@ -424,8 +426,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const handleSend = async () => {
     const trimmed = draft.trim();
     if (!trimmed && images.length === 0 && files.length === 0) return;
-    if (activeRequestRef.current || creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
+    if (activeRequestRef.current || submissionInFlightRef.current || creating
+      || dirStatus === 'invalid' || dirStatus === 'checking') return;
 
+    submissionInFlightRef.current = true;
     setError(null);
     setCreating(true);
 
@@ -466,6 +470,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
       };
       const uncertain: Extract<PendingCreationRequest, { kind: 'uncertain' }> = { version: 3, kind: 'uncertain', request: createRequest };
       await storeProductCreationRequest(uncertain);
+      if (!mountedRef.current) {
+        try { await clearProductCreationRequest(activeRequestId); } catch { /* no request was submitted */ }
+        return;
+      }
+      activateProductCreationRequest(activeRequestId);
       activeRequestRef.current = uncertain;
       await submitCreationRequest(uncertain, true);
     } catch (err) {
@@ -473,6 +482,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
       if (err instanceof ExpansionError) throw err;
       setCreating(false);
       setError(err instanceof Error ? err.message : 'Failed to persist creation intent; no request was sent.');
+    } finally {
+      submissionInFlightRef.current = false;
     }
   };
 

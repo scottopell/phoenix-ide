@@ -25,6 +25,7 @@ const { apiMock, creationStoreMock, creationStoreState } = vi.hoisted(() => ({
   },
   creationStoreMock: {
     activeProductCreationRequestId: vi.fn<() => string | null>(),
+    activateProductCreationRequest: vi.fn(),
     readProductCreationRequest: vi.fn(),
     storeProductCreationRequest: vi.fn(),
     clearProductCreationRequest: vi.fn(),
@@ -96,12 +97,14 @@ describe('NewConversationPage', () => {
     creationStoreState.activeRequestId = null;
     creationStoreState.records.clear();
     creationStoreMock.activeProductCreationRequestId.mockReset().mockImplementation(() => creationStoreState.activeRequestId);
+    creationStoreMock.activateProductCreationRequest.mockReset().mockImplementation((requestId: string) => {
+      creationStoreState.activeRequestId = requestId;
+    });
     creationStoreMock.readProductCreationRequest.mockReset().mockImplementation(async (requestId: string) =>
       creationStoreState.records.get(requestId) ?? null);
     creationStoreMock.storeProductCreationRequest.mockReset().mockImplementation(async (stored: { kind: string; request?: { request_id: string }; requestId?: string }) => {
       const requestId = stored.kind === 'uncertain' ? stored.request!.request_id : stored.requestId!;
       creationStoreState.records.set(requestId, stored);
-      creationStoreState.activeRequestId = requestId;
     });
     creationStoreMock.clearProductCreationRequest.mockReset().mockImplementation(async (requestId: string) => {
       creationStoreState.records.delete(requestId);
