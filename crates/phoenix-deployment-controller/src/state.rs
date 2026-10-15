@@ -268,14 +268,15 @@ impl DeploymentAttempt {
                 resume: ActiveAttempt::ResourceSampling(_),
                 ..
             }) => CleanupOutcome::NotStarted,
-            Self::Active(ActiveAttempt::Ownership(attempt)) => attempt.cleanup,
-            Self::Interrupted(InterruptedAttempt {
+            Self::Active(ActiveAttempt::Ownership(attempt))
+            | Self::Interrupted(InterruptedAttempt {
                 resume: ActiveAttempt::Ownership(attempt),
                 ..
             }) => attempt.cleanup,
             Self::Ready(_) => CleanupOutcome::VerifiedClean,
-            Self::ForwardRecovery(_) => CleanupOutcome::UnresolvedRisk,
-            Self::AdministrativeCloseoutRequired(_) => CleanupOutcome::UnresolvedRisk,
+            Self::ForwardRecovery(_) | Self::AdministrativeCloseoutRequired(_) => {
+                CleanupOutcome::UnresolvedRisk
+            }
             Self::AdministrativelyClosed(_) => CleanupOutcome::AdministrativeRiskAccepted,
         }
     }

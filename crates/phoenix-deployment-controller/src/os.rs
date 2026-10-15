@@ -48,6 +48,8 @@ pub enum OsEffect {
 pub trait ControllerOs {
     fn sample_resources(&mut self, sequence: u64) -> ResourceSample;
 
+    /// # Errors
+    /// Returns a typed query error when enumeration cannot produce trustworthy evidence.
     fn list_children(&mut self, parent: ProcessIdentity) -> Result<Vec<ProcessId>, OsQueryError>;
 
     fn acquire_child_identity(&mut self, discovery: CandidateDiscovery)

@@ -95,16 +95,16 @@ impl OwnedProcessTree {
                     .or_insert(OwnedIdentityStatus::NeedsFreshObservation);
             }
             ChildIdentityObservation::Unresolved(failure) => {
-                self.unresolved
-                    .get_mut(&discovery.id())
-                    .expect("discovery presence checked above")
-                    .gap = DiscoveryGap::Observation(failure);
+                let Some(unresolved) = self.unresolved.get_mut(&discovery.id()) else {
+                    return Err(UnknownDiscovery);
+                };
+                unresolved.gap = DiscoveryGap::Observation(failure);
             }
             ChildIdentityObservation::DifferentProcess(identity) => {
-                self.unresolved
-                    .get_mut(&discovery.id())
-                    .expect("discovery presence checked above")
-                    .gap = DiscoveryGap::DifferentProcess(identity);
+                let Some(unresolved) = self.unresolved.get_mut(&discovery.id()) else {
+                    return Err(UnknownDiscovery);
+                };
+                unresolved.gap = DiscoveryGap::DifferentProcess(identity);
             }
         }
         Ok(())
