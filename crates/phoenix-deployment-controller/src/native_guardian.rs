@@ -159,6 +159,28 @@ pub fn same_uid(stream: &UnixStream) -> io::Result<()> {
     }
 }
 
+fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<bool> {
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready > 0 {
+            return Ok(true);
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// Retain the same GuardianServer across disconnected connections until the
 /// explicit fixture lifetime ends. EOF, timeouts and malformed frames fence,
 /// never initiate child cleanup or authorize another policy step.
@@ -176,9 +198,11 @@ pub fn serve_until<E: GuardianExecutor>(
                 if same_uid(&stream).is_err() {
                     continue;
                 }
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(IO_SLICE))?;
+                stream.set_nonblocking(true)?;
                 while Instant::now() < until {
+                    if !wait_readable(&stream, IO_SLICE)? {
+                        continue;
+                    }
                     if serve_once(&mut stream, server).is_err() {
                         break;
                     }
