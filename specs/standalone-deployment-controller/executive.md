@@ -17,18 +17,18 @@ complete recovery reconciliation, expired resource-sampling recovery, sustained
 contention, and exact-candidate forward recovery. Five harmless macOS integration
 tests plus five adapter unit regressions cover supervised-child finalization,
 bounded best-effort teardown, arbitrary-PID mutation rejection, native resource
-measurement, counter regression, and capacity arithmetic. Hosted Rust, Clippy, and
-native macOS qualification passed for the implementation tree at commit
-`9518d50ef75ee9e804469c3417c3fc1960ff5c8a`; local compilation was not attempted
-because the host did not satisfy its compiler admission threshold.
+measurement, counter regression, and capacity arithmetic. Exact-head full CI
+run `38805004723` and dedicated macOS run `38805004659` pass at commit
+`907ca04670f46c5c2ea9f0b15993a996a83ac911`; no local heavy compilation was
+performed for this source-only slice.
 
 A controller-owned normalized SQLite store implements atomic checkpoint replacement,
 durable compare-and-swap revisions, strict schema-version admission, affine crash-load
 recovery, and fail-stop handle poisoning. Twenty SQLite integration tests and four
 codec/schema unit tests cover relational round trips, corruption, stale writes,
-recovery authority, and commit failure. Full CI run `38752367219` and dedicated
-macOS run `38752367467` passed. No production launchd label, process, reservation,
-application database, or installation path is used by this crate.
+recovery authority, and commit failure. The exact-head hosted runs above include
+these tests. No production launchd label, process, application database, or
+installation path is used by this crate.
 
 The crate also contains an affine dispatch boundary: consuming a non-cloneable
 `CommittedTransition` mints one batch with private, non-cloneable tickets keyed by
@@ -47,11 +47,12 @@ codes avoid raw SQL, path, command, or environment disclosure. `serde`/`serde_js
 serialize the typed summary and phase/outcome enums instead of hand-assembling JSON;
 there is no controller schema change or new dependency version.
 
-The dispatch and CLI regression suite and compile-fail authority examples are
-authored but have not been compiled or executed in this slice because host admission
-prohibits local Rust build/test/Clippy. Static qualification is limited to formatting,
-Cargo metadata/lock resolution, diff checks, and Allium; hosted Rust and CLI
-qualification remains required before claiming runtime acceptance of this slice.
+The in-process guardian and deterministic `PolicyLoop` are hosted-qualified with
+the dispatch, CLI, compile-fail authority, reconciliation-replay, and whole-signal-round
+capacity regressions. Guardian result capacity is reserved for the complete mutation
+round before its first ticket issues; retained historical evidence cannot restart an
+unfinished reconciliation generation. This qualification does not establish process
+survival, IPC correctness, or production orchestration.
 
 ## Requirement coverage
 
@@ -68,28 +69,22 @@ qualification remains required before claiming runtime acceptance of this slice.
 | REQ-SDC-009 | `CompatibilityBoundary::CandidateMigrationInvoked` retains full commit plus artifact digest and recovers only through candidate reverification. |
 | REQ-SDC-010 | `ControllerOs` is typed and fake-backed; hosted macOS tests qualify native observation and fail-closed capacity/contention sampling, including counter-regression and capacity-arithmetic regressions. |
 | REQ-SDC-011 | `ControllerSqliteStore` owns an independent schema with normalized child rows, full-transaction checkpoint replacement, revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning; hosted tests and Clippy pass. |
-| REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. The in-process `Guardian`/`PolicyLoop` author detach-and-fence custody, exact instance/session binding, retained-result acknowledgement, reconciliation revision floors, and fail-stop integration. Harmless native supervision passes; launchd IPC and controller-death qualification remain unimplemented. |
-| REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor and CLI coverage passed full CI/macOS at `802123f34813c601f9830b63e373d43491d0823d`. The new completion-to-checkpoint and guardian integration tests are authored and await hosted qualification. |
-| REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `802123f34813c601f9830b63e373d43491d0823d`. |
+| REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. The hosted-qualified in-process `Guardian`/`PolicyLoop` enforce detach-and-fence custody, exact instance/session binding, retained-result acknowledgement, strictly increasing reconciliation generations, and whole-signal-round capacity reservation. Harmless native supervision passes; launchd IPC, controller-process death/reconnect, and a surviving native guardian remain unimplemented. |
+| REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor, CLI, completion-to-checkpoint, guardian integration, replay, and capacity-reservation coverage pass full CI/macOS at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
+| REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 
 ## Next work
 
-A deterministic `PolicyLoop` and bounded in-process `Guardian` now model completion
-persistence, retained-result acknowledgement, session fencing, detach-and-fence
-recovery, reconciliation revision floors, and oversized mutation fail-closed behavior.
-Their deterministic tests and privacy examples are authored but not locally compiled
-or executed under source-only admission; hosted compilation, tests, doctests, and
-Clippy must qualify this new slice. No launchd IPC, native guardian process, deploy,
-installer, activation, or `run` command is exposed, so this is not production
-crash-survival capability.
+The qualified unit is an in-process custodian and deterministic event loop. The next
+controller-owned work is a runnable loop, a launchd-owned surviving guardian process,
+a typed guardian IPC protocol, and disposable process-death/reconnect deployment E2E.
+Those surfaces must preserve ADR-108 **detach-and-fence**, exact-instance recovery,
+the original absolute deadline, retained results, monotonic reconciliation generations,
+and whole-round signal-result reservation.
 
-PR 919 released the qualified installer seam at merge
-`0304adc6841f5fb8297d9bc036d891309083a6e3`: `dev.py` remains blob
-`c2e9b44b11350f859b0cf168aad4612fb3bc6f06`, and the launchd helper is blob
-`9a2ba2949c9f12ce7e8fa404e8b29fca037d5af2`. The supported future boundary is the
-prepared current-schema `dev.py prod deploy` command; helper-owned schema, ledger,
-claim, recovery, signature, and source-binding policy remains outside the controller.
-This slice does not invoke that boundary. Controller loss uses the ADR-108
-**detach-and-fence** policy; the in-process protocol model is authored, while launchd
-transport/native custody and disposable process-death/reconnect qualification remain
-unimplemented. Production adoption remains blocked.
+Installer and `dev.py` integration remain separately owned. The future boundary may
+invoke only the supported prepared current-schema deploy seam; helper-owned schema,
+ledger, claim, recovery, signature, and source-binding policy remain outside the Rust
+controller. Independent guardian/runtime work does not wait on artifact identity, but
+no helper invocation, native activation, deployment, or production adoption is
+implemented or authorized by this qualification.
