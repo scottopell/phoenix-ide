@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-15
-- **Affects:** REQ-SDC-001, REQ-SDC-003–010; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild`
+- **Affects:** REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `ControllerSqliteStore`, `SupervisedChild`
 
 ## Context
 
@@ -42,6 +42,12 @@ The standalone deployment controller owns a separate SQLite database. Its schema
 normalizes attempt phases, owned identities, pending child scans, discovery epochs,
 resource samples, and retained candidates. Application-schema migration neither
 creates nor upgrades this database.
+
+Checkpoint replacement uses a durable revision compare-and-swap so stale in-memory
+states cannot erase newer evidence or replace a retained candidate. A crash load
+returns affine recovery evidence rather than a live mutation-capable attempt, and an
+unclassified persistence or load failure invalidates that database handle until the
+controller reopens and classifies durable state.
 
 On macOS, process mutation begins with controller-spawned direct-child supervision.
 The supervisor creates a dedicated process group and retains the direct child

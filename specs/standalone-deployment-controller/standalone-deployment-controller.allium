@@ -590,7 +590,8 @@ contract ControllerOsBoundary {
 
 contract ControllerSqliteBoundary {
     persist_checkpoint: (attempt: DeploymentAttempt) -> Boolean
-    load_attempt: (attempt_id: String) -> DeploymentAttempt?
+    load_attempt: (attempt_id: String) -> LoadedAttempt?
+    prepare_recovery: (loaded: LoadedAttempt) -> PersistableRecoveryCheckpoint?
 
     @invariant IndependentNormalizedAuthority
         -- Controller persistence is a distinct SQLite lifecycle. Attempts,
@@ -600,6 +601,20 @@ contract ControllerSqliteBoundary {
     @invariant AuthorityLossFailsStop
         -- An unclassified checkpoint write exposes no OS effect and stops the
         -- controller rather than projecting semantic uncertainty.
+
+    @invariant DurableRevisionCompareAndSwap
+        -- First persistence requires row absence. Every replacement compares the
+        -- attempt's revision with the durable row and advances it in the same
+        -- transaction, so stale clones cannot erase evidence or retarget candidates.
+
+    @invariant CrashLoadHasNoMutationAuthority
+        -- A crash-loaded active checkpoint is affine recovery evidence, not a live
+        -- DeploymentAttempt. Interruption and fresh reconciliation are committed
+        -- before any process-mutation effect can become accessible.
+
+    @invariant FailedAuthorityPoisonsHandle
+        -- Persistence or loading that cannot classify durable authority invalidates
+        -- the handle until reopen and classification; no new attempt is admitted.
 }
 
 contract MacOsSupervisionBoundary {

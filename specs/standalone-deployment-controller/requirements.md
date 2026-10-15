@@ -192,6 +192,19 @@ constraints rather than storing those child collections in an aggregate blob.
 WHEN controller SQLite authority cannot classify whether a checkpoint committed
 THE SYSTEM SHALL fail stop rather than publish effects or continue admission.
 
+WHEN a checkpoint replaces an existing attempt row
+THE SYSTEM SHALL compare the checkpoint's durable revision with the stored revision
+in the same transaction
+AND SHALL reject stale or same-ID replacement authority.
+
+WHEN a checkpoint is loaded after controller restart
+THE SYSTEM SHALL return affine recovery evidence that cannot request process mutation
+until the required interruption and fresh-reconciliation checkpoints are committed.
+
+WHEN persistence or load authority cannot classify durable state
+THE SYSTEM SHALL invalidate that database handle for further admission until the
+controller reopens the database and classifies its durable evidence.
+
 ---
 
 ### REQ-SDC-012: Owned-Child macOS Mutation
