@@ -1,11 +1,12 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["httpx", "httpx-sse"]
 # ///
-"""Compiler-free, process-free opening harness regressions (no httpx import needed)."""
+"""Compiler-free opening regressions; HTTP/SSE authentication uses in-memory mocks."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -315,6 +316,82 @@ class OpeningQualificationTests(unittest.TestCase):
         boundaries = opening.shipping.member_boundaries(["root", "successor"], [[{"message_id": "boundary", "message_type": "continuation"}], []])
         self.assertEqual(boundaries[0]["successor_transcript_row_id"], "successor")
         with self.assertRaises(AssertionError): opening.shipping.member_boundaries(["root", "successor"], [[], []])
+
+    def test_owned_auth_credential_rejects_external_symlink_permissions_and_content(self):
+        home = self.root / "auth-home"
+        home.mkdir(mode=0o700)
+        credential = home / "qualification-password"
+        secret = "12345678-1234-4234-8234-123456789abc"
+        credential.write_text(secret)
+        credential.chmod(0o600)
+        startup = {"home": str(home), "credential_file": str(credential)}
+        self.assertEqual(opening.owned_qualification_password(startup), secret)
+        credential.chmod(0o644)
+        with self.assertRaises(ValueError): opening.owned_qualification_password(startup)
+        credential.chmod(0o600)
+        credential.write_text("x" * 36)
+        with self.assertRaises(ValueError): opening.owned_qualification_password(startup)
+        credential.unlink()
+        outside = self.root / "outside-password"
+        outside.write_text(secret); outside.chmod(0o600)
+        credential.symlink_to(outside)
+        with self.assertRaises(ValueError): opening.owned_qualification_password(startup)
+        with self.assertRaises(ValueError): opening.owned_qualification_password({**startup, "credential_file": str(outside)})
+
+    def test_parent_session_login_and_sse_use_same_cookie_without_secret_receipts(self):
+        import httpx
+        from types import SimpleNamespace
+        calls = []
+        password = "12345678-1234-4234-8234-123456789abc"
+        def serve(request):
+            calls.append((request.method, request.url.path, request.headers.get("cookie")))
+            if request.url.path == "/api/auth/status":
+                return httpx.Response(200, json={"auth_required": True, "authenticated": "phoenix-auth=session" == request.headers.get("cookie")})
+            if request.url.path == "/api/auth/login":
+                self.assertEqual(json.loads(request.content), {"password": password})
+                return httpx.Response(200, json={"ok": True}, headers={"set-cookie": "phoenix-auth=session; Path=/; HttpOnly"})
+            self.assertEqual(request.headers.get("cookie"), "phoenix-auth=session")
+            if request.url.path == "/api/models":
+                return httpx.Response(200, json={"default": "mock-model"})
+            return httpx.Response(200, text='event: init\ndata: ready\n\n', headers={"content-type": "text/event-stream"})
+        with httpx.Client(base_url="http://127.0.0.1:12345", transport=httpx.MockTransport(serve)) as client:
+            opening.authenticate_fixture(client, password)
+            adapter = opening.AuthenticatedHarness(SimpleNamespace(marker="delegated"), client)
+            self.assertEqual(adapter.marker, "delegated")
+            self.assertEqual(adapter._default_model("http://127.0.0.1:12345"), "mock-model")
+            observed = []
+            adapter._wait_for_sse_signal("http://127.0.0.1:12345", "row",
+                lambda kind, data: observed.append((kind, data)) or kind == "init", 20)
+        self.assertEqual(observed, [("init", "ready")])
+        self.assertNotIn(password, repr(calls))
+
+    def test_parent_auth_disabled_wrong_boolean_and_failed_login_fail_closed(self):
+        import httpx
+        for initial in ({"auth_required": False, "authenticated": True},
+                        {"auth_required": 1, "authenticated": False},
+                        {"auth_required": True, "authenticated": 0}):
+            methods = []
+            def serve(request):
+                methods.append(request.method)
+                return httpx.Response(200, json=initial)
+            with httpx.Client(base_url="http://127.0.0.1:12345", transport=httpx.MockTransport(serve)) as client:
+                with self.assertRaises(ValueError): opening.authenticate_fixture(client, "must-not-log")
+            self.assertEqual(methods, ["GET"])
+        def reject(request):
+            if request.method == "GET": return httpx.Response(200, json={"auth_required": True, "authenticated": False})
+            return httpx.Response(401, text="private-login-body")
+        with httpx.Client(base_url="http://127.0.0.1:12345", transport=httpx.MockTransport(reject)) as client:
+            with self.assertRaises(ValueError) as caught: opening.authenticate_fixture(client, "private-password")
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_cfgtest_auth_created_after_scrub_not_restored_from_ambient_password(self):
+        app = Path(os.environ.get("APP_ROOT", str(opening.ROOT / "target/history-hidden-geometry-repair")))
+        source = (app / "crates/phoenix-ide/src/opening_qualifier_tests.rs").read_text()
+        self.assertLess(source.index('std::env::remove_var(key)'), source.index('let password = uuid::Uuid::new_v4().to_string()'))
+        self.assertLess(source.index('let password = uuid::Uuid::new_v4().to_string()'), source.index('std::env::set_var("PHOENIX_PASSWORD", password)'))
+        self.assertIn('.create_new(true)\n        .mode(0o600)', source)
+        self.assertIn('"credential_file":credential', source)
+        self.assertNotIn('std::env::var("PHOENIX_PASSWORD")', source)
 
     def test_lifecycle_preserves_primary_and_nested_cleanup_failures(self):
         import contextlib

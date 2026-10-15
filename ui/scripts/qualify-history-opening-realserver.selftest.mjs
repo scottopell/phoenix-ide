@@ -355,6 +355,16 @@ test('cleanup-only runner failures fail closed and remain bounded (UNIT ONLY)', 
   assert.equal(result.cleanup_failures[0].error.length, 2048); assert.equal(result.cleanup_failures[0].truncated, true);
 });
 
+test('authenticated opening session precedes observers/navigation and protects direct HTTP/SSE (source control)', () => {
+  const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  const run = script.slice(script.indexOf('async function run()'));
+  assert.ok(run.indexOf('await authenticateOwnedContext(context, api)') < run.indexOf('page = await context.newPage()'));
+  assert.ok(run.indexOf('await authenticateOwnedContext(context, api)') < run.indexOf('installObservedHistoryTelemetry(page, ui)'));
+  assert.match(run, /fetch\(api \+ path, \{ method, headers: \{ Cookie: sessionCookie/);
+  assert.match(run, /\/stream`, \{ headers: \{ Cookie: sessionCookie \}/);
+  assert.doesNotMatch(run, /record\([^\n]*sessionCookie/);
+});
+
 function controlledClock() {
   let time = 0, serial = 0;
   const timers = new Map();

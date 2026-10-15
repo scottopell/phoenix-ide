@@ -4,9 +4,9 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = '4e615ea3513bac5ee6f4cff797ec17a7bcb3dac0';
+export const APP_PIN = '6e05de110b0cdcf075448d363f82be7a21fa26fc';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
-export const TELEMETRY_MODULE_SHA256 = '47850454849f7870c4374c7b071b74f9a436d3123f6e6017533e7305411ca42f';
+export const TELEMETRY_MODULE_SHA256 = '53ca4542ffdf7cce2040f8dfdba03575b1b44b334c94a2aed1611f185a8a00c3a';
 export const TELEMETRY_DIAGNOSTICS_SHA256 = '2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c';
 export const TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE = 'ui/scripts/view-telemetry-diagnostics.mjs';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
@@ -194,6 +194,37 @@ export function appendObservedHistory(result, inventory, identity, module) {
   return result;
 }
 
+export async function authenticateOwnedContext(context, baseURL, env = process.env) {
+  const home = resolve(nonempty(env.HISTORY_AUTH_HOME, 'owned authentication HOME required'));
+  assert.equal(realpathSync(home), home, 'authentication HOME must be canonical');
+  const directory = lstatSync(home);
+  assert.ok(directory.isDirectory() && (directory.mode & 0o777) === 0o700 && directory.uid === process.getuid(), 'authentication HOME ownership');
+  const path = resolve(nonempty(env.HISTORY_AUTH_CREDENTIAL_FILE, 'owned authentication credential required'));
+  assert.equal(path, resolve(home, 'qualification-password'), 'credential must belong to actual server HOME');
+  const info = lstatSync(path);
+  assert.ok(info.isFile() && !info.isSymbolicLink() && (info.mode & 0o777) === 0o600 && info.uid === process.getuid() && info.size === 36, 'credential file ownership');
+  const password = readFileSync(path, 'utf8');
+  assert.ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(password), 'synthetic credential format');
+  const origin = new URL(baseURL);
+  assert.ok(origin.protocol === 'http:' && origin.hostname === '127.0.0.1' && !origin.username && !origin.password && origin.pathname === '/' && !origin.search && !origin.hash, 'owned login requires bare loopback origin');
+  const endpoint = new URL('/api/auth/login', origin).href;
+  let response;
+  try { response = await context.request.post(endpoint, { data: { password }, timeout: 3000 }); }
+  catch { throw new Error('owned browser session login transport failed'); }
+  try { assert.equal(response.status(), 200, 'owned browser session login status'); }
+  finally { await response.dispose(); }
+  const status = await context.request.get(new URL('/api/auth/status', baseURL).href, { timeout: 3000 });
+  try {
+    assert.equal(status.status(), 200, 'owned browser authentication status');
+    let value; try { value = await status.json(); } catch { throw new Error('owned browser invalid authentication status'); }
+    assert.ok(value?.auth_required === true && value?.authenticated === true, 'owned browser authenticated session required');
+  } finally { await status.dispose(); }
+  const cookies = (await context.cookies(baseURL)).filter(cookie => cookie.name === 'phoenix-auth');
+  assert.equal(cookies.length, 1, 'one owned session cookie required');
+  assert.ok(typeof cookies[0].value === 'string' && /^[A-Za-z0-9_-]+$/.test(cookies[0].value), 'owned session cookie format');
+  return `phoenix-auth=${cookies[0].value}`;
+}
+
 export async function runJointTelemetryStage({ config, browser, baseURL, outputDir, historyPhysical, harnessPath, historyGlobalOwnedGetCount, UNIT }) {
   if (config === null) return null;
   assert.equal(config.unitOnly, UNIT !== undefined, 'UNIT dependency injection cannot become fixture proof');
@@ -211,6 +242,9 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
     assert.equal(typeof module.runTelemetryChecks, 'function', 'installed telemetry module export required');
     phase = 'context_acquisition';
     context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    phase = 'session_authentication';
+    if (config.unitOnly) { if (UNIT?.authenticateContext) await UNIT.authenticateContext(context, baseURL); }
+    else await authenticateOwnedContext(context, baseURL);
     phase = 'page_acquisition';
     const page = await context.newPage();
     phase = 'module_checks';

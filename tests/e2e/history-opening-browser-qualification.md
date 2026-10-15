@@ -1053,3 +1053,60 @@ is retained and the corrected exact-type regression passes.
 These are source/mock checks, not a new full UI, Rust/codegen, normal-shutdown,
 export, Global, or overhead qualification. No hosted publication, rerun,
 production mutation, or browser capture follows automatically from this packet.
+
+
+## Authenticated disposable-fixture contract repair after run 38657260015
+
+The admitted exact application `4e615ea` and harness `8447e887` were published
+once. Run `38657260015`, instrumented job `116169860707`, failed at the isolated
+collector authentication negative with actual status 204 rather than 401.
+Artifact `11938370840` is retained separately from the earlier `614` failure.
+Codegen, actual Coordinator DB fixture, instrumentation guards, and full pinned
+UI passed. Ordinary history completed nine checks; the stock telemetry sweep
+completed 48 trials (24 ordinary, 24 Global), with 16 sampled journeys and 16
+POSTs and no per-trial failures. Those Global telemetry trials do not establish
+execution of the outer Global-history case, which was not reached. Forced
+cleanup remains failure evidence, not normal shutdown proof.
+
+Source diagnosis establishes a fixture mismatch: the ignored cfg-test driver
+scrubbed every environment variable, wrote empty configuration, and never set
+`PHOENIX_PASSWORD`. The server's auth-disabled allow-all behavior is required
+by `specs/auth/requirements.md` REQ-AUTH-001. The collector is inside the normal
+auth layer; this result is not evidence of a product collector exemption.
+The donor authentication-negative contract requires an authenticated server.
+
+The source successor application `6e05de110b0cdcf075448d363f82be7a21fa26fc`,
+tree `3f2ce53714f1f44dbc2d50d219e81692f07a6771`, retains `4e615ea` and applies
+only donor preflight delta `107555e6b3ff451852a070ebbe3d542a0a5a1d40`
+(cherry-picked as `890d913f`) plus the owned cfg-test authentication fixture.
+After the full ambient environment scrub, the fixture generates its own random
+UUID password, stores it using exclusive creation and mode 0600 under the owned
+mode-0700 temporary HOME, and sets the server password from that synthetic
+value. The startup receipt exposes only the credential file path, never its
+contents. No production/inherited password or bearer credential is imported.
+
+Parent HTTP, model discovery, and SSE use the same existing-login session
+cookie. The parent first requires auth-required/unauthenticated status, logs in
+through `/api/auth/login`, and requires authenticated status. Readiness uses the
+public auth-status endpoint. Both the original browser context and the fresh
+stock context mint sessions through the existing login endpoint before page
+observers/navigation. Direct driver HTTP/SSE requests use the same context's
+cookie; no credential or session value is written to capture receipts. Owned
+file checks reject foreign paths, symlinks, wrong ownership/permissions and
+invalid synthetic credential content. Shared shipping qualification is unchanged.
+
+The donor checks the authenticated parent prerequisite before the first cohort.
+The negative context remains empty-storage with no bearer/session injection and
+must first prove auth-required/unauthenticated status, then receive the original
+401 collector rejection. Auth-disabled fixtures fail early; 204 is not accepted
+or skipped. Sampling, readiness, export assertions, and content-free diagnostic
+bounds are unchanged. Close-time producer delivery remains `not_proven`.
+
+Source-only checks: shipping Python 16, base Node 14, opening Python 45, opening
+Node 30, joint Node 50, and exact successor focused application Vitest 90 tests
+across seven files passed. Node syntax, Rust source-format parsing, and diff
+checks passed. Initial local mock failures (missing imports/helper identifiers)
+are retained separately from the corrected passing logs. No Rust compilation,
+codegen, full UI, authenticated runtime, normal shutdown, Global-history,
+export/drain, or overhead acceptance is transferred to this successor. It has
+not been published or rerun merely by preparing this source packet.

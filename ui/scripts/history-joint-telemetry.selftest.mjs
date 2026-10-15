@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSync, realpathSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, TELEMETRY_SPA_SELECTOR, UNIT_ONLY,
-  prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage,
+  prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage, authenticateOwnedContext,
   installObservedHistoryTelemetry, appendObservedHistory } from './history-joint-telemetry.mjs';
 
 // All positive fake browser/module/fixture values in this file are UNIT ONLY, not runtime proof.
@@ -36,6 +36,44 @@ function unitFiles() {
   const UNIT = { label: UNIT_ONLY, digest: path => path === diagnostics ? TELEMETRY_DIAGNOSTICS_SHA256 : TELEMETRY_MODULE_SHA256 };
   return { root, module, diagnostics, fixture, env, UNIT, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
+
+test('owned browser login mints session before use, disposes responses, and never returns password (UNIT ONLY)', async () => {
+  const f = unitFiles(); try {
+    const path = resolve(f.root, 'qualification-password'), password = '12345678-1234-4234-8234-123456789abc'; writeFileSync(path, password, { mode: 0o600 });
+    const calls = [], disposed = [];
+    const context = { request: {
+      post: async (url, options) => { calls.push(['login', url, options.data.password]); return { status: () => 200, dispose: async () => disposed.push('login') }; },
+      get: async url => { calls.push(['status', url]); return { status: () => 200, json: async () => ({ auth_required: true, authenticated: true }), dispose: async () => disposed.push('status') }; },
+    }, cookies: async () => [{ name: 'phoenix-auth', value: 'opaque_session' }] };
+    const env = { HISTORY_AUTH_HOME: f.root, HISTORY_AUTH_CREDENTIAL_FILE: path };
+    const cookie = await authenticateOwnedContext(context, 'http://127.0.0.1:12345', env);
+    assert.equal(cookie, 'phoenix-auth=opaque_session'); assert.ok(!cookie.includes(password));
+    assert.deepEqual(disposed, ['login', 'status']); assert.equal(calls[0][2], password);
+    assert.deepEqual(calls.map(c => c[0]), ['login', 'status']);
+    chmodSync(path, 0o644);
+    await assert.rejects(authenticateOwnedContext(context, 'http://127.0.0.1:12345', env), /credential file ownership/);
+    chmodSync(path, 0o600); rmSync(path); symlinkSync(f.fixture, path);
+    await assert.rejects(authenticateOwnedContext(context, 'http://127.0.0.1:12345', env), /credential file ownership/);
+    assert.equal(calls.length, 2);
+  } finally { f.cleanup(); }
+});
+
+test('browser login rejects auth-disabled/wrong booleans/private JSON and sanitizes login transport (UNIT ONLY)', async () => {
+  const f = unitFiles(); try {
+    const path = resolve(f.root, 'qualification-password'), password = '22345678-1234-4234-8234-123456789abc'; writeFileSync(path, password, { mode: 0o600 });
+    const env = { HISTORY_AUTH_HOME: f.root, HISTORY_AUTH_CREDENTIAL_FILE: path };
+    for (const value of [{ auth_required: false, authenticated: true }, { auth_required: 1, authenticated: true }, { auth_required: true, authenticated: 1 }, 'invalid']) {
+      let disposed = 0;
+      const context = { request: {
+        post: async () => ({ status: () => 200, dispose: async () => disposed++ }),
+        get: async () => ({ status: () => 200, json: async () => { if (value === 'invalid') throw new Error(password); return value; }, dispose: async () => disposed++ }),
+      } };
+      await assert.rejects(authenticateOwnedContext(context, 'http://127.0.0.1:12345', env), error => !String(error).includes(password));
+      assert.equal(disposed, 2);
+    }
+    await assert.rejects(authenticateOwnedContext({ request: { post: async () => { throw new Error(password); } } }, 'http://127.0.0.1:12345', env), error => !String(error).includes(password));
+  } finally { f.cleanup(); }
+});
 
 test('disabled stage does not admit imports or contexts (UNIT ONLY)', async () => {
   assert.equal(prepareJointTelemetry({ env: {} }), null);

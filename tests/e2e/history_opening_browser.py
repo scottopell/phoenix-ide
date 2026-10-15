@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent 4e615ea checkout, independently built ignored
+Inputs are a clean independent 6e05de1 checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports four hash-attested telemetry harness
@@ -27,19 +27,20 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "4e615ea3513bac5ee6f4cff797ec17a7bcb3dac0"
-TREE_PIN = "8535ae2edc92c4333e0e86cf85a7e1e5f89feaf0"
+PIN = "6e05de110b0cdcf075448d363f82be7a21fa26fc"
+TREE_PIN = "3f2ce53714f1f44dbc2d50d219e81692f07a6771"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
-    "ui/scripts/qualify-view-telemetry.mjs": "47850454849f7870c4374c7b071b74f9a436d3123f6e6017533e7305411ca42f",
+    "ui/scripts/qualify-view-telemetry.mjs": "53ca4542ffdf7cce2040f8dfdba03575b1b44b334c94a2aed1611f185a8a00c3a",
     "ui/scripts/view-telemetry-diagnostics.mjs": "2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c",
     "tests/e2e/view_telemetry_sink.py": "aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",
@@ -104,6 +105,74 @@ def startup_identity(log, exe, temp, port):
             or db != home / ".phoenix-ide/phoenix.db"):
         raise ValueError("compiled startup app/exe/owned HOME/DB/loopback identity mismatch")
     return data | {"executable_sha256": shipping.digest(exe)}
+
+
+def owned_qualification_password(startup):
+    import stat
+    home = Path(startup["home"])
+    path = Path(startup["credential_file"])
+    info = path.lstat()
+    if (path != home / "qualification-password" or path.is_symlink()
+            or path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid()
+            or stat.S_IMODE(home.stat().st_mode) != 0o700
+            or home.stat().st_uid != os.getuid() or info.st_size != 36):
+        raise ValueError("owned synthetic credential file identity mismatch")
+    password = path.read_text()
+    if str(uuid.UUID(password)) != password:
+        raise ValueError("owned synthetic credential format mismatch")
+    return password
+
+
+def authenticate_fixture(client, password):
+    def require_status(authenticated):
+        response = client.get("/api/auth/status")
+        try:
+            value = response.json()
+        except ValueError:
+            raise ValueError("owned fixture authentication status invalid JSON") from None
+        if (response.status_code != 200 or not isinstance(value, dict)
+                or value.get("auth_required") is not True
+                or value.get("authenticated") is not authenticated):
+            raise ValueError("owned fixture authentication prerequisite not established")
+    require_status(False)
+    try:
+        response = client.post("/api/auth/login", json={"password": password})
+    except Exception:
+        raise RuntimeError("owned fixture session login transport failed") from None
+    if response.status_code != 200 or not client.cookies:
+        raise ValueError("owned fixture session login failed")
+    require_status(True)
+
+
+class AuthenticatedHarness:
+    def __init__(self, harness, client):
+        self.harness, self.client = harness, client
+
+    def __getattr__(self, name):
+        return getattr(self.harness, name)
+
+    def _default_model(self, base_url):
+        response = self.client.get("/api/models")
+        response.raise_for_status()
+        model = response.json().get("default")
+        if not isinstance(model, str) or not model:
+            raise AssertionError("authenticated fixture default model required")
+        return model
+
+    def _wait_for_sse_signal(self, base_url, row, predicate, timeout):
+        import httpx
+        from httpx_sse import connect_sse
+        started = time.monotonic()
+        with connect_sse(self.client, "GET", f"/api/conversations/{row}/stream",
+                         timeout=httpx.Timeout(connect=5, read=timeout, write=5, pool=5)) as source:
+            source.response.raise_for_status()
+            for event in source.iter_sse():
+                if time.monotonic() - started > timeout:
+                    raise TimeoutError("authenticated fixture SSE signal deadline")
+                if predicate(event.event, event.data):
+                    return
+        raise RuntimeError("authenticated fixture SSE closed before expected signal")
 
 
 def readiness(proc, url, expected_hash=None, timeout=30):
@@ -520,12 +589,17 @@ def qualify(app, exe, output, joint_telemetry=False):
                                 command, work, env,
                                 case / "instrumented-runtime.log"), "server") as server:
                             try:
-                                readiness(server, base + "/api/models")
+                                readiness(server, base + "/api/auth/status")
                                 startup = startup_identity(
                                     case / "instrumented-runtime.log", exe, work, port)
                                 shipping.write_json(case / "startup.json", startup)
                                 fixture = shipping.Fixture(h, base, case)
                                 try:
+                                    authenticate_fixture(fixture.client, owned_qualification_password(startup))
+                                    fixture.h = AuthenticatedHarness(h, fixture.client)
+                                    shipping.write_json(case / "authentication.json", {
+                                        "auth_required": True, "parent_authenticated": True,
+                                        "credential_source": "owned_cfg_test_home", "session": "existing_login_cookie"})
                                     cwd = work / "cwd"
                                     cwd.mkdir(mode=0o700)
                                     aggregate = equal_text_fixture(
@@ -579,6 +653,8 @@ def qualify(app, exe, output, joint_telemetry=False):
                                     "HISTORY_OUTPUT": str(case),
                                     "HISTORY_FIXTURE": str(case / "fixture.json"),
                                     "HISTORY_CONTROL": str(control),
+                                    "HISTORY_AUTH_HOME": startup["home"],
+                                    "HISTORY_AUTH_CREDENTIAL_FILE": startup["credential_file"],
                                     "HISTORY_FAULT": str(fault),
                                     "PLAYWRIGHT_BROWSERS_PATH": os.environ.get(
                                         "PLAYWRIGHT_BROWSERS_PATH",

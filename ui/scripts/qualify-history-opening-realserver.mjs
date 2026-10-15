@@ -8,7 +8,7 @@ import { createConnection } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate, aggregateBoundaries } from './qualify-history-realserver.mjs';
 import { historicalMessageIdentities, observePhysicalHistoricalRow, physicalBaselineMatches, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
-import { prepareJointTelemetry, runJointTelemetryStage, installObservedHistoryTelemetry } from './history-joint-telemetry.mjs';
+import { prepareJointTelemetry, runJointTelemetryStage, installObservedHistoryTelemetry, authenticateOwnedContext } from './history-joint-telemetry.mjs';
 
 export function ownedWireCursor(event, observedEvents) {
   const payload = JSON.parse(event.data);
@@ -786,7 +786,7 @@ async function run() {
   const checked = (name, data) => { result.checks.push(name); record('assertions.jsonl', { name, ...data }); };
   const gate = { armed: false, releaseAttempted: false, predecessor: a.members.at(-1), key: randomUUID() };
   const command = async body => { const reply = await ipc(control, body); record('ipc.jsonl', { command: body, reply }); return reply; };
-  let browser, page, continuation, recorder, historyTelemetry, finalizeHistoryTelemetry;
+  let browser, page, continuation, recorder, historyTelemetry, finalizeHistoryTelemetry, sessionCookie;
   const snapshots = [], events = [];
   let requests = [], failed = [];
   const deadlineStarted = performance.now();
@@ -802,7 +802,7 @@ async function run() {
     for (;;) { const value = await fn(); if (value) return value; assert.ok(performance.now() < end, label); await new Promise(r => setTimeout(r, 40)); }
   }
   async function http(method, path, body) {
-    const response = await fetch(api + path, { method, headers: body ? { 'Content-Type': 'application/json' } : {},
+    const response = await fetch(api + path, { method, headers: { Cookie: sessionCookie, ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10000) });
     const raw = await response.text(); record('driver-http.jsonl', { method, path, body, status: response.status, raw });
     assert.ok(response.ok, `${method} ${path}: ${response.status}`); return JSON.parse(raw);
@@ -845,6 +845,8 @@ async function run() {
     const { chromium } = createRequire(resolve(app, 'ui/package.json'))('playwright');
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 1360, height: 900 } });
+    sessionCookie = await authenticateOwnedContext(context, api);
+    result.authentication = { auth_required: true, authenticated: true, session: 'existing_login_cookie' };
     page = await context.newPage(); page.setDefaultTimeout(10000); page.setDefaultNavigationTimeout(10000);
     if (jointTelemetry) historyTelemetry = installObservedHistoryTelemetry(page, ui);
     recorder = installAggregateRecorder(page, a, record, snapshots, {
@@ -897,7 +899,7 @@ async function run() {
     const direct = await http('GET', `/api/conversations/${latest}`);
     assert.equal(direct.messages.some(m => [gate.key, acceptedId].includes(m.message_id)), false);
     // New independent actual subscription must get Init while the write is held.
-    const stream = await fetch(api + `/api/conversations/${latest}/stream`, { signal: AbortSignal.timeout(5000) });
+    const stream = await fetch(api + `/api/conversations/${latest}/stream`, { headers: { Cookie: sessionCookie }, signal: AbortSignal.timeout(5000) });
     assert.equal(stream.status, 200); assert.match(stream.headers.get('content-type'), /text\/event-stream/);
     const reader = stream.body.getReader(); let raw = '';
     try { while (!raw.includes('\n\n')) { const value = await reader.read(); assert.equal(value.done, false); raw += new TextDecoder().decode(value.value); assert.ok(raw.length < 1000000); }
