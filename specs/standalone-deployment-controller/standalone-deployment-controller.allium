@@ -4,6 +4,18 @@
 -- This module refines the independent-owner and truthful-recovery obligations in
 -- specs/production-deployment and specs/launchd-deployment. It does not replace
 -- either deployment contract or grant production activation authority.
+--
+-- Requirement traceability:
+-- REQ-SDC-001: transitions and PersistInterruption
+-- REQ-SDC-002: RecordResourceSample, AdmitSustainedResources, BlockInsufficientResources
+-- REQ-SDC-003: RecordChildDiscoveryBeforeIdentity and AdoptStableChildIdentity
+-- REQ-SDC-004: PreserveUnidentifiedChildObservation and RequireAdministrativeCloseoutAtDeadline
+-- REQ-SDC-005: RecheckBeforeEveryOwnedSignal, KeepReparentedIdentityOwned, IgnoreReplacementAtOwnedPid
+-- REQ-SDC-006: CompleteVerifiedCleanup and cleanup invariants
+-- REQ-SDC-007: AcceptAdministrativeRiskWithoutCleanupClaim
+-- REQ-SDC-008: PersistInterruption and RecoverByReconciliation
+-- REQ-SDC-009: RecordCandidateMigrationInvocation and RecoverForwardAfterMigrationInvocation
+-- REQ-SDC-010: ControllerOsBoundary
 
 value ProcessIdentity {
     pid: Integer
@@ -427,6 +439,20 @@ contract ControllerOsBoundary {
 }
 
 -- Helper meanings
+--
+-- sequence_is_after(sample, samples) -> Boolean
+-- sustained_capacity_and_contention_are_admissible(samples, count) -> Boolean
+-- stable_child_evidence_binds(discovery, identity) -> Boolean
+-- freshly_observed_same_identity(identity) -> Boolean
+-- exact_identity_absence_is_verified(identity) -> Boolean
+-- every_owned_identity_is_verified_absent(attempt) -> Boolean
+-- a_freshly_matching_owned_identity_is_live(attempt) -> Boolean
+-- cleanup_evidence_is_unresolved(attempt) -> Boolean
+-- explicit_risk_acceptance_matches(attempt) -> Boolean
+-- no_additional_process_signal_requested(attempt) -> Boolean
+-- recovery_or_retry_does_not_change(deadline) -> Boolean
+-- resource_decision_uses_only_capacity_and_contention_samples(attempt) -> Boolean
+-- candidate_identity_is_exact(candidate) -> Boolean
 --
 -- stable_child_evidence_binds(discovery, identity) is true only when one OS-boundary
 -- observation verifies discovery.verified_parent at its recorded birth, the child
