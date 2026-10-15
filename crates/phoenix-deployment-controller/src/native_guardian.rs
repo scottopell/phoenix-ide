@@ -184,8 +184,9 @@ pub fn serve_until<E: GuardianExecutor>(
                     if slice.is_zero() {
                         break;
                     }
-                    stream.set_read_timeout(Some(slice))?;
-                    stream.set_write_timeout(Some(slice))?;
+                    let timeout = slice.max(Duration::from_millis(1));
+                    stream.set_read_timeout(Some(timeout))?;
+                    stream.set_write_timeout(Some(timeout))?;
                     if serve_once(&mut stream, server).is_err() {
                         break;
                     }
