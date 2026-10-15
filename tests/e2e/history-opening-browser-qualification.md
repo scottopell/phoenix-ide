@@ -1190,3 +1190,43 @@ Node/esbuild descendants and port 61237 listener were absent afterward; idle
 zsh wrappers 20330 and 81783 remained. No source/evidence was deleted and no
 protected prototype or unrelated service was signalled. These local service
 receipts do not qualify the hosted application's normal shutdown.
+
+
+## Pagehide diagnostic successor after run 38779812212
+
+The one exact app `06156cc` / harness `24398672` publication produced run
+`38779812212`, terminal failure in witness `116576778604`; standard Rust
+`116576973076` and other CI jobs passed. Artifact `11996596997` remains retained
+remotely. Bounded ZIP range reads retained only selected small JSON receipts,
+not the approximately 89 MB artifact archive. The identity receipt establishes
+all nine predicates true, HOME mode 0700 and credential mode 0600. Ordinary
+history completed nine checks. Stock telemetry completed 48 trials with eight
+sampled journeys and eight POSTs; those are not outer Global-history execution.
+
+The pagehide trial observed one incomplete report body and matching request
+correlation but no page response status. Its original assertion was actual
+statuses `[]` versus expected `[204]`. The donor finally then masked that
+failure with `pagehide late capture failure`. A captured body does not prove
+collector acceptance. The retained evidence cannot distinguish failed transport
+from a missing observer response; no causal transport fix is claimed.
+
+Donor `e75512a094734b294a6dc221b9552f1c18654d5e` is integrated atop `06156cc`
+as app `debe25378d5a460c18d1ac2a01e3ebe309da236b`, tree
+`c9e6eddf38044f8c59e496222d1c57a18a4c8e12`. The two-file delta preserves the
+first Error through context close, cleanup assertions, callback and receipt
+publication, and records independent bounded secondary failures. At most 32
+content-free ordered page/context/CDP transport facts distinguish actual
+Request-local ordinals and separate CDP-local ordinals without claiming
+cross-channel identity. Raw CDP IDs, URLs, error text, headers and bodies are
+not copied into those facts. Overflow fails closed. Observer phases and context
+close return do not imply normal application shutdown.
+
+The existing page-response `[204]`, request correlation, incomplete outcome,
+null meaningful-transcript, sampling, timing and export assertions are unchanged.
+The successor is diagnostic: context/CDP observations cannot replace missing
+page-response acceptance evidence. Actual cached offline checks passed: shipping
+Python 16, base Node 14, opening Python 46, opening Node 30, joint Node 50 and
+focused donor Vitest 54 across two files. No local compile, install, application
+server, browser capture or large artifact copy was performed. New-source full
+UI/codegen/Rust/runtime/normal drain/export remain hosted obligations, not
+inferred from those source and mock checks.
