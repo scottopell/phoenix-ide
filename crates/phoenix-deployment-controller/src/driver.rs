@@ -134,13 +134,11 @@ impl CommittedTransition {
         let tickets = effects
             .into_iter()
             .enumerate()
-            .map(|(ordinal, effect)| DispatchTicket {
-                key: DispatchKey {
-                    attempt_id,
-                    revision,
-                    ordinal,
-                },
-                effect,
+            .map(|(ordinal, effect)| {
+                DispatchTicket::from_committed_parts(
+                    DispatchKey::from_committed_parts(attempt_id, revision, ordinal),
+                    effect,
+                )
             })
             .collect::<Vec<_>>()
             .into_iter();
@@ -214,6 +212,10 @@ pub struct ExecutedEffect {
 }
 
 impl ExecutedEffect {
+    pub(crate) const fn from_parts(key: DispatchKey, completion: EffectCompletion) -> Self {
+        Self { key, completion }
+    }
+
     #[must_use]
     pub const fn key(&self) -> DispatchKey {
         self.key
@@ -277,6 +279,6 @@ impl<'a, O: ControllerOs + ?Sized> EffectExecutor<'a, O> {
                 }
             }
         };
-        ExecutedEffect { key, completion }
+        ExecutedEffect::from_parts(key, completion)
     }
 }

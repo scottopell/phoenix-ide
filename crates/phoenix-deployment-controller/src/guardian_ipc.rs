@@ -587,21 +587,26 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             next_admission: 1,
         })
     }
+    /// Returns the live guardian without exposing mutable custody.
     pub fn guardian(&self) -> &Guardian<E> {
         &self.guardian
     }
-    // These proofs must come from the trusted, committed runtime path, not a wire revision.
-    pub(crate) fn stage_interruption(&mut self, revision: PersistenceRevision) {
+
+    /// Stages the exact interruption revision produced by the trusted durable runtime.
+    pub fn stage_interruption(&mut self, revision: PersistenceRevision) {
         self.interruption = Some(revision);
     }
-    pub(crate) fn stage_finish_proof(
+
+    /// Stages a reconciliation proof minted by the trusted durable runtime.
+    pub fn stage_finish_proof(
         &mut self,
         revision: PersistenceRevision,
         proof: crate::ReconciledSessionPermit,
     ) {
         self.finish_proof = Some((revision, proof));
     }
-    pub(crate) fn stage_applied_ack(
+    /// Stages an acknowledgement proof minted only after durable result application.
+    pub fn stage_applied_ack(
         &mut self,
         key: DispatchKey,
         revision: PersistenceRevision,
@@ -609,11 +614,17 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     ) {
         self.ack_proofs.push((key, revision, ack));
     }
-    // Trusted runtime presents the actual affine committed ticket, not a decoded DTO.
-    pub(crate) fn take_refused(&mut self) -> Vec<DispatchTicket> {
+    /// Returns definite pre-execution refusals to the trusted affine runtime.
+    pub fn take_refused(&mut self) -> Vec<DispatchTicket> {
         std::mem::take(&mut self.refused)
     }
-    pub(crate) fn stage_committed(&mut self, ticket: DispatchTicket) -> Result<(), DispatchTicket> {
+
+    /// Stages an affine ticket issued from a committed policy transition.
+    ///
+    /// # Errors
+    /// Returns the unchanged ticket when its attempt does not match or its key is
+    /// already staged, refused, or admitted.
+    pub fn stage_committed(&mut self, ticket: DispatchTicket) -> Result<(), DispatchTicket> {
         if ticket.key().attempt_id() != self.guardian.attempt_id()
             || self
                 .staged
@@ -1149,13 +1160,13 @@ mod tests {
                 OsEffect::SampleResources { sequence } => *sequence,
                 _ => panic!("fixture only samples"),
             };
-            ExecutedEffect {
-                key: ticket.key(),
-                completion: EffectCompletion::SampleResources {
+            ExecutedEffect::from_parts(
+                ticket.key(),
+                EffectCompletion::SampleResources {
                     sequence,
                     result: Err(crate::ResourceObservationFailure::Unsupported),
                 },
-            }
+            )
         }
         fn poll_observation_only(&self, _: &()) -> ChildSlotObservation {
             ChildSlotObservation::Running
