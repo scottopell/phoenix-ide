@@ -38,6 +38,11 @@ WHEN execution is interrupted after a checkpoint
 THE SYSTEM SHALL recover from that checkpoint without assuming that an emitted
 operating-system request completed.
 
+WHEN a checkpoint has an unfinished child-enumeration, identity-observation, birth-probe,
+or resource-sample request
+THE SYSTEM SHALL retain and reissue that exact obligation during recovery before
+advancing past its owning phase.
+
 ---
 
 ### REQ-SDC-002: Measured Resource Admission
@@ -62,6 +67,10 @@ token.
 
 WHEN a PID appears in a child listing but no birth token has been acquired
 THE SYSTEM SHALL record a distinct discovery epoch rather than an owned process.
+
+WHEN a discovery epoch has recorded any failure before birth identity acquisition
+THE SYSTEM SHALL NOT permit a later process at that PID to satisfy that epoch,
+even when a reconstructed platform adapter observes the expected parent relationship.
 
 ---
 
@@ -124,6 +133,9 @@ THE SYSTEM SHALL freshly observe every acquired owned identity before requesting
 new mutation
 AND SHALL preserve the original absolute operation deadline.
 
+THE SYSTEM SHALL NOT request any owned-process mutation until every acquired owned
+identity has completed that recovery observation barrier.
+
 THE SYSTEM SHALL NOT replay a signal solely because the interrupted checkpoint
 shows that the signal was previously planned or emitted.
 
@@ -137,6 +149,11 @@ candidate identified by full source commit and artifact digest.
 
 THE SYSTEM SHALL NOT start the predecessor or imply that an older binary is
 compatible with the migrated database.
+
+WHEN candidate migration invocation is already durable
+THE SYSTEM SHALL reject an attempt to replace its retained candidate identity
+AND SHALL allow recovery to reissue exact-candidate verification from both the
+ready migration checkpoint and a forward-recovery checkpoint.
 
 ---
 

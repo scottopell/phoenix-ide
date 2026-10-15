@@ -13,8 +13,8 @@ pub use identity::{
 };
 pub use os::{CandidateVerification, ControllerOs, OsEffect, OsQueryError, Signal, SignalOutcome};
 pub use ownership::{
-    CleanupReadiness, DiscoveryGap, OwnedIdentityStatus, OwnedProcessTree, UnknownDiscovery,
-    UnknownOwnedIdentity, UnknownParent, UnresolvedDiscovery,
+    ChildObservationOutcome, CleanupReadiness, DiscoveryGap, OwnedIdentityStatus, OwnedProcessTree,
+    UnknownChildScan, UnknownDiscovery, UnknownOwnedIdentity, UnknownParent, UnresolvedDiscovery,
 };
 pub use resource::{
     CpuContentionBasisPoints, InvalidCpuContention, MemoryPressure, NonIncreasingSampleSequence,

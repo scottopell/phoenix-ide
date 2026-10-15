@@ -6,7 +6,8 @@ use crate::{
     },
     os::{CandidateVerification, OsEffect, Signal},
     ownership::{
-        CleanupReadiness, OwnedProcessTree, UnknownDiscovery, UnknownOwnedIdentity, UnknownParent,
+        ChildObservationOutcome, CleanupReadiness, OwnedProcessTree, UnknownChildScan,
+        UnknownDiscovery, UnknownOwnedIdentity, UnknownParent,
     },
     resource::{
         NonIncreasingSampleSequence, ResourceAssessment, ResourceBlock, ResourcePolicy,
@@ -98,7 +99,7 @@ struct AttemptContext {
 pub struct ResourceSamplingAttempt {
     context: AttemptContext,
     root: ProcessIdentity,
-    next_sample_sequence: u64,
+    pending_sample_sequence: u64,
     window: ResourceWindow,
 }
 
@@ -111,12 +112,21 @@ enum OwnershipPhase {
     Recovering,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryResume {
+    Discovery,
+    AwaitingBirthEvidence,
+    Cleaning,
+    Verifying,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnershipAttempt {
     context: AttemptContext,
     resources: SustainedResourceEvidence,
     tree: OwnedProcessTree,
     phase: OwnershipPhase,
+    recovery_resume: Option<RecoveryResume>,
     cleanup: CleanupOutcome,
 }
 
@@ -241,7 +251,7 @@ impl DeploymentAttempt {
                 compatibility: CompatibilityBoundary::PreMigration,
             },
             root,
-            next_sample_sequence: 1,
+            pending_sample_sequence: 0,
             window: ResourceWindow::new(policy),
         }));
         Transition {
@@ -316,14 +326,20 @@ impl DeploymentAttempt {
         let Self::Active(ActiveAttempt::ResourceSampling(mut attempt)) = self else {
             return Err(TransitionError::WrongPhase);
         };
+        if sample.sequence != attempt.pending_sample_sequence {
+            return Err(TransitionError::UnexpectedSampleSequence {
+                expected: attempt.pending_sample_sequence,
+                actual: sample.sequence,
+            });
+        }
         let assessment = attempt
             .window
             .record(sample)
             .map_err(TransitionError::NonIncreasingSample)?;
         match assessment {
             ResourceAssessment::NeedMoreSamples { .. } => {
-                let sequence = attempt.next_sample_sequence;
-                attempt.next_sample_sequence = attempt.next_sample_sequence.saturating_add(1);
+                attempt.pending_sample_sequence = attempt.pending_sample_sequence.saturating_add(1);
+                let sequence = attempt.pending_sample_sequence;
                 Ok(Transition {
                     checkpoint: Self::Active(ActiveAttempt::ResourceSampling(attempt)),
                     after_persist: vec![OsEffect::SampleResources { sequence }],
@@ -336,6 +352,7 @@ impl DeploymentAttempt {
                     resources,
                     tree: OwnedProcessTree::new(root),
                     phase: OwnershipPhase::Discovery,
+                    recovery_resume: None,
                     cleanup: CleanupOutcome::NotStarted,
                 };
                 Ok(Transition {
@@ -390,21 +407,28 @@ impl DeploymentAttempt {
         observation: ChildIdentityObservation,
     ) -> Result<Transition, TransitionError> {
         let mut attempt = self.into_ownership()?;
-        let stable_identity = match observation {
-            ChildIdentityObservation::Stable(evidence) => Some(evidence.identity()),
-            ChildIdentityObservation::Unresolved(_)
-            | ChildIdentityObservation::DifferentProcess(_) => None,
-        };
-        attempt
+        let recovering = attempt.phase == OwnershipPhase::Recovering;
+        let outcome = attempt
             .tree
             .record_child_observation(discovery, observation)
             .map_err(TransitionError::UnknownDiscovery)?;
-        let after_persist = if let Some(identity) = stable_identity {
-            attempt.phase = OwnershipPhase::Discovery;
-            vec![OsEffect::ListChildren { parent: identity }]
-        } else {
-            attempt.phase = OwnershipPhase::AwaitingBirthEvidence;
-            Vec::new()
+        let after_persist = match outcome {
+            ChildObservationOutcome::Adopted(identity) => {
+                if !recovering {
+                    attempt.phase = OwnershipPhase::Discovery;
+                }
+                let mut effects = vec![OsEffect::ListChildren { parent: identity }];
+                if recovering {
+                    effects.push(OsEffect::ObserveIdentity { identity });
+                }
+                effects
+            }
+            ChildObservationOutcome::RemainsUnresolved => {
+                if !recovering {
+                    attempt.phase = OwnershipPhase::AwaitingBirthEvidence;
+                }
+                Vec::new()
+            }
         };
         Ok(Transition {
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
@@ -434,6 +458,38 @@ impl DeploymentAttempt {
     }
 
     /// # Errors
+    /// Returns an error unless `parent` has an unfinished scan in an ownership-discovery phase.
+    pub fn child_scan_completed(
+        self,
+        parent: ProcessIdentity,
+    ) -> Result<Transition, TransitionError> {
+        let mut attempt = self.into_ownership()?;
+        if !matches!(
+            attempt.phase,
+            OwnershipPhase::Discovery
+                | OwnershipPhase::AwaitingBirthEvidence
+                | OwnershipPhase::Recovering
+        ) {
+            return Err(TransitionError::WrongPhase);
+        }
+        attempt
+            .tree
+            .complete_child_scan(parent)
+            .map_err(TransitionError::UnknownChildScan)?;
+        if attempt.phase != OwnershipPhase::Recovering {
+            attempt.phase = if attempt.tree.unresolved().is_empty() {
+                OwnershipPhase::Discovery
+            } else {
+                OwnershipPhase::AwaitingBirthEvidence
+            };
+        }
+        Ok(Transition {
+            checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
+            after_persist: Vec::new(),
+        })
+    }
+
+    /// # Errors
     /// Returns [`TransitionError::WrongPhase`] unless ownership discovery is active.
     pub fn ownership_scan_completed(self) -> Result<Transition, TransitionError> {
         let mut attempt = self.into_ownership()?;
@@ -442,6 +498,9 @@ impl DeploymentAttempt {
             OwnershipPhase::Discovery | OwnershipPhase::AwaitingBirthEvidence
         ) {
             return Err(TransitionError::WrongPhase);
+        }
+        if !attempt.tree.pending_child_scans().is_empty() {
+            return Err(TransitionError::PendingChildScans);
         }
         if !attempt.tree.unresolved().is_empty() {
             attempt.phase = OwnershipPhase::AwaitingBirthEvidence;
@@ -487,14 +546,14 @@ impl DeploymentAttempt {
     /// Returns an error unless cleanup is active and every discovery has stable evidence.
     pub fn request_owned_signals(self, signal: Signal) -> Result<Transition, TransitionError> {
         let attempt = self.into_ownership()?;
-        if !matches!(
-            attempt.phase,
-            OwnershipPhase::Cleaning | OwnershipPhase::Recovering
-        ) {
+        if attempt.phase != OwnershipPhase::Cleaning {
             return Err(TransitionError::WrongPhase);
         }
-        if !attempt.tree.unresolved().is_empty() {
+        if !attempt.tree.unresolved().is_empty() || !attempt.tree.pending_child_scans().is_empty() {
             return Err(TransitionError::UnresolvedOwnership);
+        }
+        if !attempt.tree.reconciliation_complete() {
+            return Err(TransitionError::IncompleteReconciliation);
         }
         let effects = attempt
             .tree
@@ -525,13 +584,57 @@ impl DeploymentAttempt {
     }
 
     /// # Errors
+    /// Returns an error unless recovery has freshly reconciled every acquired identity.
+    pub fn recovery_reconciliation_completed(
+        self,
+        now: MonotonicTick,
+    ) -> Result<Transition, TransitionError> {
+        let mut attempt = self.into_ownership()?;
+        if attempt.phase != OwnershipPhase::Recovering {
+            return Err(TransitionError::WrongPhase);
+        }
+        if !attempt.tree.reconciliation_complete() {
+            return Err(TransitionError::IncompleteReconciliation);
+        }
+        if !attempt.tree.pending_child_scans().is_empty() || !attempt.tree.unresolved().is_empty() {
+            if now >= attempt.context.deadline {
+                return Ok(to_administrative_closeout(attempt));
+            }
+            attempt.phase = if attempt.tree.unresolved().is_empty() {
+                OwnershipPhase::Discovery
+            } else {
+                OwnershipPhase::AwaitingBirthEvidence
+            };
+            attempt.recovery_resume = None;
+            return Ok(Transition {
+                checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
+                after_persist: Vec::new(),
+            });
+        }
+
+        let resume = attempt
+            .recovery_resume
+            .take()
+            .ok_or(TransitionError::MissingRecoveryResume)?;
+        attempt.phase = match resume {
+            RecoveryResume::Discovery | RecoveryResume::AwaitingBirthEvidence => {
+                attempt.cleanup = CleanupOutcome::InProgress;
+                OwnershipPhase::Cleaning
+            }
+            RecoveryResume::Cleaning => OwnershipPhase::Cleaning,
+            RecoveryResume::Verifying => OwnershipPhase::Verifying,
+        };
+        Ok(Transition {
+            checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
+            after_persist: Vec::new(),
+        })
+    }
+
+    /// # Errors
     /// Returns [`TransitionError::WrongPhase`] unless verification or recovery is active.
     pub fn verification_completed(self, now: MonotonicTick) -> Result<Transition, TransitionError> {
         let mut attempt = self.into_ownership()?;
-        if !matches!(
-            attempt.phase,
-            OwnershipPhase::Verifying | OwnershipPhase::Recovering
-        ) {
+        if attempt.phase != OwnershipPhase::Verifying {
             return Err(TransitionError::WrongPhase);
         }
         match attempt.tree.cleanup_readiness() {
@@ -593,64 +696,80 @@ impl DeploymentAttempt {
     }
 
     /// # Errors
-    /// Returns [`TransitionError::WrongPhase`] unless the attempt is interrupted.
+    /// Returns [`TransitionError::WrongPhase`] unless the checkpoint has recoverable work.
     pub fn recover(self) -> Result<Transition, TransitionError> {
-        let Self::Interrupted(interrupted) = self else {
-            return Err(TransitionError::WrongPhase);
-        };
-        match interrupted.context.compatibility {
-            CompatibilityBoundary::CandidateMigrationInvoked(candidate) => Ok(Transition {
-                checkpoint: Self::ForwardRecovery(ForwardRecoveryAttempt {
-                    context: interrupted.context,
-                    candidate,
-                    verification: None,
-                }),
-                after_persist: vec![OsEffect::ReverifyRetainedCandidate { candidate }],
-            }),
-            CompatibilityBoundary::PreMigration => match interrupted.resume {
-                ActiveAttempt::ResourceSampling(attempt) => {
-                    let sequence = attempt.next_sample_sequence;
-                    Ok(Transition {
-                        checkpoint: Self::Active(ActiveAttempt::ResourceSampling(attempt)),
-                        after_persist: vec![OsEffect::SampleResources { sequence }],
-                    })
+        match self {
+            Self::Interrupted(interrupted) => match interrupted.context.compatibility {
+                CompatibilityBoundary::CandidateMigrationInvoked(candidate) => {
+                    Ok(forward_recovery_transition(interrupted.context, candidate))
                 }
-                ActiveAttempt::Ownership(mut attempt) => {
-                    attempt.phase = OwnershipPhase::Recovering;
-                    attempt.tree.mark_all_for_reconciliation();
-                    let effects = observe_all(&attempt.tree);
-                    Ok(Transition {
-                        checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
-                        after_persist: effects,
-                    })
-                }
+                CompatibilityBoundary::PreMigration => match interrupted.resume {
+                    ActiveAttempt::ResourceSampling(attempt) => {
+                        let sequence = attempt.pending_sample_sequence;
+                        Ok(Transition {
+                            checkpoint: Self::Active(ActiveAttempt::ResourceSampling(attempt)),
+                            after_persist: vec![OsEffect::SampleResources { sequence }],
+                        })
+                    }
+                    ActiveAttempt::Ownership(mut attempt) => {
+                        let resume = recovery_resume_for(attempt.phase)?;
+                        attempt.phase = OwnershipPhase::Recovering;
+                        attempt.recovery_resume = Some(resume);
+                        attempt.tree.mark_all_for_reconciliation();
+                        let effects = recovery_effects(&attempt.tree);
+                        Ok(Transition {
+                            checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
+                            after_persist: effects,
+                        })
+                    }
+                },
             },
+            Self::Ready(attempt) => match attempt.context.compatibility {
+                CompatibilityBoundary::CandidateMigrationInvoked(candidate) => {
+                    Ok(forward_recovery_transition(attempt.context, candidate))
+                }
+                CompatibilityBoundary::PreMigration => Err(TransitionError::WrongPhase),
+            },
+            Self::ForwardRecovery(mut attempt) => {
+                attempt.verification = None;
+                let candidate = attempt.candidate;
+                Ok(Transition {
+                    checkpoint: Self::ForwardRecovery(attempt),
+                    after_persist: vec![OsEffect::ReverifyRetainedCandidate { candidate }],
+                })
+            }
+            Self::Active(_)
+            | Self::ResourceBlocked(_)
+            | Self::AdministrativeCloseoutRequired(_)
+            | Self::AdministrativelyClosed(_) => Err(TransitionError::WrongPhase),
         }
     }
 
     /// # Errors
-    /// Returns [`TransitionError::WrongPhase`] when invocation cannot be recorded safely.
+    /// Returns an error unless verified cleanup is ready or a different candidate was already frozen.
     pub fn record_migration_invoked(
-        mut self,
+        self,
         candidate: RetainedCandidateIdentity,
     ) -> Result<Transition, TransitionError> {
-        match &mut self {
-            Self::Active(active) => {
-                active.context_mut().compatibility =
-                    CompatibilityBoundary::CandidateMigrationInvoked(candidate);
-            }
-            Self::Ready(attempt) => {
+        let Self::Ready(mut attempt) = self else {
+            return Err(TransitionError::WrongPhase);
+        };
+        match attempt.context.compatibility {
+            CompatibilityBoundary::PreMigration => {
                 attempt.context.compatibility =
                     CompatibilityBoundary::CandidateMigrationInvoked(candidate);
             }
-            Self::Interrupted(_)
-            | Self::ResourceBlocked(_)
-            | Self::ForwardRecovery(_)
-            | Self::AdministrativeCloseoutRequired(_)
-            | Self::AdministrativelyClosed(_) => return Err(TransitionError::WrongPhase),
+            CompatibilityBoundary::CandidateMigrationInvoked(existing) if existing == candidate => {
+            }
+            CompatibilityBoundary::CandidateMigrationInvoked(existing) => {
+                return Err(TransitionError::CandidateMismatch {
+                    expected: existing,
+                    actual: candidate,
+                });
+            }
         }
         Ok(Transition {
-            checkpoint: self,
+            checkpoint: Self::Ready(attempt),
             after_persist: Vec::new(),
         })
     }
@@ -807,12 +926,47 @@ impl ActiveAttempt {
             Self::Ownership(attempt) => &attempt.context,
         }
     }
+}
 
-    const fn context_mut(&mut self) -> &mut AttemptContext {
-        match self {
-            Self::ResourceSampling(attempt) => &mut attempt.context,
-            Self::Ownership(attempt) => &mut attempt.context,
-        }
+fn recovery_resume_for(phase: OwnershipPhase) -> Result<RecoveryResume, TransitionError> {
+    match phase {
+        OwnershipPhase::Discovery => Ok(RecoveryResume::Discovery),
+        OwnershipPhase::AwaitingBirthEvidence => Ok(RecoveryResume::AwaitingBirthEvidence),
+        OwnershipPhase::Cleaning => Ok(RecoveryResume::Cleaning),
+        OwnershipPhase::Verifying => Ok(RecoveryResume::Verifying),
+        OwnershipPhase::Recovering => Err(TransitionError::WrongPhase),
+    }
+}
+
+fn recovery_effects(tree: &OwnedProcessTree) -> Vec<OsEffect> {
+    let mut effects = observe_all(tree);
+    effects.extend(
+        tree.pending_child_scans()
+            .iter()
+            .copied()
+            .map(|parent| OsEffect::ListChildren { parent }),
+    );
+    effects.extend(
+        tree.unresolved()
+            .values()
+            .map(|unresolved| OsEffect::AcquireChildIdentity {
+                discovery: unresolved.discovery,
+            }),
+    );
+    effects
+}
+
+fn forward_recovery_transition(
+    context: AttemptContext,
+    candidate: RetainedCandidateIdentity,
+) -> Transition {
+    Transition {
+        checkpoint: DeploymentAttempt::ForwardRecovery(ForwardRecoveryAttempt {
+            context,
+            candidate,
+            verification: None,
+        }),
+        after_persist: vec![OsEffect::ReverifyRetainedCandidate { candidate }],
     }
 }
 
@@ -841,10 +995,22 @@ fn to_administrative_closeout(attempt: OwnershipAttempt) -> Transition {
 pub enum TransitionError {
     WrongPhase,
     NonIncreasingSample(NonIncreasingSampleSequence),
+    UnexpectedSampleSequence {
+        expected: u64,
+        actual: u64,
+    },
     UnknownParent(UnknownParent),
+    UnknownChildScan(UnknownChildScan),
     UnknownDiscovery(UnknownDiscovery),
     UnknownOwnedIdentity(UnknownOwnedIdentity),
     UnresolvedOwnership,
+    PendingChildScans,
+    IncompleteReconciliation,
+    MissingRecoveryResume,
+    CandidateMismatch {
+        expected: RetainedCandidateIdentity,
+        actual: RetainedCandidateIdentity,
+    },
     DeadlineNotReached,
     NoUnresolvedRisk,
     AcceptanceAttemptMismatch,

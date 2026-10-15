@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::identity::{
     CandidateDiscovery, ChildIdentityObservation, DiscoveryId, IdentityObservation,
@@ -19,6 +19,12 @@ pub struct UnresolvedDiscovery {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildObservationOutcome {
+    Adopted(ProcessIdentity),
+    RemainsUnresolved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnedIdentityStatus {
     NeedsFreshObservation,
     Present {
@@ -32,6 +38,7 @@ pub enum OwnedIdentityStatus {
 pub struct OwnedProcessTree {
     next_discovery: u64,
     identities: BTreeMap<ProcessIdentity, OwnedIdentityStatus>,
+    pending_child_scans: BTreeSet<ProcessIdentity>,
     unresolved: BTreeMap<DiscoveryId, UnresolvedDiscovery>,
 }
 
@@ -41,6 +48,7 @@ impl OwnedProcessTree {
         Self {
             next_discovery: 0,
             identities: BTreeMap::from([(root, OwnedIdentityStatus::NeedsFreshObservation)]),
+            pending_child_scans: BTreeSet::from([root]),
             unresolved: BTreeMap::new(),
         }
     }
@@ -74,7 +82,7 @@ impl OwnedProcessTree {
         &mut self,
         discovery: CandidateDiscovery,
         observation: ChildIdentityObservation,
-    ) -> Result<(), UnknownDiscovery> {
+    ) -> Result<ChildObservationOutcome, UnknownDiscovery> {
         if self
             .unresolved
             .get(&discovery.id())
@@ -89,25 +97,42 @@ impl OwnedProcessTree {
                     return Err(UnknownDiscovery);
                 }
                 let identity = evidence.identity();
+                let gap = self
+                    .unresolved
+                    .get(&discovery.id())
+                    .ok_or(UnknownDiscovery)?
+                    .gap;
+                if gap != DiscoveryGap::NotYetObserved {
+                    self.unresolved
+                        .get_mut(&discovery.id())
+                        .ok_or(UnknownDiscovery)?
+                        .gap = DiscoveryGap::DifferentProcess(identity);
+                    return Ok(ChildObservationOutcome::RemainsUnresolved);
+                }
                 self.unresolved.remove(&discovery.id());
                 self.identities
                     .entry(identity)
                     .or_insert(OwnedIdentityStatus::NeedsFreshObservation);
+                self.pending_child_scans.insert(identity);
+                Ok(ChildObservationOutcome::Adopted(identity))
             }
             ChildIdentityObservation::Unresolved(failure) => {
-                let Some(unresolved) = self.unresolved.get_mut(&discovery.id()) else {
-                    return Err(UnknownDiscovery);
-                };
+                let unresolved = self
+                    .unresolved
+                    .get_mut(&discovery.id())
+                    .ok_or(UnknownDiscovery)?;
                 unresolved.gap = DiscoveryGap::Observation(failure);
+                Ok(ChildObservationOutcome::RemainsUnresolved)
             }
             ChildIdentityObservation::DifferentProcess(identity) => {
-                let Some(unresolved) = self.unresolved.get_mut(&discovery.id()) else {
-                    return Err(UnknownDiscovery);
-                };
+                let unresolved = self
+                    .unresolved
+                    .get_mut(&discovery.id())
+                    .ok_or(UnknownDiscovery)?;
                 unresolved.gap = DiscoveryGap::DifferentProcess(identity);
+                Ok(ChildObservationOutcome::RemainsUnresolved)
             }
         }
-        Ok(())
     }
 
     /// # Errors
@@ -139,6 +164,15 @@ impl OwnedProcessTree {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns [`UnknownChildScan`] unless `parent` has an unfinished owned-child scan.
+    pub fn complete_child_scan(&mut self, parent: ProcessIdentity) -> Result<(), UnknownChildScan> {
+        if !self.pending_child_scans.remove(&parent) {
+            return Err(UnknownChildScan);
+        }
+        Ok(())
+    }
+
     pub fn mark_all_for_reconciliation(&mut self) {
         for status in self.identities.values_mut() {
             *status = OwnedIdentityStatus::NeedsFreshObservation;
@@ -148,6 +182,21 @@ impl OwnedProcessTree {
     #[must_use]
     pub fn identities(&self) -> &BTreeMap<ProcessIdentity, OwnedIdentityStatus> {
         &self.identities
+    }
+
+    #[must_use]
+    pub fn pending_child_scans(&self) -> &BTreeSet<ProcessIdentity> {
+        &self.pending_child_scans
+    }
+
+    #[must_use]
+    pub fn reconciliation_complete(&self) -> bool {
+        self.identities.values().all(|status| {
+            matches!(
+                status,
+                OwnedIdentityStatus::Present { .. } | OwnedIdentityStatus::VerifiedAbsent
+            )
+        })
     }
 
     #[must_use]
@@ -169,7 +218,7 @@ impl OwnedProcessTree {
 
     #[must_use]
     pub fn cleanup_readiness(&self) -> CleanupReadiness {
-        if !self.unresolved.is_empty() {
+        if !self.unresolved.is_empty() || !self.pending_child_scans.is_empty() {
             return CleanupReadiness::UnresolvedEvidence;
         }
         if self
@@ -202,6 +251,9 @@ pub struct UnknownParent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnknownDiscovery;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnknownChildScan;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnknownOwnedIdentity;

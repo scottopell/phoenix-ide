@@ -214,10 +214,16 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
     assert_eq!(state.phase(), Phase::AwaitingBirthEvidence);
 
     let reused = identity(5_189, 1_792_031_140, 99);
-    os.replace(FakeProcess {
-        identity: reused,
-        parent: Some(root),
-    });
+    os = FakeOs::new([
+        FakeProcess {
+            identity: root,
+            parent: None,
+        },
+        FakeProcess {
+            identity: reused,
+            parent: Some(root),
+        },
+    ]);
     let retry = state
         .retry_unresolved_discoveries()
         .expect("bounded reconciliation can retry");
@@ -227,15 +233,23 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
     );
     let (state, _) = retry.persisted().into_parts();
     let replacement_observation = os.acquire_child_identity(discovery);
-    assert_eq!(
+    assert!(matches!(
         replacement_observation,
-        ChildIdentityObservation::DifferentProcess(reused)
-    );
+        ChildIdentityObservation::Stable(_)
+    ));
     let (state, _) = state
         .child_observed(discovery, replacement_observation)
-        .expect("PID reuse cannot resolve the old discovery")
+        .expect("durable discovery evidence rejects a later stable-looking process")
         .persisted()
         .into_parts();
+    assert_eq!(
+        state
+            .ownership_tree()
+            .expect("ownership evidence remains available")
+            .unresolved()
+            .len(),
+        1
+    );
 
     os.remove(root);
     let transition = state
@@ -388,7 +402,7 @@ fn pid_reuse_is_absence_of_owned_identity_not_signal_authority() {
 fn malformed_pid_reuse_observation_cannot_launder_owned_identity_absence() {
     let root = identity(350, 25, 1);
     let unrelated = identity(999, 26, 1);
-    let state = admitted_attempt(root);
+    let state = complete_empty_scan(admitted_attempt(root), root);
     let (state, _) = state
         .ownership_scan_completed()
         .expect("empty child discovery enters cleanup")
@@ -421,7 +435,7 @@ fn recovery_reobserves_owned_identities_before_repeating_mutation() {
         identity: root,
         parent: None,
     }]);
-    let state = admitted_attempt(root);
+    let state = complete_empty_scan(admitted_attempt(root), root);
     let (state, _) = state
         .ownership_scan_completed()
         .expect("empty child discovery can enter cleanup")
@@ -454,6 +468,11 @@ fn recovery_reobserves_owned_identities_before_repeating_mutation() {
 
     let (state, effects) = recovered.persisted().into_parts();
     let state = apply_identity_observations(state, &effects, &mut os);
+    let (state, _) = state
+        .recovery_reconciliation_completed(MonotonicTick::new(5))
+        .expect("every acquired identity was freshly observed")
+        .persisted()
+        .into_parts();
     let signals = state
         .request_owned_signals(Signal::Terminate)
         .expect("fresh identity match restores signal authority");
@@ -473,7 +492,7 @@ fn migration_invocation_recovery_is_exact_candidate_forward_only() {
         source_commit: FullCommitSha::parse(&"a".repeat(40)).expect("valid full SHA"),
         artifact_digest: ArtifactDigest::parse(&"b".repeat(64)).expect("valid digest"),
     };
-    let state = admitted_attempt(root);
+    let state = verified_ready_attempt(root);
     let (state, _) = state
         .record_migration_invoked(candidate)
         .expect("migration invocation is durably fenced")
@@ -483,12 +502,9 @@ fn migration_invocation_recovery_is_exact_candidate_forward_only() {
         state.compatibility_boundary(),
         CompatibilityBoundary::CandidateMigrationInvoked(candidate)
     );
-    let (state, _) = state
-        .interrupt()
-        .expect("post-invocation interruption persists")
-        .persisted()
-        .into_parts();
-    let recovered = state.recover().expect("forward recovery remains available");
+    let recovered = state
+        .recover()
+        .expect("the ready migration checkpoint recovers forward");
     assert_eq!(
         recovered.clone().persisted().checkpoint().phase(),
         Phase::ForwardRecovery
@@ -500,9 +516,181 @@ fn migration_invocation_recovery_is_exact_candidate_forward_only() {
 }
 
 #[test]
+fn recovery_reissues_unfinished_child_scan_before_cleanup() {
+    let root = identity(525, 42, 1);
+    let state = admitted_attempt(root);
+    let (state, _) = state
+        .interrupt()
+        .expect("ownership discovery can be interrupted")
+        .persisted()
+        .into_parts();
+    let recovered = state.recover().expect("discovery recovery reconciles");
+    assert!(persisted_effects(&recovered).contains(&OsEffect::ListChildren { parent: root }));
+    let (state, _) = recovered.persisted().into_parts();
+    let (state, _) = state
+        .identity_observed(
+            root,
+            IdentityObservation::SameIdentity {
+                current_parent: None,
+            },
+        )
+        .expect("root identity is freshly reconciled")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .recovery_reconciliation_completed(MonotonicTick::new(5))
+        .expect("identity reconciliation preserves unfinished enumeration")
+        .persisted()
+        .into_parts();
+    assert_eq!(
+        state
+            .ownership_scan_completed()
+            .expect_err("cleanup cannot start before the reissued scan completes"),
+        phoenix_deployment_controller::TransitionError::PendingChildScans
+    );
+}
+
+#[test]
+fn resource_recovery_reuses_one_pending_sequence_then_advances() {
+    let root = identity(530, 43, 1);
+    let (state, _) =
+        DeploymentAttempt::start(AttemptId::new(530), MonotonicTick::new(30), policy(), root)
+            .persisted()
+            .into_parts();
+    let (state, _) = state
+        .record_resource_sample(ample_sample(0))
+        .expect("first sample is ordered")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .interrupt()
+        .expect("resource sampling can be interrupted")
+        .persisted()
+        .into_parts();
+    let recovered = state
+        .recover()
+        .expect("sampling recovery reissues pending work");
+    assert_eq!(
+        persisted_effects(&recovered),
+        vec![OsEffect::SampleResources { sequence: 1 }]
+    );
+    let (state, _) = recovered.persisted().into_parts();
+    let second = state
+        .record_resource_sample(ample_sample(1))
+        .expect("the reissued sequence is accepted exactly once");
+    assert_eq!(
+        persisted_effects(&second),
+        vec![OsEffect::SampleResources { sequence: 2 }]
+    );
+    let (state, _) = second.persisted().into_parts();
+    let admitted = state
+        .record_resource_sample(ample_sample(2))
+        .expect("sampling advances after the recovered result");
+    assert_eq!(
+        admitted.clone().persisted().checkpoint().phase(),
+        Phase::OwnershipDiscovery
+    );
+}
+
+#[test]
+fn recovery_barrier_requires_every_owned_identity_before_mutation() {
+    let root = identity(535, 44, 1);
+    let child = identity(536, 44, 2);
+    let mut os = FakeOs::new([
+        FakeProcess {
+            identity: root,
+            parent: None,
+        },
+        FakeProcess {
+            identity: child,
+            parent: Some(root),
+        },
+    ]);
+    let state = acquire_child(admitted_attempt(root), &mut os, root, child);
+    let (state, effects) = state
+        .ownership_scan_completed()
+        .expect("discovery enters cleanup")
+        .persisted()
+        .into_parts();
+    let state = apply_identity_observations(state, &effects, &mut os);
+    let (state, _) = state
+        .interrupt()
+        .expect("cleanup can be interrupted")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .recover()
+        .expect("recovery starts a fresh observation barrier")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .identity_observed(
+            root,
+            IdentityObservation::SameIdentity {
+                current_parent: None,
+            },
+        )
+        .expect("root observation is fresh")
+        .persisted()
+        .into_parts();
+    assert_eq!(
+        state
+            .clone()
+            .request_owned_signals(Signal::Terminate)
+            .expect_err("mutation cannot begin while a child observation is pending"),
+        phoenix_deployment_controller::TransitionError::WrongPhase
+    );
+    assert_eq!(
+        state
+            .recovery_reconciliation_completed(MonotonicTick::new(5))
+            .expect_err("the barrier is incomplete"),
+        phoenix_deployment_controller::TransitionError::IncompleteReconciliation
+    );
+}
+
+#[test]
+fn migration_candidate_is_frozen_and_forward_recovery_is_restartable() {
+    let root = identity(540, 45, 1);
+    let candidate_a = RetainedCandidateIdentity {
+        source_commit: FullCommitSha::parse(&"a".repeat(40)).expect("valid SHA"),
+        artifact_digest: ArtifactDigest::parse(&"b".repeat(64)).expect("valid digest"),
+    };
+    let candidate_b = RetainedCandidateIdentity {
+        source_commit: FullCommitSha::parse(&"c".repeat(40)).expect("valid SHA"),
+        artifact_digest: ArtifactDigest::parse(&"d".repeat(64)).expect("valid digest"),
+    };
+    let (state, _) = verified_ready_attempt(root)
+        .record_migration_invoked(candidate_a)
+        .expect("the first candidate is frozen")
+        .persisted()
+        .into_parts();
+    assert!(matches!(
+        state.clone().record_migration_invoked(candidate_b),
+        Err(phoenix_deployment_controller::TransitionError::CandidateMismatch {
+            expected,
+            actual,
+        }) if expected == candidate_a && actual == candidate_b
+    ));
+    let (state, _) = state
+        .recover()
+        .expect("ready migration recovers forward")
+        .persisted()
+        .into_parts();
+    let restarted = state
+        .recover()
+        .expect("forward recovery can reissue reverification after another interruption");
+    assert_eq!(
+        persisted_effects(&restarted),
+        vec![OsEffect::ReverifyRetainedCandidate {
+            candidate: candidate_a,
+        }]
+    );
+}
+
+#[test]
 fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
     let root = identity(550, 45, 1);
-    let state = admitted_attempt(root);
+    let state = complete_empty_scan(admitted_attempt(root), root);
     let (state, _) = state
         .ownership_scan_completed()
         .expect("empty discovery enters cleanup")
@@ -529,7 +717,7 @@ fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
 #[test]
 fn administrative_acceptance_is_bound_to_the_attempt() {
     let root = identity(575, 47, 1);
-    let state = admitted_attempt(root);
+    let state = complete_empty_scan(admitted_attempt(root), root);
     let (state, _) = state
         .ownership_scan_completed()
         .expect("empty discovery enters cleanup")
@@ -641,6 +829,41 @@ fn admitted_attempt(root: ProcessIdentity) -> DeploymentAttempt {
     state
 }
 
+fn verified_ready_attempt(root: ProcessIdentity) -> DeploymentAttempt {
+    let state = complete_empty_scan(admitted_attempt(root), root);
+    let (state, _) = state
+        .ownership_scan_completed()
+        .expect("completed discovery enters cleanup")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .identity_observed(root, IdentityObservation::ExactIdentityAbsent)
+        .expect("root absence is exact")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .request_owned_signals(Signal::Terminate)
+        .expect("no present identity needs a signal")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .cleanup_signals_settled()
+        .expect("cleanup enters verification")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .identity_observed(root, IdentityObservation::ExactIdentityAbsent)
+        .expect("verification confirms exact absence")
+        .persisted()
+        .into_parts();
+    state
+        .verification_completed(MonotonicTick::new(5))
+        .expect("verified absence is ready")
+        .persisted()
+        .into_parts()
+        .0
+}
+
 fn acquire_child(
     state: DeploymentAttempt,
     os: &mut FakeOs,
@@ -657,7 +880,17 @@ fn acquire_child(
         .expect("stable child observation is accepted")
         .persisted()
         .into_parts();
+    let state = complete_empty_scan(state, child);
+    complete_empty_scan(state, parent)
+}
+
+fn complete_empty_scan(state: DeploymentAttempt, parent: ProcessIdentity) -> DeploymentAttempt {
     state
+        .child_scan_completed(parent)
+        .expect("fake child enumeration completed")
+        .persisted()
+        .into_parts()
+        .0
 }
 
 fn apply_identity_observations(
