@@ -105,17 +105,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: ./dev.py check (rust,cargo-fmt)
         run: ./dev.py check --lanes rust,cargo-fmt
-      - name: Upload generated creation wire types
+      - name: Upload creation wire codegen
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: creation-wire-codegen-${{ github.sha }}
+          name: creation-wire-codegen-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
-            ui/src/generated/ProductCreationProvisioningStage.ts
-            ui/src/generated/ProductConversationCreateAcceptedResponse.ts
-            ui/src/generated/ProductConversationCreationStatusResponse.ts
-            ui/src/generated/ProductConversationCreationPendingStatus.ts
-            ui/src/generated/ProductConversationCreationFailureStatus.ts
+            target/codegen-scratch/**/ProductCreationProvisioningStage.ts
+            target/codegen-scratch/**/ProductConversationCreateAcceptedResponse.ts
+            target/codegen-scratch/**/ProductConversationCreationStatusResponse.ts
+            target/codegen-scratch/**/ProductConversationCreationPendingStatus.ts
+            target/codegen-scratch/**/ProductConversationCreationFailureStatus.ts
           if-no-files-found: error
           retention-days: 1
       - name: Check production feature on musl

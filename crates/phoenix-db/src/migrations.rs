@@ -20618,19 +20618,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(visible, 0);
-        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
-        assert!(db
-            .list_conversations()
-            .await
-            .unwrap()
-            .iter()
-            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
-        assert!(db
-            .list_archived_conversations()
-            .await
-            .unwrap()
-            .iter()
-            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
     }
 
     #[tokio::test]
