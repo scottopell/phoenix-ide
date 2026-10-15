@@ -80,7 +80,7 @@ impl MacOsControllerOs {
         })
     }
 
-    fn observe_supervised_slot(&self, identity: ProcessIdentity) -> crate::ChildSlotObservation {
+    fn observe_supervised_slot(identity: ProcessIdentity) -> crate::ChildSlotObservation {
         match observe_process(identity.pid()) {
             Ok(observed) if observed.identity == identity => crate::ChildSlotObservation::Running,
             Ok(_) | Err(MacOsError::NoSuchProcess) => crate::ChildSlotObservation::Exited,
@@ -297,7 +297,7 @@ impl crate::GuardianExecutor for MacOsGuardianExecutor {
     }
 
     fn poll_observation_only(&self, slot: &SupervisedChild) -> crate::ChildSlotObservation {
-        self.os.observe_supervised_slot(slot.identity())
+        MacOsControllerOs::observe_supervised_slot(slot.identity())
     }
 }
 

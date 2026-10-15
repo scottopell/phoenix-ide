@@ -113,7 +113,7 @@ pub fn same_uid(stream: &UnixStream) -> io::Result<()> {
         let mut uid: libc::uid_t = 0;
         let mut gid: libc::gid_t = 0;
         // SAFETY: pointers refer to initialized stack variables and fd is live.
-        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
         if uid != unsafe { libc::geteuid() } {
@@ -167,7 +167,7 @@ fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<bool> {
         revents: 0,
     };
     loop {
-        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        let ready = unsafe { libc::poll(&raw mut descriptor, 1, millis) };
         if ready > 0 {
             return Ok(true);
         }
@@ -181,7 +181,7 @@ fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<bool> {
     }
 }
 
-/// Retain the same GuardianServer across disconnected connections until the
+/// Retain the same `GuardianServer` across disconnected connections until the
 /// explicit fixture lifetime ends. EOF, timeouts and malformed frames fence,
 /// never initiate child cleanup or authorize another policy step.
 /// # Errors
@@ -211,7 +211,7 @@ pub fn serve_until<E: GuardianExecutor>(
                 server.fence_connection();
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL.min(until.saturating_duration_since(Instant::now())))
+                thread::sleep(ACCEPT_POLL.min(until.saturating_duration_since(Instant::now())));
             }
             Err(error) => return Err(error),
         }
@@ -251,47 +251,105 @@ impl GuardianClient {
         stream.set_write_timeout(Some(IO_SLICE))?;
         Ok(Self { stream })
     }
-    fn exchange(&mut self, request: Request) -> Result<Response, ClientError> {
-        write_frame(&mut self.stream, &request)?;
+    fn exchange(&mut self, request: &Request) -> Result<Response, ClientError> {
+        write_frame(&mut self.stream, request)?;
         match read_frame(&mut self.stream)? {
             Response::Refused(error) => Err(ClientError::Refused(error)),
-            response => Ok(response),
+            response @ (Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }) => Ok(response),
         }
     }
     /// # Errors
     /// Returns transport or protocol errors rather than inferring a live binding.
     pub fn hello(&mut self) -> Result<WireSnapshot, ClientError> {
-        match self.exchange(Request::Hello)? {
+        match self.exchange(&Request::Hello)? {
             Response::Hello { snapshot } => Ok(snapshot),
-            _ => Err(ClientError::UnexpectedResponse),
+            Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
     }
     /// # Errors
     /// Returns transport or protocol errors.
     pub fn snapshot(&mut self) -> Result<WireSnapshot, ClientError> {
-        match self.exchange(Request::Snapshot)? {
+        match self.exchange(&Request::Snapshot)? {
             Response::Snapshot(snapshot) => Ok(snapshot),
-            _ => Err(ClientError::UnexpectedResponse),
+            Response::Hello { .. }
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
     }
     /// # Errors
     /// Returns transport or protocol errors.
     pub fn inventory(&mut self) -> Result<Vec<WireSlot>, ClientError> {
-        match self.exchange(Request::Inventory)? {
+        match self.exchange(&Request::Inventory)? {
             Response::Inventory(slots) => Ok(slots),
-            _ => Err(ClientError::UnexpectedResponse),
+            Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::ReconciliationFinished
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
     }
     /// # Errors
     /// Returns transport or protocol errors.
     pub fn observe_slot(&mut self, slot: WireSlot) -> Result<WireObservation, ClientError> {
-        match self.exchange(Request::ObserveSlot { slot })? {
+        match self.exchange(&Request::ObserveSlot { slot })? {
             Response::SlotObserved(observation) => Ok(observation),
-            _ => Err(ClientError::UnexpectedResponse),
+            Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
     }
     /// Native reconciliation needs a committed interruption and exact durable
     /// inventory/identity binding. This transport-only runner has neither.
+    ///
+    /// # Errors
+    /// Always refuses reconciliation without durable binding.
     pub fn reconcile(&self) -> Result<(), ClientError> {
         Err(ClientError::Refused(WireError::UnsupportedDurableBinding))
     }

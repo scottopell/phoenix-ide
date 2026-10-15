@@ -828,7 +828,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         &mut self,
         session: WireSession,
         key: WireKey,
-        effect: WireEffect,
+        effect: &WireEffect,
     ) -> Result<Response, WireError> {
         Ok({
             let session = self.resolve_session(session)?;
@@ -851,7 +851,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 .iter()
                 .position(|ticket| {
                     WireKey::try_from(ticket.key()).ok() == Some(key)
-                        && WireEffect::from(ticket.effect()) == effect
+                        && WireEffect::from(ticket.effect()) == *effect
                 })
                 .ok_or(WireError::NoStagedTicket)?;
             if self
@@ -970,7 +970,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 session,
                 key,
                 effect,
-            } => self.dispatch_admit(session, key, effect)?,
+            } => self.dispatch_admit(session, key, &effect)?,
             Request::DispatchSubmit {
                 session,
                 admission,
