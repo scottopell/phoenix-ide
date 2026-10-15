@@ -1,6 +1,7 @@
 """Current-schema prepared-artifact installer regressions."""
 
 import importlib.util
+import itertools
 import re
 import sqlite3
 import sys
@@ -198,6 +199,49 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         )
         self.assertEqual(registry, tuple(compiled_ledger()))
 
+    def test_future_registry_fields_are_parsed_in_every_order(self) -> None:
+        source = self.registry.read_text()
+        registry = self.root / "future-migrations.rs"
+        fields = ('version: 129', 'name: "future"', 'sql: MIGRATION_129')
+        for ordered_fields in itertools.permutations(fields):
+            with self.subTest(fields=ordered_fields):
+                entry = "Migration { " + ", ".join(ordered_fields) + " },"
+                registry.write_text(source.replace("\n];", f"\n    {entry}\n];", 1))
+                self.assertEqual(
+                    helper.migration_registry(registry, qualified_current_target=False),
+                    tuple(compiled_ledger()) + ((129, "future"),),
+                )
+                with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
+                    helper.migration_registry(registry)
+
+    def test_malformed_registry_entries_fail_closed(self) -> None:
+        source = self.registry.read_text()
+        registry = self.root / "malformed-migrations.rs"
+        invalid_entries = (
+            'Migration { name: "future", sql: MIGRATION_129 },',
+            'Migration { version: 129, sql: MIGRATION_129 },',
+            'Migration { version: 129, name: "future" },',
+            'Migration { version: 129, version: 130, name: "future", sql: MIGRATION_129 },',
+            'Migration { version: 129, name: "future", name: "other", sql: MIGRATION_129 },',
+            'Migration { version: 129, name: "future", sql: MIGRATION_129, sql: MIGRATION_130 },',
+            'Migration { version: 129, name: "future", sql: },',
+            'Migration { version: 129, name: "future", sql: MIGRATION_129, extra: 1 },',
+            'Migration { version: 129, name: "future", sql: MIGRATION_129 garbage },',
+            'Migration { version: 129 name: "future", sql: MIGRATION_129 },',
+            'Migration { version: 129, name: "future", sql: MIGRATION_129,',
+            'Migration { version: 129, name: "future", sql: MIGRATION_129 }, garbage',
+            'garbage, Migration { version: 129, name: "future", sql: MIGRATION_129 },',
+            'Migration { version: 129, name: "future", sql: MIGRATION_129 },,',
+            'Migration { version: 128, name: "duplicate", sql: MIGRATION_128 },',
+            'Migration { version: 127, name: "out_of_order", sql: MIGRATION_127 },',
+        )
+        for entry in invalid_entries:
+            registry.write_text(source.replace("\n];", f"\n    {entry}\n];", 1))
+            for qualified in (True, False):
+                with self.subTest(entry=entry, qualified=qualified):
+                    with self.assertRaisesRegex(helper.ActivationError, "registry is invalid"):
+                        helper.migration_registry(registry, qualified_current_target=qualified)
+
     def test_unknown_newer_and_name_mismatched_ledgers_fail_closed(self) -> None:
         newer = self.database(through=124)
         with self.assertRaisesRegex(helper.ActivationError, "supported current baseline"):
@@ -306,13 +350,20 @@ sys.exit({7 if partial else 0})
         source = registry.read_text()
         source = source.replace(
             "\n];",
-            '\n    Migration { version: 129, name: "future", sql: "SELECT 1" },\n];',
+            '\n    Migration { sql: "SELECT 1", name: "future", version: 129 },\n];',
             1,
         )
         registry.write_text(source)
         object.__setattr__(
             ordinary, "migration_registry_sha256", helper.sha256(registry)
         )
+
+        self.assertEqual(
+            helper.migration_registry(registry, qualified_current_target=False),
+            tuple(compiled_ledger()) + ((129, "future"),),
+        )
+        with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
+            helper.migration_registry(registry)
 
         helper.validate_manifest_mode(manifest)
         self.assertFalse(helper.ordinary_forward_policy_applies(manifest))

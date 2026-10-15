@@ -2480,8 +2480,9 @@ mod product_creation_acceptance_tests {
                 let expected_actions: &[&str] = match *status {
                     "accepted" | "claimed" | "retry_scheduled" => &["cancel", "delete"],
                     "cancelling" | "cleanup_ambiguous" => &["delete"],
-                    "failed" | "delivery_failed" => &["delete", "start_over"],
-                    "deletion_pending" | "delivery_pending" => &[],
+                    "failed" => &["delete", "start_over"],
+                    "delivery_pending" => &["cancel"],
+                    "deletion_pending" | "delivery_failed" => &[],
                     _ => unreachable!(),
                 };
                 assert_eq!(
@@ -2504,7 +2505,7 @@ mod product_creation_acceptance_tests {
         assert_eq!(projected["status"], "delivery_failed");
         assert_eq!(
             projected["allowed_actions"],
-            serde_json::json!(["retry_delivery", "delete", "start_over"])
+            serde_json::json!(["retry_delivery"])
         );
         assert!(projected.get("canonical_route").is_none());
         assert!(projected.get("transcript_row_id").is_none());

@@ -4815,7 +4815,12 @@ impl Database {
               AND NOT (c.archived = 1 AND EXISTS (\
                   SELECT 1 FROM conversation_creation_jobs j \
                   WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-              ))",
+              )) \
+              AND NOT EXISTS (\
+                  SELECT 1 FROM product_creation_jobs product_job \
+                  WHERE product_job.product_conversation_id = c.product_conversation_id \
+                    AND product_job.status <> 'published'\
+              )",
         );
 
         let rows = query.build().fetch_all(&self.pool).await?;
@@ -4901,7 +4906,12 @@ impl Database {
                AND NOT (c.archived = 1 AND EXISTS (\
                    SELECT 1 FROM conversation_creation_jobs j \
                    WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-               ))",
+               )) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM product_creation_jobs product_job \
+                   WHERE product_job.product_conversation_id = c.product_conversation_id \
+                     AND product_job.status <> 'published'\
+               )",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -5162,6 +5172,11 @@ impl Database {
                AND NOT EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
                    WHERE j.conversation_id = c.id AND j.status <> 'ready'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM product_creation_jobs product_job
+                   WHERE product_job.product_conversation_id = c.product_conversation_id
+                     AND product_job.status <> 'published'
                )
              ORDER BY c.updated_at DESC",
         )

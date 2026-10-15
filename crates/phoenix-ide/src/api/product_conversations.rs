@@ -564,8 +564,12 @@ mod creation_allowed_actions_tests {
 
     #[test]
     fn pending_delivery_offers_cancel_only() {
-        assert_eq!(creation_allowed_actions("delivery_pending", false),
-            vec![ProductConversationCreationAllowedActionView::Cancel]);
+        for delivery_retryable in [false, true] {
+            assert_eq!(
+                creation_allowed_actions("delivery_pending", delivery_retryable),
+                vec![ProductConversationCreationAllowedActionView::Cancel]
+            );
+        }
     }
 
     #[test]

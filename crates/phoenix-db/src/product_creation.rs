@@ -2555,6 +2555,23 @@ mod product_creation_tests {
         let delivery = staged_delivery(&db, "hidden-staged").await;
         let product_id = &delivery.job.product_conversation_id;
         let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        seed_staged_dependents(&db, conversation_id).await;
+        assert!(db
+            .list_archived_conversations()
+            .await
+            .unwrap()
+            .iter()
+            .all(|conversation| conversation.id != conversation_id));
+        assert!(!db
+            .list_conversation_search_ids()
+            .await
+            .unwrap()
+            .contains(&conversation_id.to_string()));
+        assert!(!db
+            .get_conversation_search_metadata(&[conversation_id.to_string()])
+            .await
+            .unwrap()
+            .contains_key(conversation_id));
         for reference in [product_id.as_str(), conversation_id] {
             assert!(matches!(db.resolve_ordinary_product_conversation(reference).await,
                 Err(DbError::ConversationNotFound(_))));
@@ -2570,6 +2587,16 @@ mod product_creation_tests {
         assert!(db.resolve_ordinary_product_conversation(product_id.as_str()).await.is_ok());
         assert!(db.get_ordinary_product_conversation(product_id).await.is_ok());
         assert!(db.read_ordinary_product_conversation_snapshot(product_id.as_str(), None, None, 10).await.is_ok());
+        assert!(db
+            .list_conversation_search_ids()
+            .await
+            .unwrap()
+            .contains(&conversation_id.to_string()));
+        assert!(db
+            .get_conversation_search_metadata(&[conversation_id.to_string()])
+            .await
+            .unwrap()
+            .contains_key(conversation_id));
     }
 
     #[tokio::test]

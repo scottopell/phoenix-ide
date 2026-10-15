@@ -451,7 +451,7 @@ async fn process_claimed_product_creation(
         claim: claimed.claim.clone(),
         job: delivery,
     };
-    deliver_product_creation_objective_inner(manager, &claimed).await
+    Box::pin(deliver_product_creation_objective_inner(manager, &claimed)).await
 }
 
 async fn expand_product_creation_objective(
@@ -564,7 +564,7 @@ async fn deliver_product_creation_objective(
     run_product_creation_until_closed(
         manager,
         claimed,
-        deliver_product_creation_objective_inner(manager, claimed),
+        Box::pin(deliver_product_creation_objective_inner(manager, claimed)),
     )
     .await
 }
@@ -1322,7 +1322,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         .await
         .map_err(|error| error.to_string())?
     {
-        if deliver_product_creation_objective(manager, &delivery)
+        if Box::pin(deliver_product_creation_objective(manager, &delivery))
             .await
             .is_err()
         {
@@ -3478,11 +3478,11 @@ mod product_creation_delivery_replay_tests {
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, async {
+                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
                     started_tx.send(()).unwrap();
                     release_rx.await.unwrap();
-                    deliver_product_creation_objective_inner(&manager, &delivery).await
-                }).await
+                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
+                })).await
             }
         });
         tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
@@ -3528,11 +3528,11 @@ mod product_creation_delivery_replay_tests {
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, async {
+                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
                     started_tx.send(()).unwrap();
                     release_rx.await.unwrap();
-                    deliver_product_creation_objective_inner(&manager, &delivery).await
-                }).await
+                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
+                })).await
             }
         });
         tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
@@ -3557,11 +3557,11 @@ mod product_creation_delivery_replay_tests {
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, async {
+                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
                     started_tx.send(()).unwrap();
                     release_rx.await.unwrap();
-                    deliver_product_creation_objective_inner(&manager, &delivery).await
-                }).await
+                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
+                })).await
             }
         });
         tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
@@ -3591,11 +3591,11 @@ mod product_creation_delivery_replay_tests {
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, async {
+                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
                     started_tx.send(()).unwrap();
                     release_rx.await.unwrap();
-                    deliver_product_creation_objective_inner(&manager, &delivery).await
-                }).await
+                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
+                })).await
             }
         });
         started_rx.await.unwrap();
@@ -3766,7 +3766,7 @@ mod product_creation_delivery_replay_tests {
                 Some(conversation_id)
             );
 
-            let error = deliver_product_creation_objective(manager, &delivery)
+            let error = Box::pin(deliver_product_creation_objective(manager, &delivery))
                 .await
                 .unwrap_err();
             assert_eq!(error, "steering queue is full");
@@ -3852,7 +3852,7 @@ mod product_creation_delivery_replay_tests {
             Some(conversation_id)
         );
 
-        deliver_product_creation_objective(manager, &retried)
+        Box::pin(deliver_product_creation_objective(manager, &retried))
             .await
             .unwrap();
         let origin: String = sqlx::query_scalar("SELECT origin_kind FROM steering_messages WHERE message_id = ?1 UNION ALL SELECT origin_kind FROM messages WHERE message_id = ?1 LIMIT 1").bind(request_id).fetch_one(db.pool()).await.unwrap();
@@ -4005,17 +4005,9 @@ mod product_creation_delivery_replay_tests {
             },
             job: pending,
         };
-        let manager = Arc::new(RuntimeManager::new(
-            db.clone(),
-            Arc::new(ModelRegistry::new_empty()),
-            PlatformCapability::None {
-                details: "test".to_string(),
-            },
-            Arc::new(McpClientManager::new()),
-            None,
-        ));
+        let manager = test_runtime_manager(db.clone());
 
-        let error = deliver_product_creation_objective(&manager, &stale_delivery)
+        let error = Box::pin(deliver_product_creation_objective(&manager, &stale_delivery))
             .await
             .unwrap_err();
         assert_eq!(error, "product creation claim was lost before processing");
@@ -4058,14 +4050,14 @@ mod product_creation_delivery_replay_tests {
 
         create_non_target_conversation_and_enqueue(&db, &manager, &cwd).await;
 
-        let last_delivery_lease_until = exhaust_delivery_into_failed_state(
+        let last_delivery_lease_until = Box::pin(exhaust_delivery_into_failed_state(
             &db,
             &manager,
             request_id,
             conversation_id,
             &accepted_product_id,
             publish_claim_lease_until + chrono::Duration::seconds(1),
-        )
+        ))
         .await;
 
         assert_retry_identity_counts(
@@ -4094,14 +4086,14 @@ mod product_creation_delivery_replay_tests {
             .retry_failed_product_creation_delivery(request_id)
             .await
             .unwrap());
-        assert_explicit_retry_publish_success(
+        Box::pin(assert_explicit_retry_publish_success(
             &db,
             &manager,
             request_id,
             conversation_id,
             &accepted_product_id,
             last_delivery_lease_until + chrono::Duration::seconds(1),
-        )
+        ))
         .await;
         assert_retry_identity_counts(
             &db,

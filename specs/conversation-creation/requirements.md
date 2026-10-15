@@ -308,12 +308,21 @@ THE SYSTEM SHALL leave the job non-ready and retryable or failed according to th
 
 ### REQ-CCR-007: Cancellation
 
-WHEN a user cancels an accepted, claimed, or retry-scheduled creation
+WHEN a user cancels an accepted, claimed, retry-scheduled, or `delivery_pending` creation before durable objective acceptance
 THE SYSTEM SHALL immediately revoke the active generation
 AND SHALL preserve a visible cancelled creation record with its original creation intent
-AND SHALL reconcile owned resources asynchronously
+AND SHALL reconcile owned resources asynchronously, including removing the exactly owned hidden staged ProductConversation, transcript, and attached `WorkScope` aggregate without publishing it
+AND SHALL preserve selected working-directory segments whose exclusive Phoenix ownership cannot be proven
 
-WHEN reconciliation completes
+WHEN cancellation races objective enqueue for a `delivery_pending` creation
+THE SYSTEM SHALL linearize cancellation and durable objective acceptance atomically under the same persistence write authority
+AND, if cancellation commits first, SHALL reject the revoked delivery claim without persisting an objective acceptance receipt or queued objective
+AND, if durable objective acceptance commits first, SHALL reject creation cancellation without revoking the claim or removing the aggregate, even if completion has not yet marked the creation ready or the queue has already drained
+
+THE SYSTEM SHALL NOT allow creation cancellation after durable objective acceptance
+AND SHALL leave subsequent lifecycle actions to the ordinary conversation lifecycle
+
+WHEN reconciliation completes successfully after cancellation
 THE SYSTEM SHALL offer Start over and Delete for the cancelled record
 
 ### REQ-CCR-008: Deletion During Creation

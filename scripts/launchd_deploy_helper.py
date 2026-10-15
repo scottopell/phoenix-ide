@@ -463,13 +463,38 @@ def migration_registry(
     )
     if match is None:
         raise ActivationError("candidate migration registry is invalid")
-    migrations = tuple(
-        (int(version), name)
-        for version, name in re.findall(
-            r'Migration\s*\{\s*version:\s*(\d+),\s*name:\s*"([^"]+)"',
-            match.group(1),
-        )
+    entries = match.group(1).strip()
+    block_pattern = re.compile(
+        r'\s*Migration\s*\{((?:"(?:\\.|[^"\\])*"|[^{}"])*?)\}\s*(?:,|$)',
+        re.DOTALL,
     )
+    field_pattern = re.compile(
+        r'\s*(?:version\s*:\s*(?P<version>[0-9]+)'
+        r'|name\s*:\s*"(?P<name>[^"\\]+)"'
+        r'|sql\s*:\s*(?P<sql>[A-Za-z_][A-Za-z0-9_]*|"(?:\\.|[^"\\])*"))'
+        r'\s*(?:,|$)',
+        re.DOTALL,
+    )
+    parsed = []
+    position = 0
+    while position < len(entries):
+        block = block_pattern.match(entries, position)
+        if block is None:
+            raise ActivationError("candidate migration registry is invalid")
+        body = block.group(1).strip()
+        fields = {}
+        field_position = 0
+        while field_position < len(body):
+            field = field_pattern.match(body, field_position)
+            if field is None or field.lastgroup in fields:
+                raise ActivationError("candidate migration registry is invalid")
+            fields[field.lastgroup] = field.group(field.lastgroup)
+            field_position = field.end()
+        if set(fields) != {"version", "name", "sql"}:
+            raise ActivationError("candidate migration registry is invalid")
+        parsed.append((int(fields["version"]), fields["name"]))
+        position = block.end()
+    migrations = tuple(parsed)
     versions = tuple(version for version, _name in migrations)
     if not migrations or versions != tuple(sorted(set(versions))):
         raise ActivationError("candidate migration registry is invalid")
