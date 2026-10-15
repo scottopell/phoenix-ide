@@ -8,6 +8,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn assert_guardian_is_parent(child_pid: u32, guardian_pid: u32) {
+    let parent_pid = Command::new("/bin/ps")
+        .args(["-o", "ppid=", "-p", &child_pid.to_string()])
+        .output()
+        .unwrap();
+    assert_eq!(parent_pid.status.code(), Some(0));
+    assert_eq!(
+        parent_pid
+            .stdout
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>(),
+        guardian_pid.to_string().into_bytes(),
+        "guardian retains original parenthood"
+    );
+}
+
 #[test]
 fn runner_death_does_not_kill_guardian_or_its_original_child() {
     let parent = tempfile::Builder::new()
@@ -93,21 +111,7 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         0,
         "child survived runner death"
     );
-    let parent_pid = Command::new("/bin/ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    assert_eq!(parent_pid.status.code(), Some(0));
-    assert_eq!(
-        parent_pid
-            .stdout
-            .iter()
-            .copied()
-            .filter(|b| !b.is_ascii_whitespace())
-            .collect::<Vec<_>>(),
-        guardian.id().to_string().into_bytes(),
-        "guardian retains original parenthood"
-    );
+    assert_guardian_is_parent(pid, guardian.id());
     let runner_status = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
         .args([
             "--socket-dir",
