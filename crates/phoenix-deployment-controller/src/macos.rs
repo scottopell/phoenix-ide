@@ -184,7 +184,19 @@ impl SupervisedChild {
                 if observed.identity == self.identity
                     && observed.process_group == self.process_group => {}
             Ok(_) => return SignalOutcome::PidReused,
-            Err(MacOsError::NoSuchProcess) => return SignalOutcome::ExactIdentityAlreadyAbsent,
+            Err(MacOsError::NoSuchProcess) => {
+                let ChildSupervision::Retained(child) = &mut self.state else {
+                    return SignalOutcome::TemporarilyUnavailable;
+                };
+                match (
+                    child_exited_without_reaping(child),
+                    group_has_other_members(self.process_group, self.identity.pid()),
+                ) {
+                    (Ok(true), Ok(true)) => {}
+                    (Ok(true), Ok(false)) => return SignalOutcome::ExactIdentityAlreadyAbsent,
+                    _ => return SignalOutcome::TemporarilyUnavailable,
+                }
+            }
             Err(_) => return SignalOutcome::TemporarilyUnavailable,
         }
         let native_signal = match signal {
