@@ -4,9 +4,9 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = '6e05de110b0cdcf075448d363f82be7a21fa26fc';
+export const APP_PIN = 'd9f46a58c1c50ff83dbb5b2c2afe7ad5e15c7deb';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
-export const TELEMETRY_MODULE_SHA256 = '263935bd8e5cba3620724abc17142e426b5f4b9c744bd617cce05ed02b2981ea';
+export const TELEMETRY_MODULE_SHA256 = 'c8e3c50b8c8fbc91a562d5e7f7be922c8bb35c83f4e6153d74ee3d58f345a973';
 export const TELEMETRY_DIAGNOSTICS_SHA256 = '2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c';
 export const TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE = 'ui/scripts/view-telemetry-diagnostics.mjs';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
@@ -194,6 +194,19 @@ export function appendObservedHistory(result, inventory, identity, module) {
   return result;
 }
 
+async function inspectOwnedAuthResponse(response, inspect) {
+  let primary = null;
+  try { return await inspect(response); }
+  catch (error) { primary = error; throw error; }
+  finally {
+    try { await response.dispose(); }
+    catch {
+      if (!primary) throw new Error('owned authentication response disposal failed');
+      primary.owned_auth_cleanup_failure = 'owned authentication response disposal failed';
+    }
+  }
+}
+
 export async function authenticateOwnedContext(context, baseURL, env = process.env) {
   const home = resolve(nonempty(env.HISTORY_AUTH_HOME, 'owned authentication HOME required'));
   assert.equal(realpathSync(home), home, 'authentication HOME must be canonical');
@@ -211,16 +224,15 @@ export async function authenticateOwnedContext(context, baseURL, env = process.e
   let response;
   try { response = await context.request.post(endpoint, { data: { password }, timeout: 3000 }); }
   catch { throw new Error('owned browser session login transport failed'); }
-  try { assert.equal(response.status(), 200, 'owned browser session login status'); }
-  finally { await response.dispose(); }
+  await inspectOwnedAuthResponse(response, value => assert.equal(value.status(), 200, 'owned browser session login status'));
   let status;
   try { status = await context.request.get(new URL('/api/auth/status', baseURL).href, { timeout: 3000 }); }
   catch { throw new Error('owned browser authentication status transport failed'); }
-  try {
-    assert.equal(status.status(), 200, 'owned browser authentication status');
-    let value; try { value = await status.json(); } catch { throw new Error('owned browser invalid authentication status'); }
+  await inspectOwnedAuthResponse(status, async response => {
+    assert.equal(response.status(), 200, 'owned browser authentication status');
+    let value; try { value = await response.json(); } catch { throw new Error('owned browser invalid authentication status'); }
     assert.ok(value?.auth_required === true && value?.authenticated === true, 'owned browser authenticated session required');
-  } finally { await status.dispose(); }
+  });
   const cookies = (await context.cookies(baseURL)).filter(cookie => cookie.name === 'phoenix-auth');
   assert.equal(cookies.length, 1, 'one owned session cookie required');
   assert.ok(typeof cookies[0].value === 'string' && /^[A-Za-z0-9_-]+$/.test(cookies[0].value), 'owned session cookie format');
@@ -288,6 +300,7 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
         evidence_class: config.unitOnly ? 'UNIT_ONLY_not_runtime' : 'runtime_dependency_bytes_not_acceptance',
         before, after, primary_failure: primaryError ? String(primaryError.message).slice(0, 1024) : null,
         failure_phase: primaryError ? phase : null, context_acquired: context !== null,
+        authentication_response_cleanup_failure: primaryError?.owned_auth_cleanup_failure ?? null,
         cleanup_failures: cleanupErrors.map(error => String(error.message).slice(0, 1024)),
       }, null, 2));
     } catch (error) { cleanupErrors.push(error); }

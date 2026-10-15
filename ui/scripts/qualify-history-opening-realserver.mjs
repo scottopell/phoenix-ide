@@ -1142,6 +1142,7 @@ async function run() {
     result.status = 'passed_assertions';
   } catch (error) {
     result.error = String(error.stack ?? error); process.exitCode = 1;
+    if (error.owned_auth_cleanup_failure) retainCleanupFailure(result, 'authentication_response', new Error(error.owned_auth_cleanup_failure));
     if (page) await page.screenshot({ path: resolve(output, 'failure.png') }).catch(() => {});
   } finally {
     try { if (recorder) { await recorder.sealAndDrain(); recorder.assertQualified(); } }

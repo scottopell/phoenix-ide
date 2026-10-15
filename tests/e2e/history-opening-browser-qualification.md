@@ -1122,3 +1122,24 @@ findings are not hosted runtime results and do not authorize another attempt.
 The previous run's standard Rust job `116169938486` has independently completed
 successfully; whole run `38657260015` is completed failure. Its watch terminated
 with exit status 1, as expected for that overall failed run.
+
+The donor privacy correction `6d6218f0ff08a19e774e0d92a552a2331990ca1c`
+is integrated as application `d9f46a58c1c50ff83dbb5b2c2afe7ad5e15c7deb`,
+tree `f24d93471e201d010f0657ce1712a3a04a02b6fd`, directly atop `6e05de1`.
+It replaces raw Playwright transport/disposal/context errors at every donor
+APIRequest boundary with fixed labels, preserving primary rejection assertions
+and separate sanitized cleanup errors. The shared login helper also sanitizes
+status transport and disposal failures and retains its separate disposal error
+through the original browser result and fresh-context manifest. No original
+transport message, stack, or cause is attached. Cookie/Authorization call-log
+canaries cover these failure paths; the original actual-Playwright no-network
+review reproduction remains separate evidence from mocked regressions.
+
+Final source-only ring for this integrated privacy successor: 16 shipping
+Python, 14 base Node, 46 opening Python (including actual pinned Git blob/checkout
+hashes), 30 opening Node, 50 joint Node, and 93 focused application Vitest tests
+across seven files passed. Syntax, Rust source-format parsing, and diff checks
+passed. Actual authenticated runtime, full pinned UI, genuine codegen/DB fixture/
+guards, export/drain and normal shutdown remain owed to a separately admitted
+hosted attempt. The earlier failed artifacts and local failed regression logs
+remain intact; there is no automatic retry/publication.
