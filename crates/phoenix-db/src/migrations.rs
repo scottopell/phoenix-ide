@@ -14162,6 +14162,119 @@ mod tests {
         }
     }
 
+    fn validate_current_schema_with_controller(database_path: &std::path::Path, migrated: bool) {
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let helper = repository.join("scripts/launchd_deploy_helper.py");
+        let registry = repository.join("crates/phoenix-db/src/migrations.rs");
+        let script = r#"
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("migration_contract_helper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.validate_current_schema_database(
+    Path(sys.argv[2]), Path(sys.argv[3]), migrated=sys.argv[4] == "target"
+)
+"#;
+        let output = std::process::Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("-c")
+            .arg(script)
+            .arg(helper)
+            .arg(database_path)
+            .arg(registry)
+            .arg(if migrated { "target" } else { "baseline" })
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "controller rejected compiled migration schema: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn current_schema_controller_accepts_compiled_123_and_128_shapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("current-schema.sqlite3");
+        let path_text = path.to_str().unwrap();
+        let db = crate::Database::open(path_text).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS _migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 123)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let baseline_count = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 123)
+            .count();
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            baseline_count
+        );
+        sqlx::query("DELETE FROM _migrations WHERE version > 123")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let fictional_members: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'product_conversation_members'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(fictional_members, 0);
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+
+        validate_current_schema_with_controller(&path, false);
+
+        let db = crate::Database::open(path_text).await.unwrap();
+        let target_count = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 123)
+            .count();
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            target_count
+        );
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+
+        validate_current_schema_with_controller(&path, true);
+    }
+
     #[tokio::test]
     async fn migration_128_backfills_relational_stages_and_enforces_constraints() {
         let pool = test_pool().await;

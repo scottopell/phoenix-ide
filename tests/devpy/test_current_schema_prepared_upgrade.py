@@ -1,21 +1,40 @@
 """Current-schema prepared-artifact installer regressions."""
 
+import dataclasses
 import importlib.util
 import itertools
+import json
+import os
+import plistlib
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
-import dataclasses
-import json
-import os
-import plistlib
-import shutil
-import subprocess
-import sys
+
+
+PRODUCT_CONVERSATION_SCHEMA = """
+CREATE TABLE product_conversations (
+    id TEXT PRIMARY KEY
+);
+CREATE TABLE conversations (
+    id TEXT PRIMARY KEY,
+    product_conversation_id TEXT REFERENCES product_conversations(id) ON DELETE CASCADE
+);
+CREATE TABLE product_conversation_sources (
+    target_product_conversation_id TEXT PRIMARY KEY
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
+    source_product_conversation_id TEXT NOT NULL,
+    source_conversation_id TEXT NOT NULL,
+    relation_kind TEXT NOT NULL,
+    relation_key TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+);
+"""
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -58,11 +77,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
                 "INSERT INTO _migrations (version, name) VALUES (?, ?)",
                 compiled_ledger(through),
             )
-            connection.execute("CREATE TABLE product_conversations (id TEXT PRIMARY KEY)")
-            connection.execute(
-                "CREATE TABLE product_conversation_members ("
-                "product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id))"
-            )
+            connection.executescript(PRODUCT_CONVERSATION_SCHEMA)
         return path
 
     def manifest(self, database: Path) -> helper.Manifest:
@@ -130,6 +145,18 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             created_at="2026-01-01T00:00:00+00:00",
             current_schema_upgrade=current,
         )
+
+    def helper_main_argv(self, manifest: helper.Manifest) -> list[str]:
+        return [
+            "launchd_deploy_helper.py",
+            "activate",
+            "--manifest",
+            str(self.root / "manifest.json"),
+            "--helper-label",
+            manifest.helper_label,
+            "--uid",
+            str(manifest.uid),
+        ]
 
     def ordinary_manifest(self, database: Path) -> helper.Manifest:
         base = self.manifest(database)
@@ -255,15 +282,333 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         with self.assertRaisesRegex(helper.ActivationError, "supported current baseline"):
             helper.validate_current_schema_database(mismatch, self.registry)
 
+    def test_actual_product_conversation_relationship_is_required(self) -> None:
+        for mutation in (
+            "DROP TABLE product_conversation_sources",
+            "ALTER TABLE conversations DROP COLUMN product_conversation_id",
+            "DROP TABLE conversations",
+            "DROP TABLE product_conversations",
+        ):
+            with self.subTest(mutation=mutation):
+                database = self.database()
+                with sqlite3.connect(database) as connection:
+                    connection.execute(mutation)
+                with self.assertRaisesRegex(
+                    helper.ActivationError, "ProductConversation schema"
+                ):
+                    helper.validate_current_schema_database(database, self.registry)
+
+    def test_actual_product_conversation_foreign_keys_are_required(self) -> None:
+        database = self.database()
+        with sqlite3.connect(database) as connection:
+            connection.executescript(
+                "DROP TABLE conversations;"
+                "CREATE TABLE conversations ("
+                "id TEXT PRIMARY KEY, product_conversation_id TEXT);"
+            )
+        with self.assertRaisesRegex(helper.ActivationError, "foreign key is missing"):
+            helper.validate_current_schema_database(database, self.registry)
+
+        database = self.database()
+        with sqlite3.connect(database) as connection:
+            connection.executescript(
+                "DROP TABLE product_conversation_sources;"
+                "CREATE TABLE product_conversation_sources ("
+                "target_product_conversation_id TEXT PRIMARY KEY,"
+                "source_product_conversation_id TEXT NOT NULL,"
+                "source_conversation_id TEXT NOT NULL,"
+                "relation_kind TEXT NOT NULL,"
+                "relation_key TEXT NOT NULL,"
+                "created_at_us INTEGER NOT NULL);"
+            )
+        with self.assertRaisesRegex(helper.ActivationError, "foreign keys do not match"):
+            helper.validate_current_schema_database(database, self.registry)
+
+    def test_fictional_members_table_is_not_required(self) -> None:
+        database = self.database()
+        with sqlite3.connect(database) as connection:
+            members = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'product_conversation_members'"
+            ).fetchone()
+        self.assertIsNone(members)
+        helper.validate_current_schema_database(database, self.registry)
+
     def test_foreign_key_violation_fails_before_migration(self) -> None:
         database = self.database()
         with sqlite3.connect(database) as connection:
             connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute(
-                "INSERT INTO product_conversation_members (product_conversation_id) VALUES ('missing')"
+                "INSERT INTO conversations (id, product_conversation_id) "
+                "VALUES ('orphan', 'missing')"
             )
         with self.assertRaisesRegex(helper.ActivationError, "foreign key"):
             helper.validate_current_schema_database(database, self.registry)
+
+    def test_helper_main_releases_exact_claim_after_durable_precondition_failure(self) -> None:
+        database = self.database()
+        with sqlite3.connect(database) as connection:
+            connection.execute("DROP TABLE product_conversation_sources")
+        manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        events: list[str] = []
+        original_fsync = helper.fsync_dir
+        original_release = helper.release_claim
+
+        def observed_fsync(path: Path) -> None:
+            original_fsync(path)
+            status_path = Path(manifest.status_path)
+            if path == status_path.parent and status_path.exists():
+                status = json.loads(status_path.read_text())
+                if status["state"] == "precondition_failed":
+                    events.append("status_fsync")
+
+        def observed_release(current: helper.Manifest) -> bool:
+            events.append("claim_release")
+            return original_release(current)
+
+        with mock.patch.object(sys, "argv", self.helper_main_argv(manifest)), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper, "fsync_dir", side_effect=observed_fsync
+        ), mock.patch.object(
+            helper, "release_claim", side_effect=observed_release
+        ), mock.patch.object(helper, "Launchctl") as launchctl, mock.patch.object(
+            helper, "request_helper_bootout"
+        ):
+            self.assertEqual(helper.main(), 1)
+
+        launchctl.assert_not_called()
+        self.assertEqual(events[-2:], ["status_fsync", "claim_release"])
+        self.assertFalse(claim.exists())
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+        self.assertIn("ProductConversation schema", status["failure"])
+
+    def test_helper_main_releases_pre_stop_precondition_without_disruption(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        backup = Path(manifest.current_schema_upgrade.backup_path)
+        restore = helper._restore_capacity_path(manifest, database)
+        reservation = helper.DatabaseCapacityReservation(
+            backup, restore, database.stat().st_size
+        )
+        backup.touch(mode=0o600)
+        restore.touch(mode=0o600)
+        validations = 0
+
+        def validate(*_args, **_kwargs):
+            nonlocal validations
+            validations += 1
+            if validations == 2:
+                raise helper.ActivationError("database changed before stop")
+            return tuple(compiled_ledger(123))
+
+        class NotYetStopped:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+                self.disruption_started = False
+
+            def stop(self) -> int | None:
+                self.stop_calls += 1
+                raise AssertionError("pre-stop validation should fail first")
+
+        launchctl = NotYetStopped()
+        original_release = helper.release_claim
+        with mock.patch.object(sys, "argv", self.helper_main_argv(manifest)), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper, "validate_current_schema_database", side_effect=validate
+        ), mock.patch.object(
+            helper, "reserve_database_capacity", return_value=reservation
+        ), mock.patch.object(
+            helper, "Launchctl", return_value=launchctl
+        ), mock.patch.object(
+            helper, "release_claim", wraps=original_release
+        ) as release, mock.patch.object(helper, "request_helper_bootout"):
+            self.assertEqual(helper.main(), 1)
+
+        self.assertEqual(validations, 2)
+        self.assertEqual(launchctl.stop_calls, 0)
+        self.assertFalse(backup.exists())
+        self.assertFalse(restore.exists())
+        release.assert_called_once_with(manifest)
+        self.assertFalse(claim.exists())
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+        self.assertEqual(status["failure"], "database changed before stop")
+
+    def test_helper_main_retains_precondition_status_and_claim_when_release_fails(self) -> None:
+        database = self.database()
+        with sqlite3.connect(database) as connection:
+            connection.execute("DROP TABLE product_conversation_sources")
+        manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        release = mock.Mock(side_effect=OSError("injected claim release failure"))
+
+        with mock.patch.object(sys, "argv", self.helper_main_argv(manifest)), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper, "release_claim", release
+        ), mock.patch.object(helper, "request_helper_bootout"):
+            self.assertEqual(helper.main(), 1)
+
+        release.assert_called_once_with(manifest)
+        self.assertEqual(claim.read_text(), manifest.transaction_id)
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+
+    def test_helper_main_does_not_release_a_newer_claim_owner(self) -> None:
+        database = self.database()
+        with sqlite3.connect(database) as connection:
+            connection.execute("DROP TABLE product_conversation_sources")
+        manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
+        claim = Path(manifest.active_path)
+        claim.write_text("newer-transaction")
+        original_release = helper.release_claim
+        release_results: list[bool] = []
+
+        def observed_release(current: helper.Manifest) -> bool:
+            released = original_release(current)
+            release_results.append(released)
+            return released
+
+        with mock.patch.object(sys, "argv", self.helper_main_argv(manifest)), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper, "release_claim", side_effect=observed_release
+        ) as release, mock.patch.object(helper, "request_helper_bootout"):
+            self.assertEqual(helper.main(), 1)
+
+        release.assert_called_once_with(manifest)
+        self.assertEqual(release_results, [False])
+        self.assertEqual(claim.read_text(), "newer-transaction")
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+
+    def test_helper_main_retains_claim_when_terminal_status_fsync_fails(self) -> None:
+        database = self.database()
+        with sqlite3.connect(database) as connection:
+            connection.execute("DROP TABLE product_conversation_sources")
+        manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        original_fsync = helper.fsync_dir
+        precondition_fsyncs = 0
+
+        def fail_release_barrier(path: Path) -> None:
+            nonlocal precondition_fsyncs
+            status_path = Path(manifest.status_path)
+            if path == status_path.parent and status_path.exists():
+                status = json.loads(status_path.read_text())
+                if status["state"] == "precondition_failed":
+                    precondition_fsyncs += 1
+                    if precondition_fsyncs == 2:
+                        raise OSError("injected terminal status fsync failure")
+            original_fsync(path)
+
+        with mock.patch.object(sys, "argv", self.helper_main_argv(manifest)), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper, "fsync_dir", side_effect=fail_release_barrier
+        ), mock.patch.object(helper, "release_claim") as release, mock.patch.object(
+            helper, "request_helper_bootout"
+        ):
+            self.assertEqual(helper.main(), 1)
+
+        self.assertEqual(precondition_fsyncs, 2)
+        release.assert_not_called()
+        self.assertEqual(claim.read_text(), manifest.transaction_id)
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+
+    def test_helper_main_preserves_unresolved_status_on_activate_reentry(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        for state, finalization_pending in (
+            ("migration_started", False),
+            ("committed", True),
+            ("precondition_failed", False),
+        ):
+            with self.subTest(state=state):
+                status = {
+                    "transaction_id": manifest.transaction_id,
+                    "state": state,
+                    "source_kind": manifest.source_kind,
+                    "finalization_pending": finalization_pending,
+                }
+                status_bytes = json.dumps(status, sort_keys=True).encode()
+                Path(manifest.status_path).write_bytes(status_bytes)
+                claim.write_text(manifest.transaction_id)
+                with mock.patch.object(
+                    sys, "argv", self.helper_main_argv(manifest)
+                ), mock.patch.object(
+                    helper.Manifest, "load", return_value=manifest
+                ), mock.patch.object(
+                    helper, "validate_manifest_identities"
+                ) as validate_identities, mock.patch.object(
+                    helper, "release_claim"
+                ) as release, mock.patch.object(helper, "request_helper_bootout"):
+                    self.assertEqual(helper.main(), 1)
+                validate_identities.assert_not_called()
+                release.assert_not_called()
+                self.assertEqual(Path(manifest.status_path).read_bytes(), status_bytes)
+                self.assertEqual(claim.read_text(), manifest.transaction_id)
+
+    def test_helper_main_checks_freshness_under_activation_lock(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        events: list[str] = []
+
+        def observe_flock(_lock, operation: int) -> None:
+            if operation == helper.fcntl.LOCK_EX | helper.fcntl.LOCK_NB:
+                events.append("activation_lock")
+
+        def reject_after_lock(_manifest: helper.Manifest) -> None:
+            events.append("freshness_check")
+            raise helper.ActivationError("injected stale activation")
+
+        with mock.patch.object(sys, "argv", self.helper_main_argv(manifest)), mock.patch.object(
+            helper.Manifest, "load", return_value=manifest
+        ), mock.patch.object(helper.fcntl, "flock", side_effect=observe_flock), mock.patch.object(
+            helper,
+            "require_fresh_prepared_activation",
+            side_effect=reject_after_lock,
+        ), mock.patch.object(helper, "release_claim") as release, mock.patch.object(
+            helper, "request_helper_bootout"
+        ):
+            self.assertEqual(helper.main(), 1)
+
+        self.assertEqual(events, ["activation_lock", "freshness_check"])
+        release.assert_not_called()
+        self.assertEqual(claim.read_text(), manifest.transaction_id)
+        self.assertEqual(
+            json.loads(Path(manifest.status_path).read_text())["state"], "prepared"
+        )
 
     def migration_script(self, manifest: helper.Manifest, *, partial: bool = False) -> None:
         target = Path(manifest.target_binary)
@@ -412,6 +757,7 @@ sys.exit({7 if partial else 0})
     def test_current_initial_start_rechecks_exclusivity(self) -> None:
         database = self.database()
         manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
         Path(manifest.target_plist).write_bytes(Path(manifest.rollback_plist).read_bytes())
         reservation = helper.DatabaseCapacityReservation(
             Path(manifest.current_schema_upgrade.backup_path),
@@ -489,6 +835,7 @@ sys.exit({7 if partial else 0})
     def test_current_pre_stop_failure_releases_both_capacity_files(self) -> None:
         database = self.database()
         manifest = self.manifest(database)
+        helper.write_status(manifest, "prepared")
         backup = Path(manifest.current_schema_upgrade.backup_path)
         restore = helper._restore_capacity_path(manifest, database)
         reservation = helper.DatabaseCapacityReservation(
