@@ -471,7 +471,9 @@ def migration_registry(
     field_pattern = re.compile(
         r'\s*(?:version\s*:\s*(?P<version>[0-9]+)'
         r'|name\s*:\s*"(?P<name>[^"\\]+)"'
-        r'|sql\s*:\s*(?P<sql>[A-Za-z_][A-Za-z0-9_]*|"(?:\\.|[^"\\])*"))'
+        r'|sql\s*:\s*(?P<sql>[A-Za-z_][A-Za-z0-9_]*'
+        r'|"(?:\\.|[^"\\])*"'
+        r'|include_str!\(\s*"(?:\\.|[^"\\])*"\s*\)))'
         r'\s*(?:,|$)',
         re.DOTALL,
     )

@@ -1,4 +1,4 @@
-//! ProductConversation creation provisioning vocabulary.
+//! `ProductConversation` creation provisioning vocabulary.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
