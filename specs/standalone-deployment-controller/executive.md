@@ -10,14 +10,16 @@ direct-child supervision in an isolated process group. The general observation
 adapter intentionally cannot signal arbitrary observed PIDs. The crate has no
 production caller, and existing deployment behavior remains unchanged.
 
-The deterministic suite contains 18 fake-OS tests covering the observed
+The deterministic suite contains 20 fake-OS tests covering the observed
 child-ESRCH-before-birth race, PID reuse, reparenting, exact-identity signaling,
 permission uncertainty, absolute-deadline closeout, repeated interruption,
-complete recovery reconciliation, sustained contention, and exact-candidate
-forward recovery. Two harmless native macOS tests exercise supervised-child group
-cleanup and resource measurement. Exact-head hosted Rust, Clippy, and native macOS
-qualification is pending because the local host did not satisfy its compiler
-admission threshold.
+complete recovery reconciliation, expired resource-sampling recovery, sustained
+contention, and exact-candidate forward recovery. Five harmless macOS integration
+tests plus five adapter unit regressions cover supervised-child finalization,
+bounded best-effort teardown, arbitrary-PID mutation rejection, native resource
+measurement, counter regression, and capacity arithmetic. Exact-head hosted Rust,
+Clippy, and native macOS qualification is pending because the local host did not
+satisfy its compiler admission threshold.
 
 The controller-owned normalized SQLite store required by REQ-SDC-011 is not yet
 implemented. No production launchd label, process, reservation, application
@@ -36,9 +38,9 @@ database, or installation path is used by this crate.
 | REQ-SDC-007 | Attempt-bound `AdministrativeRiskAcceptance` closes without a cleanup claim or OS effect and retains evidence. |
 | REQ-SDC-008 | Recovery marks owned identities for fresh observation and preserves the original deadline before exposing signal effects. |
 | REQ-SDC-009 | `CompatibilityBoundary::CandidateMigrationInvoked` retains full commit plus artifact digest and recovers only through candidate reverification. |
-| REQ-SDC-010 | `ControllerOs` is typed and fake-backed; the macOS adapter implements native observation and capacity/contention sampling. Its harmless native qualification is pending exact-head hosted results. |
+| REQ-SDC-010 | `ControllerOs` is typed and fake-backed; the macOS adapter implements native observation and fail-closed capacity/contention sampling, including counter-regression and capacity-arithmetic regressions. Its harmless native qualification is pending exact-head hosted results. |
 | REQ-SDC-011 | `AttemptStore` enforces checkpoint-before-effect capability separation, but the controller-owned normalized SQLite implementation and load/recovery authority remain unimplemented. |
-| REQ-SDC-012 | `SupervisedChild` retains a direct child as an isolated process-group leader until explicit wait. Arbitrary observed PID signaling is unsupported; group escape, deliberate group join, and controller-exit risks remain explicit. Exact-head hosted macOS qualification is pending. |
+| REQ-SDC-012 | `SupervisedChild` retains a direct child as an isolated process-group leader until original-group finalization. Leader exit alone cannot finalize while same-group descendants remain; Drop is bounded best-effort and cannot claim cleanup. Arbitrary observed PID signaling is unsupported; group escape, deliberate group join, and controller-exit risks remain explicit. Exact-head hosted macOS qualification is pending. |
 
 ## Next work
 

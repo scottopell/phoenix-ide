@@ -4,11 +4,13 @@ use std::{
     mem::{self, MaybeUninit},
     num::NonZeroU32,
     os::{
-        raw::{c_int, c_void},
+        raw::c_int,
         unix::{ffi::OsStrExt, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -19,10 +21,6 @@ use crate::{
     StableChildEvidence,
 };
 
-unsafe extern "C" {
-    fn proc_listchildpids(ppid: libc::pid_t, buffer: *mut c_void, buffersize: c_int) -> c_int;
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MacOsError {
     NoSuchProcess,
@@ -30,6 +28,10 @@ pub enum MacOsError {
     TemporarilyUnavailable,
     MalformedObservation,
     InvalidPath,
+    /// Identity acquisition failed after spawn; cleanup was attempted, not verified.
+    PartialSpawnCleanupUnverified {
+        leader_reaped: bool,
+    },
     System(i32),
 }
 
@@ -57,10 +59,10 @@ struct ObservedProcess {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CpuTicks {
-    user: u64,
-    system: u64,
-    idle: u64,
-    nice: u64,
+    user: u32,
+    system: u32,
+    idle: u32,
+    nice: u32,
 }
 
 pub struct MacOsControllerOs {
@@ -78,14 +80,24 @@ impl MacOsControllerOs {
         })
     }
 
+    fn observe_cpu_contention(
+        &mut self,
+        current_cpu: CpuTicks,
+    ) -> Result<CpuContentionBasisPoints, ResourceObservationFailure> {
+        let previous_cpu = mem::replace(&mut self.previous_cpu, current_cpu);
+        cpu_contention(previous_cpu, current_cpu)
+    }
+
     /// Spawns a direct child as the leader of a controller-owned process group.
     ///
-    /// The returned affine value retains the direct child without reaping it, so the
-    /// kernel cannot reuse the leader PID before group signaling and final wait.
+    /// The returned affine value retains the direct child without reaping it until
+    /// finalization observes its exit and no other members in its original group.
+    /// Group escape and join risks still prevent a verified owned-tree cleanup claim.
     ///
     /// # Errors
     /// Returns a typed boundary error when spawning, identity acquisition, or process-group
-    /// verification fails. A partially spawned child is killed and reaped before returning.
+    /// verification fails. Partial-spawn cleanup is bounded and best-effort; its error
+    /// records whether the leader was reaped, never whether descendants were cleaned up.
     pub fn spawn_supervised(&self, command: &mut Command) -> Result<SupervisedChild, MacOsError> {
         // SAFETY: pre_exec runs after fork and calls only the async-signal-safe setpgid syscall.
         unsafe {
@@ -98,24 +110,20 @@ impl MacOsControllerOs {
             });
         }
         let mut child = command.spawn().map_err(io_error)?;
-        let pid = process_id(child.id()).ok_or(MacOsError::MalformedObservation)?;
-        let observed = match observe_process(pid) {
-            Ok(observed) if observed.process_group == pid => observed,
-            Ok(_) => {
-                cleanup_partial_child(&mut child, pid);
-                return Err(MacOsError::MalformedObservation);
-            }
-            Err(error) => {
-                cleanup_partial_child(&mut child, pid);
-                return Err(error);
-            }
-        };
-        Ok(SupervisedChild {
-            child,
-            identity: observed.identity,
-            process_group: pid,
-            finished: false,
-        })
+        let group = process_id(child.id());
+        let observed = group
+            .ok_or(MacOsError::MalformedObservation)
+            .and_then(observe_process);
+        match observed {
+            Ok(observed) if Some(observed.process_group) == group => Ok(SupervisedChild {
+                state: ChildSupervision::Retained(child),
+                identity: observed.identity,
+                process_group: observed.process_group,
+            }),
+            Ok(_) | Err(_) => Err(MacOsError::PartialSpawnCleanupUnverified {
+                leader_reaped: cleanup_partial_child(&mut child, group),
+            }),
+        }
     }
 
     #[must_use]
@@ -128,11 +136,23 @@ impl MacOsControllerOs {
     }
 }
 
+enum ChildSupervision {
+    Retained(Child),
+    Finalized(SupervisedFinalization),
+}
+
+/// Original-group finalization, not evidence that the entire owned tree is absent.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "finalization retains unresolved supervision risks; it is not verified tree cleanup"]
+pub struct SupervisedFinalization {
+    pub leader_status: ExitStatus,
+    pub unresolved_risks: [SupervisionRisk; 3],
+}
+
 pub struct SupervisedChild {
-    child: Child,
+    state: ChildSupervision,
     identity: ProcessIdentity,
     process_group: ProcessId,
-    finished: bool,
 }
 
 impl SupervisedChild {
@@ -147,8 +167,9 @@ impl SupervisedChild {
     }
 
     pub fn signal_group(&mut self, signal: Signal) -> SignalOutcome {
-        if self.finished {
-            return SignalOutcome::ExactIdentityAlreadyAbsent;
+        if let ChildSupervision::Finalized(_) = self.state {
+            // Reaping released the PID reservation; the old PGID is no longer authority.
+            return SignalOutcome::TemporarilyUnavailable;
         }
         let native_signal = match signal {
             Signal::Terminate => libc::SIGTERM,
@@ -157,23 +178,53 @@ impl SupervisedChild {
         signal_process_group(self.process_group, native_signal)
     }
 
+    /// Nonblocking finalization. A leader exit alone does not permit reaping: other
+    /// original-group members must also be absent from a complete native group scan.
+    /// `None` retains supervision; a report retains escape/join/controller-exit risks.
+    ///
     /// # Errors
-    /// Returns the native wait error while retaining drop-time cleanup authority.
-    pub fn wait(mut self) -> io::Result<ExitStatus> {
-        let status = self.child.wait()?;
-        self.finished = true;
-        Ok(status)
+    /// Returns a typed observation/wait error without relinquishing supervision.
+    pub fn try_finalize(&mut self) -> Result<Option<SupervisedFinalization>, MacOsError> {
+        let child = match &mut self.state {
+            ChildSupervision::Retained(child) => child,
+            ChildSupervision::Finalized(report) => return Ok(Some(*report)),
+        };
+        if !child_exited_without_reaping(child)?
+            || group_has_other_members(self.process_group, self.identity.pid())?
+        {
+            return Ok(None);
+        }
+        let Some(leader_status) = child.try_wait().map_err(io_error)? else {
+            return Ok(None);
+        };
+        let report = SupervisedFinalization {
+            leader_status,
+            unresolved_risks: MacOsControllerOs::supervision_risks(),
+        };
+        self.state = ChildSupervision::Finalized(report);
+        Ok(Some(report))
+    }
+
+    /// Requests forced cleanup using both original-group and retained direct-child
+    /// authority, including when group signaling fails. Does not block for exit.
+    ///
+    /// # Errors
+    /// Returns unresolved observation/wait errors; retries retain the unreaped child.
+    pub fn try_cleanup(&mut self) -> Result<Option<SupervisedFinalization>, MacOsError> {
+        if let ChildSupervision::Retained(child) = &mut self.state {
+            let _ = signal_process_group(self.process_group, libc::SIGKILL);
+            let _ = child.kill();
+        }
+        self.try_finalize()
     }
 }
 
 impl Drop for SupervisedChild {
     fn drop(&mut self) {
-        if self.finished {
-            return;
+        if let ChildSupervision::Retained(child) = &mut self.state {
+            // Drop forfeits authority after a bounded best-effort attempt, not cleanup proof.
+            let _ = cleanup_partial_child(child, Some(self.process_group));
         }
-        let _ = signal_process_group(self.process_group, libc::SIGKILL);
-        let _ = self.child.wait();
-        self.finished = true;
     }
 }
 
@@ -183,8 +234,7 @@ impl ControllerOs for MacOsControllerOs {
         sequence: u64,
     ) -> Result<ResourceSample, ResourceObservationFailure> {
         let current_cpu = cpu_ticks().map_err(resource_error)?;
-        let contention = cpu_contention(self.previous_cpu, current_cpu)?;
-        self.previous_cpu = current_cpu;
+        let contention = self.observe_cpu_contention(current_cpu)?;
         let available_memory_bytes = available_memory_bytes().map_err(resource_error)?;
         let available_storage_bytes =
             available_storage_bytes(&self.storage_path).map_err(resource_error)?;
@@ -334,7 +384,7 @@ fn list_child_pids(parent: ProcessId) -> Result<Vec<ProcessId>, MacOsError> {
         c_int::try_from(parent.get()).map_err(|_| MacOsError::MalformedObservation)?;
     for extra in [8_usize, 32, 128] {
         // SAFETY: a null buffer with zero size requests the current child count.
-        let count = unsafe { proc_listchildpids(native_parent, std::ptr::null_mut(), 0) };
+        let count = unsafe { libc::proc_listchildpids(native_parent, std::ptr::null_mut(), 0) };
         if count < 0 {
             return Err(last_process_error());
         }
@@ -346,7 +396,7 @@ fn list_child_pids(parent: ProcessId) -> Result<Vec<ProcessId>, MacOsError> {
             .map_err(|_| MacOsError::MalformedObservation)?;
         // SAFETY: pids owns bytes writable bytes and remains alive for the call.
         let returned =
-            unsafe { proc_listchildpids(native_parent, pids.as_mut_ptr().cast(), bytes) };
+            unsafe { libc::proc_listchildpids(native_parent, pids.as_mut_ptr().cast(), bytes) };
         if returned < 0 {
             return Err(last_process_error());
         }
@@ -362,45 +412,65 @@ fn list_child_pids(parent: ProcessId) -> Result<Vec<ProcessId>, MacOsError> {
     Err(MacOsError::TemporarilyUnavailable)
 }
 
+#[allow(deprecated)]
+fn current_host_port() -> libc::host_t {
+    // SAFETY: mach_host_self takes no arguments and returns a send right for this host.
+    unsafe { libc::mach_host_self() }
+}
+
 fn cpu_ticks() -> Result<CpuTicks, MacOsError> {
     let mut info = MaybeUninit::<libc::host_cpu_load_info>::zeroed();
     let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
     // SAFETY: info is correctly sized for HOST_CPU_LOAD_INFO and count names that size.
-    let status = unsafe {
+    let kern_result = unsafe {
         libc::host_statistics(
-            libc::mach_host_self(),
+            current_host_port(),
             libc::HOST_CPU_LOAD_INFO,
             info.as_mut_ptr().cast(),
             &mut count,
         )
     };
-    if status != libc::KERN_SUCCESS || count != libc::HOST_CPU_LOAD_INFO_COUNT {
-        return Err(MacOsError::System(status));
+    if kern_result != libc::KERN_SUCCESS || count != libc::HOST_CPU_LOAD_INFO_COUNT {
+        return Err(MacOsError::System(kern_result));
     }
     // SAFETY: host_statistics succeeded with the complete expected count.
     let info = unsafe { info.assume_init() };
     Ok(CpuTicks {
-        user: u64::from(info.cpu_ticks[libc::CPU_STATE_USER]),
-        system: u64::from(info.cpu_ticks[libc::CPU_STATE_SYSTEM]),
-        idle: u64::from(info.cpu_ticks[libc::CPU_STATE_IDLE]),
-        nice: u64::from(info.cpu_ticks[libc::CPU_STATE_NICE]),
+        user: cpu_tick(&info, libc::CPU_STATE_USER)?,
+        system: cpu_tick(&info, libc::CPU_STATE_SYSTEM)?,
+        idle: cpu_tick(&info, libc::CPU_STATE_IDLE)?,
+        nice: cpu_tick(&info, libc::CPU_STATE_NICE)?,
     })
+}
+
+fn cpu_tick(info: &libc::host_cpu_load_info, state: c_int) -> Result<u32, MacOsError> {
+    let index = usize::try_from(state).map_err(|_| MacOsError::MalformedObservation)?;
+    info.cpu_ticks
+        .get(index)
+        .copied()
+        .ok_or(MacOsError::MalformedObservation)
 }
 
 fn cpu_contention(
     previous: CpuTicks,
     current: CpuTicks,
 ) -> Result<CpuContentionBasisPoints, ResourceObservationFailure> {
-    let user = current.user.saturating_sub(previous.user);
-    let system = current.system.saturating_sub(previous.system);
-    let idle = current.idle.saturating_sub(previous.idle);
-    let nice = current.nice.saturating_sub(previous.nice);
-    let busy = user.saturating_add(system).saturating_add(nice);
-    let total = busy.saturating_add(idle);
+    let delta = |current: u32, previous: u32| {
+        current
+            .checked_sub(previous)
+            .map(u64::from)
+            .ok_or(ResourceObservationFailure::TemporarilyUnavailable)
+    };
+    let user = delta(current.user, previous.user)?;
+    let system = delta(current.system, previous.system)?;
+    let idle = delta(current.idle, previous.idle)?;
+    let nice = delta(current.nice, previous.nice)?;
+    let busy = user + system + nice;
+    let total = busy + idle;
     if total == 0 {
         return Err(ResourceObservationFailure::TemporarilyUnavailable);
     }
-    let basis_points = busy.saturating_mul(10_000) / total;
+    let basis_points = busy * 10_000 / total;
     let basis_points =
         u16::try_from(basis_points).map_err(|_| ResourceObservationFailure::Malformed)?;
     CpuContentionBasisPoints::new(basis_points).map_err(|_| ResourceObservationFailure::Malformed)
@@ -410,25 +480,34 @@ fn available_memory_bytes() -> Result<u64, MacOsError> {
     let mut stats = MaybeUninit::<libc::vm_statistics64>::zeroed();
     let mut count = libc::HOST_VM_INFO64_COUNT;
     // SAFETY: stats is correctly sized for HOST_VM_INFO64 and count names that size.
-    let status = unsafe {
+    let kern_result = unsafe {
         libc::host_statistics64(
-            libc::mach_host_self(),
+            current_host_port(),
             libc::HOST_VM_INFO64,
             stats.as_mut_ptr().cast(),
             &mut count,
         )
     };
-    if status != libc::KERN_SUCCESS || count != libc::HOST_VM_INFO64_COUNT {
-        return Err(MacOsError::System(status));
+    if kern_result != libc::KERN_SUCCESS || count != libc::HOST_VM_INFO64_COUNT {
+        return Err(MacOsError::System(kern_result));
     }
     // SAFETY: host_statistics64 succeeded with the complete expected count.
     let stats = unsafe { stats.assume_init() };
     // SAFETY: sysconf with _SC_PAGESIZE has no pointer arguments.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page_size = u64::try_from(page_size).map_err(|_| MacOsError::MalformedObservation)?;
-    u64::from(stats.free_count)
-        .saturating_add(u64::from(stats.inactive_count))
-        .saturating_add(u64::from(stats.speculative_count))
+    reclaimable_memory_bytes(&stats, page_size)
+}
+
+fn reclaimable_memory_bytes(
+    stats: &libc::vm_statistics64,
+    page_size: u64,
+) -> Result<u64, MacOsError> {
+    if page_size == 0 {
+        return Err(MacOsError::MalformedObservation);
+    }
+    // Darwin free_count already includes speculative_count.
+    (u64::from(stats.free_count) + u64::from(stats.inactive_count))
         .checked_mul(page_size)
         .ok_or(MacOsError::MalformedObservation)
 }
@@ -442,9 +521,8 @@ fn available_storage_bytes(path: &Path) -> Result<u64, MacOsError> {
     }
     // SAFETY: statvfs succeeded and initialized the complete struct.
     let stats = unsafe { stats.assume_init() };
-    stats
-        .f_bavail
-        .checked_mul(stats.f_frsize)
+    u64::from(stats.f_bavail)
+        .checked_mul(u64::from(stats.f_frsize))
         .ok_or(MacOsError::MalformedObservation)
 }
 
@@ -486,14 +564,86 @@ fn signal_process_group(group: ProcessId, signal: c_int) -> SignalOutcome {
     }
     match io::Error::last_os_error().raw_os_error() {
         Some(libc::ESRCH) => SignalOutcome::ExactIdentityAlreadyAbsent,
-        Some(libc::EPERM) | Some(libc::EACCES) => SignalOutcome::PermissionDenied,
+        Some(libc::EPERM | libc::EACCES) => SignalOutcome::PermissionDenied,
         _ => SignalOutcome::TemporarilyUnavailable,
     }
 }
 
-fn cleanup_partial_child(child: &mut Child, group: ProcessId) {
-    let _ = signal_process_group(group, libc::SIGKILL);
-    let _ = child.wait();
+fn child_exited_without_reaping(child: &Child) -> Result<bool, MacOsError> {
+    let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: the retained Child reserves its PID; WNOWAIT preserves that reservation,
+    // WNOHANG never waits for exit, and info is writable siginfo_t storage.
+    let status = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if status != 0 {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    // SAFETY: the zero-initialized siginfo_t was filled by successful waitid.
+    let info = unsafe { info.assume_init() };
+    if info.si_pid == 0 {
+        return Ok(false);
+    }
+    let pid = u32::try_from(info.si_pid).map_err(|_| MacOsError::MalformedObservation)?;
+    if pid != child.id() {
+        return Err(MacOsError::MalformedObservation);
+    }
+    Ok(true)
+}
+
+fn group_has_other_members(group: ProcessId, leader: ProcessId) -> Result<bool, MacOsError> {
+    let group = c_int::try_from(group.get()).map_err(|_| MacOsError::MalformedObservation)?;
+    let mut pids = [0_i32; 256];
+    let bytes =
+        c_int::try_from(mem::size_of_val(&pids)).map_err(|_| MacOsError::MalformedObservation)?;
+    // SAFETY: pids is writable for bytes bytes. libproc returns a PID count, not bytes.
+    let count = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), bytes) };
+    if count < 0 {
+        return Err(last_process_error());
+    }
+    let count = usize::try_from(count).map_err(|_| MacOsError::MalformedObservation)?;
+    if count >= pids.len() {
+        return Err(MacOsError::TemporarilyUnavailable);
+    }
+    for &pid in &pids[..count] {
+        let pid = u32::try_from(pid)
+            .ok()
+            .and_then(process_id)
+            .ok_or(MacOsError::MalformedObservation)?;
+        if pid != leader {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+const BEST_EFFORT_CLEANUP_BUDGET: Duration = Duration::from_millis(100);
+const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+fn cleanup_partial_child(child: &mut Child, group: Option<ProcessId>) -> bool {
+    if let Some(group) = group {
+        let _ = signal_process_group(group, libc::SIGKILL);
+    }
+    // Child::kill retains direct-child authority when group signaling is unavailable.
+    let _ = child.kill();
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        let remaining = BEST_EFFORT_CLEANUP_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(CLEANUP_POLL_INTERVAL.min(remaining));
+    }
 }
 
 const fn process_id(raw: u32) -> Option<ProcessId> {
@@ -506,7 +656,7 @@ const fn process_id(raw: u32) -> Option<ProcessId> {
 fn last_process_error() -> MacOsError {
     match io::Error::last_os_error().raw_os_error() {
         Some(libc::ESRCH) => MacOsError::NoSuchProcess,
-        Some(libc::EPERM) | Some(libc::EACCES) => MacOsError::PermissionDenied,
+        Some(libc::EPERM | libc::EACCES) => MacOsError::PermissionDenied,
         Some(code) => MacOsError::System(code),
         None => MacOsError::TemporarilyUnavailable,
     }
@@ -515,7 +665,7 @@ fn last_process_error() -> MacOsError {
 fn io_error(error: io::Error) -> MacOsError {
     match error.raw_os_error() {
         Some(libc::ESRCH) => MacOsError::NoSuchProcess,
-        Some(libc::EPERM) | Some(libc::EACCES) => MacOsError::PermissionDenied,
+        Some(libc::EPERM | libc::EACCES) => MacOsError::PermissionDenied,
         Some(code) => MacOsError::System(code),
         None => MacOsError::TemporarilyUnavailable,
     }
@@ -526,9 +676,9 @@ const fn observation_error(error: MacOsError) -> ObservationFailure {
         MacOsError::NoSuchProcess => ObservationFailure::NoSuchProcess,
         MacOsError::PermissionDenied => ObservationFailure::PermissionDenied,
         MacOsError::MalformedObservation | MacOsError::InvalidPath => ObservationFailure::Malformed,
-        MacOsError::TemporarilyUnavailable | MacOsError::System(_) => {
-            ObservationFailure::TemporarilyUnavailable
-        }
+        MacOsError::TemporarilyUnavailable
+        | MacOsError::PartialSpawnCleanupUnverified { .. }
+        | MacOsError::System(_) => ObservationFailure::TemporarilyUnavailable,
     }
 }
 
@@ -536,9 +686,10 @@ const fn query_error(error: MacOsError) -> OsQueryError {
     match error {
         MacOsError::PermissionDenied => OsQueryError::PermissionDenied,
         MacOsError::MalformedObservation | MacOsError::InvalidPath => OsQueryError::Malformed,
-        MacOsError::NoSuchProcess | MacOsError::TemporarilyUnavailable | MacOsError::System(_) => {
-            OsQueryError::TemporarilyUnavailable
-        }
+        MacOsError::NoSuchProcess
+        | MacOsError::TemporarilyUnavailable
+        | MacOsError::PartialSpawnCleanupUnverified { .. }
+        | MacOsError::System(_) => OsQueryError::TemporarilyUnavailable,
     }
 }
 
@@ -550,6 +701,154 @@ const fn resource_error(error: MacOsError) -> ResourceObservationFailure {
         MacOsError::NoSuchProcess
         | MacOsError::PermissionDenied
         | MacOsError::TemporarilyUnavailable
+        | MacOsError::PartialSpawnCleanupUnverified { .. }
         | MacOsError::System(_) => ResourceObservationFailure::TemporarilyUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_state_indices_are_checked_c_int_values() {
+        let info = libc::host_cpu_load_info {
+            cpu_ticks: [11, 22, 33, 44],
+        };
+        for (state, expected) in [
+            (libc::CPU_STATE_USER, 11),
+            (libc::CPU_STATE_SYSTEM, 22),
+            (libc::CPU_STATE_IDLE, 33),
+            (libc::CPU_STATE_NICE, 44),
+        ] {
+            assert_eq!(cpu_tick(&info, state), Ok(expected));
+        }
+        assert_eq!(cpu_tick(&info, -1), Err(MacOsError::MalformedObservation));
+        assert_eq!(
+            cpu_tick(&info, libc::CPU_STATE_MAX),
+            Err(MacOsError::MalformedObservation)
+        );
+    }
+
+    #[test]
+    fn every_regressing_or_wrapping_cpu_counter_is_unavailable() {
+        let unchanged = CpuTicks {
+            user: 100,
+            system: 100,
+            idle: 100,
+            nice: 100,
+        };
+        assert_eq!(
+            cpu_contention(unchanged, unchanged),
+            Err(ResourceObservationFailure::TemporarilyUnavailable)
+        );
+        let ticks = |[user, system, idle, nice]: [u32; 4]| CpuTicks {
+            user,
+            system,
+            idle,
+            nice,
+        };
+        for state in [0_usize, 1, 2, 3] {
+            for old in [100, u32::MAX] {
+                let mut previous = [100; 4];
+                previous[state] = old;
+                let mut current = [110, 110, 210, 110];
+                current[state] = if old == u32::MAX { 0 } else { 99 };
+                assert_eq!(
+                    cpu_contention(ticks(previous), ticks(current)),
+                    Err(ResourceObservationFailure::TemporarilyUnavailable)
+                );
+            }
+        }
+        assert_eq!(
+            cpu_contention(
+                unchanged,
+                CpuTicks {
+                    user: 200,
+                    idle: 200,
+                    ..unchanged
+                }
+            )
+            .expect("half of measured ticks are busy")
+            .get(),
+            5_000
+        );
+    }
+
+    #[test]
+    fn sample_rebaselines_after_counter_regression() {
+        let mut os = MacOsControllerOs {
+            storage_path: PathBuf::from("/tmp"),
+            previous_cpu: CpuTicks {
+                user: 100,
+                system: 100,
+                idle: 100,
+                nice: 100,
+            },
+        };
+        let reset = CpuTicks {
+            user: 0,
+            system: 101,
+            idle: 200,
+            nice: 101,
+        };
+        assert_eq!(
+            os.observe_cpu_contention(reset),
+            Err(ResourceObservationFailure::TemporarilyUnavailable)
+        );
+        assert_eq!(os.previous_cpu, reset);
+        assert_eq!(
+            os.observe_cpu_contention(CpuTicks {
+                user: 100,
+                idle: 300,
+                ..reset
+            })
+            .expect("subsequent sample uses the new baseline")
+            .get(),
+            5_000
+        );
+    }
+
+    #[test]
+    fn speculative_pages_are_not_added_twice() {
+        // SAFETY: vm_statistics64 contains only integer counters; all-zero is valid.
+        let mut stats = unsafe { MaybeUninit::<libc::vm_statistics64>::zeroed().assume_init() };
+        stats.free_count = 100;
+        stats.inactive_count = 20;
+        stats.speculative_count = 40;
+        assert_eq!(reclaimable_memory_bytes(&stats, 4096), Ok(120 * 4096));
+        stats.speculative_count = 0;
+        assert_eq!(reclaimable_memory_bytes(&stats, 4096), Ok(120 * 4096));
+        assert_eq!(
+            reclaimable_memory_bytes(&stats, 0),
+            Err(MacOsError::MalformedObservation)
+        );
+        assert_eq!(
+            reclaimable_memory_bytes(&stats, u64::MAX),
+            Err(MacOsError::MalformedObservation)
+        );
+    }
+
+    #[test]
+    fn partial_cleanup_without_a_group_still_targets_the_retained_child() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("15")
+            .spawn()
+            .expect("harmless child starts");
+        let started = Instant::now();
+        let _leader_reaped = cleanup_partial_child(&mut child, None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("nonblocking reap succeeds") {
+                assert!(!status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "direct-child kill must not depend on a PGID"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

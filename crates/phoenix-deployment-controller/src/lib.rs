@@ -14,7 +14,9 @@ pub use identity::{
     StableChildEvidence,
 };
 #[cfg(target_os = "macos")]
-pub use macos::{MacOsControllerOs, MacOsError, SupervisedChild, SupervisionRisk};
+pub use macos::{
+    MacOsControllerOs, MacOsError, SupervisedChild, SupervisedFinalization, SupervisionRisk,
+};
 pub use os::{
     CandidateVerification, ControllerOs, OsEffect, OsQueryError, ResourceObservationFailure,
     Signal, SignalOutcome,

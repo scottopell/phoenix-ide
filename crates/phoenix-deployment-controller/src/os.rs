@@ -46,6 +46,8 @@ pub enum OsEffect {
 }
 
 pub trait ControllerOs {
+    /// # Errors
+    /// Returns a typed observation failure when no trustworthy resource sample is available.
     fn sample_resources(
         &mut self,
         sequence: u64,
