@@ -43,6 +43,36 @@ pub struct OwnedProcessTree {
 }
 
 impl OwnedProcessTree {
+    pub(crate) const fn next_discovery(&self) -> u64 {
+        self.next_discovery
+    }
+
+    pub(crate) fn restore(
+        next_discovery: u64,
+        identities: BTreeMap<ProcessIdentity, OwnedIdentityStatus>,
+        pending_child_scans: BTreeSet<ProcessIdentity>,
+        unresolved: BTreeMap<DiscoveryId, UnresolvedDiscovery>,
+    ) -> Option<Self> {
+        if identities.is_empty()
+            || !pending_child_scans
+                .iter()
+                .all(|identity| identities.contains_key(identity))
+            || !unresolved.iter().all(|(id, entry)| {
+                *id == entry.discovery.id()
+                    && identities.contains_key(&entry.discovery.verified_parent())
+                    && (id.get() < next_discovery || next_discovery == u64::MAX)
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            next_discovery,
+            identities,
+            pending_child_scans,
+            unresolved,
+        })
+    }
+
     #[must_use]
     pub fn new(root: ProcessIdentity) -> Self {
         Self {

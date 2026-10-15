@@ -1,3 +1,5 @@
+pub(crate) mod sqlite;
+
 use crate::{
     candidate::RetainedCandidateIdentity,
     identity::{
@@ -88,9 +90,186 @@ pub enum Phase {
     AdministrativelyClosed,
 }
 
+/// A durable, nonzero checkpoint revision. Absence means never persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistenceRevision(std::num::NonZeroU64);
+
+impl PersistenceRevision {
+    #[must_use]
+    pub const fn new(value: std::num::NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn first() -> Self {
+        Self(std::num::NonZeroU64::MIN)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    #[must_use]
+    pub fn checked_next(self) -> Option<Self> {
+        self.get()
+            .checked_add(1)
+            .and_then(std::num::NonZeroU64::new)
+            .map(Self)
+    }
+}
+
+/// Crash-loaded evidence has no live mutation or signal capability.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::{LoadedAttempt, MonotonicTick, Signal};
+/// fn signal(loaded: LoadedAttempt) {
+///     loaded.request_owned_signals(Signal::Terminate, MonotonicTick::new(0));
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::LoadedAttempt;
+/// fn duplicate(loaded: LoadedAttempt) {
+///     let _ = loaded.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::{DeploymentAttempt, LoadedAttempt};
+/// fn checkpoint(loaded: LoadedAttempt) -> DeploymentAttempt {
+///     loaded.checkpoint().clone()
+/// }
+/// ```
+pub struct LoadedAttempt {
+    checkpoint: DeploymentAttempt,
+}
+
+/// Classification after consuming crash-loaded evidence. Effects in a checkpoint
+/// remain private until its persistence succeeds.
+#[derive(Debug)]
+pub enum RecoveryDisposition {
+    Checkpoint(Box<Transition>),
+    Stable(StableAttempt),
+}
+
+/// Crash-loaded stable evidence exposes only phase-appropriate, persistence-gated
+/// continuation. It cannot request process mutation.
+#[derive(Debug)]
+pub struct StableAttempt {
+    checkpoint: DeploymentAttempt,
+}
+
+impl StableAttempt {
+    #[must_use]
+    pub const fn attempt_id(&self) -> AttemptId {
+        self.checkpoint.attempt_id()
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.checkpoint.phase()
+    }
+
+    #[must_use]
+    pub const fn compatibility_boundary(&self) -> CompatibilityBoundary {
+        self.checkpoint.compatibility_boundary()
+    }
+
+    #[must_use]
+    pub const fn cleanup_outcome(&self) -> CleanupOutcome {
+        self.checkpoint.cleanup_outcome()
+    }
+
+    #[must_use]
+    pub const fn resource_block_reason(&self) -> Option<ResourceBlock> {
+        self.checkpoint.resource_block_reason()
+    }
+
+    /// # Errors
+    /// Returns an error unless the loaded checkpoint is pre-migration ready.
+    pub fn record_migration_invoked(
+        self,
+        candidate: RetainedCandidateIdentity,
+    ) -> Result<Transition, TransitionError> {
+        self.checkpoint.record_migration_invoked(candidate)
+    }
+
+    /// # Errors
+    /// Returns an error unless the loaded checkpoint requires administrative closeout
+    /// and the acceptance is bound to the same attempt.
+    pub fn accept_administrative_risk(
+        self,
+        acceptance: AdministrativeRiskAcceptance,
+    ) -> Result<Transition, TransitionError> {
+        self.checkpoint.accept_administrative_risk(acceptance)
+    }
+}
+
+impl LoadedAttempt {
+    #[must_use]
+    pub const fn attempt_id(&self) -> AttemptId {
+        self.checkpoint.attempt_id()
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.checkpoint.phase()
+    }
+
+    /// Active work first checkpoints interruption without OS effects. A further
+    /// committed recovery transition restarts the fresh-observation barrier.
+    ///
+    /// # Errors
+    /// Returns an error if the stored phase cannot prepare recovery.
+    pub fn prepare_recovery(self) -> Result<RecoveryDisposition, TransitionError> {
+        match self.checkpoint {
+            attempt @ DeploymentAttempt::Active(_) => attempt
+                .interrupt()
+                .map(Box::new)
+                .map(RecoveryDisposition::Checkpoint),
+            attempt @ (DeploymentAttempt::Interrupted(_)
+            | DeploymentAttempt::ForwardRecovery(_)) => attempt
+                .recover()
+                .map(Box::new)
+                .map(RecoveryDisposition::Checkpoint),
+            DeploymentAttempt::Ready(attempt)
+                if matches!(
+                    attempt.context.compatibility,
+                    CompatibilityBoundary::CandidateMigrationInvoked(_)
+                ) =>
+            {
+                DeploymentAttempt::Ready(attempt)
+                    .recover()
+                    .map(Box::new)
+                    .map(RecoveryDisposition::Checkpoint)
+            }
+            attempt @ (DeploymentAttempt::Ready(_)
+            | DeploymentAttempt::ResourceBlocked(_)
+            | DeploymentAttempt::AdministrativeCloseoutRequired(_)
+            | DeploymentAttempt::AdministrativelyClosed(_)) => {
+                Ok(RecoveryDisposition::Stable(StableAttempt {
+                    checkpoint: attempt,
+                }))
+            }
+        }
+    }
+}
+
+// Debug exposes the same safe metadata as the public accessors.
+impl std::fmt::Debug for LoadedAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedAttempt")
+            .field("id", &self.attempt_id())
+            .field("phase", &self.phase())
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AttemptContext {
     id: AttemptId,
+    revision: Option<PersistenceRevision>,
     deadline: MonotonicTick,
     compatibility: CompatibilityBoundary,
 }
@@ -196,9 +375,16 @@ pub struct Transition {
 pub trait AttemptStore {
     type Error;
 
+    /// Atomically compares `checkpoint.persistence_revision()` with the durable
+    /// row, stores the complete checkpoint with its checked next revision, and
+    /// returns that committed revision. An unpersisted checkpoint requires no row.
+    ///
     /// # Errors
-    /// Returns the store's typed error when the complete checkpoint is not durable.
-    fn persist(&mut self, checkpoint: &DeploymentAttempt) -> Result<(), Self::Error>;
+    /// Returns the store's typed error on conflict, exhaustion, or storage failure.
+    fn persist(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+    ) -> Result<PersistenceRevision, Self::Error>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,9 +395,14 @@ pub struct CommittedTransition {
 
 impl Transition {
     /// # Errors
-    /// Returns the store's error and does not expose OS effects when persistence fails.
-    pub fn persist<S: AttemptStore>(self, store: &mut S) -> Result<CommittedTransition, S::Error> {
-        store.persist(&self.checkpoint)?;
+    /// Drops the transition and all effect capabilities on failure. An ambiguous
+    /// commit requires reopening and classifying durable evidence, not retrying.
+    pub fn persist<S: AttemptStore>(
+        mut self,
+        store: &mut S,
+    ) -> Result<CommittedTransition, S::Error> {
+        let revision = store.persist(&self.checkpoint)?;
+        self.checkpoint.set_revision(revision);
         Ok(CommittedTransition {
             checkpoint: self.checkpoint,
             after_persist: self.after_persist,
@@ -247,6 +438,7 @@ impl DeploymentAttempt {
         let attempt = Self::Active(ActiveAttempt::ResourceSampling(ResourceSamplingAttempt {
             context: AttemptContext {
                 id,
+                revision: None,
                 deadline,
                 compatibility: CompatibilityBoundary::PreMigration,
             },
@@ -288,6 +480,11 @@ impl DeploymentAttempt {
     #[must_use]
     pub const fn attempt_id(&self) -> AttemptId {
         self.context().id
+    }
+
+    #[must_use]
+    pub const fn persistence_revision(&self) -> Option<PersistenceRevision> {
+        self.context().revision
     }
 
     #[must_use]
@@ -942,6 +1139,23 @@ impl DeploymentAttempt {
         }
     }
 
+    fn set_revision(&mut self, revision: PersistenceRevision) {
+        match self {
+            Self::Active(active) => active.set_revision(revision),
+            Self::Ready(attempt) => attempt.context.revision = Some(revision),
+            Self::ResourceBlocked(attempt) => attempt.context.revision = Some(revision),
+            Self::Interrupted(attempt) => {
+                attempt.context.revision = Some(revision);
+                attempt.resume.set_revision(revision);
+            }
+            Self::ForwardRecovery(attempt) => attempt.context.revision = Some(revision),
+            Self::AdministrativeCloseoutRequired(attempt) => {
+                attempt.context.revision = Some(revision)
+            }
+            Self::AdministrativelyClosed(attempt) => attempt.context.revision = Some(revision),
+        }
+    }
+
     fn into_ownership(self) -> Result<OwnershipAttempt, TransitionError> {
         match self {
             Self::Active(ActiveAttempt::Ownership(attempt)) => Ok(attempt),
@@ -957,6 +1171,13 @@ impl DeploymentAttempt {
 }
 
 impl ActiveAttempt {
+    fn set_revision(&mut self, revision: PersistenceRevision) {
+        match self {
+            Self::ResourceSampling(attempt) => attempt.context.revision = Some(revision),
+            Self::Ownership(attempt) => attempt.context.revision = Some(revision),
+        }
+    }
+
     const fn context(&self) -> &AttemptContext {
         match self {
             Self::ResourceSampling(attempt) => &attempt.context,

@@ -75,6 +75,15 @@ impl ResourcePolicy {
         }
     }
 
+    pub(crate) const fn thresholds(self) -> (u64, u64, CpuContentionBasisPoints, MemoryPressure) {
+        (
+            self.minimum_available_memory_bytes,
+            self.minimum_available_storage_bytes,
+            self.maximum_cpu_contention,
+            self.maximum_memory_pressure,
+        )
+    }
+
     #[must_use]
     pub const fn required_consecutive_samples(self) -> NonZeroUsize {
         self.required_consecutive_samples
@@ -91,10 +100,29 @@ pub enum ResourceBlock {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SustainedResourceEvidence {
+    policy: ResourcePolicy,
     samples: Vec<ResourceSample>,
 }
 
 impl SustainedResourceEvidence {
+    pub(crate) const fn policy(&self) -> ResourcePolicy {
+        self.policy
+    }
+
+    pub(crate) fn restore(policy: ResourcePolicy, samples: Vec<ResourceSample>) -> Option<Self> {
+        if samples.len() != policy.required_consecutive_samples.get()
+            || !samples
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        {
+            return None;
+        }
+        match (ResourceWindow { policy, samples }).assess() {
+            ResourceAssessment::Admitted(evidence) => Some(evidence),
+            ResourceAssessment::NeedMoreSamples { .. } | ResourceAssessment::Blocked(_) => None,
+        }
+    }
+
     #[must_use]
     pub fn samples(&self) -> &[ResourceSample] {
         &self.samples
@@ -118,6 +146,25 @@ pub struct ResourceWindow {
 }
 
 impl ResourceWindow {
+    pub(crate) const fn policy(&self) -> ResourcePolicy {
+        self.policy
+    }
+
+    pub(crate) fn samples(&self) -> &[ResourceSample] {
+        &self.samples
+    }
+
+    pub(crate) fn restore(policy: ResourcePolicy, samples: Vec<ResourceSample>) -> Option<Self> {
+        if samples.len() >= policy.required_consecutive_samples.get()
+            || !samples
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        {
+            return None;
+        }
+        Some(Self { policy, samples })
+    }
+
     #[must_use]
     pub const fn new(policy: ResourcePolicy) -> Self {
         Self {
@@ -184,6 +231,7 @@ impl ResourceWindow {
         }
 
         ResourceAssessment::Admitted(SustainedResourceEvidence {
+            policy: self.policy,
             samples: self.samples.clone(),
         })
     }

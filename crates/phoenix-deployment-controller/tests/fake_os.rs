@@ -8,10 +8,10 @@ use phoenix_deployment_controller::{
     CandidateDiscovery, CandidateVerification, ChildIdentityObservation, CleanupOutcome,
     CommittedTransition, CompatibilityBoundary, ControllerOs, CpuContentionBasisPoints,
     DeploymentAttempt, DiscoveryId, FullCommitSha, IdentityObservation, MemoryPressure,
-    MonotonicTick, ObservationFailure, OsEffect, OsQueryError, Phase, ProcessId, ProcessIdentity,
-    ResourceCapacity, ResourceContention, ResourceObservationFailure, ResourcePolicy,
-    ResourceSample, RetainedCandidateIdentity, Signal, SignalOutcome, StableChildEvidence,
-    Transition,
+    MonotonicTick, ObservationFailure, OsEffect, OsQueryError, PersistenceRevision, Phase,
+    ProcessId, ProcessIdentity, ResourceCapacity, ResourceContention, ResourceObservationFailure,
+    ResourcePolicy, ResourceSample, RetainedCandidateIdentity, Signal, SignalOutcome,
+    StableChildEvidence, Transition,
 };
 
 #[derive(Default)]
@@ -22,10 +22,19 @@ struct FakeStore {
 impl AttemptStore for FakeStore {
     type Error = std::convert::Infallible;
 
-    fn persist(&mut self, checkpoint: &DeploymentAttempt) -> Result<(), Self::Error> {
+    fn persist(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+    ) -> Result<PersistenceRevision, Self::Error> {
         self.checkpoints
             .push((checkpoint.attempt_id(), checkpoint.phase()));
-        Ok(())
+        Ok(checkpoint
+            .persistence_revision()
+            .map_or_else(PersistenceRevision::first, |revision| {
+                revision
+                    .checked_next()
+                    .expect("fixture revision cannot exhaust")
+            }))
     }
 }
 
@@ -34,7 +43,10 @@ struct FailingStore;
 impl AttemptStore for FailingStore {
     type Error = &'static str;
 
-    fn persist(&mut self, _checkpoint: &DeploymentAttempt) -> Result<(), Self::Error> {
+    fn persist(
+        &mut self,
+        _checkpoint: &DeploymentAttempt,
+    ) -> Result<PersistenceRevision, Self::Error> {
         Err("durable write failed")
     }
 }

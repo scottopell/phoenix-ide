@@ -2,6 +2,10 @@
 pub struct FullCommitSha([u8; 20]);
 
 impl FullCommitSha {
+    pub(crate) const fn from_bytes(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+
     /// # Errors
     /// Returns [`InvalidHexIdentity`] unless `value` is exactly 40 hexadecimal characters.
     pub fn parse(value: &str) -> Result<Self, InvalidHexIdentity> {
@@ -18,6 +22,10 @@ impl FullCommitSha {
 pub struct ArtifactDigest([u8; 32]);
 
 impl ArtifactDigest {
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// # Errors
     /// Returns [`InvalidHexIdentity`] unless `value` is exactly 64 hexadecimal characters.
     pub fn parse(value: &str) -> Result<Self, InvalidHexIdentity> {
