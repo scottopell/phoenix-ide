@@ -2,6 +2,7 @@
 use phoenix_deployment_controller::{guardian_ipc::WireState, native_guardian::GuardianClient};
 use std::{
     io::{BufRead, BufReader},
+    os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -10,6 +11,7 @@ use std::{
 #[test]
 fn runner_death_does_not_kill_guardian_or_its_original_child() {
     let parent = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = parent.path().join("sdc-disposable-process");
     let mut guardian = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"))
         .args([

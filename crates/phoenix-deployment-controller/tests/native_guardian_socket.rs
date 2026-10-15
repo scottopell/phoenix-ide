@@ -32,6 +32,7 @@ impl GuardianExecutor for NoEffects {
 #[test]
 fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
     let parent = tempfile::tempdir().unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let directory = parent.path().join("sdc-disposable-socket");
     let listener = bind_disposable(&directory).unwrap();
     assert_eq!(
@@ -126,6 +127,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
 #[test]
 fn disposable_path_rejects_existing_symlink_and_broad_parent() {
     let parent = tempfile::tempdir().unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let private = parent.path().join("sdc-disposable-safe");
     bind_disposable(&private).unwrap();
     assert!(bind_disposable(&private).is_err());
