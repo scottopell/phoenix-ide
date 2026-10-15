@@ -80,6 +80,14 @@ impl MacOsControllerOs {
         })
     }
 
+    fn observe_supervised_slot(&self, identity: ProcessIdentity) -> crate::ChildSlotObservation {
+        match observe_process(identity.pid()) {
+            Ok(observed) if observed.identity == identity => crate::ChildSlotObservation::Running,
+            Ok(_) | Err(MacOsError::NoSuchProcess) => crate::ChildSlotObservation::Exited,
+            Err(_) => crate::ChildSlotObservation::Unavailable,
+        }
+    }
+
     fn observe_cpu_contention(
         &mut self,
         current_cpu: CpuTicks,
@@ -171,6 +179,14 @@ impl SupervisedChild {
             // Reaping released the PID reservation; the old PGID is no longer authority.
             return SignalOutcome::TemporarilyUnavailable;
         }
+        match observe_process(self.identity.pid()) {
+            Ok(observed)
+                if observed.identity == self.identity
+                    && observed.process_group == self.process_group => {}
+            Ok(_) => return SignalOutcome::PidReused,
+            Err(MacOsError::NoSuchProcess) => return SignalOutcome::ExactIdentityAlreadyAbsent,
+            Err(_) => return SignalOutcome::TemporarilyUnavailable,
+        }
         let native_signal = match signal {
             Signal::Terminate => libc::SIGTERM,
             Signal::Kill => libc::SIGKILL,
@@ -225,6 +241,51 @@ impl Drop for SupervisedChild {
             // Drop forfeits authority after a bounded best-effort attempt, not cleanup proof.
             let _ = cleanup_partial_child(child, Some(self.process_group));
         }
+    }
+}
+
+/// Native executor retaining the original direct-child handle in Guardian custody.
+/// Only an exact match to that slot can reach the group signal operation.
+pub struct MacOsGuardianExecutor {
+    os: MacOsControllerOs,
+}
+
+impl MacOsGuardianExecutor {
+    #[must_use]
+    pub fn new(os: MacOsControllerOs) -> Self {
+        Self { os }
+    }
+}
+
+impl crate::GuardianExecutor for MacOsGuardianExecutor {
+    type ChildSlot = SupervisedChild;
+
+    fn execute(
+        &mut self,
+        ticket: crate::DispatchTicket,
+        slots: &mut std::collections::BTreeMap<crate::ChildSlotId, SupervisedChild>,
+    ) -> crate::ExecutedEffect {
+        if let crate::OsEffect::SignalExactIdentity { identity, signal } = ticket.effect() {
+            let (identity, signal) = (*identity, *signal);
+            let outcome = match slots.values_mut().find(|slot| slot.identity() == identity) {
+                Some(slot) => slot.signal_group(signal),
+                None => SignalOutcome::TemporarilyUnavailable,
+            };
+            crate::ExecutedEffect::from_parts(
+                ticket.key(),
+                crate::EffectCompletion::SignalExactIdentity {
+                    identity,
+                    signal,
+                    outcome,
+                },
+            )
+        } else {
+            crate::EffectExecutor::new(&mut self.os).execute(ticket)
+        }
+    }
+
+    fn poll_observation_only(&self, slot: &SupervisedChild) -> crate::ChildSlotObservation {
+        self.os.observe_supervised_slot(slot.identity())
     }
 }
 

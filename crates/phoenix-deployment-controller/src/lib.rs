@@ -17,6 +17,8 @@ pub mod guardian_ipc;
 mod identity;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(unix)]
+pub mod native_guardian;
 mod os;
 mod ownership;
 mod resource;
@@ -41,7 +43,8 @@ pub use identity::{
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    MacOsControllerOs, MacOsError, SupervisedChild, SupervisedFinalization, SupervisionRisk,
+    MacOsControllerOs, MacOsError, MacOsGuardianExecutor, SupervisedChild, SupervisedFinalization,
+    SupervisionRisk,
 };
 pub use os::{
     CandidateVerification, ControllerOs, OsEffect, OsQueryError, ResourceObservationFailure,

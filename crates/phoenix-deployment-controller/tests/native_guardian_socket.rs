@@ -1,0 +1,141 @@
+#![cfg(unix)]
+use phoenix_deployment_controller::{
+    guardian_ipc::{
+        read_frame, write_frame, GuardianServer, Request, Response, WireError, WireState,
+    },
+    native_guardian::{bind_disposable, disposable_dir, same_uid, serve_until, GuardianClient},
+    AttemptId, ChildSlotId, ChildSlotObservation, DispatchTicket, ExecutedEffect, Guardian,
+    GuardianExecutor, MonotonicTick,
+};
+use std::{
+    fs,
+    io::Write,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
+    time::{Duration, Instant},
+};
+
+struct NoEffects;
+impl GuardianExecutor for NoEffects {
+    type ChildSlot = ();
+    fn execute(
+        &mut self,
+        _: DispatchTicket,
+        _: &mut std::collections::BTreeMap<ChildSlotId, ()>,
+    ) -> ExecutedEffect {
+        panic!("unbound transport cannot execute")
+    }
+    fn poll_observation_only(&self, _: &()) -> ChildSlotObservation {
+        ChildSlotObservation::Running
+    }
+}
+
+#[test]
+fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
+    let parent = tempfile::tempdir().unwrap();
+    let directory = parent.path().join("sdc-disposable-socket");
+    let listener = bind_disposable(&directory).unwrap();
+    assert_eq!(
+        fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(directory.join("guardian.sock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let (guardian, session) = Guardian::new(
+        AttemptId::new(1),
+        MonotonicTick::new(200),
+        NoEffects,
+        vec![()],
+    )
+    .unwrap();
+    let mut server = GuardianServer::new(guardian, session).unwrap();
+    server.require_native_binding();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            serve_until(
+                &listener,
+                &mut server,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap()
+        });
+        let mut client = GuardianClient::connect(&directory).unwrap();
+        let hello = client.hello().unwrap();
+        assert_eq!(hello.slots.len(), 1);
+        assert_eq!(client.inventory().unwrap(), hello.slots);
+        assert_eq!(
+            client.observe_slot(hello.slots[0]).unwrap(),
+            phoenix_deployment_controller::guardian_ipc::WireObservation::Running
+        );
+        assert!(matches!(
+            client.reconcile(),
+            Err(
+                phoenix_deployment_controller::native_guardian::ClientError::Refused(
+                    WireError::UnsupportedDurableBinding
+                )
+            )
+        ));
+        drop(client);
+        std::thread::sleep(Duration::from_millis(80));
+        let mut raw = UnixStream::connect(directory.join("guardian.sock")).unwrap();
+        same_uid(&raw).unwrap();
+        write_frame(&mut raw, &Request::Hello).unwrap();
+        let Response::Hello { snapshot } = read_frame(&mut raw).unwrap() else {
+            panic!("hello")
+        };
+        assert_eq!(snapshot.instance, hello.instance);
+        assert_eq!(snapshot.state, WireState::DetachedFenced);
+        write_frame(
+            &mut raw,
+            &Request::BeginReconciliation {
+                instance: hello.instance,
+                inventory: hello.slots,
+                interruption_revision: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame::<Response>(&mut raw).unwrap(),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        raw.write_all(&0_u32.to_be_bytes()).unwrap();
+        drop(raw);
+        std::thread::sleep(Duration::from_millis(80));
+        let mut oversized = UnixStream::connect(directory.join("guardian.sock")).unwrap();
+        oversized
+            .write_all(
+                &((phoenix_deployment_controller::guardian_ipc::MAX_FRAME_BYTES + 1) as u32)
+                    .to_be_bytes(),
+            )
+            .unwrap();
+        drop(oversized);
+        std::thread::sleep(Duration::from_millis(80));
+        let mut replacement = GuardianClient::connect(&directory).unwrap();
+        assert_eq!(
+            replacement.hello().unwrap().state,
+            WireState::DetachedFenced
+        );
+    });
+}
+
+#[test]
+fn disposable_path_rejects_existing_symlink_and_broad_parent() {
+    let parent = tempfile::tempdir().unwrap();
+    let private = parent.path().join("sdc-disposable-safe");
+    bind_disposable(&private).unwrap();
+    assert!(bind_disposable(&private).is_err());
+    assert!(disposable_dir(
+        std::env::temp_dir().join("sdc-disposable-unsafe").as_path(),
+        true
+    )
+    .is_err());
+    let link = parent.path().join("sdc-disposable-link");
+    std::os::unix::fs::symlink(&private, &link).unwrap();
+    assert!(disposable_dir(&link, false).is_err());
+    assert!(disposable_dir(parent.path().join("phoenix-production").as_path(), true).is_err());
+}

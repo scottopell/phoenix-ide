@@ -511,6 +511,7 @@ pub enum WireError {
     AdmissionMismatch,
     NoStagedTicket,
     MissingProof,
+    UnsupportedDurableBinding,
     Guardian(WireGuardianError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -578,6 +579,7 @@ pub struct GuardianServer<E: GuardianExecutor> {
     refused: Vec<DispatchTicket>,
     admissions: BTreeMap<u64, (ControllerSession, DispatchTicket)>,
     next_admission: u64,
+    native_unbound: bool,
 }
 impl<E: GuardianExecutor> GuardianServer<E> {
     /// Construct a server bound to an authenticated policy session.
@@ -601,8 +603,16 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             refused: Vec::new(),
             admissions: BTreeMap::new(),
             next_admission: 1,
+            native_unbound: false,
         })
     }
+    /// Disable native mutation until durable policy binding can stage affine proof.
+    /// The disposable process may expose observations, but cannot fabricate a
+    /// committed transition, interruption, reconciliation or applied ACK.
+    pub fn require_native_binding(&mut self) {
+        self.native_unbound = true;
+    }
+
     /// Returns the live guardian without exposing mutable custody.
     pub fn guardian(&self) -> &Guardian<E> {
         &self.guardian
@@ -716,6 +726,19 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         self.ack_proofs.clear();
     }
     pub fn handle(&mut self, request: Request) -> Response {
+        if self.native_unbound
+            && !matches!(
+                request,
+                Request::Hello
+                    | Request::Snapshot
+                    | Request::Inventory
+                    | Request::ObserveSlot { .. }
+                    | Request::ObserveRetained { .. }
+                    | Request::Fence { .. }
+            )
+        {
+            return Response::Refused(WireError::UnsupportedDurableBinding);
+        }
         match self.try_handle(request) {
             Ok(response) => response,
             Err(error) => Response::Refused(error),
