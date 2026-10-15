@@ -2453,7 +2453,7 @@ class PreparationTests(unittest.TestCase):
                 self.assertEqual(1, helper.main())
             self.assertEqual(manifest.transaction_id, claim.read_text().strip())
 
-    def test_precondition_failure_is_terminal_and_releases_claim(self):
+    def test_precondition_failure_is_classified_as_terminal(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
             helper.write_status(manifest, "precondition_failed", failure="bad staged plist")

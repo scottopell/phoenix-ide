@@ -170,6 +170,10 @@ class ConcurrentDeploy(ActivationError):
     pass
 
 
+class CurrentSchemaPreconditionFailure(ActivationError):
+    pass
+
+
 class VerifiedPredecessorFinalizationError(ActivationError):
     pass
 
@@ -531,6 +535,91 @@ def database_ledger(path: Path) -> tuple[tuple[int, str], ...]:
     return tuple((version, name) for version, name in rows)
 
 
+def _validate_product_conversation_schema(connection) -> None:
+    required_tables = {
+        "conversations",
+        "product_conversations",
+        "product_conversation_sources",
+    }
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
+            tuple(sorted(required_tables)),
+        )
+    }
+    missing_tables = sorted(required_tables - tables)
+    if missing_tables:
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: missing table(s) "
+            + ", ".join(missing_tables)
+        )
+
+    conversation_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(conversations)")
+    }
+    if conversation_columns.get("product_conversation_id") != ("TEXT", 0, 0):
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "conversations.product_conversation_id must be nullable TEXT"
+        )
+    conversation_foreign_keys = {
+        (str(row[2]), str(row[3]), str(row[4]), str(row[6]).upper())
+        for row in connection.execute("PRAGMA foreign_key_list(conversations)")
+    }
+    if (
+        "product_conversations",
+        "product_conversation_id",
+        "id",
+        "CASCADE",
+    ) not in conversation_foreign_keys:
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "conversations.product_conversation_id foreign key is missing"
+        )
+
+    source_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(product_conversation_sources)")
+    }
+    required_source_columns = {
+        "target_product_conversation_id": ("TEXT", 0, 1),
+        "source_product_conversation_id": ("TEXT", 1, 0),
+        "source_conversation_id": ("TEXT", 1, 0),
+        "relation_kind": ("TEXT", 1, 0),
+        "relation_key": ("TEXT", 1, 0),
+        "created_at_us": ("INTEGER", 1, 0),
+    }
+    if any(
+        source_columns.get(name) != shape
+        for name, shape in required_source_columns.items()
+    ):
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "product_conversation_sources columns do not match migration 70"
+        )
+    source_foreign_keys = {
+        (str(row[2]), str(row[3]), str(row[4]), str(row[6]).upper())
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(product_conversation_sources)"
+        )
+    }
+    required_source_foreign_keys = {
+        (
+            "product_conversations",
+            "target_product_conversation_id",
+            "id",
+            "CASCADE",
+        ),
+    }
+    if not required_source_foreign_keys.issubset(source_foreign_keys):
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "product_conversation_sources foreign keys do not match migration 70"
+        )
+
+
 def validate_current_schema_database(
     path: Path,
     registry_path: Path,
@@ -552,17 +641,9 @@ def validate_current_schema_database(
         )
     try:
         with closing(_readonly_connection(path)) as connection:
-            tables = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-                    "('product_conversations', 'product_conversation_members')"
-                )
-            }
+            _validate_product_conversation_schema(connection)
     except sqlite3.Error as exc:
-        raise ActivationError("current-schema table check failed") from exc
-    if tables != {"product_conversations", "product_conversation_members"}:
-        raise ActivationError("current-schema migration requires ProductConversation tables")
+        raise ActivationError("current-schema ProductConversation schema check failed") from exc
     return ledger
 
 
@@ -1177,6 +1258,18 @@ def finalize_verified_predecessor(manifest: Manifest, failure: str | None) -> No
     write_verified_predecessor_status(manifest, failure=failure)
 
 
+def release_durable_terminal_claim(
+    manifest: Manifest, *, required_state: Optional[str] = None
+) -> bool:
+    if not status_is_durable_terminal(manifest):
+        return False
+    status = read_status(manifest)
+    if required_state is not None and status.get("state") != required_state:
+        return False
+    fsync_dir(Path(manifest.status_path).parent)
+    return release_claim(manifest)
+
+
 def release_claim(manifest: Manifest) -> bool:
     claim = Path(manifest.active_path)
     claim_lock = Path(manifest.claim_lock_path)
@@ -1418,6 +1511,21 @@ def validate_manifest_identities(manifest: Manifest) -> None:
         raise ActivationError("previous runtime identity is malformed")
 
 
+def require_fresh_prepared_activation(manifest: Manifest) -> None:
+    if manifest.current_schema_upgrade is None:
+        return
+    status = read_status(manifest)
+    if (
+        status.get("transaction_id") == manifest.transaction_id
+        and status.get("state") == "prepared"
+        and not status.get("finalization_pending", False)
+    ):
+        return
+    raise ActivationError(
+        "prepared activation requires the matching fresh prepared transaction"
+    )
+
+
 def activate(manifest: Manifest) -> str:
     lock_path = Path(manifest.lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1426,6 +1534,8 @@ def activate(manifest: Manifest) -> str:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another deployment is already activating") from exc
+
+        require_fresh_prepared_activation(manifest)
 
         prepared_installs: list[Path] = []
         prepared_rollback: Optional[tuple[Path, Path]] = None
@@ -1487,6 +1597,8 @@ def activate(manifest: Manifest) -> str:
             for prepared in prepared_installs:
                 prepared.unlink(missing_ok=True)
             write_status(manifest, "precondition_failed", failure=str(exc))
+            if manifest.current_schema_upgrade is not None:
+                raise CurrentSchemaPreconditionFailure(str(exc)) from exc
             raise
 
         launchctl = Launchctl(manifest)
@@ -1628,6 +1740,8 @@ def activate(manifest: Manifest) -> str:
                 if capacity_reservation is not None and not database_snapshot:
                     abandon_capacity_reservation(manifest, capacity_reservation)
                 write_status(manifest, "precondition_failed", failure=failure)
+                if manifest.current_schema_upgrade is not None:
+                    raise CurrentSchemaPreconditionFailure(failure) from activation_exc
                 raise
             try:
                 restore(
@@ -2064,9 +2178,8 @@ def main() -> int:
             state = resume_forward(manifest)
         else:
             state = activate(manifest)
-        if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
-            fsync_dir(Path(manifest.status_path).parent)
-            release_claim(manifest)
+        if state in TERMINAL_STATES:
+            release_durable_terminal_claim(manifest)
         print(state, flush=True)
         return 0 if state == "committed" or (args.command in {"recover-paired", "recover-current"} and state == "activation_failed_rolled_back") else 1
     except ConcurrentDeploy as exc:
@@ -2093,8 +2206,24 @@ def main() -> int:
     except Exception as exc:
         if manifest is not None and args.command in {"recover-paired", "recover-current"}:
             record_recovery_error(manifest, exc)
-        if manifest is not None and args.command not in {"finalize-paired", "finalize-current", "resume-forward"} and prepared_database_upgrade(manifest) is None and status_is_durable_terminal(manifest):
-            release_claim(manifest)
+        if manifest is not None and args.command not in {"finalize-paired", "finalize-current", "resume-forward"}:
+            if prepared_database_upgrade(manifest) is None:
+                if status_is_durable_terminal(manifest):
+                    release_claim(manifest)
+            elif (
+                args.command in {None, "activate"}
+                and isinstance(exc, CurrentSchemaPreconditionFailure)
+            ):
+                try:
+                    release_durable_terminal_claim(
+                        manifest, required_state="precondition_failed"
+                    )
+                except Exception as release_exc:
+                    print(
+                        "activation helper could not release durable precondition claim: "
+                        f"{release_exc}",
+                        file=sys.stderr,
+                    )
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     finally:
