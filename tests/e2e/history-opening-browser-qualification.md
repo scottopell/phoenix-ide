@@ -1230,3 +1230,42 @@ focused donor Vitest 54 across two files. No local compile, install, application
 server, browser capture or large artifact copy was performed. New-source full
 UI/codegen/Rust/runtime/normal drain/export remain hosted obligations, not
 inferred from those source and mock checks.
+
+
+## Producer-admitted pagehide classification after run 38807478274
+
+Diagnostic app `debe253` / harness `532112bc` produced witness `116671957805`
+failure in run `38807478274`, artifact `12007392732`. Selected small receipts
+were retained using 53,289 bytes of ZIP range reads. The original assertion now
+survives: `sampled pagehide must report once`, actual zero versus one expected.
+This trial has no report, no response status and only page/context-close facts;
+that does not prove an attempted or failed transport. Stock telemetry completed
+48 trials, 13 sampled/13 POSTs, and all seven collector negatives including 401.
+Those observations remain distinct from whole-case acceptance and the earlier
+243 trial with a report body but missing response 204.
+
+Exact donor `50c8fbbab918b15dcf5c149c5cb091c108396567` is integrated as app
+`e84f78faa572da6156d541360ce6ccb96bb11eb8`, tree
+`6a5fa5017bf2315892ca06cea7446678c237123b`, directly atop `debe253`. Pagehide
+installs the existing bounded read-only producer diagnostic contract before page
+creation and classifies sampling from its explicit admission. A sampled finite
+request UUID must match the producer request-association event, and the report
+must match that admission. Missing, invalid, overflowing or foreign admission
+fails closed. A genuinely unsampled correlated GET remains inconclusive, with
+no forced pagehide or report; a sampled journey without a POST still fails.
+The 64-event cap and existing 32-fact transport cap are retained. Observer phases
+do not promise complete close-time delivery or normal application shutdown.
+
+The old correlated-GET sampling assignment is removed. Other lifecycle probes
+use finite GETs only to establish an actual pending request and still demand a
+correlated report and 204; absence-only labels now say `sampling_unknown` rather
+than imply an unobserved sampling decision. No sampling force, readiness change,
+timeout increase, response-status relaxation or export exemption is introduced.
+The earlier report-body-without-204 case remains causally unresolved.
+
+Actual cached offline checks passed: shipping Python 16, base Node 14, opening
+Python 46, opening Node 30, joint Node 50 and donor Vitest 59 across two files,
+plus syntax and diff checks. These include genuine-unsampled correlated GET,
+missing admission, foreign request UUID, overflow, sampled/no-POST and missing
+response controls. No local compile/install/server/capture or large copy was
+performed. New-source full UI/Rust/runtime/drain/export acceptance remains owed.
