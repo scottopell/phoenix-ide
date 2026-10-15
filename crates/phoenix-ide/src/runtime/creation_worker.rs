@@ -489,7 +489,7 @@ async fn persist_retryable_delivery_failure(
     claimed: &crate::db::ClaimedProductCreationJob,
     delivery_error: &str,
 ) -> Result<String, String> {
-    manager
+    let scheduled = manager
         .db()
         .schedule_product_creation_delivery_retry(
             &claimed.job.request_id,
@@ -501,6 +501,11 @@ async fn persist_retryable_delivery_failure(
         .map_err(|db_error| {
             format!("{delivery_error}; delivery retry persistence failed: {db_error}")
         })?;
+    if !scheduled {
+        return Err(format!(
+            "{delivery_error}; delivery retry persistence lost its claim"
+        ));
+    }
     manager.kick_creation_worker();
     Ok(delivery_error.to_string())
 }
@@ -600,7 +605,14 @@ async fn deliver_product_creation_objective_inner(
         })
         .collect();
     let expanded =
-        expand_product_creation_objective(manager, &conversation_id, &job.intent.objective).await?;
+        match expand_product_creation_objective(manager, &conversation_id, &job.intent.objective)
+            .await
+        {
+            Ok(expanded) => expanded,
+            Err(error) => {
+                return Err(persist_retryable_delivery_failure(manager, claimed, &error).await?);
+            }
+        };
     checkpoint_product_creation_stage(
         manager,
         claimed,
@@ -3514,6 +3526,7 @@ mod product_creation_delivery_replay_tests {
         cwd: &str,
         request_id: &str,
         conversation_id: &str,
+        objective: &str,
     ) -> (
         ProductCreationIntent,
         phoenix_core::domain::close::ProductConversationId,
@@ -3522,7 +3535,7 @@ mod product_creation_delivery_replay_tests {
         let intent = ProductCreationIntent {
             origin: phoenix_db::ProductCreationOrigin::UserApi,
             cwd: cwd.to_string(),
-            objective: "deliver objective".to_string(),
+            objective: objective.to_string(),
             model: None,
             effort: None,
             images: Vec::new(),
@@ -3569,7 +3582,14 @@ mod product_creation_delivery_replay_tests {
         request_id: &str,
         conversation_id: &str,
     ) -> crate::db::ClaimedProductCreationJob {
-        seed_retry_identity_delivery(db, cwd.to_str().unwrap(), request_id, conversation_id).await;
+        seed_retry_identity_delivery(
+            db,
+            cwd.to_str().unwrap(),
+            request_id,
+            conversation_id,
+            "deliver objective",
+        )
+        .await;
         let job = db
             .get_product_creation_job(request_id)
             .await
@@ -4260,6 +4280,52 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
+    async fn objective_expansion_failure_exhausts_bounded_delivery_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let request_id = "req-expansion-failure";
+        let conversation_id = "conv-expansion-failure";
+        let manager = test_runtime_manager(db.clone());
+        let (_, _, publish_lease_until) = seed_retry_identity_delivery(
+            &db,
+            root.path().to_str().unwrap(),
+            request_id,
+            conversation_id,
+            "Read @missing.md",
+        )
+        .await;
+        let mut claim_time = publish_lease_until + chrono::Duration::seconds(1);
+
+        for attempt in 1..=4 {
+            let delivery =
+                claim_delivery_attempt(&db, request_id, &attempt.to_string(), claim_time).await;
+            let error = Box::pin(deliver_product_creation_objective(&manager, &delivery))
+                .await
+                .unwrap_err();
+            assert!(error.contains("missing.md"));
+            let job = product_creation_job(&db, request_id).await;
+            assert_eq!(
+                job.status,
+                if attempt < 4 {
+                    "delivery_pending"
+                } else {
+                    "delivery_failed"
+                }
+            );
+            assert_eq!(job.last_error.as_deref(), Some(error.as_str()));
+            if attempt < 4 {
+                claim_time = job.delivery_retry_at.unwrap() + chrono::Duration::seconds(1);
+            } else {
+                assert!(job.delivery_retry_at.is_none());
+            }
+        }
+        assert_eq!(
+            global_objective_artifact_counts(&db, request_id).await,
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
     async fn initial_objective_expands_against_published_conversation_root() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("notes.md"), "published root contents").unwrap();
@@ -4413,7 +4479,14 @@ mod product_creation_delivery_replay_tests {
         let conversation_id = "conv-retry-identities";
         let manager = test_runtime_manager(db.clone());
         let (_intent, accepted_product_id, publish_claim_lease_until) =
-            seed_retry_identity_delivery(&db, &cwd, request_id, conversation_id).await;
+            seed_retry_identity_delivery(
+                &db,
+                &cwd,
+                request_id,
+                conversation_id,
+                "deliver objective",
+            )
+            .await;
         let baseline_artifact_counts = global_objective_artifact_counts(&db, request_id).await;
         assert_eq!(baseline_artifact_counts, (0, 0));
         let baseline_job_count: i64 =
