@@ -69,8 +69,7 @@ use tracing::Instrument;
 #[cfg(not(test))]
 const CREATION_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(test)]
-const CREATION_RECONCILE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(100);
+const CREATION_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Shared slot carrying the trace identity of whatever triggered a
 /// conversation's next turn: the HTTP request span that delivered the user
@@ -6647,8 +6646,12 @@ impl RuntimeManager {
         request_fingerprint: &str,
     ) -> Result<(), SteeringAdmissionError> {
         self.enqueue_steer_message_with_authority(
-            conversation_id, event, request_fingerprint, SteeringAppendAuthority::Ordinary,
-        ).await
+            conversation_id,
+            event,
+            request_fingerprint,
+            SteeringAppendAuthority::Ordinary,
+        )
+        .await
     }
 
     pub async fn enqueue_product_creation_steer_message(
@@ -6657,12 +6660,18 @@ impl RuntimeManager {
         event: Event,
         request_fingerprint: &str,
     ) -> Result<(), SteeringAdmissionError> {
-        let conversation_id = delivery.job.published_conversation_id.as_deref()
+        let conversation_id = delivery
+            .job
+            .published_conversation_id
+            .as_deref()
             .ok_or(SteeringAdmissionError::ProductCreationClaimLost)?;
         self.enqueue_steer_message_with_authority(
-            conversation_id, event, request_fingerprint,
+            conversation_id,
+            event,
+            request_fingerprint,
             SteeringAppendAuthority::ProductCreation(delivery),
-        ).await
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6733,26 +6742,36 @@ impl RuntimeManager {
             }
 
             let append_result = match &authority {
-                SteeringAppendAuthority::Ordinary => self.db()
-                    .append_steering_entry(conversation_id, &new_entry, request_fingerprint).await,
-                SteeringAppendAuthority::ProductCreation(delivery) => self.db()
-                    .append_product_creation_steering_entry(delivery, &new_entry, request_fingerprint).await,
+                SteeringAppendAuthority::Ordinary => {
+                    self.db()
+                        .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
+                        .await
+                }
+                SteeringAppendAuthority::ProductCreation(delivery) => {
+                    self.db()
+                        .append_product_creation_steering_entry(
+                            delivery,
+                            &new_entry,
+                            request_fingerprint,
+                        )
+                        .await
+                }
             };
             let queue_position = append_result.map_err(|error| match error {
-                    crate::db::DbError::ProductCreationClaimLost => {
-                        SteeringAdmissionError::ProductCreationClaimLost
-                    }
-                    crate::db::DbError::CloseAdmissionFenced(_) => {
-                        SteeringAdmissionError::CloseAdmissionFenced
-                    }
-                    crate::db::DbError::ProductConversationUnavailable(_) => {
-                        SteeringAdmissionError::HistoryUnavailable
-                    }
-                    crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
-                    error => SteeringAdmissionError::Internal(format!(
-                        "Failed to persist steering queue before enqueue: {error}"
-                    )),
-                })?;
+                crate::db::DbError::ProductCreationClaimLost => {
+                    SteeringAdmissionError::ProductCreationClaimLost
+                }
+                crate::db::DbError::CloseAdmissionFenced(_) => {
+                    SteeringAdmissionError::CloseAdmissionFenced
+                }
+                crate::db::DbError::ProductConversationUnavailable(_) => {
+                    SteeringAdmissionError::HistoryUnavailable
+                }
+                crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
+                error => SteeringAdmissionError::Internal(format!(
+                    "Failed to persist steering queue before enqueue: {error}"
+                )),
+            })?;
             let _ = handle.broadcast_tx.send_live_projection(|sequence_id| {
                 SseEvent::SteerMessageQueued {
                     sequence_id,

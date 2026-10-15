@@ -999,9 +999,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
-        | crate::db::DbError::ProductCreationClaimLost) => {
-            map_db_internal_error(&other)
-        }
+        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
     }
 }
 
@@ -1052,9 +1050,7 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
-        | crate::db::DbError::ProductCreationClaimLost) => {
-            map_db_internal_error(&other)
-        }
+        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
     }
 }
 

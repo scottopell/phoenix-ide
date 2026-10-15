@@ -85,11 +85,7 @@ async fn checkpoint_product_creation_stage(
     };
     if manager
         .db()
-        .advance_product_creation_provisioning_stage(
-            &claimed.job.request_id,
-            &claimed.claim,
-            stage,
-        )
+        .advance_product_creation_provisioning_stage(&claimed.job.request_id, &claimed.claim, stage)
         .await
         .map_err(|error| error.to_string())?
     {
@@ -970,10 +966,11 @@ async fn run_product_creation_until_closed(
         .unwrap()
         .clone();
     #[cfg(test)]
-    let (lease, heartbeat_interval) = policy.as_ref().map_or(
-        (lease, heartbeat_interval),
-        |policy| (policy.lease, policy.heartbeat_interval),
-    );
+    let (lease, heartbeat_interval) = policy
+        .as_ref()
+        .map_or((lease, heartbeat_interval), |policy| {
+            (policy.lease, policy.heartbeat_interval)
+        });
     let renewed_at = chrono::Utc::now();
     let mut fatal = manager.fatal_local_authority_receiver();
     if !manager
@@ -1343,8 +1340,11 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         else {
             break;
         };
-        if let Err(error) =
-            Box::pin(process_product_creation_until_closed(manager, claimed.clone())).await
+        if let Err(error) = Box::pin(process_product_creation_until_closed(
+            manager,
+            claimed.clone(),
+        ))
+        .await
         {
             cleanup_and_retry_unpublished_product_creation(
                 manager,
@@ -2903,7 +2903,9 @@ mod product_creation_delivery_replay_tests {
         ] {
             assert!(db
                 .advance_product_creation_provisioning_stage(
-                    &claimed.job.request_id, &claimed.claim, stage,
+                    &claimed.job.request_id,
+                    &claimed.claim,
+                    stage,
                 )
                 .await
                 .unwrap());
@@ -2931,7 +2933,10 @@ mod product_creation_delivery_replay_tests {
         .unwrap();
         let claimed = db
             .claim_product_creation(
-                "later-stage", "worker", "token", chrono::Utc::now(),
+                "later-stage",
+                "worker",
+                "token",
+                chrono::Utc::now(),
                 chrono::Duration::minutes(5),
             )
             .await
@@ -2949,13 +2954,25 @@ mod product_creation_delivery_replay_tests {
                 .unwrap());
         }
         assert!(db
-            .schedule_product_creation_retry("later-stage", &claimed.claim, "retry", chrono::Utc::now())
+            .schedule_product_creation_retry(
+                "later-stage",
+                &claimed.claim,
+                "retry",
+                chrono::Utc::now()
+            )
             .await
             .unwrap());
-        let retry = db.get_product_creation_job("later-stage").await.unwrap().unwrap();
+        let retry = db
+            .get_product_creation_job("later-stage")
+            .await
+            .unwrap()
+            .unwrap();
         let claimed = db
             .claim_product_creation(
-                "later-stage", "replacement", "replacement-token", retry.retry_at.unwrap(),
+                "later-stage",
+                "replacement",
+                "replacement-token",
+                retry.retry_at.unwrap(),
                 chrono::Duration::minutes(5),
             )
             .await
@@ -2974,7 +2991,13 @@ mod product_creation_delivery_replay_tests {
                 .await
                 .unwrap();
             assert_eq!(current_stage, Stage::FinalizeAttachments);
-            assert_eq!(db.get_product_creation_job("later-stage").await.unwrap().unwrap(), before);
+            assert_eq!(
+                db.get_product_creation_job("later-stage")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
         }
         checkpoint_product_creation_stage(
             &manager,
@@ -2985,7 +3008,11 @@ mod product_creation_delivery_replay_tests {
         .await
         .unwrap();
         assert_eq!(current_stage, Stage::CommitMetadata);
-        let advanced = db.get_product_creation_job("later-stage").await.unwrap().unwrap();
+        let advanced = db
+            .get_product_creation_job("later-stage")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(advanced.provisioning_stage, Stage::CommitMetadata);
         assert!(advanced.stage_updated_at >= before.stage_updated_at);
     }
@@ -3028,29 +3055,79 @@ mod product_creation_delivery_replay_tests {
         let manager = test_runtime_manager(db.clone());
         let mut old = accept_and_claim_product_at(&db, "skipped-fence", Path::new("/tmp")).await;
         advance_product_metadata_for_test(&db, &old).await;
-        old.job = db.get_product_creation_job("skipped-fence").await.unwrap().unwrap();
-        assert!(db.schedule_product_creation_retry(
-            "skipped-fence", &old.claim, "retry", chrono::Utc::now(),
-        ).await.unwrap());
-        let retry = db.get_product_creation_job("skipped-fence").await.unwrap().unwrap();
-        let replacement = db.claim_product_creation(
-            "skipped-fence", "replacement", "new-token", retry.retry_at.unwrap(),
-            chrono::Duration::seconds(30),
-        ).await.unwrap().unwrap();
+        old.job = db
+            .get_product_creation_job("skipped-fence")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .schedule_product_creation_retry(
+                "skipped-fence",
+                &old.claim,
+                "retry",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap());
+        let retry = db
+            .get_product_creation_job("skipped-fence")
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = db
+            .claim_product_creation(
+                "skipped-fence",
+                "replacement",
+                "new-token",
+                retry.retry_at.unwrap(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let mut stage = old.job.provisioning_stage;
         assert!(checkpoint_product_creation_stage(
-            &manager, &old, &mut stage, Stage::ResolveStartingPin,
-        ).await.is_err());
+            &manager,
+            &old,
+            &mut stage,
+            Stage::ResolveStartingPin,
+        )
+        .await
+        .is_err());
         assert_eq!(stage, Stage::CommitMetadata);
-        assert_eq!(db.get_product_creation_job("skipped-fence").await.unwrap().unwrap(), replacement.job);
+        assert_eq!(
+            db.get_product_creation_job("skipped-fence")
+                .await
+                .unwrap()
+                .unwrap(),
+            replacement.job
+        );
 
-        assert!(db.cancel_product_creation("skipped-fence", chrono::Utc::now()).await.unwrap());
-        let cancelled = db.get_product_creation_job("skipped-fence").await.unwrap().unwrap();
+        assert!(db
+            .cancel_product_creation("skipped-fence", chrono::Utc::now())
+            .await
+            .unwrap());
+        let cancelled = db
+            .get_product_creation_job("skipped-fence")
+            .await
+            .unwrap()
+            .unwrap();
         let mut stage = replacement.job.provisioning_stage;
         assert!(checkpoint_product_creation_stage(
-            &manager, &replacement, &mut stage, Stage::ValidateIntent,
-        ).await.is_err());
-        assert_eq!(db.get_product_creation_job("skipped-fence").await.unwrap().unwrap(), cancelled);
+            &manager,
+            &replacement,
+            &mut stage,
+            Stage::ValidateIntent,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            db.get_product_creation_job("skipped-fence")
+                .await
+                .unwrap()
+                .unwrap(),
+            cancelled
+        );
     }
 
     fn initialized_product_repository() -> tempfile::TempDir {
@@ -3059,10 +3136,24 @@ mod product_creation_delivery_replay_tests {
             vec!["init", "--initial-branch=main"],
             vec!["config", "user.name", "Product Creation Test"],
             vec!["config", "user.email", "product-creation@example.invalid"],
-            vec!["-c", "commit.gpgSign=false", "commit", "--allow-empty", "-m", "main pin"],
+            vec![
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "main pin",
+            ],
             vec!["tag", "protected-tag"],
             vec!["checkout", "-b", "user-work"],
-            vec!["-c", "commit.gpgSign=false", "commit", "--allow-empty", "-m", "user work"],
+            vec![
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "user work",
+            ],
         ] {
             crate::git_ops::run_git(repo.path(), &args).unwrap();
         }
@@ -3072,8 +3163,14 @@ mod product_creation_delivery_replay_tests {
     fn product_repository_refs(repo: &Path) -> String {
         crate::git_ops::run_git(
             repo,
-            &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags"],
-        ).unwrap()
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/tags",
+            ],
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -3084,36 +3181,69 @@ mod product_creation_delivery_replay_tests {
         let mut claimed = accept_and_claim_product_at(&db, "git-pin", repo.path()).await;
         let (oid, base) = strict_product_creation_pin(repo.path()).unwrap();
         assert_eq!(base, "main");
-        assert_ne!(crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap().trim(), oid);
+        assert_ne!(
+            crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            oid
+        );
         assert!(matches!(
-            db.pin_product_creation_once("git-pin", &claimed.claim, &oid, &base, "fresh").await.unwrap(),
+            db.pin_product_creation_once("git-pin", &claimed.claim, &oid, &base, "fresh")
+                .await
+                .unwrap(),
             crate::db::ProductCreationPinOutcome::Pinned(_)
         ));
-        claimed.job = db.get_product_creation_job("git-pin").await.unwrap().unwrap();
+        claimed.job = db
+            .get_product_creation_job("git-pin")
+            .await
+            .unwrap()
+            .unwrap();
         let persisted_oid = claimed.job.pin_exact_checkout_oid.clone().unwrap();
         assert_eq!(persisted_oid, oid);
         // Move main after pin persistence so re-resolving the branch cannot pass this test.
         crate::git_ops::run_git(repo.path(), &["update-ref", "refs/heads/main", "HEAD"]).unwrap();
         let before = product_repository_refs(repo.path());
-        assert_eq!(before.lines().count(), 3, "snapshot must include both heads and the tag");
+        assert_eq!(
+            before.lines().count(),
+            3,
+            "snapshot must include both heads and the tag"
+        );
         assert!(before.contains("refs/heads/main "));
         assert!(before.contains("refs/heads/user-work "));
         assert!(before.contains("refs/tags/protected-tag "));
         let original_head = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
         assert_ne!(original_head.trim(), persisted_oid);
         let worktree = deterministic_worktree_path(
-            repo.path().to_str().unwrap(), claimed.job.product_conversation_id.as_str(),
+            repo.path().to_str().unwrap(),
+            claimed.job.product_conversation_id.as_str(),
         );
         let result = Box::pin(process_product_creation_until_closed(&manager, claimed)).await;
-        let job = db.get_product_creation_job("git-pin").await.unwrap().unwrap();
+        let job = db
+            .get_product_creation_job("git-pin")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(job.published_conversation_id.is_some(), "{result:?}");
         assert_eq!(job.pin_exact_checkout_oid.as_deref(), Some(oid.as_str()));
         validate_detached_task_worktree(&worktree, &persisted_oid).unwrap();
-        assert_eq!(crate::git_ops::run_git(&worktree, &["rev-parse", "HEAD"]).unwrap().trim(), persisted_oid);
+        assert_eq!(
+            crate::git_ops::run_git(&worktree, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            persisted_oid
+        );
         assert!(crate::git_ops::run_git(&worktree, &["symbolic-ref", "-q", "HEAD"]).is_err());
         assert_eq!(product_repository_refs(repo.path()), before);
-        assert_eq!(crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap(), original_head);
-        assert_eq!(crate::git_ops::run_git(repo.path(), &["symbolic-ref", "HEAD"]).unwrap().trim(), "refs/heads/user-work");
+        assert_eq!(
+            crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap(),
+            original_head
+        );
+        assert_eq!(
+            crate::git_ops::run_git(repo.path(), &["symbolic-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            "refs/heads/user-work"
+        );
     }
 
     #[tokio::test]
@@ -3126,45 +3256,85 @@ mod product_creation_delivery_replay_tests {
         let manager = test_runtime_manager(db.clone());
         let claimed = accept_and_claim_product_at(&db, "cancel-lock", repo.path()).await;
         let worktree = deterministic_worktree_path(
-            repo.path().to_str().unwrap(), claimed.job.product_conversation_id.as_str(),
+            repo.path().to_str().unwrap(),
+            claimed.job.product_conversation_id.as_str(),
         );
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             let claimed = claimed.clone();
-            async move {
-                Box::pin(process_product_creation_until_closed(&manager, claimed)).await
-            }
+            async move { Box::pin(process_product_creation_until_closed(&manager, claimed)).await }
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let job = db.get_product_creation_job("cancel-lock").await.unwrap().unwrap();
+                let job = db
+                    .get_product_creation_job("cancel-lock")
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if job.provisioning_stage == Stage::ResolveStartingPin {
                     break;
                 }
-                assert!(!worker.is_finished(), "worker exited before the pin lock barrier");
+                assert!(
+                    !worker.is_finished(),
+                    "worker exited before the pin lock barrier"
+                );
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(!worker.is_finished());
-        assert!(db.cancel_product_creation("cancel-lock", chrono::Utc::now()).await.unwrap());
-        let cancelled = db.get_product_creation_job("cancel-lock").await.unwrap().unwrap();
+        assert!(db
+            .cancel_product_creation("cancel-lock", chrono::Utc::now())
+            .await
+            .unwrap());
+        let cancelled = db
+            .get_product_creation_job("cancel-lock")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cancelled.claim_generation > claimed.claim.generation);
         drop(lock);
-        assert!(tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().is_err());
-        assert_eq!(db.get_product_creation_job("cancel-lock").await.unwrap().unwrap(), cancelled);
+        assert!(tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            db.get_product_creation_job("cancel-lock")
+                .await
+                .unwrap()
+                .unwrap(),
+            cancelled
+        );
         assert_eq!(cancelled.provisioning_stage, Stage::ResolveStartingPin);
         assert!(cancelled.pin_exact_checkout_oid.is_none());
         assert!(cancelled.staging_path.is_none());
         assert!(cancelled.published_conversation_id.is_none());
         assert!(cancelled.published_product_id.is_none());
-        assert!(db.get_product_creation_resource_reservations("cancel-lock").await.unwrap().is_empty());
+        assert!(db
+            .get_product_creation_resource_reservations("cancel-lock")
+            .await
+            .unwrap()
+            .is_empty());
         assert!(!worktree.exists());
         assert_eq!(product_repository_refs(repo.path()), before_refs);
         let mut stage = Stage::ResolveStartingPin;
         assert!(checkpoint_product_creation_stage(
-            &manager, &claimed, &mut stage, Stage::MaterializeWorktree,
-        ).await.is_err());
-        assert_eq!(db.get_product_creation_job("cancel-lock").await.unwrap().unwrap(), cancelled);
+            &manager,
+            &claimed,
+            &mut stage,
+            Stage::MaterializeWorktree,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            db.get_product_creation_job("cancel-lock")
+                .await
+                .unwrap()
+                .unwrap(),
+            cancelled
+        );
     }
 
     #[tokio::test]
@@ -3199,29 +3369,39 @@ mod product_creation_delivery_replay_tests {
         .unwrap();
         let claimed = db
             .claim_product_creation(
-                "direct-stages", "worker", "token", chrono::Utc::now(),
+                "direct-stages",
+                "worker",
+                "token",
+                chrono::Utc::now(),
                 chrono::Duration::minutes(5),
             )
             .await
             .unwrap()
             .unwrap();
         let _delivery_result = process_claimed_product_creation(&manager, &claimed).await;
-        let stages: Vec<String> = sqlx::query_scalar(
-            "SELECT stage FROM observed_creation_stages ORDER BY rowid",
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
-        assert!(stages.starts_with(&[
-            "resolve_repository".to_string(),
-            "resolve_starting_pin".to_string(),
-            "materialize_worktree".to_string(),
-            "finalize_attachments".to_string(),
-            "commit_metadata".to_string(),
-            "bootstrap_initial_turn".to_string(),
-        ]), "{stages:?}");
-        let job = db.get_product_creation_job("direct-stages").await.unwrap().unwrap();
-        let conversation = db.get_conversation(job.published_conversation_id.as_ref().unwrap())
+        let stages: Vec<String> =
+            sqlx::query_scalar("SELECT stage FROM observed_creation_stages ORDER BY rowid")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            stages.starts_with(&[
+                "resolve_repository".to_string(),
+                "resolve_starting_pin".to_string(),
+                "materialize_worktree".to_string(),
+                "finalize_attachments".to_string(),
+                "commit_metadata".to_string(),
+                "bootstrap_initial_turn".to_string(),
+            ]),
+            "{stages:?}"
+        );
+        let job = db
+            .get_product_creation_job("direct-stages")
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = db
+            .get_conversation(job.published_conversation_id.as_ref().unwrap())
             .await
             .unwrap();
         assert_eq!(conversation.conv_mode, ConvMode::Direct);
@@ -3394,7 +3574,11 @@ mod product_creation_delivery_replay_tests {
         conversation_id: &str,
     ) -> crate::db::ClaimedProductCreationJob {
         seed_retry_identity_delivery(db, cwd.to_str().unwrap(), request_id, conversation_id).await;
-        let job = db.get_product_creation_job(request_id).await.unwrap().unwrap();
+        let job = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
         crate::db::ClaimedProductCreationJob {
             claim: crate::db::ProductCreationClaim {
                 worker_id: job.claim_worker_id.clone().unwrap(),
@@ -3410,11 +3594,18 @@ mod product_creation_delivery_replay_tests {
     async fn delivery_claim_renewal_preserves_identity_and_expiry_fences() {
         let db = Database::open_in_memory().await.unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let delivery = seed_live_delivery(&db, directory.path(), "renew-delivery", "renew-root").await;
+        let delivery =
+            seed_live_delivery(&db, directory.path(), "renew-delivery", "renew-root").await;
         let now = chrono::Utc::now();
-        assert!(db.renew_product_creation_claim(
-            "renew-delivery", &delivery.claim, now, chrono::Duration::seconds(30),
-        ).await.unwrap());
+        assert!(db
+            .renew_product_creation_claim(
+                "renew-delivery",
+                &delivery.claim,
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
         for wrong_field in 0..3 {
             let mut stale = delivery.claim.clone();
             match wrong_field {
@@ -3422,34 +3613,83 @@ mod product_creation_delivery_replay_tests {
                 1 => stale.worker_id.push_str("-wrong"),
                 _ => stale.token.push_str("-wrong"),
             }
-            assert!(!db.renew_product_creation_claim(
-                "renew-delivery", &stale, now + chrono::Duration::seconds(1),
-                chrono::Duration::seconds(30),
-            ).await.unwrap());
+            assert!(!db
+                .renew_product_creation_claim(
+                    "renew-delivery",
+                    &stale,
+                    now + chrono::Duration::seconds(1),
+                    chrono::Duration::seconds(30),
+                )
+                .await
+                .unwrap());
         }
-        let expiry = db.get_product_creation_job("renew-delivery").await.unwrap().unwrap().claim_lease_until.unwrap();
-        assert_eq!(expiry.timestamp_micros(), (now + chrono::Duration::seconds(30)).timestamp_micros());
-        assert!(!db.renew_product_creation_claim(
-            "renew-delivery", &delivery.claim, expiry, chrono::Duration::seconds(30),
-        ).await.unwrap());
-        let replacement = db.claim_next_product_creation_delivery(
-            "replacement", "new-token", expiry, chrono::Duration::seconds(30),
-        ).await.unwrap().unwrap();
+        let expiry = db
+            .get_product_creation_job("renew-delivery")
+            .await
+            .unwrap()
+            .unwrap()
+            .claim_lease_until
+            .unwrap();
+        assert_eq!(
+            expiry.timestamp_micros(),
+            (now + chrono::Duration::seconds(30)).timestamp_micros()
+        );
+        assert!(!db
+            .renew_product_creation_claim(
+                "renew-delivery",
+                &delivery.claim,
+                expiry,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
+        let replacement = db
+            .claim_next_product_creation_delivery(
+                "replacement",
+                "new-token",
+                expiry,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert!(replacement.claim.generation > delivery.claim.generation);
-        assert!(!db.renew_product_creation_claim(
-            "renew-delivery", &delivery.claim, expiry, chrono::Duration::seconds(30),
-        ).await.unwrap());
-        assert!(db.renew_product_creation_claim(
-            "renew-delivery", &replacement.claim, expiry + chrono::Duration::seconds(1),
-            chrono::Duration::seconds(30),
-        ).await.unwrap());
-        assert!(db.schedule_product_creation_delivery_retry(
-            "renew-delivery", &replacement.claim, "retry", expiry + chrono::Duration::seconds(2),
-        ).await.unwrap());
-        assert!(!db.renew_product_creation_claim(
-            "renew-delivery", &replacement.claim, expiry + chrono::Duration::seconds(3),
-            chrono::Duration::seconds(30),
-        ).await.unwrap());
+        assert!(!db
+            .renew_product_creation_claim(
+                "renew-delivery",
+                &delivery.claim,
+                expiry,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .renew_product_creation_claim(
+                "renew-delivery",
+                &replacement.claim,
+                expiry + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .schedule_product_creation_delivery_retry(
+                "renew-delivery",
+                &replacement.claim,
+                "retry",
+                expiry + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .renew_product_creation_claim(
+                "renew-delivery",
+                &replacement.claim,
+                expiry + chrono::Duration::seconds(3),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
     }
 
     const SHORT_CLAIM_LEASE: chrono::Duration = chrono::Duration::milliseconds(300);
@@ -3471,21 +3711,33 @@ mod product_creation_delivery_replay_tests {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
         let directory = tempfile::tempdir().unwrap();
-        let delivery = seed_live_delivery(&db, directory.path(), "slow-delivery", "slow-root").await;
+        let delivery =
+            seed_live_delivery(&db, directory.path(), "slow-delivery", "slow-root").await;
         let mut renewals = install_short_claim_guard_policy(&manager);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
-                    started_tx.send(()).unwrap();
-                    release_rx.await.unwrap();
-                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
-                })).await
+                run_product_creation_until_closed(
+                    &manager,
+                    &delivery,
+                    Box::pin(async {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Box::pin(deliver_product_creation_objective_inner(
+                            &manager, &delivery,
+                        ))
+                        .await
+                    }),
+                )
+                .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
         let first_renewal = tokio::time::timeout(Duration::from_secs(1), renewals.recv())
             .await
             .expect("claim guard must renew within the bounded wait")
@@ -3501,20 +3753,42 @@ mod product_creation_delivery_replay_tests {
         })
         .await
         .expect("a heartbeat must successfully renew after the initial lease expired");
-        let current = db.get_product_creation_job("slow-delivery").await.unwrap().unwrap();
+        let current = db
+            .get_product_creation_job("slow-delivery")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(chrono::Utc::now() > first_lease);
         assert!(current.claim_lease_until.unwrap() > chrono::Utc::now());
         assert!(current.claim_lease_until.unwrap() > first_lease);
         assert_eq!(current.status, "delivery_pending");
         assert!(!worker.is_finished());
-        assert!(db.claim_next_product_creation_delivery(
-            "competitor", "competitor-token", chrono::Utc::now(), chrono::Duration::seconds(30),
-        ).await.unwrap().is_none());
+        assert!(db
+            .claim_next_product_creation_delivery(
+                "competitor",
+                "competitor-token",
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .is_none());
         release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().unwrap();
-        let completed = db.get_product_creation_job("slow-delivery").await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let completed = db
+            .get_product_creation_job("slow-delivery")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(completed.status, "published");
-        assert_eq!(completed.provisioning_stage, phoenix_db::ProductCreationProvisioningStage::FinalizePublication);
+        assert_eq!(
+            completed.provisioning_stage,
+            phoenix_db::ProductCreationProvisioningStage::FinalizePublication
+        );
         let (committed, queued) = global_objective_artifact_counts(&db, "slow-delivery").await;
         assert_eq!(committed + queued, 1);
     }
@@ -3524,27 +3798,64 @@ mod product_creation_delivery_replay_tests {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
         let directory = tempfile::tempdir().unwrap();
-        let delivery = seed_live_delivery(&db, directory.path(), "cancel-heartbeat", "cancel-heartbeat-root").await;
+        let delivery = seed_live_delivery(
+            &db,
+            directory.path(),
+            "cancel-heartbeat",
+            "cancel-heartbeat-root",
+        )
+        .await;
         let _renewals = install_short_claim_guard_policy(&manager);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
-                    started_tx.send(()).unwrap();
-                    release_rx.await.unwrap();
-                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
-                })).await
+                run_product_creation_until_closed(
+                    &manager,
+                    &delivery,
+                    Box::pin(async {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Box::pin(deliver_product_creation_objective_inner(
+                            &manager, &delivery,
+                        ))
+                        .await
+                    }),
+                )
+                .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
-        assert!(db.cancel_product_creation("cancel-heartbeat", chrono::Utc::now()).await.unwrap());
-        let error = tokio::time::timeout(Duration::from_secs(1), worker).await.unwrap().unwrap().unwrap_err();
-        assert_eq!(error, "product creation claim was lost during heartbeat renewal");
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .cancel_product_creation("cancel-heartbeat", chrono::Utc::now())
+            .await
+            .unwrap());
+        let error = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "product creation claim was lost during heartbeat renewal"
+        );
         assert!(release_tx.send(()).is_err());
-        assert_eq!(global_objective_artifact_counts(&db, "cancel-heartbeat").await, (0, 0));
-        assert_eq!(db.get_product_creation_job("cancel-heartbeat").await.unwrap().unwrap().status, "cancelling");
+        assert_eq!(
+            global_objective_artifact_counts(&db, "cancel-heartbeat").await,
+            (0, 0)
+        );
+        assert_eq!(
+            db.get_product_creation_job("cancel-heartbeat")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelling"
+        );
     }
 
     #[tokio::test]
@@ -3552,7 +3863,8 @@ mod product_creation_delivery_replay_tests {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
         let directory = tempfile::tempdir().unwrap();
-        let delivery = seed_live_delivery(&db, directory.path(), "replace-delivery", "replace-root").await;
+        let delivery =
+            seed_live_delivery(&db, directory.path(), "replace-delivery", "replace-root").await;
         let _renewals = install_short_claim_guard_policy(&manager);
         let old_claim = delivery.claim.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -3560,26 +3872,63 @@ mod product_creation_delivery_replay_tests {
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
-                    started_tx.send(()).unwrap();
-                    release_rx.await.unwrap();
-                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
-                })).await
+                run_product_creation_until_closed(
+                    &manager,
+                    &delivery,
+                    Box::pin(async {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Box::pin(deliver_product_creation_objective_inner(
+                            &manager, &delivery,
+                        ))
+                        .await
+                    }),
+                )
+                .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
         sqlx::query("UPDATE product_creation_jobs SET claim_lease_until_unix_micros = ?1 WHERE request_id = 'replace-delivery'")
             .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).timestamp_micros())
             .execute(db.pool()).await.unwrap();
-        let replacement = db.claim_next_product_creation_delivery(
-            "replacement", "replacement-token", chrono::Utc::now(), chrono::Duration::seconds(30),
-        ).await.unwrap().unwrap();
+        let replacement = db
+            .claim_next_product_creation_delivery(
+                "replacement",
+                "replacement-token",
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert!(replacement.claim.generation > old_claim.generation);
-        let error = tokio::time::timeout(Duration::from_secs(1), worker).await.unwrap().unwrap().unwrap_err();
-        assert_eq!(error, "product creation claim was lost during heartbeat renewal");
-        assert!(release_tx.send(()).is_err(), "lost-claim work must have been dropped");
-        assert_eq!(db.get_product_creation_job("replace-delivery").await.unwrap().unwrap(), replacement.job);
-        assert_eq!(global_objective_artifact_counts(&db, "replace-delivery").await, (0, 0));
+        let error = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "product creation claim was lost during heartbeat renewal"
+        );
+        assert!(
+            release_tx.send(()).is_err(),
+            "lost-claim work must have been dropped"
+        );
+        assert_eq!(
+            db.get_product_creation_job("replace-delivery")
+                .await
+                .unwrap()
+                .unwrap(),
+            replacement.job
+        );
+        assert_eq!(
+            global_objective_artifact_counts(&db, "replace-delivery").await,
+            (0, 0)
+        );
         assert!(db.get_conversation("replace-root").await.unwrap().archived);
     }
 
@@ -3588,27 +3937,56 @@ mod product_creation_delivery_replay_tests {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
         let directory = tempfile::tempdir().unwrap();
-        let delivery = seed_live_delivery(&db, directory.path(), "fatal-delivery", "fatal-root").await;
+        let delivery =
+            seed_live_delivery(&db, directory.path(), "fatal-delivery", "fatal-root").await;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move {
-                run_product_creation_until_closed(&manager, &delivery, Box::pin(async {
-                    started_tx.send(()).unwrap();
-                    release_rx.await.unwrap();
-                    Box::pin(deliver_product_creation_objective_inner(&manager, &delivery)).await
-                })).await
+                run_product_creation_until_closed(
+                    &manager,
+                    &delivery,
+                    Box::pin(async {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Box::pin(deliver_product_creation_objective_inner(
+                            &manager, &delivery,
+                        ))
+                        .await
+                    }),
+                )
+                .await
             }
         });
         started_rx.await.unwrap();
-        let before = db.get_product_creation_job("fatal-delivery").await.unwrap().unwrap();
+        let before = db
+            .get_product_creation_job("fatal-delivery")
+            .await
+            .unwrap()
+            .unwrap();
         manager.signal_fatal_local_authority("test_product_delivery_closure");
-        let error = tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().unwrap_err();
-        assert_eq!(error, "product creation stopped after fatal local authority closure");
+        let error = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "product creation stopped after fatal local authority closure"
+        );
         assert!(release_tx.send(()).is_err());
-        assert_eq!(db.get_product_creation_job("fatal-delivery").await.unwrap().unwrap(), before);
-        assert_eq!(global_objective_artifact_counts(&db, "fatal-delivery").await, (0, 0));
+        assert_eq!(
+            db.get_product_creation_job("fatal-delivery")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            global_objective_artifact_counts(&db, "fatal-delivery").await,
+            (0, 0)
+        );
         assert!(db.get_conversation("fatal-root").await.unwrap().archived);
     }
 
@@ -3976,7 +4354,11 @@ mod product_creation_delivery_replay_tests {
             .unwrap());
         let delivery = crate::db::ClaimedProductCreationJob {
             claim: provisioning.claim,
-            job: db.get_product_creation_job("req-stale-delivery").await.unwrap().unwrap(),
+            job: db
+                .get_product_creation_job("req-stale-delivery")
+                .await
+                .unwrap()
+                .unwrap(),
         };
         db.append_product_creation_steering_entry(
             &delivery,
@@ -4010,9 +4392,12 @@ mod product_creation_delivery_replay_tests {
         };
         let manager = test_runtime_manager(db.clone());
 
-        let error = Box::pin(deliver_product_creation_objective(&manager, &stale_delivery))
-            .await
-            .unwrap_err();
+        let error = Box::pin(deliver_product_creation_objective(
+            &manager,
+            &stale_delivery,
+        ))
+        .await
+        .unwrap_err();
         assert_eq!(error, "product creation claim was lost before processing");
         let still_pending = db
             .get_product_creation_job("req-stale-delivery")
