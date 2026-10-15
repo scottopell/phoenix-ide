@@ -3,6 +3,14 @@ import { api, ApiResponseError, ExpansionError } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import type { CreateProductConversationRequest, ImageData, ModelEffort, ModelsResponse, ProductConversationCreationObservation, RecentManagementRootSuggestion } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
+import {
+  activeProductCreationRequestId,
+  clearProductCreationRequest,
+  creationRequestId,
+  readProductCreationRequest,
+  storeProductCreationRequest,
+} from '../productCreationStore';
+import type { PendingCreationRequest } from '../productCreationStore';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
 import { generateUUID } from '../utils/uuid';
@@ -10,66 +18,11 @@ import { generateUUID } from '../utils/uuid';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
-const REPLAY_CREATE_REQUEST_KEY = 'phoenix-replay-product-create-request';
-const REPLAY_CREATE_INTENT_KEY = 'phoenix-replay-product-create-intent';
 const RECOVERED_LLM_LANGUAGE_KEY = 'phoenix-create-llm-language';
-const PENDING_CREATE_REQUEST_KEY = 'phoenix-pending-product-create-request';
 const CREATION_OBSERVATION_INTERVAL_MS = 2000;
-
-type PendingCreationRequest =
-  | { readonly version: 2; readonly kind: 'uncertain'; readonly request: CreateProductConversationRequest }
-  | { readonly version: 2; readonly kind: 'accepted'; readonly requestId: string; readonly productConversationId: string };
-
-function creationRequestId(pending: PendingCreationRequest): string {
-  return pending.kind === 'uncertain' ? pending.request.request_id : pending.requestId;
-}
-
-function isCreateRequest(value: unknown): value is CreateProductConversationRequest {
-  if (!value || typeof value !== 'object') return false;
-  const request = value as Record<string, unknown>;
-  const efforts: readonly ModelEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
-  return typeof request['request_id'] === 'string' && request['request_id'].length > 0
-    && typeof request['cwd'] === 'string'
-    && typeof request['objective'] === 'string'
-    && typeof request['model'] === 'string' && request['model'].length > 0
-    && (request['effort'] == null || efforts.some((effort) => effort === request['effort']))
-    && (request['llm_language'] == null || typeof request['llm_language'] === 'string')
-    && (request['images'] === undefined || (Array.isArray(request['images']) && request['images'].every((image: unknown) =>
-      image !== null && typeof image === 'object'
-      && 'data' in image && typeof image.data === 'string'
-      && 'media_type' in image && typeof image.media_type === 'string')));
-}
-
-function readPendingCreationRequest(): PendingCreationRequest | null {
-  try {
-    const stored: unknown = JSON.parse(localStorage.getItem(PENDING_CREATE_REQUEST_KEY) ?? 'null');
-    if (stored && typeof stored === 'object'
-      && 'version' in stored && stored.version === 2 && 'kind' in stored) {
-      if (stored.kind === 'uncertain' && 'request' in stored && isCreateRequest(stored.request)) {
-        return { version: 2, kind: 'uncertain', request: stored.request };
-      }
-      if (stored.kind === 'accepted'
-        && 'requestId' in stored && typeof stored.requestId === 'string' && stored.requestId
-        && 'productConversationId' in stored && typeof stored.productConversationId === 'string' && stored.productConversationId) {
-        return { version: 2, kind: 'accepted', requestId: stored.requestId, productConversationId: stored.productConversationId };
-      }
-    }
-  } catch { /* invalid or unavailable storage has no resumable request */ }
-  try { localStorage.removeItem(PENDING_CREATE_REQUEST_KEY); } catch { /* best effort */ }
-  return null;
-}
-
-function storePendingCreationRequest(request: PendingCreationRequest | null): void {
-  try {
-    if (request) localStorage.setItem(PENDING_CREATE_REQUEST_KEY, JSON.stringify(request));
-    else localStorage.removeItem(PENDING_CREATE_REQUEST_KEY);
-  } catch { /* the mounted flow retains its immutable identity */ }
-}
 
 export function beginNewProductConversationIntent(): void {
   try {
-    localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
-    localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
     localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
   } catch { /* best effort */ }
 }
@@ -127,27 +80,29 @@ function clearNewConversationDraft(): void {
   }
 }
 
+function immutableCreationIntent(request: Omit<CreateProductConversationRequest, 'request_id'>): string {
+  return JSON.stringify({
+    cwd: request.cwd,
+    objective: request.objective,
+    model: request.model,
+    effort: request.effort,
+    llm_language: request.llm_language,
+    images: request.images ?? [],
+  });
+}
+
 export function useCreateConversation(navigate: (path: string) => void) {
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
-  const [requestId, setRequestId] = useState(() => {
-    const pending = readPendingCreationRequest();
-    if (pending) return creationRequestId(pending);
-    try {
-      const replay = localStorage.getItem(REPLAY_CREATE_REQUEST_KEY);
-      if (replay) return replay;
-    } catch { /* use a fresh in-memory identity */ }
-    return generateUUID();
-  });
+  const [initialActiveRequestId] = useState(activeProductCreationRequestId);
+  const [requestId, setRequestId] = useState(() => initialActiveRequestId ?? generateUUID());
   const [recoveredLlmLanguage, setRecoveredLlmLanguage] = useState<string | null>(() => {
     try { return localStorage.getItem(RECOVERED_LLM_LANGUAGE_KEY); } catch { return null; }
   });
-  const replayIntentRef = useRef<string | null>((() => {
-    try { return localStorage.getItem(REPLAY_CREATE_INTENT_KEY); } catch { return null; }
-  })());
+  const replayIntentRef = useRef<string | null>(null);
   const [homeDir, setHomeDir] = useState<string>('');
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
   const [dirStatus, setDirStatus] = useState<DirStatus>(() =>
@@ -163,11 +118,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [files, setFiles] = useState<File[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [observedRequest, setObservedRequest] = useState<PendingCreationRequest | null>(readPendingCreationRequest);
-  const activeRequestRef = useRef(observedRequest);
+  const [observedRequest, setObservedRequest] = useState<PendingCreationRequest | null>(null);
+  const activeRequestRef = useRef<PendingCreationRequest | null>(null);
   const [creationObservation, setCreationObservation] = useState<ProductConversationCreationObservation | null>(null);
   const [observationVersion, setObservationVersion] = useState(0);
-  const [creating, setCreating] = useState(observedRequest !== null);
+  const [creating, setCreating] = useState(initialActiveRequestId !== null);
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
   const [recentManagementRootSuggestions, setRecentManagementRootSuggestions] = useState<RecentManagementRootSuggestion[]>([]);
@@ -192,6 +147,32 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => {
     selectedEffortRef.current = selectedEffort;
   }, [selectedEffort]);
+
+  useEffect(() => {
+    if (!initialActiveRequestId) return;
+    let active = true;
+    void readProductCreationRequest(initialActiveRequestId)
+      .then(async (pending) => {
+        if (!active) return;
+        if (!pending) {
+          await clearProductCreationRequest(initialActiveRequestId);
+          if (!active) return;
+          setRequestId(generateUUID());
+          setCreating(false);
+          return;
+        }
+        activeRequestRef.current = pending;
+        if (pending.kind === 'uncertain') {
+          replayIntentRef.current = immutableCreationIntent(pending.request);
+        }
+        setObservedRequest(pending);
+      })
+      .catch((storageError: unknown) => {
+        if (!active) return;
+        setError(`Unable to restore this tab's creation request; no new request will be sent. ${storageError instanceof Error ? storageError.message : ''}`);
+      });
+    return () => { active = false; };
+  }, [initialActiveRequestId]);
 
   useEffect(() => {
     const unsub = subscribeModels(modelsData => {
@@ -225,20 +206,18 @@ export function useCreateConversation(navigate: (path: string) => void) {
   }, [models, selectedEffort, selectedModel, selectEffort]);
   useEffect(() => { writeNewConversationDraft(draft); }, [draft]);
 
-  const releaseCreation = useCallback((message: string | null, rotate = true) => {
+  const releaseCreation = useCallback(async (message: string | null, rotate = true) => {
+    const active = activeRequestRef.current;
+    if (active) await clearProductCreationRequest(creationRequestId(active));
+    if (!mountedRef.current || activeRequestRef.current !== active) return;
     activeRequestRef.current = null;
     setObservedRequest(null);
     setCreationObservation(null);
     setCreating(false);
     setError(message);
-    storePendingCreationRequest(null);
     if (rotate) {
       setRequestId(generateUUID());
       replayIntentRef.current = null;
-      try {
-        localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
-        localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
-      } catch { /* best effort after authoritative release */ }
     }
   }, []);
 
@@ -249,16 +228,17 @@ export function useCreateConversation(navigate: (path: string) => void) {
       if (!isCurrent()) return;
       if (response.request_id !== uncertain.request.request_id) throw new Error('Creation acceptance did not match the submitted request.');
       const accepted: PendingCreationRequest = {
-        version: 2, kind: 'accepted', requestId: response.request_id, productConversationId: response.product_conversation_id,
+        version: 3, kind: 'accepted', requestId: response.request_id, productConversationId: response.product_conversation_id,
       };
+      await storeProductCreationRequest(accepted);
+      if (!isCurrent()) return;
       activeRequestRef.current = accepted;
-      storePendingCreationRequest(accepted);
       setObservedRequest(accepted);
     } catch (err) {
       if (!isCurrent()) return;
       if (err instanceof ExpansionError || (err instanceof ApiResponseError && err.status >= 400 && err.status < 500)) {
         const conflict = err instanceof ApiResponseError && err.status === 409;
-        releaseCreation(conflict
+        await releaseCreation(conflict
           ? 'This request ID conflicts with an existing creation. Submit again to use a new request ID.'
           : err.message, conflict);
         if (surfaceExpansionError && err instanceof ExpansionError) throw err;
@@ -288,25 +268,27 @@ export function useCreateConversation(navigate: (path: string) => void) {
         }
         if (expectedProductId === null) {
           const acceptedRequest: PendingCreationRequest = {
-            version: 2, kind: 'accepted', requestId: result.request_id, productConversationId: result.product_conversation_id,
+            version: 3, kind: 'accepted', requestId: result.request_id, productConversationId: result.product_conversation_id,
           };
+          await storeProductCreationRequest(acceptedRequest);
+          if (!isCurrent()) return;
           activeRequestRef.current = acceptedRequest;
-          storePendingCreationRequest(acceptedRequest);
         }
         setCreationObservation(result);
         setError(null);
         if (result.kind === 'published') {
+          await clearProductCreationRequest(observedRequestId);
+          if (!isCurrent()) return;
+          activeRequestRef.current = null;
+          setObservedRequest(null);
           setCreating(false);
           setDraft('');
           setImages([]);
           setFiles([]);
           setRecoveredLlmLanguage(null);
           clearNewConversationDraft();
-          storePendingCreationRequest(null);
           try {
             localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
-            localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
-            localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
           } catch { /* publication is already durable */ }
           navigateRef.current(result.canonical_route);
           return;
@@ -321,7 +303,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         if (err instanceof ApiResponseError && err.status === 404) {
           const active = activeRequestRef.current;
           if (active?.kind === 'accepted') {
-            releaseCreation('This conversation creation was removed from the server. You can start a new conversation.');
+            await releaseCreation('This conversation creation was removed from the server. You can start a new conversation.');
             return;
           }
           if (active?.kind === 'uncertain') {
@@ -352,7 +334,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     if (!activeRequestRef.current || creationRequestId(activeRequestRef.current) !== requestId) return;
     if (!creationObservation || (creationObservation.kind !== 'failed' && creationObservation.kind !== 'cancelled')
       || creationObservation.allowed_actions.length !== 0) return;
-    releaseCreation('Stopped observing this terminal creation locally. The server record has not been deleted. You can start a new conversation.');
+    void releaseCreation('Stopped observing this terminal creation locally. The server record has not been deleted. You can start a new conversation.');
   }, [creationObservation, releaseCreation]);
 
   const genericFilesEnabled = false;
@@ -430,7 +412,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
     try {
       const trimmedCwd = cwd.trim();
-      try { localStorage.setItem(REPLAY_CREATE_REQUEST_KEY, requestId); } catch { /* in-memory identity remains stable */ }
       if (files.length > 0) {
         setError('File attachments are not available for this conversation flow yet.');
         setCreating(false);
@@ -441,7 +422,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
-      const immutableIntent = JSON.stringify({
+      const immutableIntent = immutableCreationIntent({
         cwd: trimmedCwd,
         objective: trimmed,
         model: selectedModel,
@@ -453,10 +434,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
       if (replayIntentRef.current !== null && replayIntentRef.current !== immutableIntent) {
         activeRequestId = generateUUID();
         setRequestId(activeRequestId);
-        try { localStorage.setItem(REPLAY_CREATE_REQUEST_KEY, activeRequestId); } catch { /* in-memory identity remains stable */ }
       }
       replayIntentRef.current = immutableIntent;
-      try { localStorage.setItem(REPLAY_CREATE_INTENT_KEY, immutableIntent); } catch { /* in-memory intent remains stable */ }
       const createRequest: CreateProductConversationRequest = {
         request_id: activeRequestId,
         cwd: trimmedCwd,
@@ -466,9 +445,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
         llm_language: recoveredLlmLanguage,
         ...(images.length > 0 ? { images: images.map((image) => ({ ...image })) } : {}),
       };
-      const uncertain: Extract<PendingCreationRequest, { kind: 'uncertain' }> = { version: 2, kind: 'uncertain', request: createRequest };
-      // Do not issue a POST unless reload recovery has its complete immutable intent.
-      localStorage.setItem(PENDING_CREATE_REQUEST_KEY, JSON.stringify(uncertain));
+      const uncertain: Extract<PendingCreationRequest, { kind: 'uncertain' }> = { version: 3, kind: 'uncertain', request: createRequest };
+      await storeProductCreationRequest(uncertain);
       activeRequestRef.current = uncertain;
       await submitCreationRequest(uncertain, true);
     } catch (err) {
@@ -487,34 +465,36 @@ export function useCreateConversation(navigate: (path: string) => void) {
     images: ImageData[];
     llm_language: string | null;
   }) => {
-    if (activeRequestRef.current && creationRequestId(activeRequestRef.current) !== rowRequestId) return;
-    activeRequestRef.current = null;
-    setObservedRequest(null);
-    setCreationObservation(null);
-    setCreating(false);
-    storePendingCreationRequest(null);
-    const nextRequestId = generateUUID();
-    setRequestId(nextRequestId);
-    replayIntentRef.current = null;
-    setCwd(creation.cwd);
-    setDraft(creation.objective);
-    setImages(creation.images ?? []);
-    setFiles([]);
-    setRecoveredLlmLanguage(creation.llm_language);
-    selectModel(creation.model);
-    selectEffort(creation.effort);
-    try {
-      if (creation.llm_language) {
-        localStorage.setItem(RECOVERED_LLM_LANGUAGE_KEY, creation.llm_language);
-      } else {
-        localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
-      }
-    } catch { /* replay still retains the pinned language in memory */ }
-    setError(null);
-    try {
-      localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
-      localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
-    } catch { /* best effort */ }
+    const active = activeRequestRef.current;
+    if (active && creationRequestId(active) !== rowRequestId) return;
+    void clearProductCreationRequest(rowRequestId)
+      .then(() => {
+        if (!mountedRef.current || activeRequestRef.current !== active) return;
+        activeRequestRef.current = null;
+        setObservedRequest(null);
+        setCreationObservation(null);
+        setCreating(false);
+        setRequestId(generateUUID());
+        replayIntentRef.current = null;
+        setCwd(creation.cwd);
+        setDraft(creation.objective);
+        setImages(creation.images ?? []);
+        setFiles([]);
+        setRecoveredLlmLanguage(creation.llm_language);
+        selectModel(creation.model);
+        selectEffort(creation.effort);
+        try {
+          if (creation.llm_language) {
+            localStorage.setItem(RECOVERED_LLM_LANGUAGE_KEY, creation.llm_language);
+          } else {
+            localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
+          }
+        } catch { /* replay still retains the pinned language in memory */ }
+        setError(null);
+      })
+      .catch((storageError: unknown) => {
+        if (mountedRef.current) setError(`Unable to clear creation recovery state. ${storageError instanceof Error ? storageError.message : ''}`);
+      });
   }, [selectEffort, selectModel]);
 
   return {

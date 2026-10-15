@@ -4,7 +4,7 @@ import type { CreateProductConversationRequest, CreateProductConversationRespons
 import { ApiResponseError } from '../api';
 import { useCreateConversation } from './useCreateConversation';
 
-const { apiMock, generateUUIDMock } = vi.hoisted(() => ({
+const { apiMock, generateUUIDMock, creationStoreMock, creationStoreState } = vi.hoisted(() => ({
   apiMock: {
     getEnv: vi.fn().mockResolvedValue({ home_dir: '/home/user' }),
     listRecentManagementRootSuggestions: vi.fn().mockResolvedValue({ suggestions: [] }),
@@ -12,6 +12,16 @@ const { apiMock, generateUUIDMock } = vi.hoisted(() => ({
     getProductConversationCreation: vi.fn<(requestId: string, signal?: AbortSignal) => Promise<ProductConversationCreationObservation>>(),
   },
   generateUUIDMock: vi.fn(() => 'request-1'),
+  creationStoreMock: {
+    activeProductCreationRequestId: vi.fn<() => string | null>(),
+    readProductCreationRequest: vi.fn(),
+    storeProductCreationRequest: vi.fn(),
+    clearProductCreationRequest: vi.fn(),
+  },
+  creationStoreState: {
+    activeRequestId: null as string | null,
+    records: new Map<string, unknown>(),
+  },
 }));
 
 vi.mock('../api', async () => ({
@@ -20,6 +30,10 @@ vi.mock('../api', async () => ({
 }));
 vi.mock('../modelsPoller', () => ({ subscribeModels: () => () => {} }));
 vi.mock('../utils/uuid', () => ({ generateUUID: generateUUIDMock }));
+vi.mock('../productCreationStore', async () => ({
+  ...await vi.importActual<typeof import('../productCreationStore')>('../productCreationStore'),
+  ...creationStoreMock,
+}));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -53,7 +67,16 @@ const published: ProductConversationCreationObservation = {
   kind: 'published', request_id: 'request-1', product_conversation_id: 'product-1',
   transcript_row_id: 'transcript-1', canonical_route: '/c/canonical-product-1',
 };
-const storageKey = 'phoenix-pending-product-create-request';
+function storedCreation(): Record<string, unknown> | null {
+  const activeRequestId = creationStoreState.activeRequestId;
+  const stored = activeRequestId ? creationStoreState.records.get(activeRequestId) : null;
+  return stored && typeof stored === 'object' ? stored as Record<string, unknown> : null;
+}
+
+function seedStoredCreation(requestId: string, value: unknown): void {
+  creationStoreState.activeRequestId = requestId;
+  creationStoreState.records.set(requestId, value);
+}
 
 function mountCreation() {
   const navigate = vi.fn();
@@ -78,6 +101,20 @@ describe('exact-request creation observation', () => {
     apiMock.createProductConversation.mockReset().mockResolvedValue({ request_id: 'request-1', product_conversation_id: 'product-1' });
     apiMock.getProductConversationCreation.mockReset();
     generateUUIDMock.mockReset().mockReturnValue('request-1');
+    creationStoreState.activeRequestId = null;
+    creationStoreState.records.clear();
+    creationStoreMock.activeProductCreationRequestId.mockReset().mockImplementation(() => creationStoreState.activeRequestId);
+    creationStoreMock.readProductCreationRequest.mockReset().mockImplementation(async (requestId: string) =>
+      creationStoreState.records.get(requestId) ?? null);
+    creationStoreMock.storeProductCreationRequest.mockReset().mockImplementation(async (stored: { kind: string; request?: { request_id: string }; requestId?: string }) => {
+      const storedRequestId = stored.kind === 'uncertain' ? stored.request!.request_id : stored.requestId!;
+      creationStoreState.records.set(storedRequestId, stored);
+      creationStoreState.activeRequestId = storedRequestId;
+    });
+    creationStoreMock.clearProductCreationRequest.mockReset().mockImplementation(async (requestId: string) => {
+      creationStoreState.records.delete(requestId);
+      if (creationStoreState.activeRequestId === requestId) creationStoreState.activeRequestId = null;
+    });
   });
 
   afterEach(() => {
@@ -97,7 +134,7 @@ describe('exact-request creation observation', () => {
     expect(hook.result.current.draft).toBe('Create the original objective');
     expect(hook.result.current.creating).toBe(true);
     expect(hook.result.current.canSend).toBe(false);
-    expect(JSON.parse(localStorage.getItem(storageKey)!)).toEqual({ version: 2, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1' });
+    expect(storedCreation()).toEqual({ version: 3, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1' });
 
     act(() => {
       hook.result.current.setCwd('/another-repo');
@@ -116,7 +153,7 @@ describe('exact-request creation observation', () => {
     await act(async () => { publication.resolve(published); await publication.promise; });
     expect(hook.navigate).toHaveBeenCalledExactlyOnceWith('/c/canonical-product-1');
     expect(hook.result.current.draft).toBe('');
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     expect(apiMock.getProductConversationCreation.mock.calls.every(([id]) => id === 'request-1')).toBe(true);
   });
 
@@ -139,7 +176,7 @@ describe('exact-request creation observation', () => {
     expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(1);
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(1);
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
-    expect(localStorage.getItem(storageKey)).not.toBeNull();
+    expect(storedCreation()).not.toBeNull();
   });
 
   it('resumes the persisted exact request after reload without another POST', async () => {
@@ -165,14 +202,14 @@ describe('exact-request creation observation', () => {
     expect(resumed.navigate).toHaveBeenCalledExactlyOnceWith('/c/canonical-product-1');
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(1);
     expect(apiMock.getProductConversationCreation).toHaveBeenNthCalledWith(2, 'request-1', expect.any(AbortSignal));
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
   });
 
   it('persists the exact uncertain intent before POST, then binds accepted identity on 202', async () => {
     const acceptance = deferred<CreateProductConversationResponse>();
     let storedAtPost: unknown;
     apiMock.createProductConversation.mockImplementationOnce(() => {
-      storedAtPost = JSON.parse(localStorage.getItem(storageKey) ?? 'null');
+      storedAtPost = storedCreation();
       return acceptance.promise;
     });
     apiMock.getProductConversationCreation.mockResolvedValue(pending);
@@ -181,19 +218,19 @@ describe('exact-request creation observation', () => {
     let submit!: Promise<void>;
     act(() => { submit = hook.result.current.handleSend(); });
     expect(storedAtPost).toEqual({
-      version: 2, kind: 'uncertain', request: apiMock.createProductConversation.mock.calls[0]![0],
+      version: 3, kind: 'uncertain', request: apiMock.createProductConversation.mock.calls[0]![0],
     });
-    expect(JSON.parse(localStorage.getItem(storageKey)!)).toEqual({
-      version: 2, kind: 'uncertain', request: apiMock.createProductConversation.mock.calls[0]![0],
+    expect(storedCreation()).toEqual({
+      version: 3, kind: 'uncertain', request: apiMock.createProductConversation.mock.calls[0]![0],
     });
-    expect(localStorage.getItem('phoenix-replay-product-create-request')).toBe('request-1');
+    expect(creationStoreState.activeRequestId).toBe('request-1');
     expect(apiMock.getProductConversationCreation).not.toHaveBeenCalled();
     await act(async () => {
       acceptance.resolve({ request_id: 'request-1', product_conversation_id: 'product-1' });
       await submit;
     });
-    expect(JSON.parse(localStorage.getItem(storageKey)!)).toEqual({
-      version: 2, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
+    expect(storedCreation()).toEqual({
+      version: 3, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
     });
   });
 
@@ -206,7 +243,7 @@ describe('exact-request creation observation', () => {
     act(() => { submit = original.result.current.handleSend(); });
     const storedRequest = apiMock.createProductConversation.mock.calls[0]![0];
     original.unmount();
-    expect(JSON.parse(localStorage.getItem(storageKey)!)).toEqual({ version: 2, kind: 'uncertain', request: storedRequest });
+    expect(storedCreation()).toEqual({ version: 3, kind: 'uncertain', request: storedRequest });
     apiMock.getProductConversationCreation.mockRejectedValueOnce(new ApiResponseError('Not yet found', 404)).mockResolvedValue(pending);
     const resumed = mountCreation();
     await act(async () => {
@@ -226,7 +263,7 @@ describe('exact-request creation observation', () => {
       request_id: 'request-1', cwd: '/original', objective: 'Original objective', model: 'original-model',
       effort: 'high', llm_language: 'Japanese', images: [{ data: 'aW1hZ2U=', media_type: 'image/png' }],
     };
-    localStorage.setItem(storageKey, JSON.stringify({ version: 2, kind: 'uncertain', request: storedRequest }));
+    seedStoredCreation('request-1', { version: 3, kind: 'uncertain', request: storedRequest });
     apiMock.getProductConversationCreation.mockRejectedValueOnce(new ApiResponseError('Not yet found', 404)).mockResolvedValue(pending);
     const hook = mountCreation();
     await act(async () => {});
@@ -244,12 +281,12 @@ describe('exact-request creation observation', () => {
     await act(async () => { await hook.result.current.handleSend(); });
     expect(hook.result.current.canSend).toBe(false);
     expect(hook.result.current.creating).toBe(true);
-    expect(JSON.parse(localStorage.getItem(storageKey)!).kind).toBe('uncertain');
+    expect(storedCreation()?.kind).toBe('uncertain');
     await act(async () => { committed.resolve(published); await committed.promise; });
     expect(hook.navigate).toHaveBeenCalledExactlyOnceWith('/c/canonical-product-1');
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(1);
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
   });
 
   it('keeps a replay 500 ambiguous, observing the same request until its committed row is found', async () => {
@@ -263,10 +300,10 @@ describe('exact-request creation observation', () => {
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(2);
     expect(apiMock.createProductConversation.mock.calls[1]![0]).toEqual(apiMock.createProductConversation.mock.calls[0]![0]);
     expect(hook.result.current.canSend).toBe(false);
-    expect(JSON.parse(localStorage.getItem(storageKey)!).kind).toBe('uncertain');
+    expect(storedCreation()?.kind).toBe('uncertain');
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(hook.result.current.creationObservation).toEqual(pending);
-    expect(JSON.parse(localStorage.getItem(storageKey)!).kind).toBe('accepted');
+    expect(storedCreation()?.kind).toBe('accepted');
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
   });
 
@@ -283,7 +320,7 @@ describe('exact-request creation observation', () => {
     await act(async () => { await hook.result.current.handleSend(); });
     expect(hook.result.current.canSend).toBe(true);
     expect(hook.result.current.error).toContain('new request ID');
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     const callsBefore = apiMock.createProductConversation.mock.calls.length;
     await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(callsBefore);
@@ -299,20 +336,42 @@ describe('exact-request creation observation', () => {
   it('does not POST when uncertain intent cannot be persisted for reload recovery', async () => {
     const hook = mountCreation();
     await prepareCreation(hook);
-    const originalSetItem = localStorage.setItem.bind(localStorage);
-    const setItem = vi.spyOn(localStorage, 'setItem');
-    setItem.mockImplementation((key, value) => {
-      if (key === storageKey) throw new Error('Storage quota exceeded');
-      return originalSetItem(key, value);
+    creationStoreMock.storeProductCreationRequest.mockRejectedValueOnce(new Error('Recovery storage unavailable'));
+    await act(async () => { await hook.result.current.handleSend(); });
+    expect(apiMock.createProductConversation).not.toHaveBeenCalled();
+    expect(hook.result.current.canSend).toBe(true);
+    expect(hook.result.current.error).toContain('Recovery storage unavailable');
+  });
+
+  it('persists an attachment larger than localStorage before submitting it', async () => {
+    const hook = mountCreation();
+    await prepareCreation(hook);
+    const image = { data: 'a'.repeat(5_500_000), media_type: 'image/png' };
+    act(() => hook.result.current.startOverFromCreation('unused-request', {
+      cwd: '/repo', objective: 'Create with image', model: 'model-1', effort: null,
+      images: [image], llm_language: null,
+    }));
+    await act(async () => {});
+    await act(async () => { await hook.result.current.handleSend(); });
+    expect(creationStoreMock.storeProductCreationRequest).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'uncertain', request: expect.objectContaining({ images: [image] }),
+    }));
+    expect(apiMock.createProductConversation).toHaveBeenCalledOnce();
+  });
+
+  it('clears only its exact request when another flow owns the recovery pointer', async () => {
+    const publication = deferred<ProductConversationCreationObservation>();
+    apiMock.getProductConversationCreation.mockReturnValueOnce(publication.promise);
+    const hook = mountCreation();
+    await prepareCreation(hook);
+    await act(async () => { await hook.result.current.handleSend(); });
+    seedStoredCreation('request-2', {
+      version: 3, kind: 'accepted', requestId: 'request-2', productConversationId: 'product-2',
     });
-    try {
-      await act(async () => { await hook.result.current.handleSend(); });
-      expect(apiMock.createProductConversation).not.toHaveBeenCalled();
-      expect(hook.result.current.canSend).toBe(true);
-      expect(hook.result.current.error).toContain('Storage quota exceeded');
-    } finally {
-      setItem.mockRestore();
-    }
+    await act(async () => { publication.resolve(published); await publication.promise; });
+    expect(creationStoreMock.clearProductCreationRequest).toHaveBeenCalledWith('request-1');
+    expect(creationStoreState.activeRequestId).toBe('request-2');
+    expect(storedCreation()?.['productConversationId']).toBe('product-2');
   });
 
   it('retries observation errors without re-submitting or overlapping reads', async () => {
@@ -348,24 +407,26 @@ describe('exact-request creation observation', () => {
     { version: 1, requestId: 'legacy-request', productConversationId: null },
     { version: 1, requestId: '', productConversationId: 'legacy-product' },
     { version: 1, requestId: 'legacy-request', productConversationId: '' },
-    { version: 2, kind: 'accepted', requestId: '', productConversationId: 'product' },
-    { version: 2, kind: 'uncertain', request: { request_id: 'request-1' } },
-    { version: 2, kind: 'uncertain', request: { request_id: 'request-1', cwd: '/repo', objective: 'objective', model: 'model', images: [{}] } },
+    { version: 3, kind: 'accepted', requestId: '', productConversationId: 'product' },
+    { version: 3, kind: 'uncertain', request: { request_id: 'request-1' } },
+    { version: 3, kind: 'uncertain', request: { request_id: 'request-1', cwd: '/repo', objective: 'objective', model: 'model', images: [{}] } },
   ])('rejects and removes unversioned or invalid pending storage: %j', async (stored) => {
-    localStorage.setItem(storageKey, JSON.stringify(stored));
+    seedStoredCreation('request-1', stored);
+    creationStoreMock.readProductCreationRequest.mockResolvedValueOnce(null);
     const hook = mountCreation();
     await prepareCreation(hook);
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     expect(hook.result.current.creating).toBe(false);
     expect(hook.result.current.canSend).toBe(true);
     expect(apiMock.getProductConversationCreation).not.toHaveBeenCalled();
   });
 
   it('removes malformed pending storage', async () => {
-    localStorage.setItem(storageKey, '{not JSON');
+    seedStoredCreation('request-1', '{not JSON');
+    creationStoreMock.readProductCreationRequest.mockResolvedValueOnce(null);
     const hook = mountCreation();
     await prepareCreation(hook);
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     expect(apiMock.getProductConversationCreation).not.toHaveBeenCalled();
   });
 
@@ -375,15 +436,13 @@ describe('exact-request creation observation', () => {
     const hook = mountCreation();
     await prepareCreation(hook);
     await act(async () => { await hook.result.current.handleSend(); });
-    const intent = localStorage.getItem('phoenix-replay-product-create-intent');
     expect(hook.result.current.error).toBe('Admission failed');
     expect(hook.result.current.canSend).toBe(true);
     expect(hook.result.current.creating).toBe(false);
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     expect(apiMock.getProductConversationCreation).not.toHaveBeenCalled();
     await act(async () => { await hook.result.current.handleSend(); });
     expect(apiMock.createProductConversation.mock.calls[1]?.[0]).toEqual(apiMock.createProductConversation.mock.calls[0]?.[0]);
-    expect(localStorage.getItem('phoenix-replay-product-create-intent')).toBe(intent);
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
   });
 
@@ -396,7 +455,7 @@ describe('exact-request creation observation', () => {
     await prepareCreation(hook);
     await act(async () => { await hook.result.current.handleSend(); });
     const originalRequest = apiMock.createProductConversation.mock.calls[0]![0];
-    expect(JSON.parse(localStorage.getItem(storageKey)!)).toEqual({ version: 2, kind: 'uncertain', request: originalRequest });
+    expect(storedCreation()).toEqual({ version: 3, kind: 'uncertain', request: originalRequest });
     act(() => {
       hook.result.current.setDraft('Changed draft must not be replayed');
       hook.result.current.setCwd('/changed');
@@ -412,8 +471,8 @@ describe('exact-request creation observation', () => {
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(2);
     expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(1);
     await act(async () => { replay.resolve({ request_id: 'request-1', product_conversation_id: 'product-1' }); await replay.promise; });
-    expect(JSON.parse(localStorage.getItem(storageKey)!)).toEqual({
-      version: 2, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
+    expect(storedCreation()).toEqual({
+      version: 3, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
     });
     expect(hook.result.current.creationObservation).toEqual(pending);
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
@@ -427,7 +486,7 @@ describe('exact-request creation observation', () => {
     expect(hook.result.current.error).toContain('removed from the server');
     expect(hook.result.current.canSend).toBe(true);
     expect(hook.result.current.creating).toBe(false);
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     expect(hook.result.current.creationObservation).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
     expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(1);
@@ -443,8 +502,8 @@ describe('exact-request creation observation', () => {
     const hook = mountCreation();
     await prepareCreation(hook);
     await act(async () => { await hook.result.current.handleSend(); });
-    expect(JSON.parse(localStorage.getItem(storageKey)!)).toEqual({
-      version: 2, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
+    expect(storedCreation()).toEqual({
+      version: 3, kind: 'accepted', requestId: 'request-1', productConversationId: 'product-1',
     });
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(hook.result.current.error).toContain('did not match');
@@ -463,7 +522,7 @@ describe('exact-request creation observation', () => {
     expect(hook.result.current.creating).toBe(true);
     expect(hook.result.current.error).toContain('did not match');
     expect(hook.navigate).not.toHaveBeenCalled();
-    expect(JSON.parse(localStorage.getItem(storageKey)!).productConversationId).toBe('product-1');
+    expect(storedCreation()?.['productConversationId']).toBe('product-1');
   });
 
   it('does not let start over for another row clear the active request or mutate its intent', async () => {
@@ -471,11 +530,11 @@ describe('exact-request creation observation', () => {
     const hook = mountCreation();
     await prepareCreation(hook);
     await act(async () => { await hook.result.current.handleSend(); });
-    const storage = localStorage.getItem(storageKey);
+    const storage = storedCreation();
     act(() => hook.result.current.startOverFromCreation('unrelated-request', {
       cwd: '/other', objective: 'Other objective', model: 'other-model', effort: null, images: [], llm_language: null,
     }));
-    expect(localStorage.getItem(storageKey)).toBe(storage);
+    expect(storedCreation()).toBe(storage);
     expect(hook.result.current.creating).toBe(true);
     expect(hook.result.current.draft).toBe('Create the original objective');
     expect(hook.result.current.cwd).toBe('/repo');
@@ -490,7 +549,7 @@ describe('exact-request creation observation', () => {
     act(() => hook.result.current.startOverFromCreation('request-1', {
       cwd: '/other', objective: 'New objective', model: 'model-1', effort: null, images: [], llm_language: null,
     }));
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     expect(hook.result.current.creationObservation).toBeNull();
     expect(hook.result.current.draft).toBe('New objective');
     expect(hook.result.current.canSend).toBe(true);
@@ -508,7 +567,7 @@ describe('exact-request creation observation', () => {
     expect(hook.result.current.canSend).toBe(false);
     act(() => hook.result.current.forgetCreationObservation('request-1'));
     expect(hook.result.current.canSend).toBe(true);
-    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(storedCreation()).toBeNull();
     expect(hook.result.current.creationObservation).toBeNull();
     expect(hook.result.current.error).toContain('server record has not been deleted');
     apiMock.createProductConversation.mockResolvedValue({ request_id: 'request-2', product_conversation_id: 'product-2' });
