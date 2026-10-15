@@ -2912,6 +2912,16 @@ mod product_creation_delivery_replay_tests {
         }
     }
 
+    async fn product_creation_job(
+        db: &Database,
+        request_id: &str,
+    ) -> crate::db::ProductCreationJobRecord {
+        db.get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn retry_checkpoints_skip_completed_phases_without_regressing_durable_stage() {
         use phoenix_db::ProductCreationProvisioningStage as Stage;
@@ -2962,11 +2972,7 @@ mod product_creation_delivery_replay_tests {
             )
             .await
             .unwrap());
-        let retry = db
-            .get_product_creation_job("later-stage")
-            .await
-            .unwrap()
-            .unwrap();
+        let retry = product_creation_job(&db, "later-stage").await;
         let claimed = db
             .claim_product_creation(
                 "later-stage",
@@ -2991,13 +2997,7 @@ mod product_creation_delivery_replay_tests {
                 .await
                 .unwrap();
             assert_eq!(current_stage, Stage::FinalizeAttachments);
-            assert_eq!(
-                db.get_product_creation_job("later-stage")
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                before
-            );
+            assert_eq!(product_creation_job(&db, "later-stage").await, before);
         }
         checkpoint_product_creation_stage(
             &manager,
@@ -3008,11 +3008,7 @@ mod product_creation_delivery_replay_tests {
         .await
         .unwrap();
         assert_eq!(current_stage, Stage::CommitMetadata);
-        let advanced = db
-            .get_product_creation_job("later-stage")
-            .await
-            .unwrap()
-            .unwrap();
+        let advanced = product_creation_job(&db, "later-stage").await;
         assert_eq!(advanced.provisioning_stage, Stage::CommitMetadata);
         assert!(advanced.stage_updated_at >= before.stage_updated_at);
     }
