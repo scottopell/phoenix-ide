@@ -3,7 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
-import { summarizeTrials, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck, runPendingPagehideCheck, appendTerminalInventory, runVisibilityRoundTrip, runPendingBackgroundRoundTrip, assertBackgroundReport, runBFCacheRoundTrip, runPendingSPACancellation, observePendingFiniteRequest, runLifecycleQualificationStage, appendLifecycleInventory, captureReport } from './qualify-view-telemetry.mjs';
+import { summarizeTrials, requireCollectorAuth, runTelemetryChecks, candidateDestination, assertRequestCorrelation, runCollectorNegativeChecks, runUnauthenticatedCollectorCheck, runPendingPagehideCheck, appendTerminalInventory, runVisibilityRoundTrip, runPendingBackgroundRoundTrip, assertBackgroundReport, runBFCacheRoundTrip, runPendingSPACancellation, observePendingFiniteRequest, runLifecycleQualificationStage, appendLifecycleInventory, captureReport } from './qualify-view-telemetry.mjs';
+
+function authStatusResponse(authenticated, authRequired = true) {
+  return { status: () => 200, json: async () => ({ auth_required: authRequired, authenticated }), dispose: async () => {} };
+}
 
 test('retains insufficient natural sampling as inconclusive, never overhead clearance', () => {
   const result = summarizeTrials([{ route: 'ordinary', sampled: true }]);
@@ -60,7 +64,7 @@ test('unauthenticated collector check uses empty state and cleans up even on fai
     let closed = false;
     const browser = { newContext: async options => {
       assert.deepEqual(options.storageState, { cookies: [], origins: [] });
-      return { request: { post: async () => ({ status: () => status, dispose: async () => { disposed = true; } }) }, close: async () => { closed = true; } };
+      return { request: { get: async () => authStatusResponse(false), post: async () => ({ status: () => status, dispose: async () => { disposed = true; } }) }, close: async () => { closed = true; } };
     } };
     if (status === 401) assert.equal((await runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {})).status, 401);
     else await assert.rejects(runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {}));
@@ -368,7 +372,7 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
   const browser = { newContext: async options => {
     if (options.storageState.cookies?.length === 0 && !options.viewport) {
       authContexts++;
-      return { request: { post: async () => ({ status: () => 401, dispose: async () => {} }) }, close: async () => {} };
+      return { request: { get: async () => authStatusResponse(false), post: async () => ({ status: () => 401, dispose: async () => {} }) }, close: async () => {} };
     }
     const index = contexts++;
     if (index >= 49) return lifecycle.browser.newContext(options);
@@ -423,7 +427,7 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
   } };
   const statuses = [422, 422, 422, 400, 400, 413];
   const context = { browser: () => browser, storageState: async () => ({ cookies: [{ name: 'synthetic' }], origins: [] }),
-    request: { post: async () => { const status = statuses.shift(); return { status: () => status, dispose: async () => {} }; } } };
+    request: { get: async () => authStatusResponse(true), post: async () => { const status = statuses.shift(); return { status: () => status, dispose: async () => {} }; } } };
   try {
     const execution = runTelemetryChecks({ page: { context: () => context }, context, baseURL, serviceName: 'synthetic-main', runId: 'main', outputDir,
       fixtures: { identity, aggregates: [{ kind: 'ordinary', route: '/c/product' }, { kind: 'global', route: '/global/coordinator' }],
@@ -582,4 +586,64 @@ test('pagehide deadline records failure and closes context arriving after creati
     await vi.advanceTimersByTimeAsync(0);
     assert.equal(closed, 1);
   } finally { vi.useRealTimers(); }
+});
+
+test('auth preflight requires exact enabled/authenticated booleans and disposes every response without retaining extras', async () => {
+  for (const [auth_required, authenticated, expected, accepted] of [
+    [true, true, true, true], [true, false, false, true], [false, true, true, false],
+    [true, false, true, false], [true, true, false, false], [undefined, true, true, false], ['true', true, true, false],
+  ]) {
+    let disposed = 0;
+    const context = { request: { get: async (url, options) => {
+      assert.equal(url, 'http://127.0.0.1:8123/api/auth/status');
+      assert.deepEqual(options, { timeout: 3000 });
+      return { status: () => 200, json: async () => ({ auth_required, authenticated, secret: 'PRIVATE' }), dispose: async () => { disposed++; } };
+    } } };
+    if (accepted) assert.deepEqual(await requireCollectorAuth(context, 'http://127.0.0.1:8123', expected), { auth_required: true, authenticated: expected });
+    else await assert.rejects(requireCollectorAuth(context, 'http://127.0.0.1:8123', expected));
+    assert.equal(disposed, 1);
+  }
+});
+
+test('isolated negative refuses auth-disabled or already authenticated fixture before sending collector body and always closes', async () => {
+  for (const status of [{ auth_required: false, authenticated: true }, { auth_required: true, authenticated: true }]) {
+    let posts = 0; let closed = 0; let disposed = 0;
+    const browser = { newContext: async options => {
+      assert.deepEqual(options, { storageState: { cookies: [], origins: [] } });
+      return { request: {
+        get: async () => ({ status: () => 200, json: async () => status, dispose: async () => { disposed++; } }),
+        post: async () => { posts++; throw new Error('must not POST'); },
+      }, close: async () => { closed++; } };
+    } };
+    await assert.rejects(runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {}));
+    assert.deepEqual({ posts, closed, disposed }, { posts: 0, closed: 1, disposed: 1 });
+  }
+});
+
+test('main auth-disabled prerequisite fails before cohort admission and preserves bounded failure receipt', async () => {
+  const outputDir = mkdtempSync(join(tmpdir(), 'cvt-auth-preflight-'));
+  let contexts = 0;
+  const context = { storageState: async () => ({ cookies: [], origins: [] }),
+    browser: () => ({ newContext: async () => { contexts++; throw new Error('must not admit cohort'); } }),
+    request: { get: async () => authStatusResponse(true, false) } };
+  try {
+    await assert.rejects(runTelemetryChecks({ page: { context: () => context }, context, baseURL: 'http://127.0.0.1:8123', serviceName: 'synthetic-auth', runId: 'auth', outputDir,
+      fixtures: { identity: { appSource: 'a'.repeat(40), frontendSource: 'b'.repeat(40), serverInstanceId: 'instance' },
+        aggregates: [{ kind: 'ordinary', route: '/c/product' }, { kind: 'global', route: '/global/coordinator' }],
+        lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a' } } }), /must require authentication/);
+    const receipt = JSON.parse(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8'));
+    assert.equal(contexts, 0); assert.deepEqual(receipt.trials, []);
+    assert.match(receipt.failure, /must require authentication/);
+  } finally { rmSync(outputDir, { recursive: true, force: true }); }
+});
+
+test('auth preflight rejects malformed/non-200 responses without echoing private status or JSON errors', async () => {
+  for (const mode of ['non200', 'invalid_json', 'private_boolean']) {
+    let disposed = 0;
+    const context = { request: { get: async () => ({ status: () => mode === 'non200' ? 503 : 200,
+      json: async () => { if (mode === 'invalid_json') throw new Error('PRIVATE'); return { auth_required: true, authenticated: 'PRIVATE' }; },
+      dispose: async () => { disposed++; } }) } };
+    await assert.rejects(requireCollectorAuth(context, 'http://127.0.0.1:8123', true), error => !error.message.includes('PRIVATE'));
+    assert.equal(disposed, 1);
+  }
 });
