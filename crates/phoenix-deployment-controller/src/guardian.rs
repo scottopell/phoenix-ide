@@ -1897,9 +1897,14 @@ mod tests {
                 remaining: MAX_RETAINED_RESULTS - 1,
             })
         );
-        let unrelated = issue(&guardian, session, sample_ticket(attempt, 2));
-        let (error, unrelated) = refused(guardian.submit_bound(unrelated, tick(1)));
+        let unrelated = sample_ticket(attempt, 2);
+        let unrelated_key = unrelated.key();
+        let (error, unrelated) = guardian
+            .bind_ticket(session, unrelated)
+            .unwrap_err()
+            .into_parts();
         assert_eq!(error, GuardianError::RetainedResultCapacityExceeded);
+        assert_eq!(unrelated.key(), unrelated_key);
         assert!(matches!(
             unrelated.effect(),
             OsEffect::SampleResources { .. }
