@@ -2,22 +2,26 @@
 
 ## Current reality
 
-A new std-only Rust policy crate models deployment phases, resource admission,
-stable process identity, owned-tree evidence, bounded cleanup, interruption,
-administrative closeout, and the post-migration forward-recovery fence. The crate
-has no production adapter or caller. Existing deployment behavior remains
-unchanged.
+A Rust policy crate models deployment phases, resource admission, stable process
+identity, owned-tree evidence, bounded cleanup, interruption, administrative
+closeout, and the post-migration forward-recovery fence. A target-specific macOS
+adapter supplies native process observation, resource sampling, and retained
+direct-child supervision in an isolated process group. The general observation
+adapter intentionally cannot signal arbitrary observed PIDs. The crate has no
+production caller, and existing deployment behavior remains unchanged.
 
-The deterministic fake-OS suite covers the observed child-ESRCH-before-birth race,
-PID reuse, reparenting, exact-identity signaling, permission uncertainty, absolute
-deadline closeout, interruption reconciliation, sustained contention, and exact
-candidate forward recovery. The Allium model validates locally. Rust compilation,
-tests, and Clippy require hosted CI because the local host did not satisfy its
-compiler-admission capacity threshold.
+The deterministic suite contains 18 fake-OS tests covering the observed
+child-ESRCH-before-birth race, PID reuse, reparenting, exact-identity signaling,
+permission uncertainty, absolute-deadline closeout, repeated interruption,
+complete recovery reconciliation, sustained contention, and exact-candidate
+forward recovery. Two harmless native macOS tests exercise supervised-child group
+cleanup and resource measurement. Exact-head hosted Rust, Clippy, and native macOS
+qualification is pending because the local host did not satisfy its compiler
+admission threshold.
 
-Native macOS adapter work and harmless isolated-label integration tests remain
-future adoption slices. No production launchd label, process, reservation, or
-installation path is used by this crate.
+The controller-owned normalized SQLite store required by REQ-SDC-011 is not yet
+implemented. No production launchd label, process, reservation, application
+database, or installation path is used by this crate.
 
 ## Requirement coverage
 
@@ -32,12 +36,15 @@ installation path is used by this crate.
 | REQ-SDC-007 | Attempt-bound `AdministrativeRiskAcceptance` closes without a cleanup claim or OS effect and retains evidence. |
 | REQ-SDC-008 | Recovery marks owned identities for fresh observation and preserves the original deadline before exposing signal effects. |
 | REQ-SDC-009 | `CompatibilityBoundary::CandidateMigrationInvoked` retains full commit plus artifact digest and recovers only through candidate reverification. |
-| REQ-SDC-010 | `ControllerOs` is typed and fake-backed. Native macOS qualification and production adoption are not implemented. |
+| REQ-SDC-010 | `ControllerOs` is typed and fake-backed; the macOS adapter implements native observation and capacity/contention sampling. Its harmless native qualification is pending exact-head hosted results. |
+| REQ-SDC-011 | `AttemptStore` enforces checkpoint-before-effect capability separation, but the controller-owned normalized SQLite implementation and load/recovery authority remain unimplemented. |
+| REQ-SDC-012 | `SupervisedChild` retains a direct child as an isolated process-group leader until explicit wait. Arbitrary observed PID signaling is unsupported; group escape, deliberate group join, and controller-exit risks remain explicit. Exact-head hosted macOS qualification is pending. |
 
 ## Next work
 
-Qualify the exact source commit through the existing hosted Rust, Clippy, and spec
-checks. After the policy core is green, add a separately reviewed macOS adapter and
-harmless isolated integration fixture. Durable storage and thin `dev.py` delegation
-must be serialized with the existing installer and host reconciliation owners;
-production adoption remains opt-in until those slices are reviewed.
+Qualify the exact source commit through hosted Rust, Clippy, spec, and harmless
+macOS-native checks, then reconcile an independent adversarial review. Implement the
+controller-owned normalized SQLite store and recovery load authority as a separately
+reviewed slice. Thin `dev.py` delegation remains serialized with the installer and
+host-reconciliation owners and requires a fresh overlap receipt; production adoption
+is outside this slice.
