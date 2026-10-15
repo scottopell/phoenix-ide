@@ -10,5 +10,8 @@ path = "src/lib.rs"
 
 [dependencies]
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

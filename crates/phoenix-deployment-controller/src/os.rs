@@ -46,7 +46,10 @@ pub enum OsEffect {
 }
 
 pub trait ControllerOs {
-    fn sample_resources(&mut self, sequence: u64) -> ResourceSample;
+    fn sample_resources(
+        &mut self,
+        sequence: u64,
+    ) -> Result<ResourceSample, ResourceObservationFailure>;
 
     /// # Errors
     /// Returns a typed query error when enumeration cannot produce trustworthy evidence.
@@ -64,6 +67,13 @@ pub trait ControllerOs {
         &mut self,
         candidate: RetainedCandidateIdentity,
     ) -> CandidateVerification;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceObservationFailure {
+    TemporarilyUnavailable,
+    Unsupported,
+    Malformed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

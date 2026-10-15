@@ -16,6 +16,8 @@
 -- REQ-SDC-008: PersistInterruption and RecoverByReconciliation
 -- REQ-SDC-009: RecordCandidateMigrationInvocation and RecoverForwardAfterMigrationInvocation
 -- REQ-SDC-010: ControllerOsBoundary
+-- REQ-SDC-011: ControllerSqliteBoundary
+-- REQ-SDC-012: MacOsSupervisionBoundary
 
 value ProcessIdentity {
     pid: Integer
@@ -489,8 +491,7 @@ contract ControllerOsBoundary {
     list_children: (parent: ProcessIdentity) -> List<Integer>
     acquire_child_identity: (discovery: DiscoveryEpoch) -> ProcessIdentity?
     observe_identity: (identity: ProcessIdentity) -> Boolean
-    signal_exact_identity: (identity: ProcessIdentity) -> Boolean
-    sample_resources: (sequence: Integer) -> ResourceSample
+    sample_resources: (sequence: Integer) -> ResourceSample?
 
     @invariant BirthIdentityBeforeMutation
         -- A PID hint or process-group relationship is discovery evidence only.
@@ -509,6 +510,39 @@ contract ControllerOsBoundary {
     @invariant PersistenceBeforeEffects
         -- Every phase/evidence change is durably written before its requested OS
         -- mutation. Recovery re-observes identities instead of replaying a signal.
+}
+
+contract ControllerSqliteBoundary {
+    persist_checkpoint: (attempt: DeploymentAttempt) -> Boolean
+    load_attempt: (attempt_id: String) -> DeploymentAttempt?
+
+    @invariant IndependentNormalizedAuthority
+        -- Controller persistence is a distinct SQLite lifecycle. Attempts,
+        -- samples, identities, pending scans, discoveries, and candidates are
+        -- normalized relational rows rather than child collections in a blob.
+
+    @invariant AuthorityLossFailsStop
+        -- An unclassified checkpoint write exposes no OS effect and stops the
+        -- controller rather than projecting semantic uncertainty.
+}
+
+contract MacOsSupervisionBoundary {
+    spawn_owned_group: (attempt_id: String) -> ProcessIdentity?
+    signal_owned_group: (leader: ProcessIdentity) -> Boolean
+    wait_owned_group: (leader: ProcessIdentity) -> Boolean
+
+    @invariant UnreapedLeaderReservesIdentity
+        -- The direct group leader remains unreaped until group cleanup and wait,
+        -- preventing PID reuse while the affine supervision value exists.
+
+    @invariant ArbitraryObservationHasNoMutationAuthority
+        -- A PID-plus-birth observation without owned-child supervision cannot
+        -- invoke kill(2).
+
+    @invariant SupervisionGapsRemainVisible
+        -- Group escape, deliberate same-session join, and controller exit are
+        -- unresolved risks. Controller exit loses authority unless a surviving
+        -- supervisor handoff is positively identified.
 }
 
 -- Helper meanings
@@ -563,6 +597,8 @@ contract ControllerOsBoundary {
 surface StandaloneDeploymentController {
     contracts:
         demands ControllerOsBoundary
+        demands ControllerSqliteBoundary
+        demands MacOsSupervisionBoundary
     context attempt: DeploymentAttempt
     exposes:
         attempt.id

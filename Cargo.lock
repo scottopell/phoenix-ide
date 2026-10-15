@@ -2990,6 +2990,9 @@ dependencies = [
 [[package]]
 name = "phoenix-deployment-controller"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "phoenix-drive-turn"

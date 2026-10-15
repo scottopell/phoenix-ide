@@ -9,8 +9,9 @@ use phoenix_deployment_controller::{
     CommittedTransition, CompatibilityBoundary, ControllerOs, CpuContentionBasisPoints,
     DeploymentAttempt, DiscoveryId, FullCommitSha, IdentityObservation, MemoryPressure,
     MonotonicTick, ObservationFailure, OsEffect, OsQueryError, Phase, ProcessId, ProcessIdentity,
-    ResourceCapacity, ResourceContention, ResourcePolicy, ResourceSample,
-    RetainedCandidateIdentity, Signal, SignalOutcome, StableChildEvidence, Transition,
+    ResourceCapacity, ResourceContention, ResourceObservationFailure, ResourcePolicy,
+    ResourceSample, RetainedCandidateIdentity, Signal, SignalOutcome, StableChildEvidence,
+    Transition,
 };
 
 #[derive(Default)]
@@ -94,8 +95,11 @@ impl FakeOs {
 }
 
 impl ControllerOs for FakeOs {
-    fn sample_resources(&mut self, sequence: u64) -> ResourceSample {
-        ample_sample(sequence)
+    fn sample_resources(
+        &mut self,
+        sequence: u64,
+    ) -> Result<ResourceSample, ResourceObservationFailure> {
+        Ok(ample_sample(sequence))
     }
 
     fn list_children(&mut self, parent: ProcessIdentity) -> Result<Vec<ProcessId>, OsQueryError> {

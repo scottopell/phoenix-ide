@@ -177,3 +177,33 @@ THE SYSTEM SHALL cover deterministic policy and race cases with a fake operating
 system
 AND SHALL separately qualify platform adapters with harmless isolated native
 labels and resources before production adoption.
+
+---
+
+### REQ-SDC-011: Independent Normalized Persistence
+
+THE standalone controller SHALL own a SQLite database whose lifecycle is independent
+of the Phoenix application database under migration.
+
+THE controller database SHALL normalize attempts, resource samples, owned identities,
+pending child scans, discovery epochs, and retained candidates with relational
+constraints rather than storing those child collections in an aggregate blob.
+
+WHEN controller SQLite authority cannot classify whether a checkpoint committed
+THE SYSTEM SHALL fail stop rather than publish effects or continue admission.
+
+---
+
+### REQ-SDC-012: Owned-Child macOS Mutation
+
+WHEN the macOS adapter creates process-mutation authority
+THE SYSTEM SHALL spawn a direct child as an isolated process-group leader and retain
+that child unreaped until group cleanup and final wait.
+
+THE general observation adapter SHALL NOT signal an arbitrary process solely from a
+PID-plus-birth observation.
+
+THE SYSTEM SHALL expose descendant group escape, deliberate same-session group join,
+and controller exit as unresolved supervision risks
+AND SHALL treat supervision lost across controller exit as unresolved risk unless a
+surviving supervisor handoff is positively identified.

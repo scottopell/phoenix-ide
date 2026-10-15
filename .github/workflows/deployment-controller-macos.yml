@@ -1,0 +1,61 @@
+name: Deployment controller macOS
+
+on:
+  pull_request:
+    paths:
+      - "crates/phoenix-deployment-controller/**"
+      - "specs/standalone-deployment-controller/**"
+      - "specs/adrs/106_standalone-controller-owns-durability-and-supervision.md"
+      - ".github/workflows/deployment-controller-macos.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - "crates/phoenix-deployment-controller/**"
+      - "specs/standalone-deployment-controller/**"
+      - "specs/adrs/106_standalone-controller-owns-durability-and-supervision.md"
+      - ".github/workflows/deployment-controller-macos.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+concurrency:
+  group: deployment-controller-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-controller:
+    name: native controller (macOS)
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      PHOENIX_CHECK_ALL: "1"
+      PHOENIX_CHECK_WORKERS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+          shared-key: deployment-controller-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@phoenix-ide.invalid"
+          git config --global user.name "Phoenix CI"
+      - name: Run native controller and workspace Rust checks
+        run: ./dev.py check --lanes rust,clippy,cargo-fmt
