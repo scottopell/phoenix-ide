@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent e84f78f checkout, independently built ignored
+Inputs are a clean independent 89a9e8e checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports four hash-attested telemetry harness
@@ -32,15 +32,15 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "e84f78faa572da6156d541360ce6ccb96bb11eb8"
-TREE_PIN = "6a5fa5017bf2315892ca06cea7446678c237123b"
+PIN = "89a9e8ec5bf7779bb2dff4c145e76844803a47ff"
+TREE_PIN = "542bbc877ae5cd3fdbfefb13b762d660220e78ae"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
-    "ui/scripts/qualify-view-telemetry.mjs": "75d7543900c9e9af7e86f279afdf99d2125cf291b9691ac9a7b85aabb3c820b1",
+    "ui/scripts/qualify-view-telemetry.mjs": "c19bbc39d35e3adcaa046c0269d2a2d1d111bd644d0e34bd08bee5e0389c6d22",
     "ui/scripts/view-telemetry-diagnostics.mjs": "2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c",
     "tests/e2e/view_telemetry_sink.py": "aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",

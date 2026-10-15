@@ -1269,3 +1269,17 @@ plus syntax and diff checks. These include genuine-unsampled correlated GET,
 missing admission, foreign request UUID, overflow, sampled/no-POST and missing
 response controls. No local compile/install/server/capture or large copy was
 performed. New-source full UI/Rust/runtime/drain/export acceptance remains owed.
+
+Exact review of the admission successor found one bounded-lifecycle gap: newly
+installed binding/init-script awaits preceded the case's absolute-deadline
+operation. Donor correction `af5d0ba5d15aaab7131995ce53ab8e15c3381435`, integrated
+as app `89a9e8ec5bf7779bb2dff4c145e76844803a47ff`, tree
+`542bbc877ae5cd3fdbfefb13b762d660220e78ae`, starts that same operation before
+installation, without increasing any deadline, and rejects late installation
+completion before page admission. Fake-clock controls stall each install await:
+the original timeout survives, the context closes once, the trial receipt is
+emitted, and late release cannot create a page. Actual cached offline checks
+passed again: 16 shipping Python, 14 base Node, 46 opening Python, 30 opening
+Node, 50 joint Node and 61 donor tests across two files. The prior uncorrected
+admission packet was not published; these remain source/mock checks, not runtime
+acceptance or proof of the earlier missing response's cause.
