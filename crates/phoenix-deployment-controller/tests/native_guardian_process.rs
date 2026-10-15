@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn assert_guardian_is_parent(child_pid: u32, guardian_pid: u32) {
+fn assert_guardian_is_parent(child_pid: i32, guardian_pid: u32) {
     let parent_pid = Command::new("/bin/ps")
         .args(["-o", "ppid=", "-p", &child_pid.to_string()])
         .output()
