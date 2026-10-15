@@ -782,3 +782,24 @@ test.each(['unsampled', 'missing', 'foreign_request', 'overflow', 'sampled_no_po
     assert.ok(trial.producer_events.length <= 64);
   } finally { vi.useRealTimers(); }
 });
+
+test.each(['binding', 'initialization'])('pagehide stalled diagnostic %s obeys absolute case deadline, finalizes and cannot admit a late page', async mode => {
+  vi.useFakeTimers();
+  let release; let closed = 0; let pages = 0; let trial;
+  const stalled = new Promise(resolve => { release = resolve; });
+  const owned = { exposeBinding: async () => mode === 'binding' ? stalled : undefined,
+    addInitScript: async () => mode === 'initialization' ? stalled : undefined,
+    newPage: async () => { pages++; throw new Error('must not admit page after timeout'); }, close: async () => { closed++; } };
+  try {
+    const operation = runPendingPagehideCheck({ browser: { newContext: async () => owned }, storageState: {}, baseURL: 'http://127.0.0.1:8123', route: '/c/product', attempts: 1, budgetMs: 1, onTrial: value => { trial = value; } });
+    const outcome = operation.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await outcome;
+    assert.match(error.message, /absolute pagehide stage/);
+    assert.equal(trial.failure, error.message); assert.equal(trial.context_close_returned, true);
+    assert.equal(closed, 1); assert.equal(pages, 0);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(pages, 0); assert.equal(closed, 1);
+  } finally { vi.useRealTimers(); }
+});
