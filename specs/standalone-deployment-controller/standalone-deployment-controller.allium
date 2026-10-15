@@ -114,20 +114,14 @@ value DispatchBatch {
     remaining: Integer
 }
 
-value DispatchIssuance {
-    checkpoint_attempt_id: String
-    batch: DispatchBatch
-}
-
-value DispatchAdvance {
-    remaining_batch: DispatchBatch
-    ticket: DispatchTicket?
-}
-
 value ExecutedEffect {
     key: DispatchKey
     effect_kind: DispatchEffectKind
     completion_kind: EffectCompletionKind
+}
+
+value SignalRoundResults {
+    completed_count: Integer
 }
 
 enum GuardianSessionState {
@@ -140,6 +134,8 @@ value GuardianBinding {
     guardian_pid: Integer
     guardian_birth: Timestamp
     state: GuardianSessionState
+    minimum_dispatch_revision: Integer?
+    reconciliation_floor: Integer?
 }
 
 value StatusSummary {
@@ -703,8 +699,8 @@ contract ControllerSqliteBoundary {
 }
 
 contract AffineDispatchBoundary {
-    into_dispatch: (committed: CommittedTransition) -> DispatchIssuance
-    next_ticket: (batch: DispatchBatch) -> DispatchAdvance
+    into_dispatch: (committed: CommittedTransition) -> DispatchBatch
+    next_ticket: (batch: DispatchBatch) -> DispatchTicket?
     execute: (ticket: DispatchTicket) -> ExecutedEffect
 
     @invariant SuccessfulPersistenceIsTheIssuingBoundary
@@ -805,6 +801,8 @@ contract MacOsSupervisionBoundary {
 contract SurvivingGuardianBoundary {
     fence_controller_loss: (binding: GuardianBinding) -> GuardianBinding
     begin_reconciliation: (binding: GuardianBinding) -> GuardianBinding?
+    admit_observation: (binding: GuardianBinding, ticket: DispatchTicket) -> Boolean
+    admit_mutation: (binding: GuardianBinding, ticket: DispatchTicket) -> Boolean
 
     @invariant ControllerLossDetachesAndFences
         -- Controller exit changes the same retained guardian instance to
@@ -822,10 +820,38 @@ contract SurvivingGuardianBoundary {
         -- observation barrier before any new mutation, preserving the attempt's
         -- original absolute deadline and forward-only compatibility boundary.
 
+    @invariant ReconciliationRevisionNeverRegresses
+        -- Reconciliation is bound to the exact committed interruption revision.
+        -- Observation tickets and the final reconciliation permit cannot predate
+        -- that floor, and a later session never lowers the installed dispatch floor.
+        -- Retained recovery plans from an older session cannot activate a guardian.
+
     @invariant GuardianLossFailsStop
         -- Guardian loss, replacement, or deadline expiry preserves unresolved
         -- supervision risk. No historical process identity is adopted and no
         -- automatic TERM/KILL sequence is inferred from liveness telemetry.
+}
+
+contract DeterministicPolicyLoop {
+    apply_retained: (result: ExecutedEffect) -> Boolean
+    settle_signal_round: (results: SignalRoundResults) -> Boolean
+
+    @invariant PersistBeforeAcknowledgement
+        -- A guardian-held result is acknowledged only after its corresponding
+        -- checkpoint or explicit round settlement commits. Query failures and
+        -- unsettled signal outcomes remain retained rather than fabricating evidence.
+
+    @invariant SiblingResultsRemainAdmissible
+        -- Applying one sibling may advance the checkpoint revision but does not
+        -- invalidate other issued siblings from the same committed dispatch batch.
+
+    @invariant FailedPersistenceFencesCustody
+        -- Unclassified persistence discards unissued loop authority and moves the
+        -- bound guardian to authority_lost before another ticket can execute.
+
+    @invariant OversizedMutationBatchFailsClosed
+        -- A signal round larger than the bounded guardian result capacity emits no
+        -- partial mutation and enters administrative closeout with unresolved risk.
 }
 
 -- Helper meanings

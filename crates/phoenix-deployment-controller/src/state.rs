@@ -93,7 +93,7 @@ pub enum Phase {
 }
 
 /// A durable, nonzero checkpoint revision. Absence means never persisted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PersistenceRevision(std::num::NonZeroU64);
 
 impl PersistenceRevision {
@@ -234,6 +234,19 @@ impl LoadedAttempt {
         self.checkpoint.cleanup_outcome()
     }
 
+    pub(crate) fn into_committed_interruption(
+        self,
+    ) -> Result<CommittedTransition, TransitionError> {
+        if self.checkpoint.phase() != Phase::Interrupted {
+            return Err(TransitionError::WrongPhase);
+        }
+        Ok(CommittedTransition {
+            checkpoint: self.checkpoint,
+            after_persist: Vec::new(),
+            dispatch_purpose: DispatchPurpose::Ordinary,
+        })
+    }
+
     /// Active work first checkpoints interruption without OS effects. A further
     /// committed recovery transition restarts the fresh-observation barrier.
     ///
@@ -279,7 +292,7 @@ impl std::fmt::Debug for LoadedAttempt {
         f.debug_struct("LoadedAttempt")
             .field("id", &self.attempt_id())
             .field("phase", &self.phase())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -383,6 +396,18 @@ pub enum DeploymentAttempt {
     AdministrativelyClosed(AdministrativelyClosed),
 }
 
+/// Maximum signals in one retained, explicitly settled policy round.
+pub const MAX_OWNED_SIGNAL_BATCH: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchPurpose {
+    Ordinary,
+    OwnedSignalRound,
+    Recovery {
+        interrupted_revision: PersistenceRevision,
+    },
+}
+
 /// An uncommitted plan cannot issue tickets.
 ///
 /// ```compile_fail
@@ -395,6 +420,7 @@ pub enum DeploymentAttempt {
 pub struct Transition {
     checkpoint: DeploymentAttempt,
     after_persist: Vec<OsEffect>,
+    dispatch_purpose: DispatchPurpose,
 }
 
 pub trait AttemptStore {
@@ -427,6 +453,7 @@ pub trait AttemptStore {
 pub struct CommittedTransition {
     checkpoint: DeploymentAttempt,
     after_persist: Vec<OsEffect>,
+    dispatch_purpose: DispatchPurpose,
 }
 
 impl Transition {
@@ -442,11 +469,25 @@ impl Transition {
         Ok(CommittedTransition {
             checkpoint: self.checkpoint,
             after_persist: self.after_persist,
+            dispatch_purpose: self.dispatch_purpose,
         })
     }
 }
 
 impl CommittedTransition {
+    pub(crate) fn is_owned_signal_round(&self) -> bool {
+        self.dispatch_purpose == DispatchPurpose::OwnedSignalRound
+    }
+
+    pub(crate) const fn recovery_origin(&self) -> Option<PersistenceRevision> {
+        match self.dispatch_purpose {
+            DispatchPurpose::Recovery {
+                interrupted_revision,
+            } => Some(interrupted_revision),
+            DispatchPurpose::Ordinary | DispatchPurpose::OwnedSignalRound => None,
+        }
+    }
+
     #[must_use]
     pub fn checkpoint(&self) -> &DeploymentAttempt {
         &self.checkpoint
@@ -483,6 +524,7 @@ impl DeploymentAttempt {
             window: ResourceWindow::new(policy),
         }));
         Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: attempt,
             after_persist: vec![OsEffect::SampleResources { sequence: 0 }],
         }
@@ -574,6 +616,7 @@ impl DeploymentAttempt {
                 attempt.pending_sample_sequence = attempt.pending_sample_sequence.saturating_add(1);
                 let sequence = attempt.pending_sample_sequence;
                 Ok(Transition {
+                    dispatch_purpose: DispatchPurpose::Ordinary,
                     checkpoint: Self::Active(ActiveAttempt::ResourceSampling(attempt)),
                     after_persist: vec![OsEffect::SampleResources { sequence }],
                 })
@@ -589,11 +632,13 @@ impl DeploymentAttempt {
                     cleanup: CleanupOutcome::NotStarted,
                 };
                 Ok(Transition {
+                    dispatch_purpose: DispatchPurpose::Ordinary,
                     checkpoint: Self::Active(ActiveAttempt::Ownership(ownership)),
                     after_persist: vec![OsEffect::ListChildren { parent: root }],
                 })
             }
             ResourceAssessment::Blocked(reason) => Ok(Transition {
+                dispatch_purpose: DispatchPurpose::Ordinary,
                 checkpoint: Self::ResourceBlocked(ResourceBlockedAttempt {
                     context: attempt.context,
                     reason,
@@ -625,11 +670,70 @@ impl DeploymentAttempt {
             .map_err(TransitionError::UnknownParent)?;
         Ok((
             Transition {
+                dispatch_purpose: DispatchPurpose::Ordinary,
                 checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
                 after_persist: vec![OsEffect::AcquireChildIdentity { discovery }],
             },
             discovery,
         ))
+    }
+
+    /// Records one complete enumeration, including every birth-evidence obligation,
+    /// in a single checkpoint. Duplicate PID hints create only one discovery epoch.
+    ///
+    /// # Errors
+    /// Rejects non-discovery phases, a parent without a pending scan, or exhausted
+    /// discovery sequence space. No partial enumeration is returned.
+    pub fn record_child_list(
+        self,
+        parent: ProcessIdentity,
+        mut pids: Vec<ProcessId>,
+    ) -> Result<Transition, TransitionError> {
+        let mut attempt = self.into_ownership()?;
+        if !matches!(
+            attempt.phase,
+            OwnershipPhase::Discovery
+                | OwnershipPhase::AwaitingBirthEvidence
+                | OwnershipPhase::Recovering
+        ) {
+            return Err(TransitionError::WrongPhase);
+        }
+        if !attempt.tree.pending_child_scans().contains(&parent) {
+            return Err(TransitionError::UnknownChildScan(UnknownChildScan));
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        let count =
+            u64::try_from(pids.len()).map_err(|_| TransitionError::DiscoverySequenceExhausted)?;
+        attempt
+            .tree
+            .next_discovery()
+            .checked_add(count)
+            .ok_or(TransitionError::DiscoverySequenceExhausted)?;
+        let mut after_persist = Vec::with_capacity(pids.len());
+        for pid in pids {
+            let discovery = attempt
+                .tree
+                .discover_child(parent, pid)
+                .map_err(TransitionError::UnknownParent)?;
+            after_persist.push(OsEffect::AcquireChildIdentity { discovery });
+        }
+        attempt
+            .tree
+            .complete_child_scan(parent)
+            .map_err(TransitionError::UnknownChildScan)?;
+        if attempt.phase != OwnershipPhase::Recovering {
+            attempt.phase = if attempt.tree.unresolved().is_empty() {
+                OwnershipPhase::Discovery
+            } else {
+                OwnershipPhase::AwaitingBirthEvidence
+            };
+        }
+        Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
+            checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
+            after_persist,
+        })
     }
 
     /// # Errors
@@ -648,7 +752,11 @@ impl DeploymentAttempt {
         let after_persist = match outcome {
             ChildObservationOutcome::Adopted(identity) => {
                 if !recovering {
-                    attempt.phase = OwnershipPhase::Discovery;
+                    attempt.phase = if attempt.tree.unresolved().is_empty() {
+                        OwnershipPhase::Discovery
+                    } else {
+                        OwnershipPhase::AwaitingBirthEvidence
+                    };
                 }
                 let mut effects = vec![OsEffect::ListChildren { parent: identity }];
                 if recovering {
@@ -664,6 +772,7 @@ impl DeploymentAttempt {
             }
         };
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist,
         })
@@ -685,6 +794,7 @@ impl DeploymentAttempt {
             })
             .collect();
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist: effects,
         })
@@ -717,6 +827,7 @@ impl DeploymentAttempt {
             };
         }
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist: Vec::new(),
         })
@@ -738,6 +849,7 @@ impl DeploymentAttempt {
         if !attempt.tree.unresolved().is_empty() {
             attempt.phase = OwnershipPhase::AwaitingBirthEvidence;
             return Ok(Transition {
+                dispatch_purpose: DispatchPurpose::Ordinary,
                 checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
                 after_persist: Vec::new(),
             });
@@ -746,6 +858,7 @@ impl DeploymentAttempt {
         attempt.cleanup = CleanupOutcome::InProgress;
         let effects = observe_all(&attempt.tree);
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist: effects,
         })
@@ -770,6 +883,7 @@ impl DeploymentAttempt {
             .record_identity_observation(identity, observation)
             .map_err(TransitionError::UnknownOwnedIdentity)?;
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist: Vec::new(),
         })
@@ -795,6 +909,7 @@ impl DeploymentAttempt {
         if now >= attempt.context.deadline {
             return match attempt.tree.cleanup_readiness() {
                 CleanupReadiness::VerifiedClean => Ok(Transition {
+                    dispatch_purpose: DispatchPurpose::Ordinary,
                     checkpoint: Self::Ready(ReadyAttempt {
                         context: attempt.context,
                         resources: attempt.resources,
@@ -807,13 +922,16 @@ impl DeploymentAttempt {
                 }
             };
         }
-        let effects = attempt
-            .tree
-            .exact_signal_candidates()
+        let candidates = attempt.tree.exact_signal_candidates();
+        if candidates.len() > MAX_OWNED_SIGNAL_BATCH {
+            return Ok(to_administrative_closeout(attempt));
+        }
+        let effects = candidates
             .into_iter()
             .map(|identity| OsEffect::SignalExactIdentity { identity, signal })
             .collect();
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::OwnedSignalRound,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist: effects,
         })
@@ -830,6 +948,7 @@ impl DeploymentAttempt {
         attempt.tree.mark_all_for_reconciliation();
         let effects = observe_all(&attempt.tree);
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist: effects,
         })
@@ -851,6 +970,7 @@ impl DeploymentAttempt {
         if now >= attempt.context.deadline {
             return match attempt.tree.cleanup_readiness() {
                 CleanupReadiness::VerifiedClean => Ok(Transition {
+                    dispatch_purpose: DispatchPurpose::Ordinary,
                     checkpoint: Self::Ready(ReadyAttempt {
                         context: attempt.context,
                         resources: attempt.resources,
@@ -871,6 +991,7 @@ impl DeploymentAttempt {
             };
             attempt.recovery_resume = None;
             return Ok(Transition {
+                dispatch_purpose: DispatchPurpose::Ordinary,
                 checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
                 after_persist: Vec::new(),
             });
@@ -889,6 +1010,7 @@ impl DeploymentAttempt {
             RecoveryResume::Verifying => OwnershipPhase::Verifying,
         };
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
             after_persist: Vec::new(),
         })
@@ -903,6 +1025,7 @@ impl DeploymentAttempt {
         }
         match attempt.tree.cleanup_readiness() {
             CleanupReadiness::VerifiedClean => Ok(Transition {
+                dispatch_purpose: DispatchPurpose::Ordinary,
                 checkpoint: Self::Ready(ReadyAttempt {
                     context: attempt.context,
                     resources: attempt.resources,
@@ -913,6 +1036,7 @@ impl DeploymentAttempt {
             CleanupReadiness::OwnedIdentityMayRemain if now < attempt.context.deadline => {
                 attempt.phase = OwnershipPhase::Cleaning;
                 Ok(Transition {
+                    dispatch_purpose: DispatchPurpose::Ordinary,
                     checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
                     after_persist: Vec::new(),
                 })
@@ -920,6 +1044,7 @@ impl DeploymentAttempt {
             CleanupReadiness::UnresolvedEvidence if now < attempt.context.deadline => {
                 attempt.phase = OwnershipPhase::AwaitingBirthEvidence;
                 Ok(Transition {
+                    dispatch_purpose: DispatchPurpose::Ordinary,
                     checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
                     after_persist: Vec::new(),
                 })
@@ -951,6 +1076,7 @@ impl DeploymentAttempt {
         };
         let context = *active.context();
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Interrupted(InterruptedAttempt {
                 context,
                 resume: active,
@@ -971,6 +1097,7 @@ impl DeploymentAttempt {
                     ActiveAttempt::ResourceSampling(attempt) => {
                         let sequence = attempt.pending_sample_sequence;
                         Ok(Transition {
+                            dispatch_purpose: recovery_purpose(interrupted.context)?,
                             checkpoint: Self::Active(ActiveAttempt::ResourceSampling(attempt)),
                             after_persist: vec![OsEffect::SampleResources { sequence }],
                         })
@@ -988,6 +1115,7 @@ impl DeploymentAttempt {
                         attempt.tree.mark_all_for_reconciliation();
                         let effects = recovery_effects(&attempt.tree);
                         Ok(Transition {
+                            dispatch_purpose: recovery_purpose(interrupted.context)?,
                             checkpoint: Self::Active(ActiveAttempt::Ownership(attempt)),
                             after_persist: effects,
                         })
@@ -1004,6 +1132,7 @@ impl DeploymentAttempt {
                 attempt.verification = None;
                 let candidate = attempt.candidate;
                 Ok(Transition {
+                    dispatch_purpose: DispatchPurpose::Ordinary,
                     checkpoint: Self::ForwardRecovery(attempt),
                     after_persist: vec![OsEffect::ReverifyRetainedCandidate { candidate }],
                 })
@@ -1039,6 +1168,7 @@ impl DeploymentAttempt {
             }
         }
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::Ready(attempt),
             after_persist: Vec::new(),
         })
@@ -1055,6 +1185,7 @@ impl DeploymentAttempt {
         };
         attempt.verification = Some(verification);
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::ForwardRecovery(attempt),
             after_persist: Vec::new(),
         })
@@ -1073,6 +1204,7 @@ impl DeploymentAttempt {
             return Err(TransitionError::AcceptanceAttemptMismatch);
         }
         Ok(Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
             checkpoint: Self::AdministrativelyClosed(AdministrativelyClosed {
                 context: attempt.context,
                 resources: attempt.resources,
@@ -1192,6 +1324,14 @@ impl DeploymentAttempt {
         }
     }
 
+    pub(crate) fn checkpoint_only(self) -> Transition {
+        Transition {
+            dispatch_purpose: DispatchPurpose::Ordinary,
+            checkpoint: self,
+            after_persist: Vec::new(),
+        }
+    }
+
     fn into_ownership(self) -> Result<OwnershipAttempt, TransitionError> {
         match self {
             Self::Active(ActiveAttempt::Ownership(attempt)) => Ok(attempt),
@@ -1220,6 +1360,12 @@ impl ActiveAttempt {
             Self::Ownership(attempt) => &attempt.context,
         }
     }
+}
+
+fn recovery_purpose(context: AttemptContext) -> Result<DispatchPurpose, TransitionError> {
+    Ok(DispatchPurpose::Recovery {
+        interrupted_revision: context.revision.ok_or(TransitionError::WrongPhase)?,
+    })
 }
 
 fn recovery_resume_for(phase: OwnershipPhase) -> Result<RecoveryResume, TransitionError> {
@@ -1255,6 +1401,7 @@ fn forward_recovery_transition(
     candidate: RetainedCandidateIdentity,
 ) -> Transition {
     Transition {
+        dispatch_purpose: DispatchPurpose::Ordinary,
         checkpoint: DeploymentAttempt::ForwardRecovery(ForwardRecoveryAttempt {
             context,
             candidate,
@@ -1274,6 +1421,7 @@ fn observe_all(tree: &OwnedProcessTree) -> Vec<OsEffect> {
 
 fn to_administrative_closeout(attempt: OwnershipAttempt) -> Transition {
     Transition {
+        dispatch_purpose: DispatchPurpose::Ordinary,
         checkpoint: DeploymentAttempt::AdministrativeCloseoutRequired(
             AdministrativeCloseoutRequired {
                 context: attempt.context,
@@ -1296,6 +1444,7 @@ pub enum TransitionError {
     UnknownParent(UnknownParent),
     UnknownChildScan(UnknownChildScan),
     UnknownDiscovery(UnknownDiscovery),
+    DiscoverySequenceExhausted,
     UnknownOwnedIdentity(UnknownOwnedIdentity),
     UnresolvedOwnership,
     PendingChildScans,

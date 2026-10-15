@@ -68,16 +68,20 @@ qualification remains required before claiming runtime acceptance of this slice.
 | REQ-SDC-009 | `CompatibilityBoundary::CandidateMigrationInvoked` retains full commit plus artifact digest and recovers only through candidate reverification. |
 | REQ-SDC-010 | `ControllerOs` is typed and fake-backed; hosted macOS tests qualify native observation and fail-closed capacity/contention sampling, including counter-regression and capacity-arithmetic regressions. |
 | REQ-SDC-011 | `ControllerSqliteStore` owns an independent schema with normalized child rows, full-transaction checkpoint replacement, revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning; hosted tests and Clippy pass. |
-| REQ-SDC-012 | `SupervisedChild` retains a direct child as an isolated process-group leader until original-group finalization. Leader exit alone cannot finalize while same-group descendants remain; Drop is bounded best-effort and cannot claim cleanup. Arbitrary observed PID signaling is unsupported; group escape, deliberate group join, and controller-exit risks remain explicit. Harmless hosted macOS qualification passes. |
-| REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor and recording-OS tests cover all six calls, typed outcomes, sibling ordinals, drop, and persistence failure. Compile-fail examples reject cloning and fabrication. New tests are unexecuted pending admitted/hosted Rust validation. |
-| REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope. New tests are unexecuted pending admitted/hosted Rust validation. |
+| REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. The in-process `Guardian`/`PolicyLoop` author detach-and-fence custody, exact instance/session binding, retained-result acknowledgement, reconciliation revision floors, and fail-stop integration. Harmless native supervision passes; launchd IPC and controller-death qualification remain unimplemented. |
+| REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor and CLI coverage passed full CI/macOS at `802123f34813c601f9830b63e373d43491d0823d`. The new completion-to-checkpoint and guardian integration tests are authored and await hosted qualification. |
+| REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `802123f34813c601f9830b63e373d43491d0823d`. |
 
 ## Next work
 
-Native `run`, reconciliation, deployment, and activation remain blocked and are not
-binary commands. No surviving-supervisor behavior or installer/schema mechanics is
-introduced by the dispatch and safe-CLI slice. Hosted compilation, tests, doctests,
-and Clippy must qualify this slice before integration acceptance.
+A deterministic `PolicyLoop` and bounded in-process `Guardian` now model completion
+persistence, retained-result acknowledgement, session fencing, detach-and-fence
+recovery, reconciliation revision floors, and oversized mutation fail-closed behavior.
+Their deterministic tests and privacy examples are authored but not locally compiled
+or executed under source-only admission; hosted compilation, tests, doctests, and
+Clippy must qualify this new slice. No launchd IPC, native guardian process, deploy,
+installer, activation, or `run` command is exposed, so this is not production
+crash-survival capability.
 
 PR 919 released the qualified installer seam at merge
 `0304adc6841f5fb8297d9bc036d891309083a6e3`: `dev.py` remains blob
@@ -86,5 +90,6 @@ PR 919 released the qualified installer seam at merge
 prepared current-schema `dev.py prod deploy` command; helper-owned schema, ledger,
 claim, recovery, signature, and source-binding policy remains outside the controller.
 This slice does not invoke that boundary. Controller loss uses the ADR-108
-**detach-and-fence** policy; the guardian protocol and disposable death/reconnect
-qualification remain unimplemented, so production adoption remains blocked.
+**detach-and-fence** policy; the in-process protocol model is authored, while launchd
+transport/native custody and disposable process-death/reconnect qualification remain
+unimplemented. Production adoption remains blocked.

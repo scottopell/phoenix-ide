@@ -12,17 +12,26 @@
 
 mod candidate;
 mod driver;
+pub mod guardian;
 mod identity;
 #[cfg(target_os = "macos")]
 mod macos;
 mod os;
 mod ownership;
 mod resource;
+pub mod runtime;
 mod state;
 
 pub use candidate::{ArtifactDigest, FullCommitSha, InvalidHexIdentity, RetainedCandidateIdentity};
 pub use driver::{
     DispatchBatch, DispatchKey, DispatchTicket, EffectCompletion, EffectExecutor, ExecutedEffect,
+};
+pub use guardian::{
+    AppliedResultAck, BoundSubmissionError, BoundSubmissionRefusal, ChildSlotId,
+    ChildSlotObservation, ControllerSession, CustodySummary, ForfeitedCustody, Guardian,
+    GuardianBuildFailure, GuardianError, GuardianExecutor, GuardianInstanceId, GuardianState,
+    QuarantinedResult, ReconciledSessionPermit, SessionDispatchTicket, TicketBindingRefusal,
+    MAX_CHILD_SLOTS, MAX_RETAINED_RESULTS,
 };
 pub use identity::{
     BirthToken, CandidateDiscovery, ChildEvidenceMismatch, ChildIdentityObservation, DiscoveryId,
@@ -46,10 +55,14 @@ pub use resource::{
     ResourceAssessment, ResourceBlock, ResourceCapacity, ResourceContention, ResourcePolicy,
     ResourceSample, ResourceWindow, SustainedResourceEvidence,
 };
+pub use runtime::{
+    AckDisposition, EffectMismatchDetail, GuardianLoopError, LoopError, LoopFailure,
+    LoopFenceReason, LoopProgress, LoopStatus, LoopSummary, ParkReason, PolicyLoop, SignalResult,
+};
 pub use state::sqlite::{ControllerSqliteStore, ControllerStoreError};
 pub use state::{
     ActiveAttempt, AdministrativeRiskAcceptance, AttemptId, AttemptStore, CleanupOutcome,
     CommittedTransition, CompatibilityBoundary, DeploymentAttempt, LoadedAttempt, MonotonicTick,
     OwnershipAttempt, PersistenceRevision, Phase, RecoveryDisposition, ResourceSamplingAttempt,
-    StableAttempt, Transition, TransitionError,
+    StableAttempt, Transition, TransitionError, MAX_OWNED_SIGNAL_BATCH,
 };
