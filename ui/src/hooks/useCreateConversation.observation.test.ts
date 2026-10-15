@@ -216,7 +216,11 @@ describe('exact-request creation observation', () => {
     const hook = mountCreation();
     await prepareCreation(hook);
     let submit!: Promise<void>;
-    act(() => { submit = hook.result.current.handleSend(); });
+    await act(async () => {
+      submit = hook.result.current.handleSend();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(storedAtPost).toEqual({
       version: 3, kind: 'uncertain', request: apiMock.createProductConversation.mock.calls[0]![0],
     });
@@ -240,7 +244,11 @@ describe('exact-request creation observation', () => {
     const original = mountCreation();
     await prepareCreation(original);
     let submit!: Promise<void>;
-    act(() => { submit = original.result.current.handleSend(); });
+    await act(async () => {
+      submit = original.result.current.handleSend();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     const storedRequest = apiMock.createProductConversation.mock.calls[0]![0];
     original.unmount();
     expect(storedCreation()).toEqual({ version: 3, kind: 'uncertain', request: storedRequest });
@@ -281,7 +289,7 @@ describe('exact-request creation observation', () => {
     await act(async () => { await hook.result.current.handleSend(); });
     expect(hook.result.current.canSend).toBe(false);
     expect(hook.result.current.creating).toBe(true);
-    expect(storedCreation()?.kind).toBe('uncertain');
+    expect(storedCreation()?.['kind']).toBe('uncertain');
     await act(async () => { committed.resolve(published); await committed.promise; });
     expect(hook.navigate).toHaveBeenCalledExactlyOnceWith('/c/canonical-product-1');
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(1);
@@ -300,10 +308,10 @@ describe('exact-request creation observation', () => {
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(2);
     expect(apiMock.createProductConversation.mock.calls[1]![0]).toEqual(apiMock.createProductConversation.mock.calls[0]![0]);
     expect(hook.result.current.canSend).toBe(false);
-    expect(storedCreation()?.kind).toBe('uncertain');
+    expect(storedCreation()?.['kind']).toBe('uncertain');
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(hook.result.current.creationObservation).toEqual(pending);
-    expect(storedCreation()?.kind).toBe('accepted');
+    expect(storedCreation()?.['kind']).toBe('accepted');
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
   });
 
@@ -549,6 +557,10 @@ describe('exact-request creation observation', () => {
     act(() => hook.result.current.startOverFromCreation('request-1', {
       cwd: '/other', objective: 'New objective', model: 'model-1', effort: null, images: [], llm_language: null,
     }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(storedCreation()).toBeNull();
     expect(hook.result.current.creationObservation).toBeNull();
     expect(hook.result.current.draft).toBe('New objective');
@@ -566,6 +578,10 @@ describe('exact-request creation observation', () => {
     await act(async () => { await hook.result.current.handleSend(); });
     expect(hook.result.current.canSend).toBe(false);
     act(() => hook.result.current.forgetCreationObservation('request-1'));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(hook.result.current.canSend).toBe(true);
     expect(storedCreation()).toBeNull();
     expect(hook.result.current.creationObservation).toBeNull();

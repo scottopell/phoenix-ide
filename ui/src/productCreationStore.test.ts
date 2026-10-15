@@ -52,13 +52,18 @@ function installIndexedDb(): void {
   };
   const indexedDb = {
     open: () => {
-      const request = {
+      const request: Record<string, unknown> & {
+        result: unknown;
+        onsuccess: (() => void) | null;
+      } = {
         ...fakeRequest(),
+        result: undefined,
+        onsuccess: null,
         onupgradeneeded: null,
       };
       queueMicrotask(() => {
         request.result = database;
-        (request.onsuccess as (() => void) | null)?.();
+        request.onsuccess?.();
       });
       return request;
     },
