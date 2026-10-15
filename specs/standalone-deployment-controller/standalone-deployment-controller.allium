@@ -855,6 +855,8 @@ contract DeterministicPolicyLoop {
     @invariant OversizedMutationBatchFailsClosed
         -- A signal round larger than the bounded guardian result capacity emits no
         -- partial mutation and enters administrative closeout with unresolved risk.
+        -- A bounded round starts only after the guardian reserves enough unoccupied
+        -- result custody for every signal; reservation refusal emits no mutation.
 }
 
 -- Helper meanings

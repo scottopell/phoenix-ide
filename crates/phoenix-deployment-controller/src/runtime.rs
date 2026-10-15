@@ -223,6 +223,7 @@ struct IssuedEffect {
 }
 
 struct Round {
+    dispatch_revision: PersistenceRevision,
     unissued: DispatchBatch,
     returned: Option<DispatchTicket>,
     issued: Vec<IssuedEffect>,
@@ -232,6 +233,19 @@ struct Round {
 impl Round {
     fn complete(&self) -> bool {
         self.returned.is_none() && self.unissued.is_empty() && self.issued.is_empty()
+    }
+
+    fn signal_reservation_request(&self) -> Option<(PersistenceRevision, usize)> {
+        self.signals.as_ref()?;
+        if self.returned.is_none() && self.unissued.is_empty() {
+            return None;
+        }
+        let count = self
+            .unissued
+            .len()
+            .saturating_add(self.issued.len())
+            .saturating_add(usize::from(self.returned.is_some()));
+        Some((self.dispatch_revision, count))
     }
 }
 
@@ -733,6 +747,15 @@ impl PolicyLoop {
             });
         }
         self.check_bridge(guardian, session)?;
+        if let Some((revision, count)) = self
+            .rounds
+            .front()
+            .and_then(Round::signal_reservation_request)
+        {
+            guardian
+                .reserve_signal_results(session, revision, count)
+                .map_err(GuardianLoopError::Guardian)?;
+        }
         let Some(ticket) = self.issue_next() else {
             return Ok(None);
         };
@@ -1267,6 +1290,10 @@ impl PolicyLoop {
     fn enqueue(&mut self, batch: DispatchBatch, signal_round: bool) {
         if !batch.is_empty() || signal_round {
             self.rounds.push_back(Round {
+                dispatch_revision: self
+                    .checkpoint
+                    .persistence_revision()
+                    .expect("committed dispatch revision"),
                 unissued: batch,
                 returned: None,
                 issued: Vec::new(),

@@ -520,6 +520,13 @@ impl<E: GuardianExecutor> ForfeitedCustody<E> {
 /// use phoenix_deployment_controller::guardian::{Guardian, GuardianExecutor};
 /// fn extract<E: GuardianExecutor>(guardian: Guardian<E>) { let _ = guardian.into_parts(); }
 /// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SignalResultReservation {
+    session: ControllerSession,
+    revision: PersistenceRevision,
+    remaining: usize,
+}
+
 #[must_use]
 pub struct Guardian<E: GuardianExecutor> {
     session: ControllerSession,
@@ -529,6 +536,7 @@ pub struct Guardian<E: GuardianExecutor> {
     minimum_dispatch_revision: Option<PersistenceRevision>,
     reconciliation_floor: Option<PersistenceRevision>,
     latest_reconciliation_revision: Option<PersistenceRevision>,
+    signal_result_reservation: Option<SignalResultReservation>,
     executor: ManuallyDrop<E>,
     slots: ManuallyDrop<BTreeMap<ChildSlotId, E::ChildSlot>>,
     retained: Vec<ExecutedEffect>,
@@ -598,6 +606,7 @@ impl<E: GuardianExecutor> Guardian<E> {
                 minimum_dispatch_revision: None,
                 reconciliation_floor: None,
                 latest_reconciliation_revision: None,
+                signal_result_reservation: None,
                 executor: ManuallyDrop::new(executor),
                 slots: ManuallyDrop::new(slots),
                 retained: Vec::with_capacity(MAX_RETAINED_RESULTS),
@@ -732,7 +741,7 @@ impl<E: GuardianExecutor> Guardian<E> {
                 BoundSubmissionRefusal { error, token },
             )));
         }
-        let SessionDispatchTicket { ticket, session: _ } = token;
+        let SessionDispatchTicket { ticket, session } = token;
         let key = ticket.key();
         let effect = ticket.effect().clone();
         let result = self.executor.execute(ticket, &mut self.slots);
@@ -745,8 +754,49 @@ impl<E: GuardianExecutor> Guardian<E> {
             self.lose_authority();
             return Err(BoundSubmissionError::ExecutorCorrelationMismatch);
         }
+        self.consume_signal_reservation(session, key, &effect);
         self.retained.push(result);
         Ok(key)
+    }
+
+    /// Reserves custody for an entire committed signal round before its first effect.
+    /// Repeating the exact reservation is idempotent while the round is in flight.
+    ///
+    /// # Errors
+    /// Requires the current active session, a non-stale dispatch revision, and enough
+    /// unreserved result capacity for every remaining signal.
+    pub(crate) fn reserve_signal_results(
+        &mut self,
+        session: ControllerSession,
+        revision: PersistenceRevision,
+        count: usize,
+    ) -> Result<(), GuardianError> {
+        self.require_session(session)?;
+        self.require_state(GuardianState::Active, GuardianError::NotActive)?;
+        if self
+            .minimum_dispatch_revision
+            .is_some_and(|minimum| revision < minimum)
+        {
+            return Err(GuardianError::StaleDispatchRevision);
+        }
+        if let Some(existing) = self.signal_result_reservation {
+            return if existing.session == session && existing.revision == revision {
+                Ok(())
+            } else {
+                Err(GuardianError::RetainedResultCapacityExceeded)
+            };
+        }
+        if count > MAX_RETAINED_RESULTS.saturating_sub(self.retained.len()) {
+            return Err(GuardianError::RetainedResultCapacityExceeded);
+        }
+        if count != 0 {
+            self.signal_result_reservation = Some(SignalResultReservation {
+                session,
+                revision,
+                remaining: count,
+            });
+        }
+        Ok(())
     }
 
     /// Atomic bridge: a raw ticket never escapes with a new public session label.
@@ -836,10 +886,41 @@ impl<E: GuardianExecutor> Guardian<E> {
         if self.retained_result(key).is_some() {
             return Err(GuardianError::DuplicateDispatchKey);
         }
-        if !self.can_retain_result() {
+        let reserved_for_ticket = matches!(effect, OsEffect::SignalExactIdentity { .. })
+            && self.signal_result_reservation.is_some_and(|claim| {
+                claim.session == session && claim.revision == key.revision() && claim.remaining != 0
+            });
+        let claimed_capacity = self
+            .signal_result_reservation
+            .map_or(0, |claim| claim.remaining);
+        if !self.can_retain_result()
+            || (!reserved_for_ticket
+                && self.retained.len().saturating_add(claimed_capacity) >= MAX_RETAINED_RESULTS)
+        {
             return Err(GuardianError::RetainedResultCapacityExceeded);
         }
         Ok(())
+    }
+
+    fn consume_signal_reservation(
+        &mut self,
+        session: ControllerSession,
+        key: DispatchKey,
+        effect: &OsEffect,
+    ) {
+        let Some(claim) = self.signal_result_reservation.as_mut() else {
+            return;
+        };
+        if !matches!(effect, OsEffect::SignalExactIdentity { .. })
+            || claim.session != session
+            || claim.revision != key.revision()
+        {
+            return;
+        }
+        claim.remaining -= 1;
+        if claim.remaining == 0 {
+            self.signal_result_reservation = None;
+        }
     }
 
     /// Fence exactly the current controller. No native calls or custody transfers.
@@ -853,6 +934,7 @@ impl<E: GuardianExecutor> Guardian<E> {
         }
         self.state = GuardianState::DetachedFenced;
         self.reconciliation_floor = None;
+        self.signal_result_reservation = None;
         Ok(())
     }
 
@@ -986,6 +1068,7 @@ impl<E: GuardianExecutor> Guardian<E> {
     fn lose_authority(&mut self) {
         self.state = GuardianState::AuthorityLost;
         self.reconciliation_floor = None;
+        self.signal_result_reservation = None;
     }
 
     fn require_session(&self, session: ControllerSession) -> Result<(), GuardianError> {
@@ -1039,10 +1122,10 @@ mod tests {
         AttemptId, AttemptStore, BirthToken, CandidateDiscovery, CandidateVerification,
         ChildIdentityObservation, ControllerOs, CpuContentionBasisPoints, DeploymentAttempt,
         DispatchKey, DispatchTicket, EffectCompletion, EffectExecutor, ExecutedEffect,
-        IdentityObservation, MemoryPressure, MonotonicTick, ObservationFailure, OsEffect,
-        OsQueryError, PersistenceRevision, ProcessId, ProcessIdentity, ResourceCapacity,
-        ResourceContention, ResourceObservationFailure, ResourcePolicy, ResourceSample,
-        RetainedCandidateIdentity, Signal, SignalOutcome, Transition,
+        GuardianLoopError, IdentityObservation, MemoryPressure, MonotonicTick, ObservationFailure,
+        OsEffect, OsQueryError, PersistenceRevision, PolicyLoop, ProcessId, ProcessIdentity,
+        ResourceCapacity, ResourceContention, ResourceObservationFailure, ResourcePolicy,
+        ResourceSample, RetainedCandidateIdentity, Signal, SignalOutcome, Transition,
     };
 
     #[derive(Default)]
@@ -1784,6 +1867,84 @@ mod tests {
         assert_eq!(guardian.submit_bound(rebound, tick(2)).unwrap(), raw_key);
         assert_eq!(guardian.retained_results().len(), MAX_RETAINED_RESULTS);
         assert_eq!(audit.executions.borrow().len(), MAX_RETAINED_RESULTS + 2);
+        assert_no_cleanup(&audit);
+    }
+
+    #[test]
+    fn reservation_uses_available_not_nominal_result_capacity() {
+        let attempt = AttemptId::new(26);
+        let (mut guardian, session, audit) = fixture(attempt, tick(100));
+        let retained = issue(&guardian, session, sample_ticket(attempt, 1));
+        guardian.submit_bound(retained, tick(1)).unwrap();
+        let signal = signal_ticket(attempt);
+        let revision = signal.key().revision();
+
+        assert_eq!(
+            guardian.reserve_signal_results(session, revision, MAX_RETAINED_RESULTS),
+            Err(GuardianError::RetainedResultCapacityExceeded)
+        );
+        assert_eq!(guardian.retained_results().len(), 1);
+        assert_eq!(audit.signals.get(), 0);
+
+        guardian
+            .reserve_signal_results(session, revision, MAX_RETAINED_RESULTS - 1)
+            .unwrap();
+        assert_eq!(
+            guardian.signal_result_reservation,
+            Some(SignalResultReservation {
+                session,
+                revision,
+                remaining: MAX_RETAINED_RESULTS - 1,
+            })
+        );
+        let unrelated = issue(&guardian, session, sample_ticket(attempt, 2));
+        let (error, unrelated) = refused(guardian.submit_bound(unrelated, tick(1)));
+        assert_eq!(error, GuardianError::RetainedResultCapacityExceeded);
+        assert!(matches!(
+            unrelated.effect(),
+            OsEffect::SampleResources { .. }
+        ));
+        guardian.controller_lost(session).unwrap();
+        assert_eq!(guardian.signal_result_reservation, None);
+        assert_eq!(audit.signals.get(), 0);
+        assert_no_cleanup(&audit);
+    }
+
+    #[test]
+    fn policy_bridge_reserves_before_issuing_the_first_signal() {
+        let attempt = AttemptId::new(27);
+        let (mut guardian, session, audit) = fixture(attempt, tick(100));
+        let first_revision = 1_000_u64;
+        for offset in 0..u64::try_from(MAX_RETAINED_RESULTS).unwrap() {
+            let ticket = issue(
+                &guardian,
+                session,
+                sample_ticket(attempt, first_revision + offset),
+            );
+            guardian.submit_bound(ticket, tick(1)).unwrap();
+        }
+        let executions_before = audit.executions.borrow().len();
+        let mut store = MemoryStore {
+            next: PersistenceRevision::first(),
+        };
+        let committed = signal_plan(attempt, &mut store);
+        let mut policy =
+            PolicyLoop::from_committed_for_guardian(committed, &guardian, session).unwrap();
+
+        assert_eq!(
+            policy.dispatch_next_to_guardian(&mut guardian, session, tick(2)),
+            Err(GuardianLoopError::Guardian(
+                GuardianError::RetainedResultCapacityExceeded
+            ))
+        );
+        assert_eq!(audit.executions.borrow().len(), executions_before);
+        assert_eq!(audit.signals.get(), 0);
+        assert_eq!(guardian.retained_results().len(), MAX_RETAINED_RESULTS);
+        let ticket = policy.issue_next().unwrap();
+        assert!(matches!(
+            ticket.effect(),
+            OsEffect::SignalExactIdentity { .. }
+        ));
         assert_no_cleanup(&audit);
     }
 
