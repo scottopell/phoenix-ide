@@ -596,10 +596,22 @@ impl DeploymentAttempt {
         if !attempt.tree.reconciliation_complete() {
             return Err(TransitionError::IncompleteReconciliation);
         }
+        if now >= attempt.context.deadline {
+            return match attempt.tree.cleanup_readiness() {
+                CleanupReadiness::VerifiedClean => Ok(Transition {
+                    checkpoint: Self::Ready(ReadyAttempt {
+                        context: attempt.context,
+                        resources: attempt.resources,
+                        tree: attempt.tree,
+                    }),
+                    after_persist: Vec::new(),
+                }),
+                CleanupReadiness::OwnedIdentityMayRemain | CleanupReadiness::UnresolvedEvidence => {
+                    Ok(to_administrative_closeout(attempt))
+                }
+            };
+        }
         if !attempt.tree.pending_child_scans().is_empty() || !attempt.tree.unresolved().is_empty() {
-            if now >= attempt.context.deadline {
-                return Ok(to_administrative_closeout(attempt));
-            }
             attempt.phase = if attempt.tree.unresolved().is_empty() {
                 OwnershipPhase::Discovery
             } else {
@@ -712,7 +724,13 @@ impl DeploymentAttempt {
                         })
                     }
                     ActiveAttempt::Ownership(mut attempt) => {
-                        let resume = recovery_resume_for(attempt.phase)?;
+                        let resume = if attempt.phase == OwnershipPhase::Recovering {
+                            attempt
+                                .recovery_resume
+                                .ok_or(TransitionError::MissingRecoveryResume)?
+                        } else {
+                            recovery_resume_for(attempt.phase)?
+                        };
                         attempt.phase = OwnershipPhase::Recovering;
                         attempt.recovery_resume = Some(resume);
                         attempt.tree.mark_all_for_reconciliation();

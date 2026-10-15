@@ -136,6 +136,14 @@ AND SHALL preserve the original absolute operation deadline.
 THE SYSTEM SHALL NOT request any owned-process mutation until every acquired owned
 identity has completed that recovery observation barrier.
 
+WHEN reconciliation is itself interrupted
+THE SYSTEM SHALL retain the original resume target and restart the complete
+observation barrier.
+
+WHEN reconciliation completes at or after the absolute operation deadline
+THE SYSTEM SHALL NOT restore process-mutation authority unless cleanup is already
+verified clean.
+
 THE SYSTEM SHALL NOT replay a signal solely because the interrupted checkpoint
 shows that the signal was previously planned or emitted.
 

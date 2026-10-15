@@ -360,9 +360,31 @@ rule CompleteRecoveryReconciliation {
     when: RecoveryReconciliationCompleted(attempt)
     requires: attempt.phase = recovering
     requires: every_owned_identity_was_freshly_observed(attempt)
+    requires: now < attempt.operation_deadline
+              or every_owned_identity_is_verified_absent(attempt)
     ensures:
         no_owned_mutation_preceded_reconciliation(attempt)
         attempt.phase = recovery_resume_phase(attempt)
+}
+
+rule ReinterruptRecovery {
+    when: ControllerInterrupted(attempt)
+    requires: attempt.phase = recovering
+    ensures:
+        attempt.resume_phase = recovery_resume_phase(attempt)
+        attempt.phase = interrupted
+}
+
+rule CloseRecoveryAtDeadline {
+    when: RecoveryReconciliationCompleted(attempt)
+    requires: attempt.phase = recovering
+    requires: every_owned_identity_was_freshly_observed(attempt)
+    requires: now >= attempt.operation_deadline
+    requires: not every_owned_identity_is_verified_absent(attempt)
+    ensures:
+        attempt.cleanup_result = unresolved_risk
+        attempt.phase = administrative_closeout_required
+        not OwnedSignalRequestedForAttempt(attempt)
 }
 
 rule RecoverPendingResourceSample {

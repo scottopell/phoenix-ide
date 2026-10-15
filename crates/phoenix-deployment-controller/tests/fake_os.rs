@@ -647,6 +647,89 @@ fn migration_candidate_is_frozen_and_forward_recovery_is_restartable() {
 }
 
 #[test]
+fn repeated_interruption_preserves_the_original_recovery_target() {
+    let root = identity(545, 46, 1);
+    let (state, _) = admitted_attempt(root)
+        .interrupt()
+        .expect("discovery can be interrupted")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .recover()
+        .expect("first recovery starts reconciliation")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .interrupt()
+        .expect("reconciliation can itself be interrupted")
+        .persisted()
+        .into_parts();
+    let recovered = state
+        .recover()
+        .expect("the second recovery retains the original discovery target");
+    assert_eq!(
+        recovered.clone().persisted().checkpoint().phase(),
+        Phase::Recovering
+    );
+    assert!(persisted_effects(&recovered).contains(&OsEffect::ListChildren { parent: root }));
+}
+
+#[test]
+fn recovery_at_deadline_cannot_restore_signal_authority() {
+    let root = identity(546, 46, 2);
+    let state = complete_empty_scan(admitted_attempt(root), root);
+    let (state, _) = state
+        .ownership_scan_completed()
+        .expect("discovery enters cleanup")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .identity_observed(
+            root,
+            IdentityObservation::SameIdentity {
+                current_parent: None,
+            },
+        )
+        .expect("root is live")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .interrupt()
+        .expect("cleanup can be interrupted")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .recover()
+        .expect("recovery begins reconciliation")
+        .persisted()
+        .into_parts();
+    let (state, _) = state
+        .identity_observed(
+            root,
+            IdentityObservation::SameIdentity {
+                current_parent: None,
+            },
+        )
+        .expect("the recovery observation is fresh")
+        .persisted()
+        .into_parts();
+    let closeout = state
+        .recovery_reconciliation_completed(MonotonicTick::new(30))
+        .expect("the deadline selects truthful closeout");
+    assert_eq!(
+        closeout.clone().persisted().checkpoint().phase(),
+        Phase::AdministrativeCloseoutRequired
+    );
+    let (state, _) = closeout.persisted().into_parts();
+    assert_eq!(
+        state
+            .request_owned_signals(Signal::Terminate)
+            .expect_err("deadline closeout has no signal authority"),
+        phoenix_deployment_controller::TransitionError::WrongPhase
+    );
+}
+
+#[test]
 fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
     let root = identity(550, 45, 1);
     let state = complete_empty_scan(admitted_attempt(root), root);
