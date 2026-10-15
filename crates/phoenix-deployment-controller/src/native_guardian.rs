@@ -6,7 +6,7 @@ use crate::guardian_ipc::{
 use crate::GuardianExecutor;
 use std::{
     fs::{self, DirBuilder, Metadata, Permissions},
-    io,
+    io::{self, Write},
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         io::AsRawFd,
