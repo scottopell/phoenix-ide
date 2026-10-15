@@ -1,9 +1,11 @@
 mod mandatory_close;
+mod presentation;
 use mandatory_close::decode_route;
 pub use mandatory_close::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
     WatchEventRoute,
 };
+pub use presentation::{WatchEventPresentation, WatchEventProvenance};
 
 use chrono::Utc;
 use phoenix_core::domain::product_conversation::ProductConversationId;

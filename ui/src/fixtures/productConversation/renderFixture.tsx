@@ -40,6 +40,9 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
   if (scenario.state === 'error') {
     return root.textContent?.includes(scenario.snapshotError ?? 'Fixture failed to fetch product conversation snapshot') ?? false;
   }
+  if (scenario.initialEntry?.startsWith('/global/')) {
+    return root.querySelector('.coordinator-conversation #chat-view .conversation-event-card') !== null;
+  }
   const page = root.querySelector('[data-testid="product-conversation-page"]');
   if (!page) return false;
   const hasConversation = page.querySelector('#chat-view') !== null;
@@ -98,7 +101,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       data-product-conversation-fixture={scenario.id}
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
     >
-      <MemoryRouter initialEntries={[new URLSearchParams(window.location.search).get('fixtureEntry') ?? `/product-conversations/fixture-product-conversation${fixtureHash}`]}>
+      <MemoryRouter initialEntries={[new URLSearchParams(window.location.search).get('fixtureEntry') ?? `${scenario.initialEntry ?? '/product-conversations/fixture-product-conversation'}${fixtureHash}`]}>
         <FixtureLocation />
         <FocusScopeProvider>
           <ConversationProvider>

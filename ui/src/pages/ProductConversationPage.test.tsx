@@ -224,6 +224,7 @@ vi.mock('../api', async () => {
 
 function makeMessage(message_id: string, sequence_id: number, conversation_id = 'conv-a') {
   return {
+    event_presentation: null,
     message_id,
     conversation_id,
     sequence_id,
@@ -775,6 +776,7 @@ describe('ProductConversationPage', () => {
       conversationId: 'prior-latest-row',
       slug: 'prior-latest-row',
       messages: [{
+        event_presentation: null,
         message_id: 'foreign-row-message',
         conversation_id: 'prior-latest-row',
         sequence_id: 999,

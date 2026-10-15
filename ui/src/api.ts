@@ -673,6 +673,8 @@ export interface ToolCall {
 
 export type { InputOrigin } from './generated/InputOrigin';
 import type { InputOrigin } from './generated/InputOrigin';
+import type { EventPresentation } from './generated/EventPresentation';
+export type { EventPresentation } from './generated/EventPresentation';
 
 export interface Message {
   message_id: string;
@@ -681,6 +683,7 @@ export interface Message {
   message_type: 'user' | 'agent' | 'tool' | 'system' | 'error' | 'continuation' | 'skill';
   /** Synthetic UI messages may lack origin; authoritative wire messages require it. */
   origin?: InputOrigin;
+  event_presentation: EventPresentation | null;
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)

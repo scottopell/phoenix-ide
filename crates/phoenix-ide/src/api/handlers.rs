@@ -11,6 +11,7 @@ use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
 };
+use super::event_presentation::{enrich_messages, EventPresentations};
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
     get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
@@ -3609,10 +3610,8 @@ async fn get_conversation(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -3734,17 +3733,15 @@ async fn bump_transcript_generation_for_test(
     Ok(())
 }
 
-fn build_message_slice_response(
+async fn build_message_slice_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
     has_older_messages: bool,
 ) -> ConversationMessageSliceResponse {
     ConversationMessageSliceResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -3752,7 +3749,8 @@ fn build_message_slice_response(
     }
 }
 
-fn build_message_range_response(
+async fn build_message_range_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     start_message_sequence: i64,
     end_message_sequence: i64,
@@ -3764,10 +3762,7 @@ fn build_message_range_response(
         .filter(|seq| !present.contains(seq))
         .collect();
     ConversationMessageRangeResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         missing_sequences,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
@@ -3775,21 +3770,16 @@ fn build_message_range_response(
     }
 }
 
-fn build_messages_around_response(
+async fn build_messages_around_response(
+    db: &crate::db::Database,
     before: &[crate::db::Message],
     after: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
 ) -> ConversationMessagesAroundResponse {
     ConversationMessagesAroundResponse {
-        before: before
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
-        after: after
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        before: enrich_messages(db, before).await,
+        after: enrich_messages(db, after).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -4026,7 +4016,11 @@ async fn reconcile_accepted_messages(
     for message_id in req.message_ids {
         let disposition = match state.db.get_message_by_id(&message_id).await {
             Ok(message) if message.conversation_id == id => AcceptedMessageDisposition::Persisted {
-                message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                message: Box::new(
+                    EventPresentations::load(&state.db, [&message])
+                        .await
+                        .enrich(&message),
+                ),
             },
             Err(crate::db::DbError::MessageNotFound(_))
                 if queued_ids.contains(message_id.as_str()) =>
@@ -4075,12 +4069,16 @@ async fn get_conversation_messages_latest(
     })
     .await?;
     let (messages, has_older_messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_slice_response(
-        &messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-        has_older_messages,
-    )))
+    Ok(Json(
+        build_message_slice_response(
+            &state.db,
+            &messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+            has_older_messages,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages(
@@ -4111,12 +4109,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, has_older_messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                has_older_messages,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    has_older_messages,
+                )
+                .await,
+            ))
         }
         (None, Some(after)) => {
             let stable = stable_transcript_read(db, &id, |db, id, _attempt| {
@@ -4131,12 +4133,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                false,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    false,
+                )
+                .await,
+            ))
         }
     }
 }
@@ -4177,13 +4183,17 @@ async fn get_conversation_message_range(
     })
     .await?;
     let (messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_range_response(
-        &messages,
-        start_message_sequence,
-        end_message_sequence,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_message_range_response(
+            &state.db,
+            &messages,
+            start_message_sequence,
+            end_message_sequence,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages_around(
@@ -4206,12 +4216,16 @@ async fn get_conversation_messages_around(
     })
     .await?;
     let (before_messages, after_messages, server_message_tail) = stable.value;
-    Ok(Json(build_messages_around_response(
-        &before_messages,
-        &after_messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_messages_around_response(
+            &state.db,
+            &before_messages,
+            &after_messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 /// `GET /api/conversations/:id/slug` — compatibility lookup used by links that
@@ -4903,7 +4917,7 @@ async fn read_stream_init_messages_with_tail(
 }
 
 async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
-    super::sse::aggregate_event_stream(state.runtime.subscribe_aggregate_events())
+    super::sse::aggregate_event_stream(state.db.clone(), state.runtime.subscribe_aggregate_events())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5144,6 +5158,7 @@ async fn stream_conversation(
     };
 
     Ok(sse_stream(
+        state.db.clone(),
         id,
         init_event,
         broadcast_rx,
@@ -7816,10 +7831,8 @@ async fn get_by_slug(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -9445,9 +9458,10 @@ async fn get_shared_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let presentations = EventPresentations::redacted();
     let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
         .iter()
-        .map(super::wire::EnrichedMessage::from)
+        .map(|message| presentations.enrich(message))
         .collect();
 
     let context_window_size = messages
@@ -9580,6 +9594,7 @@ async fn shared_sse_stream(
     };
 
     Ok(sse_stream(
+        state.db.clone(),
         conversation_id,
         init_event,
         broadcast_rx,

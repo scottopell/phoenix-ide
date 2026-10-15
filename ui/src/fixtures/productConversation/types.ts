@@ -68,6 +68,8 @@ export const productConversationScenarioDefinitions = [
     viewport: 'desktop',
     state: 'ready',
   },
+  { id: 'compact-events-ordinary', title: 'Compact ordinary events', viewport: 'desktop', state: 'ready' },
+  { id: 'compact-events-global', title: 'Compact Global events', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-global', title: 'One-click Global source send', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-ordinary', title: 'One-click historical ordinary source send', viewport: 'desktop', state: 'ready' },
 ] as const satisfies readonly {
@@ -80,6 +82,7 @@ export const productConversationScenarioDefinitions = [
 export type ProductConversationScenarioId = (typeof productConversationScenarioDefinitions)[number]['id'];
 
 export interface ProductConversationScenario {
+  initialEntry?: string;
   sourceSnapshot?: ProductConversationSnapshotView;
   sourceIsGlobal?: boolean;
   initialDraft?: string;

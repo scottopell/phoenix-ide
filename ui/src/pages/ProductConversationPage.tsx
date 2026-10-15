@@ -158,6 +158,7 @@ function toMessage(message: EnrichedMessage, occurrenceToken?: string): Message 
     message_type: message.message_type,
     content: message.content as Message['content'],
     origin: message.origin,
+    event_presentation: message.event_presentation,
     display_data: occurrenceToken
       ? {
         ...(((message.display_data ?? null) as Exclude<Message['display_data'], undefined>) ?? {}),
@@ -180,6 +181,7 @@ function makeHandoffMessage(snapshot: ProductConversationSnapshotView, segmentOr
   if (!segment?.handoff) return null;
   return {
     message_id: `product-handoff:${snapshot.product_conversation_id}:${segment.transcript_row_id}:${segment.handoff.continuation_message_id}`,
+    event_presentation: null,
     conversation_id: snapshot.product_conversation_id,
     sequence_id: Number.MIN_SAFE_INTEGER + segment.segment_ordinal,
     message_type: 'system',

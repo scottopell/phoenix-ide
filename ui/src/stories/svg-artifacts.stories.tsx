@@ -12,7 +12,7 @@ const description = 'Measured directory sizes in GiB; free space is shown separa
 function Fixture({ theme, density, shape }: { theme: 'light' | 'dark'; density: Density; shape?: 'tall' | 'wide' }) {
   document.documentElement.dataset['theme'] = theme;
   const artifact = { artifact_id: shape ?? 'chart', conversation_id: 'svg-fixture', title: 'Largest storage consumers — measured sizes with exact GiB labels', description, width: shape === 'tall' ? 400 : shape === 'wide' ? 8000 : 800, height: shape === 'tall' ? 1600 : 400, validation: 'accepted_static_svg' };
-  const agent: Message = { message_id: 'agent', conversation_id: 'svg-fixture', sequence_id: 1, message_type: 'agent', content: [{ type: 'tool_use', id: 'publish', name: 'present_svg', input: { path: '/staging/chart.svg' } }], display_data: null, created_at: '' };
+  const agent: Message = { event_presentation: null, message_id: 'agent', conversation_id: 'svg-fixture', sequence_id: 1, message_type: 'agent', content: [{ type: 'tool_use', id: 'publish', name: 'present_svg', input: { path: '/staging/chart.svg' } }], display_data: null, created_at: '' };
   const result: Message = { ...agent, message_id: 'result', message_type: 'tool', sequence_id: 2, content: { tool_use_id: 'publish', content: JSON.stringify(artifact), is_error: false } };
   return <main style={{ maxWidth: 1000, padding: 12, margin: 'auto' }} data-svg-artifacts-ready={shape ?? `${theme}-${density}`}>
     <DensityContext.Provider value={{ density, setDensity: () => {} }}><MemoryRouter>

@@ -3,7 +3,7 @@
 //! REQ-API-005: Real-time Streaming
 //!
 //! The serialization boundary lives in [`super::wire::SseWireEvent`]: every
-//! broadcast [`SseEvent`] is `From`-converted into the typed wire enum and
+//! broadcast [`SseEvent`] is asynchronously projected into the typed wire enum and
 //! then through `serde_json::to_string`. See `super::wire` for the rationale
 //! and for the ts-rs-driven TS codegen that downstream clients consume.
 
@@ -146,19 +146,24 @@ fn conversation_keep_alive() -> KeepAlive {
 /// events long enough to mask client UI as "stuck on stale phase" between
 /// transitions. No-op for TCP-level forwarders, harmless either way.
 pub fn sse_stream(
+    db: crate::db::Database,
     conv_id: String,
     init_event: SseEvent,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
     init_trace: Option<SseInitTrace>,
     audience: SseStreamAudience,
 ) -> impl IntoResponse {
+    let init_db = db.clone();
     let init = futures::stream::once(async move {
         let serialization_started = std::time::Instant::now();
-        let event = sse_event_to_axum(
+        let event = project_sse_event(
+            &init_db,
+            audience,
             audience
                 .prepare(init_event)
                 .expect("init is visible to every SSE audience"),
-        );
+        )
+        .await;
         if let Some(trace) = init_trace {
             trace.record_ms("stream.serialization_ms", serialization_started.elapsed());
             trace.record_ms("stream.time_to_init_ms", trace.started.elapsed());
@@ -179,12 +184,11 @@ pub fn sse_stream(
             }
             _ => true,
         })
-        .filter_map(move |result| match result {
-            Ok(event) => audience
-                .prepare(event)
-                .map(|event| Ok(sse_event_to_axum(event))),
-            Err(_) => None, // Lagged already closed the stream above
-        });
+        .filter_map(move |result| result.ok().and_then(|event| audience.prepare(event)));
+    let broadcasts = futures::StreamExt::then(broadcasts, move |event| {
+        let db = db.clone();
+        async move { Ok::<Event, Infallible>(project_sse_event(&db, audience, event).await) }
+    });
 
     let combined = init.chain(broadcasts);
 
@@ -204,9 +208,10 @@ pub fn sse_stream(
 }
 
 fn aggregate_broadcast_events(
+    db: crate::db::Database,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    BroadcastStream::new(broadcast_rx)
+    let events = BroadcastStream::new(broadcast_rx)
         .take_while(|result| match result {
             Err(BroadcastStreamRecvError::Lagged(n)) => {
                 tracing::warn!(
@@ -217,29 +222,58 @@ fn aggregate_broadcast_events(
             }
             _ => true,
         })
-        .filter_map(|result| match result {
-            Ok(event) => Some(Ok(sse_event_to_axum(event))),
-            Err(_) => None,
-        })
+        .filter_map(Result::ok);
+    futures::StreamExt::then(events, move |event| {
+        let db = db.clone();
+        async move { Ok(project_sse_event(&db, SseStreamAudience::Authenticated, event).await) }
+    })
 }
 
 pub(crate) fn aggregate_event_stream(
+    db: crate::db::Database,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
 ) -> impl IntoResponse {
-    let sse =
-        Sse::new(aggregate_broadcast_events(broadcast_rx)).keep_alive(conversation_keep_alive());
+    let sse = Sse::new(aggregate_broadcast_events(db, broadcast_rx))
+        .keep_alive(conversation_keep_alive());
     let mut headers = HeaderMap::new();
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     (headers, sse)
 }
 
+async fn project_sse_event(
+    db: &crate::db::Database,
+    audience: SseStreamAudience,
+    event: SseEvent,
+) -> Event {
+    wire_event_to_axum(&project_sse_wire(db, audience, event).await)
+}
+
+async fn project_sse_wire(
+    db: &crate::db::Database,
+    audience: SseStreamAudience,
+    event: SseEvent,
+) -> SseWireEvent {
+    use super::event_presentation::{event_messages, EventPresentations};
+    let presentations = match audience {
+        SseStreamAudience::Authenticated => {
+            EventPresentations::load(db, event_messages(&event)).await
+        }
+        SseStreamAudience::SharedTranscript => EventPresentations::redacted(),
+    };
+    SseWireEvent::with_presentations(event, &presentations)
+}
+
+#[cfg(test)]
 fn sse_event_to_axum(event: SseEvent) -> Event {
-    let wire: SseWireEvent = event.into();
+    wire_event_to_axum(&event.into())
+}
+
+fn wire_event_to_axum(wire: &SseWireEvent) -> Event {
     let event_type = wire.event_type();
     // SseWireEvent derives Serialize over types that themselves derive
     // Serialize (or carry `serde_json::Value`). `to_string` cannot fail
     // at this layer; if it did, we'd want to know loudly.
-    let data = serde_json::to_string(&wire).expect("SseWireEvent is always serializable");
+    let data = serde_json::to_string(wire).expect("SseWireEvent is always serializable");
     Event::default().event(event_type).data(data)
 }
 
@@ -652,6 +686,92 @@ mod tests {
     // ------------------------------------------------------------------
     // Parity tests — one per SseEvent variant
     // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn event_projection_matches_rest_init_pending_live_and_aggregate_and_redacts_share() {
+        let (db, messages) = super::super::event_presentation::tests::fixture(1).await;
+        let message = messages[0].clone();
+        let rest = super::super::event_presentation::enrich_messages(&db, &messages).await;
+        let expected = serde_json::to_value(&rest[0]).unwrap();
+        let live_event = SseEvent::Message {
+            message: message.clone(),
+        };
+        let live =
+            project_sse_wire(&db, SseStreamAudience::Authenticated, live_event.clone()).await;
+        assert_eq!(serde_json::to_value(live).unwrap()["message"], expected);
+        let init = SseEvent::Init {
+            sequence_id: 1,
+            conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
+            transcript: crate::runtime::InitTranscript::Complete(messages),
+            steering_messages: Vec::new(),
+            agent_working: false,
+            presentation_mode: "idle".into(),
+            last_sequence_id: 1,
+            stream_incarnation: "test-stream".into(),
+            context_window_size: 0,
+            project_name: None,
+            pending_anchor_sequence_id: 0,
+            pending_events: vec![live_event.clone()],
+            pending_truncated: false,
+        };
+        let projected = project_sse_wire(&db, SseStreamAudience::Authenticated, init.clone()).await;
+        let value = serde_json::to_value(projected).unwrap();
+        assert_eq!(value["messages"][0], expected);
+        assert_eq!(value["pending_events"][0]["message"], expected);
+        for transcript in [
+            crate::runtime::InitTranscript::Tail(vec![message.clone()]),
+            crate::runtime::InitTranscript::Preserve,
+        ] {
+            let preserve = matches!(&transcript, crate::runtime::InitTranscript::Preserve);
+            let mut variant = init.clone();
+            if let SseEvent::Init {
+                transcript: rows,
+                pending_events,
+                ..
+            } = &mut variant
+            {
+                *rows = transcript;
+                pending_events.push(init.clone());
+            }
+            let collected = super::super::event_presentation::event_messages(&variant);
+            assert_eq!(collected.len(), if preserve { 3 } else { 4 });
+            let wire = project_sse_wire(&db, SseStreamAudience::Authenticated, variant).await;
+            let value = serde_json::to_value(wire).unwrap();
+            assert_eq!(
+                value["messages"].as_array().unwrap().len(),
+                usize::from(!preserve)
+            );
+            assert_eq!(value["pending_events"][0]["message"], expected);
+            assert_eq!(value["pending_events"][1]["messages"][0], expected);
+            assert_eq!(
+                value["pending_events"][1]["pending_events"][0]["message"],
+                expected
+            );
+        }
+        let shared = project_sse_wire(&db, SseStreamAudience::SharedTranscript, init).await;
+        let value = serde_json::to_value(shared).unwrap();
+        for projected in [
+            &value["messages"][0],
+            &value["pending_events"][0]["message"],
+        ] {
+            assert_eq!(projected["content"], expected["content"]);
+            assert_eq!(projected["event_presentation"]["reason"], "redacted");
+            assert!(projected["event_presentation"]
+                .get("display_name")
+                .is_none());
+        }
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        tx.send(live_event.clone()).unwrap();
+        let expected_event =
+            project_sse_event(&db, SseStreamAudience::Authenticated, live_event).await;
+        let mut stream = Box::pin(aggregate_broadcast_events(db, rx));
+        let aggregate_event = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            format!("{aggregate_event:?}"),
+            format!("{expected_event:?}")
+        );
+    }
 
     #[test]
     fn parity_init() {
@@ -1439,7 +1559,10 @@ mod tests {
         tx.send(event()).unwrap();
         tx.send(event()).unwrap();
 
-        let mut stream = Box::pin(aggregate_broadcast_events(rx));
+        let mut stream = Box::pin(aggregate_broadcast_events(
+            crate::db::Database::open_in_memory().await.unwrap(),
+            rx,
+        ));
         assert!(stream.next().await.is_none());
     }
 

@@ -690,7 +690,7 @@ async fn snapshot_view(
         |cursor| cursor.segment_ceilings.clone(),
     );
     let (messages, has_older, page_messages, boundary_message_ids) =
-        aggregate_messages(&aggregate, page, message_limit);
+        aggregate_messages(&state.db, &aggregate, page, message_limit).await;
     let source = match aggregate.source.as_mut() {
         Some(source) => {
             source.deleted = state
@@ -784,13 +784,19 @@ type AggregatePage = (
     std::collections::HashSet<String>,
 );
 
-fn aggregate_messages(
+async fn aggregate_messages(
+    db: &crate::db::Database,
     aggregate: &ProductConversationAggregate,
     mut messages: Vec<(i64, crate::db::Message)>,
     limit: usize,
 ) -> AggregatePage {
     let has_older = messages.len() > limit;
     messages.truncate(limit);
+    let presentations = super::event_presentation::EventPresentations::load(
+        db,
+        messages.iter().map(|(_, message)| message),
+    )
+    .await;
     let boundary_message_ids = aggregate
         .segments
         .iter()
@@ -811,7 +817,7 @@ fn aggregate_messages(
             by_segment
                 .entry(message.conversation_id.clone())
                 .or_default()
-                .push(crate::api::wire::EnrichedMessage::from(message));
+                .push(presentations.enrich(message));
         }
     }
     for segment_messages in by_segment.values_mut() {

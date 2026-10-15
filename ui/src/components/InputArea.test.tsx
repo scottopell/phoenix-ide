@@ -604,6 +604,7 @@ describe('InputArea cancellation affordance', () => {
 
 function renderBashTool(input: Record<string, unknown>) {
   const agentMessage: Message = {
+    event_presentation: null,
     message_id: `agent-${JSON.stringify(input)}`,
     sequence_id: 1,
     conversation_id: 'conv-bash',
@@ -658,6 +659,7 @@ describe('bash tool rendering', () => {
 
   it('does not render a peek draft mutation action for running output', () => {
     const agentMessage: Message = {
+      event_presentation: null,
       message_id: 'agent-1',
       sequence_id: 1,
       conversation_id: 'conv-bash',
@@ -673,6 +675,7 @@ describe('bash tool rendering', () => {
       created_at: '2026-01-01T00:00:00Z',
     };
     const resultMessage: Message = {
+      event_presentation: null,
       message_id: 'tool-result-1',
       sequence_id: 2,
       conversation_id: 'conv-bash',
