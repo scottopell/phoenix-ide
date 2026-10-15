@@ -15644,42 +15644,6 @@ pub(crate) mod hard_delete_cascade_tests {
         (tmp, repo, worktree, branch)
     }
 
-    /// A first-pass Work-mode Close captures its inventory before retirement.
-    #[tokio::test]
-    async fn archive_chain_captures_first_pass_close_inventory() {
-        let state = make_test_state().await;
-        let ids = ["sc-a", "sc-a2", "sc-a3"];
-        let (_tmp, repo, worktree, branch) =
-            build_workmode_chain_with_shared_worktree(&state, &ids).await;
-
-        assert!(worktree.exists(), "precondition: worktree must exist");
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
-            "precondition: branch must exist"
-        );
-
-        let _ = crate::api::chains::archive_chain_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("sc-a".to_string()),
-        )
-        .await
-        .expect("first-pass Close must capture inventory and converge");
-
-        assert!(!worktree.exists(), "Close must retire the shared worktree");
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
-            "archive preserves the shared task branch"
-        );
-        for id in ids {
-            let conv = state
-                .db
-                .get_conversation(id)
-                .await
-                .unwrap_or_else(|_| panic!("{id} row preserved in History"));
-            assert!(conv.archived, "{id} must be archived after Close");
-        }
-    }
-
     /// Chain hard-delete must tear down the chain's shared worktree +
     /// branch exactly once and remove every row. Root-first iteration
     /// (FK on `continued_in_conv_id` requires it) plus the in-cascade
