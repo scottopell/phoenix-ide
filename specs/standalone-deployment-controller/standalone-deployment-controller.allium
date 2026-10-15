@@ -18,6 +18,8 @@
 -- REQ-SDC-010: ControllerOsBoundary
 -- REQ-SDC-011: ControllerSqliteBoundary
 -- REQ-SDC-012: MacOsSupervisionBoundary
+-- REQ-SDC-013: AffineDispatchBoundary
+-- REQ-SDC-014: SafeStoreCliBoundary
 
 value ProcessIdentity {
     pid: Integer
@@ -60,6 +62,13 @@ enum ControllerPhase {
     | administrative_closeout_required | administratively_closed
 }
 
+enum PersistedControllerPhase {
+    resource_sampling | ownership_discovery | awaiting_birth_evidence
+    | cleaning_owned_tree | verifying_cleanup | ready_for_disruption
+    | resource_blocked | interrupted | recovering | forward_recovery
+    | administrative_closeout_required | administratively_closed
+}
+
 enum CompatibilityBoundary { predecessor_eligible | candidate_migration_invoked }
 
 enum CleanupResult {
@@ -68,6 +77,64 @@ enum CleanupResult {
 
 enum ObservationFailure {
     no_such_process | permission_denied | temporarily_unavailable | malformed_observation
+}
+
+value DispatchKey {
+    attempt_id: String
+    persistence_revision: Integer
+    ordinal: Integer
+}
+
+enum DispatchEffectKind {
+    sample_resources | list_children | acquire_child_identity | observe_identity
+    | signal_exact_identity | reverify_retained_candidate
+}
+
+enum EffectCompletionKind {
+    resource_sample | resource_observation_failure | child_list | child_query_failure
+    | child_identity_observation | identity_observation | signal_outcome
+    | candidate_verification
+}
+
+value CommittedTransition {
+    attempt_id: String
+    persistence_revision: Integer
+    effect_count: Integer
+}
+
+value DispatchTicket {
+    key: DispatchKey
+    effect_kind: DispatchEffectKind
+}
+
+value DispatchBatch {
+    attempt_id: String
+    persistence_revision: Integer
+    next_ordinal: Integer
+    remaining: Integer
+}
+
+value DispatchIssuance {
+    checkpoint_attempt_id: String
+    batch: DispatchBatch
+}
+
+value DispatchAdvance {
+    remaining_batch: DispatchBatch
+    ticket: DispatchTicket?
+}
+
+value ExecutedEffect {
+    key: DispatchKey
+    effect_kind: DispatchEffectKind
+    completion_kind: EffectCompletionKind
+}
+
+value StatusSummary {
+    attempt_id: String
+    persistence_revision: Integer
+    phase: PersistedControllerPhase
+    cleanup_outcome: CleanupResult
 }
 
 entity DeploymentAttempt {
@@ -564,10 +631,12 @@ invariant RecoveryMutationWaitsForCompleteReconciliation {
 }
 
 contract ControllerOsBoundary {
-    list_children: (parent: ProcessIdentity) -> List<Integer>
-    acquire_child_identity: (discovery: DiscoveryEpoch) -> ProcessIdentity?
-    observe_identity: (identity: ProcessIdentity) -> Boolean
-    sample_resources: (sequence: Integer) -> ResourceSample?
+    list_children: (parent: ProcessIdentity) -> ChildListObservation
+    acquire_child_identity: (discovery: DiscoveryEpoch) -> ChildIdentityObservation
+    observe_identity: (identity: ProcessIdentity) -> IdentityObservation
+    sample_resources: (sequence: Integer) -> ResourceObservation
+    signal_exact_identity: (identity: ProcessIdentity, signal: Signal) -> SignalOutcome
+    reverify_retained_candidate: (candidate: RetainedCandidateIdentity) -> CandidateVerification
 
     @invariant BirthIdentityBeforeMutation
         -- A PID hint or process-group relationship is discovery evidence only.
@@ -577,6 +646,10 @@ contract ControllerOsBoundary {
         -- ESRCH while acquiring a birth token, permission denial, temporary
         -- unavailability, and malformed metadata remain distinct observations.
         -- None is silently converted into verified process absence.
+        -- ChildListObservation is Result<List<ProcessId>, OsQueryError> and
+        -- ResourceObservation is Result<ResourceSample, ResourceObservationFailure>.
+        -- Identity, child, signal, and candidate results retain their native typed
+        -- observation variants rather than collapsing uncertainty to Boolean/null.
 
     @invariant NoProcessBlacklistAdmission
         -- Resource admission is based on a sustained series of measured capacity
@@ -589,7 +662,7 @@ contract ControllerOsBoundary {
 }
 
 contract ControllerSqliteBoundary {
-    persist_checkpoint: (attempt: DeploymentAttempt) -> Boolean
+    persist_checkpoint: (attempt: DeploymentAttempt) -> CommittedTransition
     load_attempt: (attempt_id: String) -> LoadedAttempt?
     prepare_recovery: (loaded: LoadedAttempt) -> PersistableRecoveryCheckpoint?
 
@@ -615,6 +688,87 @@ contract ControllerSqliteBoundary {
     @invariant FailedAuthorityPoisonsHandle
         -- Persistence or loading that cannot classify durable authority invalidates
         -- the handle until reopen and classification; no new attempt is admitted.
+}
+
+contract AffineDispatchBoundary {
+    into_dispatch: (committed: CommittedTransition) -> DispatchIssuance
+    next_ticket: (batch: DispatchBatch) -> DispatchAdvance
+    execute: (ticket: DispatchTicket) -> ExecutedEffect
+
+    @invariant SuccessfulPersistenceIsTheIssuingBoundary
+        -- CommittedTransition, DispatchBatch, and DispatchTicket are affine and
+        -- cannot be cloned. Consumption of a plan accepted by a trusted AttemptStore
+        -- issues a batch for the EffectExecutor. Diagnostic checkpoint/effect values
+        -- cannot fabricate tickets; diagnostic decomposition discards executor
+        -- admission. Uncommitted transitions, failed persistence, and crash loads
+        -- issue none. ControllerOs remains an adapter boundary rather than a global
+        -- operating-system capability sandbox.
+
+    @invariant StableSiblingCorrelation
+        -- Each ticket contains one OsEffect and one DispatchKey. The key names
+        -- the exact attempt, issuing committed revision, and zero-based ordinal
+        -- in that plan. Equal-valued sibling effects still have distinct ordinals.
+        -- next_ticket returns the retained remainder together with the next ticket;
+        -- issuing one sibling does not consume or renumber the others.
+
+    @invariant OneCallAndStructurallyPairedOutcome
+        -- Consuming a ticket calls exactly its matching ControllerOs method once:
+        -- SampleResources -> sample_resources; ListChildren -> list_children;
+        -- AcquireChildIdentity -> acquire_child_identity;
+        -- ObserveIdentity -> observe_identity;
+        -- SignalExactIdentity -> signal_exact_identity;
+        -- ReverifyRetainedCandidate -> reverify_retained_candidate.
+        -- ExecutedEffect privately pairs that ticket's original key with a typed
+        -- EffectCompletion variant containing the effect inputs and exact native
+        -- result. Resource/query errors and observation/signal/verification outcomes
+        -- retain their types; no empty or fabricated evidence replaces a failure.
+
+    @invariant NoExecutorPolicyOrActivation
+        -- The executor does not retry, escalate, roll back, infer phase, or apply
+        -- outcomes to policy. CandidateVerification::Exact is observation only,
+        -- never activation permission. There is no activation effect.
+
+    @invariant DroppingIsNotDispatch
+        -- Dropping a batch or unexecuted ticket makes no OS call. Affine dispatch
+        -- is not exactly-once execution across crash and gives no replay permission.
+}
+
+contract SafeStoreCliBoundary {
+    status: (store_path: String, attempt_id: String) -> StatusSummary
+    closeout: (store_path: String, attempt_id: String) -> StatusSummary
+
+    @invariant OnlyTwoSafeCommands
+        -- Only status --store PATH --attempt U128 and closeout with the same flags
+        -- are accepted. Flags occur once, in either order. U128 is unsigned ASCII
+        -- decimal within u128 range. Bad/duplicate/unknown arguments or commands
+        -- fail before store open. No native run/reconcile/deploy, activation,
+        -- installer, schema migration, or native deployment adapter is reachable.
+
+    @invariant ExistingStoreOnly
+        -- Store open never creates a missing database or initializes an unversioned
+        -- one. Schema admission, CAS revisions, and load/write handle poisoning
+        -- remain the ControllerSqliteBoundary contract.
+
+    @invariant StatusIsAffineInspectionOnly
+        -- Status loads affine evidence and prints only attempt_id as a canonical
+        -- decimal string, positive persistence_revision, snake-case phase, and
+        -- snake-case cleanup_outcome. It exposes no live checkpoint/effects/native
+        -- details and performs no recovery preparation or checkpoint mutation.
+
+    @invariant CloseoutIsPhaseFenced
+        -- Only administrative_closeout_required proceeds to stable evidence and
+        -- matching AdministrativeRiskAcceptance. Persist closeout, check the batch
+        -- has zero effects, and summarize administratively_closed with unresolved
+        -- evidence retained and administrative_risk_accepted, not verified cleanup.
+        -- Every other phase fails before recovery preparation or persistence,
+        -- with no revision change or effect execution.
+
+    @invariant JsonAndCategoryOnlyOutput
+        -- Success is one JSON StatusSummary object plus newline on stdout.
+        -- Errors expose only a fixed category plus newline on stderr, never paths,
+        -- arguments, raw SQL/SQLite errors, command lines, or environment values.
+        -- Exit codes: 0 success; 2 usage_error; 3 store_error; 4 attempt_not_found;
+        -- 5 wrong_phase; 6 internal_error (invariant, encoding, or stdout failure).
 }
 
 contract MacOsSupervisionBoundary {
@@ -711,6 +865,7 @@ surface StandaloneDeploymentController {
     contracts:
         demands ControllerOsBoundary
         demands ControllerSqliteBoundary
+        demands AffineDispatchBoundary
         demands MacOsSupervisionBoundary
     context attempt: DeploymentAttempt
     exposes:
@@ -745,4 +900,25 @@ surface StandaloneDeploymentController {
         CandidateMigrationInvoked(attempt, candidate)
         ForwardRecoveryFailed(attempt)
         AdministrativeRiskAccepted(attempt)
+}
+
+surface AffineDispatchCorrelation {
+    contracts:
+        demands AffineDispatchBoundary
+    context key: DispatchKey
+    exposes:
+        key.attempt_id
+        key.persistence_revision
+        key.ordinal
+}
+
+surface SafeStandaloneStoreCli {
+    contracts:
+        demands SafeStoreCliBoundary
+    context summary: StatusSummary
+    exposes:
+        summary.attempt_id
+        summary.persistence_revision
+        summary.phase
+        summary.cleanup_outcome
 }

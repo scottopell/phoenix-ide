@@ -65,7 +65,8 @@ pub enum CompatibilityBoundary {
     CandidateMigrationInvoked(RetainedCandidateIdentity),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CleanupOutcome {
     NotStarted,
     InProgress,
@@ -74,7 +75,8 @@ pub enum CleanupOutcome {
     AdministrativeRiskAccepted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     ResourceSampling,
     OwnershipDiscovery,
@@ -215,6 +217,21 @@ impl LoadedAttempt {
     #[must_use]
     pub const fn phase(&self) -> Phase {
         self.checkpoint.phase()
+    }
+
+    /// # Panics
+    /// Panics if private loaded evidence lacks its store-validated revision.
+    #[must_use]
+    pub fn persistence_revision(&self) -> PersistenceRevision {
+        // Only the store constructs loaded evidence, after validating its revision.
+        self.checkpoint
+            .persistence_revision()
+            .expect("loaded revision")
+    }
+
+    #[must_use]
+    pub const fn cleanup_outcome(&self) -> CleanupOutcome {
+        self.checkpoint.cleanup_outcome()
     }
 
     /// Active work first checkpoints interruption without OS effects. A further
@@ -366,6 +383,14 @@ pub enum DeploymentAttempt {
     AdministrativelyClosed(AdministrativelyClosed),
 }
 
+/// An uncommitted plan cannot issue tickets.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::Transition;
+/// fn dispatch_before_persistence(pending: Transition) {
+///     let _ = pending.into_dispatch();
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transition {
     checkpoint: DeploymentAttempt,
@@ -375,6 +400,9 @@ pub struct Transition {
 pub trait AttemptStore {
     type Error;
 
+    /// A successful return is trusted as durable issuance authority. Implementations
+    /// must not return a revision before the complete checkpoint commits.
+    ///
     /// Atomically compares `checkpoint.persistence_revision()` with the durable
     /// row, stores the complete checkpoint with its checked next revision, and
     /// returns that committed revision. An unpersisted checkpoint requires no row.
@@ -387,7 +415,15 @@ pub trait AttemptStore {
     ) -> Result<PersistenceRevision, Self::Error>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Persisted checkpoint and effect plan; consuming it can issue executor admission.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::CommittedTransition;
+/// fn duplicate(committed: CommittedTransition) {
+///     let _ = committed.clone();
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct CommittedTransition {
     checkpoint: DeploymentAttempt,
     after_persist: Vec<OsEffect>,

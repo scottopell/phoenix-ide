@@ -30,6 +30,29 @@ recovery authority, and commit failure. Full CI run `38752367219` and dedicated
 macOS run `38752367467` passed. No production launchd label, process, reservation,
 application database, or installation path is used by this crate.
 
+The crate also contains an affine dispatch boundary: consuming a non-cloneable
+`CommittedTransition` mints one batch with private, non-cloneable tickets keyed by
+attempt, committed revision, and zero-based ordinal. `EffectExecutor` maps each of
+the six effects to one typed `ControllerOs` call and correlated completion without
+policy, retries, or activation authority. Diagnostic effect values cannot mint
+tickets; dropped tickets do nothing. This is not exactly-once execution across crash.
+
+The `phoenix-deployment-controller` binary exposes only safe `status` and explicit
+administrative `closeout` against an existing caller-selected controller store.
+`open_existing` omits SQLite's create flag and does not initialize schemas. Status
+reads affine evidence into a four-field JSON summary, never a live checkpoint.
+Closeout phase-checks before recovery preparation, persists matching risk acceptance
+through CAS, and requires an empty dispatch batch. Fixed error categories and exit
+codes avoid raw SQL, path, command, or environment disclosure. `serde`/`serde_json`
+serialize the typed summary and phase/outcome enums instead of hand-assembling JSON;
+there is no controller schema change or new dependency version.
+
+The dispatch and CLI regression suite and compile-fail authority examples are
+authored but have not been compiled or executed in this slice because host admission
+prohibits local Rust build/test/Clippy. Static qualification is limited to formatting,
+Cargo metadata/lock resolution, diff checks, and Allium; hosted Rust and CLI
+qualification remains required before claiming runtime acceptance of this slice.
+
 ## Requirement coverage
 
 | Requirement | Current coverage / gap |
@@ -46,10 +69,20 @@ application database, or installation path is used by this crate.
 | REQ-SDC-010 | `ControllerOs` is typed and fake-backed; hosted macOS tests qualify native observation and fail-closed capacity/contention sampling, including counter-regression and capacity-arithmetic regressions. |
 | REQ-SDC-011 | `ControllerSqliteStore` owns an independent schema with normalized child rows, full-transaction checkpoint replacement, revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning; hosted tests and Clippy pass. |
 | REQ-SDC-012 | `SupervisedChild` retains a direct child as an isolated process-group leader until original-group finalization. Leader exit alone cannot finalize while same-group descendants remain; Drop is bounded best-effort and cannot claim cleanup. Arbitrary observed PID signaling is unsupported; group escape, deliberate group join, and controller-exit risks remain explicit. Harmless hosted macOS qualification passes. |
+| REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor and recording-OS tests cover all six calls, typed outcomes, sibling ordinals, drop, and persistence failure. Compile-fail examples reject cloning and fabrication. New tests are unexecuted pending admitted/hosted Rust validation. |
+| REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope. New tests are unexecuted pending admitted/hosted Rust validation. |
 
 ## Next work
 
-Thin `dev.py` delegation remains serialized with the installer and
-host-reconciliation owners and requires a fresh overlap receipt. Production adoption
-is outside this slice, and a surviving supervisor handoff is required before any
-controller-exit cleanup guarantee can be introduced.
+Native `run`, reconciliation, deployment, and activation remain blocked and are not
+binary commands. No surviving-supervisor behavior or installer/schema mechanics is
+introduced by the dispatch and safe-CLI slice. Hosted compilation, tests, doctests,
+and Clippy must qualify this slice before integration acceptance.
+
+The installer owner released `dev.py` unchanged at blob
+`c2e9b44b11350f859b0cf168aad4612fb3bc6f06` for future thin delegation. The launchd
+helper, current-schema/launchd tests, migration registry, and installer task remain
+owned until the finite qualification-and-freeze receipt completes; this slice does
+not edit or invoke them. Production adoption is outside this slice, and a surviving
+supervisor handoff is required before any controller-exit cleanup guarantee can be
+introduced.

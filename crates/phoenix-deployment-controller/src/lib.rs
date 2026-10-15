@@ -11,6 +11,7 @@
 //! candidate through a separately persisted transition.
 
 mod candidate;
+mod driver;
 mod identity;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -20,6 +21,9 @@ mod resource;
 mod state;
 
 pub use candidate::{ArtifactDigest, FullCommitSha, InvalidHexIdentity, RetainedCandidateIdentity};
+pub use driver::{
+    DispatchBatch, DispatchKey, DispatchTicket, EffectCompletion, EffectExecutor, ExecutedEffect,
+};
 pub use identity::{
     BirthToken, CandidateDiscovery, ChildEvidenceMismatch, ChildIdentityObservation, DiscoveryId,
     IdentityObservation, InvalidBirthToken, ObservationFailure, ProcessId, ProcessIdentity,

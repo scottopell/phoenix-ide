@@ -220,3 +220,90 @@ THE SYSTEM SHALL expose descendant group escape, deliberate same-session group j
 and controller exit as unresolved supervision risks
 AND SHALL treat supervision lost across controller exit as unresolved risk unless a
 surviving supervisor handoff is positively identified.
+
+---
+
+### REQ-SDC-013: Affine Dispatch and Completion Correlation
+
+WHEN a transition has successfully persisted its checkpoint
+THE SYSTEM SHALL allow consumption of that `CommittedTransition` to mint one
+non-cloneable `DispatchBatch` of non-cloneable `DispatchTicket` values.
+
+EACH ticket SHALL carry exactly one `OsEffect` and a correlation key consisting
+of the attempt ID, the issuing committed persistence revision, and the effect's
+zero-based ordinal in the committed plan. Sibling effects SHALL have distinct
+ordinals, including when their effect values are equal.
+
+THE SYSTEM SHALL prevent executable ticket or batch fabrication from diagnostic
+checkpoint or effect values. Uncommitted transitions, failed persistence, and
+crash-loaded evidence SHALL expose no dispatch authority. Consuming a committed
+plan through a diagnostic decomposition SHALL discard its dispatch authority.
+
+`AttemptStore` implementations used by the dispatch boundary SHALL be trusted durable
+issuers and SHALL return success only after committing the supplied checkpoint.
+Dispatch tickets SHALL gate admission to `EffectExecutor`; `ControllerOs` remains an
+adapter interface rather than a global operating-system capability sandbox.
+
+WHEN the executor consumes one ticket
+THE SYSTEM SHALL make exactly one matching `ControllerOs` call and return an
+`ExecutedEffect` that structurally binds the original key and effect identity to
+the corresponding typed `EffectCompletion` outcome, including typed failures.
+
+THE executor SHALL NOT retry, escalate, roll back, infer phase, apply results to
+policy state, fabricate evidence, or authorize activation. Exact retained-candidate
+reverification SHALL remain an observation, not activation permission. Dropping a
+batch or unexecuted ticket SHALL make no operating-system call.
+
+THE dispatch boundary SHALL NOT claim exactly-once execution across controller
+crash or derive replay permission from a previously issued ticket.
+
+---
+
+### REQ-SDC-014: Safe Standalone Store Commands
+
+THE standalone binary SHALL accept only `status --store PATH --attempt U128` and
+`closeout --store PATH --attempt U128`, with each flag supplied once in either
+order. The attempt ID SHALL be unsigned ASCII decimal within the full `u128`
+range. Unknown commands, unknown or duplicate flags, missing values, and malformed
+IDs SHALL fail before opening a store.
+
+THE commands SHALL open only an existing controller store without creating a
+missing database or initializing an unversioned one. Missing stores SHALL remain
+absent. The commands SHALL preserve schema admission, compare-and-swap revision
+checks, and load/persistence fail-stop poisoning.
+
+WHEN `status` loads an attempt
+THE SYSTEM SHALL consume only affine loaded evidence for inspection and print
+one JSON object followed by a newline without changing the checkpoint or requesting
+recovery. The summary SHALL contain only `attempt_id` (canonical decimal string),
+`persistence_revision` (positive integer), `phase` (the snake-case phase name), and
+`cleanup_outcome` (the snake-case cleanup outcome name), without exposing a live
+checkpoint, effects, or native process/resource details.
+
+WHEN `closeout` loads an attempt in `administrative_closeout_required`
+THE SYSTEM SHALL consume its stable evidence, create matching
+`AdministrativeRiskAcceptance`, persist the administrative closeout, verify that
+the committed batch has zero effects, and report `administratively_closed` through
+the same summary shape. Administrative closeout SHALL preserve unresolved evidence
+and SHALL NOT claim verified cleanup or authorize deployment continuation.
+
+WHEN `closeout` loads any other phase
+THE SYSTEM SHALL fail before recovery preparation or persistence without changing
+the durable revision or executing an effect.
+
+THE binary SHALL NOT expose native run, reconcile, deploy, activation, installer,
+or schema-migration commands, and SHALL NOT invoke a native deployment adapter.
+
+THE commands SHALL emit success JSON only on stdout and fixed category diagnostics
+only on stderr. Diagnostics SHALL NOT include arguments, paths, raw SQL or SQLite
+errors, command lines, or environment values. Exit codes and stderr categories
+SHALL be:
+
+| Exit code | Meaning | Stderr category |
+| --- | --- | --- |
+| 0 | Successful summary | None |
+| 2 | Invalid command or arguments | `usage_error` |
+| 3 | Store open, schema, load, or persistence failure | `store_error` |
+| 4 | Attempt not found in the existing store | `attempt_not_found` |
+| 5 | Closeout rejected for the loaded phase | `wrong_phase` |
+| 6 | Internal invariant, JSON encoding, or stdout I/O failure | `internal_error` |

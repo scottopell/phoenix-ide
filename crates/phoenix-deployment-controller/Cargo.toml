@@ -8,8 +8,14 @@ description = "Standalone Phoenix deployment orchestration and durable controlle
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "phoenix-deployment-controller"
+path = "src/main.rs"
+
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -6,7 +6,7 @@ use std::{error::Error, fmt, path::Path};
 use rusqlite::{
     params,
     types::{FromSql, FromSqlError, ToSql, ToSqlOutput, Value, ValueRef},
-    Connection, OptionalExtension, TransactionBehavior,
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior,
 };
 
 use super::{
@@ -101,6 +101,25 @@ impl ControllerSqliteStore {
         Self::initialize(Connection::open(path)?)
     }
 
+    /// Opens a pre-existing controller database without creating or initializing it.
+    /// No schema changes or persistent pragmas are issued.
+    ///
+    /// # Errors
+    /// Rejects a missing file, unknown schema, invalid authority, or `SQLite` failure.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        check_authority(&connection)?;
+        Ok(Self {
+            connection,
+            poisoned: false,
+        })
+    }
+
     /// Creates an isolated, ephemeral controller database.
     ///
     /// # Errors
@@ -138,7 +157,7 @@ impl ControllerSqliteStore {
     }
 
     /// Loads affine recovery evidence under a consistent read transaction.
-    /// Only id, phase, and consuming recovery preparation are exposed.
+    /// Only safe summary metadata and consuming recovery preparation are exposed.
     ///
     /// # Errors
     /// Rejects poisoned handles and malformed, incomplete, unknown, or
