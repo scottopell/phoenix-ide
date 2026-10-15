@@ -1,4 +1,4 @@
-//! Isolated SQLite fixtures only: no processes, services, or application database.
+//! Isolated `SQLite` fixtures only: no processes, services, or application database.
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use phoenix_deployment_controller::{
@@ -770,68 +770,76 @@ fn reopening_cleaning_or_recovering_restarts_observation_before_signal_capabilit
             .unwrap();
         assert!(interrupted.after_persist().is_empty());
         let interrupted = interrupted.into_parts().0;
-        assert_eq!(interrupted.phase(), Phase::Interrupted);
-        assert!(matches!(
-            interrupted
-                .clone()
-                .request_owned_signals(Signal::Terminate, MonotonicTick::new(1)),
-            Err(TransitionError::WrongPhase)
-        ));
-        let recovering = interrupted.recover().unwrap().persist(&mut store).unwrap();
-        assert_eq!(
-            recovering.after_persist(),
-            &[OsEffect::ObserveIdentity { identity: root }]
-        );
-        let state = recovering.into_parts().0;
-        assert_eq!(state.phase(), Phase::Recovering);
-        assert_eq!(
-            state.ownership_tree().unwrap().identities()[&root],
-            OwnedIdentityStatus::NeedsFreshObservation
-        );
-        assert!(matches!(
-            state
-                .clone()
-                .request_owned_signals(Signal::Kill, MonotonicTick::new(1)),
-            Err(TransitionError::WrongPhase)
-        ));
-        assert!(matches!(
-            state
-                .clone()
-                .recovery_reconciliation_completed(MonotonicTick::new(1)),
-            Err(TransitionError::IncompleteReconciliation)
-        ));
-        let state = roundtrip(
-            &mut store,
-            state
-                .identity_observed(
-                    root,
-                    IdentityObservation::SameIdentity {
-                        current_parent: None,
-                    },
-                )
-                .unwrap(),
-        );
-        let resumed = state
-            .recovery_reconciliation_completed(MonotonicTick::new(1))
-            .unwrap()
-            .persist(&mut store)
-            .unwrap();
-        assert!(resumed.after_persist().is_empty());
-        let state = resumed.into_parts().0;
-        assert_eq!(state.phase(), Phase::CleaningOwnedTree);
-        let signals = state
-            .request_owned_signals(Signal::Terminate, MonotonicTick::new(1))
-            .unwrap()
-            .persist(&mut store)
-            .unwrap();
-        assert_eq!(
-            signals.after_persist(),
-            &[OsEffect::SignalExactIdentity {
-                identity: root,
-                signal: Signal::Terminate
-            }]
-        );
+        assert_recovery_barrier(&mut store, interrupted, root);
     }
+}
+
+fn assert_recovery_barrier(
+    store: &mut ControllerSqliteStore,
+    interrupted: DeploymentAttempt,
+    root: ProcessIdentity,
+) {
+    assert_eq!(interrupted.phase(), Phase::Interrupted);
+    assert!(matches!(
+        interrupted
+            .clone()
+            .request_owned_signals(Signal::Terminate, MonotonicTick::new(1)),
+        Err(TransitionError::WrongPhase)
+    ));
+    let recovering = interrupted.recover().unwrap().persist(store).unwrap();
+    assert_eq!(
+        recovering.after_persist(),
+        &[OsEffect::ObserveIdentity { identity: root }]
+    );
+    let state = recovering.into_parts().0;
+    assert_eq!(state.phase(), Phase::Recovering);
+    assert_eq!(
+        state.ownership_tree().unwrap().identities()[&root],
+        OwnedIdentityStatus::NeedsFreshObservation
+    );
+    assert!(matches!(
+        state
+            .clone()
+            .request_owned_signals(Signal::Kill, MonotonicTick::new(1)),
+        Err(TransitionError::WrongPhase)
+    ));
+    assert!(matches!(
+        state
+            .clone()
+            .recovery_reconciliation_completed(MonotonicTick::new(1)),
+        Err(TransitionError::IncompleteReconciliation)
+    ));
+    let state = roundtrip(
+        store,
+        state
+            .identity_observed(
+                root,
+                IdentityObservation::SameIdentity {
+                    current_parent: None,
+                },
+            )
+            .unwrap(),
+    );
+    let resumed = state
+        .recovery_reconciliation_completed(MonotonicTick::new(1))
+        .unwrap()
+        .persist(store)
+        .unwrap();
+    assert!(resumed.after_persist().is_empty());
+    let state = resumed.into_parts().0;
+    assert_eq!(state.phase(), Phase::CleaningOwnedTree);
+    let signals = state
+        .request_owned_signals(Signal::Terminate, MonotonicTick::new(1))
+        .unwrap()
+        .persist(store)
+        .unwrap();
+    assert_eq!(
+        signals.after_persist(),
+        &[OsEffect::SignalExactIdentity {
+            identity: root,
+            signal: Signal::Terminate
+        }]
+    );
 }
 
 #[test]
