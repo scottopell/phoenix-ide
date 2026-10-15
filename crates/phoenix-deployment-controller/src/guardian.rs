@@ -1114,8 +1114,8 @@ mod tests {
     use super::{
         AppliedResultAck, BoundSubmissionError, ChildSlotId, ChildSlotObservation,
         ControllerSession, Guardian, GuardianError, GuardianExecutor, GuardianInstanceId,
-        GuardianState, ReconciledSessionPermit, SessionDispatchTicket, MAX_CHILD_SLOTS,
-        MAX_RETAINED_RESULTS,
+        GuardianState, ReconciledSessionPermit, SessionDispatchTicket, SignalResultReservation,
+        MAX_CHILD_SLOTS, MAX_RETAINED_RESULTS,
     };
 
     use crate::{
