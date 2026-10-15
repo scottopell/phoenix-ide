@@ -1,12 +1,59 @@
-.message.meta.conversation-event-message { opacity: 1; }
-.conversation-event-card { min-width: 0; font-size: 0.875rem; }
-.conversation-event-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.65rem; }
-.conversation-event-title { min-width: 0; overflow-wrap: anywhere; color: var(--accent-blue); }
-.conversation-event-title:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
-.conversation-event-outcome { font-weight: 600; }
-.conversation-event-outcome.failure, .conversation-event-reason { color: var(--color-error, #d85858); }
-.conversation-event-summary time { font-size: 0.8em; color: var(--text-muted); }
-.conversation-event-card summary { cursor: pointer; width: fit-content; padding: 0.25rem 0; }
-.conversation-event-card summary:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
-.conversation-event-provenance, .conversation-event-reason { white-space: pre-wrap; overflow-wrap: anywhere; }
-.conversation-event-card .message-content { margin-top: 0.5rem; }
+.message.meta.conversation-event-message {
+  opacity: 1;
+}
+
+.conversation-event-card {
+  min-width: 0;
+  font-size: 0.875rem;
+}
+
+.conversation-event-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.65rem;
+}
+
+.conversation-event-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--accent-blue);
+}
+
+.conversation-event-title:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.conversation-event-outcome {
+  font-weight: 600;
+}
+
+.conversation-event-outcome.failure, .conversation-event-reason {
+  color: var(--color-error, #d85858);
+}
+
+.conversation-event-summary time {
+  font-size: 0.8em;
+  color: var(--text-muted);
+}
+
+.conversation-event-card summary {
+  cursor: pointer;
+  width: fit-content;
+  padding: 0.25rem 0;
+}
+
+.conversation-event-card summary:focus-visible {
+  outline: 2px solid currentcolor;
+  outline-offset: 2px;
+}
+
+.conversation-event-provenance, .conversation-event-reason {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.conversation-event-card .message-content {
+  margin-top: 0.5rem;
+}

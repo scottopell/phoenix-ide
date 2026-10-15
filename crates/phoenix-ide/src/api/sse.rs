@@ -10,13 +10,13 @@
 use super::wire::SseWireEvent;
 use crate::runtime::SseEvent;
 use axum::http::{HeaderMap, HeaderValue};
-use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 const CONVERSATION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -245,7 +245,7 @@ async fn project_sse_event(
     audience: SseStreamAudience,
     event: SseEvent,
 ) -> Event {
-    wire_event_to_axum(project_sse_wire(db, audience, event).await)
+    wire_event_to_axum(&project_sse_wire(db, audience, event).await)
 }
 
 async fn project_sse_wire(
@@ -253,7 +253,7 @@ async fn project_sse_wire(
     audience: SseStreamAudience,
     event: SseEvent,
 ) -> SseWireEvent {
-    use super::event_presentation::{EventPresentations, event_messages};
+    use super::event_presentation::{event_messages, EventPresentations};
     let presentations = match audience {
         SseStreamAudience::Authenticated => {
             EventPresentations::load(db, event_messages(&event)).await
@@ -265,15 +265,15 @@ async fn project_sse_wire(
 
 #[cfg(test)]
 fn sse_event_to_axum(event: SseEvent) -> Event {
-    wire_event_to_axum(event.into())
+    wire_event_to_axum(&event.into())
 }
 
-fn wire_event_to_axum(wire: SseWireEvent) -> Event {
+fn wire_event_to_axum(wire: &SseWireEvent) -> Event {
     let event_type = wire.event_type();
     // SseWireEvent derives Serialize over types that themselves derive
     // Serialize (or carry `serde_json::Value`). `to_string` cannot fail
     // at this layer; if it did, we'd want to know loudly.
-    let data = serde_json::to_string(&wire).expect("SseWireEvent is always serializable");
+    let data = serde_json::to_string(wire).expect("SseWireEvent is always serializable");
     Event::default().event(event_type).data(data)
 }
 
@@ -287,7 +287,7 @@ mod tests {
     use crate::runtime::{ConversationMetadataUpdate, EnrichedConversation};
     use crate::state_machine::state::ConvState;
     use chrono::{TimeZone, Utc};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     /// Legacy `json!()` serialization — kept in tests only. The production
     /// path goes through `SseWireEvent`; this function is the gold-standard
@@ -757,11 +757,9 @@ mod tests {
         ] {
             assert_eq!(projected["content"], expected["content"]);
             assert_eq!(projected["event_presentation"]["reason"], "redacted");
-            assert!(
-                projected["event_presentation"]
-                    .get("display_name")
-                    .is_none()
-            );
+            assert!(projected["event_presentation"]
+                .get("display_name")
+                .is_none());
         }
         let (tx, rx) = tokio::sync::broadcast::channel(2);
         tx.send(live_event.clone()).unwrap();
@@ -1311,26 +1309,18 @@ mod tests {
             message_id: "msg-steer-1".to_string(),
         };
 
-        assert!(
-            SseStreamAudience::Authenticated
-                .prepare(queued.clone())
-                .is_some()
-        );
-        assert!(
-            SseStreamAudience::SharedTranscript
-                .prepare(queued)
-                .is_none()
-        );
-        assert!(
-            SseStreamAudience::SharedTranscript
-                .prepare(cancelled)
-                .is_none()
-        );
-        assert!(
-            SseStreamAudience::SharedTranscript
-                .prepare(SseEvent::AgentDone { sequence_id: 24 })
-                .is_some()
-        );
+        assert!(SseStreamAudience::Authenticated
+            .prepare(queued.clone())
+            .is_some());
+        assert!(SseStreamAudience::SharedTranscript
+            .prepare(queued)
+            .is_none());
+        assert!(SseStreamAudience::SharedTranscript
+            .prepare(cancelled)
+            .is_none());
+        assert!(SseStreamAudience::SharedTranscript
+            .prepare(SseEvent::AgentDone { sequence_id: 24 })
+            .is_some());
     }
 
     #[test]

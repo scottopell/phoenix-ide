@@ -110,7 +110,10 @@ impl EventPresentations {
             .into_iter()
             .filter_map(|message| match &message.origin {
                 InputOrigin::SubscriptionEvent { event_id } => Some(event_id.clone()),
-                _ => None,
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated => None,
             })
             .collect();
         match db.coordinator_watch_event_presentations(&ids).await {
@@ -142,7 +145,10 @@ impl EventPresentations {
                     |event| EventPresentation::Available(event.clone()),
                 ))
             }
-            _ => None,
+            InputOrigin::UnknownHistorical
+            | InputOrigin::UserApi
+            | InputOrigin::InternalConversation { .. }
+            | InputOrigin::SystemGenerated => None,
         }
     }
 
@@ -181,7 +187,22 @@ pub(crate) fn event_messages(event: &crate::runtime::SseEvent) -> Vec<&Message> 
                 .collect()
         }
         SseEvent::Message { message } => vec![message],
-        _ => Vec::new(),
+        SseEvent::MessageUpdated { .. }
+        | SseEvent::StateChange { .. }
+        | SseEvent::Token { .. }
+        | SseEvent::LlmFirstByte { .. }
+        | SseEvent::LlmAttempt { .. }
+        | SseEvent::AgentDone { .. }
+        | SseEvent::ConversationBecameTerminal { .. }
+        | SseEvent::ConversationUpdate { .. }
+        | SseEvent::Error { .. }
+        | SseEvent::ConversationHardDeleted { .. }
+        | SseEvent::BrowserSessionState { .. }
+        | SseEvent::BashToolProgress { .. }
+        | SseEvent::SteerMessageQueued { .. }
+        | SseEvent::SteerMessageCancelled { .. }
+        | SseEvent::RateLimitSnapshot { .. }
+        | SseEvent::WorkScopeUpdate { .. } => Vec::new(),
     }
 }
 

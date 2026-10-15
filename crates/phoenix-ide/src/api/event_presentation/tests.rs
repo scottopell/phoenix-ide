@@ -68,7 +68,7 @@ async fn caller_projects_every_event_across_400_boundary_and_historical_delivery
                 panic!("event omitted")
             };
             assert!(matches!(event.outcome, EventOutcome::TurnFinished));
-            assert_eq!(event.occurred_at_us, 123456789);
+            assert_eq!(event.occurred_at_us, 123_456_789);
         }
     }
 }
@@ -97,11 +97,9 @@ async fn missing_lookup_failed_and_shared_projections_keep_original_message() {
         })
     ));
     let shared_json = serde_json::to_value(shared).unwrap();
-    assert!(
-        shared_json["event_presentation"]
-            .get("display_name")
-            .is_none()
-    );
+    assert!(shared_json["event_presentation"]
+        .get("display_name")
+        .is_none());
     db.pool().close().await;
     let failed = enrich_messages(&db, &messages).await;
     assert_eq!(failed.len(), 2);

@@ -10,8 +10,8 @@ import type { WorkScopeInventory } from "./WorkScopeInventory";
 /**
  * Wire-format `SseEvent`. Single source of truth for what each variant looks
  * like on the `data:` line of an SSE frame. Every broadcast-side
- * [`SseEvent`] goes through `From<SseEvent>` into `SseWireEvent` and then
- * through `serde_json::to_string`.
+ * [`SseEvent`] is explicitly projected with event presentations into
+ * `SseWireEvent`, then serialized through `serde_json::to_string`.
  *
  * `#[serde(tag = "type", rename_all = "snake_case")]` puts the discriminant
  * on the wire as the `type` field — matches the old `json!()` shape and what
