@@ -228,7 +228,6 @@ impl BoundSubmissionRefusal {
         self.error
     }
 
-    #[must_use]
     pub fn into_parts(self) -> (GuardianError, SessionDispatchTicket) {
         let Self { error, token } = self;
         (error, token)

@@ -98,7 +98,6 @@ pub enum LoopProgress {
 
 impl LoopProgress {
     /// Only keys whose evidence or superseding barrier is durably incorporated.
-    #[must_use]
     pub fn acknowledge_keys(&self) -> impl Iterator<Item = DispatchKey> + '_ {
         let key = match self {
             Self::Applied {
@@ -570,9 +569,9 @@ impl PolicyLoop {
         }
         let key = executed.key();
         if key.attempt_id() != self.checkpoint.attempt_id()
-            || !self
+            || self
                 .interrupted_revision
-                .is_some_and(|revision| key.revision().get() < revision.get())
+                .is_none_or(|revision| key.revision().get() >= revision.get())
         {
             return Err(LoopError::NotSuperseded(key));
         }
@@ -784,7 +783,7 @@ impl PolicyLoop {
         Ok(progress)
     }
 
-    /// Commits settlement before ACKing the exact signal keys returned by progress.
+    /// Commits settlement before acknowledging the exact signal keys returned by progress.
     ///
     /// # Errors
     /// Every accumulated result must still be retained in this guardian/session.
