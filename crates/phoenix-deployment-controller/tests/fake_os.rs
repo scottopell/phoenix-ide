@@ -252,48 +252,7 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
     );
 
     os.remove(root);
-    let transition = state
-        .deadline_reached(MonotonicTick::new(30))
-        .expect("the absolute deadline ends reconciliation without claiming cleanup");
-    assert_eq!(
-        transition.clone().persisted().checkpoint().phase(),
-        Phase::AdministrativeCloseoutRequired
-    );
-    assert_eq!(
-        transition
-            .clone()
-            .persisted()
-            .checkpoint()
-            .cleanup_outcome(),
-        CleanupOutcome::UnresolvedRisk
-    );
-    assert!(persisted_effects(&transition).is_empty());
-    let (state, _) = transition.persisted().into_parts();
-
-    let closed = state
-        .accept_administrative_risk(AdministrativeRiskAcceptance::for_attempt(AttemptId::new(1)))
-        .expect("explicit administrative closeout is separate from cleanup proof");
-    assert_eq!(
-        closed.clone().persisted().checkpoint().phase(),
-        Phase::AdministrativelyClosed
-    );
-    assert_eq!(
-        closed.clone().persisted().checkpoint().cleanup_outcome(),
-        CleanupOutcome::AdministrativeRiskAccepted
-    );
-    assert!(persisted_effects(&closed).is_empty());
-    assert!(os.signalled.is_empty());
-    assert_eq!(
-        closed
-            .clone()
-            .persisted()
-            .checkpoint()
-            .ownership_tree()
-            .expect("closeout retains evidence")
-            .unresolved()
-            .len(),
-        1
-    );
+    assert_unresolved_administrative_closeout(state, &os);
 }
 
 #[test]
@@ -827,6 +786,47 @@ fn admitted_attempt(root: ProcessIdentity) -> DeploymentAttempt {
     }
     assert_eq!(state.phase(), Phase::OwnershipDiscovery);
     state
+}
+
+fn assert_unresolved_administrative_closeout(state: DeploymentAttempt, os: &FakeOs) {
+    let transition = state
+        .deadline_reached(MonotonicTick::new(30))
+        .expect("the absolute deadline ends reconciliation without claiming cleanup");
+    let committed = transition.clone().persisted();
+    assert_eq!(
+        committed.checkpoint().phase(),
+        Phase::AdministrativeCloseoutRequired
+    );
+    assert_eq!(
+        committed.checkpoint().cleanup_outcome(),
+        CleanupOutcome::UnresolvedRisk
+    );
+    assert!(persisted_effects(&transition).is_empty());
+    let (state, _) = transition.persisted().into_parts();
+
+    let closed = state
+        .accept_administrative_risk(AdministrativeRiskAcceptance::for_attempt(AttemptId::new(1)))
+        .expect("explicit administrative closeout is separate from cleanup proof");
+    let committed = closed.clone().persisted();
+    assert_eq!(
+        committed.checkpoint().phase(),
+        Phase::AdministrativelyClosed
+    );
+    assert_eq!(
+        committed.checkpoint().cleanup_outcome(),
+        CleanupOutcome::AdministrativeRiskAccepted
+    );
+    assert!(persisted_effects(&closed).is_empty());
+    assert!(os.signalled.is_empty());
+    assert_eq!(
+        committed
+            .checkpoint()
+            .ownership_tree()
+            .expect("closeout retains evidence")
+            .unresolved()
+            .len(),
+        1
+    );
 }
 
 fn verified_ready_attempt(root: ProcessIdentity) -> DeploymentAttempt {
