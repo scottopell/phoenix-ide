@@ -2132,10 +2132,8 @@ fn product_creation_status_response(
             transcript_row_id,
         });
     }
-    let allowed_actions = super::product_conversations::creation_allowed_actions(
-        &job.status,
-        delivery_retryable,
-    );
+    let allowed_actions =
+        super::product_conversations::creation_allowed_actions(&job.status, delivery_retryable);
     if job.status == "cancelled" {
         return Ok(Response::Cancelled {
             request_id: job.request_id,
@@ -2343,8 +2341,8 @@ mod product_creation_acceptance_tests {
         let state = hard_delete_cascade_tests::make_test_state().await;
         let repo = tempfile::tempdir().unwrap();
         crate::git_ops::run_git(repo.path(), &["init", "--quiet"]).unwrap();
-        let _lock = crate::runtime::creation_worker::RepositoryMutationLock::acquire(repo.path())
-            .unwrap();
+        let _lock =
+            crate::runtime::creation_worker::RepositoryMutationLock::acquire(repo.path()).unwrap();
         let request_id = uuid::Uuid::new_v4().to_string();
         let body = request_body(&request_id, repo.path().to_str().unwrap());
         let app = create_router(state.clone());
@@ -2460,7 +2458,10 @@ mod product_creation_acceptance_tests {
                     "delivery_pending",
                 ][..],
             ),
-            ("failed", &["failed", "cleanup_ambiguous", "delivery_failed"][..]),
+            (
+                "failed",
+                &["failed", "cleanup_ambiguous", "delivery_failed"][..],
+            ),
         ] {
             for status in statuses {
                 let mut projected_job = job.clone();
@@ -2497,10 +2498,9 @@ mod product_creation_acceptance_tests {
         }
         let mut retryable = job.clone();
         retryable.status = "delivery_failed".to_string();
-        let projected = serde_json::to_value(
-            product_creation_status_response(retryable, true).unwrap(),
-        )
-        .unwrap();
+        let projected =
+            serde_json::to_value(product_creation_status_response(retryable, true).unwrap())
+                .unwrap();
         assert_eq!(projected["kind"], "failed");
         assert_eq!(projected["status"], "delivery_failed");
         assert_eq!(

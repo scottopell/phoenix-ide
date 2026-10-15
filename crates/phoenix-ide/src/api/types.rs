@@ -73,7 +73,8 @@ pub enum ProductConversationCreationStatusResponse {
         request_id: String,
         product_conversation_id: String,
         status: ProductConversationCreationPendingStatus,
-        provisioning_stage: phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
+        provisioning_stage:
+            phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
         stage_updated_at: String,
         retry_at: Option<String>,
         allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
@@ -82,7 +83,8 @@ pub enum ProductConversationCreationStatusResponse {
         request_id: String,
         product_conversation_id: String,
         status: ProductConversationCreationFailureStatus,
-        provisioning_stage: phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
+        provisioning_stage:
+            phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
         stage_updated_at: String,
         error: Option<String>,
         allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
@@ -90,7 +92,8 @@ pub enum ProductConversationCreationStatusResponse {
     Cancelled {
         request_id: String,
         product_conversation_id: String,
-        provisioning_stage: phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
+        provisioning_stage:
+            phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
         stage_updated_at: String,
         error: Option<String>,
         allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
