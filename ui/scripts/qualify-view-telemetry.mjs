@@ -76,9 +76,22 @@ export async function runCollectorNegativeChecks(context, baseURL, validReport) 
   return results;
 }
 
+export async function requireCollectorAuth(context, baseURL, authenticated) {
+  const response = await context.request.get(candidateDestination('/api/auth/status', baseURL), { timeout: 3000 });
+  try {
+    assert.equal(response.status(), 200, 'collector authentication preflight status required');
+    let status;
+    try { status = await response.json(); } catch { throw new Error('invalid collector authentication status JSON'); }
+    assert.ok(status?.auth_required === true, 'disposable collector fixture must require authentication');
+    assert.ok(status?.authenticated === authenticated, 'collector context authentication prerequisite');
+    return { auth_required: true, authenticated };
+  } finally { await response.dispose(); }
+}
+
 export async function runUnauthenticatedCollectorCheck(browser, baseURL, validReport) {
   const isolated = await browser.newContext({ storageState: { cookies: [], origins: [] } });
   try {
+    await requireCollectorAuth(isolated, baseURL, false);
     const response = await isolated.request.post(candidateDestination('/api/telemetry/conversation-view', baseURL), { data: validReport, timeout: 3000 });
     try {
       assert.equal(response.status(), 401, 'synthetic server must enforce collector authentication');
@@ -643,6 +656,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
   let execution;
   try {
     execution = (async () => {
+      result.auth_preflight = await requireCollectorAuth(context, baseURL, true);
       for (let index = 0; index < 48; index++) {
         assert.ok(Date.now() < deadline, 'telemetry context budget deadline');
         const aggregate = aggregates[index % 2];
