@@ -932,7 +932,7 @@ async fn process_product_creation_until_closed(
     run_product_creation_until_closed(
         manager,
         &claimed,
-        process_claimed_product_creation(manager, &claimed),
+        Box::pin(process_claimed_product_creation(manager, &claimed)),
     )
     .await
 }
@@ -1311,7 +1311,9 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         else {
             break;
         };
-        if let Err(error) = process_product_creation_until_closed(manager, claimed.clone()).await {
+        if let Err(error) =
+            Box::pin(process_product_creation_until_closed(manager, claimed.clone())).await
+        {
             cleanup_and_retry_unpublished_product_creation(
                 manager,
                 &claimed.job.request_id,
@@ -3062,7 +3064,7 @@ mod product_creation_delivery_replay_tests {
         let worktree = deterministic_worktree_path(
             repo.path().to_str().unwrap(), claimed.job.product_conversation_id.as_str(),
         );
-        let result = process_product_creation_until_closed(&manager, claimed).await;
+        let result = Box::pin(process_product_creation_until_closed(&manager, claimed)).await;
         let job = db.get_product_creation_job("git-pin").await.unwrap().unwrap();
         assert!(job.published_conversation_id.is_some(), "{result:?}");
         assert_eq!(job.pin_exact_checkout_oid.as_deref(), Some(oid.as_str()));
@@ -3088,7 +3090,9 @@ mod product_creation_delivery_replay_tests {
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             let claimed = claimed.clone();
-            async move { process_product_creation_until_closed(&manager, claimed).await }
+            async move {
+                Box::pin(process_product_creation_until_closed(&manager, claimed)).await
+            }
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {

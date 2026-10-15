@@ -28,13 +28,13 @@ function isCreateRequest(value: unknown): value is CreateProductConversationRequ
   if (!value || typeof value !== 'object') return false;
   const request = value as Record<string, unknown>;
   const efforts: readonly ModelEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
-  return typeof request.request_id === 'string' && request.request_id.length > 0
-    && typeof request.cwd === 'string'
-    && typeof request.objective === 'string'
-    && typeof request.model === 'string' && request.model.length > 0
-    && (request.effort == null || efforts.some((effort) => effort === request.effort))
-    && (request.llm_language == null || typeof request.llm_language === 'string')
-    && (request.images === undefined || (Array.isArray(request.images) && request.images.every((image: unknown) =>
+  return typeof request['request_id'] === 'string' && request['request_id'].length > 0
+    && typeof request['cwd'] === 'string'
+    && typeof request['objective'] === 'string'
+    && typeof request['model'] === 'string' && request['model'].length > 0
+    && (request['effort'] == null || efforts.some((effort) => effort === request['effort']))
+    && (request['llm_language'] == null || typeof request['llm_language'] === 'string')
+    && (request['images'] === undefined || (Array.isArray(request['images']) && request['images'].every((image: unknown) =>
       image !== null && typeof image === 'object'
       && 'data' in image && typeof image.data === 'string'
       && 'media_type' in image && typeof image.media_type === 'string')));
