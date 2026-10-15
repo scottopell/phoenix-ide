@@ -198,11 +198,6 @@ pub struct CommittedTransition {
 }
 
 impl Transition {
-    #[must_use]
-    pub fn checkpoint(&self) -> &DeploymentAttempt {
-        &self.checkpoint
-    }
-
     /// # Errors
     /// Returns the store's error and does not expose OS effects when persistence fails.
     pub fn persist<S: AttemptStore>(self, store: &mut S) -> Result<CommittedTransition, S::Error> {

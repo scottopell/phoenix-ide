@@ -242,11 +242,15 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
         .deadline_reached(MonotonicTick::new(30))
         .expect("the absolute deadline ends reconciliation without claiming cleanup");
     assert_eq!(
-        transition.checkpoint().phase(),
+        transition.clone().persisted().checkpoint().phase(),
         Phase::AdministrativeCloseoutRequired
     );
     assert_eq!(
-        transition.checkpoint().cleanup_outcome(),
+        transition
+            .clone()
+            .persisted()
+            .checkpoint()
+            .cleanup_outcome(),
         CleanupOutcome::UnresolvedRisk
     );
     assert!(persisted_effects(&transition).is_empty());
@@ -255,15 +259,20 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
     let closed = state
         .accept_administrative_risk(AdministrativeRiskAcceptance::for_attempt(AttemptId::new(1)))
         .expect("explicit administrative closeout is separate from cleanup proof");
-    assert_eq!(closed.checkpoint().phase(), Phase::AdministrativelyClosed);
     assert_eq!(
-        closed.checkpoint().cleanup_outcome(),
+        closed.clone().persisted().checkpoint().phase(),
+        Phase::AdministrativelyClosed
+    );
+    assert_eq!(
+        closed.clone().persisted().checkpoint().cleanup_outcome(),
         CleanupOutcome::AdministrativeRiskAccepted
     );
     assert!(persisted_effects(&closed).is_empty());
     assert!(os.signalled.is_empty());
     assert_eq!(
         closed
+            .clone()
+            .persisted()
             .checkpoint()
             .ownership_tree()
             .expect("closeout retains evidence")
@@ -328,7 +337,10 @@ fn acquired_child_remains_owned_after_reparenting() {
     let ready = state
         .verification_completed(MonotonicTick::new(5))
         .expect("all exact identities are absent");
-    assert_eq!(ready.checkpoint().phase(), Phase::ReadyForDisruption);
+    assert_eq!(
+        ready.clone().persisted().checkpoint().phase(),
+        Phase::ReadyForDisruption
+    );
     assert!(os.signalled.contains(&child));
 }
 
@@ -391,7 +403,7 @@ fn malformed_pid_reuse_observation_cannot_launder_owned_identity_absence() {
         .deadline_reached(MonotonicTick::new(30))
         .expect("malformed evidence cannot yield verified cleanup");
     assert_eq!(
-        closeout.checkpoint().phase(),
+        closeout.clone().persisted().checkpoint().phase(),
         Phase::AdministrativeCloseoutRequired
     );
 }
@@ -424,8 +436,14 @@ fn recovery_reobserves_owned_identities_before_repeating_mutation() {
     assert_eq!(state.phase(), Phase::Interrupted);
 
     let recovered = state.recover().expect("pre-migration recovery reconciles");
-    assert_eq!(recovered.checkpoint().phase(), Phase::Recovering);
-    assert_eq!(recovered.checkpoint().deadline(), deadline);
+    assert_eq!(
+        recovered.clone().persisted().checkpoint().phase(),
+        Phase::Recovering
+    );
+    assert_eq!(
+        recovered.clone().persisted().checkpoint().deadline(),
+        deadline
+    );
     assert_eq!(
         persisted_effects(&recovered),
         vec![OsEffect::ObserveIdentity { identity: root }]
@@ -471,7 +489,10 @@ fn migration_invocation_recovery_is_exact_candidate_forward_only() {
         .persisted()
         .into_parts();
     let recovered = state.recover().expect("forward recovery remains available");
-    assert_eq!(recovered.checkpoint().phase(), Phase::ForwardRecovery);
+    assert_eq!(
+        recovered.clone().persisted().checkpoint().phase(),
+        Phase::ForwardRecovery
+    );
     assert_eq!(
         persisted_effects(&recovered),
         vec![OsEffect::ReverifyRetainedCandidate { candidate }]
@@ -499,7 +520,7 @@ fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
         .deadline_reached(MonotonicTick::new(30))
         .expect("uncertainty stops at the absolute deadline");
     assert_eq!(
-        transition.checkpoint().phase(),
+        transition.clone().persisted().checkpoint().phase(),
         Phase::AdministrativeCloseoutRequired
     );
     assert!(persisted_effects(&transition).is_empty());
@@ -589,13 +610,19 @@ fn admission_requires_consecutive_capacity_and_contention_measurements() {
         let transition = state
             .record_resource_sample(ample_sample(sequence))
             .expect("ordered sample");
-        assert_eq!(transition.checkpoint().phase(), Phase::ResourceSampling);
+        assert_eq!(
+            transition.clone().persisted().checkpoint().phase(),
+            Phase::ResourceSampling
+        );
         (state, _) = transition.persisted().into_parts();
     }
     let admitted = state
         .record_resource_sample(ample_sample(2))
         .expect("third sustained sample admits");
-    assert_eq!(admitted.checkpoint().phase(), Phase::OwnershipDiscovery);
+    assert_eq!(
+        admitted.clone().persisted().checkpoint().phase(),
+        Phase::OwnershipDiscovery
+    );
 }
 
 fn admitted_attempt(root: ProcessIdentity) -> DeploymentAttempt {
