@@ -7670,7 +7670,9 @@ impl Database {
         if requires_claim {
             return Err(DbError::ProductCreationClaimLost);
         }
-        let position = self.append_steering_entry_tx(&mut tx, id, entry, request_fingerprint).await?;
+        let position = self
+            .append_steering_entry_tx(&mut tx, id, entry, request_fingerprint)
+            .await?;
         tx.commit().await?;
         Ok(position)
     }

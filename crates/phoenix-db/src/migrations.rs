@@ -14195,22 +14195,30 @@ mod tests {
                 ("accepted".to_string(), "validate_intent".to_string(), 11),
                 ("pinned".to_string(), "resolve_starting_pin".to_string(), 12),
                 ("staged".to_string(), "materialize_worktree".to_string(), 13),
-                ("delivery".to_string(), "bootstrap_initial_turn".to_string(), 14),
-                ("published".to_string(), "finalize_publication".to_string(), 15),
+                (
+                    "delivery".to_string(),
+                    "bootstrap_initial_turn".to_string(),
+                    14
+                ),
+                (
+                    "published".to_string(),
+                    "finalize_publication".to_string(),
+                    15
+                ),
             ]
         );
-        assert!(sqlx::query(
-            "UPDATE product_creation_jobs SET provisioning_stage = 'unknown'"
-        )
-        .execute(&pool)
-        .await
-        .is_err());
-        assert!(sqlx::query(
-            "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = -1"
-        )
-        .execute(&pool)
-        .await
-        .is_err());
+        assert!(
+            sqlx::query("UPDATE product_creation_jobs SET provisioning_stage = 'unknown'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE product_creation_jobs SET stage_updated_at_unix_micros = -1")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

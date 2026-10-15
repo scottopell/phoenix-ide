@@ -2389,6 +2389,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn cancellation_before_delivery_fences_sink_and_renewal_then_removes_staged_aggregate() {
         let db = Database::open_in_memory().await.unwrap();
         let delivery = staged_delivery(&db, "cancel-before-sink").await;
@@ -3063,6 +3064,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn provisioning_stage_is_relational_claim_fenced_and_retained_on_failure() {
         use ProductCreationProvisioningStage as Stage;
         let db = Database::open_in_memory().await.unwrap();
