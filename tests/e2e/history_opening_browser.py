@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent d9f46a5 checkout, independently built ignored
+Inputs are a clean independent 06156cc checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports four hash-attested telemetry harness
@@ -32,8 +32,8 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "d9f46a58c1c50ff83dbb5b2c2afe7ad5e15c7deb"
-TREE_PIN = "f24d93471e201d010f0657ce1712a3a04a02b6fd"
+PIN = "06156cc05ce3636cd09b57c43e99dc3ff1f92724"
+TREE_PIN = "1b4f4ab7f79d1f37c8f6ee74a76185c1a04c62e9"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
@@ -107,19 +107,37 @@ def startup_identity(log, exe, temp, port):
     return data | {"executable_sha256": shipping.digest(exe)}
 
 
-def owned_qualification_password(startup):
+def owned_qualification_password(startup, evidence_path):
     import stat
     home = Path(startup["home"])
     path = Path(startup["credential_file"])
-    info = path.lstat()
-    if (path != home / "qualification-password" or path.is_symlink()
-            or path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid()
-            or stat.S_IMODE(home.stat().st_mode) != 0o700
-            or home.stat().st_uid != os.getuid() or info.st_size != 36):
+    try:
+        info, directory = path.lstat(), home.lstat()
+        checks = {
+            "owned_child": path == home / "qualification-password",
+            "canonical": path.resolve(strict=True) == path,
+            "file_regular": stat.S_ISREG(info.st_mode),
+            "file_mode_0600": stat.S_IMODE(info.st_mode) == 0o600,
+            "file_current_uid": info.st_uid == os.getuid(),
+            "file_size_36": info.st_size == 36,
+            "home_directory": stat.S_ISDIR(directory.st_mode),
+            "home_mode_0700": stat.S_IMODE(directory.st_mode) == 0o700,
+            "home_current_uid": directory.st_uid == os.getuid(),
+        }
+        facts = {"checks": checks, "file_mode": oct(stat.S_IMODE(info.st_mode)),
+                 "home_mode": oct(stat.S_IMODE(directory.st_mode)), "file_size": info.st_size}
+    except OSError as error:
+        shipping.write_json(evidence_path, {"status": "stat_failed", "error_type": type(error).__name__})
+        raise ValueError("owned synthetic credential metadata unavailable") from None
+    shipping.write_json(evidence_path, {"status": "valid" if all(checks.values()) else "invalid", **facts})
+    if not all(checks.values()):
         raise ValueError("owned synthetic credential file identity mismatch")
-    password = path.read_text()
-    if str(uuid.UUID(password)) != password:
+    try:
+        password = path.read_text()
+        valid = str(uuid.UUID(password)) == password
+    except (OSError, ValueError):
+        raise ValueError("owned synthetic credential format unavailable or invalid") from None
+    if not valid:
         raise ValueError("owned synthetic credential format mismatch")
     return password
 
@@ -595,7 +613,8 @@ def qualify(app, exe, output, joint_telemetry=False):
                                 shipping.write_json(case / "startup.json", startup)
                                 fixture = shipping.Fixture(h, base, case)
                                 try:
-                                    authenticate_fixture(fixture.client, owned_qualification_password(startup))
+                                    authenticate_fixture(fixture.client, owned_qualification_password(
+                                        startup, case / "credential-identity.json"))
                                     fixture.h = AuthenticatedHarness(h, fixture.client)
                                     shipping.write_json(case / "authentication.json", {
                                         "auth_required": True, "parent_authenticated": True,

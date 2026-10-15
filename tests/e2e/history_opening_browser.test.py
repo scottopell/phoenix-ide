@@ -337,18 +337,26 @@ class OpeningQualificationTests(unittest.TestCase):
         credential.write_text(secret)
         credential.chmod(0o600)
         startup = {"home": str(home), "credential_file": str(credential)}
-        self.assertEqual(opening.owned_qualification_password(startup), secret)
+        self.assertEqual(opening.owned_qualification_password(startup, self.root / "credential-check.json"), secret)
+        home.chmod(0o755)
+        with self.assertRaises(ValueError): opening.owned_qualification_password(startup, self.root / "credential-check.json")
+        facts = json.loads((self.root / "credential-check.json").read_text())
+        self.assertEqual(facts["home_mode"], "0o755")
+        self.assertFalse(facts["checks"]["home_mode_0700"])
+        self.assertTrue(all(value for key, value in facts["checks"].items() if key != "home_mode_0700"))
+        self.assertNotIn(secret, json.dumps(facts))
+        home.chmod(0o700)
         credential.chmod(0o644)
-        with self.assertRaises(ValueError): opening.owned_qualification_password(startup)
+        with self.assertRaises(ValueError): opening.owned_qualification_password(startup, self.root / "credential-check.json")
         credential.chmod(0o600)
         credential.write_text("x" * 36)
-        with self.assertRaises(ValueError): opening.owned_qualification_password(startup)
+        with self.assertRaises(ValueError): opening.owned_qualification_password(startup, self.root / "credential-check.json")
         credential.unlink()
         outside = self.root / "outside-password"
         outside.write_text(secret); outside.chmod(0o600)
         credential.symlink_to(outside)
-        with self.assertRaises(ValueError): opening.owned_qualification_password(startup)
-        with self.assertRaises(ValueError): opening.owned_qualification_password({**startup, "credential_file": str(outside)})
+        with self.assertRaises(ValueError): opening.owned_qualification_password(startup, self.root / "credential-check.json")
+        with self.assertRaises(ValueError): opening.owned_qualification_password({**startup, "credential_file": str(outside)}, self.root / "credential-check.json")
 
     def test_parent_session_login_and_sse_use_same_cookie_without_secret_receipts(self):
         import httpx
@@ -402,6 +410,7 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertLess(source.index('std::env::remove_var(key)'), source.index('let password = uuid::Uuid::new_v4().to_string()'))
         self.assertLess(source.index('let password = uuid::Uuid::new_v4().to_string()'), source.index('std::env::set_var("PHOENIX_PASSWORD", password)'))
         self.assertIn('.create_new(true)\n        .mode(0o600)', source)
+        self.assertIn('.prefix("opening-server-")\n        .permissions(std::fs::Permissions::from_mode(0o700))\n        .tempdir_in(&parent)', source)
         self.assertIn('"credential_file":credential', source)
         self.assertNotIn('std::env::var("PHOENIX_PASSWORD")', source)
 

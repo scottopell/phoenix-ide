@@ -1143,3 +1143,50 @@ passed. Actual authenticated runtime, full pinned UI, genuine codegen/DB fixture
 guards, export/drain and normal shutdown remain owed to a separately admitted
 hosted attempt. The earlier failed artifacts and local failed regression logs
 remain intact; there is no automatic retry/publication.
+
+
+## Explicit private-HOME source repair after run 38660832205
+
+One admitted app `d9f46a5` source-only publication and harness `925f75ce` push
+created exact-head run `38660832205`. Instrumented job `116181400157` failed
+before browser execution with `owned synthetic credential file identity mismatch`.
+Artifact `11939500869` is retained. Genuine codegen, the actual Coordinator DB
+fixture, guards, compiler-free checks and full pinned UI passed. There is no
+browser/telemetry result and no outer Global-history execution in this attempt.
+Normal shutdown was not proven; force-stop observations remain distinct.
+The separate standard Rust job `116181483963` was still running at this source
+packet's preparation; it must be refreshed rather than inferred from prior runs.
+
+The failed artifact does not contain credential stat facts, so the actual
+rejected predicate cannot be recovered from it. Source inspection identified a
+producer omission: the locked `tempfile 3.27.0` directory creator uses default
+`DirBuilder` permissions unless supplied, while the consumer requires HOME mode
+0700. Existing Python fixtures explicitly created mode 0700 and did not expose
+that omission. Application `06156cc05ce3636cd09b57c43e99dc3ff1f92724`, tree
+`1b4f4ab7f79d1f37c8f6ee74a76185c1a04c62e9`, directly atop `d9f46a5`, adds exactly
+one line requesting `Permissions::from_mode(0o700)` before `tempdir_in`. It does
+not loosen the consumer, change authentication, inherit secrets, or alter the
+telemetry modules and their hashes.
+
+The Python consumer writes bounded content-free identity predicates, modes and
+size to `credential-identity.json` before rejection. A mode-0755 fixture must
+fail specifically `home_mode_0700` while all other predicates remain true; the
+receipt must not contain the password. Valid mode-0700 and existing wrong-file,
+symlink, external-path and invalid-content controls remain. A source assertion
+requires the exact explicit private-directory builder sequence. This is source
+and filesystem-mock coverage, not execution of the Rust builder under a hosted
+umask or proof that permissions were the failed artifact's only mismatch.
+
+Actual successor checks passed: shipping Python 16, base Node 14, opening Python
+46 (including real pinned module-byte hashes), opening Node 30, joint Node 50,
+Node syntax, Rust source-format parsing and diff checks. The app UI/telemetry
+files are byte-unchanged from `d9f46a5`; prior source tests are not a new Rust or
+runtime qualification. No successor hosted publication/rerun is automatic.
+
+Separately, owner reconciliation found two stale Oct12 local Ladle services with
+no consumer in this commission. Their exact node CLI PID/start/argv/PGID/cwd
+identities were recorded before normal SIGINT to PIDs 20336 and 81788. All their
+Node/esbuild descendants and port 61237 listener were absent afterward; idle
+zsh wrappers 20330 and 81783 remained. No source/evidence was deleted and no
+protected prototype or unrelated service was signalled. These local service
+receipts do not qualify the hosted application's normal shutdown.
