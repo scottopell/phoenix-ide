@@ -6,7 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 
 export const APP_PIN = '6e05de110b0cdcf075448d363f82be7a21fa26fc';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
-export const TELEMETRY_MODULE_SHA256 = '53ca4542ffdf7cce2040f8dfdba03575b1b44b334c94a2aed1611f185a8a00c3a';
+export const TELEMETRY_MODULE_SHA256 = '263935bd8e5cba3620724abc17142e426b5f4b9c744bd617cce05ed02b2981ea';
 export const TELEMETRY_DIAGNOSTICS_SHA256 = '2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c';
 export const TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE = 'ui/scripts/view-telemetry-diagnostics.mjs';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
@@ -213,7 +213,9 @@ export async function authenticateOwnedContext(context, baseURL, env = process.e
   catch { throw new Error('owned browser session login transport failed'); }
   try { assert.equal(response.status(), 200, 'owned browser session login status'); }
   finally { await response.dispose(); }
-  const status = await context.request.get(new URL('/api/auth/status', baseURL).href, { timeout: 3000 });
+  let status;
+  try { status = await context.request.get(new URL('/api/auth/status', baseURL).href, { timeout: 3000 }); }
+  catch { throw new Error('owned browser authentication status transport failed'); }
   try {
     assert.equal(status.status(), 200, 'owned browser authentication status');
     let value; try { value = await status.json(); } catch { throw new Error('owned browser invalid authentication status'); }

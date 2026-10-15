@@ -40,7 +40,7 @@ CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
-    "ui/scripts/qualify-view-telemetry.mjs": "53ca4542ffdf7cce2040f8dfdba03575b1b44b334c94a2aed1611f185a8a00c3a",
+    "ui/scripts/qualify-view-telemetry.mjs": "263935bd8e5cba3620724abc17142e426b5f4b9c744bd617cce05ed02b2981ea",
     "ui/scripts/view-telemetry-diagnostics.mjs": "2f3bd91d6f8243cbad4790af2ecde77835fefa9be2f9011b65f920c6ce7d233c",
     "tests/e2e/view_telemetry_sink.py": "aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",

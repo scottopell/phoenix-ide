@@ -112,6 +112,18 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("command = [str(destination), 'opening_qualifier::', '--nocapture', '--test-threads=1']", workflow)
         self.assertIn("'11 passed; 0 failed; 1 ignored'", workflow)
 
+    def test_actual_pinned_git_module_bytes_match_both_unmocked_hash_consumers(self):
+        import hashlib
+        import subprocess
+        app = Path(os.environ.get("APP_ROOT", str(opening.ROOT / "target/history-hidden-geometry-repair")))
+        source = (opening.ROOT / "ui/scripts/history-joint-telemetry.mjs").read_text()
+        for relative, expected in opening.TELEMETRY_MODULES.items():
+            actual = subprocess.check_output(["git", "-C", str(app), "show", f"{opening.PIN}:{relative}"])
+            self.assertEqual(hashlib.sha256(actual).hexdigest(), expected)
+            self.assertEqual(hashlib.sha256((app / relative).read_bytes()).hexdigest(), expected)
+            if relative.endswith(".mjs"):
+                self.assertIn(expected, source)
+
     def test_donor_relative_helper_is_staged_hashed_and_discovered(self):
         import ast
         import hashlib

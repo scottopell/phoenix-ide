@@ -1078,7 +1078,7 @@ The donor authentication-negative contract requires an authenticated server.
 The source successor application `6e05de110b0cdcf075448d363f82be7a21fa26fc`,
 tree `3f2ce53714f1f44dbc2d50d219e81692f07a6771`, retains `4e615ea` and applies
 only donor preflight delta `107555e6b3ff451852a070ebbe3d542a0a5a1d40`
-(cherry-picked as `890d913f`) plus the owned cfg-test authentication fixture.
+(cherry-picked as `fbd8b831`) plus the owned cfg-test authentication fixture.
 After the full ambient environment scrub, the fixture generates its own random
 UUID password, stores it using exclusive creation and mode 0600 under the owned
 mode-0700 temporary HOME, and sets the server password from that synthetic
@@ -1110,3 +1110,15 @@ are retained separately from the corrected passing logs. No Rust compilation,
 codegen, full UI, authenticated runtime, normal shutdown, Global-history,
 export/drain, or overhead acceptance is transferred to this successor. It has
 not been published or rerun merely by preparing this source packet.
+
+Auth-successor exact review found two source-level blockers before publication:
+the donor expected-hash constant did not match the actual pinned Git blob, and
+Playwright authenticated auth-status transport errors could include the session
+cookie in their call logs. The shared login boundary now sanitizes status-GET
+transport failures. A new unmocked regression hashes the actual pinned Git blobs
+and checkout bytes against both consumers, rather than trusting mocked hashes.
+The corresponding donor transport boundary remains telemetry-owned. These
+findings are not hosted runtime results and do not authorize another attempt.
+The previous run's standard Rust job `116169938486` has independently completed
+successfully; whole run `38657260015` is completed failure. Its watch terminated
+with exit status 1, as expected for that overall failed run.

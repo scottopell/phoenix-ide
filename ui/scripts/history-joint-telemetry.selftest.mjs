@@ -72,6 +72,11 @@ test('browser login rejects auth-disabled/wrong booleans/private JSON and saniti
       assert.equal(disposed, 2);
     }
     await assert.rejects(authenticateOwnedContext({ request: { post: async () => { throw new Error(password); } } }, 'http://127.0.0.1:12345', env), error => !String(error).includes(password));
+    const privateSession = 'SYNTHETIC_SESSION_SENTINEL';
+    await assert.rejects(authenticateOwnedContext({ request: {
+      post: async () => ({ status: () => 200, dispose: async () => {} }),
+      get: async () => { throw new Error(`apiRequestContext.get: timeout\nCall log:\n - cookie: phoenix-auth=${privateSession}`); },
+    } }, 'http://127.0.0.1:12345', env), error => error.message === 'owned browser authentication status transport failed' && !String(error.stack).includes(privateSession));
   } finally { f.cleanup(); }
 });
 
