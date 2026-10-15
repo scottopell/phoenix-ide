@@ -150,7 +150,7 @@ After exact observation returns `published`:
 1. Retain the published response's `request_id`, `product_conversation_id`, root `transcript_row_id`, and `canonical_route`.
 2. Read `GET /api/product-conversations/{product_conversation_id}`. When its complete JSON is observable, this independently verifies the published aggregate and returns `latest_transcript_row_id`, `writable_transcript_row_id`, lifecycle, and route data.
 3. Read `GET /api/conversations/{latest_transcript_row_id}`. When complete, this separately exposes exact transcript state, messages, and `agent_working`.
-4. Report the identities and activity state without conflating acceptance, publication, dispatch, generation, or turn completion.
+4. Report `request_id`, `product_conversation_id`, root `transcript_row_id`, current `latest_transcript_row_id`, `canonical_route`, `conversation.state.type`, and `agent_working` without conflating acceptance, publication, dispatch, generation, or turn completion.
 
 The aggregate and transcript reads can exceed Bash's result cap after large model output or message history. Validate each response as complete JSON before using it. Truncation is inconclusive: report that publication succeeded but activity/state verification is unavailable through the current unbounded read APIs. Never infer state from a partial body.
 

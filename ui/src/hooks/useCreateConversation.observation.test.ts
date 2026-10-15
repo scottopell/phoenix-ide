@@ -339,7 +339,7 @@ describe('exact-request creation observation', () => {
     creationStoreMock.clearProductCreationRequest.mockRejectedValueOnce(new Error('IndexedDB abort'));
     apiMock.getProductConversationCreation.mockRejectedValue(new ApiResponseError('Removed', 404));
     const hook = mountCreation();
-    await act(async () => {});
+    await prepareCreation(hook);
     expect(hook.result.current.creating).toBe(true);
     expect(hook.result.current.canSend).toBe(false);
     expect(hook.result.current.error).toContain('exact request remains active');
