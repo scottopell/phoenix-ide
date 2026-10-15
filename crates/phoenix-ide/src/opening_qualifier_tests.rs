@@ -518,6 +518,7 @@ async fn actual_server_opening_qualifier() {
         .expect("invalid isolated trace exporter environment");
     let home = tempfile::Builder::new()
         .prefix("opening-server-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(&parent)
         .unwrap();
     // This ignored driver is executed as the only test in its own process.
