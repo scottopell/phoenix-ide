@@ -109,7 +109,7 @@ impl MacOsControllerOs {
                 }
             });
         }
-        let mut child = command.spawn().map_err(io_error)?;
+        let mut child = command.spawn().map_err(|error| io_error(&error))?;
         let group = process_id(child.id());
         let observed = group
             .ok_or(MacOsError::MalformedObservation)
@@ -194,7 +194,7 @@ impl SupervisedChild {
         {
             return Ok(None);
         }
-        let Some(leader_status) = child.try_wait().map_err(io_error)? else {
+        let Some(leader_status) = child.try_wait().map_err(|error| io_error(&error))? else {
             return Ok(None);
         };
         let report = SupervisedFinalization {
@@ -427,7 +427,7 @@ fn cpu_ticks() -> Result<CpuTicks, MacOsError> {
             current_host_port(),
             libc::HOST_CPU_LOAD_INFO,
             info.as_mut_ptr().cast(),
-            &mut count,
+            &raw mut count,
         )
     };
     if kern_result != libc::KERN_SUCCESS || count != libc::HOST_CPU_LOAD_INFO_COUNT {
@@ -485,7 +485,7 @@ fn available_memory_bytes() -> Result<u64, MacOsError> {
             current_host_port(),
             libc::HOST_VM_INFO64,
             stats.as_mut_ptr().cast(),
-            &mut count,
+            &raw mut count,
         )
     };
     if kern_result != libc::KERN_SUCCESS || count != libc::HOST_VM_INFO64_COUNT {
@@ -517,12 +517,12 @@ fn available_storage_bytes(path: &Path) -> Result<u64, MacOsError> {
     let mut stats = MaybeUninit::<libc::statvfs>::zeroed();
     // SAFETY: path is NUL-terminated and stats points to writable statvfs storage.
     if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(io_error(io::Error::last_os_error()));
+        return Err(io_error(&io::Error::last_os_error()));
     }
     // SAFETY: statvfs succeeded and initialized the complete struct.
     let stats = unsafe { stats.assume_init() };
     u64::from(stats.f_bavail)
-        .checked_mul(u64::from(stats.f_frsize))
+        .checked_mul(stats.f_frsize)
         .ok_or(MacOsError::MalformedObservation)
 }
 
@@ -535,13 +535,13 @@ fn memory_pressure() -> Result<MemoryPressure, MacOsError> {
         libc::sysctlbyname(
             name.as_ptr(),
             (&raw mut value).cast(),
-            &mut size,
+            &raw mut size,
             std::ptr::null_mut(),
             0,
         )
     } != 0
     {
-        return Err(io_error(io::Error::last_os_error()));
+        return Err(io_error(&io::Error::last_os_error()));
     }
     if size != mem::size_of_val(&value) {
         return Err(MacOsError::MalformedObservation);
@@ -582,7 +582,7 @@ fn child_exited_without_reaping(child: &Child) -> Result<bool, MacOsError> {
         )
     };
     if status != 0 {
-        return Err(io_error(io::Error::last_os_error()));
+        return Err(io_error(&io::Error::last_os_error()));
     }
     // SAFETY: the zero-initialized siginfo_t was filled by successful waitid.
     let info = unsafe { info.assume_init() };
@@ -662,7 +662,7 @@ fn last_process_error() -> MacOsError {
     }
 }
 
-fn io_error(error: io::Error) -> MacOsError {
+fn io_error(error: &io::Error) -> MacOsError {
     match error.raw_os_error() {
         Some(libc::ESRCH) => MacOsError::NoSuchProcess,
         Some(libc::EPERM | libc::EACCES) => MacOsError::PermissionDenied,
@@ -848,6 +848,7 @@ mod tests {
                 Instant::now() < deadline,
                 "direct-child kill must not depend on a PGID"
             );
+            // test-timing-allow: each retry observes retained-child exit; the sleep only bounds polling load.
             thread::sleep(Duration::from_millis(10));
         }
     }

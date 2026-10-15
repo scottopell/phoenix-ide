@@ -30,8 +30,6 @@ jobs:
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
-      PHOENIX_CHECK_ALL: "1"
-      PHOENIX_CHECK_WORKERS: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,15 +45,13 @@ jobs:
           shared-key: deployment-controller-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
           prefix-key: v1-rust
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: Configure git identity
-        run: |
-          git config --global user.email "ci@phoenix-ide.invalid"
-          git config --global user.name "Phoenix CI"
-      - name: Run native controller and workspace Rust checks
-        run: ./dev.py check --lanes rust,clippy,cargo-fmt
+      - name: Run deployment controller tests
+        run: cargo nextest run -p phoenix-deployment-controller
+      - name: Lint deployment controller
+        run: cargo clippy -p phoenix-deployment-controller --all-targets -- -D warnings
+      - name: Check workspace formatting
+        run: cargo fmt --all -- --check

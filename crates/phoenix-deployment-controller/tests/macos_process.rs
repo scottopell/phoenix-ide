@@ -174,6 +174,7 @@ fn cleanup_before_deadline(child: &mut SupervisedChild) -> ExitStatus {
             Instant::now() < deadline,
             "native cleanup must finish within the test budget"
         );
+        // test-timing-allow: the retained child exposes no notification API; each retry rechecks observable cleanup state.
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -207,6 +208,7 @@ fn poll_until(mut ready: impl FnMut() -> bool) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
+        // test-timing-allow: fixture readiness is observed on every retry; the sleep only bounds polling load.
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -242,6 +244,7 @@ fn native_resource_sample_reports_capacity_and_measured_contention() {
         .expect("native resource baseline is observable");
     let mut observed = None;
     for sequence in 0..50 {
+        // test-timing-allow: elapsed time is required for cumulative native CPU counters to advance.
         thread::sleep(Duration::from_millis(20));
         match os.sample_resources(sequence) {
             Ok(sample) => {
