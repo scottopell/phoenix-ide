@@ -4,9 +4,11 @@ use crate::guardian_ipc::{
     WireObservation, WireSlot, WireSnapshot,
 };
 use crate::GuardianExecutor;
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::{
     fs::{self, DirBuilder, Metadata, Permissions},
-    io::{self, Write},
+    io,
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         io::AsRawFd,
@@ -54,15 +56,9 @@ pub fn disposable_dir(path: &Path, create: bool) -> io::Result<PathBuf> {
     {
         return Err(permission_denied());
     }
-    let roots = [
-        fs::canonicalize(std::env::temp_dir())?,
-        fs::canonicalize("/tmp")?,
-    ];
+    let root = fs::canonicalize("/tmp")?;
     let canonical_parent = fs::canonicalize(parent)?;
-    if !roots
-        .iter()
-        .any(|root| canonical_parent != *root && canonical_parent.starts_with(root))
-    {
+    if canonical_parent == root || !canonical_parent.starts_with(&root) {
         return Err(permission_denied());
     }
     let parent_meta = fs::symlink_metadata(parent)?;
@@ -128,23 +124,23 @@ pub fn same_uid(stream: &UnixStream) -> io::Result<()> {
             uid: 0,
             gid: 0,
         };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let expected_len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+            .map_err(|_| io::Error::other("peer credential size overflow"))?;
+        let mut len = expected_len;
         // SAFETY: cred and len are valid writable buffers; fd is live.
         if unsafe {
             libc::getsockopt(
                 stream.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_PEERCRED,
-                &mut cred as *mut _ as *mut _,
-                &mut len,
+                (&raw mut cred).cast(),
+                &raw mut len,
             )
         } != 0
         {
             return Err(io::Error::last_os_error());
         }
-        if len as usize != std::mem::size_of::<libc::ucred>()
-            || cred.uid != unsafe { libc::geteuid() }
-        {
+        if len != expected_len || cred.uid != unsafe { libc::geteuid() } {
             return Err(permission_denied());
         }
         Ok(())

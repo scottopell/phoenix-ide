@@ -47,6 +47,7 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
             break client;
         }
         assert!(Instant::now() < until, "guardian socket not ready");
+        // test-timing-allow: bounded polling waits for socket readiness.
         thread::sleep(Duration::from_millis(25));
     };
     let original = client.hello().unwrap();
@@ -68,12 +69,24 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
     assert!(ready.starts_with("guardian instance="));
     runner.kill().unwrap();
     runner.wait().unwrap();
-    thread::sleep(Duration::from_millis(350));
-    let mut replacement = GuardianClient::connect(&dir).unwrap();
-    let snapshot = replacement.hello().unwrap();
+    let reconnect_deadline = Instant::now() + Duration::from_secs(5);
+    let snapshot = loop {
+        if let Ok(mut replacement) = GuardianClient::connect(&dir) {
+            if let Ok(snapshot) = replacement.hello() {
+                if snapshot.state == WireState::DetachedFenced {
+                    break snapshot;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < reconnect_deadline,
+            "guardian did not fence"
+        );
+        // test-timing-allow: bounded polling observes the protocol state transition.
+        thread::sleep(Duration::from_millis(25));
+    };
     assert_eq!(snapshot.instance, original.instance);
     assert_eq!(snapshot.slots, original.slots);
-    assert_eq!(snapshot.state, WireState::DetachedFenced);
     assert!(guardian.try_wait().unwrap().is_none());
     assert_eq!(
         unsafe { libc::kill(pid, 0) },
@@ -95,7 +108,6 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         guardian.id().to_string().into_bytes(),
         "guardian retains original parenthood"
     );
-    drop(replacement);
     let runner_status = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
         .args([
             "--socket-dir",
