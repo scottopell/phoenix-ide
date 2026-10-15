@@ -553,6 +553,8 @@ impl Drop for AdmittedOperation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SteeringAdmissionError {
+    #[error("product creation delivery claim was lost")]
+    ProductCreationClaimLost,
     #[error("conversation is fenced by an active Close attempt")]
     CloseAdmissionFenced,
     #[error("conversation is permanently unavailable in History")]
@@ -567,6 +569,11 @@ impl From<String> for SteeringAdmissionError {
     fn from(error: String) -> Self {
         Self::Internal(error)
     }
+}
+
+enum SteeringAppendAuthority<'a> {
+    Ordinary,
+    ProductCreation(&'a crate::db::ClaimedProductCreationJob),
 }
 
 pub struct RuntimeManager {
@@ -615,6 +622,10 @@ pub struct RuntimeManager {
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    creation_worker_idle_signal: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    product_creation_claim_guard_policy: Mutex<Option<creation_worker::ClaimGuardPolicy>>,
     #[cfg(test)]
     terminal_cleanup_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -2446,6 +2457,10 @@ impl RuntimeManager {
             #[cfg(test)]
             hard_delete_barrier: AsyncMutex::new(None),
             #[cfg(test)]
+            creation_worker_idle_signal: Mutex::new(None),
+            #[cfg(test)]
+            product_creation_claim_guard_policy: Mutex::new(None),
+            #[cfg(test)]
             terminal_cleanup_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             bash_reconciliation_barrier: AsyncMutex::new(None),
@@ -3632,12 +3647,32 @@ impl RuntimeManager {
                         Some(chrono::Utc::now() + chrono::Duration::seconds(1))
                     }
                 };
+                #[cfg(test)]
+                let no_deadline = next_deadline.is_none();
                 let delay = next_deadline.map_or(CREATION_RECONCILE_INTERVAL, |deadline| {
                     (deadline - chrono::Utc::now())
                         .to_std()
                         .unwrap_or(std::time::Duration::ZERO)
                         .min(CREATION_RECONCILE_INTERVAL)
                 });
+                let reconcile_sleep = tokio::time::sleep(delay);
+                #[cfg(test)]
+                let reconcile_sleep = async {
+                    let mut sleep = std::pin::pin!(reconcile_sleep);
+                    std::future::poll_fn(|cx| {
+                        let result = std::future::Future::poll(sleep.as_mut(), cx);
+                        // The biased select polls this only after fatal/kick waits are pending.
+                        if result.is_pending() && no_deadline {
+                            if let Some(idle) =
+                                manager.creation_worker_idle_signal.lock().unwrap().take()
+                            {
+                                let _ = idle.send(());
+                            }
+                        }
+                        result
+                    })
+                    .await;
+                };
                 tokio::select! {
                     biased;
                     _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
@@ -3646,7 +3681,7 @@ impl RuntimeManager {
                             break;
                         }
                     }
-                    () = tokio::time::sleep(delay) => {}
+                    () = reconcile_sleep => {}
                 }
             }
             tracing::info!("Conversation creation worker stopped");
@@ -6611,6 +6646,33 @@ impl RuntimeManager {
         event: Event,
         request_fingerprint: &str,
     ) -> Result<(), SteeringAdmissionError> {
+        self.enqueue_steer_message_with_authority(
+            conversation_id, event, request_fingerprint, SteeringAppendAuthority::Ordinary,
+        ).await
+    }
+
+    pub async fn enqueue_product_creation_steer_message(
+        self: &Arc<Self>,
+        delivery: &crate::db::ClaimedProductCreationJob,
+        event: Event,
+        request_fingerprint: &str,
+    ) -> Result<(), SteeringAdmissionError> {
+        let conversation_id = delivery.job.published_conversation_id.as_deref()
+            .ok_or(SteeringAdmissionError::ProductCreationClaimLost)?;
+        self.enqueue_steer_message_with_authority(
+            conversation_id, event, request_fingerprint,
+            SteeringAppendAuthority::ProductCreation(delivery),
+        ).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn enqueue_steer_message_with_authority(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+        request_fingerprint: &str,
+        authority: SteeringAppendAuthority<'_>,
+    ) -> Result<(), SteeringAdmissionError> {
         let Event::SteerMessage {
             ref text,
             ref origin,
@@ -6670,11 +6732,16 @@ impl RuntimeManager {
                 continue;
             }
 
-            let queue_position = self
-                .db()
-                .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
-                .await
-                .map_err(|error| match error {
+            let append_result = match &authority {
+                SteeringAppendAuthority::Ordinary => self.db()
+                    .append_steering_entry(conversation_id, &new_entry, request_fingerprint).await,
+                SteeringAppendAuthority::ProductCreation(delivery) => self.db()
+                    .append_product_creation_steering_entry(delivery, &new_entry, request_fingerprint).await,
+            };
+            let queue_position = append_result.map_err(|error| match error {
+                    crate::db::DbError::ProductCreationClaimLost => {
+                        SteeringAdmissionError::ProductCreationClaimLost
+                    }
                     crate::db::DbError::CloseAdmissionFenced(_) => {
                         SteeringAdmissionError::CloseAdmissionFenced
                     }

@@ -335,7 +335,7 @@ THE SYSTEM SHALL exercise generated operation schedules containing concurrent cl
 AND SHALL check lifecycle and ownership invariants after every generated operation
 AND SHALL retain minimized failing schedules as deterministic regressions
 
-### REQ-CCR-011: Provisioning-Stage Migration Preserves Durable Evidence
+### REQ-CCR-012: Provisioning-Stage Migration Preserves Durable Evidence
 
 WHEN a forward migration adds provisioning-stage fields to product creation rows that lack them
 THE SYSTEM SHALL preserve the rows, request and product identities, accepted intent, status, claims, pins, and staging facts

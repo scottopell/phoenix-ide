@@ -133,13 +133,13 @@ THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an ol
 **Condition:** When a qualified current-schema snapshot exists,
 **System:** the activation helper SHALL install the exact candidate binary, invoke that binary's bounded `--migrate-only` operation against the manifest-bound database while exclusive ownership remains proven, and verify the exact target ledger, SQLite integrity, and foreign keys before admitting candidate runtime traffic.
 
-**Condition:** When current-schema activation fails before any migration or reconciliation write commits,
+**Condition:** When current-schema activation fails before offline candidate migration was invoked and the stopped, exclusively owned database retains the exact source ledger and logical contents,
 **System:** the activation helper MAY restore only the matching verified snapshot and predecessor binary/configuration, then SHALL verify predecessor identity before releasing ownership.
 
-**Condition:** When current-schema migration commits any database write, including a proper prefix of the target ledger,
+**Condition:** When offline candidate migration is invoked, including when it fails, is interrupted, commits only a proper prefix of the target ledger, or leaves its write outcome ambiguous,
 **System:** the activation helper SHALL NOT replay the snapshot or start the predecessor, SHALL retain exclusive deployment ownership and the compatible candidate artifacts, and SHALL report whether candidate start/publication is pending or migration repair is required.
 
-**Rationale:** Migrations commit independently, migration 126 retires wake behavior while preserving history, and migration 127 changes coordinator-home ownership. Treating a successful or partially committed migration as reversible could erase committed state or run an incompatible predecessor.
+**Rationale:** Migrations commit independently: migration 126 retires wake behavior while preserving history, migration 127 changes coordinator-home ownership, and migration 128 adds durable creation checkpoints under REQ-CCR-012. Invocation ends rollback authority because a failed process cannot prove that no migration or reconciliation write committed. Treating a successful, partially committed, or ambiguous migration as reversible could erase committed state or run an incompatible predecessor.
 
 ### REQ-LDD-022: Current-schema finalization and recovery
 
@@ -153,13 +153,13 @@ THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an ol
 
 ### REQ-LDD-023: Ordinary forward activation failure boundary
 
-**Condition:** When ordinary in-place launchd deployment detects the exact migration-123 baseline and exact migration-127 candidate registry,
-**System:** the controller SHALL retain the exact candidate registry and helper with the transaction without requiring a standalone database backup, and the helper SHALL preserve ordinary predecessor rollback only for failures before candidate startup is attempted.
+**Condition:** When ordinary in-place launchd deployment detects the exact migration-123 baseline and exact migration-128 candidate registry qualified by [ADR-105](../adrs/105_qualify-migration-128-for-bounded-current-schema-activation.md) and REQ-COMP-012,
+**System:** the controller SHALL retain the complete candidate registry and its SHA-256 digest as immutable transaction evidence bound to the exact candidate and helper without requiring a standalone database backup; SHALL re-verify that evidence before activation; SHALL reject any different, missing, or newer registry; and the helper SHALL preserve ordinary predecessor rollback only for failures before candidate startup is attempted.
 
 **Condition:** When candidate startup is attempted,
-**System:** the helper SHALL treat migration 126, migration 127, and coordinator-home initialization as possibly committed even when startup or health fails; SHALL stop the failed candidate when possible; SHALL retain the candidate binary/configuration, transaction evidence, and ownership fence; SHALL NOT launch the predecessor; and SHALL report a forward-only recovery state.
+**System:** the helper SHALL treat migration 126 (`retire_wake_feature_preserving_history`), migration 127 (`coordinator_owned_work_scope_home`), migration 128 (`product_creation_provisioning_stage`), and coordinator-home initialization as possibly committed even when startup or health fails; SHALL stop the failed candidate when possible; SHALL retain the candidate binary/configuration, transaction evidence, and ownership fence; SHALL NOT launch the predecessor; and SHALL report a forward-only recovery state.
 
 **Condition:** When an operator explicitly authorizes `prod resume-forward <transaction>`,
-**System:** the controller SHALL re-verify the retained helper, candidate binary/configuration, candidate registry, stopped target, and ownership claim; SHALL start only that exact retained candidate; and SHALL retain the forward-only fence on another failure.
+**System:** the controller SHALL re-verify the retained helper, candidate binary/configuration, immutable complete candidate registry and its SHA-256 digest, stopped target, and ownership claim; SHALL start only that exact retained candidate; and SHALL retain the forward-only fence on another failure.
 
-**Rationale:** Migration 126 commits independently and older wake logic does not understand its retirement metadata. Migration 127 plus coordinator-home initialization can durably introduce an environment kind the predecessor resource-authority reader rejects. A failed health check cannot establish that the database remained predecessor-compatible.
+**Rationale:** Migration 126 commits independently and older wake logic does not understand its retirement metadata. Migration 127 plus coordinator-home initialization can durably introduce an environment kind the predecessor resource-authority reader rejects. Migration 128 adds durable creation checkpoints under REQ-CCR-012. A failed health check cannot establish that the database remained predecessor-compatible.

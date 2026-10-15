@@ -880,6 +880,45 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
+    pub async fn append_product_creation_steering_entry(
+        &self,
+        delivery: &ClaimedProductCreationJob,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
+    ) -> DbResult<usize> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = unix_micros_now();
+        let conversation_id: Option<String> = sqlx::query_scalar(
+            "SELECT j.published_conversation_id FROM product_creation_jobs j
+             JOIN conversations c ON c.id = j.published_conversation_id
+             WHERE j.request_id = ?1 AND j.status = 'delivery_pending'
+               AND j.claim_generation = ?2 AND j.claim_worker_id = ?3 AND j.claim_token = ?4
+               AND j.claim_lease_until_unix_micros > ?5
+               AND j.product_conversation_id = ?6 AND j.published_product_id = ?6
+               AND c.product_conversation_id = ?6 AND j.published_conversation_id = ?7",
+        )
+        .bind(&delivery.job.request_id)
+        .bind(delivery.claim.generation)
+        .bind(&delivery.claim.worker_id)
+        .bind(&delivery.claim.token)
+        .bind(now)
+        .bind(delivery.job.product_conversation_id.as_str())
+        .bind(&delivery.job.published_conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(conversation_id) = conversation_id else {
+            return Err(DbError::ProductCreationClaimLost);
+        };
+        if entry.message_id != delivery.job.request_id {
+            return Err(DbError::ProductCreationClaimLost);
+        }
+        let position = self
+            .append_steering_entry_tx(&mut tx, &conversation_id, entry, request_fingerprint)
+            .await?;
+        tx.commit().await?;
+        Ok(position)
+    }
+
     pub async fn renew_product_creation_claim(
         &self,
         request_id: &str,
@@ -1633,45 +1672,40 @@ impl Database {
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let now_micros = datetime_to_unix_micros(now);
-        let mut tx = self.pool.begin().await?;
-        let job: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT claim_generation, published_product_id, published_conversation_id
-             FROM product_creation_jobs
-             WHERE request_id = ?1
-               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
-        )
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((generation, published_product_id, published_conversation_id)) = job else {
-            tx.rollback().await?;
-            return Ok(false);
-        };
-        if published_product_id.is_some() || published_conversation_id.is_some() {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        let updated = sqlx::query(
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let generation: Option<i64> = sqlx::query_scalar(
             "UPDATE product_creation_jobs
              SET status = 'cancelling', claim_generation = claim_generation + 1,
                  claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL,
                  retry_at_unix_micros = NULL,
                  cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until_unix_micros = NULL,
                  last_error = NULL, cancelled_at_unix_micros = NULL,
+                 published_product_id = NULL, published_conversation_id = NULL,
                  deletion_requested_at_unix_micros = NULL, updated_at_unix_micros = ?2
-             WHERE request_id = ?1 AND claim_generation = ?3
-               AND status IN ('accepted', 'claimed', 'retry_scheduled')
-               AND published_product_id IS NULL AND published_conversation_id IS NULL",
+             WHERE request_id = ?1
+               AND (status IN ('accepted', 'claimed', 'retry_scheduled')
+                    OR (status = 'delivery_pending' AND EXISTS (
+                        SELECT 1 FROM conversations c
+                        JOIN product_conversations p ON p.id = c.product_conversation_id
+                        WHERE c.id = product_creation_jobs.published_conversation_id
+                          AND p.id = product_creation_jobs.product_conversation_id
+                          AND p.id = product_creation_jobs.published_product_id
+                          AND p.kind = 'ordinary' AND p.ordinary_lifecycle = 'open'
+                          AND c.archived = 1 AND c.runtime_role = 'user'
+                          AND c.parent_conversation_id IS NULL
+                          AND NOT EXISTS (SELECT 1 FROM conversations other
+                              WHERE other.product_conversation_id = p.id AND other.id <> c.id)
+                          AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt
+                              WHERE receipt.conversation_id = c.id))))
+             RETURNING claim_generation",
         )
         .bind(request_id)
         .bind(now_micros)
-        .bind(generation)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        if updated.rows_affected() != 1 {
-            tx.rollback().await?;
+        let Some(generation) = generation else {
             return Ok(false);
-        }
+        };
         sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
@@ -1679,7 +1713,7 @@ impl Database {
         )
         .bind(request_id)
         .bind(now_micros)
-        .bind(generation + 1)
+        .bind(generation)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1910,15 +1944,17 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn finish_product_creation_cleanup(
         &self,
         cleanup: &ProductCreationCleanupJob,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let now_micros = datetime_to_unix_micros(now);
-        let mut tx = self.pool.begin().await?;
-        let authoritative: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM product_creation_jobs
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let authoritative: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT product_conversation_id, published_product_id, published_conversation_id
+             FROM product_creation_jobs
              WHERE request_id = ?1 AND status = ?2 AND claim_generation = ?3
                AND cleanup_worker_id = ?4 AND cleanup_token = ?5
                AND cleanup_lease_until_unix_micros > ?6",
@@ -1931,9 +1967,14 @@ impl Database {
         .bind(now_micros)
         .fetch_optional(&mut *tx)
         .await?;
-        if authoritative.is_none() {
-            tx.rollback().await?;
+        let Some((reserved_id, product_id, conversation_id)) = authoritative else {
             return Ok(false);
+        };
+        if reserved_id != cleanup.job.product_conversation_id.as_str()
+            || product_id.as_deref() != cleanup.job.published_product_id.as_ref().map(ProductConversationId::as_str)
+            || conversation_id != cleanup.job.published_conversation_id
+        {
+            return Err(DbError::Serialization("product creation cleanup identity mismatch".to_string()));
         }
         let remaining: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM product_creation_resource_reservations
@@ -1947,6 +1988,66 @@ impl Database {
             return Err(DbError::Serialization(
                 "product creation cleanup still has unreconciled resources".to_string(),
             ));
+        }
+        if product_id.is_some() || conversation_id.is_some() {
+            return Err(DbError::Serialization(
+                "product creation cleanup retained published identity".to_string(),
+            ));
+        }
+        let staged_product_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1)",
+        )
+        .bind(&reserved_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if staged_product_exists {
+            let aggregate: Option<(String, String)> = sqlx::query_as(
+                "SELECT c.id, c.work_scope_id FROM conversations c
+                 JOIN product_conversations p ON p.id = c.product_conversation_id
+                 JOIN product_conversation_work_scopes attachment
+                   ON attachment.product_conversation_id = p.id
+                  AND attachment.work_scope_id = c.work_scope_id
+                 WHERE p.id = ?1 AND p.kind = 'ordinary'
+                   AND p.ordinary_lifecycle = 'open' AND c.archived = 1
+                   AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM conversations other
+                       WHERE other.id <> c.id AND (other.product_conversation_id = p.id
+                           OR other.work_scope_id = c.work_scope_id
+                           OR other.parent_conversation_id = c.id))
+                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_attachment
+                       WHERE other_attachment.product_conversation_id = p.id
+                         AND other_attachment.work_scope_id <> c.work_scope_id)
+                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_owner
+                       WHERE other_owner.work_scope_id = c.work_scope_id
+                         AND other_owner.product_conversation_id <> p.id)
+                   AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt
+                       WHERE receipt.conversation_id = c.id)",
+            )
+            .bind(&reserved_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((conversation_id, scope_id)) = aggregate else {
+                return Err(DbError::Serialization(
+                    "product creation cleanup staged aggregate mismatch or accepted input".to_string(),
+                ));
+            };
+            let deleted = Self::hard_delete_conversation_tx(
+                &mut tx,
+                &conversation_id,
+                sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+                None,
+            )
+            .await?;
+            if deleted != (true, true) {
+                return Err(DbError::Serialization("staged aggregate was not deleted".to_string()));
+            }
+            Self::delete_work_scope_if_empty(&mut tx, &scope_id).await?;
+            let scope_remains: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM work_scopes WHERE id = ?1)",
+            ).bind(&scope_id).fetch_one(&mut *tx).await?;
+            if scope_remains {
+                return Err(DbError::Serialization("staged work scope was not deleted".to_string()));
+            }
         }
         match cleanup.job.status.as_str() {
             "cancelling" => {
@@ -2133,6 +2234,383 @@ mod product_creation_tests {
             llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
         }
+    }
+
+    async fn seed_staged_dependents(db: &Database, conversation_id: &str) {
+        let pool = db.pool();
+        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (52, 'wake', 1, 1, 0, 1, 0, 'Active', 'wake', 1, X'00', 1, 1)")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version, family, kind, intent_codec_family, intent_codec_version, intent_payload, generation, role, capability_kind, status) VALUES (52, 1, 0, 'wake', 'observe', 'wake', 1, X'01', 0, 'Required', 'ReclaimableObservation', 'Receipted')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind, profile_version, scope_kind, scope_stable_key, resource_kind, bash_handle_id, registering_tool_use_id, expires_at, resolved_at, prepared_fingerprint, observe_effect_id, created_at) VALUES (52, ?1, 'contract', 'wake', 1, 'Conversation', ?1, 'Bash', 'b-52', 'tool-52', 100, NULL, 'fingerprint', 1, 1)")
+            .bind(conversation_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages
+            (message_id, conversation_id, sequence_id, message_type, content, created_at)
+            VALUES ('staged-message', ?1, 1, 'system', 'staged metadata', '2026-01-01')")
+            .bind(conversation_id).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO message_fts(rowid, text) VALUES (52, 'staged metadata')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO message_fts_rows
+            (fts_rowid, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+            VALUES (52, 'staged-message', 0, ?1, 'system', '2026-01-01', 'hash')")
+            .bind(conversation_id).execute(pool).await.unwrap();
+    }
+
+    async fn assert_staged_dependents(db: &Database, conversation_id: &str, expected: i64) {
+        let counts: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1),
+                (SELECT COUNT(*) FROM message_fts_rows WHERE conversation_id = ?1),
+                (SELECT COUNT(*) FROM message_fts WHERE rowid = 52),
+                (SELECT COUNT(*) FROM workflows WHERE workflow_id = 52),
+                (SELECT COUNT(*) FROM workflow_effects WHERE workflow_id = 52),
+                (SELECT COUNT(*) FROM wake_bindings WHERE conversation_id = ?1)",
+        ).bind(conversation_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(counts, (expected, expected, expected, expected, expected, expected));
+        assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(db.pool()).await.unwrap().is_empty());
+    }
+
+    async fn staged_delivery(db: &Database, request_id: &str) -> ClaimedProductCreationJob {
+        db.accept_product_creation(request_id, &intent("/repo/a", "inspect repository"))
+            .await.unwrap();
+        let claimed = db.claim_product_creation(
+            request_id, "worker", "token", Utc::now(), chrono::Duration::minutes(5),
+        ).await.unwrap().unwrap();
+        advance_to_metadata(db, request_id, &claimed.claim).await;
+        let mut conversation = published_conversation(
+            &format!("conversation-{request_id}"), claimed.job.product_conversation_id.clone(),
+            WorkScopeId::new(), "/repo/a",
+        );
+        conversation.archived = true;
+        assert!(db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: request_id.to_string(), claim: claimed.claim.clone(), conversation,
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd { cwd: "/repo/a".to_string() },
+            git_publication: None,
+        }).await.unwrap());
+        ClaimedProductCreationJob {
+            claim: claimed.claim,
+            job: db.get_product_creation_job(request_id).await.unwrap().unwrap(),
+        }
+    }
+
+    fn delivery_entry(delivery: &ClaimedProductCreationJob) -> phoenix_core::domain::sm_event::SteerEntry {
+        phoenix_core::domain::sm_event::SteerEntry {
+            text: delivery.job.intent.objective.clone(), origin: delivery.job.intent.origin.input_origin(),
+            message_id: delivery.job.request_id.clone(), llm_text: None, images: Vec::new(),
+            files: Vec::new(), user_agent: None, skill_invocation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_sink_rejects_every_stale_claim_and_ordinary_bypass_without_side_effects() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "sink-fence").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        let entry = delivery_entry(&delivery);
+        for field in 0..5 {
+            let mut stale = delivery.clone();
+            match field {
+                0 => stale.claim.generation += 1,
+                1 => stale.claim.worker_id.push_str("-wrong"),
+                2 => stale.claim.token.push_str("-wrong"),
+                3 => stale.job.request_id.push_str("-wrong"),
+                _ => stale.job.published_conversation_id = Some("wrong".to_string()),
+            }
+            assert!(matches!(db.append_product_creation_steering_entry(&stale, &entry, "fp").await,
+                Err(DbError::ProductCreationClaimLost)));
+        }
+        assert!(matches!(db.append_steering_entry(conversation_id, &entry, "fp").await,
+            Err(DbError::ProductCreationClaimLost)));
+        let mut unrelated_entry = entry.clone();
+        unrelated_entry.message_id = "ordinary-message-cannot-bypass-staging".to_string();
+        assert!(matches!(db.append_steering_entry(conversation_id, &unrelated_entry, "fp").await,
+            Err(DbError::ProductCreationClaimLost)));
+        assert!(matches!(db.append_product_creation_steering_entry(&delivery, &unrelated_entry, "fp").await,
+            Err(DbError::ProductCreationClaimLost)));
+        assert!(matches!(db.update_steering_queue(conversation_id, std::slice::from_ref(&entry)).await,
+            Err(DbError::ProductCreationClaimLost)));
+        assert!(matches!(db.update_steering_queue(conversation_id, std::slice::from_ref(&unrelated_entry)).await,
+            Err(DbError::ProductCreationClaimLost)));
+        sqlx::query("UPDATE product_creation_jobs SET claim_lease_until_unix_micros = ?1 WHERE request_id = ?2")
+            .bind(Utc::now().timestamp_micros()).bind(&delivery.job.request_id)
+            .execute(db.pool()).await.unwrap();
+        assert!(matches!(db.append_product_creation_steering_entry(&delivery, &entry, "fp").await,
+            Err(DbError::ProductCreationClaimLost)));
+        assert!(db.get_steering_queue(conversation_id).await.unwrap().is_empty());
+        assert!(db.get_steering_acceptance_fingerprint(conversation_id, &entry.message_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_delivery_fences_sink_and_renewal_then_removes_staged_aggregate() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "cancel-before-sink").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        let scope_id = db.get_conversation(conversation_id).await.unwrap().attached_work_scope_id.unwrap();
+        seed_staged_dependents(&db, conversation_id).await;
+        assert_staged_dependents(&db, conversation_id, 1).await;
+        assert!(db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        let cancelling = db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap();
+        assert_eq!(cancelling.status, "cancelling");
+        assert!(cancelling.published_product_id.is_none());
+        assert!(cancelling.published_conversation_id.is_none());
+        assert_eq!(cancelling.claim_generation, delivery.claim.generation + 1);
+        assert!(db.get_conversation(conversation_id).await.unwrap().archived);
+        assert_staged_dependents(&db, conversation_id, 1).await;
+        assert!(db.list_ordinary_product_conversation_projections().await.unwrap().is_empty());
+        for reference in [delivery.job.product_conversation_id.as_str(), conversation_id] {
+            assert!(matches!(db.resolve_ordinary_product_conversation(reference).await,
+                Err(DbError::ConversationNotFound(_))));
+            assert!(matches!(db.read_ordinary_product_conversation_snapshot(reference, None, None, 10).await,
+                Err(DbError::ConversationNotFound(_))));
+        }
+        assert!(matches!(db.get_ordinary_product_conversation(&delivery.job.product_conversation_id).await,
+            Err(DbError::ConversationNotFound(_))));
+        let mut ordinary_entry = delivery_entry(&delivery);
+        ordinary_entry.message_id = "cancelled-aggregate-cannot-accept".to_string();
+        assert!(matches!(db.append_steering_entry(conversation_id, &ordinary_entry, "fp").await,
+            Err(DbError::ProductCreationClaimLost)));
+        assert!(matches!(db.update_steering_queue(conversation_id, &[ordinary_entry]).await,
+            Err(DbError::ProductCreationClaimLost)));
+        assert!(matches!(db.append_product_creation_steering_entry(&delivery, &delivery_entry(&delivery), "fp").await,
+            Err(DbError::ProductCreationClaimLost)));
+        assert!(!db.renew_product_creation_claim(&delivery.job.request_id, &delivery.claim,
+            Utc::now(), chrono::Duration::seconds(30)).await.unwrap());
+        assert!(db.get_steering_queue(conversation_id).await.unwrap().is_empty());
+        assert!(db.get_steering_acceptance_fingerprint(conversation_id, &delivery.job.request_id).await.unwrap().is_none());
+        let cleanup = db.claim_next_product_creation_cleanup("cleaner", "cleanup-token", Utc::now(),
+            chrono::Duration::minutes(5)).await.unwrap().unwrap();
+        assert!(db.finish_product_creation_cleanup(&cleanup, Utc::now()).await.unwrap());
+        let job = db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap();
+        assert_eq!(job.status, "cancelled");
+        assert!(job.published_product_id.is_none());
+        assert!(job.published_conversation_id.is_none());
+        let remnants: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM conversations WHERE id = ?1),
+             (SELECT COUNT(*) FROM product_conversations WHERE id = ?2),
+             (SELECT COUNT(*) FROM work_scopes WHERE id = ?3),
+             (SELECT COUNT(*) FROM product_conversation_work_scopes
+                 WHERE product_conversation_id = ?2 OR work_scope_id = ?3)",
+        ).bind(conversation_id).bind(delivery.job.product_conversation_id.as_str())
+            .bind(scope_id.as_str()).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(remnants, (0, 0, 0, 0));
+        assert_staged_dependents(&db, conversation_id, 0).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_cancelled_staged_creation_removes_the_hidden_aggregate_too() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "cancel-then-delete").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        let scope_id = db.get_conversation(conversation_id).await.unwrap().attached_work_scope_id.unwrap();
+        seed_staged_dependents(&db, conversation_id).await;
+        assert!(db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        assert!(db.request_product_creation_deletion(&delivery.job.request_id, Utc::now()).await.unwrap());
+        let cleanup = db.claim_next_product_creation_cleanup("cleaner", "token", Utc::now(),
+            chrono::Duration::minutes(5)).await.unwrap().unwrap();
+        assert_eq!(cleanup.job.status, "deletion_pending");
+        assert!(db.finish_product_creation_cleanup(&cleanup, Utc::now()).await.unwrap());
+        assert!(db.get_product_creation_job(&delivery.job.request_id).await.unwrap().is_none());
+        let remnants: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM conversations WHERE id = ?1),
+             (SELECT COUNT(*) FROM product_conversations WHERE id = ?2),
+             (SELECT COUNT(*) FROM work_scopes WHERE id = ?3)",
+        ).bind(conversation_id).bind(delivery.job.product_conversation_id.as_str())
+            .bind(scope_id.as_str()).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(remnants, (0, 0, 0));
+        assert_staged_dependents(&db, conversation_id, 0).await;
+    }
+
+    #[tokio::test]
+    async fn staged_cancellation_rejects_mismatched_root_and_any_steering_receipt() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "cancel-mismatch").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1")
+            .bind(conversation_id).execute(db.pool()).await.unwrap();
+        assert!(!db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?1")
+            .bind(conversation_id).execute(db.pool()).await.unwrap();
+        let wrong_product = ProductConversationId::new();
+        sqlx::query("INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+            VALUES (?1, 'ordinary', 'open')")
+            .bind(wrong_product.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE product_creation_jobs SET published_product_id = ?1 WHERE request_id = ?2")
+            .bind(wrong_product.as_str()).bind(&delivery.job.request_id)
+            .execute(db.pool()).await.unwrap();
+        assert!(!db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        sqlx::query("UPDATE product_creation_jobs SET published_product_id = ?1 WHERE request_id = ?2")
+            .bind(delivery.job.product_conversation_id.as_str()).bind(&delivery.job.request_id)
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint)
+            VALUES (?1, 'not-the-creation-request', 'fp')")
+            .bind(conversation_id).execute(db.pool()).await.unwrap();
+        assert!(!db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        let unchanged = db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, "delivery_pending");
+        assert_eq!(unchanged.claim_generation, delivery.claim.generation);
+        assert_eq!(unchanged.published_product_id, delivery.job.published_product_id);
+        assert_eq!(unchanged.published_conversation_id, delivery.job.published_conversation_id);
+    }
+
+    #[tokio::test]
+    async fn staged_failure_and_cancelled_cleanup_ambiguity_fit_existing_constraints() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "staged-failure").await;
+        sqlx::query("UPDATE product_creation_jobs SET delivery_attempt_count = ?1 WHERE request_id = ?2")
+            .bind(PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS).bind(&delivery.job.request_id)
+            .execute(db.pool()).await.unwrap();
+        assert!(db.schedule_product_creation_delivery_retry(&delivery.job.request_id, &delivery.claim,
+            "injected delivery failure", Utc::now()).await.unwrap());
+        let failed = db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap();
+        assert_eq!(failed.status, "delivery_failed");
+        assert_eq!(failed.published_product_id, delivery.job.published_product_id);
+        assert_eq!(failed.published_conversation_id, delivery.job.published_conversation_id);
+        assert!(db.list_ordinary_product_conversation_projections().await.unwrap().is_empty());
+
+        let delivery = staged_delivery(&db, "staged-ambiguity").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        assert!(db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        let cleanup = db.claim_next_product_creation_cleanup("cleaner", "token", Utc::now(),
+            chrono::Duration::minutes(5)).await.unwrap().unwrap();
+        assert!(db.mark_claimed_product_creation_cleanup_ambiguous(&cleanup, "ownership conflict", Utc::now())
+            .await.unwrap());
+        let ambiguous = db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap();
+        assert_eq!(ambiguous.status, "cleanup_ambiguous");
+        assert!(ambiguous.published_product_id.is_none());
+        assert!(ambiguous.published_conversation_id.is_none());
+        assert!(db.get_conversation(conversation_id).await.unwrap().archived);
+        assert!(db.list_ordinary_product_conversation_projections().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_enqueue_rolls_back_receipt_so_cancellation_can_still_win() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "sink-rollback").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        sqlx::query("CREATE TRIGGER reject_creation_enqueue BEFORE INSERT ON steering_messages
+            BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END")
+            .execute(db.pool()).await.unwrap();
+        assert!(matches!(db.append_product_creation_steering_entry(
+            &delivery, &delivery_entry(&delivery), "fp").await, Err(DbError::Sqlx(_))));
+        assert!(db.get_steering_queue(conversation_id).await.unwrap().is_empty());
+        assert!(db.get_steering_acceptance_fingerprint(conversation_id, &delivery.job.request_id)
+            .await.unwrap().is_none());
+        assert!(db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        assert_eq!(db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap().status,
+            "cancelling");
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_defeats_cancellation_even_after_queue_drain() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "sink-before-cancel").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        assert_eq!(db.append_product_creation_steering_entry(&delivery, &delivery_entry(&delivery), "fp")
+            .await.unwrap(), 0);
+        assert!(db.remove_steering_entry(conversation_id, &delivery.job.request_id).await.unwrap());
+        assert!(!db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        assert_eq!(db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap().status, "delivery_pending");
+    }
+
+    #[tokio::test]
+    async fn file_backed_cancellation_and_sink_have_exactly_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delivery-race.db").to_string_lossy().to_string();
+        let db = Database::open(&path).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
+        let peer = Database::open(&path).await.unwrap();
+        for index in 0..4 {
+            let request_id = format!("sink-race-{index}");
+            let delivery = staged_delivery(&db, &request_id).await;
+            let entry = delivery_entry(&delivery);
+            let (cancelled, enqueued) = tokio::join!(
+                peer.cancel_product_creation(&request_id, Utc::now()),
+                db.append_product_creation_steering_entry(&delivery, &entry, "fp"),
+            );
+            let cancelled = cancelled.unwrap();
+            match enqueued {
+                Ok(0) => assert!(!cancelled),
+                Err(DbError::ProductCreationClaimLost) => assert!(cancelled),
+                other => panic!("unexpected sink race outcome: {other:?}"),
+            }
+            let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+            assert_eq!(db.get_steering_queue(conversation_id).await.unwrap().len(), usize::from(!cancelled));
+            assert_eq!(db.get_steering_acceptance_fingerprint(conversation_id, &request_id).await.unwrap().is_some(), !cancelled);
+            let job = db.get_product_creation_job(&request_id).await.unwrap().unwrap();
+            assert_eq!(job.published_product_id.is_none(), cancelled);
+            assert_eq!(job.published_conversation_id.is_none(), cancelled);
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_reserved_identity_is_unreadable_until_delivery_completes() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "hidden-staged").await;
+        let product_id = &delivery.job.product_conversation_id;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        for reference in [product_id.as_str(), conversation_id] {
+            assert!(matches!(db.resolve_ordinary_product_conversation(reference).await,
+                Err(DbError::ConversationNotFound(_))));
+            assert!(matches!(db.read_ordinary_product_conversation_snapshot(reference, None, None, 10).await,
+                Err(DbError::ConversationNotFound(_))));
+        }
+        assert!(matches!(db.get_ordinary_product_conversation(product_id).await,
+            Err(DbError::ConversationNotFound(_))));
+        let fingerprint = format!("product-create:{}", delivery.job.request_id);
+        db.append_product_creation_steering_entry(&delivery, &delivery_entry(&delivery), &fingerprint).await.unwrap();
+        assert!(db.complete_product_creation_delivery(&delivery.job.request_id, &delivery.claim,
+            &SteeringAcceptanceFingerprint::Exact(fingerprint), &delivery.job.intent).await.unwrap());
+        assert!(db.resolve_ordinary_product_conversation(product_id.as_str()).await.is_ok());
+        assert!(db.get_ordinary_product_conversation(product_id).await.is_ok());
+        assert!(db.read_ordinary_product_conversation_snapshot(product_id.as_str(), None, None, 10).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn staged_cancellation_cleanup_fails_closed_and_rolls_back_partial_deletion() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "cleanup-rollback").await;
+        let conversation_id = delivery.job.published_conversation_id.as_deref().unwrap();
+        seed_staged_dependents(&db, conversation_id).await;
+        assert!(db.cancel_product_creation(&delivery.job.request_id, Utc::now()).await.unwrap());
+        let cleanup = db.claim_next_product_creation_cleanup("cleaner", "token", Utc::now(),
+            chrono::Duration::minutes(5)).await.unwrap().unwrap();
+        let mut mismatched = cleanup.clone();
+        mismatched.job.published_conversation_id = Some("another-conversation".to_string());
+        assert!(db.finish_product_creation_cleanup(&mismatched, Utc::now()).await.is_err());
+        mismatched = cleanup.clone();
+        mismatched.job.product_conversation_id = ProductConversationId::new();
+        assert!(db.finish_product_creation_cleanup(&mismatched, Utc::now()).await.is_err());
+        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1")
+            .bind(conversation_id).execute(db.pool()).await.unwrap();
+        assert!(db.finish_product_creation_cleanup(&cleanup, Utc::now()).await.is_err());
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?1")
+            .bind(conversation_id).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint)
+            VALUES (?1, ?2, 'fp')").bind(conversation_id).bind(&delivery.job.request_id)
+            .execute(db.pool()).await.unwrap();
+        assert!(db.finish_product_creation_cleanup(&cleanup, Utc::now()).await.is_err());
+        sqlx::query("DELETE FROM steering_acceptance_receipts WHERE conversation_id = ?1")
+            .bind(conversation_id).execute(db.pool()).await.unwrap();
+        sqlx::query("CREATE TRIGGER refuse_staged_scope_delete BEFORE DELETE ON work_scopes
+            BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END")
+            .execute(db.pool()).await.unwrap();
+        assert!(db.finish_product_creation_cleanup(&cleanup, Utc::now()).await.is_err());
+        let pending = db.get_product_creation_job(&delivery.job.request_id).await.unwrap().unwrap();
+        assert_eq!(pending.status, "cancelling");
+        assert!(pending.published_product_id.is_none());
+        assert!(pending.published_conversation_id.is_none());
+        assert!(db.get_conversation(conversation_id).await.unwrap().archived);
+        assert_staged_dependents(&db, conversation_id, 1).await;
+        sqlx::query("DROP TRIGGER refuse_staged_scope_delete").execute(db.pool()).await.unwrap();
+        assert!(db.finish_product_creation_cleanup(&cleanup, Utc::now()).await.unwrap());
+        assert_staged_dependents(&db, conversation_id, 0).await;
     }
 
     #[tokio::test]
@@ -3792,8 +4270,8 @@ mod product_creation_tests {
             )
             .await
             .unwrap());
-        db.append_steering_entry(
-            "conv-delivery-complete",
+        db.append_product_creation_steering_entry(
+            &delivery,
             &phoenix_core::domain::sm_event::SteerEntry {
                 origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: delivery.job.intent.objective.clone(),
@@ -4005,7 +4483,7 @@ mod product_creation_tests {
         advance_to_metadata(&db, "req-published-lifecycle", &claimed.claim).await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-published-lifecycle".to_string(),
-            claim: claimed.claim,
+            claim: claimed.claim.clone(),
             conversation: published_conversation(
                 "conv-published-lifecycle",
                 claimed.job.product_conversation_id.clone(),
@@ -4023,6 +4501,13 @@ mod product_creation_tests {
         })
         .await
         .unwrap();
+
+        let delivery = ClaimedProductCreationJob {
+            claim: claimed.claim,
+            job: db.get_product_creation_job("req-published-lifecycle").await.unwrap().unwrap(),
+        };
+        db.append_product_creation_steering_entry(&delivery, &delivery_entry(&delivery),
+            "product-create:req-published-lifecycle").await.unwrap();
 
         assert!(!db
             .cancel_product_creation("req-published-lifecycle", now)

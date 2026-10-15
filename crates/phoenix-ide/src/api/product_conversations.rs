@@ -533,12 +533,13 @@ pub(super) fn creation_allowed_actions(
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
             actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
+        "delivery_pending" => {
+            actions.push(ProductConversationCreationAllowedActionView::Cancel);
+        }
         "delivery_failed" => {
             if delivery_retryable {
                 actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
             }
-            actions.push(ProductConversationCreationAllowedActionView::Delete);
-            actions.push(ProductConversationCreationAllowedActionView::StartOver);
         }
         "failed" | "cancelled" => {
             actions.push(ProductConversationCreationAllowedActionView::Delete);
@@ -557,25 +558,21 @@ mod creation_allowed_actions_tests {
     use super::{creation_allowed_actions, ProductConversationCreationAllowedActionView};
 
     #[test]
-    fn permanent_delivery_failure_offers_safe_recovery_without_retry() {
-        assert_eq!(
-            creation_allowed_actions("delivery_failed", false),
-            vec![
-                ProductConversationCreationAllowedActionView::Delete,
-                ProductConversationCreationAllowedActionView::StartOver,
-            ]
-        );
+    fn permanent_delivery_failure_has_no_backend_recovery_actions() {
+        assert!(creation_allowed_actions("delivery_failed", false).is_empty());
     }
 
     #[test]
-    fn transient_delivery_failure_offers_retry_and_safe_recovery() {
+    fn pending_delivery_offers_cancel_only() {
+        assert_eq!(creation_allowed_actions("delivery_pending", false),
+            vec![ProductConversationCreationAllowedActionView::Cancel]);
+    }
+
+    #[test]
+    fn transient_delivery_failure_offers_retry_only() {
         assert_eq!(
             creation_allowed_actions("delivery_failed", true),
-            vec![
-                ProductConversationCreationAllowedActionView::RetryDelivery,
-                ProductConversationCreationAllowedActionView::Delete,
-                ProductConversationCreationAllowedActionView::StartOver,
-            ]
+            vec![ProductConversationCreationAllowedActionView::RetryDelivery]
         );
     }
 

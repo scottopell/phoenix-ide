@@ -27,7 +27,7 @@ Ordinary creation with omitted model uses the registry product default independe
 | REQ-CCR-008 Deletion | Modelled | Hidden deletion-pending tombstone test; explicit ambiguity retention remains unimplemented |
 | REQ-CCR-009 Durable Scheduling | Not implemented | Deadline-aware production scheduler required |
 | REQ-CCR-010 Deterministic Verification | Partial | Generated protocol schedules exist, but immutable-pin and atomic-publication coverage still need implementation |
-| REQ-CCR-011 Provisioning-Stage Migration | Authored; unvalidated | `MIGRATION_128` maps status, staging, and pin evidence and copies the row update timestamp; `migration_128_backfills_relational_stages_and_enforces_constraints` is the regression. Policy: ADR-104. No test execution claimed. |
+| REQ-CCR-012 Provisioning-Stage Migration | Authored; unvalidated | `MIGRATION_128` maps status, staging, and pin evidence and copies the row update timestamp; `migration_128_backfills_relational_stages_and_enforces_constraints` is the regression. Policy: ADR-104. No test execution claimed. |
 
 ## Provisioning Checkpoint Follow-Up
 

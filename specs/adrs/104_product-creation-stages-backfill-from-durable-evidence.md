@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-15
-- **Affects:** REQ-CCR-002, REQ-CCR-003, REQ-CCR-011, REQ-COMP-001, REQ-COMP-002, REQ-COMP-005
+- **Affects:** REQ-CCR-002, REQ-CCR-003, REQ-CCR-012, REQ-COMP-001, REQ-COMP-002, REQ-COMP-005
 
 ## Context
 
@@ -16,7 +16,7 @@ Product creation jobs gain a relational provisioning stage and a stage timestamp
 
 ## Decision
 
-Choose the evidence-based forward transformation defined by REQ-CCR-011. Preserve existing product creation rows and their accepted data. Apply this precedence: `published` becomes `finalize_publication`; `delivery_pending` and `delivery_failed` become `bootstrap_initial_turn`; otherwise a non-null staging path becomes `materialize_worktree`; otherwise a non-null exact checkout pin becomes `resolve_starting_pin`; otherwise use `validate_intent`.
+Choose the evidence-based forward transformation defined by REQ-CCR-012. Preserve existing product creation rows and their accepted data. Apply this precedence: `published` becomes `finalize_publication`; `delivery_pending` and `delivery_failed` become `bootstrap_initial_turn`; otherwise a non-null staging path becomes `materialize_worktree`; otherwise a non-null exact checkout pin becomes `resolve_starting_pin`; otherwise use `validate_intent`.
 
 Copy `updated_at_unix_micros` exactly into `stage_updated_at_unix_micros`. The timestamp is the durable row's update observation, not a reconstructed phase-entry time. The migration does not inspect external resources, rewrite claim authority, or treat a staging path as proof that materialization finished.
 
@@ -30,7 +30,7 @@ After migration, a worker retains the persisted phase as its checkpoint floor wh
 
 ## References
 
-- [Conversation creation requirements](../conversation-creation/requirements.md), especially REQ-CCR-002, REQ-CCR-003, and REQ-CCR-011.
+- [Conversation creation requirements](../conversation-creation/requirements.md), especially REQ-CCR-002, REQ-CCR-003, and REQ-CCR-012.
 - [Compatibility requirements](../compatibility/requirements.md).
 - ADR-034 establishes explicit feature-owned compatibility and data policies.
 - ADR-043 defines the private staging ownership boundary; ADR-044 defines request-bound creation identity and immutable pins.

@@ -382,6 +382,9 @@ impl Database {
              WHERE p.kind = 'ordinary'
                AND c.runtime_role = 'user'
                AND c.parent_conversation_id IS NULL
+               AND (c.archived = 0 OR p.ordinary_lifecycle = 'history')
+               AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
+                   WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')
                AND (p.id = ?1 OR c.id = ?1 OR c.slug = ?1)
              ORDER BY CASE WHEN p.id = ?1 THEN 0 WHEN c.id = ?1 THEN 1 ELSE 2 END, c.id ASC
              LIMIT 1",
@@ -587,7 +590,7 @@ impl Database {
                    AND root.parent_conversation_id IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM product_creation_jobs creation
-                       WHERE creation.published_conversation_id = root.id
+                       WHERE creation.product_conversation_id = root.product_conversation_id
                          AND creation.status <> 'published'
                    )
                    AND NOT EXISTS (
@@ -721,7 +724,12 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<ProductConversationAggregate> {
         let product =
-            sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+            sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations p WHERE id = ?1
+                AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
+                    WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')
+                AND (p.ordinary_lifecycle = 'history' OR EXISTS (
+                    SELECT 1 FROM conversations c WHERE c.product_conversation_id = p.id
+                      AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL AND c.archived = 0))")
                 .bind(product_conversation_id.as_str())
                 .fetch_optional(&self.pool)
                 .await?;
@@ -929,6 +937,9 @@ impl Database {
             "SELECT c.product_conversation_id, c.id
              FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
              WHERE p.kind = 'ordinary' AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
+               AND (c.archived = 0 OR p.ordinary_lifecycle = 'history')
+               AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
+                   WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')
                AND (p.id = ?1 OR c.id = ?1 OR c.slug = ?1)
              ORDER BY CASE WHEN p.id = ?1 THEN 0 WHEN c.id = ?1 THEN 1 ELSE 2 END,
                       c.created_at ASC, c.id ASC LIMIT 1",
@@ -954,7 +965,12 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<ProductConversationAggregate> {
         let product =
-            sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+            sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations p WHERE id = ?1
+                AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
+                    WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')
+                AND (p.ordinary_lifecycle = 'history' OR EXISTS (
+                    SELECT 1 FROM conversations c WHERE c.product_conversation_id = p.id
+                      AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL AND c.archived = 0))")
                 .bind(product_conversation_id.as_str())
                 .fetch_optional(&mut *connection)
                 .await?;

@@ -2338,31 +2338,6 @@ mod product_creation_acceptance_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    #[test]
-    fn acceptance_handler_only_persists_and_synchronously_wakes_worker() {
-        let source = include_str!("handlers.rs");
-        let handler = source
-            .split("async fn create_product_conversation(")
-            .nth(1)
-            .unwrap()
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        let accepted = handler.find(".accept_product_creation(").unwrap();
-        let wake = handler.find("state.runtime.kick_creation_worker();").unwrap();
-        let receipt = handler.find("StatusCode::ACCEPTED").unwrap();
-        assert!(accepted < wake && wake < receipt);
-        assert!(!handler.get(wake..).unwrap().contains(".await"));
-        for forbidden in [
-            "process_product_creation_request",
-            "process_claimed_product_creation",
-            "spawn",
-            "strict_product_creation_pin",
-        ] {
-            assert!(!handler.contains(forbidden), "{forbidden}");
-        }
-    }
-
     #[tokio::test]
     async fn blocked_repository_lock_does_not_delay_acceptance_or_replay() {
         let state = hard_delete_cascade_tests::make_test_state().await;

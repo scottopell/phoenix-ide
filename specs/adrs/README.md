@@ -118,9 +118,10 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
 | [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
-| [102](102_current-schema-prepared-activation-commits-at-database-write.md) | Current-schema prepared activation commits at the database-write boundary | Accepted | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
-| [103](103_ordinary-forward-launch-is-the-downgrade-boundary.md) | Ordinary forward candidate launch is the downgrade boundary | Accepted | REQ-COMP-013, REQ-LDD-023, REQ-PD-022 |
-| [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-011, REQ-COMP-001/002/005 |
+| [102](102_current-schema-prepared-activation-commits-at-database-write.md) | Current-schema prepared activation commits at the database-write boundary | Accepted; interval superseded by 105 | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
+| [103](103_ordinary-forward-launch-is-the-downgrade-boundary.md) | Ordinary forward candidate launch is the downgrade boundary | Accepted; interval superseded by 105 | REQ-COMP-013, REQ-LDD-023, REQ-PD-022 |
+| [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-012, REQ-COMP-001/002/005 |
+| [105](105_qualify-migration-128-for-bounded-current-schema-activation.md) | Qualify migration 128 for bounded current-schema activation | Accepted; supersedes interval portions of 102/103 | REQ-COMP-012/013, REQ-LDD-019–023, REQ-PD-021–022, REQ-CCR-012 |
 
 ## For agents: which decisions bind your task
 
@@ -151,12 +152,13 @@ Consult the relevant ADRs before starting work of each kind.
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
 | Retiring wake execution and preserving wake history | 098, within 034's compatibility scope; 006/011/012 are historical only |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
-| Migrating product creation provisioning stages or changing checkpoint progression | 072, then 044, 043, 034, and 007 |
+| Migrating product creation provisioning stages or changing checkpoint progression | 104, then 044, 043, 034, and 007 |
 | Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 044, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
 | Specifying protected prepared artifacts or paired launchd ProductConversation database recovery | 076, 077, within 034; then 050 and 017 |
+| Qualifying the migration-123 to exact migration-128 current-schema prepared or ordinary activation interval | 105 supersedes the interval portions of 102/103; retain their activation/recovery boundaries, then 104 and 034 |
 | Specifying authoritative build identity, candidate verification, legacy predecessor rollback, or bare-supervisor replacement | 064, then 017 and 010 |
 | Reviewing historical wake registration, observation, or resume records | 098 governs retirement; 006, 011, 012 record former behavior without execution authority |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
@@ -204,6 +206,9 @@ ADR-000 (adopt spEARS v2 for new work)
       │       └── ADR-093 (Federation validates CA capability and types IPv6 persistence)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
+      │   ├── ADR-102 (Current-schema prepared activation commits at the database-write boundary)
+      │   │   └── ADR-103 (Ordinary forward candidate launch is the downgrade boundary)
+      │   │       └── ADR-105 (Qualify migration 128 for bounded current-schema activation; supersedes interval portions of 102/103 and applies ADR-104)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
       │   ├── ADR-082 (Legacy AUQ waits retain identity absence)
       │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)

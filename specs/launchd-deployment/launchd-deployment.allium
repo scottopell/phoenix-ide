@@ -1,7 +1,8 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
 -- Requirement traceability: REQ-LDD-001 through REQ-LDD-023
--- REQ-LDD-023 ordinary forward boundary applies only to an exact 123 -> 127 qualification.
+-- REQ-LDD-019–023 use only the exact 123 -> 128 qualification from ADR-105
+-- (../adrs/105_qualify-migration-128-for-bounded-current-schema-activation.md).
 
 config {
     transition_timeout_seconds: Integer = 30
@@ -250,15 +251,20 @@ external entity TargetService {
 --   prepared_artifact mode with exact canonical DB path shared by predecessor
 --   and candidate, retained controller helper path/SHA-256 and candidate migration
 --   registry path/SHA-256 bound to the immutable transaction. The source ledger
---   equals the complete qualified ordered ledger through 123, not merely MAX=123;
---   absent, unknown, mismatched, gapped or newer entries reject. Required
+--   equals the complete qualified ordered ledger through 123, not merely MAX=123.
+--   The complete candidate registry ends at 128 and names 126 as
+--   retire_wake_feature_preserving_history, 127 as coordinator_owned_work_scope_home,
+--   and 128 as product_creation_provisioning_stage. The complete registry and
+--   SHA-256 digest are immutable transaction evidence, re-verified before migration,
+--   activation and forward recovery; absent, unknown, mismatched, gapped or newer
+--   entries reject. Required
 --   ProductConversation tables, SQLite integrity and foreign keys pass before
 --   disruption. No release or runtime-only source can select this mode.
 -- current_schema_snapshot_is_valid(transaction, proof) -> Boolean
 --   Proof matches the retained preflight and transaction. Offline exclusive
 --   DB/WAL/SHM ownership follows service stop; SQLite backup
 --   API snapshot in a private directory has verified hash, logical source contents
---   and durable proof bound to source 123 and target 127 ledgers, path, exact
+--   and durable proof bound to source 123 and target 128 ledgers, path, exact
 --   controller/helper/candidate/predecessor identities and transaction ID.
 --   No candidate migration or startup precedes this proof.
 -- current_schema_source_unchanged(transaction) -> Boolean
@@ -271,7 +277,7 @@ external entity TargetService {
 --   private loaded configuration and running identity were checked after restore;
 --   durable status precedes release of only the owned claim.
 -- current_schema_target_verified(transaction) -> Boolean
---   The exact full target ledger through 127, SQLite integrity and foreign keys
+--   The exact full target ledger through 128, SQLite integrity and foreign keys
 --   were durably checked after the candidate's bounded offline --migrate-only;
 --   exclusive database ownership remains proven before runtime traffic.
 -- current_schema_migration_failure_is_fenced(transaction) -> Boolean
@@ -283,13 +289,17 @@ external entity TargetService {
 -- current_schema_finalization_context_is_valid(transaction) -> Boolean
 --   Retained immutable transaction, matching owned claim, absent activation
 --   helper, byte-bound controller helper/candidate/private plist, durable exact
---   target ledger commit proof and exclusive operation lock all re-verify
---   before any candidate startup. It does not repeat offline migration.
+--   target ledger commit proof, immutable complete registry and SHA-256 digest,
+--   and exclusive operation lock all re-verify before any candidate startup.
+--   It does not repeat offline migration.
 -- ordinary_forward_boundary_qualified(transaction) -> Boolean
 --   Only ordinary local HEAD or published release deployment with an exact
---   complete migration-123 source ledger and exact migration-127 candidate
---   registry. The exact registry, candidate identity/configuration and helper
---   are retained with the transaction; no standalone database backup is required.
+--   complete migration-123 source ledger and exact migration-128 candidate
+--   registry with the named 126/127/128 entries defined by current_schema_preflight_is_valid.
+--   The complete registry and SHA-256 digest are immutable evidence bound to the
+--   candidate identity/configuration and helper, re-verified before activation
+--   and forward recovery. Different, missing or newer registries reject.
+--   No standalone database backup is required.
 -- ordinary_forward_no_start_proven(transaction) -> Boolean
 --   Affirmative durable proof that the candidate has never had a start attempt.
 --   Missing or ambiguous start evidence is not proof; once attempted, this
@@ -299,8 +309,9 @@ external entity TargetService {
 --   retained across interruption and all resume attempts.
 -- ordinary_forward_resume_context_is_valid(transaction) -> Boolean
 --   Explicit operator authorization, matching ownership claim and retained
---   transaction/helper, exact candidate binary/configuration and registry,
---   stopped target and exclusive operation lock all re-verify before startup.
+--   transaction/helper, exact candidate binary/configuration, immutable complete
+--   registry and SHA-256 digest, stopped target and exclusive operation lock all
+--   re-verify before startup.
 -- ordinary_forward_failure_fenced(transaction) -> Boolean
 --   Candidate teardown is attempted and the target remains stopped when possible;
 --   failure to confirm stop is reported explicitly, never treated as safe to
@@ -330,10 +341,10 @@ external entity TargetService {
 --   runtime/configuration and predecessor identity before releasing ownership.
 -- CandidateStartupReady(transaction)
 --   Emitted after quiesce and paired snapshot proof, or after current-schema
---   migration reached durably verified target 127; ordinary sources use preparation.
+--   migration reached durably verified target 128; ordinary sources use preparation.
 -- candidate_startup_proof_is_valid(transaction) -> Boolean
 --   True for ordinary sources. Paired legacy requires paired_database_proof_is_valid.
---   Current schema requires a durable matching snapshot proof, exact target 127
+--   Current schema requires a durable matching snapshot proof, exact target 128
 --   ledger and integrity/FK verification after offline migration. In both modes
 --   exclusive offline ownership precedes snapshot and candidate startup.
 -- paired_predecessor_start_order_is_valid(transaction) -> Boolean
@@ -629,7 +640,7 @@ rule PreserveCurrentSchemaPendingCandidate {
 --   Durably records migration_started before invoking bounded --migrate-only
 --   on the exact installed candidate. No later no-write exit clears this fence.
 -- CurrentSchemaTargetLedgerVerified(transaction)
---   Exact target 127 ledger/integrity/FK proof is durable.
+--   Exact target 128 ledger/integrity/FK proof is durable.
 -- CurrentSchemaWritesCommitted(transaction)
 --   A complete or partial DB write crossed the irreversible boundary.
 -- CurrentSchemaMigrationUncertain(transaction)
@@ -882,7 +893,7 @@ rule RecoverUnchangedCurrentSchemaSource {
 -- CurrentSchemaSnapshotNotReplayed(transaction)
 --   Finalization does not restore or replay the audit snapshot.
 -- OrdinaryForwardCandidateStartupRequested(transaction)
---   Exact 123 -> 127 ordinary activation is about to attempt candidate startup.
+--   Exact 123 -> 128 ordinary activation is about to attempt candidate startup.
 -- OrdinaryForwardActivationFailed(transaction, failure)
 --   Candidate startup or health failed, or absence of a start attempt is unproven.
 -- OrdinaryForwardResumeRequested(transaction)
@@ -900,7 +911,7 @@ rule FenceFailedOrdinaryForwardActivation {
     ensures: DurableStatusWritten(transaction)
 
     @guidance
-        -- A failed or unknown start may have committed migrations 126/127 or
+        -- A failed or unknown start may have committed migrations 126/127/128 or
         -- coordinator-home initialization. Stop the candidate where possible;
         -- never bootstrap the predecessor or clear the claim on uncertainty.
 }
