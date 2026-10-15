@@ -1,6 +1,6 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
--- Requirement traceability: REQ-LDD-001 through REQ-LDD-023
+-- Requirement traceability: REQ-LDD-001 through REQ-LDD-024
 -- REQ-LDD-019–023 use only the exact 123 -> 128 qualification from ADR-105
 -- (../adrs/105_qualify-migration-128-for-bounded-current-schema-activation.md).
 
@@ -8,10 +8,15 @@ config {
     transition_timeout_seconds: Integer = 30
     health_timeout_seconds: Integer = 120
     stale_after_seconds: Integer = 390
+    current_schema_growth_margin_divisor: Integer = 10
+    current_schema_growth_margin_min_bytes: Integer = 1_073_741_824
+    current_schema_growth_margin_max_bytes: Integer = 8_589_934_592
+    current_schema_evidence_budget_bytes: Integer = 2_097_152
+    current_schema_max_proof_bytes: Integer = 1_048_576
 }
 
 enum TransactionState {
-    preparing | prepared | activating | committed |
+    preparing | prepared | precondition_cleanup_pending | activating | committed |
     precondition_failed | activation_failed_rolled_back |
     activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed |
     ordinary_forward_only_failed | rejected_concurrent
@@ -125,6 +130,10 @@ entity DeployTransaction {
         preparing -> precondition_failed
         preparing -> rejected_concurrent
         prepared -> activating
+        prepared -> precondition_cleanup_pending
+        activating -> precondition_cleanup_pending
+        activating -> precondition_failed
+        precondition_cleanup_pending -> precondition_failed
         prepared -> precondition_failed
         prepared -> activation_failed_rolled_back
         prepared -> activation_failed_rollback_failed
@@ -200,14 +209,53 @@ external entity TargetService {
 --   no plist environment values.
 -- helper_capacity_reserved(transaction) -> Boolean
 --   After handoff, the helper physically reserves private snapshot and restore
---   capacity for DB plus WAL and margin before production stop. True for
---   ordinary sources, whose prepared runtime capacity is already held. Current
---   schema reserves both backup and restore space after install overhead, with
---   at least 20 GiB free remaining on every affected filesystem.
+--   capacity. Current-schema capacity uses observed live DB plus WAL and a 10
+--   percent growth margin clamped to 1–8 GiB, capped by each capacity pool's safe
+--   ceiling without crediting live DB/WAL logical bytes against copy-on-write peak
+--   demand, while retaining at least 20 GiB free after prepared install overhead.
+--   APFS volumes in one container share a pool; every evidence check uses the
+--   minimum reported free value among affected paths in that pool. The complete
+--   allocation-unit-rounded atomic evidence lifecycle, including old and replacement
+--   proofs plus capacity evidence, fits 2 MiB; each proof generation is at most 1 MiB.
+--   Both bounds are projected before disruption, and the floor plus pending atomic
+--   evidence peak is proved before initial or replacement evidence publication.
+--   The stopped, exclusively owned size recheck against held capacity retains
+--   the floor plus the not-yet-resident evidence allowance and is authoritative.
+--   After migration, actual DB+WAL remains within the held target and every affected
+--   capacity pool retains the floor plus its remaining evidence allowance. True for
+--   ordinary sources/backends with prepared capacity.
+-- pre_stop_cleanup_uncertain(transaction) -> Boolean
+--   Reservation/evidence cleanup durability is uncertain before service stop;
+--   no snapshot exists and no runtime or database mutation was authorized.
+-- pre_stop_capacity_cleanup_durable(transaction) -> Boolean
+--   Transaction-owned unsnapshotted reservation/evidence files are absent and
+--   their parent directories were fsynced; true for failures with no such files.
+-- pre_stop_cleanup_retry_context_is_valid(transaction) -> Boolean
+--   Exact retained transaction and matching claim under the operation fence;
+--   uses recorded pre-stop evidence, not runtime inspection.
+-- PreStopCleanupUncertain(transaction, failure)
+--   Capacity reservation failed before stop without durable cleanup proof.
+-- PreStopCleanupRetryRequested(transaction)
+--   Operator requests cleanup-only disposition of the retained transaction.
+-- PreStopCleanupRetryFailed(transaction, failure)
+--   Cleanup or terminal status durability failed; ownership remains retained.
+-- PreStopCleanupFilesRemovedAndParentsSynced(transaction)
+--   Only this transaction's unsnapshotted reservation/evidence files were
+--   removed and all affected parent directories fsynced.
 -- HelperCapacityVerified(transaction)
 --   Emitted by the independent helper after successful capacity reservation.
 -- activation_claim_available() -> Boolean
---   No active or unresolved deployment or restart owns the host-level claim.
+--   No active or unresolved deployment or restart owns the host-level claim. A
+--   markerless status is resolved only when it positively names a nonempty
+--   transaction, an exact supported source kind, a recognized terminal state,
+--   finalization_pending absent or literally false, and rollback_failure absent or
+--   literally null; every other markerless status is unresolved. Active-owner
+--   terminal proof also requires a regular non-symlink status with explicit literal
+--   lifecycle fields and an exact source kind coherent with retained mode evidence.
+--   Unreadable/non-regular active
+--   markers remain visible unresolved fences. Active-owner status
+--   is rendered even when the shared last-status record is absent, unreadable, or
+--   belongs to another owner.
 -- helper_is_launchd_owned(transaction) -> Boolean
 --   A distinct one-shot LaunchAgent owns activation independently of Phoenix.
 -- atomic_candidate_install(transaction) -> Boolean
@@ -406,8 +454,15 @@ external entity TargetService {
 -- pre_manifest_abandonment_verified(transaction) -> Boolean
 --   Matching preparing status preceded owned claim publication, manifest
 --   is absent or exists; preparation PID is dead and no helper was admitted,
---   or a prepared/helper-handoff attempt ended with confirmed helper absence and
---   helper absence is confirmed. Manifest presence does not imply handoff.
+--   or a prepared/helper-handoff attempt ended with confirmed helper absence.
+--   Retained source kind and requested paired/current-schema recovery mode match
+--   exactly; initial status carries the mode before manifest publication. All
+--   transaction-owned unsnapshotted capacity/evidence files, atomic temporaries, and
+--   SQLite sidecars are removed on reservation abort and cleanup, with parents fsynced
+--   before terminal status. Terminal-status or claim-release durability failure
+--   restores a visible exact-owner fence and cleanup-pending where possible; matching
+--   claim removal is parent-directory-fsynced before success. Manifest
+--   presence does not imply handoff.
 -- PreparedAbandonmentVerified(transaction)
 --   Operator requested recovery and pre_manifest_abandonment_verified holds.
 
@@ -674,8 +729,9 @@ rule ActivateCandidate {
 
 rule HelperCapacityFailureBeforeStop {
     when: HelperCapacityFailed(transaction, failure)
-    requires: transaction.state = prepared
+    requires: transaction.state in { prepared, activating }
     requires: helper_is_launchd_owned(transaction)
+    requires: pre_stop_capacity_cleanup_durable(transaction)
     ensures: transaction.state = precondition_failed
     ensures: transaction.failure = failure
     ensures: ProductionArtifactsUnchanged(transaction)
@@ -685,6 +741,51 @@ rule HelperCapacityFailureBeforeStop {
 
 -- PairedSnapshotProofPersisted(transaction)
 --   The verified context-bound snapshot proof was atomically written and fsynced.
+
+rule PreservePreStopCleanupUncertainty {
+    when: PreStopCleanupUncertain(transaction, failure)
+    requires: transaction.state in { prepared, activating }
+    requires: DeploymentOwnsActivationClaim(transaction)
+    requires: transaction.kind in { PreparedArtifactDeployment, CurrentSchemaDeployment }
+    requires: helper_is_launchd_owned(transaction)
+    requires: pre_stop_cleanup_uncertain(transaction)
+    ensures: transaction.state = precondition_cleanup_pending
+    ensures: transaction.failure = failure
+    ensures: active_claim_retained(transaction)
+    ensures: TargetServiceUnchanged(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule RetryPreStopCleanupOnly {
+    when: PreStopCleanupRetryRequested(transaction)
+    requires: transaction.state = precondition_cleanup_pending
+    requires: pre_stop_cleanup_retry_context_is_valid(transaction)
+    requires: DeploymentOwnsActivationClaim(transaction)
+    ensures: PreStopCleanupFilesRemovedAndParentsSynced(transaction)
+    ensures: pre_stop_capacity_cleanup_durable(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Remove only transaction-owned unsnapshotted reservation/evidence files
+        -- and fsync their parents. Persist terminal status before releasing only
+        -- the matching claim. Never stop/start/inspect runtime, touch DB contents,
+        -- production plist/binary, perform snapshot recovery, or use
+        -- recover-current/paired.
+        -- Those recovery commands refuse this state without rewriting it.
+        -- Markerless pending status fences deploy/restart/stop. Invalid helper
+        -- identity cannot request bootout; only the exact transaction-derived
+        -- deployment-helper label may be booted out.
+}
+
+rule PreserveFailedPreStopCleanupRetry {
+    when: PreStopCleanupRetryFailed(transaction, failure)
+    requires: transaction.state = precondition_cleanup_pending
+    requires: DeploymentOwnsActivationClaim(transaction)
+    ensures: transaction.state = precondition_cleanup_pending
+    ensures: transaction.failure = failure
+    ensures: active_claim_retained(transaction)
+}
 
 rule MarkOrdinaryForwardStartAttempt {
     when: OrdinaryForwardCandidateStartupRequested(transaction)
@@ -1122,7 +1223,7 @@ rule ShowUnresolvedPairedStatus {
 
 rule ReportStaleTransaction {
     when: DeploymentStatusRequested(transaction)
-    requires: transaction.state in { preparing, prepared, activating }
+    requires: transaction.state in { preparing, prepared, precondition_cleanup_pending, activating }
     requires: TransactionAgeSeconds(transaction) > stale_after_seconds
     ensures: StaleRecoveryGuidanceShown(transaction)
     ensures: not transaction.state = committed
@@ -1232,6 +1333,15 @@ invariant OrdinaryForwardAttemptNeverReauthorizesPredecessor {
             and active_claim_retained(transaction)
 }
 
+invariant PreStopCleanupPendingKeepsRuntimeAndClaim {
+    for transaction in DeployTransactions:
+        transaction.state = precondition_cleanup_pending implies
+            pre_stop_cleanup_uncertain(transaction)
+            and active_claim_retained(transaction)
+            and not RuntimeDisruptionStarted(transaction)
+            and not DatabaseRollbackCompleted(transaction)
+}
+
 invariant CurrentSchemaPreparedModeIsDistinct {
     for transaction in DeployTransactions:
         transaction.kind = CurrentSchemaDeployment
@@ -1303,7 +1413,7 @@ invariant PairedUnresolvedFailureAutoloadFence {
 invariant PairedPrecommitAutoloadSafety {
     for transaction in DeployTransactions:
         transaction.kind = PreparedArtifactDeployment
-        and transaction.state in { preparing, prepared, activating } implies
+        and transaction.state in { preparing, prepared, precondition_cleanup_pending, activating } implies
             paired_precommit_autoload_safe(transaction)
 }
 
