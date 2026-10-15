@@ -1,0 +1,491 @@
+-- allium: 3
+-- Standalone deployment-controller evidence, cleanup, and recovery core.
+--
+-- This module refines the independent-owner and truthful-recovery obligations in
+-- specs/production-deployment and specs/launchd-deployment. It does not replace
+-- either deployment contract or grant production activation authority.
+
+value ProcessIdentity {
+    pid: Integer
+    birth_token: String
+}
+
+value DiscoveryEpoch {
+    sequence: Integer
+    hinted_pid: Integer
+    verified_parent: ProcessIdentity
+}
+
+value RetainedCandidateIdentity {
+    full_commit: String
+    artifact_hash: String
+}
+
+value ResourceCapacity {
+    available_memory_bytes: Integer
+    available_storage_bytes: Integer
+}
+
+value ResourceContention {
+    cpu_contention_basis_points: Integer
+    memory_pressure: MemoryPressure
+}
+
+value ResourceSample {
+    sequence: Integer
+    capacity: ResourceCapacity
+    contention: ResourceContention
+}
+
+enum MemoryPressure { nominal | warning | critical }
+
+enum ControllerPhase {
+    pending | resource_sampling | ownership_discovery | awaiting_birth_evidence
+    | cleaning_owned_tree | verifying_cleanup | ready_for_disruption
+    | resource_blocked | interrupted | recovering | forward_recovery
+    | administrative_closeout_required | administratively_closed
+}
+
+enum CompatibilityBoundary { predecessor_eligible | candidate_migration_invoked }
+
+enum CleanupResult {
+    not_started | in_progress | verified_clean | unresolved_risk | administrative_risk_accepted
+}
+
+enum ObservationFailure {
+    no_such_process | permission_denied | temporarily_unavailable | malformed_observation
+}
+
+entity DeploymentAttempt {
+    id: String
+    phase: ControllerPhase
+    operation_deadline: Timestamp
+    next_discovery_sequence: Integer
+    compatibility_boundary: CompatibilityBoundary
+    retained_candidate: RetainedCandidateIdentity?
+    resume_phase: ControllerPhase?
+    cleanup_result: CleanupResult
+    last_observation_failure: ObservationFailure?
+    resource_samples: List<ResourceSample>
+    owned_identities: Set<ProcessIdentity>
+    unresolved_discoveries: Set<DiscoveryEpoch>
+    verified_absent_identities: Set<ProcessIdentity>
+
+    transitions phase {
+        pending -> resource_sampling
+        resource_sampling -> ownership_discovery
+        resource_sampling -> resource_blocked
+        resource_sampling -> interrupted
+        ownership_discovery -> awaiting_birth_evidence
+        ownership_discovery -> cleaning_owned_tree
+        ownership_discovery -> interrupted
+        awaiting_birth_evidence -> ownership_discovery
+        awaiting_birth_evidence -> cleaning_owned_tree
+        awaiting_birth_evidence -> administrative_closeout_required
+        awaiting_birth_evidence -> interrupted
+        cleaning_owned_tree -> verifying_cleanup
+        cleaning_owned_tree -> administrative_closeout_required
+        cleaning_owned_tree -> interrupted
+        verifying_cleanup -> ready_for_disruption
+        verifying_cleanup -> cleaning_owned_tree
+        verifying_cleanup -> administrative_closeout_required
+        verifying_cleanup -> interrupted
+        interrupted -> recovering
+        interrupted -> forward_recovery
+        recovering -> ownership_discovery
+        recovering -> cleaning_owned_tree
+        recovering -> verifying_cleanup
+        recovering -> administrative_closeout_required
+        recovering -> interrupted
+        forward_recovery -> forward_recovery
+        forward_recovery -> interrupted
+        administrative_closeout_required -> administratively_closed
+        terminal: ready_for_disruption, resource_blocked, administratively_closed
+    }
+}
+
+config {
+    minimum_sustained_samples: Integer = 3
+}
+
+rule StartResourceAssessment {
+    when: DeploymentRequested(attempt)
+    requires: attempt.phase = pending
+    ensures:
+        attempt.phase = resource_sampling
+        attempt.compatibility_boundary = predecessor_eligible
+        attempt.cleanup_result = not_started
+        attempt.next_discovery_sequence = 0
+}
+
+rule RecordResourceSample {
+    when: ResourceSampleObserved(attempt, sample)
+    requires: attempt.phase = resource_sampling
+    requires: sample.sequence_is_after(attempt.resource_samples)
+    ensures: attempt.resource_samples.append(sample)
+}
+
+rule AdmitSustainedResources {
+    when: ResourceSamplingCompleted(attempt)
+    requires: attempt.phase = resource_sampling
+    requires: sustained_capacity_and_contention_are_admissible(
+        attempt.resource_samples,
+        minimum_sustained_samples
+    )
+    ensures: attempt.phase = ownership_discovery
+}
+
+rule BlockInsufficientResources {
+    when: ResourceSamplingCompleted(attempt)
+    requires: attempt.phase = resource_sampling
+    requires: not sustained_capacity_and_contention_are_admissible(
+        attempt.resource_samples,
+        minimum_sustained_samples
+    )
+    ensures: attempt.phase = resource_blocked
+}
+
+rule RecordChildDiscoveryBeforeIdentity {
+    when: ChildPidObserved(attempt, parent, pid)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.owned_identities.contains(parent)
+    requires: pid > 1
+    ensures:
+        attempt.unresolved_discoveries.add(DiscoveryEpoch {
+            sequence: attempt.next_discovery_sequence,
+            hinted_pid: pid,
+            verified_parent: parent
+        })
+        attempt.next_discovery_sequence = attempt.next_discovery_sequence + 1
+        BirthIdentityProbeRequested(attempt, attempt.next_discovery_sequence - 1)
+}
+
+rule AdoptStableChildIdentity {
+    when: StableChildIdentityObserved(attempt, discovery, identity)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.unresolved_discoveries.contains(discovery)
+    requires: stable_child_evidence_binds(discovery, identity)
+    ensures:
+        attempt.unresolved_discoveries.remove(discovery)
+        attempt.owned_identities.add(identity)
+        attempt.phase = ownership_discovery
+        attempt.last_observation_failure = null
+}
+
+rule PreserveUnidentifiedChildObservation {
+    when: ChildIdentityProbeFailed(attempt, discovery, failure)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.unresolved_discoveries.contains(discovery)
+    requires: failure in {
+        no_such_process,
+        permission_denied,
+        temporarily_unavailable,
+        malformed_observation
+    }
+    ensures:
+        attempt.phase = awaiting_birth_evidence
+        attempt.last_observation_failure = failure
+        attempt.unresolved_discoveries.contains(discovery)
+}
+
+rule PreserveDiscoveryAcrossPidReuse {
+    when: HintPidNowNamesDifferentProcess(attempt, discovery, replacement)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.unresolved_discoveries.contains(discovery)
+    requires: replacement.pid = discovery.hinted_pid
+    requires: not stable_child_evidence_binds(discovery, replacement)
+    ensures:
+        attempt.phase = awaiting_birth_evidence
+        attempt.unresolved_discoveries.contains(discovery)
+        not attempt.owned_identities.contains(replacement)
+        not OwnedSignalRequested(attempt, replacement)
+}
+
+rule BeginOwnedTreeCleanup {
+    when: OwnershipScanCompleted(attempt)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence }
+    requires: attempt.unresolved_discoveries.count = 0
+    ensures:
+        attempt.phase = cleaning_owned_tree
+        attempt.cleanup_result = in_progress
+}
+
+rule RecheckBeforeEveryOwnedSignal {
+    when: OwnedCleanupRequested(attempt, identity)
+    requires: attempt.phase = cleaning_owned_tree
+    requires: attempt.owned_identities.contains(identity)
+    requires: freshly_observed_same_identity(identity)
+    ensures: OwnedSignalRequested(attempt, identity)
+}
+
+rule KeepReparentedIdentityOwned {
+    when: OwnedIdentityObservedWithDifferentParent(attempt, identity)
+    requires: attempt.phase in { cleaning_owned_tree, verifying_cleanup, recovering }
+    requires: attempt.owned_identities.contains(identity)
+    requires: freshly_observed_same_identity(identity)
+    ensures:
+        attempt.owned_identities.contains(identity)
+        not attempt.verified_absent_identities.contains(identity)
+}
+
+rule RecordVerifiedOwnedIdentityAbsence {
+    when: OwnedIdentityAbsenceVerified(attempt, identity)
+    requires: attempt.phase in { cleaning_owned_tree, verifying_cleanup, recovering }
+    requires: attempt.owned_identities.contains(identity)
+    requires: exact_identity_absence_is_verified(identity)
+    ensures: attempt.verified_absent_identities.add(identity)
+}
+
+rule IgnoreReplacementAtOwnedPid {
+    when: OwnedPidReused(attempt, owned_identity, replacement)
+    requires: attempt.phase in { cleaning_owned_tree, verifying_cleanup, recovering }
+    requires: attempt.owned_identities.contains(owned_identity)
+    requires: replacement.pid = owned_identity.pid
+    requires: replacement.birth_token != owned_identity.birth_token
+    ensures:
+        attempt.verified_absent_identities.add(owned_identity)
+        not attempt.owned_identities.contains(replacement)
+        not OwnedSignalRequested(attempt, replacement)
+}
+
+rule VerifyOwnedTreeCleanup {
+    when: CleanupSignalsSettled(attempt)
+    requires: attempt.phase = cleaning_owned_tree
+    ensures: attempt.phase = verifying_cleanup
+}
+
+rule CompleteVerifiedCleanup {
+    when: CleanupVerificationCompleted(attempt)
+    requires: attempt.phase = verifying_cleanup
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: every_owned_identity_is_verified_absent(attempt)
+    ensures:
+        attempt.cleanup_result = verified_clean
+        attempt.phase = ready_for_disruption
+}
+
+rule ContinueCleanupForLiveOwnedIdentity {
+    when: CleanupVerificationCompleted(attempt)
+    requires: attempt.phase = verifying_cleanup
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: a_freshly_matching_owned_identity_is_live(attempt)
+    requires: now < attempt.operation_deadline
+    ensures: attempt.phase = cleaning_owned_tree
+}
+
+rule RequireAdministrativeCloseoutAtDeadline {
+    when: attempt: DeploymentAttempt.operation_deadline <= now
+    requires: attempt.phase in {
+        awaiting_birth_evidence,
+        cleaning_owned_tree,
+        verifying_cleanup,
+        recovering
+    }
+    requires: cleanup_evidence_is_unresolved(attempt)
+    ensures:
+        attempt.cleanup_result = unresolved_risk
+        attempt.phase = administrative_closeout_required
+}
+
+rule AcceptAdministrativeRiskWithoutCleanupClaim {
+    when: AdministrativeRiskAccepted(attempt)
+    requires: attempt.phase = administrative_closeout_required
+    requires: explicit_risk_acceptance_matches(attempt)
+    ensures:
+        attempt.cleanup_result = administrative_risk_accepted
+        attempt.phase = administratively_closed
+        not VerifiedCleanupClaimed(attempt)
+        no_additional_process_signal_requested(attempt)
+}
+
+rule PersistInterruption {
+    when: ControllerInterrupted(attempt)
+    requires: attempt.phase in {
+        resource_sampling,
+        ownership_discovery,
+        awaiting_birth_evidence,
+        cleaning_owned_tree,
+        verifying_cleanup,
+        recovering,
+        forward_recovery
+    }
+    ensures:
+        attempt.resume_phase = attempt.phase
+        attempt.phase = interrupted
+        DurableAttemptWritten(attempt)
+}
+
+rule RecoverByReconciliation {
+    when: RecoveryRequested(attempt)
+    requires: attempt.phase = interrupted
+    requires: attempt.compatibility_boundary = predecessor_eligible
+    ensures:
+        attempt.phase = recovering
+        FreshOwnershipReconciliationRequested(attempt)
+}
+
+rule RecordCandidateMigrationInvocation {
+    when: CandidateMigrationInvoked(attempt, candidate)
+    requires: candidate_identity_is_exact(candidate)
+    ensures:
+        attempt.compatibility_boundary = candidate_migration_invoked
+        attempt.retained_candidate = candidate
+        DurableAttemptWritten(attempt)
+}
+
+rule RecoverForwardAfterMigrationInvocation {
+    when: RecoveryRequested(attempt)
+    requires: attempt.phase = interrupted
+    requires: attempt.compatibility_boundary = candidate_migration_invoked
+    requires: attempt.retained_candidate != null
+    ensures:
+        attempt.phase = forward_recovery
+        ExactRetainedCandidateReverificationRequested(
+            attempt,
+            attempt.retained_candidate
+        )
+}
+
+rule PreserveForwardFenceOnFailure {
+    when: ForwardRecoveryFailed(attempt)
+    requires: attempt.phase = forward_recovery
+    ensures:
+        attempt.phase = forward_recovery
+        attempt.compatibility_boundary = candidate_migration_invoked
+        not PredecessorStartupRequested(attempt)
+}
+
+invariant SignalsRequireStableOwnedIdentity {
+    for attempt in DeploymentAttempts:
+        for identity in ProcessIdentities:
+            OwnedSignalRequested(attempt, identity) implies
+                attempt.owned_identities.contains(identity)
+                and freshly_observed_same_identity(identity)
+}
+
+invariant UnresolvedDiscoveryIsNotAbsence {
+    for attempt in DeploymentAttempts:
+        attempt.unresolved_discoveries.count > 0 implies
+            attempt.cleanup_result != verified_clean
+            and attempt.phase != ready_for_disruption
+}
+
+invariant AdministrativeCloseoutIsNotVerifiedCleanup {
+    for attempt in DeploymentAttempts where attempt.phase = administrative_closeout_required:
+        attempt.cleanup_result = unresolved_risk
+        and attempt.cleanup_result != verified_clean
+}
+
+invariant AdministrativeAcceptanceIsNotVerifiedCleanup {
+    for attempt in DeploymentAttempts where attempt.phase = administratively_closed:
+        attempt.cleanup_result = administrative_risk_accepted
+        and attempt.cleanup_result != verified_clean
+        and not VerifiedCleanupClaimed(attempt)
+}
+
+invariant DeadlineIsAbsolute {
+    for attempt in DeploymentAttempts:
+        recovery_or_retry_does_not_change(attempt.operation_deadline)
+}
+
+invariant ResourceAdmissionUsesMeasurements {
+    for attempt in DeploymentAttempts where attempt.phase != pending:
+        resource_decision_uses_only_capacity_and_contention_samples(attempt)
+}
+
+invariant MigrationInvocationIsForwardOnly {
+    for attempt in DeploymentAttempts:
+        attempt.compatibility_boundary = candidate_migration_invoked implies
+            attempt.retained_candidate != null
+            and not PredecessorStartupRequested(attempt)
+}
+
+contract ControllerOsBoundary {
+    list_children: (parent: ProcessIdentity) -> List<Integer>
+    acquire_child_identity: (discovery: DiscoveryEpoch) -> ProcessIdentity?
+    observe_identity: (identity: ProcessIdentity) -> Boolean
+    signal_exact_identity: (identity: ProcessIdentity) -> Boolean
+    sample_resources: (sequence: Integer) -> ResourceSample
+
+    @invariant BirthIdentityBeforeMutation
+        -- A PID hint or process-group relationship is discovery evidence only.
+        -- Mutation requires a high-resolution birth token rechecked at the edge.
+
+    @invariant ObservationFailuresRemainTyped
+        -- ESRCH while acquiring a birth token, permission denial, temporary
+        -- unavailability, and malformed metadata remain distinct observations.
+        -- None is silently converted into verified process absence.
+
+    @invariant NoProcessBlacklistAdmission
+        -- Resource admission is based on a sustained series of measured capacity
+        -- and contention samples. Process names and a globally invariant process
+        -- metadata snapshot are not admission authorities.
+
+    @invariant PersistenceBeforeEffects
+        -- Every phase/evidence change is durably written before its requested OS
+        -- mutation. Recovery re-observes identities instead of replaying a signal.
+}
+
+-- Helper meanings
+--
+-- stable_child_evidence_binds(discovery, identity) is true only when one OS-boundary
+-- observation verifies discovery.verified_parent at its recorded birth, the child
+-- relationship, and identity's high-resolution birth token. A later process at the
+-- same PID cannot satisfy an older discovery epoch merely by reusing that PID.
+--
+-- exact_identity_absence_is_verified(identity) is stronger than an empty PID scan or
+-- an ESRCH returned while birth identity is still unknown. It proves that the exact
+-- previously acquired pid-plus-birth identity is no longer present.
+--
+-- sustained_capacity_and_contention_are_admissible(samples, count) requires at least
+-- count ordered consecutive samples with sufficient measured capacity and refuses
+-- contention only when it exceeds policy throughout that window. One transient busy
+-- sample is not sustained contention. Process names and whole-process-table equality
+-- are not admission authorities.
+--
+-- administrative_closeout_required is a truthful stopped state. Explicit matching
+-- risk acceptance may close scheduling ownership without claiming verified cleanup,
+-- sending another signal, or authorizing the interrupted deployment to continue.
+--
+-- candidate_identity_is_exact requires a complete source commit and artifact hash.
+-- Once candidate migration invocation is durable, recovery may run only the exact
+-- retained candidate. This module grants no older-binary or database downgrade
+-- compatibility.
+--
+-- Resource and process diagnostics expose typed values and categories only; command
+-- lines, environment values, credentials, and raw secret-bearing OS errors are not
+-- durable telemetry.
+
+surface StandaloneDeploymentController {
+    contracts:
+        demands ControllerOsBoundary
+    context attempt: DeploymentAttempt
+    exposes:
+        attempt.id
+        attempt.phase
+        attempt.operation_deadline
+        attempt.cleanup_result
+        attempt.compatibility_boundary
+        attempt.owned_identities
+        attempt.unresolved_discoveries
+    provides:
+        DeploymentRequested(attempt)
+        ResourceSampleObserved(attempt, sample)
+        ResourceSamplingCompleted(attempt)
+        ChildPidObserved(attempt, parent, pid)
+        StableChildIdentityObserved(attempt, discovery, identity)
+        ChildIdentityProbeFailed(attempt, discovery, failure)
+        HintPidNowNamesDifferentProcess(attempt, discovery, replacement)
+        OwnershipScanCompleted(attempt)
+        OwnedCleanupRequested(attempt, identity)
+        OwnedIdentityObservedWithDifferentParent(attempt, identity)
+        OwnedIdentityAbsenceVerified(attempt, identity)
+        OwnedPidReused(attempt, owned_identity, replacement)
+        CleanupSignalsSettled(attempt)
+        CleanupVerificationCompleted(attempt)
+        ControllerInterrupted(attempt)
+        RecoveryRequested(attempt)
+        CandidateMigrationInvoked(attempt, candidate)
+        ForwardRecoveryFailed(attempt)
+        AdministrativeRiskAccepted(attempt)
+}

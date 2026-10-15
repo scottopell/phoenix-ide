@@ -1,0 +1,14 @@
+[package]
+name = "phoenix-deployment-controller"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Pure policy core for standalone Phoenix deployment orchestration"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
