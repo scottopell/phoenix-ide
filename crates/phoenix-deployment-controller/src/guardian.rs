@@ -528,6 +528,7 @@ pub struct Guardian<E: GuardianExecutor> {
     deadline: MonotonicTick,
     minimum_dispatch_revision: Option<PersistenceRevision>,
     reconciliation_floor: Option<PersistenceRevision>,
+    latest_reconciliation_revision: Option<PersistenceRevision>,
     executor: ManuallyDrop<E>,
     slots: ManuallyDrop<BTreeMap<ChildSlotId, E::ChildSlot>>,
     retained: Vec<ExecutedEffect>,
@@ -596,6 +597,7 @@ impl<E: GuardianExecutor> Guardian<E> {
                 deadline: original_deadline,
                 minimum_dispatch_revision: None,
                 reconciliation_floor: None,
+                latest_reconciliation_revision: None,
                 executor: ManuallyDrop::new(executor),
                 slots: ManuallyDrop::new(slots),
                 retained: Vec::with_capacity(MAX_RETAINED_RESULTS),
@@ -883,6 +885,9 @@ impl<E: GuardianExecutor> Guardian<E> {
         if self
             .minimum_dispatch_revision
             .is_some_and(|minimum| committed_interruption_revision < minimum)
+            || self
+                .latest_reconciliation_revision
+                .is_some_and(|latest| committed_interruption_revision <= latest)
         {
             return Err(GuardianError::StaleDispatchRevision);
         }
@@ -896,6 +901,7 @@ impl<E: GuardianExecutor> Guardian<E> {
         self.session = next;
         self.state = GuardianState::Reconciling;
         self.reconciliation_floor = Some(committed_interruption_revision);
+        self.latest_reconciliation_revision = Some(committed_interruption_revision);
         Ok(next)
     }
 
@@ -1302,14 +1308,13 @@ mod tests {
     ) -> ControllerSession {
         guardian.controller_lost(old).unwrap();
         let ids: Vec<_> = guardian.inventory().collect();
+        let revision = guardian
+            .minimum_dispatch_revision
+            .map_or_else(PersistenceRevision::first, |minimum| {
+                minimum.checked_next().unwrap()
+            });
         guardian
-            .begin_reconciliation(
-                guardian.instance_id(),
-                &ids,
-                guardian
-                    .minimum_dispatch_revision
-                    .unwrap_or(PersistenceRevision::first()),
-            )
+            .begin_reconciliation(guardian.instance_id(), &ids, revision)
             .unwrap()
     }
 
@@ -1614,6 +1619,35 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_reconciliation_requires_a_newer_interruption_revision() {
+        let attempt = AttemptId::new(25);
+        let (mut guardian, old, audit) = fixture(attempt, tick(100));
+        guardian.controller_lost(old).unwrap();
+        let ids: Vec<_> = guardian.inventory().collect();
+        let floor = PersistenceRevision::first();
+        let first = guardian
+            .begin_reconciliation(guardian.instance_id(), &ids, floor)
+            .unwrap();
+
+        guardian.controller_lost(first).unwrap();
+        assert_eq!(guardian.reconciliation_floor(), None);
+        assert_eq!(
+            guardian.begin_reconciliation(guardian.instance_id(), &ids, floor),
+            Err(GuardianError::StaleDispatchRevision)
+        );
+        assert_eq!(guardian.state(), GuardianState::DetachedFenced);
+
+        let next_floor = floor.checked_next().unwrap();
+        let second = guardian
+            .begin_reconciliation(guardian.instance_id(), &ids, next_floor)
+            .unwrap();
+        assert_eq!(second.generation(), first.generation() + 1);
+        assert_eq!(guardian.reconciliation_floor(), Some(next_floor));
+        assert!(audit.executions.borrow().is_empty());
+        assert_no_cleanup(&audit);
+    }
+
+    #[test]
     fn repeated_reconciliation_cannot_lower_the_installed_dispatch_floor() {
         let attempt = AttemptId::new(23);
         let (mut guardian, old, audit) = fixture(attempt, tick(100));
@@ -1654,8 +1688,9 @@ mod tests {
             .unwrap();
         assert_eq!(guardian.minimum_dispatch_revision, Some(floor));
         assert_eq!(guardian.reconciliation_floor(), None);
+        let final_floor = floor.checked_next().unwrap();
         let final_session = reconnect(&mut guardian, next);
-        assert_eq!(guardian.reconciliation_floor(), Some(floor));
+        assert_eq!(guardian.reconciliation_floor(), Some(final_floor));
         guardian.authority_lost(final_session).unwrap();
         assert_eq!(guardian.reconciliation_floor(), None);
         assert_eq!(guardian.minimum_dispatch_revision, Some(floor));

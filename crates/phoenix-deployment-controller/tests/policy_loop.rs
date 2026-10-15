@@ -2639,6 +2639,52 @@ fn recovery_cannot_use_a_different_committed_interruption_than_the_guardian_floo
 }
 
 #[test]
+fn held_interruption_cannot_restart_after_unfinished_reconciliation() {
+    let mut store = TestStore::in_memory().unwrap();
+    let committed = start(128, 1, root()).persist(&mut store).unwrap();
+    let (mut guardian, old, audit) = audited_guardian_fixture(128, FakeOs::default());
+    let mut policy = PolicyLoop::from_committed_for_guardian(committed, &guardian, old).unwrap();
+    policy
+        .interrupt_with_guardian(&mut guardian, old, &mut store)
+        .unwrap();
+    let held = store.load_attempt(AttemptId::new(128)).unwrap().unwrap();
+    let held_revision = held.persistence_revision();
+    let slots: Vec<_> = guardian.inventory().collect();
+    let first = policy
+        .begin_guardian_reconciliation(&mut guardian, old, &slots)
+        .unwrap();
+    policy
+        .recover_with_guardian(&mut guardian, first, &mut store)
+        .unwrap();
+    policy
+        .interrupt_with_guardian(&mut guardian, first, &mut store)
+        .unwrap();
+    let current_revision = loaded_revision(&mut store, 128);
+    assert!(current_revision > held_revision);
+
+    let mut historical =
+        PolicyLoop::from_loaded_interruption_for_guardian(held, &guardian, first).unwrap();
+    assert!(matches!(
+        historical.begin_guardian_reconciliation(&mut guardian, first, &slots),
+        Err(GuardianLoopError::Guardian(
+            GuardianError::StaleDispatchRevision
+        ))
+    ));
+    assert_eq!(guardian.state(), GuardianState::DetachedFenced);
+    assert_eq!(guardian.reconciliation_floor(), None);
+
+    let loaded = store.load_attempt(AttemptId::new(128)).unwrap().unwrap();
+    let mut current =
+        PolicyLoop::from_loaded_interruption_for_guardian(loaded, &guardian, first).unwrap();
+    let second = current
+        .begin_guardian_reconciliation(&mut guardian, first, &slots)
+        .unwrap();
+    assert_eq!(second.generation(), first.generation() + 1);
+    assert_eq!(guardian.reconciliation_floor(), Some(current_revision));
+    assert!(audit.borrow().is_empty());
+}
+
+#[test]
 fn historical_sampling_recovery_cannot_reactivate_a_later_interruption() {
     for retain_bound_loop in [false, true] {
         let mut store = TestStore::in_memory().unwrap();

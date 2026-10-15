@@ -136,6 +136,7 @@ value GuardianBinding {
     state: GuardianSessionState
     minimum_dispatch_revision: Integer?
     reconciliation_floor: Integer?
+    latest_reconciliation_revision: Integer?
 }
 
 value StatusSummary {
@@ -824,7 +825,9 @@ contract SurvivingGuardianBoundary {
         -- Reconciliation is bound to the exact committed interruption revision.
         -- Observation tickets and the final reconciliation permit cannot predate
         -- that floor, and a later session never lowers the installed dispatch floor.
-        -- Retained recovery plans from an older session cannot activate a guardian.
+        -- Every replacement session starts from an interruption revision strictly
+        -- newer than every earlier reconciliation session, including one that did not
+        -- finish. Retained historical evidence cannot reactivate a guardian.
 
     @invariant GuardianLossFailsStop
         -- Guardian loss, replacement, or deadline expiry preserves unresolved
