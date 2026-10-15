@@ -3,6 +3,7 @@
 fn main() -> Result<(), String> {
     use phoenix_deployment_controller::native_guardian::GuardianClient;
     use std::{
+        io::Write,
         path::Path,
         thread,
         time::{Duration, Instant},
@@ -36,7 +37,6 @@ fn main() -> Result<(), String> {
         hello.state,
         slots.len()
     );
-    use std::io::Write;
     std::io::stdout()
         .flush()
         .map_err(|error| error.to_string())?;
