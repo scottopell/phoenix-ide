@@ -4,13 +4,55 @@ use std::{
 };
 
 use phoenix_deployment_controller::{
-    AdministrativeRiskAcceptance, ArtifactDigest, AttemptId, BirthToken, CandidateDiscovery,
-    CandidateVerification, ChildIdentityObservation, CleanupOutcome, CompatibilityBoundary,
-    ControllerOs, CpuContentionBasisPoints, DeploymentAttempt, DiscoveryId, FullCommitSha,
-    IdentityObservation, MemoryPressure, MonotonicTick, ObservationFailure, OsEffect, OsQueryError,
-    Phase, ProcessId, ProcessIdentity, ResourceCapacity, ResourceContention, ResourcePolicy,
-    ResourceSample, RetainedCandidateIdentity, Signal, SignalOutcome, StableChildEvidence,
+    AdministrativeRiskAcceptance, ArtifactDigest, AttemptId, AttemptStore, BirthToken,
+    CandidateDiscovery, CandidateVerification, ChildIdentityObservation, CleanupOutcome,
+    CommittedTransition, CompatibilityBoundary, ControllerOs, CpuContentionBasisPoints,
+    DeploymentAttempt, DiscoveryId, FullCommitSha, IdentityObservation, MemoryPressure,
+    MonotonicTick, ObservationFailure, OsEffect, OsQueryError, Phase, ProcessId, ProcessIdentity,
+    ResourceCapacity, ResourceContention, ResourcePolicy, ResourceSample,
+    RetainedCandidateIdentity, Signal, SignalOutcome, StableChildEvidence, Transition,
 };
+
+#[derive(Default)]
+struct FakeStore {
+    checkpoints: Vec<(AttemptId, Phase)>,
+}
+
+impl AttemptStore for FakeStore {
+    type Error = std::convert::Infallible;
+
+    fn persist(&mut self, checkpoint: &DeploymentAttempt) -> Result<(), Self::Error> {
+        self.checkpoints
+            .push((checkpoint.attempt_id(), checkpoint.phase()));
+        Ok(())
+    }
+}
+
+struct FailingStore;
+
+impl AttemptStore for FailingStore {
+    type Error = &'static str;
+
+    fn persist(&mut self, _checkpoint: &DeploymentAttempt) -> Result<(), Self::Error> {
+        Err("durable write failed")
+    }
+}
+
+trait PersistForTest {
+    fn persisted(self) -> CommittedTransition;
+}
+
+impl PersistForTest for Transition {
+    fn persisted(self) -> CommittedTransition {
+        let mut store = FakeStore::default();
+        self.persist(&mut store)
+            .expect("in-memory checkpoint persistence succeeds")
+    }
+}
+
+fn persisted_effects(transition: &Transition) -> Vec<OsEffect> {
+    transition.clone().persisted().after_persist().to_vec()
+}
 
 #[derive(Clone, Copy)]
 struct FakeProcess {
@@ -121,6 +163,17 @@ impl ControllerOs for FakeOs {
 }
 
 #[test]
+fn failed_checkpoint_write_does_not_produce_a_committed_transition() {
+    let root = identity(5_000, 1_792_031_100, 1);
+    let transition =
+        DeploymentAttempt::start(AttemptId::new(90), MonotonicTick::new(30), policy(), root);
+    let error = transition
+        .persist(&mut FailingStore)
+        .expect_err("OS effects require a successful checkpoint write");
+    assert_eq!(error, "durable write failed");
+}
+
+#[test]
 fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_closeout() {
     let root = identity(5_188, 1_792_031_138, 344_344);
     let child = identity(5_189, 1_792_031_138, 400_001);
@@ -142,10 +195,10 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
         .child_discovered(root, child.pid())
         .expect("verified parent admits a discovery epoch");
     assert_eq!(
-        transition.after_persist(),
-        &[OsEffect::AcquireChildIdentity { discovery }]
+        persisted_effects(&transition),
+        vec![OsEffect::AcquireChildIdentity { discovery }]
     );
-    let (state, _) = transition.into_parts();
+    let (state, _) = transition.persisted().into_parts();
 
     os.remove(child);
     let observation = os.acquire_child_identity(discovery);
@@ -156,6 +209,7 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
     let (state, _) = state
         .child_observed(discovery, observation)
         .expect("ESRCH remains typed evidence")
+        .persisted()
         .into_parts();
     assert_eq!(state.phase(), Phase::AwaitingBirthEvidence);
 
@@ -168,10 +222,10 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
         .retry_unresolved_discoveries()
         .expect("bounded reconciliation can retry");
     assert_eq!(
-        retry.after_persist(),
-        &[OsEffect::AcquireChildIdentity { discovery }]
+        persisted_effects(&retry),
+        vec![OsEffect::AcquireChildIdentity { discovery }]
     );
-    let (state, _) = retry.into_parts();
+    let (state, _) = retry.persisted().into_parts();
     let replacement_observation = os.acquire_child_identity(discovery);
     assert_eq!(
         replacement_observation,
@@ -180,6 +234,7 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
     let (state, _) = state
         .child_observed(discovery, replacement_observation)
         .expect("PID reuse cannot resolve the old discovery")
+        .persisted()
         .into_parts();
 
     os.remove(root);
@@ -194,8 +249,8 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
         transition.checkpoint().cleanup_outcome(),
         CleanupOutcome::UnresolvedRisk
     );
-    assert!(transition.after_persist().is_empty());
-    let (state, _) = transition.into_parts();
+    assert!(persisted_effects(&transition).is_empty());
+    let (state, _) = transition.persisted().into_parts();
 
     let closed = state
         .accept_administrative_risk(AdministrativeRiskAcceptance::for_attempt(AttemptId::new(1)))
@@ -205,7 +260,7 @@ fn transient_child_esrch_before_birth_stays_unresolved_until_administrative_clos
         closed.checkpoint().cleanup_outcome(),
         CleanupOutcome::AdministrativeRiskAccepted
     );
-    assert!(closed.after_persist().is_empty());
+    assert!(persisted_effects(&closed).is_empty());
     assert!(os.signalled.is_empty());
     assert_eq!(
         closed
@@ -242,24 +297,25 @@ fn acquired_child_remains_owned_after_reparenting() {
     let (mut state, effects) = state
         .ownership_scan_completed()
         .expect("all discoveries have stable identities")
+        .persisted()
         .into_parts();
     state = apply_identity_observations(state, &effects, &mut os);
     let signals = state
         .request_owned_signals(Signal::Terminate)
         .expect("stable identities authorize bounded signals");
-    assert!(signals
-        .after_persist()
-        .contains(&OsEffect::SignalExactIdentity {
+    assert!(
+        persisted_effects(&signals).contains(&OsEffect::SignalExactIdentity {
             identity: child,
             signal: Signal::Terminate,
-        }));
+        })
+    );
 
-    let (mut state, effects) = signals.into_parts();
+    let (mut state, effects) = signals.persisted().into_parts();
     apply_signal_effects(&effects, &mut os);
     let settled = state
         .cleanup_signals_settled()
         .expect("TERM phase settles into verification");
-    (state, _) = settled.into_parts();
+    (state, _) = settled.persisted().into_parts();
     let effects: Vec<_> = state
         .ownership_tree()
         .expect("tree remains available")
@@ -301,18 +357,19 @@ fn pid_reuse_is_absence_of_owned_identity_not_signal_authority() {
     let (mut state, effects) = state
         .ownership_scan_completed()
         .expect("stable ownership discovery completes")
+        .persisted()
         .into_parts();
     state = apply_identity_observations(state, &effects, &mut os);
     let signals = state
         .request_owned_signals(Signal::Terminate)
         .expect("only currently matching identities can be signalled");
-    assert!(!signals.after_persist().iter().any(|effect| {
+    assert!(!persisted_effects(&signals).iter().any(|effect| {
         matches!(
             effect,
             OsEffect::SignalExactIdentity { identity, .. } if *identity == replacement
         )
     }));
-    assert!(signals.after_persist().is_empty());
+    assert!(persisted_effects(&signals).is_empty());
 }
 
 #[test]
@@ -326,11 +383,13 @@ fn recovery_reobserves_owned_identities_before_repeating_mutation() {
     let (state, _) = state
         .ownership_scan_completed()
         .expect("empty child discovery can enter cleanup")
+        .persisted()
         .into_parts();
     let deadline = state.deadline();
     let (state, _) = state
         .interrupt()
         .expect("active cleanup interruption is durable")
+        .persisted()
         .into_parts();
     assert_eq!(state.phase(), Phase::Interrupted);
 
@@ -338,22 +397,21 @@ fn recovery_reobserves_owned_identities_before_repeating_mutation() {
     assert_eq!(recovered.checkpoint().phase(), Phase::Recovering);
     assert_eq!(recovered.checkpoint().deadline(), deadline);
     assert_eq!(
-        recovered.after_persist(),
-        &[OsEffect::ObserveIdentity { identity: root }]
+        persisted_effects(&recovered),
+        vec![OsEffect::ObserveIdentity { identity: root }]
     );
-    assert!(!recovered
-        .after_persist()
+    assert!(!persisted_effects(&recovered)
         .iter()
         .any(|effect| matches!(effect, OsEffect::SignalExactIdentity { .. })));
 
-    let (state, effects) = recovered.into_parts();
+    let (state, effects) = recovered.persisted().into_parts();
     let state = apply_identity_observations(state, &effects, &mut os);
     let signals = state
         .request_owned_signals(Signal::Terminate)
         .expect("fresh identity match restores signal authority");
     assert_eq!(
-        signals.after_persist(),
-        &[OsEffect::SignalExactIdentity {
+        persisted_effects(&signals),
+        vec![OsEffect::SignalExactIdentity {
             identity: root,
             signal: Signal::Terminate,
         }]
@@ -371,6 +429,7 @@ fn migration_invocation_recovery_is_exact_candidate_forward_only() {
     let (state, _) = state
         .record_migration_invoked(candidate)
         .expect("migration invocation is durably fenced")
+        .persisted()
         .into_parts();
     assert_eq!(
         state.compatibility_boundary(),
@@ -379,12 +438,13 @@ fn migration_invocation_recovery_is_exact_candidate_forward_only() {
     let (state, _) = state
         .interrupt()
         .expect("post-invocation interruption persists")
+        .persisted()
         .into_parts();
     let recovered = state.recover().expect("forward recovery remains available");
     assert_eq!(recovered.checkpoint().phase(), Phase::ForwardRecovery);
     assert_eq!(
-        recovered.after_persist(),
-        &[OsEffect::ReverifyRetainedCandidate { candidate }]
+        persisted_effects(&recovered),
+        vec![OsEffect::ReverifyRetainedCandidate { candidate }]
     );
 }
 
@@ -395,6 +455,7 @@ fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
     let (state, _) = state
         .ownership_scan_completed()
         .expect("empty discovery enters cleanup")
+        .persisted()
         .into_parts();
     let (state, _) = state
         .identity_observed(
@@ -402,6 +463,7 @@ fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
             IdentityObservation::Unresolved(ObservationFailure::PermissionDenied),
         )
         .expect("permission uncertainty remains typed")
+        .persisted()
         .into_parts();
     let transition = state
         .deadline_reached(MonotonicTick::new(30))
@@ -410,7 +472,7 @@ fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
         transition.checkpoint().phase(),
         Phase::AdministrativeCloseoutRequired
     );
-    assert!(transition.after_persist().is_empty());
+    assert!(persisted_effects(&transition).is_empty());
 }
 
 #[test]
@@ -420,6 +482,7 @@ fn administrative_acceptance_is_bound_to_the_attempt() {
     let (state, _) = state
         .ownership_scan_completed()
         .expect("empty discovery enters cleanup")
+        .persisted()
         .into_parts();
     let (state, _) = state
         .identity_observed(
@@ -427,10 +490,12 @@ fn administrative_acceptance_is_bound_to_the_attempt() {
             IdentityObservation::Unresolved(ObservationFailure::PermissionDenied),
         )
         .expect("permission uncertainty remains typed")
+        .persisted()
         .into_parts();
     let (state, _) = state
         .deadline_reached(MonotonicTick::new(30))
         .expect("uncertainty requires closeout")
+        .persisted()
         .into_parts();
     let error = state
         .accept_administrative_risk(AdministrativeRiskAcceptance::for_attempt(AttemptId::new(
@@ -448,6 +513,7 @@ fn contention_blocks_only_when_sustained_across_the_measurement_window() {
     let root = identity(590, 48, 1);
     let (mut state, _) =
         DeploymentAttempt::start(AttemptId::new(3), MonotonicTick::new(30), policy(), root)
+            .persisted()
             .into_parts();
     let mut congested = ample_sample(0);
     congested.contention.cpu =
@@ -455,17 +521,20 @@ fn contention_blocks_only_when_sustained_across_the_measurement_window() {
     (state, _) = state
         .record_resource_sample(congested)
         .expect("first measurement remains nonterminal")
+        .persisted()
         .into_parts();
     for sequence in 1..3 {
         (state, _) = state
             .record_resource_sample(ample_sample(sequence))
             .expect("ordered measurement")
+            .persisted()
             .into_parts();
     }
     assert_eq!(state.phase(), Phase::OwnershipDiscovery);
 
     let (mut state, _) =
         DeploymentAttempt::start(AttemptId::new(4), MonotonicTick::new(30), policy(), root)
+            .persisted()
             .into_parts();
     for sequence in 0..3 {
         let mut congested = ample_sample(sequence);
@@ -474,6 +543,7 @@ fn contention_blocks_only_when_sustained_across_the_measurement_window() {
         (state, _) = state
             .record_resource_sample(congested)
             .expect("three sustained congested measurements")
+            .persisted()
             .into_parts();
     }
     assert_eq!(state.phase(), Phase::ResourceBlocked);
@@ -483,14 +553,14 @@ fn contention_blocks_only_when_sustained_across_the_measurement_window() {
 fn admission_requires_consecutive_capacity_and_contention_measurements() {
     let root = identity(600, 50, 1);
     let start = DeploymentAttempt::start(AttemptId::new(2), MonotonicTick::new(30), policy(), root);
-    let (mut state, _) = start.into_parts();
+    let (mut state, _) = start.persisted().into_parts();
 
     for sequence in 0..2 {
         let transition = state
             .record_resource_sample(ample_sample(sequence))
             .expect("ordered sample");
         assert_eq!(transition.checkpoint().phase(), Phase::ResourceSampling);
-        (state, _) = transition.into_parts();
+        (state, _) = transition.persisted().into_parts();
     }
     let admitted = state
         .record_resource_sample(ample_sample(2))
@@ -501,11 +571,13 @@ fn admission_requires_consecutive_capacity_and_contention_measurements() {
 fn admitted_attempt(root: ProcessIdentity) -> DeploymentAttempt {
     let (mut state, _) =
         DeploymentAttempt::start(AttemptId::new(1), MonotonicTick::new(30), policy(), root)
+            .persisted()
             .into_parts();
     for sequence in 0..3 {
         (state, _) = state
             .record_resource_sample(ample_sample(sequence))
             .expect("ample ordered resource sample")
+            .persisted()
             .into_parts();
     }
     assert_eq!(state.phase(), Phase::OwnershipDiscovery);
@@ -521,11 +593,12 @@ fn acquire_child(
     let (transition, discovery) = state
         .child_discovered(parent, child.pid())
         .expect("known parent can discover child");
-    let (state, _) = transition.into_parts();
+    let (state, _) = transition.persisted().into_parts();
     let observation = os.acquire_child_identity(discovery);
     let (state, _) = state
         .child_observed(discovery, observation)
         .expect("stable child observation is accepted")
+        .persisted()
         .into_parts();
     state
 }
@@ -541,6 +614,7 @@ fn apply_identity_observations(
             (state, _) = state
                 .identity_observed(*identity, observation)
                 .expect("effect names an owned identity")
+                .persisted()
                 .into_parts();
         }
     }

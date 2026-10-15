@@ -183,7 +183,38 @@ pub struct Transition {
     after_persist: Vec<OsEffect>,
 }
 
+pub trait AttemptStore {
+    type Error;
+
+    /// # Errors
+    /// Returns the store's typed error when the complete checkpoint is not durable.
+    fn persist(&mut self, checkpoint: &DeploymentAttempt) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedTransition {
+    checkpoint: DeploymentAttempt,
+    after_persist: Vec<OsEffect>,
+}
+
 impl Transition {
+    #[must_use]
+    pub fn checkpoint(&self) -> &DeploymentAttempt {
+        &self.checkpoint
+    }
+
+    /// # Errors
+    /// Returns the store's error and does not expose OS effects when persistence fails.
+    pub fn persist<S: AttemptStore>(self, store: &mut S) -> Result<CommittedTransition, S::Error> {
+        store.persist(&self.checkpoint)?;
+        Ok(CommittedTransition {
+            checkpoint: self.checkpoint,
+            after_persist: self.after_persist,
+        })
+    }
+}
+
+impl CommittedTransition {
     #[must_use]
     pub fn checkpoint(&self) -> &DeploymentAttempt {
         &self.checkpoint

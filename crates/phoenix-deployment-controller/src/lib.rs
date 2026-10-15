@@ -22,7 +22,7 @@ pub use resource::{
     ResourceSample, ResourceWindow, SustainedResourceEvidence,
 };
 pub use state::{
-    ActiveAttempt, AdministrativeRiskAcceptance, AttemptId, CleanupOutcome, CompatibilityBoundary,
-    DeploymentAttempt, MonotonicTick, OwnershipAttempt, Phase, ResourceSamplingAttempt, Transition,
-    TransitionError,
+    ActiveAttempt, AdministrativeRiskAcceptance, AttemptId, AttemptStore, CleanupOutcome,
+    CommittedTransition, CompatibilityBoundary, DeploymentAttempt, MonotonicTick, OwnershipAttempt,
+    Phase, ResourceSamplingAttempt, Transition, TransitionError,
 };
