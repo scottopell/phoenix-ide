@@ -177,16 +177,9 @@ pub fn serve_until<E: GuardianExecutor>(
                     continue;
                 }
                 stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(IO_SLICE))?;
+                stream.set_write_timeout(Some(IO_SLICE))?;
                 while Instant::now() < until {
-                    let slice = until
-                        .saturating_duration_since(Instant::now())
-                        .min(IO_SLICE);
-                    if slice.is_zero() {
-                        break;
-                    }
-                    let timeout = slice.max(Duration::from_millis(1));
-                    stream.set_read_timeout(Some(timeout))?;
-                    stream.set_write_timeout(Some(timeout))?;
                     if serve_once(&mut stream, server).is_err() {
                         break;
                     }
