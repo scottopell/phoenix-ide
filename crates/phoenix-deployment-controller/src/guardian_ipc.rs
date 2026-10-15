@@ -33,6 +33,11 @@ pub struct Envelope<T> {
     pub body: T,
 }
 
+/// Serialize a versioned, length-prefixed frame.
+///
+/// # Errors
+/// Returns `Malformed` if serialization fails, `Oversized` if the encoded
+/// envelope exceeds the frame limit, or `Io` if either write fails.
 pub fn write_frame<T: Serialize>(out: &mut impl Write, body: &T) -> Result<(), CodecError> {
     let bytes = serde_json::to_vec(&Envelope {
         version: PROTOCOL_VERSION,
@@ -42,11 +47,17 @@ pub fn write_frame<T: Serialize>(out: &mut impl Write, body: &T) -> Result<(), C
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(CodecError::Oversized);
     }
-    out.write_all(&(bytes.len() as u32).to_be_bytes())
-        .map_err(CodecError::Io)?;
+    let len = u32::try_from(bytes.len()).map_err(|_| CodecError::Oversized)?;
+    out.write_all(&len.to_be_bytes()).map_err(CodecError::Io)?;
     out.write_all(&bytes).map_err(CodecError::Io)
 }
 
+/// Read a versioned, length-prefixed frame.
+///
+/// # Errors
+/// Returns `Io` on a failed read, `Empty` or `Oversized` for an invalid
+/// length, `Malformed` for invalid JSON, or `UnsupportedVersion` for an
+/// envelope with a different protocol version.
 pub fn read_frame<T: for<'de> Deserialize<'de>>(input: &mut impl Read) -> Result<T, CodecError> {
     let mut prefix = [0; 4];
     input.read_exact(&mut prefix).map_err(CodecError::Io)?;
@@ -569,6 +580,11 @@ pub struct GuardianServer<E: GuardianExecutor> {
     next_admission: u64,
 }
 impl<E: GuardianExecutor> GuardianServer<E> {
+    /// Construct a server bound to an authenticated policy session.
+    ///
+    /// # Errors
+    /// Returns the guardian's authentication error if the supplied session
+    /// does not match its instance, attempt, deadline, or active authority.
     pub fn new(guardian: Guardian<E>, session: ControllerSession) -> Result<Self, GuardianError> {
         guardian.authenticate_policy_binding(
             session,
@@ -705,6 +721,167 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             Err(error) => Response::Refused(error),
         }
     }
+    fn begin_reconciliation(
+        &mut self,
+        instance: u64,
+        inventory: Vec<WireSlot>,
+        interruption_revision: u64,
+    ) -> Result<Response, WireError> {
+        Ok({
+            if instance != self.guardian.instance_id().get() {
+                return Err(GuardianError::InstanceMismatch.into());
+            }
+            let slots = inventory
+                .into_iter()
+                .map(|slot| self.slot(slot))
+                .collect::<Result<Vec<_>, _>>()?;
+            let revision = revision(interruption_revision)?;
+            if self.interruption != Some(revision) {
+                return Err(WireError::MissingProof);
+            }
+            let session = self
+                .guardian
+                .begin_reconciliation(self.guardian.instance_id(), &slots, revision)
+                .map_err(WireError::from)?;
+            self.interruption = None;
+            self.session = session;
+            self.staged.clear();
+            self.refused.clear();
+            self.admissions.clear();
+            self.finish_proof = None;
+            self.ack_proofs.clear();
+            Response::ReconciliationBegun {
+                session: session.into(),
+            }
+        })
+    }
+    fn finish_reconciliation(
+        &mut self,
+        session: WireSession,
+        applied_revision: u64,
+        now: u64,
+    ) -> Result<Response, WireError> {
+        Ok({
+            let session = self.resolve_session(session)?;
+            let revision = revision(applied_revision)?;
+            if self.finish_proof.as_ref().map(|(stored, _)| *stored) != Some(revision) {
+                return Err(WireError::MissingProof);
+            }
+            let (_, permit) = self.finish_proof.take().ok_or(WireError::MissingProof)?;
+            self.guardian
+                .finish_reconciliation(session, permit, MonotonicTick::new(now))
+                .map_err(WireError::from)?;
+            Response::ReconciliationFinished
+        })
+    }
+    fn ack_after_applied_revision(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        applied_revision: u64,
+    ) -> Result<Response, WireError> {
+        Ok({
+            let session = self.resolve_session(session)?;
+            let key = self.resolve_key(key)?;
+            let applied_revision = revision(applied_revision)?;
+            if applied_revision < key.revision() {
+                return Err(GuardianError::StaleDispatchRevision.into());
+            }
+            let position = self
+                .ack_proofs
+                .iter()
+                .position(|(stored_key, stored_revision, _)| {
+                    *stored_key == key && *stored_revision == applied_revision
+                })
+                .ok_or(WireError::MissingProof)?;
+            let (_, _, ack) = self.ack_proofs.swap_remove(position);
+            self.guardian
+                .ack_result(session, ack)
+                .map_err(WireError::from)?;
+            Response::Acked
+        })
+    }
+    fn dispatch_admit(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        effect: WireEffect,
+    ) -> Result<Response, WireError> {
+        Ok({
+            let session = self.resolve_session(session)?;
+            self.guardian
+                .authenticate_policy_session(
+                    session,
+                    self.guardian.attempt_id(),
+                    self.guardian.original_deadline(),
+                )
+                .map_err(WireError::from)?;
+            if self
+                .admissions
+                .values()
+                .any(|(_, ticket)| WireKey::try_from(ticket.key()).ok() == Some(key))
+            {
+                return Err(WireError::AdmissionReplayed);
+            }
+            let position = self
+                .staged
+                .iter()
+                .position(|ticket| {
+                    WireKey::try_from(ticket.key()).ok() == Some(key)
+                        && WireEffect::from(ticket.effect()) == effect
+                })
+                .ok_or(WireError::NoStagedTicket)?;
+            if self
+                .admissions
+                .values()
+                .any(|(_, ticket)| ticket.key() == self.staged[position].key())
+            {
+                return Err(WireError::AdmissionReplayed);
+            }
+            let handle = self.next_admission;
+            self.next_admission = self
+                .next_admission
+                .checked_add(1)
+                .ok_or(WireError::InvalidValue)?;
+            self.admissions
+                .insert(handle, (session, self.staged.swap_remove(position)));
+            Response::Admitted { admission: handle }
+        })
+    }
+    fn dispatch_submit(
+        &mut self,
+        session: WireSession,
+        admission: u64,
+        now: u64,
+    ) -> Result<Response, WireError> {
+        Ok({
+            let session = self.resolve_session(session)?;
+            // Remove BEFORE execution; an ambiguous lost response cannot issue this handle twice.
+            let (bound_session, ticket) = self
+                .admissions
+                .remove(&admission)
+                .ok_or(WireError::UnknownAdmission)?;
+            if bound_session != session {
+                self.refused.push(ticket);
+                return Err(WireError::AdmissionMismatch);
+            }
+            match self
+                .guardian
+                .submit_policy_ticket(session, ticket, MonotonicTick::new(now))
+            {
+                Ok(key) => Response::Submitted {
+                    key: key.try_into()?,
+                },
+                Err(crate::guardian::PolicySubmissionError::Refused { error, ticket }) => {
+                    self.refused.push(ticket);
+                    return Err(error.into());
+                }
+                Err(crate::guardian::PolicySubmissionError::ExecutorCorrelationMismatch) => {
+                    return Err(GuardianError::ExecutorCorrelationMismatch.into())
+                }
+            }
+        })
+    }
     fn try_handle(&mut self, request: Request) -> Result<Response, WireError> {
         Ok(match request {
             Request::Hello => Response::Hello {
@@ -731,49 +908,12 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 instance,
                 inventory,
                 interruption_revision,
-            } => {
-                if instance != self.guardian.instance_id().get() {
-                    return Err(GuardianError::InstanceMismatch.into());
-                }
-                let slots = inventory
-                    .into_iter()
-                    .map(|slot| self.slot(slot))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let revision = revision(interruption_revision)?;
-                if self.interruption != Some(revision) {
-                    return Err(WireError::MissingProof);
-                }
-                let session = self
-                    .guardian
-                    .begin_reconciliation(self.guardian.instance_id(), &slots, revision)
-                    .map_err(WireError::from)?;
-                self.interruption = None;
-                self.session = session;
-                self.staged.clear();
-                self.refused.clear();
-                self.admissions.clear();
-                self.finish_proof = None;
-                self.ack_proofs.clear();
-                Response::ReconciliationBegun {
-                    session: session.into(),
-                }
-            }
+            } => self.begin_reconciliation(instance, inventory, interruption_revision)?,
             Request::FinishReconciliation {
                 session,
                 applied_revision,
                 now,
-            } => {
-                let session = self.resolve_session(session)?;
-                let revision = revision(applied_revision)?;
-                if self.finish_proof.as_ref().map(|(stored, _)| *stored) != Some(revision) {
-                    return Err(WireError::MissingProof);
-                }
-                let (_, permit) = self.finish_proof.take().ok_or(WireError::MissingProof)?;
-                self.guardian
-                    .finish_reconciliation(session, permit, MonotonicTick::new(now))
-                    .map_err(WireError::from)?;
-                Response::ReconciliationFinished
-            }
+            } => self.finish_reconciliation(session, applied_revision, now)?,
             Request::ObserveSlot { slot } => {
                 let slot = self.slot(slot)?;
                 Response::SlotObserved(
@@ -791,26 +931,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 session,
                 key,
                 applied_revision,
-            } => {
-                let session = self.resolve_session(session)?;
-                let key = self.resolve_key(key)?;
-                let applied_revision = revision(applied_revision)?;
-                if applied_revision < key.revision() {
-                    return Err(GuardianError::StaleDispatchRevision.into());
-                }
-                let position = self
-                    .ack_proofs
-                    .iter()
-                    .position(|(stored_key, stored_revision, _)| {
-                        *stored_key == key && *stored_revision == applied_revision
-                    })
-                    .ok_or(WireError::MissingProof)?;
-                let (_, _, ack) = self.ack_proofs.swap_remove(position);
-                self.guardian
-                    .ack_result(session, ack)
-                    .map_err(WireError::from)?;
-                Response::Acked
-            }
+            } => self.ack_after_applied_revision(session, key, applied_revision)?,
             Request::ReserveSignalRound {
                 session,
                 revision: rev,
@@ -826,83 +947,22 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 session,
                 key,
                 effect,
-            } => {
-                let session = self.resolve_session(session)?;
-                self.guardian
-                    .authenticate_policy_session(
-                        session,
-                        self.guardian.attempt_id(),
-                        self.guardian.original_deadline(),
-                    )
-                    .map_err(WireError::from)?;
-                if self
-                    .admissions
-                    .values()
-                    .any(|(_, ticket)| WireKey::try_from(ticket.key()).ok() == Some(key))
-                {
-                    return Err(WireError::AdmissionReplayed);
-                }
-                let position = self
-                    .staged
-                    .iter()
-                    .position(|ticket| {
-                        WireKey::try_from(ticket.key()).ok() == Some(key)
-                            && WireEffect::from(ticket.effect()) == effect
-                    })
-                    .ok_or(WireError::NoStagedTicket)?;
-                if self
-                    .admissions
-                    .values()
-                    .any(|(_, ticket)| ticket.key() == self.staged[position].key())
-                {
-                    return Err(WireError::AdmissionReplayed);
-                }
-                let handle = self.next_admission;
-                self.next_admission = self
-                    .next_admission
-                    .checked_add(1)
-                    .ok_or(WireError::InvalidValue)?;
-                self.admissions
-                    .insert(handle, (session, self.staged.swap_remove(position)));
-                Response::Admitted { admission: handle }
-            }
+            } => self.dispatch_admit(session, key, effect)?,
             Request::DispatchSubmit {
                 session,
                 admission,
                 now,
-            } => {
-                let session = self.resolve_session(session)?;
-                // Remove BEFORE execution; an ambiguous lost response cannot issue this handle twice.
-                let (bound_session, ticket) = self
-                    .admissions
-                    .remove(&admission)
-                    .ok_or(WireError::UnknownAdmission)?;
-                if bound_session != session {
-                    self.refused.push(ticket);
-                    return Err(WireError::AdmissionMismatch);
-                }
-                match self
-                    .guardian
-                    .submit_policy_ticket(session, ticket, MonotonicTick::new(now))
-                {
-                    Ok(key) => Response::Submitted {
-                        key: key.try_into()?,
-                    },
-                    Err(crate::guardian::PolicySubmissionError::Refused { error, ticket }) => {
-                        self.refused.push(ticket);
-                        return Err(error.into());
-                    }
-                    Err(crate::guardian::PolicySubmissionError::ExecutorCorrelationMismatch) => {
-                        return Err(GuardianError::ExecutorCorrelationMismatch.into())
-                    }
-                }
-            }
+            } => self.dispatch_submit(session, admission, now)?,
         })
     }
 }
 /// Handle one request on a Unix-domain stream. Any framing/transport error
 /// fences the session; a caller must reconcile rather than guessing whether
 /// a submitted effect ran before its response was lost.
+///
+/// # Errors
+/// Returns a framing, serialization, or stream I/O error from reading the
+/// request or writing its response. On error, the server fences the session.
 pub fn serve_once<E: GuardianExecutor>(
     stream: &mut std::os::unix::net::UnixStream,
     server: &mut GuardianServer<E>,
@@ -944,6 +1004,34 @@ impl From<crate::ObservationFailure> for WireObservationFailure {
         }
     }
 }
+fn wire_resource_sample(sample: &crate::ResourceSample) -> WireResourceSample {
+    WireResourceSample {
+        sequence: sample.sequence,
+        memory_bytes: sample.capacity.available_memory_bytes,
+        storage_bytes: sample.capacity.available_storage_bytes,
+        cpu_basis_points: sample.contention.cpu.get(),
+        memory_pressure: match sample.contention.memory_pressure {
+            crate::MemoryPressure::Nominal => WireMemoryPressure::Normal,
+            crate::MemoryPressure::Warning => WireMemoryPressure::Elevated,
+            crate::MemoryPressure::Critical => WireMemoryPressure::Critical,
+        },
+    }
+}
+fn wire_child_observation(
+    observation: &crate::ChildIdentityObservation,
+) -> WireChildIdentityObservation {
+    match observation {
+        crate::ChildIdentityObservation::Stable(evidence) => WireChildIdentityObservation::Stable {
+            identity: evidence.identity().into(),
+        },
+        crate::ChildIdentityObservation::Unresolved(error) => {
+            WireChildIdentityObservation::Unresolved((*error).into())
+        }
+        crate::ChildIdentityObservation::DifferentProcess(identity) => {
+            WireChildIdentityObservation::DifferentProcess((*identity).into())
+        }
+    }
+}
 impl From<&EffectCompletion> for WireCompletion {
     fn from(value: &EffectCompletion) -> Self {
         match value {
@@ -951,17 +1039,7 @@ impl From<&EffectCompletion> for WireCompletion {
                 sequence: *sequence,
                 result: result
                     .as_ref()
-                    .map(|sample| WireResourceSample {
-                        sequence: sample.sequence,
-                        memory_bytes: sample.capacity.available_memory_bytes,
-                        storage_bytes: sample.capacity.available_storage_bytes,
-                        cpu_basis_points: sample.contention.cpu.get(),
-                        memory_pressure: match sample.contention.memory_pressure {
-                            crate::MemoryPressure::Nominal => WireMemoryPressure::Normal,
-                            crate::MemoryPressure::Warning => WireMemoryPressure::Elevated,
-                            crate::MemoryPressure::Critical => WireMemoryPressure::Critical,
-                        },
-                    })
+                    .map(wire_resource_sample)
                     .map_err(|err| match err {
                         crate::ResourceObservationFailure::TemporarilyUnavailable => {
                             WireResourceError::TemporarilyUnavailable
@@ -992,19 +1070,7 @@ impl From<&EffectCompletion> for WireCompletion {
                 observation,
             } => Self::AcquireChildIdentity {
                 discovery: (*discovery).into(),
-                observation: match observation {
-                    crate::ChildIdentityObservation::Stable(evidence) => {
-                        WireChildIdentityObservation::Stable {
-                            identity: evidence.identity().into(),
-                        }
-                    }
-                    crate::ChildIdentityObservation::Unresolved(error) => {
-                        WireChildIdentityObservation::Unresolved((*error).into())
-                    }
-                    crate::ChildIdentityObservation::DifferentProcess(identity) => {
-                        WireChildIdentityObservation::DifferentProcess((*identity).into())
-                    }
-                },
+                observation: wire_child_observation(observation),
             },
             EffectCompletion::ObserveIdentity {
                 identity,
@@ -1108,7 +1174,9 @@ mod tests {
         ));
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(
-                ((MAX_FRAME_BYTES + 1) as u32).to_be_bytes()
+                u32::try_from(MAX_FRAME_BYTES + 1)
+                    .expect("frame limit plus one fits u32")
+                    .to_be_bytes()
             )),
             Err(CodecError::Oversized)
         ));
@@ -1126,7 +1194,11 @@ mod tests {
         ));
         let mut unknown = Vec::new();
         let bytes = br#"{"version":2,"body":{"op":"hello"}}"#;
-        unknown.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        unknown.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("fixed test JSON fits u32")
+                .to_be_bytes(),
+        );
         unknown.extend_from_slice(bytes);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(unknown)),
@@ -1134,7 +1206,11 @@ mod tests {
         ));
         let mut unknown_op = Vec::new();
         let bytes = br#"{"version":1,"body":{"op":"execute_arbitrary"}}"#;
-        unknown_op.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        unknown_op.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("fixed test JSON fits u32")
+                .to_be_bytes(),
+        );
         unknown_op.extend_from_slice(bytes);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(unknown_op)),
@@ -1158,7 +1234,11 @@ mod tests {
             self.calls.set(self.calls.get() + 1);
             let sequence = match ticket.effect() {
                 OsEffect::SampleResources { sequence } => *sequence,
-                _ => panic!("fixture only samples"),
+                OsEffect::ListChildren { .. }
+                | OsEffect::AcquireChildIdentity { .. }
+                | OsEffect::ObserveIdentity { .. }
+                | OsEffect::SignalExactIdentity { .. }
+                | OsEffect::ReverifyRetainedCandidate { .. } => panic!("fixture only samples"),
             };
             ExecutedEffect::from_parts(
                 ticket.key(),
@@ -1168,7 +1248,7 @@ mod tests {
                 },
             )
         }
-        fn poll_observation_only(&self, _: &()) -> ChildSlotObservation {
+        fn poll_observation_only(&self, &(): &()) -> ChildSlotObservation {
             ChildSlotObservation::Running
         }
     }
