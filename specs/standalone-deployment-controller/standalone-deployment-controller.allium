@@ -274,7 +274,10 @@ rule AdoptStableChildIdentity {
             attempt.phase = recovering
             OwnedIdentityObservationRequested(attempt, identity)
         else:
-            attempt.phase = ownership_discovery
+            if attempt.unresolved_discoveries.count > 0:
+                attempt.phase = awaiting_birth_evidence
+            else:
+                attempt.phase = ownership_discovery
         attempt.last_observation_failure = null
 }
 
