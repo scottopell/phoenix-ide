@@ -15,6 +15,18 @@ pub struct DispatchKey {
 }
 
 impl DispatchKey {
+    pub(crate) const fn from_committed_parts(
+        attempt_id: AttemptId,
+        revision: PersistenceRevision,
+        ordinal: usize,
+    ) -> Self {
+        Self {
+            attempt_id,
+            revision,
+            ordinal,
+        }
+    }
+
     #[must_use]
     pub const fn attempt_id(self) -> AttemptId {
         self.attempt_id
@@ -51,6 +63,10 @@ pub struct DispatchTicket {
 }
 
 impl DispatchTicket {
+    pub(crate) const fn from_committed_parts(key: DispatchKey, effect: OsEffect) -> Self {
+        Self { key, effect }
+    }
+
     #[must_use]
     pub const fn key(&self) -> DispatchKey {
         self.key

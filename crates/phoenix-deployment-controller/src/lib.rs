@@ -13,6 +13,7 @@
 mod candidate;
 mod driver;
 pub mod guardian;
+pub mod guardian_ipc;
 mod identity;
 #[cfg(target_os = "macos")]
 mod macos;

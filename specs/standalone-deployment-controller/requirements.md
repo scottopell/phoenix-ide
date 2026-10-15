@@ -22,7 +22,9 @@ The controller refines the compatibility policy in
 `specs/compatibility/requirements.md`, the independent-owner boundary in
 `specs/production-deployment/requirements.md`, and launchd activation behavior in
 `specs/launchd-deployment/requirements.md`. It does not create a downgrade,
-database rollback, or live-resource replacement guarantee.
+database rollback, or live-resource replacement guarantee. The native runner and
+guardian contract is limited to disposable, same-build pre-adoption qualification;
+it grants no production adoption or installer integration authority.
 
 ---
 
@@ -91,7 +93,7 @@ claiming verified cleanup.
 ### REQ-SDC-005: Exact Owned-Tree Mutation
 
 WHEN the controller requests a process signal
-THE SYSTEM SHALL name a previously acquired PID-plus-birth identity that a fresh
+THE SYSTEM SHALL name an acquired PID-plus-birth identity that a fresh
 observation still matches.
 
 WHEN an owned process is reparented after identity acquisition
@@ -145,7 +147,7 @@ THE SYSTEM SHALL NOT restore process-mutation authority unless cleanup is alread
 verified clean.
 
 THE SYSTEM SHALL NOT replay a signal solely because the interrupted checkpoint
-shows that the signal was previously planned or emitted.
+shows that the signal was planned or emitted.
 
 ---
 
@@ -186,8 +188,10 @@ THE standalone controller SHALL own a SQLite database whose lifecycle is indepen
 of the Phoenix application database under migration.
 
 THE controller database SHALL normalize attempts, resource samples, owned identities,
-pending child scans, discovery epochs, and retained candidates with relational
-constraints rather than storing those child collections in an aggregate blob.
+pending child scans, discovery epochs, retained candidates, guardian bindings,
+controller sessions, retained child inventory, and effect-result custody with
+relational constraints rather than storing those child collections in an aggregate
+blob. Native binding and acknowledgement obligations are defined in REQ-SDC-018.
 
 WHEN controller SQLite authority cannot classify whether a checkpoint committed
 THE SYSTEM SHALL fail stop rather than publish effects or continue admission.
@@ -273,13 +277,14 @@ reverification SHALL remain an observation, not activation permission. Dropping 
 batch or unexecuted ticket SHALL make no operating-system call.
 
 THE dispatch boundary SHALL NOT claim exactly-once execution across controller
-crash or derive replay permission from a previously issued ticket.
+crash or derive replay permission from an issued ticket.
 
 ---
 
 ### REQ-SDC-014: Safe Standalone Store Commands
 
-THE standalone binary SHALL accept only `status --store PATH --attempt U128` and
+THE `phoenix-deployment-controller` safe store binary SHALL accept only
+`status --store PATH --attempt U128` and
 `closeout --store PATH --attempt U128`, with each flag supplied once in either
 order. The attempt ID SHALL be unsigned ASCII decimal within the full `u128`
 range. Unknown commands, unknown or duplicate flags, missing values, and malformed
@@ -325,3 +330,181 @@ SHALL be:
 | 4 | Attempt not found in the existing store | `attempt_not_found` |
 | 5 | Closeout rejected for the loaded phase | `wrong_phase` |
 | 6 | Internal invariant, JSON encoding, or stdout I/O failure | `internal_error` |
+
+---
+
+### REQ-SDC-015: Separate Native Custodian and Runnable Policy Owner
+
+THE SYSTEM SHALL provide separate guardian and runner executables from the same
+build, distinct from the REQ-SDC-014 safe store binary. The safe binary SHALL remain
+status/closeout only; native execution SHALL NOT become another command of it.
+
+THE native runner SHALL own the runnable policy loop, controller-store commits,
+effect issuance, completion application, and durable acknowledgement. The guardian
+SHALL remain an effect custodian rather than choosing policy transitions, retries,
+escalation, rollback, activation, or migration compatibility.
+
+THE disposable macOS launchd job SHALL own the guardian independently of the runner.
+THE guardian SHALL be the original direct parent of the harmless workload and retain
+its native child/group ownership and results across runner death. It SHALL NOT adopt
+an already-running process from a stored PID, group, label, or socket path.
+
+THE runnable loop SHALL be independently invocable without installer or `dev.py`
+orchestration and SHALL use only isolated disposable resources and harmless work.
+It SHALL NOT invoke the prepared deployment helper, alter production labels, mutate
+the Phoenix application database, install artifacts, or activate production services.
+This contract SHALL NOT transfer installer, claim, ledger, signature, source-binding,
+or schema-migration policy to the runner or guardian.
+
+---
+
+### REQ-SDC-016: Bounded Owner-Only Native IPC
+
+THE runner and guardian SHALL communicate over an owner-only Unix-domain stream
+socket in an owner-only directory. The guardian SHALL verify the local peer's owner
+identity before session admission; pathname discovery alone SHALL NOT authenticate a
+peer or establish guardian continuity. This is a trusted same-owner boundary, not a
+sandbox against arbitrary code executing as that owner.
+
+EACH frame SHALL contain a four-byte unsigned big-endian payload length followed by
+one UTF-8 typed JSON message. Both peers SHALL reject zero-length and over-limit
+frames before payload allocation, using a finite shared build-defined maximum, and
+SHALL reject malformed, truncated, unknown-variant, or schema-invalid messages without
+executing their requested effect. Partial reads and writes SHALL preserve framing;
+EOF or protocol failure SHALL fence the associated session, not trigger cleanup.
+
+THE handshake SHALL check exact build identity, protocol version, attempt identity,
+and live guardian identity before opening a session. A mismatch SHALL fail closed,
+without negotiation, fallback decoding, session replacement, or process mutation.
+The protocol SHALL carry explicit request/response DTOs for handshake, inventory,
+admission, dispatch, retained results, reconciliation, and acknowledgement, with typed
+failures and exact correlation rather than raw operating-system error strings.
+
+---
+
+### REQ-SDC-017: Wire Data Is Not Affine Authority
+
+THE SYSTEM SHALL define wire DTOs separately from internal affine authority types.
+Deserializing a request or response SHALL NOT construct internal affine authority,
+including `CommittedTransition`, `DispatchBatch`, `DispatchTicket`,
+`SessionDispatchTicket`, `ExecutedEffect`, `ReconciledSessionPermit`, or
+`AppliedResultAck`. Serializable keys, effect descriptions, revisions, and diagnostic
+evidence SHALL NOT independently mint execution, recovery, or acknowledgement authority.
+
+WHEN the trusted runner consumes a committed affine ticket to request dispatch
+admission over the authenticated session
+THE guardian SHALL validate the live binding, dispatch revision floor, recovery gate,
+and required result capacity before minting an opaque one-use admission. The admission
+SHALL be bound to that exact live guardian instance, controller session, attempt,
+`DispatchKey`, and complete typed effect including every input, not just its kind.
+The guardian's live admission registry, not a deserialized token, SHALL own admission.
+
+WHEN a dispatch request presents an admission
+THE guardian SHALL consume its matching live registry entry before calling the native
+executor. An unknown, spent, fenced, wrong-instance, wrong-session, wrong-key, or
+wrong-effect admission SHALL produce no native call. Duplicate dispatch SHALL NOT
+repeat execution; uncertain delivery SHALL be resolved through retained results and
+fresh reconciliation, never automatic dispatch replay.
+
+THE guardian SHALL reserve result custody for the entire mutation round before its
+first effect executes. Admission refusal, oversize rounds, and loss of authority
+before execution starts SHALL emit no mutation. Once execution has started,
+interruption SHALL retain executed results without inferring permission to finish
+the round.
+
+THE native boundary SHALL preserve the one-call correlation and no-activation limits
+of REQ-SDC-013 and SHALL NOT claim exactly-once execution across process crash.
+
+---
+
+### REQ-SDC-018: Durable Native Binding, Custody, and Reconnect
+
+THE controller store SHALL bind each attempt to the guardian's instance nonce and
+native PID/birth identity, controller-session identity and fencing state, exact child
+slot inventory with native identities, dispatch/reconciliation revision floors, and
+retained result identities and application/acknowledgement state. These values SHALL
+occupy normalized columns and child rows with foreign keys, uniqueness, ordering
+where meaningful, and shape constraints; inventory and result lists SHALL NOT be
+serialized into a checkpoint blob. Any new timestamp columns SHALL obey
+`specs/compatibility/requirements.md` REQ-COMP-005.
+
+THE runner SHALL durably establish the binding before authorizing native workload
+execution. Persisted rows SHALL be evidence only: reopening the store SHALL NOT
+reconstruct native parenthood, executable tickets, live admissions, or a live session.
+Unknown commit outcomes SHALL preserve the REQ-SDC-011 fail-stop boundary.
+
+WHEN a runner disconnects or dies
+THE guardian SHALL fence that session and all its unused admissions, retain original
+child ownership and unacknowledged results, and allow only already-started work to
+continue. It SHALL NOT start another step or signal on EOF, heartbeat expiry, timeout,
+or a later connection. A second connection SHALL NOT silently replace an active owner.
+
+WHEN a runner reconnects
+THE SYSTEM SHALL positively verify the same live guardian, exact retained child slot
+inventory and native identities, and the original absolute deadline against durable
+binding evidence before establishing a fresh session. An inventory mismatch, guardian
+loss/replacement, or expired deadline SHALL fail stopped with unresolved supervision
+risk, not silently repair the binding or adopt a process. Child completion may change
+typed liveness/results but SHALL NOT substitute a slot or its original identity.
+
+THE recovering runner SHALL commit a fresh interruption revision strictly newer than
+all prior reconciliation sessions, including interrupted ones, then complete and
+commit fresh reconciliation of every acquired identity before any new mutation.
+Retained results SHALL remain evidence, not a substitute for that observation barrier;
+dispatch floors SHALL NOT regress and the original deadline SHALL NOT be extended.
+
+WHEN a retained completion is received
+THE runner SHALL correlate its instance, session of issuance, key, full effect, and
+typed outcome, and durably record its policy application or explicit round settlement
+before sending ACK. ACK SHALL name the exact retained result and committed applying
+revision; the guardian SHALL validate it against that result's binding before dropping
+custody. A recovered session MAY acknowledge an earlier session's result only after
+verified same-instance reattachment and durable application evidence, including while fresh
+reconciliation is incomplete; such acknowledgement SHALL NOT restore mutation authority.
+Receipt, socket delivery, a claimed revision alone, or a failed/ambiguous commit SHALL
+NOT authorize ACK.
+A lost ACK SHALL permit re-reading retained evidence and re-acknowledging the same
+durable application, not reapplying it or reexecuting the effect.
+
+---
+
+### REQ-SDC-019: Pre-Adoption Same-Version Boundary
+
+THE native protocol and controller schema SHALL support only the exact same build
+and admitted schema/protocol versions for disposable pre-adoption execution. Unsupported
+versions SHALL be rejected before mutation. There SHALL be no controller schema-v1
+upgrade guarantee, downgrade guarantee, rolling/mixed-version interoperability,
+live guardian replacement, or recovery guarantee across guardian death, logout,
+reboot, or cross-boot deadline interpretation. A new disposable store SHALL NOT erase
+or reinterpret an incompatible store as if its attempt had recovered.
+
+THE SYSTEM SHALL NOT infer a Phoenix application-database migration guarantee from
+controller-store handling or extend the compatibility guarantees in
+`specs/compatibility/requirements.md`. Same-build runner restart with the same live
+guardian under REQ-SDC-018 is the complete native reconnect guarantee.
+
+---
+
+### REQ-SDC-020: Disposable Native Death and Reconnect Qualification
+
+THE native qualification suite SHALL run separate real guardian and runner processes
+with a disposable launchd job, owner-only socket, disposable controller store, and
+harmless guardian-parented workload, without production labels, application databases,
+installation paths, or deployment helpers.
+
+THE suite SHALL kill the runner while work is live, prove the same guardian and
+original child survive with no new autonomous step or signal, observe retained
+completion after detach, and reconnect a fresh runner through durable interruption
+and complete fresh reconciliation within the original deadline. It SHALL also cover
+runner death after result receipt but before application commit, after commit but
+before ACK, and lost ACK, proving retained custody and no blind effect replay.
+
+THE suite SHALL reject stale sessions, spent/wrong-bound admissions, malformed and
+oversize frames, mismatched builds/protocol/schema, mismatched inventory, replaced or
+dead guardians, and recovery after the original deadline. It SHALL verify fail-stop
+persistence behavior and whole-round capacity refusal without partial mutation.
+
+THE SYSTEM SHALL report deterministic in-process qualification separately from native
+process-death/reconnect qualification. Passing either SHALL NOT constitute production
+adoption, installer integration, deployment authorization, or proof of exactly-once
+execution across crash.

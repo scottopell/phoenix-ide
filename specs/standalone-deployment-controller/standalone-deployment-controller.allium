@@ -20,6 +20,12 @@
 -- REQ-SDC-012: MacOsSupervisionBoundary
 -- REQ-SDC-013: AffineDispatchBoundary
 -- REQ-SDC-014: SafeStoreCliBoundary
+-- REQ-SDC-015: NativeRunnerBoundary
+-- REQ-SDC-016: NativeGuardianIpcBoundary
+-- REQ-SDC-017: NativeDispatchAdmissionBoundary
+-- REQ-SDC-018: NativeGuardianPersistenceBoundary and NativeGuardianReconnectBoundary
+-- REQ-SDC-019: NativeSameBuildBoundary
+-- REQ-SDC-020: NativeGuardianQualificationBoundary
 
 value ProcessIdentity {
     pid: Integer
@@ -680,8 +686,10 @@ contract ControllerSqliteBoundary {
 
     @invariant IndependentNormalizedAuthority
         -- Controller persistence is a distinct SQLite lifecycle. Attempts,
-        -- samples, identities, pending scans, discoveries, and candidates are
-        -- normalized relational rows rather than child collections in a blob.
+        -- samples, identities, pending scans, discoveries, candidates, guardian
+        -- bindings, sessions, child slots, and retained results are normalized
+        -- relational rows rather than child collections in a blob. Native binding
+        -- and acknowledgement follow NativeGuardianPersistenceBoundary.
 
     @invariant AuthorityLossFailsStop
         -- An unclassified checkpoint write exposes no OS effect and stops the
@@ -750,8 +758,9 @@ contract SafeStoreCliBoundary {
     closeout: (store_path: String, attempt_id: String) -> StatusSummary
 
     @invariant OnlyTwoSafeCommands
-        -- Only status --store PATH --attempt U128 and closeout with the same flags
-        -- are accepted. Flags occur once, in either order. U128 is unsigned ASCII
+        -- The phoenix-deployment-controller safe store binary accepts only
+        -- status --store PATH --attempt U128 and closeout with the same flags.
+        -- Flags occur once, in either order. U128 is unsigned ASCII
         -- decimal within u128 range. Bad/duplicate/unknown arguments or commands
         -- fail before store open. No native run/reconcile/deploy, activation,
         -- installer, schema migration, or native deployment adapter is reachable.
@@ -862,6 +871,170 @@ contract DeterministicPolicyLoop {
         -- result custody for every signal; reservation refusal emits no mutation.
 }
 
+contract NativeRunnerBoundary {
+    run_disposable: (attempt_id: String) -> StatusSummary
+
+    @invariant ThreeSeparateExecutableRoles
+        -- The safe store CLI remains status/closeout only. Separate same-build
+        -- runner and guardian executables implement the native path. The runner
+        -- owns policy, commits, completion application, and ACK issuance. The
+        -- guardian owns effects and custody, never autonomous policy or activation.
+
+    @invariant LaunchdOwnsTheOriginalParent
+        -- A disposable launchd job owns the guardian independently of the runner.
+        -- The guardian originally parents harmless work and retains its unreaped
+        -- child/group ownership through runner death; historical PID/group/label
+        -- discovery cannot transfer parenthood to a new guardian.
+
+    @invariant NoInstallerOrProductionAdoption
+        -- The runnable loop is invocable without installer/dev.py orchestration.
+        -- Only disposable resources and harmless work are permitted. There is no
+        -- prepared-helper invocation, production label change, application DB
+        -- mutation, artifact installation, or production activation. Installer,
+        -- claim, ledger, signature, source-binding, and migration policy stay outside.
+}
+
+contract NativeGuardianIpcBoundary {
+    exchange: (request: GuardianRequestDto) -> GuardianResponseDto
+
+    @invariant OwnerOnlyTransport
+        -- Unix-domain stream socket and containing directory are owner-only; peer
+        -- owner identity is checked before admission. The trusted same-owner
+        -- boundary is not a sandbox against other code running as that owner.
+        -- A pathname is neither peer authentication nor live guardian identity.
+
+    @invariant BoundedTypedFrames
+        -- Four-byte unsigned big-endian length, then one UTF-8 typed JSON message.
+        -- Both peers enforce a finite shared build-defined payload limit before
+        -- allocation and reject zero length, oversize, truncation, malformed JSON,
+        -- unknown variants, and invalid schema without executing a requested effect.
+        -- Partial reads/writes preserve framing. EOF/protocol failure fences the
+        -- session; it does not cancel work or authorize a signal.
+
+    @invariant HandshakeBeforeSession
+        -- Exact build, protocol version, attempt, and live guardian identity must
+        -- match. Mismatch admits no session, negotiation, fallback, or mutation.
+        -- Handshake, inventory, admission, dispatch, results, reconciliation, and
+        -- ACK have explicit typed DTO variants and correlated category failures.
+}
+
+contract NativeDispatchAdmissionBoundary {
+    request_admission: (request: DispatchAdmissionRequestDto) -> DispatchAdmissionResponseDto
+    dispatch_admitted: (request: AdmittedDispatchDto) -> GuardianResponseDto
+
+    @invariant NoDeserializedAffineAuthority
+        -- Wire DTOs are distinct from all internal affine authority, including
+        -- CommittedTransition, DispatchBatch, DispatchTicket, SessionDispatchTicket,
+        -- ExecutedEffect, ReconciledSessionPermit, and AppliedResultAck.
+        -- Deserialization constructs no internal affine authority. Keys,
+        -- descriptions, diagnostic evidence, and claimed revisions alone cannot
+        -- mint execution, reconciliation, or ACK authority.
+
+    @invariant GuardianMintsAndConsumesAdmission
+        -- The trusted runner consumes a committed affine ticket to request
+        -- admission. The guardian validates binding, session, revision floor,
+        -- recovery gate, and capacity, then registers an opaque one-use admission
+        -- for the exact live instance/session/attempt/DispatchKey/full typed effect.
+        -- Full effect equality includes all inputs, not just effect kind. The
+        -- live registry owns authority; the token DTO only locates an entry.
+        -- Matching dispatch consumes that entry before one native executor call.
+        -- Unknown, spent, fenced, wrong-instance/session/key/effect tokens execute
+        -- nothing. Duplicate or uncertain delivery never automatically replays.
+
+    @invariant CapacityBeforeFirstMutation
+        -- Reserve result custody for the complete mutation round before its first
+        -- effect. Reservation or admission refusal before execution emits no partial
+        -- round. Interruption during execution retains completed results and does
+        -- not authorize finishing the round. No exactly-once crash claim follows.
+}
+
+contract NativeGuardianPersistenceBoundary {
+    commit_binding: (binding: GuardianBindingDto) -> BindingCommitEvidence
+    apply_result: (result: RetainedResultDto) -> ResultApplicationEvidence
+    acknowledge: (request: ResultAckDto) -> GuardianResponseDto
+
+    @invariant NormalizedEvidenceNotNativeOwnership
+        -- Attempt-bound columns/rows contain guardian nonce and native PID/birth,
+        -- session identity/fencing state, exact child-slot/native-identity inventory,
+        -- dispatch and reconciliation floors, and result identities with application
+        -- and ACK state. Foreign keys, uniqueness, shape constraints, and meaningful
+        -- ordering enforce structure. Child collections are never checkpoint blobs.
+        -- New timestamp columns obey REQ-COMP-005 integer Unix microseconds.
+        -- Commit binding before authorizing workload execution. Loaded rows convey
+        -- evidence, never parenthood, live sessions, tickets, or live admissions.
+        -- Unknown commit outcomes retain ControllerSqliteBoundary fail-stop behavior.
+
+    @invariant DurableApplicationBeforeAck
+        -- Correlate result instance, session of issuance, key, full effect, and typed
+        -- outcome. Commit policy application or explicit round settlement before
+        -- emitting ACK for that result and its applying revision. Guardian validates
+        -- the binding before releasing custody. A revision claim or delivery alone
+        -- is insufficient. Failed/ambiguous commit authorizes no ACK.
+        -- A recovered session may ACK an earlier session's result after verified
+        -- same-instance reattachment and proof of durable application, even while
+        -- fresh reconciliation is incomplete. ACK cannot restore mutation authority.
+        -- Lost ACK allows repeat evidence retrieval/ACK, not application/effect replay.
+}
+
+contract NativeGuardianReconnectBoundary {
+    reconnect: (request: GuardianReconnectDto) -> GuardianResponseDto
+
+    @invariant DisconnectRevokesUnusedAdmissions
+        -- Disconnect/death fences the ended session and every unused admission.
+        -- Original child ownership and unacknowledged results remain retained;
+        -- only already-started work continues. No new step or signal follows EOF,
+        -- heartbeat expiry, timeout, or connection. An active owner cannot be
+        -- silently replaced by a second connection.
+
+    @invariant ExactLiveInventoryAndDeadline
+        -- A fresh session requires the same live guardian, exact retained child
+        -- slot/native-identity inventory, and original absolute deadline matched
+        -- against durable binding evidence. Completion may change typed liveness
+        -- and results, never slot identity. Mismatch, replacement/loss, or deadline
+        -- expiry preserves unresolved supervision risk without adoption or repair.
+
+    @guidance
+        -- Verify same instance and inventory; commit a fresh interruption revision
+        -- strictly above every prior reconciliation session, even unfinished ones;
+        -- freshly reconcile every acquired identity; commit complete reconciliation;
+        -- only then admit new mutation. Retained results cannot replace fresh
+        -- observation. Dispatch floors never regress; deadlines never extend.
+}
+
+contract NativeSameBuildBoundary {
+    admit_versions: (request: GuardianHandshakeDto) -> GuardianResponseDto
+
+    @invariant DisposableSameVersionOnly
+        -- Native protocol and controller schema require exact same build and
+        -- admitted schema/protocol versions. Reject unsupported versions before
+        -- mutation. No schema-v1 upgrade, downgrade, rolling/mixed-version use,
+        -- live guardian replacement, guardian-death/logout/reboot recovery, or
+        -- cross-boot deadline guarantee exists. A fresh disposable store cannot
+        -- reinterpret or erase incompatible attempt evidence as successful recovery.
+        -- Same-build runner restart behind the same live guardian is the entire
+        -- reconnect guarantee; it adds no application-database migration promise.
+}
+
+contract NativeGuardianQualificationBoundary {
+    qualify_disposable_native: (build_identity: String) -> NativeQualificationReport
+
+    @invariant RealProcessDeathIsASeparateQualification
+        -- Exercise separate real guardian and runner processes, a disposable
+        -- launchd job, owner-only socket, disposable store, and harmless originally
+        -- guardian-parented workload. Kill the runner while work is live; prove
+        -- the same guardian and child survive, no autonomous step/signal occurs,
+        -- detached completion remains retained, and fresh runner recovery commits
+        -- interruption and complete reconciliation within the original deadline.
+        -- Cover death after receipt/before commit, after commit/before ACK, and
+        -- lost ACK, proving retained custody and no blind replay. Reject stale
+        -- sessions, spent/wrong-bound admissions, malformed/oversize frames,
+        -- build/protocol/schema/inventory mismatch, replaced/dead guardians, and
+        -- expired deadlines. Prove persistence fail-stop and full-round capacity
+        -- refusal without partial mutation. In-process results do not prove IPC
+        -- or survival; neither qualification authorizes production adoption,
+        -- installer integration, helper invocation, or exactly-once crash claims.
+}
+
 -- Helper meanings
 --
 -- sequence_is_after(sample, samples) -> Boolean
@@ -908,7 +1081,7 @@ contract DeterministicPolicyLoop {
 --
 -- exact_identity_absence_is_verified(identity) is stronger than an empty PID scan or
 -- an ESRCH returned while birth identity is still unknown. It proves that the exact
--- previously acquired pid-plus-birth identity is no longer present.
+-- acquired pid-plus-birth identity is no longer present.
 --
 -- cleanup_evidence_is_unresolved(attempt) is true when any acquired identity lacks
 -- verified absence, any discovery remains unresolved, or any child scan is pending.
@@ -993,4 +1166,25 @@ surface SafeStandaloneStoreCli {
         summary.persistence_revision
         summary.phase
         summary.cleanup_outcome
+}
+
+surface DisposableNativeGuardianRunner {
+    contracts:
+        demands NativeRunnerBoundary
+        demands NativeGuardianIpcBoundary
+        demands NativeDispatchAdmissionBoundary
+        demands NativeGuardianPersistenceBoundary
+        demands NativeGuardianReconnectBoundary
+        demands NativeSameBuildBoundary
+        demands NativeGuardianQualificationBoundary
+        demands SurvivingGuardianBoundary
+        demands DeterministicPolicyLoop
+    context binding: GuardianBinding
+    exposes:
+        binding.attempt_id
+        binding.guardian_instance_nonce
+        binding.state
+        binding.minimum_dispatch_revision
+        binding.reconciliation_floor
+        binding.latest_reconciliation_revision
 }
