@@ -620,20 +620,24 @@ test('isolated negative refuses auth-disabled or already authenticated fixture b
   }
 });
 
-test('main auth-disabled prerequisite fails before cohort admission and preserves bounded failure receipt', async () => {
+test.each(['disabled', 'transport'])('main auth prerequisite %s fails before cohort admission and preserves bounded private-free failure receipt', async mode => {
   const outputDir = mkdtempSync(join(tmpdir(), 'cvt-auth-preflight-'));
   let contexts = 0;
   const context = { storageState: async () => ({ cookies: [], origins: [] }),
     browser: () => ({ newContext: async () => { contexts++; throw new Error('must not admit cohort'); } }),
-    request: { get: async () => authStatusResponse(true, false) } };
+    request: { get: async () => {
+      if (mode === 'transport') throw new Error('apiRequestContext.get: socket closed\nCookie: phoenix_session=PRIVATE_SESSION');
+      return authStatusResponse(true, false);
+    } } };
   try {
     await assert.rejects(runTelemetryChecks({ page: { context: () => context }, context, baseURL: 'http://127.0.0.1:8123', serviceName: 'synthetic-auth', runId: 'auth', outputDir,
       fixtures: { identity: { appSource: 'a'.repeat(40), frontendSource: 'b'.repeat(40), serverInstanceId: 'instance' },
         aggregates: [{ kind: 'ordinary', route: '/c/product' }, { kind: 'global', route: '/global/coordinator' }],
-        lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a' } } }), /must require authentication/);
+        lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a' } } }), mode === 'transport' ? /authentication status GET transport failed/ : /must require authentication/);
     const receipt = JSON.parse(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8'));
     assert.equal(contexts, 0); assert.deepEqual(receipt.trials, []);
-    assert.match(receipt.failure, /must require authentication/);
+    assert.match(receipt.failure, mode === 'transport' ? /authentication status GET transport failed/ : /must require authentication/);
+    assert.equal(JSON.stringify(receipt).includes('PRIVATE_SESSION'), false);
   } finally { rmSync(outputDir, { recursive: true, force: true }); }
 });
 
@@ -646,4 +650,37 @@ test('auth preflight rejects malformed/non-200 responses without echoing private
     await assert.rejects(requireCollectorAuth(context, 'http://127.0.0.1:8123', true), error => !error.message.includes('PRIVATE'));
     assert.equal(disposed, 1);
   }
+});
+
+test('collector transports redact Cookie call logs for auth GET, semantic and oversized POST, and isolated POST failures', async () => {
+  const privateError = () => new Error('apiRequestContext: socket closed\nCall log:\nCookie: phoenix_session=PRIVATE_SESSION\nAuthorization: PRIVATE_TOKEN');
+  const safe = error => !`${error.message}${error.stack}${JSON.stringify(error)}`.includes('PRIVATE');
+  await assert.rejects(requireCollectorAuth({ request: { get: async () => { throw privateError(); } } }, 'http://127.0.0.1:8123', true), safe);
+  for (const failIndex of [0, 5]) {
+    let posts = 0;
+    const statuses = [422, 422, 422, 400, 400];
+    await assert.rejects(runCollectorNegativeChecks({ request: { post: async () => {
+      if (posts++ === failIndex) throw privateError();
+      const status = statuses.shift();
+      return { status: () => status, dispose: async () => {} };
+    } } }, 'http://127.0.0.1:8123', {}), safe);
+    assert.equal(posts, failIndex + 1);
+  }
+  let closed = false;
+  const browser = { newContext: async () => ({ request: { get: async () => authStatusResponse(false), post: async () => { throw privateError(); } }, close: async () => { closed = true; } }) };
+  await assert.rejects(runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {}), safe);
+  assert.equal(closed, true);
+});
+
+test('status assertion survives private response-disposal and context-close failures with independent sanitized cleanup facts', async () => {
+  const browser = { newContext: async () => ({ request: { get: async () => authStatusResponse(false),
+    post: async () => ({ status: () => 204, dispose: async () => { throw new Error('Cookie: PRIVATE'); } }) },
+    close: async () => { throw new Error('Cookie: PRIVATE'); } }) };
+  await assert.rejects(runUnauthenticatedCollectorCheck(browser, 'http://127.0.0.1:8123', {}), error => {
+    assert.match(error.message, /synthetic server must enforce collector authentication/);
+    assert.equal(error.cleanup_failure, 'collector response disposal failed');
+    assert.equal(error.context_cleanup_failure, 'collector isolated context cleanup failed');
+    assert.equal(`${error.stack}${JSON.stringify(error)}`.includes('PRIVATE'), false);
+    return true;
+  });
 });

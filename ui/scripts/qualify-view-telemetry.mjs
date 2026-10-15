@@ -53,6 +53,21 @@ export function assertRequestCorrelation(requests, report) {
   assert.ok(requests.every(id => correlated.has(id)), 'finite requests must belong to this reported journey');
 }
 
+async function collectorTransport(operation, message) {
+  try { return await operation(); } catch { throw new Error(message); }
+}
+
+async function withCollectorResponse(acquire, inspect) {
+  const response = await acquire();
+  let primary;
+  try { return await inspect(response); }
+  catch (error) { primary = error; throw error; }
+  finally {
+    try { await collectorTransport(() => response.dispose(), 'collector response disposal failed'); }
+    catch (cleanup) { if (!primary) throw cleanup; primary.cleanup_failure = cleanup.message; }
+  }
+}
+
 export async function runCollectorNegativeChecks(context, baseURL, validReport) {
   const endpoint = candidateDestination('/api/telemetry/conversation-view', baseURL);
   const cases = [
@@ -64,40 +79,53 @@ export async function runCollectorNegativeChecks(context, baseURL, validReport) 
   ];
   const results = [];
   for (const [name, expectedStatus, report] of cases) {
-    const response = await context.request.post(endpoint, { data: report, timeout: 3000 });
-    assert.equal(response.status(), expectedStatus, `collector must reject ${name}`);
-    results.push({ name, status: response.status() });
-    await response.dispose();
+    await withCollectorResponse(
+      () => collectorTransport(() => context.request.post(endpoint, { data: report, timeout: 3000 }), 'collector negative POST transport failed'),
+      response => {
+        assert.equal(response.status(), expectedStatus, `collector must reject ${name}`);
+        results.push({ name, status: response.status() });
+      });
   }
-  const oversized = await context.request.post(endpoint, { data: 'x'.repeat(8193), headers: { 'Content-Type': 'application/json' }, timeout: 3000 });
-  assert.equal(oversized.status(), 413, 'collector body bound');
-  results.push({ name: 'oversized_body', status: oversized.status() });
-  await oversized.dispose();
+  await withCollectorResponse(
+    () => collectorTransport(() => context.request.post(endpoint, { data: 'x'.repeat(8193), headers: { 'Content-Type': 'application/json' }, timeout: 3000 }), 'collector oversized POST transport failed'),
+    response => {
+      assert.equal(response.status(), 413, 'collector body bound');
+      results.push({ name: 'oversized_body', status: response.status() });
+    });
   return results;
 }
 
 export async function requireCollectorAuth(context, baseURL, authenticated) {
-  const response = await context.request.get(candidateDestination('/api/auth/status', baseURL), { timeout: 3000 });
-  try {
-    assert.equal(response.status(), 200, 'collector authentication preflight status required');
-    let status;
-    try { status = await response.json(); } catch { throw new Error('invalid collector authentication status JSON'); }
-    assert.ok(status?.auth_required === true, 'disposable collector fixture must require authentication');
-    assert.ok(status?.authenticated === authenticated, 'collector context authentication prerequisite');
-    return { auth_required: true, authenticated };
-  } finally { await response.dispose(); }
+  const endpoint = candidateDestination('/api/auth/status', baseURL);
+  return withCollectorResponse(
+    () => collectorTransport(() => context.request.get(endpoint, { timeout: 3000 }), 'collector authentication status GET transport failed'),
+    async response => {
+      assert.equal(response.status(), 200, 'collector authentication preflight status required');
+      let status;
+      try { status = await response.json(); } catch { throw new Error('invalid collector authentication status JSON'); }
+      assert.ok(status?.auth_required === true, 'disposable collector fixture must require authentication');
+      assert.ok(status?.authenticated === authenticated, 'collector context authentication prerequisite');
+      return { auth_required: true, authenticated };
+  });
 }
 
 export async function runUnauthenticatedCollectorCheck(browser, baseURL, validReport) {
-  const isolated = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+  const isolated = await collectorTransport(() => browser.newContext({ storageState: { cookies: [], origins: [] } }), 'collector isolated context creation failed');
+  let primary;
   try {
     await requireCollectorAuth(isolated, baseURL, false);
-    const response = await isolated.request.post(candidateDestination('/api/telemetry/conversation-view', baseURL), { data: validReport, timeout: 3000 });
-    try {
-      assert.equal(response.status(), 401, 'synthetic server must enforce collector authentication');
-      return { name: 'unauthenticated_report', status: response.status() };
-    } finally { await response.dispose(); }
-  } finally { await isolated.close(); }
+    const endpoint = candidateDestination('/api/telemetry/conversation-view', baseURL);
+    return await withCollectorResponse(
+      () => collectorTransport(() => isolated.request.post(endpoint, { data: validReport, timeout: 3000 }), 'collector unauthenticated POST transport failed'),
+      response => {
+        assert.equal(response.status(), 401, 'synthetic server must enforce collector authentication');
+        return { name: 'unauthenticated_report', status: response.status() };
+      });
+  } catch (error) { primary = error; throw error; }
+  finally {
+    try { await collectorTransport(() => isolated.close(), 'collector isolated context cleanup failed'); }
+    catch (cleanup) { if (!primary) throw cleanup; primary.context_cleanup_failure = cleanup.message; }
+  }
 }
 
 export function journeyExpectation(report, identity) {
@@ -819,6 +847,8 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
     return await boundedObservation(execution, Math.max(1, outerDeadline - Date.now()), 'absolute browser qualification');
   } catch (error) {
     result.failure = error.message;
+    if (error.cleanup_failure) result.cleanup_failure = error.cleanup_failure;
+    if (error.context_cleanup_failure) result.context_cleanup_failure = error.context_cleanup_failure;
     throw error;
   } finally {
     const failedBeforeCleanup = Boolean(result.failure);
