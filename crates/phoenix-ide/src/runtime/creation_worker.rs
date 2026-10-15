@@ -3887,20 +3887,19 @@ mod product_creation_delivery_replay_tests {
             .await
             .unwrap()
             .unwrap();
-        sqlx::query("UPDATE product_creation_jobs SET claim_lease_until_unix_micros = ?1 WHERE request_id = 'replace-delivery'")
-            .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).timestamp_micros())
-            .execute(db.pool()).await.unwrap();
-        let replacement = db
-            .claim_next_product_creation_delivery(
-                "replacement",
-                "replacement-token",
-                chrono::Utc::now(),
-                chrono::Duration::seconds(30),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(replacement.claim.generation > old_claim.generation);
+        sqlx::query(
+            "UPDATE product_creation_jobs
+             SET claim_generation = claim_generation + 1,
+                 claim_worker_id = 'replacement', claim_token = 'replacement-token',
+                 claim_lease_until_unix_micros = ?1
+             WHERE request_id = 'replace-delivery'",
+        )
+        .bind((chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_micros())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let replacement = product_creation_job(&db, "replace-delivery").await;
+        assert!(replacement.claim_generation > old_claim.generation);
         let error = tokio::time::timeout(Duration::from_secs(1), worker)
             .await
             .unwrap()
@@ -3919,7 +3918,7 @@ mod product_creation_delivery_replay_tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            replacement.job
+            replacement
         );
         assert_eq!(
             global_objective_artifact_counts(&db, "replace-delivery").await,
