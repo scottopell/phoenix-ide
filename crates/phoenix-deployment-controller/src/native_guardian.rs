@@ -175,6 +175,9 @@ pub fn serve_until<E: GuardianExecutor>(
                     let slice = until
                         .saturating_duration_since(Instant::now())
                         .min(IO_SLICE);
+                    if slice.is_zero() {
+                        break;
+                    }
                     stream.set_read_timeout(Some(slice))?;
                     stream.set_write_timeout(Some(slice))?;
                     if serve_once(&mut stream, server).is_err() {

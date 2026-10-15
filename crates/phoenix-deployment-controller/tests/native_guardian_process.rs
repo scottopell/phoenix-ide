@@ -10,7 +10,10 @@ use std::{
 
 #[test]
 fn runner_death_does_not_kill_guardian_or_its_original_child() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = tempfile::Builder::new()
+        .prefix("sdc-")
+        .tempdir_in("/tmp")
+        .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = parent.path().join("sdc-disposable-process");
     let mut guardian = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"))
