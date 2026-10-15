@@ -99,6 +99,7 @@ entity DeploymentAttempt {
         awaiting_birth_evidence -> administrative_closeout_required
         awaiting_birth_evidence -> interrupted
         cleaning_owned_tree -> verifying_cleanup
+        cleaning_owned_tree -> ready_for_disruption
         cleaning_owned_tree -> administrative_closeout_required
         cleaning_owned_tree -> interrupted
         verifying_cleanup -> ready_for_disruption
@@ -107,8 +108,12 @@ entity DeploymentAttempt {
         verifying_cleanup -> administrative_closeout_required
         verifying_cleanup -> interrupted
         interrupted -> recovering
+        interrupted -> resource_sampling
         interrupted -> forward_recovery
+        recovering -> recovering
         recovering -> ownership_discovery
+        recovering -> awaiting_birth_evidence
+        recovering -> ready_for_disruption
         recovering -> cleaning_owned_tree
         recovering -> verifying_cleanup
         recovering -> administrative_closeout_required
@@ -187,7 +192,11 @@ rule AdoptStableChildIdentity {
         attempt.owned_identities.add(identity)
         attempt.pending_child_scans.add(identity)
         OwnedChildScanRequested(attempt, identity)
-        attempt.phase = ownership_discovery
+        if previous(attempt.phase) = recovering:
+            attempt.phase = recovering
+            OwnedIdentityObservationRequested(attempt, identity)
+        else:
+            attempt.phase = ownership_discovery
         attempt.last_observation_failure = null
 }
 
@@ -202,7 +211,10 @@ rule PreserveUnidentifiedChildObservation {
         malformed_observation
     }
     ensures:
-        attempt.phase = awaiting_birth_evidence
+        if previous(attempt.phase) = recovering:
+            attempt.phase = recovering
+        else:
+            attempt.phase = awaiting_birth_evidence
         attempt.last_observation_failure = failure
         attempt.unresolved_discoveries.contains(discovery)
 }
@@ -214,7 +226,10 @@ rule PreserveDiscoveryAcrossPidReuse {
     requires: replacement.pid = discovery.hinted_pid
     requires: not stable_child_evidence_binds(discovery, replacement)
     ensures:
-        attempt.phase = awaiting_birth_evidence
+        if previous(attempt.phase) = recovering:
+            attempt.phase = recovering
+        else:
+            attempt.phase = awaiting_birth_evidence
         attempt.unresolved_discoveries.contains(discovery)
         not attempt.owned_identities.contains(replacement)
         not OwnedSignalRequested(attempt, replacement)
@@ -246,7 +261,32 @@ rule RecheckBeforeEveryOwnedSignal {
     requires: attempt.phase = cleaning_owned_tree
     requires: attempt.owned_identities.contains(identity)
     requires: freshly_observed_same_identity(identity)
+    requires: now < attempt.operation_deadline
     ensures: OwnedSignalRequested(attempt, identity)
+}
+
+rule CompleteVerifiedCleanupAtExpiredMutationBoundary {
+    when: CleanupMutationPassRequested(attempt)
+    requires: attempt.phase = cleaning_owned_tree
+    requires: now >= attempt.operation_deadline
+    requires: every_owned_identity_is_verified_absent(attempt)
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: attempt.pending_child_scans.count = 0
+    ensures:
+        attempt.cleanup_result = verified_clean
+        attempt.phase = ready_for_disruption
+        not OwnedSignalRequestedForAttempt(attempt)
+}
+
+rule RefuseExpiredOwnedMutation {
+    when: CleanupMutationPassRequested(attempt)
+    requires: attempt.phase = cleaning_owned_tree
+    requires: now >= attempt.operation_deadline
+    requires: cleanup_evidence_is_unresolved(attempt)
+    ensures:
+        attempt.cleanup_result = unresolved_risk
+        attempt.phase = administrative_closeout_required
+        not OwnedSignalRequestedForAttempt(attempt)
 }
 
 rule KeepReparentedIdentityOwned {
@@ -338,11 +378,10 @@ rule PersistInterruption {
         ownership_discovery,
         awaiting_birth_evidence,
         cleaning_owned_tree,
-        verifying_cleanup,
-        recovering
+        verifying_cleanup
     }
     ensures:
-        attempt.resume_phase = attempt.phase
+        attempt.resume_phase = previous(attempt.phase)
         attempt.phase = interrupted
         DurableAttemptWritten(attempt)
 }
@@ -351,8 +390,15 @@ rule RecoverByReconciliation {
     when: RecoveryRequested(attempt)
     requires: attempt.phase = interrupted
     requires: attempt.compatibility_boundary = predecessor_eligible
+    requires: attempt.resume_phase in {
+        ownership_discovery,
+        awaiting_birth_evidence,
+        cleaning_owned_tree,
+        verifying_cleanup
+    }
     ensures:
         attempt.phase = recovering
+        recovery_observation_barrier_restarted(attempt)
         FreshOwnershipReconciliationRequested(attempt)
         OutstandingChildScansRequested(attempt)
         UnresolvedBirthProbesRequested(attempt)
@@ -363,7 +409,6 @@ rule CompleteRecoveryReconciliation {
     requires: attempt.phase = recovering
     requires: every_owned_identity_was_freshly_observed(attempt)
     requires: now < attempt.operation_deadline
-              or every_owned_identity_is_verified_absent(attempt)
     ensures:
         no_owned_mutation_preceded_reconciliation(attempt)
         attempt.phase = recovery_resume_phase(attempt)
@@ -373,8 +418,24 @@ rule ReinterruptRecovery {
     when: ControllerInterrupted(attempt)
     requires: attempt.phase = recovering
     ensures:
-        attempt.resume_phase = recovery_resume_phase(attempt)
+        attempt.resume_phase = previous(attempt.resume_phase)
         attempt.phase = interrupted
+        DurableAttemptWritten(attempt)
+}
+
+rule CompleteVerifiedRecoveryAtDeadline {
+    when: RecoveryReconciliationCompleted(attempt)
+    requires: attempt.phase = recovering
+    requires: every_owned_identity_was_freshly_observed(attempt)
+    requires: now >= attempt.operation_deadline
+    requires: every_owned_identity_is_verified_absent(attempt)
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: attempt.pending_child_scans.count = 0
+    ensures:
+        no_owned_mutation_preceded_reconciliation(attempt)
+        attempt.cleanup_result = verified_clean
+        attempt.phase = ready_for_disruption
+        not OwnedSignalRequestedForAttempt(attempt)
 }
 
 rule CloseRecoveryAtDeadline {
@@ -383,6 +444,8 @@ rule CloseRecoveryAtDeadline {
     requires: every_owned_identity_was_freshly_observed(attempt)
     requires: now >= attempt.operation_deadline
     requires: not every_owned_identity_is_verified_absent(attempt)
+              or attempt.unresolved_discoveries.count > 0
+              or attempt.pending_child_scans.count > 0
     ensures:
         attempt.cleanup_result = unresolved_risk
         attempt.phase = administrative_closeout_required
@@ -393,7 +456,10 @@ rule RecoverPendingResourceSample {
     when: RecoveryRequested(attempt)
     requires: attempt.phase = interrupted
     requires: attempt.resume_phase = resource_sampling
-    ensures: ExactPendingResourceSampleRequested(attempt)
+    requires: attempt.compatibility_boundary = predecessor_eligible
+    ensures:
+        attempt.phase = resource_sampling
+        ExactPendingResourceSampleRequested(attempt)
 }
 
 rule RecordCandidateMigrationInvocation {
@@ -484,7 +550,6 @@ invariant MigrationCandidateIsFrozen {
 invariant RecoveryMutationWaitsForCompleteReconciliation {
     for attempt in DeploymentAttempts where attempt.phase = recovering:
         not OwnedSignalRequestedForAttempt(attempt)
-        until every_owned_identity_was_freshly_observed(attempt)
 }
 
 contract ControllerOsBoundary {
@@ -551,6 +616,7 @@ contract MacOsSupervisionBoundary {
 -- sustained_capacity_and_contention_are_admissible(samples, count) -> Boolean
 -- stable_child_evidence_binds(discovery, identity) -> Boolean
 -- discovery_has_no_prior_observation_gap(attempt, discovery) -> Boolean
+-- recovery_observation_barrier_restarted(attempt) -> Boolean
 -- every_owned_identity_was_freshly_observed(attempt) -> Boolean
 -- no_owned_mutation_preceded_reconciliation(attempt) -> Boolean
 -- recovery_resume_phase(attempt) -> ControllerPhase
@@ -571,9 +637,30 @@ contract MacOsSupervisionBoundary {
 -- relationship, and identity's high-resolution birth token. A later process at the
 -- same PID cannot satisfy an older discovery epoch merely by reusing that PID.
 --
+-- recovery_observation_barrier_restarted(attempt) invalidates every observation
+-- from an earlier recovery round and requires a new observation of every acquired
+-- identity. every_owned_identity_was_freshly_observed(attempt) is true only when
+-- all identities, including children adopted during this round, have completed
+-- those observations. OwnedIdentityObservationRequested requests that observation
+-- for a newly adopted identity; child-list completion does not satisfy it.
+--
+-- recovery_resume_phase(attempt) uses the preserved original resume_phase, never
+-- recovering itself. After the complete observation barrier, unresolved discoveries
+-- select awaiting_birth_evidence and pending child scans select ownership_discovery.
+-- With neither outstanding, original discovery/birth-evidence phases advance to
+-- cleaning_owned_tree; original cleaning/verifying phases resume unchanged.
+-- Resource-sample recovery is separate and reissues the exact pending sample. Any
+-- later owned-mutation pass rechecks the unchanged absolute deadline and either
+-- recognizes already verified cleanup or enters administrative closeout without a
+-- signal; resource recovery cannot establish verified owned-tree cleanup.
+--
 -- exact_identity_absence_is_verified(identity) is stronger than an empty PID scan or
 -- an ESRCH returned while birth identity is still unknown. It proves that the exact
 -- previously acquired pid-plus-birth identity is no longer present.
+--
+-- cleanup_evidence_is_unresolved(attempt) is true when any acquired identity lacks
+-- verified absence, any discovery remains unresolved, or any child scan is pending.
+-- Absence of acquired identities alone cannot discharge discovery or scan debt.
 --
 -- sustained_capacity_and_contention_are_admissible(samples, count) requires at least
 -- count ordered consecutive samples with sufficient measured capacity and refuses
@@ -621,6 +708,7 @@ surface StandaloneDeploymentController {
         OwnedChildScanCompleted(attempt, parent)
         RecoveryReconciliationCompleted(attempt)
         OwnedCleanupRequested(attempt, identity)
+        CleanupMutationPassRequested(attempt)
         OwnedIdentityObservedWithDifferentParent(attempt, identity)
         OwnedIdentityAbsenceVerified(attempt, identity)
         OwnedPidReused(attempt, owned_identity, replacement)

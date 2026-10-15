@@ -544,7 +544,11 @@ impl DeploymentAttempt {
 
     /// # Errors
     /// Returns an error unless cleanup is active and every discovery has stable evidence.
-    pub fn request_owned_signals(self, signal: Signal) -> Result<Transition, TransitionError> {
+    pub fn request_owned_signals(
+        self,
+        signal: Signal,
+        now: MonotonicTick,
+    ) -> Result<Transition, TransitionError> {
         let attempt = self.into_ownership()?;
         if attempt.phase != OwnershipPhase::Cleaning {
             return Err(TransitionError::WrongPhase);
@@ -554,6 +558,21 @@ impl DeploymentAttempt {
         }
         if !attempt.tree.reconciliation_complete() {
             return Err(TransitionError::IncompleteReconciliation);
+        }
+        if now >= attempt.context.deadline {
+            return match attempt.tree.cleanup_readiness() {
+                CleanupReadiness::VerifiedClean => Ok(Transition {
+                    checkpoint: Self::Ready(ReadyAttempt {
+                        context: attempt.context,
+                        resources: attempt.resources,
+                        tree: attempt.tree,
+                    }),
+                    after_persist: Vec::new(),
+                }),
+                CleanupReadiness::OwnedIdentityMayRemain | CleanupReadiness::UnresolvedEvidence => {
+                    Ok(to_administrative_closeout(attempt))
+                }
+            };
         }
         let effects = attempt
             .tree

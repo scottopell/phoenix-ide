@@ -287,7 +287,7 @@ fn acquired_child_remains_owned_after_reparenting() {
         .into_parts();
     state = apply_identity_observations(state, &effects, &mut os);
     let signals = state
-        .request_owned_signals(Signal::Terminate)
+        .request_owned_signals(Signal::Terminate, MonotonicTick::new(5))
         .expect("stable identities authorize bounded signals");
     assert!(
         persisted_effects(&signals).contains(&OsEffect::SignalExactIdentity {
@@ -350,7 +350,7 @@ fn pid_reuse_is_absence_of_owned_identity_not_signal_authority() {
         .into_parts();
     state = apply_identity_observations(state, &effects, &mut os);
     let signals = state
-        .request_owned_signals(Signal::Terminate)
+        .request_owned_signals(Signal::Terminate, MonotonicTick::new(5))
         .expect("only currently matching identities can be signalled");
     assert!(!persisted_effects(&signals).iter().any(|effect| {
         matches!(
@@ -437,7 +437,7 @@ fn recovery_reobserves_owned_identities_before_repeating_mutation() {
         .persisted()
         .into_parts();
     let signals = state
-        .request_owned_signals(Signal::Terminate)
+        .request_owned_signals(Signal::Terminate, MonotonicTick::new(5))
         .expect("fresh identity match restores signal authority");
     assert_eq!(
         persisted_effects(&signals),
@@ -556,6 +556,115 @@ fn resource_recovery_reuses_one_pending_sequence_then_advances() {
 }
 
 #[test]
+fn resource_sampling_recovery_cannot_restore_expired_signal_authority() {
+    for tick in [29, 30, 31] {
+        let now = MonotonicTick::new(tick);
+        let root = identity(531, 43, 2);
+        let mut os = FakeOs::new([FakeProcess {
+            identity: root,
+            parent: None,
+        }]);
+        let state = reconciled_cleanup_after_sampling_interruption(root, &mut os, now);
+        let tree = state
+            .ownership_tree()
+            .expect("ownership is retained")
+            .clone();
+        let transition = state
+            .request_owned_signals(Signal::Terminate, now)
+            .expect("the mutation boundary applies the absolute deadline");
+        let (state, effects) = transition.persisted().into_parts();
+        assert_eq!(state.deadline(), MonotonicTick::new(30));
+        if tick < 30 {
+            assert_eq!(state.phase(), Phase::CleaningOwnedTree);
+            assert_eq!(
+                effects,
+                vec![OsEffect::SignalExactIdentity {
+                    identity: root,
+                    signal: Signal::Terminate,
+                }]
+            );
+            apply_signal_effects(&effects, &mut os);
+            assert_eq!(os.signalled, vec![root]);
+            continue;
+        }
+
+        assert_eq!(state.phase(), Phase::AdministrativeCloseoutRequired);
+        assert_eq!(state.cleanup_outcome(), CleanupOutcome::UnresolvedRisk);
+        assert_eq!(state.ownership_tree(), Some(&tree));
+        assert!(state.resource_evidence().is_some());
+        assert!(effects.is_empty());
+        assert_eq!(
+            state
+                .clone()
+                .request_owned_signals(Signal::Kill, now)
+                .expect_err("expired closeout cannot emit a later signal"),
+            phoenix_deployment_controller::TransitionError::WrongPhase
+        );
+        assert_eq!(
+            state
+                .clone()
+                .recover()
+                .expect_err("expired closeout cannot resume deployment"),
+            phoenix_deployment_controller::TransitionError::WrongPhase
+        );
+        let (state, effects) = state
+            .accept_administrative_risk(AdministrativeRiskAcceptance::for_attempt(AttemptId::new(
+                1,
+            )))
+            .expect("explicit risk acceptance closes scheduling, not cleanup")
+            .persisted()
+            .into_parts();
+        assert_eq!(state.phase(), Phase::AdministrativelyClosed);
+        assert_eq!(
+            state.cleanup_outcome(),
+            CleanupOutcome::AdministrativeRiskAccepted
+        );
+        assert_eq!(state.ownership_tree(), Some(&tree));
+        assert!(effects.is_empty());
+        assert_eq!(
+            state
+                .request_owned_signals(Signal::Terminate, now)
+                .expect_err("administrative acceptance cannot restore mutation authority"),
+            phoenix_deployment_controller::TransitionError::WrongPhase
+        );
+        assert!(os.signalled.is_empty());
+        assert!(os.processes.contains_key(&root.pid()));
+    }
+}
+
+#[test]
+fn expired_resource_sampling_recovery_accepts_already_verified_cleanup() {
+    for tick in [30, 31] {
+        let now = MonotonicTick::new(tick);
+        let root = identity(532, 43, 3);
+        let mut os = FakeOs::new([]);
+        let state = reconciled_cleanup_after_sampling_interruption(root, &mut os, now);
+        let tree = state
+            .ownership_tree()
+            .expect("absence evidence is retained")
+            .clone();
+        let (state, effects) = state
+            .request_owned_signals(Signal::Terminate, now)
+            .expect("verified cleanup needs no post-deadline mutation")
+            .persisted()
+            .into_parts();
+        assert_eq!(state.phase(), Phase::ReadyForDisruption);
+        assert_eq!(state.cleanup_outcome(), CleanupOutcome::VerifiedClean);
+        assert_eq!(state.deadline(), MonotonicTick::new(30));
+        assert_eq!(state.ownership_tree(), Some(&tree));
+        assert!(state.resource_evidence().is_some());
+        assert!(effects.is_empty());
+        assert!(os.signalled.is_empty());
+        assert_eq!(
+            state
+                .request_owned_signals(Signal::Kill, now)
+                .expect_err("readiness does not emit process signals"),
+            phoenix_deployment_controller::TransitionError::WrongPhase
+        );
+    }
+}
+
+#[test]
 fn recovery_barrier_requires_every_owned_identity_before_mutation() {
     let root = identity(535, 44, 1);
     let child = identity(536, 44, 2);
@@ -599,7 +708,7 @@ fn recovery_barrier_requires_every_owned_identity_before_mutation() {
     assert_eq!(
         state
             .clone()
-            .request_owned_signals(Signal::Terminate)
+            .request_owned_signals(Signal::Terminate, MonotonicTick::new(5))
             .expect_err("mutation cannot begin while a child observation is pending"),
         phoenix_deployment_controller::TransitionError::WrongPhase
     );
@@ -727,7 +836,7 @@ fn recovery_at_deadline_cannot_restore_signal_authority() {
     let (state, _) = closeout.persisted().into_parts();
     assert_eq!(
         state
-            .request_owned_signals(Signal::Terminate)
+            .request_owned_signals(Signal::Terminate, MonotonicTick::new(30))
             .expect_err("deadline closeout has no signal authority"),
         phoenix_deployment_controller::TransitionError::WrongPhase
     );
@@ -875,6 +984,97 @@ fn admitted_attempt(root: ProcessIdentity) -> DeploymentAttempt {
     state
 }
 
+fn reconciled_cleanup_after_sampling_interruption(
+    root: ProcessIdentity,
+    os: &mut FakeOs,
+    now: MonotonicTick,
+) -> DeploymentAttempt {
+    let (state, effects) =
+        DeploymentAttempt::start(AttemptId::new(1), MonotonicTick::new(30), policy(), root)
+            .persisted()
+            .into_parts();
+    assert_eq!(effects, vec![OsEffect::SampleResources { sequence: 0 }]);
+    let (state, effects) = state
+        .record_resource_sample(os.sample_resources(0).expect("first sample is available"))
+        .expect("the initial resource window is incomplete")
+        .persisted()
+        .into_parts();
+    assert_eq!(effects, vec![OsEffect::SampleResources { sequence: 1 }]);
+    let (state, effects) = state
+        .interrupt()
+        .expect("sampling can be interrupted with an exact pending request")
+        .persisted()
+        .into_parts();
+    assert!(effects.is_empty());
+    let (mut state, effects) = state
+        .recover()
+        .expect("recovery reissues only the pending sample")
+        .persisted()
+        .into_parts();
+    assert_eq!(effects, vec![OsEffect::SampleResources { sequence: 1 }]);
+    assert_eq!(state.deadline(), MonotonicTick::new(30));
+    for sequence in [0, 2] {
+        assert_eq!(
+            state
+                .clone()
+                .record_resource_sample(ample_sample(sequence))
+                .expect_err("recovery rejects both stale and future sample sequences"),
+            phoenix_deployment_controller::TransitionError::UnexpectedSampleSequence {
+                expected: 1,
+                actual: sequence,
+            }
+        );
+    }
+    for sequence in 1..3 {
+        let sample = os.sample_resources(sequence).expect("sample is available");
+        let (next, effects) = state
+            .record_resource_sample(sample)
+            .expect("remaining samples complete the measured window")
+            .persisted()
+            .into_parts();
+        state = next;
+        assert_eq!(
+            effects,
+            if sequence == 1 {
+                vec![OsEffect::SampleResources { sequence: 2 }]
+            } else {
+                vec![OsEffect::ListChildren { parent: root }]
+            }
+        );
+    }
+    assert_eq!(
+        state
+            .clone()
+            .ownership_scan_completed()
+            .expect_err("resource admission cannot skip the pending child scan"),
+        phoenix_deployment_controller::TransitionError::PendingChildScans
+    );
+    assert!(os
+        .list_children(root)
+        .expect("child scan succeeds")
+        .is_empty());
+    let state = complete_empty_scan(state, root);
+    let (state, effects) = state
+        .ownership_scan_completed()
+        .expect("completed enumeration admits identity observation")
+        .persisted()
+        .into_parts();
+    assert_eq!(effects, vec![OsEffect::ObserveIdentity { identity: root }]);
+    assert_eq!(
+        state
+            .clone()
+            .request_owned_signals(Signal::Terminate, now)
+            .expect_err("the deadline does not bypass complete reconciliation"),
+        phoenix_deployment_controller::TransitionError::IncompleteReconciliation
+    );
+    let state = apply_identity_observations(state, &effects, os);
+    assert!(state
+        .ownership_tree()
+        .expect("root identity observation is complete")
+        .reconciliation_complete());
+    state
+}
+
 fn assert_unresolved_administrative_closeout(state: DeploymentAttempt, os: &FakeOs) {
     let transition = state
         .deadline_reached(MonotonicTick::new(30))
@@ -929,7 +1129,7 @@ fn verified_ready_attempt(root: ProcessIdentity) -> DeploymentAttempt {
         .persisted()
         .into_parts();
     let (state, _) = state
-        .request_owned_signals(Signal::Terminate)
+        .request_owned_signals(Signal::Terminate, MonotonicTick::new(5))
         .expect("no present identity needs a signal")
         .persisted()
         .into_parts();
