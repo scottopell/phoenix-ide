@@ -10,7 +10,7 @@ impl GuardianExecutor for Observer {
     fn execute(&mut self, _: DispatchTicket, _: &mut BTreeMap<ChildSlotId, ()>) -> ExecutedEffect {
         panic!("observation-only fixture never executes")
     }
-    fn poll_observation_only(&self, _: &()) -> ChildSlotObservation {
+    fn poll_observation_only(&self, (): &()) -> ChildSlotObservation {
         ChildSlotObservation::Running
     }
 }
