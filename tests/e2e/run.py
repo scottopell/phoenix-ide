@@ -1253,6 +1253,7 @@ def scenario_continuation(base_url: str) -> None:
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
     worktrees_before = _git_worktree_inventory()
     with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
+        request_id = str(uuid.uuid4())
         create = httpx.post(
             f"{base_url}/api/product-conversations/new",
             json={
@@ -1260,15 +1261,36 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
                 "model": _default_model(base_url),
                 "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
                 "images": [],
-                "request_id": str(uuid.uuid4()),
+                "request_id": request_id,
             },
             timeout=10.0,
         )
         create.raise_for_status()
-        created = create.json()
-        product_conversation_id = created["product_conversation_id"]
-        canonical_route = created["canonical_route"]
-        root_conv_id = created["transcript_row_id"]
+        assert create.status_code == 202, f"unexpected creation acceptance: {create.status_code}"
+        accepted = create.json()
+        product_conversation_id = accepted["product_conversation_id"]
+        assert accepted["request_id"] == request_id
+
+        deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+        while True:
+            status_response = httpx.get(
+                f"{base_url}/api/product-conversations/creation/{request_id}",
+                timeout=10.0,
+            )
+            status_response.raise_for_status()
+            creation = status_response.json()
+            kind = creation["kind"]
+            if kind == "published":
+                break
+            if kind in {"failed", "cancelled"}:
+                raise AssertionError(f"product creation did not publish: {creation!r}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for product publication: {creation!r}")
+            time.sleep(0.05)
+
+        assert creation["product_conversation_id"] == product_conversation_id
+        canonical_route = creation["canonical_route"]
+        root_conv_id = creation["transcript_row_id"]
 
         assert canonical_route == f"/c/{product_conversation_id}", (
             f"unexpected canonical route: {canonical_route!r}"

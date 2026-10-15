@@ -12,8 +12,8 @@ Live production deployment remains an explicitly gated operator action; automate
 
 The paired launchd controller privately bootstraps candidate/predecessor plists
 and delays auto-load publication until their required verification boundary.
-The distinct current-schema launchd mode qualifies only migration 123 to the exact migration-127 candidate registry. It performs exclusive offline snapshot/migration, forbids predecessor rollback after any committed database write, and exposes separate current-schema recovery/finalization commands while retaining every prepared-artifact provenance check.
-Ordinary in-place activation remains backup-free but uses a conservative forward-only boundary for that exact schema interval: after candidate startup is attempted, failure retains the candidate and claim and forbids predecessor launch; `resume-forward` requires explicit operator authorization.
+The authored current-schema launchd contract qualifies only the exact migration-123 baseline to the exact migration-128 candidate registry under [ADR-105](../adrs/105_qualify-migration-128-for-bounded-current-schema-activation.md), including named migrations 126/127/128 and immutable complete registry/SHA-256 evidence re-verified before migration, activation, and forward recovery. It requires exclusive offline snapshot/migration, forbids predecessor rollback or snapshot replay after offline migration invocation (including partial or ambiguous writes), and exposes separate current-schema recovery/finalization commands while retaining every prepared-artifact provenance check. The controller and regression changes are authored; hosted CI qualification is pending. No migration/runtime or deployment acceptance is claimed.
+Ordinary in-place activation remains backup-free; the authored policy uses a conservative forward-only boundary for that same exact 123-to-128 interval: after candidate startup is attempted, failure retains the candidate and claim and forbids predecessor launch; `resume-forward` requires explicit operator authorization and immutable complete registry/digest verification. Hosted CI qualification is pending.
 
 Pre-snapshot failures resume only an unchanged, exclusively owned legacy pair;
 post-commit warnings do not authorize rollback or establish reboot persistence.
@@ -40,8 +40,8 @@ It is qualified locally/CI only; no healthy production finalization was executed
 
 | Requirement | Current implementation / verification |
 | --- | --- |
-| REQ-PD-022 | Ordinary forward-only status guidance, retained helper/registry evidence, and explicit exact-candidate `resume-forward` routing |
-| REQ-PD-021 | Mutually exclusive paired/current prepared flags, receipt and exact-commit preservation, registry identity, and mode-matched recovery/finalization tests |
+| REQ-PD-022 | Authored; hosted CI pending for exact 123-to-128 ordinary forward-only status guidance, immutable complete registry/digest and helper evidence, and explicit exact-candidate `resume-forward` routing |
+| REQ-PD-021 | Authored; hosted CI pending for mutually exclusive paired/current prepared flags, receipt and exact-commit preservation, exact 123-to-128 registry/digest binding with named 126/127/128 entries, and mode-matched recovery/finalization regressions |
 | REQ-PD-020 | Launchd-only finalize-paired routing / no bootstrap, captured helper and claim verification; not shipped on main until #836 |
 | REQ-PD-001 | `detect_prod_env`; backend status naming requires normalization |
 | REQ-PD-002 | typed local/release candidate preparation requires the complete 40-character embedded SHA to equal the selected full source commit across launchd, systemd, and bare Linux |
@@ -71,8 +71,8 @@ The target surface for each backend is:
 - `./dev.py prod deploy --release vX.Y.Z` — exact published release.
 - `./dev.py prod deploy --release latest` — latest stable release resolved once.
 - `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --paired-database-upgrade` — explicit legacy launchd ProductConversation upgrade from protected prepared bytes. All options are required; the directory is trusted operator input whose workflow/source association must be established independently of local receipt validation.
-- `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --current-schema-upgrade` — explicit qualified migration-123 to migration-127 launchd activation from the same protected prepared bytes and supply-chain evidence.
-- `./dev.py prod recover-current TXN` / `finalize-current TXN` — fail-closed current-schema recovery before writes or exact-candidate finalization after committed migration.
+- `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --current-schema-upgrade` — exact migration-123 to migration-128 launchd activation under ADR-105 from the same protected prepared bytes and supply-chain evidence (authored; hosted CI qualification pending).
+- `./dev.py prod recover-current TXN` / `finalize-current TXN` — fail-closed unchanged-source recovery before offline migration invocation or exact-candidate finalization after verified committed migration.
 - `./dev.py prod resume-forward TXN` — operator-authorized continuation with the exact retained ordinary candidate after predecessor rollback becomes unsafe.
 - `./dev.py prod status` — selected backend, runtime identity, and durable transaction result.
 - `./dev.py prod stop` — backend-owned runtime stop.

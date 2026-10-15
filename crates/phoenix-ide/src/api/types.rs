@@ -58,11 +58,73 @@ pub struct CreateProductConversationRequest {
     pub images: Vec<ImageAttachment>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationCreateAcceptedResponse {
-    pub canonical_route: String,
+    pub request_id: String,
     pub product_conversation_id: String,
-    pub transcript_row_id: String,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProductConversationCreationStatusResponse {
+    Pending {
+        request_id: String,
+        product_conversation_id: String,
+        status: ProductConversationCreationPendingStatus,
+        provisioning_stage:
+            phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
+        stage_updated_at: String,
+        retry_at: Option<String>,
+        allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
+    },
+    Failed {
+        request_id: String,
+        product_conversation_id: String,
+        status: ProductConversationCreationFailureStatus,
+        provisioning_stage:
+            phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
+        stage_updated_at: String,
+        error: Option<String>,
+        allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
+    },
+    Cancelled {
+        request_id: String,
+        product_conversation_id: String,
+        provisioning_stage:
+            phoenix_core::domain::product_creation::ProductCreationProvisioningStage,
+        stage_updated_at: String,
+        error: Option<String>,
+        allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
+    },
+    Published {
+        request_id: String,
+        product_conversation_id: String,
+        canonical_route: String,
+        transcript_row_id: String,
+    },
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[serde(rename_all = "snake_case")]
+pub enum ProductConversationCreationPendingStatus {
+    Accepted,
+    Claimed,
+    RetryScheduled,
+    Cancelling,
+    DeletionPending,
+    DeliveryPending,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[serde(rename_all = "snake_case")]
+pub enum ProductConversationCreationFailureStatus {
+    Failed,
+    CleanupAmbiguous,
+    DeliveryFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]

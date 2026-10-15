@@ -7,6 +7,7 @@ import {
 describe('reconcileSubscribedModelSelection', () => {
   beforeEach(() => {
     localStorage.clear();
+    sessionStorage.clear();
   });
 
   it('retains effort when the resolved replacement model supports it', () => {
@@ -73,20 +74,13 @@ describe('reconcileSubscribedModelSelection', () => {
       .toEqual({ selectedModel: 'gpt-6-astra', selectedEffort: 'high' });
   });
 
-  it('clears any pending product create request id when a new intent begins', () => {
-    localStorage.setItem(
-      'phoenix-pending-product-create-request',
-      JSON.stringify({
-        scope: JSON.stringify(['/repo', 'Retry safely', 'claude-3-5-sonnet', null]),
-        requestId: 'req-stale',
-      }),
-    );
-
+  it('preserves this tab recovery identity when navigation begins a new intent', () => {
+    sessionStorage.setItem('phoenix-active-product-create-request', 'req-pending');
     localStorage.setItem('phoenix-create-llm-language', 'Japanese');
 
     beginNewProductConversationIntent();
 
-    expect(localStorage.getItem('phoenix-pending-product-create-request')).toBeNull();
+    expect(sessionStorage.getItem('phoenix-active-product-create-request')).toBe('req-pending');
     expect(localStorage.getItem('phoenix-create-llm-language')).toBeNull();
   });
 });

@@ -8,9 +8,9 @@ Production deployment restores the previous binary, configuration, environment, 
 
 Database restore or replacement is an offline operator procedure. Phoenix does not provide live replacement fencing for an SQLite file already opened by a running process.
 
-A narrow prepared-artifact launchd exception qualifies the exact migration-123 to migration-127 transition. Its controller proves an offline snapshot and exact source/target ledgers, and automatic predecessor rollback exists only while the source ledger and logical contents remain unchanged. Any committed migration or reconciliation write forbids snapshot replay and predecessor startup; this does not create a general downgrade guarantee.
+The narrow prepared-artifact launchd exception is specified for the exact migration-123 baseline to the exact candidate migration-128 registry (ADR-105), including named migrations 126/127/128 and immutable registry/digest checks. The controller and regression changes are authored; hosted CI qualification is pending. The contract requires an offline snapshot and exact source/target ledgers, permits automatic predecessor rollback only before offline migration invocation with unchanged source contents, and forbids snapshot replay or predecessor startup after invocation. This is not a general downgrade guarantee or a claim of migration/runtime acceptance.
 
-The ordinary in-place route does not gain a backup requirement. Instead, for that exact interval, the first candidate startup attempt is a conservative downgrade boundary: later failure retains the candidate and stops forward-only because wake retirement or coordinator-home initialization may already have committed.
+The ordinary in-place route does not gain a backup requirement. For the same exact 123-to-128 interval, the authored policy retains immutable registry/digest evidence and treats the first candidate startup attempt as a conservative downgrade boundary: later failure retains the candidate and stops forward-only because migration or initialization writes may already have committed. Hosted CI qualification remains pending.
 
 Internal SQLite timestamps use mixed representations. New or changed internal timestamp columns must converge on explicitly unit-named integer Unix microseconds unless a more specific normative requirement identifies an external reader and requires another representation.
 
@@ -20,8 +20,8 @@ Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as
 
 | Requirement | Current coverage / gap |
 | --- | --- |
-| REQ-COMP-013 | Ordinary no-backup pre-start rollback, post-start forward-only fence, no predecessor launch, and exact-candidate resume tests |
-| REQ-COMP-012 | Exact 123-to-127 registry qualification, irreversible 126/127 identity, pre-invocation-only rollback, and partial/ambiguous-write fail-closed tests in the launchd prepared helper |
+| REQ-COMP-013 | Authored; hosted CI pending for exact 123-to-128 ordinary no-backup pre-start rollback, post-start forward-only fencing, no predecessor launch, immutable registry/digest checks, and exact-candidate resume regressions. No execution or deployment acceptance claimed. |
+| REQ-COMP-012 | Authored; hosted CI pending for exact 123-to-128 registry qualification, named 126/127/128 identities, immutable registry/digest checks, pre-invocation-only rollback, and partial/ambiguous-write fail-closed regressions in the launchd prepared helper. No execution or deployment acceptance claimed. |
 | REQ-COMP-001 | The requirement is defined in `requirements.md`, and contributor guidance points agents to that authority. A broader guarantee inventory remains follow-up work. |
 | REQ-COMP-002 | Phoenix-managed forward migrations and intentional seeder gaps are implemented and tested. Damaged or manually changed ledgers, historical-binary access to newer migrations, and project-wide data preservation are not guaranteed. |
 | REQ-COMP-003 | Foundation acceptance covers manual offline paired restore, but production deployment can still launch an older candidate without proving that restore occurred, and the UI overstates runtime-artifact rollback. Enforcement and truthful messaging are tracked in task 44016. |

@@ -244,6 +244,8 @@ pub enum DbError {
     ),
     #[error("steering queue is full")]
     SteeringQueueFull,
+    #[error("product creation delivery claim was lost or is required")]
+    ProductCreationClaimLost,
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
     #[error("Close foundation latest transcript changed: expected {expected}, found {actual}")]
@@ -4813,7 +4815,12 @@ impl Database {
               AND NOT (c.archived = 1 AND EXISTS (\
                   SELECT 1 FROM conversation_creation_jobs j \
                   WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-              ))",
+              )) \
+              AND NOT EXISTS (\
+                  SELECT 1 FROM product_creation_jobs product_job \
+                  WHERE product_job.product_conversation_id = c.product_conversation_id \
+                    AND product_job.status <> 'published'\
+              )",
         );
 
         let rows = query.build().fetch_all(&self.pool).await?;
@@ -4899,7 +4906,12 @@ impl Database {
                AND NOT (c.archived = 1 AND EXISTS (\
                    SELECT 1 FROM conversation_creation_jobs j \
                    WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-               ))",
+               )) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM product_creation_jobs product_job \
+                   WHERE product_job.product_conversation_id = c.product_conversation_id \
+                     AND product_job.status <> 'published'\
+               )",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -5160,6 +5172,11 @@ impl Database {
                AND NOT EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
                    WHERE j.conversation_id = c.id AND j.status <> 'ready'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM product_creation_jobs product_job
+                   WHERE product_job.product_conversation_id = c.product_conversation_id
+                     AND product_job.status <> 'published'
                )
              ORDER BY c.updated_at DESC",
         )
@@ -7530,6 +7547,17 @@ impl Database {
     ) -> DbResult<()> {
         let now = Utc::now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let staged: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM product_creation_jobs creation
+             JOIN conversations c ON c.product_conversation_id = creation.product_conversation_id
+             WHERE c.id = ?1 AND creation.status <> 'published')",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if staged {
+            return Err(DbError::ProductCreationClaimLost);
+        }
         require_product_conversation_admission_tx(&mut tx, id).await?;
         if queue.len() > MAX_STEERING_QUEUE_DEPTH {
             tx.rollback().await?;
@@ -7621,7 +7649,6 @@ impl Database {
         entry: &phoenix_core::domain::sm_event::SteerEntry,
         request_fingerprint: &str,
     ) -> DbResult<usize> {
-        let now = Utc::now();
         #[cfg(test)]
         if let Some(latch) = &self.steering_begin_test_latch {
             latch.before_begin.notify_waiters();
@@ -7629,14 +7656,41 @@ impl Database {
             latch.begin_called.notify_waiters();
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        require_product_conversation_admission_tx(&mut tx, id).await?;
+        let requires_claim: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM product_creation_jobs creation
+             JOIN conversations c ON c.product_conversation_id = creation.product_conversation_id
+             WHERE c.id = ?2
+               AND (creation.status <> 'published'
+                    OR (creation.published_conversation_id = c.id AND creation.request_id = ?1)))",
+        )
+        .bind(&entry.message_id)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if requires_claim {
+            return Err(DbError::ProductCreationClaimLost);
+        }
+        let position = self
+            .append_steering_entry_tx(&mut tx, id, entry, request_fingerprint)
+            .await?;
+        tx.commit().await?;
+        Ok(position)
+    }
+
+    async fn append_steering_entry_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
+    ) -> DbResult<usize> {
+        require_product_conversation_admission_tx(tx, id).await?;
 
         #[cfg(any(test, feature = "test-support"))]
         if self
             .steering_capacity_test_control
             .conversation_is_blocked(id)
         {
-            tx.rollback().await?;
             return Err(DbError::SteeringQueueFull);
         }
 
@@ -7646,13 +7700,12 @@ impl Database {
              WHERE conversation_id = ?1",
         )
         .bind(id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
         let queue_depth = usize::try_from(queue_position)
             .map_err(|_| DbError::Serialization("steering queue depth overflow".to_string()))?;
         if queue_depth >= MAX_STEERING_QUEUE_DEPTH {
-            tx.rollback().await?;
             return Err(DbError::SteeringQueueFull);
         }
 
@@ -7664,15 +7717,14 @@ impl Database {
         .bind(id)
         .bind(&entry.message_id)
         .bind(request_fingerprint)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        insert_steering_entry_tx(&mut tx, id, ordinal, entry).await?;
+        insert_steering_entry_tx(tx, id, ordinal, entry).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(now.to_rfc3339())
+            .bind(Utc::now().to_rfc3339())
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        tx.commit().await?;
 
         usize::try_from(queue_position)
             .map_err(|_| DbError::Serialization("steering queue position overflow".to_string()))
