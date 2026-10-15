@@ -54,9 +54,15 @@ pub fn disposable_dir(path: &Path, create: bool) -> io::Result<PathBuf> {
     {
         return Err(permission_denied());
     }
-    let temp = fs::canonicalize(std::env::temp_dir())?;
+    let roots = [
+        fs::canonicalize(std::env::temp_dir())?,
+        fs::canonicalize("/tmp")?,
+    ];
     let canonical_parent = fs::canonicalize(parent)?;
-    if canonical_parent == temp || !canonical_parent.starts_with(&temp) {
+    if !roots
+        .iter()
+        .any(|root| canonical_parent != *root && canonical_parent.starts_with(root))
+    {
         return Err(permission_denied());
     }
     let parent_meta = fs::symlink_metadata(parent)?;
