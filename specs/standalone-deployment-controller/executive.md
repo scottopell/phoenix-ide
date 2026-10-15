@@ -10,7 +10,7 @@ direct-child supervision in an isolated process group. The general observation
 adapter intentionally cannot signal arbitrary observed PIDs. The crate has no
 production caller, and existing deployment behavior remains unchanged.
 
-The deterministic suite contains 20 fake-OS tests covering the observed
+The deterministic suite contains 22 fake-OS tests covering the observed
 child-ESRCH-before-birth race, PID reuse, reparenting, exact-identity signaling,
 permission uncertainty, absolute-deadline closeout, repeated interruption,
 complete recovery reconciliation, expired resource-sampling recovery, sustained

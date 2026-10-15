@@ -93,6 +93,7 @@ entity DeploymentAttempt {
         resource_sampling -> interrupted
         ownership_discovery -> awaiting_birth_evidence
         ownership_discovery -> cleaning_owned_tree
+        ownership_discovery -> administrative_closeout_required
         ownership_discovery -> interrupted
         awaiting_birth_evidence -> ownership_discovery
         awaiting_birth_evidence -> cleaning_owned_tree
@@ -105,6 +106,7 @@ entity DeploymentAttempt {
         verifying_cleanup -> ready_for_disruption
         ready_for_disruption -> forward_recovery
         verifying_cleanup -> cleaning_owned_tree
+        verifying_cleanup -> awaiting_birth_evidence
         verifying_cleanup -> administrative_closeout_required
         verifying_cleanup -> interrupted
         interrupted -> recovering
@@ -346,10 +348,19 @@ rule ContinueCleanupForLiveOwnedIdentity {
     ensures: attempt.phase = cleaning_owned_tree
 }
 
+rule AwaitFreshEvidenceForUncertainOwnedIdentity {
+    when: CleanupVerificationCompleted(attempt)
+    requires: attempt.phase = verifying_cleanup
+    requires: cleanup_evidence_is_unresolved(attempt)
+    requires: now < attempt.operation_deadline
+    ensures: attempt.phase = awaiting_birth_evidence
+}
+
 rule RequireAdministrativeCloseoutAtDeadline {
     when: attempt: DeploymentAttempt.operation_deadline <= now
     requires: attempt.phase in {
         awaiting_birth_evidence,
+        ownership_discovery,
         cleaning_owned_tree,
         verifying_cleanup,
         recovering

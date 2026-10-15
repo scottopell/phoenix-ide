@@ -843,6 +843,79 @@ fn recovery_at_deadline_cannot_restore_signal_authority() {
 }
 
 #[test]
+fn pending_discovery_reaches_deadline_closeout_without_scan_completion() {
+    let root = identity(545, 44, 9);
+    let state = admitted_attempt(root);
+    assert_eq!(state.phase(), Phase::OwnershipDiscovery);
+    assert_eq!(
+        state
+            .ownership_tree()
+            .expect("ownership evidence exists")
+            .pending_child_scans()
+            .len(),
+        1
+    );
+
+    let transition = state
+        .deadline_reached(MonotonicTick::new(30))
+        .expect("unfinished enumeration remains unresolved at the deadline");
+    assert_eq!(
+        transition.clone().persisted().checkpoint().phase(),
+        Phase::AdministrativeCloseoutRequired
+    );
+    assert_eq!(
+        transition
+            .clone()
+            .persisted()
+            .checkpoint()
+            .cleanup_outcome(),
+        CleanupOutcome::UnresolvedRisk
+    );
+    assert!(persisted_effects(&transition).is_empty());
+}
+
+#[test]
+fn verification_uncertainty_returns_to_evidence_collection_before_deadline() {
+    let root = identity(546, 44, 10);
+    let state = complete_empty_scan(admitted_attempt(root), root);
+    let (state, _) = state
+        .ownership_scan_completed()
+        .expect("completed discovery enters cleanup")
+        .persisted()
+        .into_parts();
+    let (state, effects) = state
+        .cleanup_signals_settled()
+        .expect("settled cleanup enters verification")
+        .persisted()
+        .into_parts();
+    assert_eq!(effects, vec![OsEffect::ObserveIdentity { identity: root }]);
+    let (state, _) = state
+        .identity_observed(
+            root,
+            IdentityObservation::Unresolved(ObservationFailure::PermissionDenied),
+        )
+        .expect("permission uncertainty remains typed")
+        .persisted()
+        .into_parts();
+    let transition = state
+        .verification_completed(MonotonicTick::new(5))
+        .expect("pre-deadline uncertainty returns to evidence collection");
+    assert_eq!(
+        transition.clone().persisted().checkpoint().phase(),
+        Phase::AwaitingBirthEvidence
+    );
+    assert_eq!(
+        transition
+            .clone()
+            .persisted()
+            .checkpoint()
+            .cleanup_outcome(),
+        CleanupOutcome::InProgress
+    );
+    assert!(persisted_effects(&transition).is_empty());
+}
+
+#[test]
 fn permission_uncertainty_reaches_bounded_closeout_without_signalling() {
     let root = identity(550, 45, 1);
     let state = complete_empty_scan(admitted_attempt(root), root);
