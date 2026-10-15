@@ -124,6 +124,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [105](105_qualify-migration-128-for-bounded-current-schema-activation.md) | Qualify migration 128 for bounded current-schema activation | Accepted; supersedes interval portions of 102/103 | REQ-COMP-012/013, REQ-LDD-019–023, REQ-PD-021–022, REQ-CCR-012 |
 | [106](106_pre-stop-capacity-cleanup-is-cleanup-only-recovery.md) | Pre-stop capacity cleanup is a cleanup-only recovery boundary | Accepted | REQ-LDD-024 |
 | [107](107_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
+| [108](108_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
 
 ## For agents: which decisions bind your task
 
@@ -226,7 +227,9 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
       │   │           └── ADR-065 (Release candidates share the stable artifact path)
       │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
-      │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
+      │   ├── ADR-050 (launchd restart preserves installed state through an independent helper)
+      │   └── ADR-106 (Standalone controller owns durability and child supervision)
+      │       └── ADR-107 (Controller loss detaches and fences the surviving guardian)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)

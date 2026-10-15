@@ -130,6 +130,18 @@ value ExecutedEffect {
     completion_kind: EffectCompletionKind
 }
 
+enum GuardianSessionState {
+    active | detached_fenced | reconciling | authority_lost
+}
+
+value GuardianBinding {
+    attempt_id: String
+    guardian_instance_nonce: String
+    guardian_pid: Integer
+    guardian_birth: Timestamp
+    state: GuardianSessionState
+}
+
 value StatusSummary {
     attempt_id: String
     persistence_revision: Integer
@@ -788,6 +800,32 @@ contract MacOsSupervisionBoundary {
         -- Group escape, deliberate same-session join, and controller exit are
         -- unresolved risks. Controller exit loses authority unless a surviving
         -- supervisor handoff is positively identified.
+}
+
+contract SurvivingGuardianBoundary {
+    fence_controller_loss: (binding: GuardianBinding) -> GuardianBinding
+    begin_reconciliation: (binding: GuardianBinding) -> GuardianBinding?
+
+    @invariant ControllerLossDetachesAndFences
+        -- Controller exit changes the same retained guardian instance to
+        -- detached_fenced. Already-started work may continue and results remain
+        -- retained, but the guardian starts no new step and sends no new signal.
+        -- Socket EOF or heartbeat expiry does not authorize cancellation.
+
+    @invariant RecoveryRequiresTheSameGuardian
+        -- Reconciliation requires positive identity of the same living guardian
+        -- instance and its retained child slots. A label, socket path, PID, PGID,
+        -- or replacement instance cannot reconstruct native mutation authority.
+
+    @invariant FreshReconciliationPrecedesMutation
+        -- A replacement controller commits interruption and a complete fresh
+        -- observation barrier before any new mutation, preserving the attempt's
+        -- original absolute deadline and forward-only compatibility boundary.
+
+    @invariant GuardianLossFailsStop
+        -- Guardian loss, replacement, or deadline expiry preserves unresolved
+        -- supervision risk. No historical process identity is adopted and no
+        -- automatic TERM/KILL sequence is inferred from liveness telemetry.
 }
 
 -- Helper meanings

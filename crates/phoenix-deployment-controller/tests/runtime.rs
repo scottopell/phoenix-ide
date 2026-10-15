@@ -400,10 +400,11 @@ fn cli(command: &str, store: &Path, attempt: &str) -> Output {
 fn summary(output: &Output) -> Value {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
-    assert_eq!(
-        output.stdout.iter().filter(|byte| **byte == b'\n').count(),
-        1
-    );
+    let payload = output
+        .stdout
+        .strip_suffix(b"\n")
+        .expect("summary ends with one newline");
+    assert!(!payload.contains(&b'\n'));
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 4); // No checkpoint, effects, or native metadata.
     value

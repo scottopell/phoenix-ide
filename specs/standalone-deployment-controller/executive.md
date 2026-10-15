@@ -79,10 +79,12 @@ binary commands. No surviving-supervisor behavior or installer/schema mechanics 
 introduced by the dispatch and safe-CLI slice. Hosted compilation, tests, doctests,
 and Clippy must qualify this slice before integration acceptance.
 
-The installer owner released `dev.py` unchanged at blob
-`c2e9b44b11350f859b0cf168aad4612fb3bc6f06` for future thin delegation. The launchd
-helper, current-schema/launchd tests, migration registry, and installer task remain
-owned until the finite qualification-and-freeze receipt completes; this slice does
-not edit or invoke them. Production adoption is outside this slice, and a surviving
-supervisor handoff is required before any controller-exit cleanup guarantee can be
-introduced.
+PR 919 released the qualified installer seam at merge
+`0304adc6841f5fb8297d9bc036d891309083a6e3`: `dev.py` remains blob
+`c2e9b44b11350f859b0cf168aad4612fb3bc6f06`, and the launchd helper is blob
+`9a2ba2949c9f12ce7e8fa404e8b29fca037d5af2`. The supported future boundary is the
+prepared current-schema `dev.py prod deploy` command; helper-owned schema, ledger,
+claim, recovery, signature, and source-binding policy remains outside the controller.
+This slice does not invoke that boundary. Controller loss uses the ADR-108
+**detach-and-fence** policy; the guardian protocol and disposable death/reconnect
+qualification remain unimplemented, so production adoption remains blocked.

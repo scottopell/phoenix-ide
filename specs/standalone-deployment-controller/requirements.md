@@ -221,6 +221,24 @@ and controller exit as unresolved supervision risks
 AND SHALL treat supervision lost across controller exit as unresolved risk unless a
 surviving supervisor handoff is positively identified.
 
+WHEN a launchd-owned guardian has retained supervised children and its policy
+controller exits
+THE SYSTEM SHALL fence the ended controller session while allowing only already
+started child work to continue
+AND SHALL retain child results and native ownership without starting another step or
+sending another signal.
+
+WHEN a replacement policy controller reconnects
+THE SYSTEM SHALL verify the same live guardian instance and its retained child slots
+AND SHALL commit interruption and fresh reconciliation before authorizing any new
+mutation
+AND SHALL preserve the original absolute operation deadline.
+
+WHEN the original deadline expires before recovery completes, or when the retained
+guardian instance is lost or replaced,
+THE SYSTEM SHALL preserve unresolved supervision risk and SHALL NOT adopt historical
+PIDs, process groups, socket paths, labels, or heartbeat expiry as mutation authority.
+
 ---
 
 ### REQ-SDC-013: Affine Dispatch and Completion Correlation
