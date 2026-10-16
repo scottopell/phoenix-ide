@@ -5,6 +5,7 @@ use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -97,14 +98,25 @@ pub fn resolve_session(
         .output()
         .ok()
         .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|root| PathBuf::from(root.strip_suffix('\n').unwrap_or(&root)));
+        .map(|mut out| {
+            if out.stdout.last() == Some(&b'\n') {
+                out.stdout.pop();
+            }
+            PathBuf::from(std::ffi::OsString::from_vec(out.stdout))
+        });
     let path = root
         .as_deref()
         .unwrap_or(cwd)
         .canonicalize()
         .map_err(|e| format!("resolve session directory: {e}"))?;
-    Ok(format!("directory:{}", path.display()))
+    Ok(directory_identity(&path))
+}
+
+fn directory_identity(path: &Path) -> String {
+    match path.to_str() {
+        Some(path) => format!("directory:{path}"),
+        None => format!("directory:hex:{}", hex::encode(path.as_os_str().as_bytes())),
+    }
 }
 
 pub fn parse_idle(value: &str) -> Result<Duration, String> {
@@ -673,5 +685,21 @@ pub async fn main_entry() -> i32 {
         Outcome::Success { .. } => 0,
         Outcome::Error { error } if error.code == ErrorCode::InvalidInput => 2,
         Outcome::Error { .. } => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_identity_preserves_non_utf8_bytes() {
+        let first = PathBuf::from(std::ffi::OsString::from_vec(b"/repo-\xff".to_vec()));
+        let second = PathBuf::from(std::ffi::OsString::from_vec(b"/repo-\xfe".to_vec()));
+        let replacement = Path::new("/repo-\u{fffd}");
+        assert_ne!(directory_identity(&first), directory_identity(&second));
+        assert_ne!(directory_identity(&first), directory_identity(replacement));
+        assert_eq!(directory_identity(Path::new("/repo")), "directory:/repo");
+        assert_eq!(directory_identity(&first), "directory:hex:2f7265706f2dff");
     }
 }

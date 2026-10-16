@@ -15,7 +15,7 @@ The lifecycle contract is specified in `browser-cli.allium`; browser operation s
 | Requirement | Status | Notes |
 | --- | --- | --- |
 | REQ-BCLI-001: Standalone Operation | ✅ Complete | Installed executable smoke: help, schema, open, eval, close without Phoenix. |
-| REQ-BCLI-002: Predictable Session Selection | ✅ Complete | Explicit/environment precedence, canonical paths, clone and linked-worktree boundaries. |
+| REQ-BCLI-002: Predictable Session Selection | ✅ Complete | Explicit/environment precedence, canonical paths, clone and linked-worktree boundaries; lossless Unix path bytes. |
 | REQ-BCLI-003: Exclusive Local Ownership | ✅ Complete | Concurrent initial opens share one owner; named sessions isolate pages. |
 | REQ-BCLI-004: Lazy Startup and State Loss | ✅ Complete | Absent discovery, idle expiry, dead-Chrome detection and fresh open. |
 | REQ-BCLI-005: Distinct Lifetimes | ✅ Complete | Daemon/browser identities appear on operation success and failure; browser-only replacement rotates identity. |
@@ -40,3 +40,5 @@ ADR-109 records the source-ordering decision. The hosted screenshot regression v
 Local broad validation passed Clippy, E2E, Allium, spec shape/anchors, task validation, and dev-tool tests. Its Rust run stopped on the unchanged database test `current_schema_controller_accepts_compiled_123_and_128_shapes`: the macOS Python SQLite controller reported `unable to open database file` during integrity checking; an isolated rerun reproduced it. Full-suite success is not claimed from that run.
 
 The local database failure is tracked separately in task 41017.
+
+Session identity tests distinguish non-UTF-8 Unix paths from each other and from literal replacement characters. A Linux executable regression verifies shared worktree identity across subdirectories and canonical symlink fallback; macOS filesystems reject the fixture's non-UTF-8 directory names, so byte encoding is tested there without filesystem creation.

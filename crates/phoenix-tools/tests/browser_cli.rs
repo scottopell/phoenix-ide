@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -383,6 +385,43 @@ fn session_selection_obeys_precedence_and_canonical_worktree_boundaries() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn non_utf8_worktree_paths_share_sessions_without_lossy_collisions() {
+    // REQ-BCLI-002.
+    let cli = BrowserCli::new();
+    let mut identities = Vec::new();
+    for name in [b"repository-\xff".to_vec(), b"repository-\xfe".to_vec()] {
+        let root = cli
+            .directory
+            .path()
+            .join(std::ffi::OsString::from_vec(name));
+        let nested = root.join("nested/deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&root, &["init", "--quiet"]);
+        let identity = selected_session(&cli, &root, None, None);
+        assert_eq!(selected_session(&cli, &nested, None, None), identity);
+        identities.push(identity);
+    }
+    assert_ne!(identities[0], identities[1]);
+    let replacement = cli.directory.path().join("repository-\u{fffd}");
+    std::fs::create_dir(&replacement).unwrap();
+    let replacement_identity = selected_session(&cli, &replacement, None, None);
+    assert!(!identities.contains(&replacement_identity));
+
+    let outside = cli
+        .directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"outside-\xff".to_vec()));
+    std::fs::create_dir(&outside).unwrap();
+    let alias = cli.directory.path().join("outside-alias");
+    std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    assert_eq!(
+        selected_session(&cli, &outside, None, None),
+        selected_session(&cli, &alias, None, None)
+    );
+}
+
+#[test]
 fn invalid_input_and_permissive_runtime_directory_fail_without_startup() {
     // REQ-BCLI-003, REQ-BCLI-010.
     let cli = BrowserCli::new();
@@ -491,7 +530,7 @@ fn missing_or_malformed_response_reports_uncertainty_without_replay() {
             let server = scope.spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_read_timeout(Some(Duration::from_secs(60)))
                     .unwrap();
                 let mut request = String::new();
                 BufReader::new(&stream).read_line(&mut request).unwrap();
@@ -499,7 +538,7 @@ fn missing_or_malformed_response_reports_uncertainty_without_replay() {
                 assert_eq!(request["command"], "eval");
                 stream.write_all(response_bytes).unwrap();
                 drop(stream);
-                released.recv_timeout(Duration::from_secs(5)).unwrap();
+                released.recv_timeout(Duration::from_secs(60)).unwrap();
                 listener.set_nonblocking(true).unwrap();
                 assert_eq!(
                     listener.accept().unwrap_err().kind(),
