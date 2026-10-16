@@ -46,14 +46,13 @@ it('diagnostic dispatch failure cannot prevent admission or transport', async ()
   expect(() => emitViewDiagnostic({ kind: 'admission', route: 'ordinary', open_id: null, sampled: false })).not.toThrow();
 });
 
-it('initiates injected keepalive fetch within the pagehide handler rather than a teardown microtask', () => {
+it('initiates injected keepalive fetch within the pagehide handler rather than a teardown microtask', async () => {
   const order: string[] = [];
-  const send = vi.fn<typeof fetch>().mockImplementation((_url, init) => {
+  const send = vi.fn<typeof fetch>().mockImplementation(() => {
     order.push('fetch');
-    expect(init?.keepalive).toBe(true);
-    expect(init?.signal?.aborted).toBe(false);
     return Promise.resolve(new Response(null, { status: 204 }));
   });
+  const dispatch = vi.spyOn(window, 'dispatchEvent');
   const reporter = new ViewJourneyReporter({ random: () => 0.1, send });
   const attempt = reporter.begin(identity)!;
   const onPagehide = () => { reporter.report(attempt, 'incomplete'); order.push('handler_return'); };
@@ -62,6 +61,9 @@ it('initiates injected keepalive fetch within the pagehide handler rather than a
     window.dispatchEvent(new Event('pagehide'));
     expect(order).toEqual(['fetch', 'handler_return']);
     expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![1]?.keepalive).toBe(true);
+    expect(send.mock.calls[0]![1]?.signal?.aborted).toBe(false);
+    await vi.waitFor(() => expect(dispatch.mock.calls.some(([event]) => (event as CustomEvent).detail?.state === 'response')).toBe(true));
   } finally { window.removeEventListener('pagehide', onPagehide); }
 });
 
