@@ -813,6 +813,70 @@ pub fn verify_native_binding(
     }
 }
 
+#[cfg(target_os = "macos")]
+/// Spawn one harmless direct child and hold its original parent slot until the
+/// explicitly bounded disposable fixture ends.
+/// # Errors
+/// Refuses any fixture outside the private temporary directory.
+pub fn run_disposable_guardian(
+    dir: &Path,
+    child_seconds: u64,
+    serve_seconds: u64,
+    attempt: crate::AttemptId,
+    deadline: crate::MonotonicTick,
+    store_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        Guardian, GuardianLifetimeNonce, MacOsControllerOs, MacOsGuardianExecutor,
+        NativeGuardianIdentity,
+    };
+    if !(1..=120).contains(&child_seconds) || !(1..=120).contains(&serve_seconds) {
+        return Err(Box::new(permission_denied()));
+    }
+    let build = BuildIdentity::compiled();
+    let reader = SqliteNativeEvidenceReader::open(store_path, attempt)?;
+    let mut nonce_bytes = [0; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+    let native_identity = NativeGuardianIdentity {
+        nonce: GuardianLifetimeNonce::new(nonce_bytes)
+            .ok_or_else(|| io::Error::other("zero random nonce"))?,
+        process: crate::macos::own_process_identity()?,
+    };
+    let listener = bind_disposable(dir)?;
+    let os = MacOsControllerOs::new(dir)?;
+    let (child, gate) = os.spawn_blocked_sleep(child_seconds)?;
+    let identity = child.identity();
+    let (guardian, session) = Guardian::new(
+        attempt,
+        deadline,
+        MacOsGuardianExecutor::new(os),
+        vec![child],
+    )
+    .map_err(|failure| {
+        let (error, executor, slots) = failure.into_parts();
+        drop(slots);
+        drop(executor);
+        error
+    })?;
+    let mut server = GuardianServer::new(guardian, session, build)?;
+    server.stage_native_identity(native_identity);
+    server.stage_native_reader(Box::new(reader));
+    server.stage_initial_gate(Box::new(gate));
+    println!(
+        "disposable child pid={} birth={}:{}",
+        identity.pid().get(),
+        identity.birth().seconds(),
+        identity.birth().nanos()
+    );
+    io::stdout().flush()?;
+    serve_until(
+        &listener,
+        &mut server,
+        Instant::now() + Duration::from_secs(serve_seconds),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod native_sampling_snapshot_tests {
     use super::*;
@@ -904,69 +968,4 @@ mod native_sampling_snapshot_tests {
         wrong_instance.session.instance += 1;
         assert!(!sampling_snapshot_matches(&wrong_instance, issue));
     }
-}
-
-#[cfg(target_os = "macos")]
-/// Spawn one harmless direct child and hold its original parent slot until the#[cfg(target_os = "macos")]
-/// Spawn one harmless direct child and hold its original parent slot until the
-/// explicitly bounded disposable fixture ends.
-/// # Errors
-/// Refuses any fixture outside the private temporary directory.
-pub fn run_disposable_guardian(
-    dir: &Path,
-    child_seconds: u64,
-    serve_seconds: u64,
-    attempt: crate::AttemptId,
-    deadline: crate::MonotonicTick,
-    store_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::{
-        Guardian, GuardianLifetimeNonce, MacOsControllerOs, MacOsGuardianExecutor,
-        NativeGuardianIdentity,
-    };
-    if !(1..=120).contains(&child_seconds) || !(1..=120).contains(&serve_seconds) {
-        return Err(Box::new(permission_denied()));
-    }
-    let build = BuildIdentity::compiled();
-    let reader = SqliteNativeEvidenceReader::open(store_path, attempt)?;
-    let mut nonce_bytes = [0; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
-    let native_identity = NativeGuardianIdentity {
-        nonce: GuardianLifetimeNonce::new(nonce_bytes)
-            .ok_or_else(|| io::Error::other("zero random nonce"))?,
-        process: crate::macos::own_process_identity()?,
-    };
-    let listener = bind_disposable(dir)?;
-    let os = MacOsControllerOs::new(dir)?;
-    let (child, gate) = os.spawn_blocked_sleep(child_seconds)?;
-    let identity = child.identity();
-    let (guardian, session) = Guardian::new(
-        attempt,
-        deadline,
-        MacOsGuardianExecutor::new(os),
-        vec![child],
-    )
-    .map_err(|failure| {
-        let (error, executor, slots) = failure.into_parts();
-        drop(slots);
-        drop(executor);
-        error
-    })?;
-    let mut server = GuardianServer::new(guardian, session, build)?;
-    server.stage_native_identity(native_identity);
-    server.stage_native_reader(Box::new(reader));
-    server.stage_initial_gate(Box::new(gate));
-    println!(
-        "disposable child pid={} birth={}:{}",
-        identity.pid().get(),
-        identity.birth().seconds(),
-        identity.birth().nanos()
-    );
-    io::stdout().flush()?;
-    serve_until(
-        &listener,
-        &mut server,
-        Instant::now() + Duration::from_secs(serve_seconds),
-    )?;
-    Ok(())
 }
