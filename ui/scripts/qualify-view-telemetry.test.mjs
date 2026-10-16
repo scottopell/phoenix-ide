@@ -274,7 +274,7 @@ function lifecycleBrowserFixture(mode = 'normal') {
   const actions = [];
   let contexts = 0;
   const browser = { newContext: async () => {
-    const kind = ['pending_background', 'spa_canceled', 'bfcache_resume'][contexts++];
+    const kind = ['pending_background', 'spa_canceled', 'bfcache_resume'][mode === 'unsampled' ? Math.floor(contexts++ / 2) : contexts++];
     const listeners = new Map();
     const emit = (event, value) => { for (const fn of [...(listeners.get(event) ?? [])]) fn(value); };
     let url = 'about:blank';
@@ -282,10 +282,12 @@ function lifecycleBrowserFixture(mode = 'normal') {
     let end = mode === 'precompleted' ? 1 : -1;
     let initialReady = false;
     const readyWaiters = [];
-    const requestId = `request-${kind}`;
+    let binding;
+    const requestId = `20000000-0000-4000-8000-${String(contexts).padStart(12, '0')}`;
+    const primaryId = `40000000-0000-4000-8000-${String(contexts).padStart(12, '0')}`;
     const request = { url: () => `http://127.0.0.1:8123/api/product-conversations/product/history?open_id=${requestId}`, method: () => 'GET', timing: () => ({ responseEnd: end }) };
     const identity = { frontend_source: 'b'.repeat(40), frontend_source_dirty: false, presentation_evidence: 'commit_frame_estimate' };
-    const report = (suffix, outcome = 'ready', trigger = 'navigation') => ({ ...identity, cache: trigger === 'back_forward' ? 'retained' : 'network', open_id: `${kind}-${suffix}`, product_conversation_id: 'product', route: 'ordinary', trigger,
+    const report = (suffix, outcome = 'ready', trigger = 'navigation') => ({ ...identity, cache: trigger === 'back_forward' ? 'retained' : 'network', open_id: suffix === 'initial' ? primaryId : `30000000-0000-4000-8000-${String(contexts * 10 + suffix.length).padStart(12, '0')}`, product_conversation_id: 'product', route: 'ordinary', trigger,
       outcome, visible: true, background_ms: 1, total_ms: 5, marks: { meaningful_transcript: 1, breadcrumb_presented: 2, breadcrumb_enabled: 2, anchor_settled: 3 }, breadcrumb_ready_minus_meaningful_ms: 1, correlations: [{ kind: 'request', id: requestId }] });
     const post = value => {
       if (mode === 'private' && kind === 'pending_background') value = { ...value, reporter_id: 'PRIVATE_CANARY' };
@@ -310,27 +312,31 @@ function lifecycleBrowserFixture(mode = 'normal') {
       goto: async target => {
         actions.push([kind, 'goto', target]); url = target;
         if (target !== 'about:blank') queueMicrotask(() => {
+          if (mode !== 'missing_admission') binding({}, { version: 1, kind: 'admission', route: 'ordinary', sampled: mode !== 'unsampled', open_id: mode === 'unsampled' ? null : primaryId });
+          if (mode !== 'unsampled') binding({}, { version: 1, kind: 'request', open_id: primaryId, request_id: mode === 'foreign_request' ? '90000000-0000-4000-8000-000000000001' : requestId });
+          if (mode === 'overflow') for (let n = 0; n < 66; n++) binding({}, { version: 1, kind: 'mark', open_id: primaryId, mark: 'shell', ms: 0 });
           emit('request', request);
-          if (kind === 'bfcache_resume') setTimeout(() => { end = 1; emit('requestfinished', request); post(report('initial')); makeReady(); }, 0);
+          if (['unsampled', 'missing_admission'].includes(mode)) makeReady();
+          if (kind === 'bfcache_resume' && mode !== 'unsampled') setTimeout(() => { end = 1; emit('requestfinished', request); post(report('initial')); makeReady(); }, 0);
           if (mode === 'preterminal') post(report('early'));
         });
       },
       waitForFunction: async () => { if (!initialReady) await new Promise(resolve => readyWaiters.push(resolve)); },
       bringToFront: async () => {
         state = 'visible'; actions.push([kind, 'foreground']);
-        if (kind === 'pending_background' && end === 1 && !initialReady) { post(report('initial')); makeReady(); }
+        if (kind === 'pending_background' && end === 1 && !initialReady) { if (mode !== 'sampled_missing_report') post(report('initial')); makeReady(); }
       },
       locator: () => ({ count: async () => 1, isVisible: async () => true, getAttribute: async () => '/c/successor', click: async () => {
         actions.push([kind, 'click']); url = 'http://127.0.0.1:8123/c/successor';
-        post(report('initial', 'canceled'));
-        post({ ...report('successor'), correlations: [{ kind: 'request', id: 'successor-request' }] });
+        if (mode !== 'spa_missing_report') post(report('initial', 'canceled'));
+        if (mode !== 'spa_missing_report') post({ ...report('successor'), correlations: [{ kind: 'request', id: 'successor-request' }] });
         makeReady();
       } }), waitForURL: async target => assert.equal(url, target),
       goBack: async () => { actions.push([kind, 'back']); url = 'http://127.0.0.1:8123/c/product'; post(report('resume', 'ready', 'back_forward')); },
     };
     let pages = 0;
     let contextClosed;
-    const owned = { on: (event, fn) => { if (event === 'close') contextClosed = fn; }, newPage: async () => ++pages === 1 ? page : {
+    const owned = { exposeBinding: async (_name, fn) => { binding = fn; }, addInitScript: async () => {}, on: (event, fn) => { if (event === 'close') contextClosed = fn; }, newPage: async () => ++pages === 1 ? page : {
       bringToFront: async () => { state = 'hidden'; actions.push([kind, 'hidden']); setTimeout(() => { end = 1; emit('requestfinished', request); }, 0); },
       close: async () => actions.push([kind, 'other_closed']),
     }, newCDPSession: async () => ({ send: async () => {} }), close: async () => {
@@ -515,7 +521,7 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
     assert.equal(result.capabilities.spa_canceled, 'observed_spa_canceled');
     assert.equal(result.capabilities.bfcache_resume, 'observed_bfcache_fresh_ready_report');
     assert.equal(result.capabilities.pending_background, 'actual_hidden_response_then_visible_readiness');
-    assert.equal(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8').includes('bfcache_resume-resume'), true);
+    assert.ok(JSON.parse(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8')).lifecycle.trials.some(trial => trial.status === 'observed_bfcache_fresh_ready_report'));
     assert.equal(new Set(result.journeys.map(journey => journey.open_id)).size, 54);
   } finally { rmSync(outputDir, { recursive: true, force: true }); if (timedFailure) vi.useRealTimers(); }
 });
@@ -824,4 +830,62 @@ test.each(['expanded', 'collapsed', 'missing', 'duplicate', 'hidden', 'disabled'
   if (['expanded', 'collapsed'].includes(mode)) assert.equal((await operation).status, 'observed_spa_canceled');
   else await assert.rejects(operation);
   assert.equal(clicked, !['missing', 'duplicate', 'hidden', 'disabled', 'wrong_element', 'completed_request'].includes(mode));
+});
+
+test('all lifecycle explicit unsampled admissions with legacy GETs remain inconclusive and perform no sampled-only action', async () => {
+  const fake = lifecycleBrowserFixture('unsampled');
+  const stage = await runLifecycleQualificationStage({ browser: fake.browser, storageState: {}, baseURL: 'http://127.0.0.1:8123', fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'sidebar_home' } } });
+  assert.equal(stage.trials.length, 6);
+  assert.ok(stage.trials.every(t => t.sampled === false && t.status === 'inconclusive_explicit_unsampled' && t.reports.length === 0));
+  assert.ok(!fake.actions.some(action => ['click', 'hidden', 'back'].includes(action[1])));
+});
+
+test.each(['missing_admission', 'foreign_request', 'overflow', 'sampled_missing_report'])('lifecycle evidence %s fails closed, never silently unsampled', async mode => {
+  vi.useFakeTimers();
+  try {
+    const fake = lifecycleBrowserFixture(mode); const trials = [];
+    const operation = runLifecycleQualificationStage({ browser: fake.browser, storageState: {}, baseURL: 'http://127.0.0.1:8123', fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'sidebar_home' } }, onTrial: t => trials.push(t) });
+    const outcome = operation.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(5020);
+    const error = await outcome;
+    assert.ok(error); assert.ok(trials[0].failure);
+    assert.notEqual(trials[0].status, 'inconclusive_explicit_unsampled');
+    assert.ok(trials[0].producer_events.length <= 64);
+    if (mode === 'sampled_missing_report') assert.match(error.message, /terminal collector response deadline/);
+    else assert.ok(!fake.actions.some(action => ['click', 'hidden', 'back'].includes(action[1])));
+  } finally { vi.useRealTimers(); }
+});
+
+test.each(['binding', 'initialization'])('lifecycle %s install is inside case deadline and late completion cannot create page', async mode => {
+  vi.useFakeTimers();
+  let release; let closed = 0; let pages = 0; const trials = [];
+  const pending = new Promise(resolve => { release = resolve; });
+  const context = { exposeBinding: async () => mode === 'binding' ? pending : undefined, addInitScript: async () => mode === 'initialization' ? pending : undefined,
+    close: async () => { closed++; throw new Error('secondary close'); }, newPage: async () => { pages++; } };
+  try {
+    const operation = runLifecycleQualificationStage({ browser: { newContext: async () => context }, storageState: {}, baseURL: 'http://127.0.0.1:8123', fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'sidebar_home' } }, budgetMs: 1, onTrial: t => trials.push(t) });
+    const outcome = operation.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await outcome;
+    assert.match(error.message, /absolute lifecycle stage deadline/);
+    assert.equal(trials[0].failure, error.message); assert.equal(trials[0].cleanup_failure, 'secondary close');
+    release(); await vi.advanceTimersByTimeAsync(0);
+    assert.equal(pages, 0); assert.equal(closed, 1);
+  } finally { vi.useRealTimers(); }
+});
+
+test('explicitly sampled SPA missing canceled report remains a failure with real action and retained producer identity', async () => {
+  vi.useFakeTimers();
+  try {
+    const fake = lifecycleBrowserFixture('spa_missing_report'); const trials = [];
+    const operation = runLifecycleQualificationStage({ browser: fake.browser, storageState: {}, baseURL: 'http://127.0.0.1:8123', fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'anchor', selector: 'a' } }, onTrial: t => trials.push(t) });
+    const outcome = operation.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(5020);
+    const error = await outcome;
+    assert.match(error.message, /terminal collector response deadline/);
+    assert.equal(trials[1].kind, 'spa_canceled'); assert.equal(trials[1].sampled, true);
+    assert.ok(trials[1].producer_events.some(event => event.kind === 'request' && event.open_id === trials[1].admitted_open_id));
+    assert.deepEqual(trials[1].reports, []);
+    assert.ok(fake.actions.some(action => action[0] === 'spa_canceled' && action[1] === 'click'));
+  } finally { vi.useRealTimers(); }
 });
