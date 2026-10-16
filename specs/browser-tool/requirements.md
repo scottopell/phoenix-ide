@@ -163,13 +163,19 @@ THE SYSTEM SHALL use the cached browser without downloading again
 
 ### REQ-BT-008: Reliable Element Clicking
 
-The `browser_click` tool SHALL click a page element identified by CSS selector using CDP-level mouse events
+The `browser_click` tool SHALL click a page element identified by exactly one CSS `selector` or accessibility snapshot `ref` using CDP-level mouse events
+
+WHEN both target fields or neither target field is supplied
+`browser_click` SHALL reject the request before interacting with the page
 
 WHEN the target element does not exist
 `browser_click` SHALL return a clear error indicating the element was not found
 
-WHEN the `wait` parameter is set to true
+WHEN a CSS selector is supplied and the `wait` parameter is set to true
 `browser_click` SHALL wait for the element to appear in the DOM before clicking
+
+WHEN a snapshot reference is supplied
+`browser_click` SHALL resolve only the original referenced node under REQ-BT-025 and SHALL NOT wait for a replacement element
 
 `browser_click` SHALL reliably trigger event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
 
@@ -181,7 +187,13 @@ WHEN the `wait` parameter is set to true
 
 ### REQ-BT-009: Reliable Text Input
 
-The `browser_type` tool SHALL type text into an input element identified by CSS selector using CDP-level keyboard events
+The `browser_type` tool SHALL type text into an input element identified by exactly one CSS `selector` or accessibility snapshot `ref` using CDP-level keyboard events
+
+WHEN both target fields or neither target field is supplied
+`browser_type` SHALL reject the request before interacting with the page
+
+WHEN a snapshot reference is supplied
+`browser_type` SHALL resolve only the original referenced node under REQ-BT-025
 
 WHEN the target element does not exist
 `browser_type` SHALL return a clear error indicating the element was not found
@@ -194,6 +206,48 @@ WHEN the `clear` parameter is set to true
 **Rationale:** Directly setting an element's value property does not fire the synthetic events that React/Vue listen to. CDP-level keyboard events correctly trigger all framework event handlers.
 
 **User Stories:** US-2
+
+---
+
+### REQ-BT-025: Accessibility Snapshots and Element References
+
+WHEN `browser_snapshot` is invoked
+THE SYSTEM SHALL return a compact, nested representation of Chrome's accessibility tree for the main document, including accessible roles, names, values, and relevant states exposed by Chrome
+
+THE SYSTEM SHALL omit ignored accessibility nodes while preserving their included descendants and nesting
+
+WHEN `interactive` is true (default: false)
+`browser_snapshot` SHALL restrict output to interactive nodes, preserving their relative hierarchy
+
+THE SYSTEM SHALL exclude iframe documents and SHALL include shadow-tree content to the extent Chrome exposes it in the main document's accessibility tree
+
+THE SYSTEM SHALL provide opaque references for supported interactive nodes with a backing DOM node, including supported shadow-tree nodes
+
+THE SYSTEM SHALL bind every reference to the originating browser instance, main document, and exact DOM node, rather than an accessible name, selector, or position
+
+WHEN a snapshot attempt begins
+THE SYSTEM SHALL invalidate the browser's previous snapshot references, including when the new attempt fails
+
+WHEN snapshot collection detects a main-document change
+`browser_snapshot` SHALL fail visibly and SHALL NOT publish usable references from the interrupted collection
+
+WHEN a reference is missing, malformed, from another browser or snapshot, belongs to a replaced document, or targets a detached node
+THE SYSTEM SHALL reject the action with instructions to take `browser_snapshot` again and SHALL NOT resolve it to a replacement node
+
+WHEN ordinary DOM changes leave the referenced node attached to its original document
+THE SYSTEM SHALL retain that reference until a new snapshot attempt or browser teardown invalidates it
+
+THE SYSTEM SHALL bound snapshot output to 2000 displayed nodes and 256 KiB of text, explicitly report truncation, and issue references only for nodes included in the output
+
+WHEN formatted snapshot output exceeds 4096 bytes
+THE SYSTEM SHALL write the bounded output to a temporary file and return its path with any truncation notice
+
+WHEN collection fails or exceeds its timeout (default: 15 seconds)
+`browser_snapshot` SHALL return a visible error rather than an empty successful snapshot
+
+**Rationale:** Agents need readable page structure and unambiguous interaction targets without inventing CSS selectors. Node-bound references distinguish duplicate labels and prevent stale actions from targeting an unrelated replacement element.
+
+**User Stories:** US-1, US-2
 
 ---
 
@@ -760,29 +814,30 @@ The auto-mount trigger is the server-authoritative `browser_session_state` lifec
 
 ## Requirements Traceability
 
-| Requirement | User Story | MVP |
-|-------------|------------|-----|
-| REQ-BT-001: Navigate to URLs | US-1, US-2, US-3 | ✅ |
-| REQ-BT-002: Execute JavaScript | US-1, US-2 | ✅ |
-| REQ-BT-003: Take Screenshots | US-1, US-2 | ✅ |
-| REQ-BT-004: Capture Console Logs | US-1, US-2 | ✅ |
-| REQ-BT-005: Resize Viewport | US-1 | ✅ |
-| REQ-BT-006: Read Image Files | US-1, US-2 | ✅ |
-| REQ-BT-007: Reliable Browser Availability | US-1, US-2, US-3 | ✅ |
-| REQ-BT-008: Reliable Element Clicking | US-2 | ✅ |
-| REQ-BT-009: Reliable Text Input | US-2 | ✅ |
-| REQ-BT-010: Implicit Session Model | US-1, US-2, US-3 | ✅ |
-| REQ-BT-011: State Persistence | US-2 | ✅ |
-| REQ-BT-012: Stateless Tools with Context | US-1, US-2, US-3 | ✅ |
-| REQ-BT-013: Wait for Async Page Elements | US-1, US-2 | ✅ |
-| REQ-BT-014: Accurate Console Log Object Representation | US-1, US-2 | ✅ |
-| REQ-BT-015: Access to Full Console Log Content | US-1, US-2 | 🟡 |
-| REQ-BT-016: Keyboard Shortcut Input | US-2 | ✅ |
-| REQ-BT-017: React Component Access | US-1, US-2 | ✅ |
-| REQ-BT-018: Live Browser View Side Panel | US-4, US-1, US-2 | ✅ |
-| REQ-BT-019: Systematic Web Performance Testing | US-5, US-1, US-2 | 🟡 |
-| REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
-| REQ-BT-021: Network Request Source | US-3 | ❌ |
-| REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |
-| REQ-BT-023: Multi-Context Console | US-3 | ❌ |
-| REQ-BT-024: Capture Network Requests | US-1, US-2 | ❌ |
+| Requirement | User Story |
+|-------------|------------|
+| REQ-BT-001: Navigate to URLs | US-1, US-2, US-3 |
+| REQ-BT-002: Execute JavaScript | US-1, US-2 |
+| REQ-BT-003: Take Screenshots | US-1, US-2 |
+| REQ-BT-004: Capture Console Logs | US-1, US-2 |
+| REQ-BT-005: Resize Viewport | US-1 |
+| REQ-BT-006: Read Image Files | US-1, US-2 |
+| REQ-BT-007: Reliable Browser Availability | US-1, US-2, US-3 |
+| REQ-BT-008: Reliable Element Clicking | US-2 |
+| REQ-BT-009: Reliable Text Input | US-2 |
+| REQ-BT-010: Implicit Session Model | US-1, US-2, US-3 |
+| REQ-BT-011: State Persistence | US-2 |
+| REQ-BT-012: Stateless Tools with Context | US-1, US-2, US-3 |
+| REQ-BT-013: Wait for Async Page Elements | US-1, US-2 |
+| REQ-BT-014: Accurate Console Log Object Representation | US-1, US-2 |
+| REQ-BT-015: Access to Full Console Log Content | US-1, US-2 |
+| REQ-BT-016: Keyboard Shortcut Input | US-2 |
+| REQ-BT-017: React Component Access | US-1, US-2 |
+| REQ-BT-018: Live Browser View Side Panel | US-4, US-1, US-2 |
+| REQ-BT-019: Systematic Web Performance Testing | US-5, US-1, US-2 |
+| REQ-BT-020: Service Worker Inspection | US-3 |
+| REQ-BT-021: Network Request Source | US-3 |
+| REQ-BT-022: Offline Mode Simulation | US-3 |
+| REQ-BT-023: Multi-Context Console | US-3 |
+| REQ-BT-024: Capture Network Requests | US-1, US-2 |
+| REQ-BT-025: Accessibility Snapshots and Element References | US-1, US-2 |

@@ -33,8 +33,8 @@ pub use bash::{
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
     BrowserKeyPressTool, BrowserNavigateTool, BrowserProfileTool, BrowserRecentConsoleLogsTool,
-    BrowserResizeTool, BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
-    BrowserWaitForSelectorTool,
+    BrowserResizeTool, BrowserSessionManager, BrowserSnapshotTool, BrowserTakeScreenshotTool,
+    BrowserTypeTool, BrowserWaitForSelectorTool,
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
@@ -835,6 +835,7 @@ fn write_tools() -> Vec<Arc<dyn Tool>> {
 fn browser_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BrowserNavigateTool),
+        Arc::new(BrowserSnapshotTool),
         Arc::new(BrowserEvalTool),
         Arc::new(BrowserTakeScreenshotTool),
         Arc::new(BrowserRecentConsoleLogsTool),
@@ -1383,6 +1384,7 @@ mod tests {
         let names = names(&ToolRegistry::standard());
         for expected in [
             "browser_navigate",
+            "browser_snapshot",
             "browser_eval",
             "browser_take_screenshot",
             "browser_recent_console_logs",

@@ -10,6 +10,7 @@
 pub mod react;
 pub mod screencast;
 pub mod session;
+pub mod snapshot;
 
 pub use screencast::{ScreencastBroker, ScreencastEvent};
 pub use session::{

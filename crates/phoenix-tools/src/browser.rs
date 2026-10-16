@@ -12,6 +12,7 @@
 //! paths keep resolving.
 
 pub mod profile;
+mod snapshot;
 mod tools;
 
 #[cfg(test)]
@@ -25,6 +26,7 @@ pub use phoenix_browser::{react, screencast, session};
 pub use phoenix_browser::{BrowserError, BrowserSession, BrowserSessionManager};
 
 pub use profile::BrowserProfileTool;
+pub use snapshot::BrowserSnapshotTool;
 pub use tools::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserKeyPressTool,
     BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
