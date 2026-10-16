@@ -1,15 +1,17 @@
 #![cfg(target_os = "macos")]
 use phoenix_deployment_controller::{
-    guardian_ipc::WireState, native_guardian::GuardianClient, AttemptId, BirthToken, ControllerOs,
-    ControllerSqliteStore, CpuContentionBasisPoints, DeploymentAttempt, IdentityObservation,
-    MacOsControllerOs, MemoryPressure, MonotonicTick, NativeSessionState, ProcessId,
-    ProcessIdentity, ResourcePolicy,
+    guardian_ipc::{WireSnapshot, WireState},
+    native_guardian::GuardianClient,
+    AttemptId, BirthToken, ControllerOs, ControllerSqliteStore, CpuContentionBasisPoints,
+    DeploymentAttempt, IdentityObservation, MacOsControllerOs, MemoryPressure, MonotonicTick,
+    NativeSessionState, ProcessId, ProcessIdentity, ResourcePolicy,
 };
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::{
     io::{BufRead, BufReader},
     os::unix::fs::PermissionsExt,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -32,8 +34,33 @@ fn assert_guardian_is_parent(child_pid: i32, guardian_pid: u32) {
     );
 }
 
-#[test]
-fn runner_death_does_not_kill_guardian_or_its_original_child() {
+struct NativeProcessFixture {
+    _parent: tempfile::TempDir,
+    dir: PathBuf,
+    path: PathBuf,
+    attempt: AttemptId,
+    guardian: Child,
+    child_pid: i32,
+    child_birth: BirthToken,
+    runner: Child,
+}
+
+fn runner_command(dir: &Path, path: &Path, observe_seconds: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"));
+    command.args([
+        "--socket-dir",
+        dir.to_str().unwrap(),
+        "--observe-seconds",
+        observe_seconds,
+        "--store",
+        path.to_str().unwrap(),
+        "--attempt",
+        "64",
+    ]);
+    command
+}
+
+fn start_fixture() -> NativeProcessFixture {
     let parent = tempfile::Builder::new()
         .prefix("sdc-")
         .tempdir_in("/tmp")
@@ -82,7 +109,7 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         .next()
         .unwrap()
         .unwrap();
-    let pid: i32 = line
+    let child_pid = line
         .strip_prefix("disposable child pid=")
         .unwrap()
         .split(' ')
@@ -90,17 +117,13 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         .unwrap()
         .parse()
         .unwrap();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
-        .args([
-            "--socket-dir",
-            dir.to_str().unwrap(),
-            "--observe-seconds",
-            "5",
-            "--store",
-            path.to_str().unwrap(),
-            "--attempt",
-            "64",
-        ])
+    let birthday: Vec<_> = line.split("birth=").nth(1).unwrap().split(':').collect();
+    let child_birth = BirthToken::new(
+        birthday[0].parse::<u64>().unwrap(),
+        birthday[1].parse::<u32>().unwrap(),
+    )
+    .unwrap();
+    let mut runner = runner_command(&dir, &path, "5")
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -108,6 +131,49 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
     let mut ready = String::new();
     runner_output.read_line(&mut ready).unwrap();
     assert_eq!(ready.trim(), "verified binding: InitialActive");
+    NativeProcessFixture {
+        _parent: parent,
+        dir,
+        path,
+        attempt,
+        guardian,
+        child_pid,
+        child_birth,
+        runner,
+    }
+}
+
+fn wait_for_detached(dir: &Path) -> WireSnapshot {
+    let reconnect_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut replacement) = GuardianClient::connect(dir) {
+            if let Ok(snapshot) = replacement.hello() {
+                if snapshot.state == WireState::DetachedFenced {
+                    return snapshot;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < reconnect_deadline,
+            "guardian did not fence"
+        );
+        // test-timing-allow: bounded polling observes the protocol state transition.
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn runner_death_does_not_kill_guardian_or_its_original_child() {
+    let NativeProcessFixture {
+        _parent,
+        dir,
+        path,
+        attempt,
+        mut guardian,
+        child_pid,
+        child_birth,
+        mut runner,
+    } = start_fixture();
     let mut store = ControllerSqliteStore::open_existing(&path).unwrap();
     let binding = store.load_native_binding(attempt).unwrap().unwrap();
     assert_eq!(binding.identity().process.pid().get(), guardian.id());
@@ -120,34 +186,14 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         "guardian PID and birth token must match OS observation"
     );
     assert_eq!(binding.slots().len(), 1);
-    assert_eq!(binding.slots()[0].process.pid().get(), pid as u32);
-    let birthday: Vec<_> = line.split("birth=").nth(1).unwrap().split(':').collect();
     assert_eq!(
-        binding.slots()[0].process.birth().seconds(),
-        birthday[0].parse::<u64>().unwrap()
+        binding.slots()[0].process.pid().get(),
+        u32::try_from(child_pid).unwrap()
     );
-    assert_eq!(
-        binding.slots()[0].process.birth().nanos(),
-        birthday[1].parse::<u32>().unwrap()
-    );
+    assert_eq!(binding.slots()[0].process.birth(), child_birth);
     runner.kill().unwrap();
     runner.wait().unwrap();
-    let reconnect_deadline = Instant::now() + Duration::from_secs(5);
-    let snapshot = loop {
-        if let Ok(mut replacement) = GuardianClient::connect(&dir) {
-            if let Ok(snapshot) = replacement.hello() {
-                if snapshot.state == WireState::DetachedFenced {
-                    break snapshot;
-                }
-            }
-        }
-        assert!(
-            Instant::now() < reconnect_deadline,
-            "guardian did not fence"
-        );
-        // test-timing-allow: bounded polling observes the protocol state transition.
-        thread::sleep(Duration::from_millis(25));
-    };
+    let snapshot = wait_for_detached(&dir);
     assert_eq!(snapshot.slots.len(), 1);
     assert_eq!(
         snapshot.native_binding.as_ref().unwrap().nonce,
@@ -155,24 +201,12 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
     );
     assert!(guardian.try_wait().unwrap().is_none());
     assert_eq!(
-        unsafe { libc::kill(pid, 0) },
+        unsafe { libc::kill(child_pid, 0) },
         0,
         "child survived runner death"
     );
-    assert_guardian_is_parent(pid, guardian.id());
-    let runner_status = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
-        .args([
-            "--socket-dir",
-            dir.to_str().unwrap(),
-            "--observe-seconds",
-            "1",
-            "--store",
-            path.to_str().unwrap(),
-            "--attempt",
-            "64",
-        ])
-        .output()
-        .unwrap();
+    assert_guardian_is_parent(child_pid, guardian.id());
+    let runner_status = runner_command(&dir, &path, "1").output().unwrap();
     assert!(
         runner_status.status.success(),
         "{}",
@@ -203,7 +237,7 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
             .persistence_revision()
     );
     assert!(guardian.try_wait().unwrap().is_none());
-    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-    assert_guardian_is_parent(pid, guardian.id());
+    assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0);
+    assert_guardian_is_parent(child_pid, guardian.id());
     assert!(guardian.wait().unwrap().success());
 }
