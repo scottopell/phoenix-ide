@@ -19,6 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 /// Called before creating the daemon's Tokio runtime or starting any threads.
 pub fn close_inherited_descriptors() -> Result<(), String> {
@@ -351,7 +352,15 @@ impl State {
             .await
             .is_running()
             .map_err(|e| e.to_string())?;
-        Ok(running.then_some(browser))
+        if running {
+            Ok(Some(browser))
+        } else {
+            self.manager
+                .kill_session(&self.scope)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(None)
+        }
     }
 
     async fn admit(&self, request: &Request) -> Admission {
@@ -642,6 +651,30 @@ async fn read_job(mut stream: UnixStream, state: &State) -> Option<Job> {
     }
 }
 
+const MAX_PENDING_CLIENTS: usize = 32;
+
+fn receive_client(clients: &mut JoinSet<Option<Job>>, stream: UnixStream, state: Arc<State>) {
+    if clients.len() < MAX_PENDING_CLIENTS {
+        clients.spawn(async move { read_job(stream, &state).await });
+    }
+}
+
+fn reject_busy(clients: &mut JoinSet<Option<Job>>, mut job: Job, state: Arc<State>) {
+    clients.spawn(async move {
+        send_response(
+            &mut job.stream,
+            &Response::error(
+                &state.session,
+                Some(&state.lifetime),
+                ErrorCode::Busy,
+                "Session request queue is full; this request was not executed.",
+            ),
+        )
+        .await;
+        None
+    });
+}
+
 async fn serve(
     listener: &UnixListener,
     state: Arc<State>,
@@ -655,6 +688,7 @@ async fn serve(
     let mut pending = 0_u32;
     let mut deadline = tokio::time::Instant::now() + state.idle;
     let mut close_stream = None;
+    let mut clients = JoinSet::new();
     tokio::pin!(signal);
     let result = loop {
         tokio::select! {
@@ -667,13 +701,20 @@ async fn serve(
             }
             accepted = listener.accept() => {
                 let (stream, _) = match accepted { Ok(accepted) => accepted, Err(error) => break Err(format!("accept: {error}")) };
-                let Some(mut job) = read_job(stream, &state).await else { continue; };
+                receive_client(&mut clients, stream, state.clone());
+            }
+            received = clients.join_next(), if !clients.is_empty() => {
+                let mut job = match received.expect("pending client") {
+                    Ok(Some(job)) => job,
+                    Ok(None) => continue,
+                    Err(error) => break Err(format!("request reader failed: {error}")),
+                };
                 if job.request.command == "close" { close_stream = Some(job.stream); break Ok(()); }
                 match jobs_tx.try_send(job) {
                     Ok(()) => pending += 1,
                     Err(mpsc::error::TrySendError::Full(returned)) => {
                         job = returned;
-                        send_response(&mut job.stream, &Response::error(&state.session, Some(&state.lifetime), ErrorCode::Busy, "Session request queue is full; this request was not executed.")).await;
+                        reject_busy(&mut clients, job, state.clone());
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break Err("browser worker stopped unexpectedly".into()),
                 }
@@ -681,6 +722,7 @@ async fn serve(
         }
     };
     let _ = shutdown_tx.send(true);
+    clients.shutdown().await;
     drop(jobs_tx);
     let worker_result = task
         .await
@@ -689,13 +731,13 @@ async fn serve(
         Some(browser) => Some(browser.read().await.launch_identity().launch_uuid.clone()),
         None => None,
     };
-    let cleanup = finish_shutdown(listener, &state, socket, close_stream, browser_lifetime).await;
+    let cleanup = finish_shutdown(listener, state, socket, close_stream, browser_lifetime).await;
     result.and(worker_result).and(cleanup)
 }
 
 async fn finish_shutdown(
     listener: &UnixListener,
-    state: &State,
+    state: Arc<State>,
     socket: &Path,
     mut close_stream: Option<UnixStream>,
     browser_lifetime: Option<String>,
@@ -720,7 +762,7 @@ async fn finish_shutdown(
         if let Some(mut stream) = close_stream.take() {
             send_response(
                 &mut stream,
-                &cleanup_failure(state, &error, browser_lifetime.clone()),
+                &cleanup_failure(&state, &error, browser_lifetime.clone()),
             )
             .await;
         }
@@ -729,18 +771,20 @@ async fn finish_shutdown(
             Err(failure) => retain_owner_forever(failure).await,
         };
         tokio::pin!(signal);
+        let mut clients = JoinSet::new();
         loop {
-            let accepted = tokio::select! {
+            let received = tokio::select! {
                 () = &mut signal => break,
-                accepted = listener.accept() => accepted,
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => receive_client(&mut clients, stream, state.clone()),
+                        Err(failure) => retain_owner_forever(failure.to_string()).await,
+                    }
+                    continue;
+                },
+                received = clients.join_next(), if !clients.is_empty() => received,
             };
-            let (stream, _) = match accepted {
-                Ok(accepted) => accepted,
-                Err(failure) => {
-                    retain_owner_forever(failure.to_string()).await;
-                }
-            };
-            let Some(mut job) = read_job(stream, state).await else {
+            let Some(Ok(Some(mut job))) = received else {
                 continue;
             };
             if job.request.command == "close" {
@@ -758,10 +802,14 @@ async fn finish_shutdown(
                 )
                 .with_browser_lifetime(browser_lifetime.clone())
             } else {
-                cleanup_failure(state, &error, browser_lifetime.clone())
+                cleanup_failure(&state, &error, browser_lifetime.clone())
             };
-            send_response(&mut job.stream, &response).await;
+            clients.spawn(async move {
+                send_response(&mut job.stream, &response).await;
+                None
+            });
         }
+        clients.shutdown().await;
     }
 }
 
@@ -838,6 +886,74 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reader_state() -> Arc<State> {
+        Arc::new(State {
+            manager: BrowserSessionManager::new(),
+            scope: ResourceScopeKey::Unattached("reader-test".into()),
+            session: "named:reader-test".into(),
+            lifetime: uuid::Uuid::new_v4().to_string(),
+            idle: Duration::from_secs(300),
+            image_directory: PhoenixRuntimeEnvironment::detect()
+                .tmp_root()
+                .join("unused-reader-test-images"),
+        })
+    }
+
+    #[tokio::test]
+    async fn partial_clients_do_not_block_complete_requests() {
+        use tokio::io::AsyncReadExt;
+
+        let state = reader_state();
+        let mut clients = JoinSet::new();
+        let (mut partial, server) = UnixStream::pair().unwrap();
+        partial.write_all(b"{\"command\":").await.unwrap();
+        receive_client(&mut clients, server, state.clone());
+        let (mut complete, server) = UnixStream::pair().unwrap();
+        receive_client(&mut clients, server, state);
+        protocol::write_message(
+            &mut complete,
+            &Request {
+                command: "close".into(),
+                input: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(30), clients.join_next())
+            .await
+            .expect("complete client must be independent of partial client")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.request.command, "close");
+        assert_eq!(clients.len(), 1);
+        clients.shutdown().await;
+        assert_eq!(partial.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_clients_are_bounded_and_cancelled_at_shutdown() {
+        use tokio::io::AsyncReadExt;
+
+        let state = reader_state();
+        let mut clients = JoinSet::new();
+        let mut peers = Vec::new();
+        for _ in 0..MAX_PENDING_CLIENTS {
+            let (peer, server) = UnixStream::pair().unwrap();
+            peers.push(peer);
+            receive_client(&mut clients, server, state.clone());
+        }
+        let (mut excess, server) = UnixStream::pair().unwrap();
+        receive_client(&mut clients, server, state);
+        assert_eq!(clients.len(), MAX_PENDING_CLIENTS);
+        assert_eq!(excess.read(&mut [0_u8; 1]).await.unwrap(), 0);
+        clients.shutdown().await;
+        assert!(clients.is_empty());
+        for mut peer in peers {
+            assert_eq!(peer.read(&mut [0_u8; 1]).await.unwrap(), 0);
+        }
+    }
 
     fn image(bytes: &[u8]) -> ToolImage {
         ToolImage {

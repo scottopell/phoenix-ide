@@ -637,6 +637,9 @@ fn assert_semantic_rejections(cli: &BrowserCli) {
         vec!["profile", "run_scenario", "--input", "{\"steps\":[]}"],
         vec!["profile", "unknown-action"],
         vec!["profile", "throttle", "--input", "{\"rate\":0}"],
+        vec!["profile", "cpu_summary"],
+        vec!["profile", "cpu_summary", "--input", "{\"path\":42}"],
+        vec!["profile", "help", "--input", "{\"runs\":\"bad\"}"],
     ] {
         let output = cli.command().args(&arguments).output().unwrap();
         assert_eq!(
@@ -783,6 +786,48 @@ fn discovery_does_not_start_a_daemon_or_browser() {
         .unwrap()
         .contains("open"));
     assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn partial_clients_do_not_block_close_signals_or_idle_cleanup() {
+    // REQ-BCLI-006.
+    if !chrome_enabled() {
+        return;
+    }
+    for shutdown in ["close", "signal", "idle"] {
+        let cli = BrowserCli::new();
+        cli.ok(&["--idle-timeout", "2", "open", &fixture()]);
+        let resources = live_resources(&cli);
+        let status = cli.ok(&["status"]);
+        let daemon_pid = u32::try_from(status["result"]["daemon_pid"].as_u64().unwrap()).unwrap();
+        let daemon = current_process_identity(daemon_pid).unwrap();
+        let mut partial = UnixStream::connect(cli.socket()).unwrap();
+        partial
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        partial.write_all(b"{\"command\":").unwrap();
+        match shutdown {
+            "close" => {
+                cli.ok(&["close"]);
+            }
+            "signal" => signal_owned(daemon, libc::SIGTERM),
+            "idle" => {}
+            _ => unreachable!(),
+        }
+        let mut reply = Vec::new();
+        match partial.read_to_end(&mut reply) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("{shutdown}: partial client was not retired: {error}"),
+        }
+        assert!(
+            reply.is_empty(),
+            "{shutdown}: partial client outlived request-read timeout: {reply:?}"
+        );
+        await_process_exit(daemon);
+        assert_resources_removed(&resources);
+        assert!(!cli.socket().exists());
+    }
 }
 
 #[test]
@@ -1074,6 +1119,10 @@ fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
     let tree = &opened["result"]["snapshot"]["result"]["text"];
     let stale = reference(tree.as_str().unwrap(), "Increment");
     cli.ok(&["profile", "cpu_start"]);
+    cli.eval("for(let i=0;i<150;i++){const b=document.createElement('button');b.textContent='Large snapshot control '+i;document.body.append(b)};true");
+    let snapshot = cli.ok(&["snapshot"]);
+    let artifact = PathBuf::from(snapshot["result"]["artifacts"][0].as_str().unwrap());
+    assert!(artifact.is_file());
     let resources = live_resources(&cli);
     let sentinel = resources.0.join("old-lifetime-sentinel");
     std::fs::write(&sentinel, b"old browser state").unwrap();
@@ -1085,6 +1134,13 @@ fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
     await_process_exit(resources.1);
     assert_eq!(status["lifetime"], opened["lifetime"]);
     assert_eq!(status["result"]["active"], false);
+    assert!(status["browser_lifetime"].is_null());
+    assert!(status["result"]["profile_path"].is_null());
+    assert!(
+        !artifact.exists(),
+        "dead browser retained its snapshot artifact"
+    );
+    assert_resources_removed(&resources);
     let missing = cli.invoke(&["snapshot"], None, false);
     assert_eq!(missing["error"]["code"], "state_lost");
     assert_eq!(missing["lifetime"], opened["lifetime"]);
