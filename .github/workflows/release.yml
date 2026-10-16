@@ -37,6 +37,7 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     outputs:
+      browser_cli: ${{ steps.capability.outputs.browser_cli }}
       preparation: ${{ steps.ver.outputs.preparation }}
       release: ${{ steps.ver.outputs.release }}
       create_tag: ${{ steps.ver.outputs.create_tag }}
@@ -154,6 +155,18 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Resolve browser CLI from immutable source
+        id: capability
+        env:
+          SOURCE_COMMIT: ${{ steps.ver.outputs.commit }}
+          RELEASE: ${{ steps.ver.outputs.release }}
+        run: |
+          browser_cli=false
+          if [[ "$RELEASE" == true ]] && git cat-file -e "$SOURCE_COMMIT:crates/phoenix-tools/src/bin/phoenix-browser.rs" 2>/dev/null; then
+            browser_cli=true
+          fi
+          echo "browser_cli=$browser_cli" >> "$GITHUB_OUTPUT"
+
   tag-release:
     needs: gate
     if: needs.gate.outputs.create_tag == 'true'
@@ -228,10 +241,27 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
           CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+      - name: Build and smoke native Linux browser CLI
+        if: needs.gate.outputs.browser_cli == 'true'
+        run: |
+          cargo build --locked -p phoenix-tools --bin phoenix-browser --profile release-min --target "${{ matrix.target }}"
+          browser="target/${{ matrix.target }}/release-min/phoenix-browser"
+          case "${{ matrix.target }}" in
+            x86_64-*) file "$browser" | grep -E 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' ;;
+            aarch64-*) file "$browser" | grep -E 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)' ;;
+          esac
+          "$browser" --help
+          "$browser" --json schema snapshot
+          cp "$browser" "phoenix-browser-${{ matrix.target }}"
+        env:
+          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ matrix.target }}-release-assets
-          path: phoenix_ide-${{ matrix.target }}*
+          path: |
+            phoenix_ide-${{ matrix.target }}*
+            phoenix-browser-${{ matrix.target }}
 
   build-macos:
     environment: macos-release-signing
@@ -275,6 +305,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release-assets"
           cargo build --profile release-min --features phoenix_ide/datadog-tracing --target "${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release-min/phoenix_ide" "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
+      - name: Build native macOS browser CLI
+        if: needs.gate.outputs.release == 'true' && needs.gate.outputs.browser_cli == 'true'
+        run: |
+          cargo build --locked -p phoenix-tools --bin phoenix-browser --profile release-min --target "${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release-min/phoenix-browser" "$RUNNER_TEMP/release-assets/phoenix-browser-${{ matrix.target }}"
       - name: Sign, verify, notarize, and package protected macOS assets
         env:
           DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
@@ -322,6 +357,10 @@ jobs:
           codesign --force --sign "$MACOS_SIGNING_IDENTITY" --options runtime --timestamp "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
           codesign --verify --strict --verbose=2 "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
           export MACOS_SIGNING_IDENTITY APPLE_TEAM_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_API_KEY_PATH
+          if [[ "${{ needs.gate.outputs.release }}" == true && "${{ needs.gate.outputs.browser_cli }}" == true ]]; then
+            bash scripts/sign-notarize-browser-cli.sh \
+              "$RUNNER_TEMP/release-assets/phoenix-browser-${{ matrix.target }}" "${{ matrix.target }}"
+          fi
           receipt_args=()
           if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
             receipt_args+=("$RUNNER_TEMP/release-assets/PREPARATION-RECEIPT-${{ matrix.target }}.json")
@@ -378,6 +417,7 @@ jobs:
             security delete-keychain "$KEYCHAIN_PATH" || cleanup_failed=1
           fi
           rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/phoenix-notary-api-key.p8" || cleanup_failed=1
+          rm -rf "$RUNNER_TEMP"/phoenix-browser-notary.* || cleanup_failed=1
           [[ ! -e "$KEYCHAIN_PATH" ]]
           [[ ! -e "$RUNNER_TEMP/developer-id.p12" ]]
           [[ ! -e "$RUNNER_TEMP/phoenix-notary-api-key.p8" ]]
@@ -444,6 +484,7 @@ jobs:
           name: macos-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/release-assets/${{ matrix.asset }}
+            ${{ runner.temp }}/release-assets/phoenix-browser-${{ matrix.target }}
             ${{ runner.temp }}/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -488,6 +529,14 @@ jobs:
             Phoenix-macos-x86_64-apple-darwin-${{ needs.gate.outputs.tag }}.zip
             Phoenix-macos-aarch64-apple-darwin-${{ needs.gate.outputs.tag }}.zip
           )
+          if [[ "${{ needs.gate.outputs.browser_cli }}" == true ]]; then
+            required+=(
+              phoenix-browser-x86_64-unknown-linux-musl
+              phoenix-browser-aarch64-unknown-linux-musl
+              phoenix-browser-x86_64-apple-darwin
+              phoenix-browser-aarch64-apple-darwin
+            )
+          fi
           for asset in "${required[@]}"; do
             test -f "$asset" || { echo "missing required release asset: $asset"; exit 1; }
           done

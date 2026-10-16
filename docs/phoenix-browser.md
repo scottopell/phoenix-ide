@@ -1,5 +1,7 @@
 # Phoenix browser for coding agents
 
+Download `phoenix-browser-<target>` and `SHA256SUMS` from the same [GitHub Release](https://github.com/scottopell/phoenix-ide/releases). Targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`. Verify the selected file's SHA-256 digest, then make it executable and put it on your PATH as `phoenix-browser`. macOS binaries are Developer ID signed and notarized. Release candidates require selecting their explicit tag.
+
 Build and install from the workspace (Rust 1.95 or later):
 
 ```sh

@@ -128,6 +128,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [109](109_console-capture-uses-ordered-context-identities.md) | Navigation console capture uses ordered context identities | Superseded by ADR-110 | REQ-BT-004, REQ-BCLI-007 |
 | [110](110_console-capture-tracks-document-incarnations.md) | Navigation console capture tracks document incarnations | Accepted | REQ-BT-004, REQ-BCLI-007 |
 | [111](111_console-capture-attaches-isolated-frame-targets.md) | Console capture attaches isolated frame targets | Accepted | REQ-BT-004, REQ-BCLI-007 |
+| [112](112_browser-cli-shares-verified-release-publication.md) | Browser CLI shares verified release publication | Accepted | REQ-DESKTOP-REL-005/009/010/011 |
 
 ## For agents: which decisions bind your task
 
