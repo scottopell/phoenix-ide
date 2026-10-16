@@ -25,15 +25,15 @@ session by default when one exists.
 
 ## Requirements
 
-### REQ-TMUX-001: Per-Conversation Tmux Server (Socket Isolation)
+### REQ-TMUX-001: Persisted-Scope Tmux Server (Socket Isolation)
 
-WHEN any tmux operation occurs for a conversation (agent calls the `tmux`
-tool, or the in-app terminal is opened)
-THE SYSTEM SHALL invoke the tmux binary with `-S <absolute-socket-path>`
-where `<absolute-socket-path>` is the conversation's dedicated socket
-AND `<absolute-socket-path>` SHALL be
-`<phoenix-data-dir>/tmux-sockets/conv-<conversation_id>.sock`
-(default: `~/.phoenix-ide/tmux-sockets/conv-<conversation_id>.sock`)
+WHEN any tmux operation occurs for an ordinary conversation (agent tool or in-app terminal)
+THE SYSTEM SHALL invoke tmux with `-S <absolute-socket-path>` derived from its persisted `work_scope_id`, not its transcript ID or cwd
+AND SHALL derive the filename `wt-<digest>.sock` beneath the configured tmux socket directory, where `digest` is the first eight SHA-256 bytes of the scope ID rendered as sixteen lowercase hexadecimal characters
+AND SHALL share the same server across continuation transcripts retaining that WorkScope
+AND SHALL keep distinct persisted scopes isolated even when their cwd matches.
+
+Unattached conversations without a persisted WorkScope use the fallback `conv-<conversation_id>.sock`; this fallback is not ordinary Direct continuation ownership. The Coordinator and Global terminal retain separate resource identities.
 
 THE SYSTEM SHALL ensure that the socket directory exists with 0700
 permissions before any tmux invocation for any conversation, creating it

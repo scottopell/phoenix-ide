@@ -44,9 +44,9 @@ use "../bedrock/bedrock.allium" as bedrock
 -- Actor Declarations
 ------------------------------------------------------------
 
--- The agent that calls the tmux tool. Identity scoping by conversation
--- mirrors specs/bash/bash.allium: the registry lookup is conversation-
--- keyed, so the agent can only address its own conversation's server.
+-- The requesting transcript identifies the actor. Its attached persisted
+-- WorkScope identifies the ordinary tmux server, shared across continuations;
+-- actor identity alone does not grant a different scope's resource authority.
 actor LlmAgent {
     identified_by: bedrock/Conversation
 }
@@ -239,7 +239,7 @@ rule ServerSpawnedLazily {
     requires: probe_socket(conversation) = no_socket
     requires: not exists TmuxServer{conversation: conversation}
 
-    let path = socket_path_for(conversation)
+    let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxServer.created(
         conversation: conversation,
@@ -279,7 +279,7 @@ rule ServerSpawnedAfterStale {
     requires: tmux_binary_available()
     requires: probe_socket(conversation) = dead_socket
 
-    let path = socket_path_for(conversation)
+    let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: SocketFileUnlinked(path)
     ensures: TmuxServer.created(
@@ -307,7 +307,7 @@ rule ServerProbedLive {
     requires: probe_socket(conversation) = live
     requires: not exists TmuxServer{conversation: conversation}
 
-    let path = socket_path_for(conversation)
+    let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxServer.created(
         conversation: conversation,
@@ -351,8 +351,8 @@ rule TmuxToolCalled {
     ensures: TmuxOperationRequested(conversation)
         -- Triggers the lifecycle rules; one of them ensures status=live
         -- by the time TmuxSubprocessSpawned fires below.
-    ensures: TmuxSubprocessSpawned(socket_path_for(conversation), args, wait_seconds)
-    ensures: TmuxToolResponseShaped(conversation, socket_path_for(conversation), args)
+    ensures: TmuxSubprocessSpawned(socket_path_for_scope(attached_work_scope_id(conversation)), args, wait_seconds)
+    ensures: TmuxToolResponseShaped(conversation, socket_path_for_scope(attached_work_scope_id(conversation)), args)
 
     @guidance
         -- Phoenix prepends `-S <sock>` before `args`. Tmux's CLI parser
@@ -443,7 +443,7 @@ rule TmuxRunToolCalled {
     requires: readiness_mode = return_immediately or readiness_mode = wait_for_text
 
     let file_root = effective_file_root_for(conversation)
-    let socket = socket_path_for(conversation)
+    let socket = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxOperationRequested(conversation)
     ensures: TmuxRunWindowCreated(
@@ -716,23 +716,17 @@ rule ServerPreservedForLiveOwner {
 -- Invariants
 ------------------------------------------------------------
 
--- REQ-TMUX-001
+-- REQ-TMUX-001: ordinary resource identity is the persisted scope, not the
+-- environment path, mode or transcript. Unattached/Coordinator/global resource
+-- identities use their separate routing contracts, not this ordinary scope rule.
 invariant SocketPathDeterministic {
     for s in TmuxServer:
-        -- Owns a worktree (Work/Branch/top-level Explore):
-        --   socket_path = wt-{hash(worktree_path)}.sock
-        -- No own worktree (Direct, sub-agent Explore):
-        --   socket_path = conv-{conversation_id}.sock
-        -- The split is on the persisted ConvMode.worktree_path(), not on
-        -- "managed vs Direct": a sub-agent Explore is managed but has no
-        -- worktree of its own, so it keys to its conversation scope.
-        s.socket_path = socket_path_for(s.conversation)
+        s.socket_path = socket_path_for_scope(s.work_scope_id)
 }
 
--- REQ-TMUX-001
-invariant OneServerPerConversation {
-    for c in bedrock/Conversation:
-        count(TmuxServer{conversation: c, status: live}) <= 1
+invariant OneServerPerWorkScope {
+    for server in TmuxServer:
+        count(TmuxServer{work_scope_id: server.work_scope_id, status: live}) <= 1
 }
 
 -- REQ-TMUX-007
