@@ -11,6 +11,8 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 
 The departing-document delivery evidence decision is [ADR-107](107_pagehide-delivery-uses-collector-and-export-evidence.md), affecting REQ-CVT-004/005/006.
 
+Complete exported span capacity is governed by [ADR-108](108_preserve-complete-span-schemas-with-bounded-capacity.md), affecting REQ-CVT-005/006/007.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |
@@ -121,6 +123,7 @@ The departing-document delivery evidence decision is [ADR-107](107_pagehide-deli
 | [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
 | [102](102_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
 | [107](107_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
+| [108](108_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
 
 ## For agents: which decisions bind your task
 

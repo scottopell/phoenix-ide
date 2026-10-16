@@ -475,6 +475,290 @@ mod tests {
         assert_eq!(child.span_context.trace_id(), view.span_context.trace_id());
     }
 
+    #[tokio::test]
+    async fn production_attribute_capacity_preserves_complete_ready_collector_schema() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use prost::Message as _;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let state = collector_test_state().await;
+        let instance = state.db.instance_id().await.unwrap().to_string();
+        let mut value = payload();
+        value["frontend_source"] = "f".repeat(40).into();
+        for key in [
+            "reconnect_count",
+            "sampled_count",
+            "sampling_dropped_count",
+            "transport_dropped_count",
+            "transport_failed_count",
+            "dropped_correlations",
+        ] {
+            value[key] = u32::MAX.into();
+        }
+        for key in [
+            "frame_delta_count",
+            "frame_over_50_count",
+            "frame_max_delta_ms",
+            "frame_p95_delta_ms",
+        ] {
+            value[key] = 500.into();
+        }
+        value["outcome"] = "ready".into();
+        value["anchor_result"] = "applied".into();
+        value["product_conversation_id"] = serde_json::json!(uuid::Uuid::new_v4());
+        value["segment_id"] = serde_json::json!(uuid::Uuid::new_v4());
+        value["marks"]["snapshot_received"] = 5.into();
+        value["marks"]["hydration_ready"] = 6.into();
+        value["marks"]["chapter_data_ready"] = 8.into();
+        value["marks"]["anchor_settled"] = 75.into();
+        let parsed: Report = serde_json::from_value(value.clone()).unwrap();
+        assert!(parsed.valid());
+        let expected: std::collections::BTreeMap<&str, serde_json::Value> = [
+            ("open.id", value["open_id"].clone()),
+            ("browser.reporter_id", value["reporter_id"].clone()),
+            (
+                "browser.counters_saturated",
+                value["counters_saturated"].clone(),
+            ),
+            (
+                "product_conversation.id",
+                value["product_conversation_id"].clone(),
+            ),
+            ("segment.id", value["segment_id"].clone()),
+            ("browser.route", value["route"].clone()),
+            ("browser.trigger", value["trigger"].clone()),
+            ("browser.outcome", value["outcome"].clone()),
+            ("browser.platform", value["platform"].clone()),
+            ("browser.standalone", value["standalone"].clone()),
+            ("browser.visible", value["visible"].clone()),
+            ("browser.frontend_source", value["frontend_source"].clone()),
+            (
+                "browser.frontend_source_dirty",
+                value["frontend_source_dirty"].clone(),
+            ),
+            ("browser.cache", value["cache"].clone()),
+            (
+                "browser.message_count_bucket",
+                value["message_count_bucket"].clone(),
+            ),
+            (
+                "browser.chapter_count_bucket",
+                value["chapter_count_bucket"].clone(),
+            ),
+            (
+                "browser.response_size_bucket",
+                value["response_size_bucket"].clone(),
+            ),
+            ("browser.reconnect_count", value["reconnect_count"].clone()),
+            ("browser.anchor_result", value["anchor_result"].clone()),
+            (
+                "server.backend_source",
+                serde_json::json!(env!("PHOENIX_GIT_SHA")),
+            ),
+            ("server.instance_id", serde_json::json!(instance)),
+            (
+                "browser.presentation_evidence",
+                value["presentation_evidence"].clone(),
+            ),
+            ("browser.total_ms", value["total_ms"].clone()),
+            ("browser.background_ms", value["background_ms"].clone()),
+            (
+                "browser.background_interval_count",
+                value["background_interval_count"].clone(),
+            ),
+            ("browser.background_open", value["background_open"].clone()),
+            (
+                "browser.observer_inspection_count",
+                value["observer_inspection_count"].clone(),
+            ),
+            (
+                "browser.observer_scan_limited",
+                value["observer_scan_limited"].clone(),
+            ),
+            (
+                "browser.timeline_saturated",
+                value["timeline_saturated"].clone(),
+            ),
+            ("browser.shell_ms", value["marks"]["shell"].clone()),
+            (
+                "browser.snapshot_received_ms",
+                value["marks"]["snapshot_received"].clone(),
+            ),
+            (
+                "browser.hydration_ready_ms",
+                value["marks"]["hydration_ready"].clone(),
+            ),
+            (
+                "browser.meaningful_transcript_ms",
+                value["marks"]["meaningful_transcript"].clone(),
+            ),
+            (
+                "browser.chapter_data_ready_ms",
+                value["marks"]["chapter_data_ready"].clone(),
+            ),
+            (
+                "browser.breadcrumb_presented_ms",
+                value["marks"]["breadcrumb_presented"].clone(),
+            ),
+            (
+                "browser.breadcrumb_enabled_ms",
+                value["marks"]["breadcrumb_enabled"].clone(),
+            ),
+            (
+                "browser.anchor_settled_ms",
+                value["marks"]["anchor_settled"].clone(),
+            ),
+            (
+                "browser.breadcrumb_ready_minus_meaningful_ms",
+                value["breadcrumb_ready_minus_meaningful_ms"].clone(),
+            ),
+            ("browser.sample_rate", value["sample_rate"].clone()),
+            ("browser.admitted_count", value["admitted_count"].clone()),
+            ("browser.sampled_count", value["sampled_count"].clone()),
+            (
+                "browser.dropped_correlations",
+                value["dropped_correlations"].clone(),
+            ),
+            (
+                "browser.transport_dropped_count",
+                value["transport_dropped_count"].clone(),
+            ),
+            (
+                "browser.transport_failed_count",
+                value["transport_failed_count"].clone(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected.len(), 44);
+        assert_eq!(expected.keys().map(|key| key.len()).sum::<usize>(), 1030);
+        assert_eq!(
+            crate::logging::phoenix_span_limits().max_attributes_per_span,
+            52
+        );
+        for cap in [
+            32,
+            crate::logging::phoenix_span_limits().max_attributes_per_span,
+        ] {
+            let exporter = InMemorySpanExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .with_span_limits({
+                    let mut limits = crate::logging::phoenix_span_limits();
+                    limits.max_attributes_per_span = cap;
+                    limits
+                })
+                .build();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer("real-ready-collector-budget")),
+            );
+            let status = report(
+                State(state.clone()),
+                Json(serde_json::from_value(value.clone()).unwrap()),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            let view = spans
+                .iter()
+                .find(|span| span.name == "browser.conversation_view")
+                .unwrap();
+            assert!(view.events.is_empty());
+            let proto: opentelemetry_proto::tonic::trace::v1::Span = view.clone().into();
+            let semantic_bytes: usize = proto
+                .attributes
+                .iter()
+                .filter(|attribute| expected.contains_key(attribute.key.as_str()))
+                .map(|attribute| attribute.encoded_len())
+                .sum();
+            let metadata_bytes: usize = proto
+                .attributes
+                .iter()
+                .filter(|attribute| !expected.contains_key(attribute.key.as_str()))
+                .map(|attribute| attribute.encoded_len())
+                .sum();
+            println!("collector_capacity cap={cap} attributes={} dropped={} otlp_span_bytes={} semantic_kv_bytes={semantic_bytes} sdk_kv_bytes={metadata_bytes}", view.attributes.len(), view.dropped_attributes_count, proto.encoded_len());
+            let required = [
+                "browser.meaningful_transcript_ms",
+                "browser.breadcrumb_presented_ms",
+                "browser.breadcrumb_enabled_ms",
+                "browser.anchor_settled_ms",
+                "browser.breadcrumb_ready_minus_meaningful_ms",
+            ];
+            if cap == 32 {
+                assert!(view.dropped_attributes_count > 0);
+                assert!(required.iter().all(|key| !view
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key.as_str() == *key)));
+            } else {
+                assert_eq!(view.dropped_attributes_count, 0);
+                for key in required {
+                    assert!(
+                        view.attributes
+                            .iter()
+                            .any(|attribute| attribute.key.as_str() == key
+                                && matches!(attribute.value, opentelemetry::Value::F64(_))),
+                        "missing typed mark {key}"
+                    );
+                }
+                assert!(view.attributes.len() <= 52);
+                for (key, expected_value) in &expected {
+                    let attribute = view
+                        .attributes
+                        .iter()
+                        .find(|attribute| attribute.key.as_str() == *key)
+                        .unwrap_or_else(|| panic!("missing field {key}"));
+                    match (&attribute.value, expected_value) {
+                        (
+                            opentelemetry::Value::String(actual),
+                            serde_json::Value::String(expected),
+                        ) => assert_eq!(actual.as_str(), expected.as_str()),
+                        (opentelemetry::Value::Bool(actual), serde_json::Value::Bool(expected)) => {
+                            assert_eq!(actual, expected)
+                        }
+                        (
+                            opentelemetry::Value::I64(actual),
+                            serde_json::Value::Number(expected),
+                        ) => assert_eq!(Some(*actual), expected.as_i64()),
+                        (
+                            opentelemetry::Value::F64(actual),
+                            serde_json::Value::Number(expected),
+                        ) => assert_eq!(Some(*actual), expected.as_f64()),
+                        _ => panic!("wrong type {key}"),
+                    }
+                }
+                let metadata = [
+                    "code.file.path",
+                    "code.module.name",
+                    "code.line.number",
+                    "thread.id",
+                    "thread.name",
+                    "target",
+                    "busy_ns",
+                    "idle_ns",
+                ];
+                assert!(view
+                    .attributes
+                    .iter()
+                    .all(|attribute| expected.contains_key(attribute.key.as_str())
+                        || metadata.contains(&attribute.key.as_str())));
+                assert_eq!(spans.len(), 2);
+                let child = spans
+                    .iter()
+                    .find(|span| span.name == "browser.view_correlation")
+                    .unwrap();
+                assert_eq!(child.parent_span_id, view.span_context.span_id());
+                assert_eq!(child.span_context.trace_id(), view.span_context.trace_id());
+                assert_eq!(child.dropped_attributes_count, 0);
+            }
+        }
+    }
+
     fn payload() -> serde_json::Value {
         serde_json::json!({
             "open_id": uuid::Uuid::new_v4(), "product_conversation_id": null, "segment_id": null,
