@@ -391,7 +391,35 @@ impl BrowserEvalTool {
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
+#[serde(try_from = "String")]
+struct ScreenshotPath(String);
+
+impl TryFrom<String> for ScreenshotPath {
+    type Error = String;
+
+    fn try_from(path: String) -> Result<Self, Self::Error> {
+        if path.is_empty() || path.contains('\0') || !std::path::Path::new(&path).is_absolute() {
+            return Err(
+                "screenshot path must be a nonempty absolute path without NUL bytes".into(),
+            );
+        }
+        Ok(Self(path))
+    }
+}
+
+impl ScreenshotPath {
+    fn temporary() -> Self {
+        Self(format!(
+            "/tmp/phoenix-screenshot-{}.png",
+            uuid::Uuid::new_v4()
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct ScreenshotInput {
+    #[serde(default)]
+    path: Option<ScreenshotPath>,
     #[serde(default)]
     selector: Option<String>,
     #[serde(default)]
@@ -412,13 +440,17 @@ impl Tool for BrowserTakeScreenshotTool {
     }
 
     fn description(&self) -> String {
-        "Capture a screenshot of the current page or a specific element. The image is saved to a temp file path returned in the result. To view the screenshot content yourself, follow up with read_image on that path.".to_string()
+        "Capture a screenshot of the current page or a specific element. The PNG image is saved to the optional absolute path (overwriting an existing regular file) or a generated temp path returned in the result. To view the screenshot content yourself, follow up with read_image on that path.".to_string()
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute output file path. Existing regular files are overwritten; the parent directory must exist. Defaults to a generated temp PNG."
+                },
                 "selector": {
                     "type": "string",
                     "description": "CSS selector for the element to screenshot (optional)"
@@ -434,6 +466,24 @@ impl Tool for BrowserTakeScreenshotTool {
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         Self::run_browser(input, &ctx).await
     }
+}
+
+async fn save_screenshot(path: &ScreenshotPath, png: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options.open(&path.0).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "screenshot output must be a regular file",
+        ));
+    }
+    file.set_len(0).await?;
+    file.write_all(png).await?;
+    file.flush().await
 }
 
 impl BrowserTakeScreenshotTool {
@@ -491,13 +541,14 @@ impl BrowserTakeScreenshotTool {
 
         match result {
             Ok(Ok(png_data)) => {
-                // Save to file
-                let filename = format!("phoenix-screenshot-{}.png", uuid::Uuid::new_v4());
-                let path = format!("/tmp/{filename}");
-
-                if let Err(e) = tokio::fs::write(&path, &png_data).await {
-                    return ToolOutput::error(format!("Failed to save screenshot: {e}"));
+                let path = input.path.unwrap_or_else(ScreenshotPath::temporary);
+                if let Err(error) = save_screenshot(&path, &png_data).await {
+                    return ToolOutput::error(format!(
+                        "Failed to save screenshot to {}: {error}",
+                        path.0
+                    ));
                 }
+                let path = path.0;
 
                 // Carry the base64 payload via the typed `images` channel so it
                 // reaches the LLM. `display_data` is UI-only and is never threaded

@@ -291,6 +291,122 @@ fn eval_returns_typed_values_without_reinterpreting_user_objects() {
         .contains("function object"));
 }
 
+#[test]
+fn screenshot_output_paths_are_validated_before_session_access() {
+    let cli = BrowserCli::new();
+    for arguments in [
+        vec!["screenshot", "--output", ""],
+        vec!["screenshot", "--input", r#"{"path":""}"#],
+        vec!["screenshot", "--input", r#"{"path":"/tmp/bad\u0000.png"}"#],
+        vec!["screenshot", "--input", r#"{"path":12}"#],
+        vec!["eval", "42", "--output", "unexpected.png"],
+        vec!["profile", "cpu_summary", "--output", "unexpected.png"],
+    ] {
+        let response = cli.invoke(&arguments, None, false);
+        assert_eq!(response["error"]["code"], "invalid_input");
+        assert!(response["lifetime"].is_null());
+        assert!(response["browser_lifetime"].is_null());
+        assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn screenshots_save_to_requested_paths_and_reuse_the_saved_artifact() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    cli.ok(&[
+        "open",
+        "data:text/html,<title>Screenshot output</title><body style='background:red'>",
+    ]);
+    let absolute = cli.directory.path().join("chosen screenshot.png");
+    let screenshot = cli.ok(&["screenshot", "--output", absolute.to_str().unwrap()]);
+    assert_eq!(screenshot["result"]["artifacts"], json!([absolute]));
+    assert!(screenshot["result"]["text"]
+        .as_str()
+        .unwrap()
+        .contains(absolute.to_str().unwrap()));
+    let first = std::fs::read(&absolute).unwrap();
+    assert!(first.starts_with(b"\x89PNG\r\n\x1a\n"));
+    cli.ok(&["resize", "640", "480"]);
+    cli.eval("document.body.style.background='blue'; true");
+    let overwritten = cli.ok(&["screenshot", "--output", absolute.to_str().unwrap()]);
+    assert_eq!(overwritten["result"]["artifacts"], json!([absolute]));
+    let second = std::fs::read(&absolute).unwrap();
+    assert_ne!(first, second);
+    assert!(second.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(u32::from_be_bytes(second[16..20].try_into().unwrap()), 640);
+    assert_eq!(u32::from_be_bytes(second[20..24].try_into().unwrap()), 480);
+    let caller = cli.directory.path().join("another caller");
+    std::fs::create_dir(&caller).unwrap();
+    let output = cli
+        .command()
+        .current_dir(&caller)
+        .args(["screenshot", "--output", "relative screenshot.png"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let relative: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let expected = caller
+        .canonicalize()
+        .unwrap()
+        .join("relative screenshot.png");
+    assert_eq!(relative["result"]["artifacts"], json!([expected]));
+    assert_eq!(std::fs::read(expected).unwrap(), second);
+    let missing = caller.join("missing/failed.png");
+    let failed = cli.invoke(
+        &["screenshot", "--output", missing.to_str().unwrap()],
+        None,
+        false,
+    );
+    assert_eq!(failed["error"]["code"], "operation_failed");
+    assert!(failed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to save screenshot"));
+    assert!(!missing.exists());
+    let directory = cli.invoke(
+        &["screenshot", "--output", caller.to_str().unwrap()],
+        None,
+        false,
+    );
+    assert_eq!(directory["error"]["code"], "operation_failed");
+    let symlink = caller.join("linked.png");
+    std::os::unix::fs::symlink(&absolute, &symlink).unwrap();
+    let rejected = cli.invoke(
+        &["screenshot", "--output", symlink.to_str().unwrap()],
+        None,
+        false,
+    );
+    assert_eq!(rejected["error"]["code"], "operation_failed");
+    assert_eq!(std::fs::read(&absolute).unwrap(), second);
+    let default = cli.ok(&["screenshot"]);
+    let default_path = default["result"]["artifacts"][0].as_str().unwrap();
+    assert!(std::fs::read(default_path)
+        .unwrap()
+        .starts_with(b"\x89PNG\r\n\x1a\n"));
+    let human = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"))
+        .env("PHOENIX_BROWSER_RUNTIME_DIR", cli.directory.path())
+        .args([
+            "--session",
+            "integration",
+            "screenshot",
+            "--output",
+            absolute.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(String::from_utf8(human.stdout)
+        .unwrap()
+        .contains(absolute.to_str().unwrap()));
+}
+
 fn live_resources(cli: &BrowserCli) -> (PathBuf, ProcessIdentity) {
     let status = cli.ok(&["status"]);
     let profile = PathBuf::from(status["result"]["profile_path"].as_str().unwrap());

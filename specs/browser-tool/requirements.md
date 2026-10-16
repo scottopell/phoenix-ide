@@ -89,6 +89,16 @@ The `browser_take_screenshot` tool SHALL capture a screenshot of the current vie
 WHEN a CSS selector is provided
 `browser_take_screenshot` SHALL capture only the matching element
 
+WHEN an explicit output path is provided
+`browser_take_screenshot` SHALL require a nonempty absolute server-filesystem path before browser access,
+SHALL save the PNG at that path, replacing an existing regular file when writing succeeds,
+AND SHALL report that same saved path in the result.
+
+THE SYSTEM SHALL reject a symbolic-link or non-regular-file output destination without writing through it.
+
+WHEN the destination cannot be written
+`browser_take_screenshot` SHALL report the save failure rather than claim a saved screenshot.
+
 THE SYSTEM SHALL make the screenshot visible to the agent by passing the saved path to `read_image`
 
 WHEN the image exceeds LLM vision size limits

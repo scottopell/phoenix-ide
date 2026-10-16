@@ -130,6 +130,9 @@ AND SHALL preserve user-returned object keys as data, including names also used 
 WHEN an evaluation result is externalized under REQ-BT-002
 THE SYSTEM SHALL identify the artifact's encoding and expose its saved handle explicitly.
 
+THE SYSTEM SHALL support `screenshot --output PATH`
+AND SHALL resolve a relative output path against the calling process's working directory before sending the request to the daemon.
+
 THE SYSTEM SHALL preserve profiling readiness boundaries, reset and warmup behavior, raw per-run samples, unavailable/null distinctions, warnings, and artifacts under REQ-BT-019
 AND SHALL preserve structured failure data, including blocked-step and methodology information, when the operation fails.
 

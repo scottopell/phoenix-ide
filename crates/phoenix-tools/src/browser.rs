@@ -201,6 +201,11 @@ mod access_tests {
     #[tokio::test]
     async fn semantic_preflight_rejects_input_without_browser_or_file_access() {
         for (operation, input) in [
+            (
+                BrowserOperation::TakeScreenshot,
+                json!({"path":"relative.png"}),
+            ),
+            (BrowserOperation::TakeScreenshot, json!({"path":""})),
             (BrowserOperation::Click, json!({})),
             (BrowserOperation::Click, json!({"selector":"#x","ref":"@x"})),
             (

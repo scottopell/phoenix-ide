@@ -22,7 +22,7 @@ Console logs are captured through one ordered CDP reader that associates per-tar
 |-------------|--------|-------|
 | **REQ-BT-001:** Navigate to URLs | ✅ Complete | `browser_navigate` tool |
 | **REQ-BT-002:** Execute JavaScript | ✅ Complete | `browser_eval` tool |
-| **REQ-BT-003:** Take Screenshots | ✅ Complete | `browser_take_screenshot` + `read_image` |
+| **REQ-BT-003:** Take Screenshots | ✅ Complete | `browser_take_screenshot` + `read_image`; optional absolute output path with visible save failures. |
 | **REQ-BT-004:** Capture Console Logs | ✅ Complete | CDP event subscription |
 | **REQ-BT-005:** Resize Viewport | ✅ Complete | `browser_resize` tool |
 | **REQ-BT-006:** Read Image Files | ✅ Complete | `read_image` tool |

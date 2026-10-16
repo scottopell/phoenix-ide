@@ -21,7 +21,7 @@ Usage: phoenix-browser [--session NAME] [--json] [--idle-timeout SECONDS] COMMAN
   click TARGET                     Click @ref or CSS selector
   type TARGET TEXT [--clear]        Type into @ref or CSS selector
   eval EXPRESSION | eval --stdin    Evaluate JavaScript (await promises)
-  screenshot [--selector CSS]       Save a PNG artifact
+  screenshot [--selector CSS] [--output PATH]  Save a PNG artifact
   resize WIDTH HEIGHT              Set viewport dimensions
   key KEY [--modifiers JSON]        Key or chord (e.g. key Enter)
   wait SELECTOR                    Wait for a CSS selector
@@ -163,6 +163,12 @@ fn parse_request(mut args: Vec<String>) -> Result<Request, String> {
     if clear {
         input["clear"] = json!(true);
     }
+    if let Some(path) = take_option(&mut args, "--output")? {
+        if command != "screenshot" {
+            return Err("--output is only valid with screenshot".into());
+        }
+        input["path"] = json!(path);
+    }
     if let Some(selector) = take_option(&mut args, "--selector")? {
         input["selector"] = json!(selector);
     }
@@ -206,6 +212,9 @@ fn validate_parameters(command: &str, input: &Value) -> Result<(), String> {
     let Some(operation) = daemon::operation(command) else {
         return Ok(());
     };
+    if command == "screenshot" && input.get("path").and_then(Value::as_str) == Some("") {
+        return Err("screenshot path must be nonempty".into());
+    }
     let schema = operation.input_schema();
     if let Some(required) = schema["required"].as_array() {
         for key in required.iter().filter_map(Value::as_str) {
