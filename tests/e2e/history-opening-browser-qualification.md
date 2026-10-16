@@ -2318,3 +2318,50 @@ work occurred. Actual newly-built strict containment and exact-six collector/
 export/drain remain required; old artifact geometry is not promoted to fixed
 artifact evidence. The dedicated geometry workflow is not triggered by this PR
 branch publication, so no duplicate diagnostic runner is created.
+
+### Corrected-artifact result and observed later-header writer
+
+Qualification run `38975198473` at harness
+`c47c678ecc2e0f8121889fe2bd7e3787eafbc526`, appc115, is terminal FAILURE.
+Witness `117222852207` still fails first ordinary/history strict acquisition;
+Rust `117222933323` and all standard jobs pass. Corrected artifact
+`12078389483` is96,401,787B; bounded failure selection75,052B retained. Target
+is present with row/message clipped, report1/204/admission1/request4/pending0/
+errors0, zero completed trials. The modeled immediate/deferred fix is not an
+actual-renderer resolution and no acceptance is claimed.
+
+The subsequently approved same-corrected-artifact write trace ran as
+`38977500891`, job `117230360829`, terminal diagnostic SUCCESS in about90s,
+source `b439a83b434860af63e57825eaec239701bf15b4`. No build/fullsuite or
+product mutation; exact retained executable/UI provenance verified; new ordinary
+fixture recipe is not originalDB. Observer forwards original assignments once,
+preserves method returns/native errors/RO callback receiver, and retains at most128
+safe finite events. Four cached VM tests and independent narrow source review
+passed before this run. Trace health installed=true, dropped0/failures0,34events.
+
+Observed event32 is start-helper write0→actual0 while header/target are absent.
+LAST assignment event33 requests42.5, before0, immediate native readback43;
+contemporaneous header BCR height42.5, target row/message top92.5 versus clip93.
+The next event is header RO content height42.5; no later write occurs. All five
+final observations remain scrollTop43 and sole top-edge delta-0.5. Exact target,
+sourcepin and original route match. This is now observed setter history, not an
+inference from final geometry.
+
+Safe compiled callsite coordinates map event33 to native setter K at line1 col15503,
+applyAnchor q col17837, applyPhysicalChange kt col18441, header-ref callback
+col21890 in `MessageList-DFfKfDYj.js`. Its SHA256
+`79e0554708297f8397ff48d987e3817130b9e1967e643fa71403695485fc98ca`
+was independently matched to the exact controlled manifest. Event32 maps through
+applyAlignedPosition xt and positionAtIndex wt; event33 does NOT use that helper.
+Thus the late header measurement/anchor write bypasses the directional start
+correction after initial start at header0. The generic native rounding mechanism
+is observed here, while the next policy/source fix must preserve continuity and
+not globally floor anchor writes.
+
+Diagnostic artifact `12079985807` is58,903B, containing only safe geometry/write
+trace/screenshot/provenance/completion. Screenshot viewed. Independent trace and
+compiled-hash join passed; normal app exit0/HOME+socket removed/receiver closed.
+Telemetry owns the next bounded local late-header regression/source correction;
+this writer retains runner/integration ownership. No speculative second product
+patch, full qualification retry, oracle relaxation or full/overhead/native
+acceptance is introduced by recording this cause.
