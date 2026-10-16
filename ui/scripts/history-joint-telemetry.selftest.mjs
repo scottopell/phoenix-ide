@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSyn
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
-import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, TELEMETRY_SPA_SELECTOR, UNIT_ONLY,
+import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, UNIT_ONLY,
   prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage, authenticateOwnedContext,
   installObservedHistoryTelemetry, appendObservedHistory } from './history-joint-telemetry.mjs';
 
@@ -15,7 +15,7 @@ function input() {
     aggregates: [
       { kind: 'ordinary', product_conversation_id: 'ordinary-product', route: '/c/ordinary-product', endpoint: '/api/product-conversations/ordinary-product', members: ['ordinary-root', 'ordinary-latest'], latest_transcript_row_id: 'ordinary-latest' },
       { kind: 'global', product_conversation_id: 'global-product', route: '/global/global-latest', endpoint: '/api/global/coordinator/history/global-root', members: ['global-root', 'global-latest'], latest_transcript_row_id: 'global-latest' },
-    ], lifecycle: { route: '/c/ordinary-product', productConversationId: 'ordinary-product', spaSelector: TELEMETRY_SPA_SELECTOR }, forbidden: [],
+    ], lifecycle: { route: '/c/ordinary-product', productConversationId: 'ordinary-product', spaControl: { kind: 'sidebar_home' } }, forbidden: [],
   } };
 }
 function stock() {
@@ -116,7 +116,7 @@ for (const [name, mutate] of Object.entries({
   global_foreign_route: i => { i.fixtures.aggregates[1].route = '/global/foreign'; },
   foreign_origin: i => { i.fixtures.aggregates[0].route = 'http://evil.test/c/ordinary-product'; },
   lifecycle_foreign_product: i => { i.fixtures.lifecycle.productConversationId = 'foreign'; },
-  lifecycle_generic_link: i => { i.fixtures.lifecycle.spaSelector = 'a'; },
+  lifecycle_generic_link: i => { i.fixtures.lifecycle.spaControl = { kind: 'anchor', selector: 'a' }; },
   repeated_members: i => { i.fixtures.aggregates[1].members[0] = 'global-latest'; },
 })) test(`actual-fixture shape rejects ${name} (UNIT ONLY)`, () => { const i = input(); mutate(i); assert.throws(() => validateJointFixtures(i)); });
 for (const [name, mutate] of Object.entries({

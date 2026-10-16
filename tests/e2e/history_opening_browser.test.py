@@ -743,7 +743,7 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertEqual(set(result), {"identity", "aggregates", "lifecycle", "forbidden"})
         self.assertEqual(result["lifecycle"]["route"], ordinary["route"])
         self.assertEqual(result["lifecycle"]["productConversationId"], "ordinary-product")
-        self.assertIn("statebar-slug", result["lifecycle"]["spaSelector"])
+        self.assertEqual(result["lifecycle"]["spaControl"], {"kind": "sidebar_home"})
         for field, bad in [("route", "/global/old-root"),
                            ("product_conversation_id", "global-root")]:
             broken = dict(global_); broken[field] = bad

@@ -1566,3 +1566,44 @@ non-sliding arrivals, page close, late completion, unavailable-body failure,
 new handoff requests and both real driver callsites. All 35 opening Node tests
 passed, including existing unavailable-body rejection controls. This ordering
 repair is independent of the reviewed pagehide collector/export contract.
+
+
+## Mounted SPA-control correction after run 38846448530
+
+Harness `55b48731` / app `194e42b7` completed run `38846448530` with witness
+`116797958302` failure and standard Rust `116798020980` success; all standard
+jobs passed. History's nine checks had no capture/page errors. Stock telemetry
+completed 48 trials, nine sampled/nine POSTs, and all seven negative probes.
+The real owned collector log contained ten distinct success witnesses from the
+actual candidate/instance, but final export/inventory/drain acceptance was not
+reached. Both pagehide attempts were explicitly unsampled and remained
+inconclusive, not delivery proof. Artifact `12024086061` remains remote;
+207,113 range bytes retrieved selected receipts/runtime evidence.
+
+The first failure was the SPA-cancel fixture's mounted anchor count zero. Source
+tracing shows this is structural: ProductConversationPage renders its loading
+skeleton before EmbeddedConversationPage/StateBar exists, while the fixture
+must click during that initial pending snapshot. Waiting for the StateBar link
+would finish the request and invalidate cancellation. The existing desktop
+shell/sidebar mounts independently and already has a real home-navigation
+button in expanded and collapsed layouts. No injected DOM, history mutation or
+new product UI is needed.
+
+Exact donor `5e15ac8242fc9b5838561d0aa083d3fb331c3aa0` is integrated as
+app `e494c38c3ca164607236949aa240961f0a02931c`, tree
+`474a84048f2250c1f121272dea13634945c4d77b`. The fixture replaces the unusable
+anchor selector with a discriminated `spaControl: {kind: 'sidebar_home'}`;
+there is no legacy-selector fallback or arbitrary button destination. Donor
+owns the fixed existing expanded/collapsed selectors. Exactly one visible,
+enabled, mounted BUTTON is required, followed by a real browser click, changed
+same-origin home URL and unchanged document time origin. Pending correlated
+request is rechecked immediately before click; actual canceled report and
+nondeparting browser 204 remain mandatory. Pagehide's reviewed collector/export
+contract, natural sampling and provisional status are unchanged.
+
+Actual cached ring: 65 opening Python, 16 shipping Python, 99 Node selftests and
+123 focused telemetry tests across seven files passed. Missing/duplicate/hidden/
+disabled/wrong-element controls, cross-document navigation, wrong destination,
+completed request, wrong ready outcome and rejected report remain failures.
+This source/mock result does not prove the actual mounted path or candidate
+export join; those remain hosted qualification obligations.

@@ -4,13 +4,12 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = '194e42b7e7730ae163aa494193a55c81ff914b87';
+export const APP_PIN = 'e494c38c3ca164607236949aa240961f0a02931c';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
-export const TELEMETRY_MODULE_SHA256 = '5bf6b2ea3a55255f9cdc53b23e46754bc7dc9159acbe201cc38af1f7a9b9cdb1';
+export const TELEMETRY_MODULE_SHA256 = 'e6d203ae7e379fd6e5a28e376d0eed2df47afec345e382d9727300541833eb6c';
 export const TELEMETRY_DIAGNOSTICS_SHA256 = 'fa442b6f4ea65c12fc2a05ec1c37c1e565430baa6d3151e6a8c180d21ed110a1';
 export const TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE = 'ui/scripts/view-telemetry-diagnostics.mjs';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
-export const TELEMETRY_SPA_SELECTOR = 'a.statebar-slug[href="/"][title="Back to conversations"]:visible';
 const ENV_KEYS = ['HISTORY_TELEMETRY_JOINT', 'HISTORY_TELEMETRY_FIXTURE', 'HISTORY_TELEMETRY_MODULE', 'HISTORY_TELEMETRY_MODULE_SHA256'];
 const ANCHOR_RESULTS = new Set(['applied', 'tail_pinned', 'empty', 'target_missing', 'superseded']);
 const READY_ANCHORS = new Set(['applied', 'tail_pinned', 'empty']);
@@ -59,7 +58,7 @@ export function validateJointFixtures(input) {
   assert.equal(new Set(fixtures.aggregates.flatMap(a => [a.product_conversation_id, ...a.members])).size,
     fixtures.aggregates.reduce((total, a) => total + a.members.length + 1, 0), 'ordinary and Global generated identities must be disjoint');
   assert.deepEqual(fixtures.lifecycle, { route: ordinary.route, productConversationId: ordinary.product_conversation_id,
-    spaSelector: TELEMETRY_SPA_SELECTOR }, 'lifecycle must use the actual ordinary fixture and real SPA home anchor');
+    spaControl: { kind: 'sidebar_home' } }, 'lifecycle must use the actual ordinary fixture and real mounted sidebar home control');
   JSON.stringify(input, (_, value) => { if (typeof value === 'number') assert.ok(Number.isFinite(value)); return value; });
   return input;
 }
