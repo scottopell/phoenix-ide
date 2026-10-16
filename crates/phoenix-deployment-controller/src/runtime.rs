@@ -249,6 +249,24 @@ impl Round {
     }
 }
 
+struct NativeSamplingStore<'a> {
+    store: &'a mut crate::ControllerSqliteStore,
+    issue: crate::NativeSamplingIssue,
+    completion: crate::NativeSamplingCompletion,
+}
+
+impl AttemptStore for NativeSamplingStore<'_> {
+    type Error = crate::ControllerStoreError;
+
+    fn persist(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+    ) -> Result<PersistenceRevision, Self::Error> {
+        self.store
+            .persist_native_sampling(checkpoint, &self.issue, &self.completion)
+    }
+}
+
 enum Receipt {
     Applied,
     Parked(ParkReason),
@@ -474,6 +492,65 @@ impl PolicyLoop {
             .iter()
             .any(|entry| entry.key == ticket.key() && entry.effect == *ticket.effect()));
         round.returned = Some(ticket);
+    }
+
+    /// Applies one native `SampleResources` completion with its original affine ticket.
+    /// Only a matching committed issue may cross this bridge; checkpoint and application
+    /// evidence commit together. No generic wire-to-executed-effect path is exposed.
+    /// # Errors
+    /// Mismatched issue/ticket/completion or failed persistence grants no ACK evidence.
+    pub fn apply_native_sampling(
+        &mut self,
+        ticket: DispatchTicket,
+        verified: crate::VerifiedNativeSamplingCompletion,
+        store: &mut crate::ControllerSqliteStore,
+    ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
+        let (issue, completion) = verified.into_parts();
+        let key = ticket.key();
+        let belongs_to_loop = self.rounds.iter().any(|round| {
+            round
+                .issued
+                .iter()
+                .any(|issued| issued.key == key && issued.effect == *ticket.effect())
+        });
+        if !belongs_to_loop {
+            return Err(LoopError::NotIssued(key));
+        }
+        let OsEffect::SampleResources { sequence } = ticket.effect() else {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        };
+        let sequence = *sequence;
+        if key != issue.key()
+            || sequence != issue.sequence()
+            || matches!(completion, crate::NativeSamplingCompletion::Sample(sample) if sample.sequence != sequence)
+        {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        }
+        let status = store
+            .load_native_sampling_status(issue.key())
+            .map_err(|error| {
+                self.status = LoopStatus::FailStopped;
+                LoopError::Persistence(error)
+            })?;
+        if status != Some(crate::NativeSamplingStatus::IssuedPendingApplication { issue }) {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        }
+        let (key, _) = ticket.into_parts();
+        let result = match completion {
+            crate::NativeSamplingCompletion::Sample(sample) => Ok(sample),
+            crate::NativeSamplingCompletion::Failure(failure) => Err(failure),
+        };
+        let executed =
+            ExecutedEffect::from_parts(key, EffectCompletion::SampleResources { sequence, result });
+        let mut adapter = NativeSamplingStore {
+            store,
+            issue,
+            completion,
+        };
+        self.apply_retained(&executed, &mut adapter)
     }
 
     /// Convenience for a caller that owns its result. For guardian-retained results,
@@ -1315,4 +1392,219 @@ fn committed_revision(committed: &CommittedTransition) -> PersistenceRevision {
         .checkpoint()
         .persistence_revision()
         .expect("committed checkpoint has a revision")
+}
+
+#[cfg(test)]
+mod native_sampling_tests {
+    use super::*;
+    use crate::{
+        BirthToken, CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce,
+        MemoryPressure, MonotonicTick, NativeGuardianIdentity, NativeSamplingCompletion,
+        NativeSamplingStatus, PersistenceRevision, ProcessId, ProcessIdentity, ResourceCapacity,
+        ResourceContention, ResourceObservationFailure, ResourcePolicy, ResourceSample,
+        VerifiedNativeSamplingCompletion,
+    };
+    use std::num::{NonZeroU32, NonZeroUsize};
+
+    fn identity(pid: u32) -> ProcessIdentity {
+        ProcessIdentity::new(
+            ProcessId::new(NonZeroU32::new(pid).unwrap()),
+            BirthToken::new(12, 3).unwrap(),
+        )
+    }
+
+    fn setup() -> (crate::ControllerSqliteStore, PolicyLoop) {
+        let mut store = crate::ControllerSqliteStore::in_memory().unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(100).unwrap(),
+            MemoryPressure::Critical,
+        );
+        let committed = DeploymentAttempt::start(
+            crate::AttemptId::new(9),
+            MonotonicTick::new(100),
+            policy,
+            identity(42),
+        )
+        .persist(&mut store)
+        .unwrap();
+        store
+            .commit_initial_binding(
+                crate::AttemptId::new(9),
+                MonotonicTick::new(100),
+                PersistenceRevision::first(),
+                NativeGuardianIdentity {
+                    nonce: GuardianLifetimeNonce::new([5; 16]).unwrap(),
+                    process: identity(100),
+                },
+                &[],
+            )
+            .unwrap();
+        (store, PolicyLoop::from_committed(committed))
+    }
+
+    fn sample(sequence: u64) -> ResourceSample {
+        ResourceSample {
+            sequence,
+            capacity: ResourceCapacity {
+                available_memory_bytes: u64::MAX,
+                available_storage_bytes: 99,
+            },
+            contention: ResourceContention {
+                cpu: CpuContentionBasisPoints::new(10_000).unwrap(),
+                memory_pressure: MemoryPressure::Warning,
+            },
+        }
+    }
+
+    #[test]
+    fn verified_native_sampling_applies_atomically_and_failures_remain_parked() {
+        let completions = [
+            NativeSamplingCompletion::Sample(sample(0)),
+            NativeSamplingCompletion::Failure(ResourceObservationFailure::TemporarilyUnavailable),
+            NativeSamplingCompletion::Failure(ResourceObservationFailure::Unsupported),
+            NativeSamplingCompletion::Failure(ResourceObservationFailure::Malformed),
+        ];
+        for completion in completions {
+            let (mut store, mut loop_) = setup();
+            let binding = store
+                .load_native_binding(crate::AttemptId::new(9))
+                .unwrap()
+                .unwrap();
+            let ticket = loop_.issue_next().unwrap();
+            let issue = store
+                .commit_native_sampling_issue(&ticket, &binding)
+                .unwrap();
+            let verified = VerifiedNativeSamplingCompletion::new(issue, completion);
+            let progress = loop_
+                .apply_native_sampling(ticket, verified, &mut store)
+                .unwrap();
+            let applying_revision = match progress {
+                LoopProgress::Applied { revision, .. } | LoopProgress::Parked { revision, .. } => {
+                    revision
+                }
+                LoopProgress::Advanced { .. }
+                | LoopProgress::GuardianMustFence { .. }
+                | LoopProgress::SignalRoundFinished { .. } => {
+                    panic!("unexpected native sampling progress")
+                }
+            };
+            let expected = match completion {
+                NativeSamplingCompletion::Sample(sample) => {
+                    NativeSamplingStatus::AppliedPendingAck {
+                        issue,
+                        sample,
+                        applying_revision,
+                    }
+                }
+                NativeSamplingCompletion::Failure(failure) => {
+                    NativeSamplingStatus::ParkedRetained {
+                        issue,
+                        failure,
+                        applying_revision,
+                    }
+                }
+            };
+            assert_eq!(
+                store.load_native_sampling_status(issue.key()).unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_native_sampling_application_rolls_back_checkpoint_and_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-atomic.sqlite");
+        let mut store = crate::ControllerSqliteStore::open(&path).unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(100).unwrap(),
+            MemoryPressure::Critical,
+        );
+        let committed = DeploymentAttempt::start(
+            crate::AttemptId::new(9),
+            MonotonicTick::new(100),
+            policy,
+            identity(42),
+        )
+        .persist(&mut store)
+        .unwrap();
+        let binding = store
+            .commit_initial_binding(
+                crate::AttemptId::new(9),
+                MonotonicTick::new(100),
+                PersistenceRevision::first(),
+                NativeGuardianIdentity {
+                    nonce: GuardianLifetimeNonce::new([5; 16]).unwrap(),
+                    process: identity(100),
+                },
+                &[],
+            )
+            .unwrap();
+        let mut loop_ = PolicyLoop::from_committed(committed);
+        let ticket = loop_.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER fail_native_application BEFORE UPDATE ON attempts BEGIN SELECT RAISE(ABORT, 'fail'); END;",
+        )
+        .unwrap();
+        let verified = VerifiedNativeSamplingCompletion::new(
+            issue,
+            NativeSamplingCompletion::Sample(sample(0)),
+        );
+        assert!(matches!(
+            loop_.apply_native_sampling(ticket, verified, &mut store),
+            Err(LoopError::Persistence(_))
+        ));
+        drop(raw);
+        drop(store);
+        let mut reopened = crate::ControllerSqliteStore::open_existing(&path).unwrap();
+        assert_eq!(
+            reopened
+                .load_attempt(crate::AttemptId::new(9))
+                .unwrap()
+                .unwrap()
+                .persistence_revision(),
+            PersistenceRevision::first()
+        );
+        assert_eq!(
+            reopened.load_native_sampling_status(issue.key()).unwrap(),
+            Some(NativeSamplingStatus::IssuedPendingApplication { issue })
+        );
+    }
+
+    #[test]
+    fn mismatched_verified_sample_fail_stops_without_restoring_dispatch() {
+        let (mut store, mut loop_) = setup();
+        let binding = store
+            .load_native_binding(crate::AttemptId::new(9))
+            .unwrap()
+            .unwrap();
+        let ticket = loop_.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let verified = VerifiedNativeSamplingCompletion::new(
+            issue,
+            NativeSamplingCompletion::Sample(sample(1)),
+        );
+        assert!(matches!(
+            loop_.apply_native_sampling(ticket, verified, &mut store),
+            Err(LoopError::NotIssued(_))
+        ));
+        assert_eq!(loop_.status(), LoopStatus::FailStopped);
+        assert!(loop_.issue_next().is_none());
+        assert_eq!(
+            store.load_native_sampling_status(issue.key()).unwrap(),
+            Some(NativeSamplingStatus::IssuedPendingApplication { issue })
+        );
+    }
 }

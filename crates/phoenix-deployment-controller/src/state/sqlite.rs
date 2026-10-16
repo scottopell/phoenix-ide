@@ -33,14 +33,19 @@ use crate::{
     BirthToken, ProcessId, ProcessIdentity,
 };
 
+mod native_sampling;
 mod resources;
+pub use native_sampling::{
+    NativeSamplingCompletion, NativeSamplingIssue, NativeSamplingStatus,
+    VerifiedNativeSamplingCompletion,
+};
 mod tree;
 
 const SCHEMA: &str = include_str!("sqlite/schema.sql");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// An independent controller database, never a Phoenix application connection.
-/// Only schema version 2 is supported; there is no upgrade/downgrade policy.
+/// Only schema version 3 is supported; there is no upgrade/downgrade policy.
 #[derive(Debug)]
 pub struct ControllerSqliteStore {
     connection: Connection,
@@ -130,7 +135,7 @@ impl ControllerSqliteStore {
         })
     }
 
-    /// Opens an existing schema-v2 store for guardian read-only evidence.
+    /// Opens an existing schema-v3 store for guardian read-only evidence.
     /// # Errors
     /// Rejects missing or incompatible stores.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
@@ -510,6 +515,7 @@ impl ControllerSqliteStore {
     fn persist_checkpoint(
         &mut self,
         checkpoint: &DeploymentAttempt,
+        application: Option<(&NativeSamplingIssue, &NativeSamplingCompletion)>,
     ) -> Result<PersistenceRevision> {
         let transaction = self
             .connection
@@ -559,6 +565,9 @@ impl ControllerSqliteStore {
         if read_attempt(&transaction, checkpoint.attempt_id())?.as_ref() != Some(&next) {
             return malformed("checkpoint did not round-trip losslessly");
         }
+        if let Some((issue, completion)) = application {
+            native_sampling::insert_application(&transaction, issue, completion, revision)?;
+        }
         transaction.commit()?;
         Ok(revision)
     }
@@ -569,7 +578,7 @@ impl AttemptStore for ControllerSqliteStore {
 
     fn persist(&mut self, checkpoint: &DeploymentAttempt) -> Result<PersistenceRevision> {
         self.ensure_usable()?;
-        let result = self.persist_checkpoint(checkpoint);
+        let result = self.persist_checkpoint(checkpoint, None);
         if result.is_err() {
             // This also covers errors from commit or an unobserved rollback failure.
             self.poisoned = true;

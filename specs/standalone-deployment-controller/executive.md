@@ -81,8 +81,9 @@ store read. Changed slot liveness is persisted without replacing identity. Gener
 reconciliation finish, native dispatch, mutation, result application, and ACK remain typed
 refusals.
 
-The remaining native contract requires reconciliation completion, durable result
-application before ACK, mutation dispatch, full `PolicyLoop` execution over IPC, actual
+The remaining native contract requires reconciliation completion, dispatch of the
+persisted sampling issue, verified guardian ACK and durable confirmation, generalized
+mutation dispatch, full `PolicyLoop` execution over IPC, actual
 launchd ownership, and production-exclusive store ownership. Schema-v1 upgrades,
 downgrade, rolling versions, guardian replacement, cross-boot recovery, installer
 integration, and production adoption remain outside this pre-adoption qualification.
@@ -101,14 +102,14 @@ integration, and production adoption remain outside this pre-adoption qualificat
 | REQ-SDC-008 | Recovery marks owned identities for fresh observation and preserves the original deadline before exposing signal effects. |
 | REQ-SDC-009 | `CompatibilityBoundary::CandidateMigrationInvoked` retains full commit plus artifact digest and recovers only through candidate reverification. |
 | REQ-SDC-010 | `ControllerOs` is typed and fake-backed; hosted macOS tests qualify native observation and fail-closed capacity/contention sampling, including counter-regression and capacity-arithmetic regressions. |
-| REQ-SDC-011 | `ControllerSqliteStore` owns exact schema-v2 normalized attempt, policy-child, guardian-binding, guardian-session, and ordered guardian-slot rows with full-transaction replacement, revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning. Production-exclusive store ownership plus retained-result/application/ACK rows remain gaps. |
+| REQ-SDC-011 | `ControllerSqliteStore` owns exact schema-v3 normalized attempt, policy-child, guardian-binding, guardian-session, ordered guardian-slot, and native sampling issue/application rows with full-transaction replacement, revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning. Production-exclusive store ownership plus generalized result and confirmed-ACK rows remain gaps. |
 | REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. Native disconnect fences, fresh interruption revisions outpace unfinished reconciliation, and the original monotonic deadline refuses expired release/begin. Guardian replacement, launchd ownership, and production recovery remain unresolved risk. |
 | REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor, CLI, completion-to-checkpoint, guardian integration, replay, and capacity-reservation coverage pass full CI/macOS at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The guardian is the harmless child's original parent and survives forced runner death; launchd ownership and a durable runnable policy loop remain gaps. |
 | REQ-SDC-016 | Owner-only path checks, same-UID peer admission, exact source-input digest Hello identity, protocol-v2 four-byte big-endian bounded typed JSON framing, strict request fields, version/malformed/oversized-frame fencing, and replacement connections pass Unix/macOS hosted tests. |
 | REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The native server independently validates durable evidence before consuming its process-local initial gate or entering reconciliation; generic transport, finish, mutation, application, and ACK remain refused. |
-| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Reconciliation completion and retained-result application/ACK custody are not. |
+| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Schema v3 also persists exact native sampling issues and atomically couples verified same-guardian sampling completion to its policy checkpoint; native dispatch, reconciliation completion, guardian ACK, and ACK confirmation remain refused/unimplemented. |
 | REQ-SDC-019 | Exact schema compatibility, source-input build identity, protocol-v2 rejection, and platform capability checks exist. The transport remains pre-adoption and same-build-only; no v1 upgrade, downgrade, rolling/replacement/cross-boot promise is made. |
 | REQ-SDC-020 | Linux policy/IPC/SQLite tests and hosted macOS exact source-input handshake, gated-start, exact binding, original parenthood, runner-death, reconnect-begin, Clippy, and formatting qualification exist. Real guardian replacement, native mutation/ACK crash windows, launchd, updater, and rollback scenarios remain required. |
 
@@ -116,8 +117,10 @@ integration, and production adoption remain outside this pre-adoption qualificat
 
 The qualified units are the in-process custodian/event loop and a disposable native
 transport with durable initial binding/release, real runner-death survival, and
-observation-only durable reconciliation begin. The next controller-owned work is native
-reconciliation completion, retained-result application/ACK recovery, a runnable policy
+observation-only durable reconciliation begin. Schema v3 additionally establishes the
+normalized sampling issue and atomic verified-result application boundary. The next
+controller-owned work is native reconciliation completion, sampling dispatch and guardian
+ACK/confirmation recovery, then a runnable policy
 loop over the IPC boundary, launchd ownership, and the remaining process-death E2E matrix. Those
 surfaces must complete REQ-SDC-015–020 and ADR-109 while preserving ADR-108
 **detach-and-fence**, exact-instance recovery, the original absolute deadline, retained

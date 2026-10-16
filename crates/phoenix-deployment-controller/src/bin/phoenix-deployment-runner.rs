@@ -32,7 +32,7 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
         || args[4] != "--store"
         || args[6] != "--attempt"
     {
-        return Err("usage: --socket-dir <private fixture> --observe-seconds 1..60 --store <existing schema-v2 database> --attempt <u128>".into());
+        return Err("usage: --socket-dir <private fixture> --observe-seconds 1..60 --store <existing schema-v3 database> --attempt <u128>".into());
     }
     let observe_seconds = args[3]
         .to_str()

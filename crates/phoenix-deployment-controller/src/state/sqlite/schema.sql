@@ -122,4 +122,32 @@ CREATE TABLE guardian_slots (
     PRIMARY KEY(attempt_id, ordinal),
     UNIQUE(pid, birth_seconds, birth_nanos)
 ) STRICT;
-PRAGMA user_version = 2;
+CREATE TABLE native_sampling_issues (
+    attempt_id BLOB NOT NULL REFERENCES guardian_bindings(attempt_id),
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision) = 8 AND dispatch_revision != zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal = 0),
+    session_generation BLOB NOT NULL CHECK(length(session_generation) = 8 AND session_generation != zeroblob(8)),
+    sequence BLOB NOT NULL CHECK(length(sequence) = 8),
+    PRIMARY KEY(attempt_id, dispatch_revision, ordinal),
+    UNIQUE(attempt_id, session_generation, sequence),
+    FOREIGN KEY(attempt_id, session_generation) REFERENCES guardian_sessions(attempt_id, generation)
+) STRICT;
+CREATE TABLE native_sampling_applications (
+    attempt_id BLOB NOT NULL,
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision) = 8 AND dispatch_revision != zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal = 0),
+    applying_revision BLOB NOT NULL CHECK(length(applying_revision) = 8 AND applying_revision != zeroblob(8)),
+    outcome TEXT NOT NULL CHECK(outcome IN ('sample','temporarily_unavailable','unsupported','malformed')),
+    available_memory BLOB CHECK(available_memory IS NULL OR length(available_memory) = 8),
+    available_storage BLOB CHECK(available_storage IS NULL OR length(available_storage) = 8),
+    cpu INTEGER CHECK(cpu BETWEEN 0 AND 10000),
+    pressure TEXT CHECK(pressure IN ('nominal','warning','critical')),
+    PRIMARY KEY(attempt_id, dispatch_revision, ordinal),
+    FOREIGN KEY(attempt_id, dispatch_revision, ordinal)
+        REFERENCES native_sampling_issues(attempt_id, dispatch_revision, ordinal),
+    CHECK((outcome = 'sample') = (available_memory IS NOT NULL)),
+    CHECK((outcome = 'sample') = (available_storage IS NOT NULL)),
+    CHECK((outcome = 'sample') = (cpu IS NOT NULL)),
+    CHECK((outcome = 'sample') = (pressure IS NOT NULL))
+) STRICT;
+PRAGMA user_version = 3;

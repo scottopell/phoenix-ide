@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Pinned read-only schema-v2 reader; it cannot commit controller transitions.
+/// Pinned read-only exact-schema reader; it cannot commit controller transitions.
 pub struct SqliteNativeEvidenceReader {
     attempt: crate::AttemptId,
     store: crate::ControllerSqliteStore,
@@ -339,10 +339,26 @@ impl From<CodecError> for ClientError {
     }
 }
 
+fn sampling_snapshot_matches(snapshot: &WireSnapshot, issue: crate::NativeSamplingIssue) -> bool {
+    let Some(native) = snapshot.native_binding.as_ref() else {
+        return false;
+    };
+    let guardian = issue.guardian_identity();
+    snapshot.state == crate::guardian_ipc::WireState::Active
+        && snapshot.attempt == issue.key().attempt_id().get()
+        && snapshot.session.instance == snapshot.instance
+        && snapshot.session.generation == issue.session_generation().get()
+        && native.attempt == snapshot.attempt
+        && native.deadline == snapshot.deadline
+        && native.nonce == guardian.nonce.bytes()
+        && native.guardian == guardian.process.into()
+}
+
 /// Typed observation client. No client method can mint a policy proof.
 pub struct GuardianClient {
     stream: Option<UnixStream>,
     build: BuildIdentity,
+    verified_snapshot: Option<WireSnapshot>,
 }
 impl GuardianClient {
     /// # Errors
@@ -361,6 +377,7 @@ impl GuardianClient {
         Ok(Self {
             stream: Some(stream),
             build,
+            verified_snapshot: None,
         })
     }
     fn exchange(&mut self, request: &Request) -> Result<Response, ClientError> {
@@ -431,7 +448,10 @@ impl GuardianClient {
         match self.exchange(&Request::Hello {
             build: self.build.clone(),
         })? {
-            Response::Hello { build, snapshot } if build == self.build => Ok(snapshot),
+            Response::Hello { build, snapshot } if build == self.build => {
+                self.verified_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
             Response::Hello { .. } => {
                 self.stream.take();
                 Err(ClientError::UnexpectedResponse)
@@ -455,7 +475,10 @@ impl GuardianClient {
     /// Returns transport or protocol errors.
     pub fn snapshot(&mut self) -> Result<WireSnapshot, ClientError> {
         match self.exchange(&Request::Snapshot)? {
-            Response::Snapshot(snapshot) => Ok(snapshot),
+            Response::Snapshot(snapshot) => {
+                self.verified_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
             Response::Hello { .. }
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
@@ -511,11 +534,106 @@ impl GuardianClient {
             | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
     }
+
+    /// Read and verify the exact retained sampling completion from this live guardian.
+    /// # Errors
+    /// Refuses a stale snapshot, wrong session/key/effect, absent custody, or malformed sample.
+    pub fn observe_native_sampling(
+        &mut self,
+        issue: crate::NativeSamplingIssue,
+    ) -> Result<crate::VerifiedNativeSamplingCompletion, ClientError> {
+        if self.verified_snapshot.is_none() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        if !sampling_snapshot_matches(&snapshot, issue) {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let retained = match self.exchange(&Request::ObserveRetained { key })? {
+            Response::Retained(Some(retained)) if retained.key == key => retained,
+            Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => return Err(ClientError::UnexpectedResponse),
+        };
+        let completion = match retained.completion {
+            crate::guardian_ipc::WireCompletion::SampleResources { sequence, result }
+                if sequence == issue.sequence() =>
+            {
+                match result {
+                    Ok(sample) if sample.sequence == sequence => {
+                        let cpu = crate::CpuContentionBasisPoints::new(sample.cpu_basis_points)
+                            .map_err(|_| ClientError::UnexpectedResponse)?;
+                        let pressure = match sample.memory_pressure {
+                            crate::guardian_ipc::WireMemoryPressure::Normal => {
+                                crate::MemoryPressure::Nominal
+                            }
+                            crate::guardian_ipc::WireMemoryPressure::Elevated => {
+                                crate::MemoryPressure::Warning
+                            }
+                            crate::guardian_ipc::WireMemoryPressure::Critical => {
+                                crate::MemoryPressure::Critical
+                            }
+                        };
+                        crate::NativeSamplingCompletion::Sample(crate::ResourceSample {
+                            sequence,
+                            capacity: crate::ResourceCapacity {
+                                available_memory_bytes: sample.memory_bytes,
+                                available_storage_bytes: sample.storage_bytes,
+                            },
+                            contention: crate::ResourceContention {
+                                cpu,
+                                memory_pressure: pressure,
+                            },
+                        })
+                    }
+                    Ok(_) => return Err(ClientError::UnexpectedResponse),
+                    Err(error) => crate::NativeSamplingCompletion::Failure(match error {
+                        crate::guardian_ipc::WireResourceError::TemporarilyUnavailable => {
+                            crate::ResourceObservationFailure::TemporarilyUnavailable
+                        }
+                        crate::guardian_ipc::WireResourceError::Unsupported => {
+                            crate::ResourceObservationFailure::Unsupported
+                        }
+                        crate::guardian_ipc::WireResourceError::Malformed => {
+                            crate::ResourceObservationFailure::Malformed
+                        }
+                    }),
+                }
+            }
+            crate::guardian_ipc::WireCompletion::SampleResources { .. }
+            | crate::guardian_ipc::WireCompletion::ListChildren { .. }
+            | crate::guardian_ipc::WireCompletion::AcquireChildIdentity { .. }
+            | crate::guardian_ipc::WireCompletion::ObserveIdentity { .. }
+            | crate::guardian_ipc::WireCompletion::SignalExactIdentity { .. }
+            | crate::guardian_ipc::WireCompletion::ReverifyRetainedCandidate { .. } => {
+                return Err(ClientError::UnexpectedResponse)
+            }
+        };
+        Ok(crate::VerifiedNativeSamplingCompletion::new(
+            issue, completion,
+        ))
+    }
     /// # Errors
     /// Refuses stale sessions or transport failure.
     pub fn fence(&mut self, session: crate::guardian_ipc::WireSession) -> Result<(), ClientError> {
         match self.exchange(&Request::Fence { session })? {
-            Response::Fenced => Ok(()),
+            Response::Fenced => {
+                self.verified_snapshot = None;
+                Ok(())
+            }
             Response::Hello { .. }
             | Response::Snapshot(_)
             | Response::ReconciliationBegun { .. }
@@ -695,7 +813,101 @@ pub fn verify_native_binding(
     }
 }
 
+#[cfg(test)]
+mod native_sampling_snapshot_tests {
+    use super::*;
+    use crate::{
+        BirthToken, CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce,
+        MemoryPressure, MonotonicTick, NativeGuardianIdentity, PersistenceRevision, PolicyLoop,
+        ProcessId, ProcessIdentity, ResourcePolicy,
+    };
+    use std::num::{NonZeroU32, NonZeroUsize};
+
+    fn process(pid: u32) -> ProcessIdentity {
+        ProcessIdentity::new(
+            ProcessId::new(NonZeroU32::new(pid).unwrap()),
+            BirthToken::new(12, 3).unwrap(),
+        )
+    }
+
+    fn issue_and_snapshot() -> (crate::NativeSamplingIssue, WireSnapshot) {
+        let mut store = crate::ControllerSqliteStore::in_memory().unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(100).unwrap(),
+            MemoryPressure::Critical,
+        );
+        let committed = DeploymentAttempt::start(
+            crate::AttemptId::new(9),
+            MonotonicTick::new(100),
+            policy,
+            process(42),
+        )
+        .persist(&mut store)
+        .unwrap();
+        let identity = NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([5; 16]).unwrap(),
+            process: process(100),
+        };
+        let binding = store
+            .commit_initial_binding(
+                crate::AttemptId::new(9),
+                MonotonicTick::new(100),
+                PersistenceRevision::first(),
+                identity,
+                &[],
+            )
+            .unwrap();
+        let mut loop_ = PolicyLoop::from_committed(committed);
+        let ticket = loop_.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let snapshot = WireSnapshot {
+            instance: 7,
+            attempt: 9,
+            deadline: 100,
+            state: crate::guardian_ipc::WireState::Active,
+            session: crate::guardian_ipc::WireSession {
+                instance: 7,
+                generation: 1,
+            },
+            slots: vec![],
+            retained: vec![],
+            native_binding: Some(crate::guardian_ipc::WireNativeBinding {
+                attempt: 9,
+                deadline: 100,
+                nonce: identity.nonce.bytes(),
+                guardian: identity.process.into(),
+                slots: vec![],
+            }),
+        };
+        (issue, snapshot)
+    }
+
+    #[test]
+    fn sampling_snapshot_requires_fresh_active_exact_guardian_identity() {
+        let (issue, snapshot) = issue_and_snapshot();
+        assert!(sampling_snapshot_matches(&snapshot, issue));
+
+        let mut detached = snapshot.clone();
+        detached.state = crate::guardian_ipc::WireState::DetachedFenced;
+        assert!(!sampling_snapshot_matches(&detached, issue));
+
+        let mut replacement = snapshot.clone();
+        replacement.native_binding.as_mut().unwrap().guardian = process(101).into();
+        assert!(!sampling_snapshot_matches(&replacement, issue));
+
+        let mut wrong_instance = snapshot;
+        wrong_instance.session.instance += 1;
+        assert!(!sampling_snapshot_matches(&wrong_instance, issue));
+    }
+}
+
 #[cfg(target_os = "macos")]
+/// Spawn one harmless direct child and hold its original parent slot until the#[cfg(target_os = "macos")]
 /// Spawn one harmless direct child and hold its original parent slot until the
 /// explicitly bounded disposable fixture ends.
 /// # Errors

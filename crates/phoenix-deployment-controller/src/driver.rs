@@ -67,6 +67,10 @@ impl DispatchTicket {
         Self { key, effect }
     }
 
+    pub(crate) fn into_parts(self) -> (DispatchKey, OsEffect) {
+        (self.key, self.effect)
+    }
+
     #[must_use]
     pub const fn key(&self) -> DispatchKey {
         self.key
