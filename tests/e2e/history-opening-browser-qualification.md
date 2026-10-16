@@ -2186,3 +2186,41 @@ cached tests65 passed with1 external-fixture skip; no local native/build/server
 was run. This publication supersedes the prior source-only execution hold solely
 to collect the reviewed target-specific actual distinction, without thresholds,
 timeout, retry, source-pin, app-pin or acceptance changes.
+
+### Actual target is present but clipped; local readiness/containment distinction
+
+The reviewed bounded run `38966536941` at harness
+`ca8df845ddfb2f4e24ab84bbee1e67e318b89ffd` is terminal failure. Witness
+`117194278348` failed controlled ordinary/history at physical_history_present;
+Rust `117194382117` and all other standard jobs passed. Actual diagnostics show
+known_target_seen1, known_target_row_clipped1, known_target_message_clipped1,
+row_clipped8, unknown_or_unexpected_identity3, with NO target-row-taller-than-clip
+counter. The target is physically present and rejected by containment; oversized
+height is not supported at this observation. One report/204, one admission,
+four requests, pending0/errors0 precede the assertion. Source-pin equality is
+not reached, so no claim about its actual match is made. Remote artifact
+`12075382939` is96,430,484B; selected bounded reads75,055B retain exact receipt
+and browser log. No completed trial or final collector/export acceptance follows.
+
+A local no-browser equivalent now executes the actual pinned app
+`isCommitVisible` function (AST-selected and transpiled with cached TypeScript),
+not a rewritten predicate, alongside the exact serialized physical oracle. A
+short target clipped1px on top/bottom/left/right, and one retaining only1px overlap,
+passes the app's positive-intersection predicate but fails strict whole-row and
+message containment. A fully contained control passes both. Combined cached
+Node66 passed with1 external-fixture skip. This proves the source predicate
+relationship, not the complete lifecycle gate, actual clipping axis or timing
+cause. The app readiness path additionally requires targetApplied, transcript,
+breadcrumb and child visibility. It cannot be equated to strict full containment.
+
+The controlled harness still uses an unpinned newContext viewport and a single
+physical read immediately after report204, unlike the existing explicit1360x900
+realserver geometry/physical stability path. These are concrete local seams to
+regress before another actual attempt: original-page physical settlement versus
+report readiness, and explicit qualification geometry. No tolerance, scroll
+mutation, alternate target, sampler change or relaxed oracle is adopted. No
+further diagnostic-only hosted attempt is started by this record. Merged #926
+is not integrated speculatively into this frozen evidence baseline, and is not
+claimed deployed. Native source-link acceptance remains release-blocking; stock
+baseline, controlled proof, overheadfalse, resumeunsupported and fullacceptancefalse
+remain separate.

@@ -190,3 +190,37 @@ test('UNIT visible exact persisted target inside oversized row still fails stric
   assert.equal(oversizedUser(null,true).predicates.row_clipped,1);
   assert.equal(oversizedUser(null,true).predicates.known_target_message_clipped,1);
 });
+
+test('UNIT actual app intersection predicate does not imply strict physical containment on any edge', async () => {
+  const {createRequire}=await import('node:module');const {resolve}=await import('node:path');
+  const app=resolve(process.env.APP_ROOT??'target/history-hidden-geometry-repair');
+  const require=createRequire(resolve(app,'ui/package.json'));const ts=require('typescript');
+  const source=readFileSync(resolve(app,'ui/src/hooks/conversationViewLifecycle.ts'),'utf8');
+  const ast=ts.createSourceFile('conversationViewLifecycle.ts',source,ts.ScriptTarget.Latest,true);
+  const fn=ast.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='isCommitVisible');
+  assert.ok(fn,'test executes the actual pinned app predicate, not a rewritten intersection rule');
+  const code=ts.transpileModule(fn.getText(ast).replace(/^export\s+/,''),
+    {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const rect=(top,left)=>({top,left,bottom:top+20,right:left+100,height:20,width:100});
+  const cases=[['visible',rect(120,30),true],['top',rect(99,30),false],['bottom',rect(281,30),false],
+    ['left',rect(120,9),false],['right',rect(120,211),false],['one_pixel_overlap',rect(299,30),false]];
+  for(const [name,b,contained] of cases){
+    const clip={top:100,left:10,bottom:300,right:310,height:200,width:300};
+    const base={isConnected:true,parentElement:null,hasAttribute:()=>false,getAttribute:()=>null,getClientRects:()=>[b]};
+    const row={...base,dataset:{virtualKey:'UNIT-row'},getBoundingClientRect:()=>b};
+    const child={...base,getAttribute:key=>key==='id'?'message-root:known':null,
+      getBoundingClientRect:()=>b,closest:()=>row};
+    row.querySelectorAll=()=>[child];
+    const scroller={...base,getBoundingClientRect:()=>clip,querySelectorAll:()=>[row],scrollTop:0,scrollHeight:1000,clientHeight:200};
+    const context={document:{visibilityState:'visible',querySelector:()=>scroller,
+      querySelectorAll:selector=>selector==='[data-virtual-key]'?[row]:[child]},
+      window:{innerHeight:900,innerWidth:1360},innerHeight:900,innerWidth:1360,
+      getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1'}),
+      location:{href:'http://127.0.0.1/source?source_transcript=root'},URL,child,scroller};
+    assert.equal(runInNewContext(code+';isCommitVisible(child,scroller)',context,{timeout:1000}),true,name);
+    const probe=runInNewContext(`(${observePhysicalHistoricalRow.toString()})`,context,{timeout:1000})({known,diagnostics:true});
+    assert.equal(probe.observation!==null,contained,name);
+    if(!contained){assert.equal(probe.predicates.known_target_row_clipped,1,name);
+      assert.equal(probe.predicates.known_target_message_clipped,1,name);}
+  }
+});
