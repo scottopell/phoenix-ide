@@ -547,12 +547,14 @@ impl State {
             phoenix_browser::BrowserError,
         >,
     ) -> Response {
-        let snapshot = adapt(
+        let output = BrowserOperation::Snapshot
+            .execute(json!({"interactive":true}), access)
+            .await;
+        let checkpoint = browser.read().await.snapshot_checkpoint();
+        let mut snapshot = adapt(
             &self.session,
             Some(&self.lifetime),
-            &BrowserOperation::Snapshot
-                .execute(json!({"interactive":true}), access)
-                .await,
+            &output,
             &self.image_directory,
         )
         .await;
@@ -594,12 +596,43 @@ impl State {
             ),
             Err(error) => (None, Some(error.to_string())),
         };
+        revalidate_open_snapshot(browser, checkpoint.as_ref(), &mut snapshot).await;
         Response::success(
             &self.session,
             Some(&self.lifetime),
             json!({"url":url,"title":title,"observation_errors":observation_errors,"navigation":"succeeded","snapshot":snapshot.outcome,"console_errors":errors,"console_capture_error":console_capture_error}),
         ).with_browser_lifetime(Some(browser_lifetime.into()))
     }
+}
+
+async fn revalidate_open_snapshot(
+    browser: &Arc<RwLock<BrowserSession>>,
+    checkpoint: Option<&phoenix_browser::snapshot::SnapshotCheckpoint>,
+    snapshot: &mut Response,
+) {
+    if !matches!(snapshot.outcome, Outcome::Success { .. }) {
+        return;
+    }
+    let validation = async {
+        let checkpoint = checkpoint.ok_or_else(|| "Snapshot references expired".to_string())?;
+        browser
+            .read()
+            .await
+            .validate_snapshot_checkpoint(checkpoint)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let error = match tokio::time::timeout(Duration::from_secs(5), validation).await {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error,
+        Err(_) => "Snapshot validation timed out after 5 seconds".into(),
+    };
+    snapshot.outcome = Response::error(
+        &snapshot.session,
+        snapshot.lifetime.as_deref(),
+        ErrorCode::OperationFailed,
+        format!("The open snapshot expired while observing the page: {error}. Call snapshot again for current references."),
+    ).outcome;
 }
 
 async fn navigation_observation<E: std::fmt::Display>(
@@ -1082,6 +1115,73 @@ mod tests {
                 .tmp_root()
                 .join("unused-reader-test-images"),
         })
+    }
+
+    #[tokio::test]
+    async fn open_snapshot_expires_during_delayed_page_observation() {
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let state = reader_state();
+        let browser = state.manager.get_session(&state.scope).await.unwrap();
+        browser.read().await.page.goto("about:blank").await.unwrap();
+        browser.read().await.page.evaluate("document.body.innerHTML = Array.from({length:100}, (_,i) => `<button>${i} ${'accessible action '.repeat(5)}</button>`).join('')").await.unwrap();
+        let output = BrowserOperation::Snapshot
+            .execute(json!({"interactive":true}), &Existing(browser.clone()))
+            .await;
+        assert!(output.is_success(), "{}", output.output());
+        let checkpoint = browser.read().await.snapshot_checkpoint().unwrap();
+        let mut snapshot = adapt(
+            &state.session,
+            Some(&state.lifetime),
+            &output,
+            &state.image_directory,
+        )
+        .await;
+        let Outcome::Success { result } = &snapshot.outcome else {
+            panic!("snapshot failed")
+        };
+        let artifact = result["artifacts"][0].as_str().unwrap().to_owned();
+        assert!(Path::new(&artifact).exists());
+        revalidate_open_snapshot(&browser, Some(&checkpoint), &mut snapshot).await;
+        assert!(matches!(snapshot.outcome, Outcome::Success { .. }));
+
+        let (release_observation, delayed_observation) = tokio::sync::oneshot::channel();
+        let navigation = tokio::spawn({
+            let browser = browser.clone();
+            async move {
+                let guard = browser.read().await;
+                guard
+                    .page
+                    .goto("data:text/html,<title>Replacement</title><button>New action</button>")
+                    .await
+                    .unwrap();
+                release_observation.send(()).unwrap();
+            }
+        });
+        delayed_observation.await.unwrap();
+        let title = browser
+            .read()
+            .await
+            .page
+            .get_title()
+            .await
+            .unwrap()
+            .unwrap();
+        navigation.await.unwrap();
+        revalidate_open_snapshot(&browser, Some(&checkpoint), &mut snapshot).await;
+        assert_eq!(title, "Replacement", "later page observation is retained");
+        let Outcome::Error { error } = snapshot.outcome else {
+            panic!("expired snapshot reported success")
+        };
+        assert!(error.message.contains("snapshot expired"));
+        assert!(error.artifacts.is_empty());
+        assert!(!Path::new(&artifact).exists());
+        assert!(browser.read().await.snapshot_checkpoint().is_none());
+        state.manager.shutdown_all().await.unwrap();
     }
 
     #[tokio::test]
