@@ -1,6 +1,7 @@
 name: Deployment controller macOS
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "crates/phoenix-deployment-controller/**"
