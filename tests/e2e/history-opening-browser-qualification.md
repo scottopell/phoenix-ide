@@ -2105,3 +2105,27 @@ independent frozen-install provenance; hosted frozen dependencies remain require
 No app pin, asset gate, collector/export inventory, outcome or timing policy was
 changed for this correction. Instrumented server startup evidence is not browser
 launch/report acceptance; no native, resume, overhead or full acceptance is inferred.
+
+### First entered controlled scenario: failed, exact cause not retained
+
+Run `38938107186` at harness `a05512b901bd3bd5e35eb109fcd1756da9ef41e0`
+is terminal failure: witness `117098592669` failed the controlled step; Rust
+`117098722795` and all other standard checks passed. The browser dependency,
+canonical builds/admission, guards, codegen and full UI gates cleared. The browser
+receipt contains trials[] and failed_trial:null, proving entry into the first
+ordinary/history scenario but no completed collected scenario. The outer wrapper
+replaced the scenario label with controlled_driver_failed; no exact failed check
+can be recovered. This is not evidence of missing browser launch or any particular
+auth, navigation, readiness or physical-history defect. Artifact `12063320113`
+remains remote (96,430,302B); first selected bounded reads99,983B preserved the
+browser log, sanitized failure and controlled artifact admission.
+
+A diagnostic-only correction preserves the original scenario failure label and
+adds a static last-entered phase, validated route/scenario kind, assertion versus
+operation classification and capped report/admission/request/pending/error counts
+plus at most8 numeric response statuses. No raw errors, stacks, URLs, credentials,
+paths or new report bodies are retained. Independent review approved this bounded
+diagnostic boundary; Node19 tests pass, including label preservation and private
+setup-error sanitation. No scenario assertion, timeout, retry, outcome or exact
+collector/export criterion changes. A successor may localize the failed stage;
+it cannot retroactively establish the previous cause or any acceptance.

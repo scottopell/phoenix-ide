@@ -78,6 +78,11 @@ function controlledObserver(page, network, module, identity, fixture, ownership)
   });
   return {
     getReports,
+    failureCounts: () => ({ reports: Math.min(8, network.snapshot().reports.length),
+      responses: network.snapshot().statuses.map(s => s.status).slice(0, 8),
+      admissions: Math.min(8, ownership.diagnostics().filter(e => e.kind === 'admission').length),
+      requests: Math.min(512, network.snapshot().requestRecords.length),
+      pending: Math.min(512, pending.size), errors: Math.min(32, network.snapshot().errors.length) }),
     reportTransportSettled: () => reportTransports.size === 0,
     getStatuses: () => network.snapshot().statuses.map(s => s.status),
     getErrors: () => [...network.snapshot().errors, ...(network.snapshot().ownershipFailure ? [network.snapshot().ownershipFailure] : []), ...(failure ? [failure] : [])],
@@ -136,13 +141,15 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
       clock.remaining();
       assert.ok(!canceled);
       const route = fixture.kind, context = await bounded(createContext, 10000);
-      let page, observer, scenarioFailure, collectedTrial;
+      let page, observer, scenarioFailure, collectedTrial, phase = 'authenticate';
       try {
         const trial = await bounded(async () => {
           await (UNIT?.authenticate ?? authenticateOwnedContext)(context, baseURL);
           assert.ok(!canceled); clock.remaining();
+          phase = 'ownership_install';
           const ownership = await installHistoryRequestOwnership(context, config, UNIT?.ownership);
           assert.ok(!canceled); clock.remaining();
+          phase = 'page_create';
           page = await context.newPage();
           if (canceled) { await page.close(); throw new Error('controlled late page creation canceled'); }
           const network = installObservedHistoryTelemetry(page, baseURL, ownership);
@@ -167,27 +174,35 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
           if (kind === 'history') {
             const target = historyTargets.find(t => t.kind === route);
             assert.ok(target && target.route && target.anchor && target.composerOwner);
+            phase = 'history_navigate';
             await page.goto(baseURL + target.route, { waitUntil: 'domcontentloaded', timeout: Math.min(15000, clock.remaining()) });
+            phase = 'history_report_wait';
             await observer.wait(() => observer.getReports().length === 1 && observer.getStatuses().length === 1, Math.min(12000, check()));
+            phase = 'physical_history';
             const physical = await page.evaluate(observePhysicalHistoricalRow, { known: [target.anchor] });
             assert.ok(physical, 'actual retained historical source must be visible');
             assert.equal(physical.persistedMessageID, target.anchor.persistedMessageID);
             assert.equal(physical.sourceRow, target.anchor.sourceRow);
             assert.equal(physical.sourcepin, target.anchor.sourceRow);
+            phase = 'composer_owner';
             assert.equal(await page.locator('textarea[placeholder="Message..."]').count(), 1, 'exactly one current composer');
             assert.equal(await page.locator('textarea[placeholder="Message..."]').isEditable(), true, 'current composer is writable');
             assert.equal(page.url(), new URL(target.route, baseURL).href, 'original retained route cannot be replaced');
+            phase = 'report_collect';
             const trial = await collect();
             assertOwnedReport(trial.reports[0], network.snapshot());
+            phase = 'additional_history_owner';
             const historicalRequests = network.snapshot().requestRecords.filter(r => r.kind === 'request'
               && new URL(r.url).pathname === fixture.endpoint && new URL(r.url).searchParams.has('before'));
             assert.ok(historicalRequests.length > 0, 'actual additional history GET required before historical ready');
             for (const request of historicalRequests) assert.ok(trial.reports[0].correlations.some(c => c.kind === 'request' && c.id === request.open_id), 'additional history request must remain in its original journey');
             trial.additional_history = { report_count: 1, request_count: historicalRequests.length, original_owner: trial.reports[0].open_id };
+            phase = 'stream_owner';
             assert.ok(network.snapshot().requestRecords.some(r => r.kind === 'sse' && new URL(r.url).pathname === `/api/conversations/${target.composerOwner}/stream`), 'stream must belong to independently selected writable owner');
             trial.physical_history = { original_page: true, anchor: physical, composer_owner: target.composerOwner };
             return trial;
           }
+          phase = 'pending_navigation';
           const cdp = await context.newCDPSession(page);
           check();
           await cdp.send('Network.enable');
@@ -197,6 +212,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
           await observer.wait(() => observer.getPendingPrimaryRequests().length > 0, Math.min(10000, check()));
           const pending = observer.getPendingPrimaryRequests();
           const before = await page.evaluate(() => performance.timeOrigin);
+          phase = kind === 'pagehide' ? 'pagehide_departure' : 'sidebar_cancellation';
           if (kind === 'pagehide') {
             assert.ok(observer.getPendingPrimaryRequests().length > 0, 'request remains pending at actual departure');
             check();
@@ -212,9 +228,11 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             await page.waitForURL(new URL('/', baseURL).href, { timeout: Math.min(10000, check()) });
             assert.equal(await page.evaluate(() => performance.timeOrigin), before, 'cancellation must be same-document');
           }
+          phase = 'departure_report_wait';
           await observer.wait(() => observer.getReports().length === 1, Math.min(5000, check()));
           if (kind !== 'pagehide') await observer.wait(() => observer.getStatuses().length === 1, Math.min(5000, check()));
           check();
+          phase = 'report_collect';
           const trial = await collect();
           assert.ok(pending.some(p => trial.reports[0].correlations.some(c => c.kind === 'request' && c.id === p.open_id)), 'report must own the actual pending request');
           assertOwnedReport(trial.reports[0], network.snapshot());
@@ -223,11 +241,14 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
         }, kind === 'history' ? 30000 : 20000);
         collectedTrial = trial;
         if (kind === 'pagehide') {
+          phase = 'departure_transport_settle';
           await bounded(() => observer.wait(() => observer.reportTransportSettled(), Math.min(5000, check())), 5000);
           trial.transport_settled_before_context_close = true;
         }
+        phase = 'context_close';
         // Keep observers until context closure so late/unexpected reports cannot disappear.
         await bounded(() => close(context), 5000);
+        phase = 'final_inventory';
         assert.equal(observer.getReports().length, 1, 'late report cannot change controlled inventory');
         assert.equal(observer.getAdmissionCount(), 1, 'late or successor admission cannot disappear');
         assert.deepEqual(observer.getErrors(), []);
@@ -236,6 +257,9 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
         canceled = true;
         const failure = UNIT ? error : new Error(`controlled ${route}/${kind} failed: ${error instanceof assert.AssertionError ? 'assertion' : 'operation_or_deadline'}`);
         failure.controlledReceipt = { evidence_class: CONTROLLED_CLASS, status: 'failed', trials,
+          failure_location: { scope: 'scenario', route, kind, phase,
+            error_kind: error instanceof assert.AssertionError ? 'assertion' : 'operation',
+            counts: observer?.failureCounts() ?? null },
           failed_trial: collectedTrial ? { ...collectedTrial, reports: observer.getReports(), status: 'failed_assertions' } : null,
           overhead_clearance: false, full_acceptance: false, failure: 'controlled_scenario_failed' };
         scenarioFailure = failure;

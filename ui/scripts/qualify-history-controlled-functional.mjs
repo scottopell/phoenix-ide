@@ -47,21 +47,25 @@ async function boundedOperation(operation, milliseconds) {
 }
 
 export async function captureOwnedBrowser({ launch, capture, negative, publish, timeoutMs = 205000, closeMs = 4000 }) {
-  let browser, result, primary, canceled = false;
+  let browser, result, primary, canceled = false, phase = 'launch';
   const failed = () => ({ evidence_class: 'controlled_functional', status: 'failed',
     failure: 'controlled_driver_failed', overhead_clearance: false, full_acceptance: false });
   try {
     await boundedOperation(async () => {
       browser = await launch();
       if (canceled) { void browser.close().catch(() => {}); return; }
+      phase = 'capture';
       result = await capture(browser);
       if (canceled) return;
+      phase = 'negative_auth';
       await negative(browser, result);
     }, timeoutMs);
   } catch (error) {
     primary = error;
     result = error.controlledReceipt ?? result ?? failed();
-    result = { ...result, status: 'failed', failure: 'controlled_driver_failed' };
+    result = { ...result, status: 'failed',
+      failure: result.failure ?? 'controlled_driver_failed',
+      failure_location: result.failure_location ?? { scope: 'browser_lifecycle', phase, error_kind: 'operation' } };
   } finally {
     canceled = true;
     result ??= failed();

@@ -186,3 +186,21 @@ test('offline declared Playwright dependency resolves through the actual pinned 
   assert.ok(pkg.devDependencies.playwright);assert.equal(pkg.devDependencies['@playwright/test'],undefined);
   const chromium=resolveOwnedChromium(app);assert.equal(typeof chromium.launch,'function');
 });
+
+test('UNIT outer lifecycle preserves allowlisted scenario failure location instead of erasing it',async()=>{
+  const runtime=fakeRuntime({omitHistoryRequest:true});const published=[];
+  await assert.rejects(captureOwnedBrowser({launch:async()=>runtime.input.browser,
+    capture:()=>runControlledFunctional(runtime.input,runtime.UNIT),negative:async()=>{},
+    publish:r=>published.push(structuredClone(r)),timeoutMs:1000}));
+  const result=published.at(-1);assert.equal(result.failure,'controlled_scenario_failed');
+  assert.deepEqual(result.failure_location,{scope:'scenario',route:'ordinary',kind:'history',
+    phase:'additional_history_owner',error_kind:'assertion',counts:{reports:1,responses:[204],admissions:1,requests:2,pending:1,errors:0}});
+});
+test('UNIT phase receipts expose bounded counts, not raw errors or private setup details',async()=>{
+  const runtime=fakeRuntime();const published=[];
+  runtime.UNIT.authenticate=async()=>{throw new Error('SECRET credential path and body');};
+  await assert.rejects(captureOwnedBrowser({launch:async()=>runtime.input.browser,
+    capture:()=>runControlledFunctional(runtime.input,runtime.UNIT),negative:async()=>{},publish:r=>published.push(structuredClone(r))}));
+  assert.equal(published.at(-1).failure_location.phase,'authenticate');
+  assert.ok(!JSON.stringify(published).includes('SECRET'));
+});
