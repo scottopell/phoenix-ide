@@ -4,7 +4,7 @@
 
 The Phoenix Browser Tool enables AI agents to interact with web pages during development, testing, and debugging. Three user stories drive the scope: web development (navigate, screenshot, debug), automated testing (interact via click/type/JS, capture evidence), and PWA testing (service workers, offline mode — post-MVP).
 
-The core set covers navigation, JavaScript evaluation, screenshots, viewport control, console log capture with accurate object representation, and dedicated click/type/wait tools that reliably trigger framework event handlers. Accessibility snapshots and snapshot-reference click/type targeting are in progress. Browser availability is automatic — if no system browser is found, a compatible Chromium is downloaded and cached transparently. Post-MVP scope covers PWA-specific inspection (service workers, network sources, offline simulation) and network request capture.
+The core set covers navigation, JavaScript evaluation, screenshots, viewport control, console log capture with accurate object representation, accessibility snapshots, and dedicated click/type/wait tools that reliably trigger framework event handlers. Click/type accept CSS selectors or snapshot references. Browser availability is automatic — if no system browser is found, a compatible Chromium is downloaded and cached transparently. Post-MVP scope covers PWA-specific inspection (service workers, network sources, offline simulation) and network request capture.
 
 ## Technical Summary
 
@@ -39,7 +39,7 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-017:** React Component Access | ✅ Complete | `browser_inject_react_devtools` + `browser_remove_react_devtools`; `window.__phoenix` helper via `__REACT_DEVTOOLS_GLOBAL_HOOK__` |
 | **REQ-BT-018:** Live Browser View Side Panel | ✅ Complete | View-only CDP screencast relay via `/api/conversations/:id/browser-view` WS; mutex with prose/diff slot; auto-mount-when-empty on first `browser_*` tool |
 | **REQ-BT-019:** Systematic Web Performance Testing | 🟡 In Progress | `browser_profile` tool (action enum). Tier 0+1 + cheap Tier 2; lading-style scenario harness returns raw per-run samples (never averaged). Lifecycle in `browser-profiling.allium`. Network emulation deferred (REQ-BT-019-NG-NETEMU) |
-| **REQ-BT-025:** Accessibility Snapshots and Element References | 🔄 In Progress | Main-document AX snapshots, interactive filtering, browser/document/node-bound click/type references; validation pending |
+| **REQ-BT-025:** Accessibility Snapshots and Element References | ✅ Complete | `browser_snapshot`; main-document AX tree and interactive filtering; exact-node click/type refs; explicit limits and large-output artifacts. Eight rendering/schema/browser tests cover reference lifetime, native/React input, shadow roots, iframe exclusion, and hover replacement. |
 
 ### WorkScope Ownership
 
@@ -60,6 +60,6 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
 | **REQ-BT-024:** Capture Network Requests | ❌ Not Started | API debugging |
 
-**Core Progress:** 18 of 20 complete; performance suite and accessibility snapshots in progress
+**Core Progress:** 19 of 20 complete; performance suite in progress
 **WorkScope Progress:** 4 of 4 complete
-**Total Progress:** 22 of 29 complete
+**Total Progress:** 23 of 29 complete

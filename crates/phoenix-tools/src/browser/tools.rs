@@ -947,17 +947,13 @@ impl Tool for BrowserClickTool {
                     }
                     Err(_) => {
                         return ToolOutput::error(format!(
-                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{}'",
-                            selector
+                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{selector}'"
                         ));
                     }
                     _ => {}
                 }
                 if start.elapsed() >= timeout {
-                    return ToolOutput::error(format!(
-                        "Timeout waiting for element '{}'",
-                        selector
-                    ));
+                    return ToolOutput::error(format!("Timeout waiting for element '{selector}'"));
                 }
                 tokio::time::sleep(poll_interval).await;
             }
@@ -967,7 +963,7 @@ impl Tool for BrowserClickTool {
         let element = match guard.page.find_element(selector).await {
             Ok(el) => el,
             Err(e) => {
-                return ToolOutput::error(format!("Could not find element '{}': {}", selector, e));
+                return ToolOutput::error(format!("Could not find element '{selector}': {e}"));
             }
         };
 
@@ -1115,94 +1111,100 @@ impl Tool for BrowserTypeTool {
                 };
             }
         };
-        let Some(deadline) = checked_deadline(timeout) else {
-            return ToolOutput::error(
-                "Invalid timeout: duration exceeds the supported deadline range",
-            );
-        };
-
-        let selector_json = serde_json::to_string(selector).unwrap();
-        let element = match focus_element_until(&guard.page, selector, deadline).await {
-            Ok(element) => element,
-            Err(message) => return ToolOutput::error(message),
-        };
-
-        // Clear existing text if requested
-        if input.clear {
-            match operation_phase(
-                BrowserOperationPhase::TypeClear,
-                deadline.saturating_duration_since(std::time::Instant::now()),
-                guard
-                    .page
-                    .evaluate(format!("document.querySelector({selector_json}).select()")),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return ToolOutput::error(format!("Failed to select text: {error}"));
-                }
-                Err(message) => return ToolOutput::error(message),
-            }
-            match operation_phase(
-                BrowserOperationPhase::TypeClear,
-                deadline.saturating_duration_since(std::time::Instant::now()),
-                element.press_key("Backspace"),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return ToolOutput::error(format!("Failed to clear text: {error}"));
-                }
-                Err(message) => return ToolOutput::error(message),
-            }
-        }
-
-        // Type the text using CDP keyboard events
-        // Handle newlines specially since type_str doesn't support them
-        let parts: Vec<&str> = input.text.split('\n').collect();
-        for (i, part) in parts.iter().enumerate() {
-            // Type the text part
-            if !part.is_empty() {
-                match operation_phase(
-                    BrowserOperationPhase::TypeInput,
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                    element.type_str(part),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return ToolOutput::error(format!("Type failed: {error}"));
-                    }
-                    Err(message) => return ToolOutput::error(message),
-                }
-            }
-            // Add Enter between parts (not after last)
-            if i < parts.len() - 1 {
-                match operation_phase(
-                    BrowserOperationPhase::TypeInput,
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                    element.press_key("Enter"),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return ToolOutput::error(format!("Failed to press Enter: {error}"));
-                    }
-                    Err(message) => return ToolOutput::error(message),
-                }
-            }
-        }
-
-        ToolOutput::success(format!(
-            "Typed {} characters into '{}'",
-            input.text.len(),
-            selector
-        ))
+        type_selector(&guard.page, selector, &input.text, input.clear, timeout).await
     }
+}
+
+async fn type_selector(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    text: &str,
+    clear: bool,
+    timeout: Duration,
+) -> ToolOutput {
+    let Some(deadline) = checked_deadline(timeout) else {
+        return ToolOutput::error("Invalid timeout: duration exceeds the supported deadline range");
+    };
+
+    let selector_json = serde_json::to_string(selector).unwrap();
+    let element = match focus_element_until(page, selector, deadline).await {
+        Ok(element) => element,
+        Err(message) => return ToolOutput::error(message),
+    };
+
+    // Clear existing text if requested
+    if clear {
+        match operation_phase(
+            BrowserOperationPhase::TypeClear,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            page.evaluate(format!("document.querySelector({selector_json}).select()")),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return ToolOutput::error(format!("Failed to select text: {error}"));
+            }
+            Err(message) => return ToolOutput::error(message),
+        }
+        match operation_phase(
+            BrowserOperationPhase::TypeClear,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            element.press_key("Backspace"),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return ToolOutput::error(format!("Failed to clear text: {error}"));
+            }
+            Err(message) => return ToolOutput::error(message),
+        }
+    }
+
+    // Type the text using CDP keyboard events
+    // Handle newlines specially since type_str doesn't support them
+    let parts: Vec<&str> = text.split('\n').collect();
+    for (i, part) in parts.iter().enumerate() {
+        // Type the text part
+        if !part.is_empty() {
+            match operation_phase(
+                BrowserOperationPhase::TypeInput,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.type_str(part),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Type failed: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
+            }
+        }
+        // Add Enter between parts (not after last)
+        if i < parts.len() - 1 {
+            match operation_phase(
+                BrowserOperationPhase::TypeInput,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.press_key("Enter"),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Failed to press Enter: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
+            }
+        }
+    }
+
+    ToolOutput::success(format!(
+        "Typed {} characters into '{}'",
+        text.len(),
+        selector
+    ))
 }
 
 // ============================================================================
