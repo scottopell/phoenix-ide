@@ -160,6 +160,9 @@ THE SYSTEM SHALL expose artifact paths explicitly
 AND SHALL return nonzero exit status for failed commands
 AND SHALL include stable error codes and actionable recovery instructions where recovery is possible.
 
+WHEN JavaScript evaluation throws
+THE SYSTEM SHALL return a concise human-readable message and preserve full exception context in structured error details.
+
 THE SYSTEM SHALL reject requests exceeding the 32 MiB encoded JSON message budget, including framing, before session lookup or startup
 AND SHALL report invalid input rather than an uncertain delivery outcome for requests that were never sent.
 

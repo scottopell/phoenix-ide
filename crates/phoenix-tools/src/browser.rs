@@ -29,9 +29,9 @@ pub use profile::BrowserProfileTool;
 pub use snapshot::BrowserSnapshotTool;
 pub use tools::{
     parse_duration, BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool,
-    BrowserEvaluation, BrowserKeyPressTool, BrowserNavigateTool, BrowserRecentConsoleLogsTool,
-    BrowserResizeTool, BrowserTakeScreenshotTool, BrowserTypeTool, BrowserWaitForSelectorTool,
-    SavedEvaluationArtifact,
+    BrowserEvaluation, BrowserEvaluationError, BrowserKeyPressTool, BrowserNavigateTool,
+    BrowserRecentConsoleLogsTool, BrowserResizeTool, BrowserTakeScreenshotTool, BrowserTypeTool,
+    BrowserWaitForSelectorTool, SavedEvaluationArtifact,
 };
 
 use crate::{Tool, ToolContext, ToolOutput};

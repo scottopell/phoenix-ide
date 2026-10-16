@@ -56,6 +56,8 @@ phoenix-browser --json eval '({title: document.title})' | jq '.result.data.value
 
 Results larger than 4 KiB use `json_artifact` or `unserializable_artifact` instead, with the saved path in `result.artifacts`: read the former as JSON and the latter as UTF-8 JavaScript scalar text. Human-readable eval output prints the value directly or the saved path.
 
+JavaScript exceptions print a concise message with a source location. In `--json` output, `error.details` retains the full CDP exception context, including the original description and stack when available. Long summaries are visibly shortened; inspect the structured details for the complete diagnostic.
+
 `screenshot --output PATH` saves the PNG at a chosen location and reports that path. Relative paths resolve from your current directory, including when the session daemon started elsewhere. The parent directory must exist; an existing regular file is overwritten. Symlink and non-file destinations are rejected. Without `--output`, screenshots use a generated temporary path. The shared screenshot schema accepts an absolute `path`.
 
 Use `--` before positional text that matches an option, for example `phoenix-browser type '#field' -- '--json'`.

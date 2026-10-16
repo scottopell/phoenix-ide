@@ -53,4 +53,6 @@ Typed evaluation uses one shared value producer and separate Phoenix-text/CLI-da
 
 Screenshot output paths resolve in the caller's working directory before transport. Native browser coverage checks chosen/default paths, overwrite behavior, saved PNG bytes, and rejection of symlink or non-file destinations.
 
-Repeated `open` reloads the current URL within the same browser lifetime, retaining cookies and origin storage while replacing page state. Fragment navigation follows native CDP semantics without depending on a document-load event for same-document completion. Real HTTP coverage checks document generations, fresh refs, and navigation-local console errors.
+Repeated `open` reloads the current URL within the same browser lifetime, retaining cookies and origin storage while replacing page state. Fragment navigation follows native CDP semantics without depending on a document-load event for same-document completion. Real HTTP coverage checks document generations, fresh refs, navigation-local console errors, and server-loss reload failure followed by recovery in the same browser.
+
+Evaluation exceptions retain one typed CDP diagnostic until rendering. Human output uses a bounded single-line message and source location; CLI structured errors retain the full exception context without interpreting user-thrown values as artifact metadata.

@@ -77,7 +77,8 @@ WHEN the expression returns a Promise
 `browser_eval` SHALL await the Promise and return the resolved value (configurable via the `await` parameter)
 
 WHEN execution throws an exception
-`browser_eval` SHALL return the error message and context
+`browser_eval` SHALL return a concise error message with an available source location
+AND SHALL retain the full exception context, including any stack trace, separately from the concise summary
 
 WHEN the result exceeds 4096 bytes
 `browser_eval` SHALL write output to a temp file and return the file path

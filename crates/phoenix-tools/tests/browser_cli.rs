@@ -293,6 +293,92 @@ fn eval_returns_typed_values_without_reinterpreting_user_objects() {
 }
 
 #[test]
+fn eval_errors_are_concise_with_full_exception_context() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    cli.ok(&[
+        "open",
+        "data:text/html,<title>Evaluation error diagnostics</title>",
+    ]);
+    for (expression, marker) in [
+        (
+            "throw new TypeError('evaluation-marker')",
+            "TypeError: evaluation-marker",
+        ),
+        ("const = syntax-marker", "SyntaxError"),
+        ("throw 'primitive-marker'", "primitive-marker"),
+        ("throw null", "null"),
+        ("throw undefined", "undefined"),
+        ("throw 42", "42"),
+        ("throw false", "false"),
+        ("throw 123n", "123n"),
+        ("throw NaN", "NaN"),
+        (
+            "Promise.reject(new Error('promise-marker'))",
+            "Error: promise-marker",
+        ),
+        (
+            "throw new Error('line-one\\nline-two')",
+            "Error: line-one line-two",
+        ),
+    ] {
+        let response = cli.invoke(&["eval", expression], None, false);
+        assert_eq!(response["error"]["code"], "operation_failed");
+        let summary = response["error"]["message"].as_str().unwrap();
+        assert!(summary.contains(marker), "{expression}: {summary}");
+        assert!(!summary.contains('\n'), "{summary}");
+        assert!(!summary.contains("ExceptionDetails"), "{summary}");
+        assert!(summary.contains("<eval>:"), "{summary}");
+        assert!(summary.len() < 500, "{summary}");
+        assert!(response["error"]["details"]["exceptionId"].is_number());
+        assert!(response["error"]["details"]["exception"].is_object());
+        assert_eq!(response["error"]["artifacts"], json!([]));
+    }
+    let expression = "throw new Error('界'.repeat(3000) + '\\nfull-tail-marker')";
+    let response = cli.invoke(&["eval", expression], None, false);
+    let summary = response["error"]["message"].as_str().unwrap();
+    assert!(summary.len() < 500);
+    assert!(summary.contains('…'));
+    let description = response["error"]["details"]["exception"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains(&"界".repeat(3000)));
+    assert!(description.contains("full-tail-marker"));
+    assert!(response["error"]["details"]["stackTrace"]["callFrames"].is_array());
+    let located = cli.invoke(
+        &[
+            "eval",
+            "throw new Error('located-marker')\n//# sourceURL=phoenix-browser-example.js",
+        ],
+        None,
+        false,
+    );
+    assert!(located["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("phoenix-browser-example.js:1:"));
+    let human = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"))
+        .env("PHOENIX_BROWSER_RUNTIME_DIR", cli.directory.path())
+        .args([
+            "--session",
+            "integration",
+            "eval",
+            "throw new Error('human-marker')",
+        ])
+        .output()
+        .unwrap();
+    assert!(!human.status.success());
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("Error: human-marker"));
+    assert!(stderr.contains("<eval>:"));
+    assert!(!stderr.contains("ExceptionDetails"));
+    assert_eq!(cli.eval("2 + 2"), 4);
+}
+
+#[test]
 fn screenshot_output_paths_are_validated_before_session_access() {
     let cli = BrowserCli::new();
     for arguments in [

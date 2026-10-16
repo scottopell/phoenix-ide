@@ -6,8 +6,8 @@ use fs2::FileExt;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_tools::browser::{
-    BrowserAccess, BrowserEvalTool, BrowserEvaluation, BrowserOperation, BrowserSession,
-    BrowserSessionManager,
+    BrowserAccess, BrowserEvalTool, BrowserEvaluation, BrowserEvaluationError, BrowserOperation,
+    BrowserSession, BrowserSessionManager,
 };
 use phoenix_tools::{ToolImage, ToolOutput};
 use serde_json::{json, Value};
@@ -260,6 +260,25 @@ impl CliImageArtifact {
             .map_err(|error| format!("Flush image artifact: {error}"))?;
         Ok(Self(pending.0.take().expect("pending image artifact")))
     }
+}
+
+fn adapt_evaluation_error(
+    session: &str,
+    lifetime: &str,
+    error: &BrowserEvaluationError,
+) -> Response {
+    let mut response = Response::error(
+        session,
+        Some(lifetime),
+        ErrorCode::OperationFailed,
+        error.to_string(),
+    );
+    if let (Outcome::Error { error: failure }, Some(details)) =
+        (&mut response.outcome, error.exception())
+    {
+        failure.details = Some(json!(details));
+    }
+    response
 }
 
 async fn adapt(
@@ -543,12 +562,7 @@ impl State {
                         json!({"kind":"evaluation","text":text,"data":data,"artifacts":artifacts}),
                     )
                 }
-                Err(error) => Response::error(
-                    &self.session,
-                    Some(&self.lifetime),
-                    ErrorCode::OperationFailed,
-                    error,
-                ),
+                Err(error) => adapt_evaluation_error(&self.session, &self.lifetime, &error),
             };
             return response.with_browser_lifetime(Some(browser_lifetime.clone()));
         }
@@ -762,9 +776,6 @@ async fn send_response(stream: &mut UnixStream, response: &Response) {
                     Outcome::Success { result } => collect_artifacts(result, &mut error.artifacts),
                     Outcome::Error { error: original } => {
                         error.artifacts.clone_from(&original.artifacts);
-                        if let Some(details) = &original.details {
-                            collect_artifacts(details, &mut error.artifacts);
-                        }
                     }
                 }
             }
@@ -1150,6 +1161,22 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn evaluation_error_values_remain_data_instead_of_artifact_handles() {
+        let details = serde_json::from_value(json!({
+            "exceptionId":1,"text":"Uncaught","lineNumber":0,"columnNumber":0,
+            "exception":{"type":"object","value":{"path":"user/path","post":"user/post","artifact_path":"user/artifact","artifacts":["user/data"],"raw_samples":[{"path":"user"}]}}
+        })).unwrap();
+        let error = BrowserEvaluationError::Javascript(Box::new(details));
+        let expected = json!(error.exception().unwrap());
+        let response = adapt_evaluation_error("named:test", "lifetime", &error);
+        let Outcome::Error { error } = response.outcome else {
+            panic!("expected error")
+        };
+        assert_eq!(error.details, Some(expected));
+        assert!(error.artifacts.is_empty());
+    }
+
     fn reader_state() -> Arc<State> {
         Arc::new(State {
             manager: BrowserSessionManager::new(),
@@ -1361,6 +1388,8 @@ mod tests {
                 );
                 if let Outcome::Error { error } = &mut response.outcome {
                     error.artifacts.push("/saved-result".into());
+                    error.details =
+                        Some(json!({"exception":{"value":{"artifacts":["/user-data-only"]}}}));
                 }
                 response
             };

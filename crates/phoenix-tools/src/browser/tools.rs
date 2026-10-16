@@ -10,7 +10,7 @@ use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::js_protocol::runtime::{
-    EvaluateParams, RemoteObjectSubtype, RemoteObjectType,
+    EvaluateParams, ExceptionDetails, RemoteObjectSubtype, RemoteObjectType,
 };
 use chromiumoxide::page::ScreenshotParams;
 use phoenix_browser::snapshot::BrowserTarget;
@@ -297,6 +297,113 @@ async fn save_evaluation_output(
     Ok(SavedEvaluationArtifact(path))
 }
 
+/// An evaluation failure retaining the browser's exception context until rendering.
+#[derive(Debug)]
+pub enum BrowserEvaluationError {
+    Javascript(Box<ExceptionDetails>),
+    Message(String),
+}
+
+impl From<String> for BrowserEvaluationError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl std::error::Error for BrowserEvaluationError {}
+
+fn concise_line(text: &str, max_bytes: usize) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    phoenix_browser::truncate_unicode_safe(line, max_bytes)
+}
+
+fn exception_description(description: &str) -> String {
+    description
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with("at "))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl std::fmt::Display for BrowserEvaluationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let details = match self {
+            Self::Javascript(details) => details,
+            Self::Message(message) => return formatter.write_str(message),
+        };
+        let message = details.exception.as_ref().map_or_else(
+            || details.text.clone(),
+            |object| {
+                if let Some(value) = &object.unserializable_value {
+                    return value.inner().clone();
+                }
+                if object.subtype == Some(RemoteObjectSubtype::Null) {
+                    return "null".into();
+                }
+                if let (Some(RemoteObjectSubtype::Error), Some(description)) =
+                    (&object.subtype, &object.description)
+                {
+                    return exception_description(description);
+                }
+                if let Some(value) = &object.value {
+                    return value.to_string();
+                }
+                if object.r#type == RemoteObjectType::Undefined {
+                    return "undefined".into();
+                }
+                object.description.as_ref().map_or_else(
+                    || details.text.clone(),
+                    |description| exception_description(description),
+                )
+            },
+        );
+        let frame = details
+            .stack_trace
+            .as_ref()
+            .and_then(|trace| trace.call_frames.first());
+        let url = frame
+            .map(|frame| frame.url.as_str())
+            .filter(|url| !url.is_empty())
+            .or(details.url.as_deref().filter(|url| !url.is_empty()))
+            .unwrap_or("<eval>");
+        let line = frame.map_or(details.line_number, |frame| frame.line_number);
+        let column = frame.map_or(details.column_number, |frame| frame.column_number);
+        let location = concise_line(url, 120);
+        let location = if line >= 0 && column >= 0 {
+            format!(
+                "{location}:{}:{}",
+                line.saturating_add(1),
+                column.saturating_add(1)
+            )
+        } else {
+            location
+        };
+        write!(
+            formatter,
+            "JavaScript error: {} ({location})",
+            concise_line(&message, 300)
+        )
+    }
+}
+
+impl BrowserEvaluationError {
+    #[must_use]
+    pub fn exception(&self) -> Option<&ExceptionDetails> {
+        match self {
+            Self::Javascript(details) => Some(details),
+            Self::Message(_) => None,
+        }
+    }
+
+    fn into_tool_output(self) -> ToolOutput {
+        let output = ToolOutput::error(self.to_string());
+        match self {
+            Self::Javascript(details) => output.with_display(json!(details)),
+            Self::Message(_) => output,
+        }
+    }
+}
+
 impl BrowserEvalTool {
     pub(super) async fn run_browser(
         input: Value,
@@ -304,7 +411,7 @@ impl BrowserEvalTool {
     ) -> ToolOutput {
         match Self::evaluate(input, access).await {
             Ok(value) => value.into_tool_output(),
-            Err(error) => ToolOutput::error(error),
+            Err(error) => error.into_tool_output(),
         }
     }
 
@@ -315,7 +422,7 @@ impl BrowserEvalTool {
     pub async fn evaluate(
         input: Value,
         access: &(impl super::BrowserAccess + ?Sized),
-    ) -> Result<BrowserEvaluation, String> {
+    ) -> Result<BrowserEvaluation, BrowserEvaluationError> {
         let input: EvalInput =
             serde_json::from_value(input).map_err(|error| format!("Invalid input: {error}"))?;
         let timeout = input
@@ -340,7 +447,13 @@ impl BrowserEvalTool {
             guard.page.evaluate(params),
         )
         .await?
-        .map_err(|error| format!("JavaScript error: {error}"))?;
+        .map_err(|error| {
+            if let chromiumoxide::error::CdpError::JavascriptException(details) = error {
+                BrowserEvaluationError::Javascript(details)
+            } else {
+                BrowserEvaluationError::Message(format!("JavaScript error: {error}"))
+            }
+        })?;
         let object = result.object();
         if object.r#type == RemoteObjectType::Function {
             return Err(format!(
@@ -351,7 +464,8 @@ impl BrowserEvalTool {
                  (e.g. `(() => typeof window.__phoenix)()`). \
                  Playwright-style `() => expr` syntax does not work with browser_eval.",
                 input.expression
-            ));
+            )
+            .into());
         }
         if let Some(value) = &object.unserializable_value {
             let text = value.inner().clone();
@@ -382,7 +496,8 @@ impl BrowserEvalTool {
         Err(format!(
             "JavaScript result cannot be represented as JSON: {:?}",
             object.r#type
-        ))
+        )
+        .into())
     }
 }
 
@@ -1703,6 +1818,49 @@ async fn dispatch_key_cdp(
 #[cfg(test)]
 mod phase_tests {
     use super::*;
+
+    #[test]
+    fn evaluation_errors_are_concise_and_keep_full_browser_context() {
+        let details: ExceptionDetails = serde_json::from_value(json!({
+            "exceptionId":1,"text":"Uncaught","lineNumber":0,"columnNumber":6,
+            "exception":{"type":"object","subtype":"error","className":"TypeError","value":{},"description":"TypeError: first line\nsecond line\n    at fail (http://example.test/app.js:5:9)"},
+            "stackTrace":{"callFrames":[{"functionName":"fail","scriptId":"1","url":"http://example.test/app.js","lineNumber":4,"columnNumber":8}]}
+        })).unwrap();
+        let error = BrowserEvaluationError::Javascript(Box::new(details.clone()));
+        assert_eq!(
+            error.to_string(),
+            "JavaScript error: TypeError: first line second line (http://example.test/app.js:5:9)"
+        );
+        let output = error.into_tool_output();
+        assert_eq!(output.display_data(), Some(&json!(details)));
+        assert!(!output.output().contains("ExceptionDetails"));
+        let mut long = details.clone();
+        long.exception.as_mut().unwrap().description = Some(format!(
+            "Error: {}\nsecond line\n    at fail",
+            "界".repeat(1000)
+        ));
+        long.stack_trace.as_mut().unwrap().call_frames[0].url =
+            format!("data:text/javascript,{}", "界".repeat(1000));
+        let error = BrowserEvaluationError::Javascript(Box::new(long.clone()));
+        let summary = error.to_string();
+        assert!(summary.len() < 500, "{summary}");
+        assert!(summary.contains('…'));
+        assert!(!summary.contains('\n'));
+        assert_eq!(error.into_tool_output().display_data(), Some(&json!(long)));
+        let mut primitive = details;
+        primitive.stack_trace = None;
+        primitive.exception = Some(
+            serde_json::from_value(json!({"type":"object","subtype":"null","value":null})).unwrap(),
+        );
+        assert_eq!(
+            BrowserEvaluationError::Javascript(Box::new(primitive)).to_string(),
+            "JavaScript error: null (<eval>:1:7)"
+        );
+        let message =
+            BrowserEvaluationError::Message("existing transport error".into()).into_tool_output();
+        assert_eq!(message.output(), "existing transport error");
+        assert!(message.display_data().is_none());
+    }
 
     #[test]
     fn typing_deadline_rejects_unrepresentable_duration() {
