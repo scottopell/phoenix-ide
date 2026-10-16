@@ -64,13 +64,15 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
             "--socket-dir",
             dir.to_str().unwrap(),
             "--child-seconds",
-            "7",
+            "15",
             "--serve-seconds",
-            "8",
+            "16",
             "--attempt",
             "64",
             "--deadline",
             "18446744073709551615",
+            "--store",
+            path.to_str().unwrap(),
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -169,10 +171,18 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
             "--attempt",
             "64",
         ])
-        .stdout(Stdio::null())
-        .status()
+        .output()
         .unwrap();
-    assert!(runner_status.success());
+    assert!(
+        runner_status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&runner_status.stderr)
+    );
+    let output = String::from_utf8_lossy(&runner_status.stdout);
+    assert!(
+        output.contains("reconciling generation=2 interruption=2"),
+        "{output}"
+    );
     assert_eq!(
         store
             .load_native_binding(attempt)
@@ -180,7 +190,20 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
             .unwrap()
             .current_session()
             .state,
-        NativeSessionState::Detached
+        NativeSessionState::Reconciling
     );
+    let durable = store.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(durable.current_session().generation.get(), 2);
+    assert_eq!(
+        durable.dispatch_floor(),
+        store
+            .load_attempt(attempt)
+            .unwrap()
+            .unwrap()
+            .persistence_revision()
+    );
+    assert!(guardian.try_wait().unwrap().is_none());
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    assert_guardian_is_parent(pid, guardian.id());
     assert!(guardian.wait().unwrap().success());
 }

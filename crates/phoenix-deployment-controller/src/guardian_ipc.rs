@@ -14,6 +14,20 @@ use std::{
     num::NonZeroU64,
 };
 
+/// Durable evidence could not be read or validated from the pinned store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEvidenceReadError;
+
+/// Trusted, pinned read-only store view; wire revisions are never proof.
+pub trait NativeEvidenceReader: Send {
+    /// # Errors
+    /// Returns an error when the pinned store cannot establish strict typed evidence.
+    fn read(
+        &mut self,
+        attempt: crate::AttemptId,
+    ) -> Result<Option<(crate::LoadedAttempt, crate::NativeGuardianBinding)>, NativeEvidenceReadError>;
+}
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
@@ -600,6 +614,7 @@ pub struct GuardianServer<E: GuardianExecutor> {
     next_admission: u64,
     native_unbound: bool,
     native_identity: Option<crate::NativeGuardianIdentity>,
+    native_reader: Option<Box<dyn NativeEvidenceReader>>,
 }
 impl<E: GuardianExecutor> GuardianServer<E> {
     /// Construct a server bound to an authenticated policy session.
@@ -625,6 +640,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             next_admission: 1,
             native_unbound: false,
             native_identity: None,
+            native_reader: None,
         })
     }
     /// Disable native mutation until durable policy binding can stage affine proof.
@@ -638,6 +654,11 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     pub fn stage_native_identity(&mut self, identity: crate::NativeGuardianIdentity) {
         self.native_identity = Some(identity);
         self.require_native_binding();
+    }
+
+    /// Pins the trusted native evidence reader for this guardian lifetime.
+    pub fn stage_native_reader(&mut self, reader: Box<dyn NativeEvidenceReader>) {
+        self.native_reader = Some(reader);
     }
 
     /// Returns the live guardian without exposing mutable custody.
@@ -781,6 +802,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ObserveSlot { .. }
                     | Request::ObserveRetained { .. }
                     | Request::Fence { .. }
+                    | Request::BeginReconciliation { .. }
             )
         {
             return Response::Refused(WireError::UnsupportedDurableBinding);
@@ -799,6 +821,68 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         Ok({
             if instance != self.guardian.instance_id().get() {
                 return Err(GuardianError::InstanceMismatch.into());
+            }
+            if self.native_unbound {
+                if self.native_reader.is_none() {
+                    return Err(WireError::UnsupportedDurableBinding);
+                }
+                let revision = revision(interruption_revision)?;
+                let live = self.snapshot();
+                let wire = live
+                    .native_binding
+                    .as_ref()
+                    .ok_or(WireError::MissingProof)?;
+                let reader = self
+                    .native_reader
+                    .as_mut()
+                    .ok_or(WireError::UnsupportedDurableBinding)?;
+                let (checkpoint, binding) = reader
+                    .read(self.guardian.attempt_id())
+                    .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+                    .ok_or(WireError::MissingProof)?;
+                let next = self
+                    .session
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(WireError::InvalidValue)?;
+                let current = binding.current_session();
+                if checkpoint.phase() != crate::Phase::Interrupted
+                    || checkpoint.persistence_revision() != revision
+                    || binding.attempt_id() != self.guardian.attempt_id()
+                    || binding.identity().nonce.bytes() != wire.nonce
+                    || WireIdentity::from(binding.identity().process) != wire.guardian
+                    || binding.deadline().get() != self.guardian.original_deadline().get()
+                    || wire.deadline != binding.deadline().get()
+                    || wire.attempt != self.guardian.attempt_id().get()
+                    || binding.dispatch_floor() != revision
+                    || current.generation.get() != next
+                    || current.state != crate::NativeSessionState::Reconciling
+                    || current.interruption_revision != revision
+                    || live.state != WireState::DetachedFenced
+                    || inventory != live.slots
+                    || binding.slots().len() != wire.slots.len()
+                    || binding
+                        .slots()
+                        .iter()
+                        .zip(&wire.slots)
+                        .any(|(stored, live)| WireIdentity::from(stored.process) != live.identity)
+                {
+                    return Err(WireError::MissingProof);
+                }
+                #[cfg(unix)]
+                {
+                    let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
+                    // SAFETY: clock_gettime initializes the timespec on success.
+                    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, now.as_mut_ptr()) } != 0
+                    {
+                        return Err(WireError::MissingProof);
+                    }
+                    let now = unsafe { now.assume_init() };
+                    if u64::try_from(now.tv_sec).map_or(true, |seconds| seconds >= wire.deadline) {
+                        return Err(WireError::MissingProof);
+                    }
+                }
+                self.interruption = Some(revision);
             }
             let slots = inventory
                 .into_iter()
@@ -1566,5 +1650,212 @@ mod tests {
             Response::Refused(WireError::MissingProof)
         );
         assert_eq!(calls.get(), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod native_evidence_tests {
+    use super::*;
+    use crate::{
+        AttemptId, BirthToken, ControllerSqliteStore, CpuContentionBasisPoints, DeploymentAttempt,
+        GuardianLifetimeNonce, MemoryPressure, NativeGuardianBinding, NativeGuardianIdentity,
+        NativeSessionState, Phase, ResourcePolicy,
+    };
+    use std::{
+        collections::BTreeMap,
+        num::{NonZeroU32, NonZeroUsize},
+    };
+
+    struct Observer;
+    impl GuardianExecutor for Observer {
+        type ChildSlot = ProcessIdentity;
+        fn execute(
+            &mut self,
+            _: DispatchTicket,
+            _: &mut BTreeMap<crate::ChildSlotId, Self::ChildSlot>,
+        ) -> ExecutedEffect {
+            panic!("read-only guardian")
+        }
+        fn poll_observation_only(&self, _: &Self::ChildSlot) -> ChildSlotObservation {
+            ChildSlotObservation::Running
+        }
+        fn diagnostic_slot_identity(&self, slot: &Self::ChildSlot) -> Option<ProcessIdentity> {
+            Some(*slot)
+        }
+    }
+    struct Reader(Option<(crate::LoadedAttempt, NativeGuardianBinding)>);
+    impl NativeEvidenceReader for Reader {
+        fn read(
+            &mut self,
+            _: AttemptId,
+        ) -> Result<Option<(crate::LoadedAttempt, NativeGuardianBinding)>, NativeEvidenceReadError>
+        {
+            Ok(self.0.take())
+        }
+    }
+    fn identity(pid: u32) -> ProcessIdentity {
+        ProcessIdentity::new(
+            ProcessId::new(NonZeroU32::new(pid).unwrap()),
+            BirthToken::new(1, 0).unwrap(),
+        )
+    }
+    fn fixture() -> (
+        GuardianServer<Observer>,
+        crate::LoadedAttempt,
+        NativeGuardianBinding,
+        Request,
+    ) {
+        fixture_with_deadline(u64::MAX)
+    }
+    fn fixture_with_deadline(
+        tick: u64,
+    ) -> (
+        GuardianServer<Observer>,
+        crate::LoadedAttempt,
+        NativeGuardianBinding,
+        Request,
+    ) {
+        let attempt = AttemptId::new(918);
+        let deadline = MonotonicTick::new(tick);
+        let mut store = ControllerSqliteStore::in_memory().unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(0).unwrap(),
+            MemoryPressure::Critical,
+        );
+        DeploymentAttempt::start(attempt, deadline, policy, identity(41))
+            .persist(&mut store)
+            .unwrap();
+        let (guardian, session) = Guardian::new(
+            attempt,
+            deadline,
+            Observer,
+            vec![identity(42), identity(44)],
+        )
+        .unwrap();
+        let mut server = GuardianServer::new(guardian, session).unwrap();
+        server.stage_native_identity(NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([8; 16]).unwrap(),
+            process: identity(43),
+        });
+        let Response::Hello { snapshot } = server.handle(Request::Hello) else {
+            panic!("hello")
+        };
+        crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
+        server.fence_connection();
+        let Response::Hello { snapshot } = server.handle(Request::Hello) else {
+            panic!("detached")
+        };
+        crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
+        let active = store.load_attempt(attempt).unwrap().unwrap();
+        let checkpoint = active.prepare_recovery().unwrap();
+        let crate::RecoveryDisposition::Checkpoint(transition) = checkpoint else {
+            panic!("checkpoint")
+        };
+        let committed = (*transition).persist(&mut store).unwrap();
+        assert_eq!(committed.checkpoint().phase(), Phase::Interrupted);
+        let revision = committed.checkpoint().persistence_revision().unwrap();
+        let old = store.load_native_binding(attempt).unwrap().unwrap();
+        let binding = store
+            .commit_fresh_interruption_binding(&old, revision)
+            .unwrap();
+        let loaded = store.load_attempt(attempt).unwrap().unwrap();
+        let request = Request::BeginReconciliation {
+            instance: snapshot.instance,
+            inventory: snapshot.slots,
+            interruption_revision: revision.get(),
+        };
+        (server, loaded, binding, request)
+    }
+    fn checked(
+        mut server: GuardianServer<Observer>,
+        loaded: crate::LoadedAttempt,
+        binding: NativeGuardianBinding,
+        request: Request,
+    ) -> Response {
+        server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
+        server.handle(request)
+    }
+    #[test]
+    fn native_begin_requires_exact_durable_checkpoint_and_full_binding() {
+        let (mut server, _, _, request) = fixture();
+        assert_eq!(
+            server.handle(request),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        let (server, loaded, binding, request) = fixture();
+        assert!(matches!(
+            checked(server, loaded, binding, request),
+            Response::ReconciliationBegun {
+                session: WireSession { generation: 2, .. }
+            }
+        ));
+        for change in 0..12 {
+            let (server, loaded, mut binding, mut request) = fixture();
+            match change {
+                0 => binding.identity.nonce = GuardianLifetimeNonce::new([9; 16]).unwrap(),
+                1 => binding.identity.process = identity(99),
+                2 => binding.deadline = MonotonicTick::new(500),
+                3 => binding.slots[0].process = identity(99),
+                4 => binding.slots.clear(),
+                5 => binding.sessions.last_mut().unwrap().state = NativeSessionState::Detached,
+                6 => binding.sessions.last_mut().unwrap().generation = NonZeroU64::new(3).unwrap(),
+                7 => binding.dispatch_floor = PersistenceRevision::first(),
+                8 => {
+                    if let Request::BeginReconciliation {
+                        interruption_revision,
+                        ..
+                    } = &mut request
+                    {
+                        *interruption_revision += 1;
+                    }
+                }
+                9 => {
+                    binding.sessions.last_mut().unwrap().interruption_revision =
+                        PersistenceRevision::first();
+                }
+                10 => {
+                    if let Request::BeginReconciliation { inventory, .. } = &mut request {
+                        inventory.clear();
+                    }
+                }
+                11 => binding.slots.swap(0, 1),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                checked(server, loaded, binding, request),
+                Response::Refused(WireError::MissingProof),
+                "case {change}"
+            );
+        }
+        let (server, _, binding, request) = fixture();
+        let mut other = ControllerSqliteStore::in_memory().unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(0).unwrap(),
+            MemoryPressure::Critical,
+        );
+        DeploymentAttempt::start(
+            AttemptId::new(918),
+            MonotonicTick::new(u64::MAX),
+            policy,
+            identity(41),
+        )
+        .persist(&mut other)
+        .unwrap();
+        let active = other.load_attempt(AttemptId::new(918)).unwrap().unwrap();
+        assert_eq!(
+            checked(server, active, binding, request),
+            Response::Refused(WireError::MissingProof)
+        );
+        let (server, loaded, binding, request) = fixture_with_deadline(1);
+        assert_eq!(
+            checked(server, loaded, binding, request),
+            Response::Refused(WireError::MissingProof)
+        );
     }
 }

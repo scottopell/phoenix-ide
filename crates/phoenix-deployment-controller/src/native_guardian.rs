@@ -1,7 +1,7 @@
 //! Disposable same-UID Unix transport; durable diagnostic binding has no policy mutation authority.
 use crate::guardian_ipc::{
-    read_frame, write_frame, CodecError, GuardianServer, Request, Response, WireError,
-    WireObservation, WireSlot, WireSnapshot,
+    read_frame, write_frame, CodecError, GuardianServer, NativeEvidenceReadError, Request,
+    Response, WireError, WireObservation, WireSlot, WireSnapshot,
 };
 use crate::GuardianExecutor;
 use std::{
@@ -15,6 +15,37 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+/// Pinned read-only schema-v2 reader; it cannot commit controller transitions.
+pub struct SqliteNativeEvidenceReader {
+    attempt: crate::AttemptId,
+    store: crate::ControllerSqliteStore,
+}
+impl SqliteNativeEvidenceReader {
+    /// # Errors
+    /// Rejects missing or incompatible stores.
+    pub fn open(
+        path: &Path,
+        attempt: crate::AttemptId,
+    ) -> Result<Self, crate::ControllerStoreError> {
+        let store = crate::ControllerSqliteStore::open_read_only(path)?;
+        Ok(Self { attempt, store })
+    }
+}
+impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
+    fn read(
+        &mut self,
+        attempt: crate::AttemptId,
+    ) -> Result<Option<(crate::LoadedAttempt, crate::NativeGuardianBinding)>, NativeEvidenceReadError>
+    {
+        if attempt != self.attempt {
+            return Err(NativeEvidenceReadError);
+        }
+        self.store
+            .read_native_evidence(attempt)
+            .map_err(|_| NativeEvidenceReadError)
+    }
+}
 
 const SOCKET_NAME: &str = "guardian.sock";
 const IO_SLICE: Duration = Duration::from_millis(250);
@@ -310,7 +341,7 @@ impl From<CodecError> for ClientError {
 
 /// Typed observation client. No client method can mint a policy proof.
 pub struct GuardianClient {
-    stream: UnixStream,
+    stream: Option<UnixStream>,
 }
 impl GuardianClient {
     /// # Errors
@@ -319,15 +350,27 @@ impl GuardianClient {
         let stream = UnixStream::connect(socket_path(dir)?)?;
         same_uid(&stream)?;
         stream.set_nonblocking(true)?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream: Some(stream),
+        })
     }
     fn exchange(&mut self, request: &Request) -> Result<Response, ClientError> {
-        let mut frame = DeadlineStream {
-            stream: &mut self.stream,
-            deadline: Instant::now() + IO_SLICE,
-        };
-        write_frame(&mut frame, request)?;
-        match read_frame(&mut frame)? {
+        let result = (|| {
+            let mut frame = DeadlineStream {
+                stream: self
+                    .stream
+                    .as_mut()
+                    .ok_or(ClientError::UnexpectedResponse)?,
+                deadline: Instant::now() + IO_SLICE,
+            };
+            write_frame(&mut frame, request)?;
+            let response = read_frame(&mut frame)?;
+            Ok::<Response, ClientError>(response)
+        })();
+        if result.is_err() {
+            self.stream.take();
+        }
+        match result? {
             Response::Refused(error) => Err(ClientError::Refused(error)),
             response @ (Response::Hello { .. }
             | Response::Snapshot(_)
@@ -419,13 +462,52 @@ impl GuardianClient {
             | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
     }
-    /// Native reconciliation needs a committed interruption and exact durable
-    /// inventory/identity binding. This transport-only runner has neither.
-    ///
     /// # Errors
-    /// Always refuses reconciliation without durable binding.
-    pub fn reconcile(&self) -> Result<(), ClientError> {
-        Err(ClientError::Refused(WireError::UnsupportedDurableBinding))
+    /// Refuses stale sessions or transport failure.
+    pub fn fence(&mut self, session: crate::guardian_ipc::WireSession) -> Result<(), ClientError> {
+        match self.exchange(&Request::Fence { session })? {
+            Response::Fenced => Ok(()),
+            Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::ReconciliationBegun { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// # Errors
+    /// Refuses missing durable evidence or transport failure.
+    pub fn begin_reconciliation(
+        &mut self,
+        snapshot: &WireSnapshot,
+        revision: crate::PersistenceRevision,
+    ) -> Result<crate::guardian_ipc::WireSession, ClientError> {
+        match self.exchange(&Request::BeginReconciliation {
+            instance: snapshot.instance,
+            inventory: snapshot.slots.clone(),
+            interruption_revision: revision.get(),
+        })? {
+            Response::ReconciliationBegun { session } => Ok(session),
+            Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
+        }
     }
 }
 
@@ -434,6 +516,7 @@ impl GuardianClient {
 pub enum VerifiedBindingStatus {
     InitialActive,
     Detached,
+    PendingBegin,
 }
 
 /// Compare all durable continuity evidence before recording a detached session.
@@ -450,10 +533,7 @@ pub fn verify_native_binding(
         NativeSlotLiveness,
     };
     let reject = || "native binding mismatch".to_owned();
-    if snapshot.attempt != attempt.get()
-        || snapshot.session.instance != snapshot.instance
-        || snapshot.session.generation != 1
-    {
+    if snapshot.attempt != attempt.get() || snapshot.session.instance != snapshot.instance {
         return Err(reject());
     }
     let wire = snapshot.native_binding.as_ref().ok_or_else(reject)?;
@@ -492,7 +572,7 @@ pub fn verify_native_binding(
         .load_native_binding(attempt)
         .map_err(|e| e.to_string())?
     {
-        None if snapshot.state == WireState::Active => {
+        None if snapshot.state == WireState::Active && snapshot.session.generation == 1 => {
             store
                 .commit_initial_binding(
                     attempt,
@@ -505,7 +585,13 @@ pub fn verify_native_binding(
             Ok(VerifiedBindingStatus::InitialActive)
         }
         Some(binding) => {
-            if binding.identity() != identity
+            let stored_generation = binding.current_session().generation.get();
+            let live_generation = snapshot.session.generation;
+            if !(stored_generation == live_generation
+                || (snapshot.state == WireState::DetachedFenced
+                    && binding.current_session().state == NativeSessionState::Reconciling
+                    && live_generation.checked_add(1) == Some(stored_generation)))
+                || binding.identity() != identity
                 || binding.deadline().get() != snapshot.deadline
                 || binding.slots().len() != slots.len()
                 || !binding
@@ -517,6 +603,11 @@ pub fn verify_native_binding(
                 return Err(reject());
             }
             match (snapshot.state, binding.current_session().state) {
+                (WireState::DetachedFenced, NativeSessionState::Reconciling)
+                    if live_generation.checked_add(1) == Some(stored_generation) =>
+                {
+                    Ok(VerifiedBindingStatus::PendingBegin)
+                }
                 (
                     WireState::DetachedFenced,
                     NativeSessionState::Active | NativeSessionState::Reconciling,
@@ -547,6 +638,7 @@ pub fn run_disposable_guardian(
     serve_seconds: u64,
     attempt: crate::AttemptId,
     deadline: crate::MonotonicTick,
+    store_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
         Guardian, GuardianLifetimeNonce, MacOsControllerOs, MacOsGuardianExecutor,
@@ -556,6 +648,7 @@ pub fn run_disposable_guardian(
     if !(1..=120).contains(&child_seconds) || !(1..=120).contains(&serve_seconds) {
         return Err(Box::new(permission_denied()));
     }
+    let reader = SqliteNativeEvidenceReader::open(store_path, attempt)?;
     let mut nonce_bytes = [0; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
     let native_identity = NativeGuardianIdentity {
@@ -583,6 +676,7 @@ pub fn run_disposable_guardian(
     })?;
     let mut server = GuardianServer::new(guardian, session)?;
     server.stage_native_identity(native_identity);
+    server.stage_native_reader(Box::new(reader));
     println!(
         "disposable child pid={} birth={}:{}",
         identity.pid().get(),

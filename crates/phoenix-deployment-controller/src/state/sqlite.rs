@@ -130,6 +130,51 @@ impl ControllerSqliteStore {
         })
     }
 
+    /// Opens an existing schema-v2 store for guardian read-only evidence.
+    /// # Errors
+    /// Rejects missing or incompatible stores.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "query_only", true)?;
+        check_authority(&connection)?;
+        Ok(Self {
+            connection,
+            poisoned: false,
+        })
+    }
+
+    /// Reads checkpoint and binding in one consistent read transaction.
+    /// # Errors
+    /// Rejects malformed evidence and poisons the handle on failure.
+    pub fn read_native_evidence(
+        &mut self,
+        id: AttemptId,
+    ) -> Result<Option<(LoadedAttempt, NativeGuardianBinding)>> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self.connection.transaction()?;
+            check_authority(&tx)?;
+            let attempt = read_attempt(&tx, id)?;
+            let binding = read_binding(&tx, id)?;
+            tx.commit()?;
+            match (attempt, binding) {
+                (Some(checkpoint), Some(binding)) => {
+                    Ok(Some((LoadedAttempt { checkpoint }, binding)))
+                }
+                (None, None) => Ok(None),
+                _ => malformed("incomplete native evidence"),
+            }
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     /// Creates an isolated, ephemeral controller database.
     ///
     /// # Errors

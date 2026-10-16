@@ -148,3 +148,98 @@ fn generic_transport_does_not_invent_native_binding() {
     wire.native_binding = None;
     assert!(verify_native_binding(&mut store, AttemptId::new(71), &wire).is_err());
 }
+
+#[test]
+fn pending_begin_crash_refreshes_interruption_and_advances_durable_generation() {
+    let (mut store, mut wire) = fixture();
+    let attempt = AttemptId::new(71);
+    assert_eq!(
+        verify_native_binding(&mut store, attempt, &wire).unwrap(),
+        VerifiedBindingStatus::InitialActive
+    );
+    wire.state = WireState::DetachedFenced;
+    assert_eq!(
+        verify_native_binding(&mut store, attempt, &wire).unwrap(),
+        VerifiedBindingStatus::Detached
+    );
+    let loaded = store.load_attempt(attempt).unwrap().unwrap();
+    let phoenix_deployment_controller::RecoveryDisposition::Checkpoint(first) =
+        loaded.prepare_recovery().unwrap()
+    else {
+        panic!("active attempt must checkpoint interruption")
+    };
+    let first = (*first)
+        .persist(&mut store)
+        .unwrap()
+        .checkpoint()
+        .persistence_revision()
+        .unwrap();
+    let binding = store.load_native_binding(attempt).unwrap().unwrap();
+    let pending = store
+        .commit_fresh_interruption_binding(&binding, first)
+        .unwrap();
+    assert_eq!(pending.current_session().generation.get(), 2);
+    assert_eq!(
+        pending.current_session().state,
+        NativeSessionState::Reconciling
+    );
+    // The runner died after durable session commit but before the guardian Begin.
+    wire.session.generation = 1;
+    assert_eq!(
+        verify_native_binding(&mut store, attempt, &wire).unwrap(),
+        VerifiedBindingStatus::PendingBegin
+    );
+    let detached = store.commit_detached_binding(&pending).unwrap();
+    let refreshed = store
+        .load_attempt(attempt)
+        .unwrap()
+        .unwrap()
+        .refresh_interruption()
+        .unwrap();
+    let newer = refreshed
+        .persist(&mut store)
+        .unwrap()
+        .checkpoint()
+        .persistence_revision()
+        .unwrap();
+    assert!(newer > first);
+    let next = store
+        .commit_fresh_interruption_binding(&detached, newer)
+        .unwrap();
+    assert_eq!(next.current_session().generation.get(), 3);
+    assert_eq!(next.current_session().interruption_revision, newer);
+    assert_eq!(next.dispatch_floor(), newer);
+    assert_eq!(next.sessions()[1].state, NativeSessionState::Detached);
+}
+
+#[test]
+fn pinned_native_reader_observes_committed_rows_only_for_selected_attempt() {
+    use phoenix_deployment_controller::{
+        guardian_ipc::NativeEvidenceReader, native_guardian::SqliteNativeEvidenceReader,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("controller.sqlite");
+    let mut store = ControllerSqliteStore::open(&path).unwrap();
+    let (source, wire) = fixture();
+    drop(source);
+    let policy = ResourcePolicy::new(
+        NonZeroUsize::new(2).unwrap(),
+        0,
+        0,
+        CpuContentionBasisPoints::new(0).unwrap(),
+        MemoryPressure::Critical,
+    );
+    let root = ProcessIdentity::new(
+        ProcessId::new(NonZeroU32::new(8).unwrap()),
+        BirthToken::new(10, 0).unwrap(),
+    );
+    let attempt = AttemptId::new(71);
+    DeploymentAttempt::start(attempt, MonotonicTick::new(500), policy, root)
+        .persist(&mut store)
+        .unwrap();
+    verify_native_binding(&mut store, attempt, &wire).unwrap();
+    let mut reader = SqliteNativeEvidenceReader::open(&path, attempt).unwrap();
+    assert!(reader.read(AttemptId::new(72)).is_err());
+    assert!(reader.read(attempt).unwrap().is_some());
+    assert!(SqliteNativeEvidenceReader::open(&dir.path().join("missing.sqlite"), attempt).is_err());
+}

@@ -146,14 +146,21 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
             client.observe_slot(hello.slots[0]).unwrap(),
             phoenix_deployment_controller::guardian_ipc::WireObservation::Running
         );
-        assert!(matches!(
-            client.reconcile(),
-            Err(
-                phoenix_deployment_controller::native_guardian::ClientError::Refused(
-                    WireError::UnsupportedDurableBinding
+        let begin = client.begin_reconciliation(
+            &hello,
+            phoenix_deployment_controller::PersistenceRevision::first(),
+        );
+        assert!(
+            matches!(
+                begin,
+                Err(
+                    phoenix_deployment_controller::native_guardian::ClientError::Refused(
+                        WireError::UnsupportedDurableBinding
+                    )
                 )
-            )
-        ));
+            ),
+            "generic transport unexpectedly began reconciliation: {begin:?}"
+        );
         drop(client);
         exercise_protocol(&directory, hello);
     });
