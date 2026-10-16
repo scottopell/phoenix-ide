@@ -1,4 +1,4 @@
-# ADR-103: Departing-document delivery uses collector acceptance and export evidence
+# ADR-107: Departing-document delivery uses collector acceptance and export evidence
 
 - **Status:** Accepted
 - **Date:** 2026-10-16
@@ -20,7 +20,7 @@ The user selected “Collector + export proof (recommended)” with the explicit
 
 ## Decision
 
-Use option2 for actual cross-document pagehide only. Preserve nondeparting browser204 checks. Require one real authenticated collector acceptance and one exported journey for each browser-observed sampled pagehide report, matching exact identity and correlations under the candidate run/service. Collector evidence comes from the validated success path immediately before204, not proxy receipt, request start or export inference. Missing, duplicate, foreign, rejected and invalid evidence fails closed. Existing raw/index export reconciliation and normal app-first receiver-drain ownership remain mandatory.
+Use option2 for actual cross-document pagehide only. Preserve nondeparting browser204 checks. Require one real authenticated collector acceptance and one exported journey for each browser-observed sampled pagehide report, matching exact identity and browser-reported request/SSE/trace correlations with independent observed provenance under the candidate run/service. Existing correlation caps and loss counters remain intact; the oracle does not demand uncapped inclusion of every observed request. Collector evidence comes from the validated success path immediately before204, not proxy receipt, request start or export inference. Missing, duplicate, foreign, rejected and invalid evidence fails closed. Existing raw/index export reconciliation and normal app-first receiver-drain ownership remain mandatory.
 
 No producer retry, queue, sendBeacon substitution, sampling change, timeout increase or delivery guarantee follows from this decision. A browser-rejected fetch remains recorded as such even if server acceptance is independently established. Contract review precedes implementation of the changed gate and a candidate rerun.
 
