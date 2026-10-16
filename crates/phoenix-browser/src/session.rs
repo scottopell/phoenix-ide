@@ -311,6 +311,7 @@ pub enum SessionInitPhase {
     Launch,
     FirstPage,
     ReactHelper,
+    ReferenceInputGuard,
     ConsoleListener,
     ProfilingListener,
 }
@@ -321,6 +322,7 @@ impl std::fmt::Display for SessionInitPhase {
             Self::Launch => "browser launch",
             Self::FirstPage => "first page creation",
             Self::ReactHelper => "React helper installation",
+            Self::ReferenceInputGuard => "reference input guard installation",
             Self::ConsoleListener => "console listener setup",
             Self::ProfilingListener => "profiling listener setup",
         })
@@ -617,6 +619,8 @@ impl BrowserLaunchIdentity {
 /// Per-conversation browser instance
 pub struct BrowserSession {
     pub(crate) snapshot: Option<crate::snapshot::SnapshotReferences>,
+    pub(crate) reference_guard_available: bool,
+    pub(crate) reference_input_lock: Arc<tokio::sync::Mutex<()>>,
     #[allow(dead_code)] // Browser must stay alive
     browser: Browser,
     chrome_pid: Option<u32>,
@@ -842,6 +846,32 @@ impl BrowserSession {
         }
     }
 
+    async fn install_reference_guard(page: &Page) -> bool {
+        match init_phase(
+            SessionInitPhase::ReferenceInputGuard,
+            SESSION_INIT_TIMEOUT,
+            async {
+                page.execute(chromiumoxide::cdp::js_protocol::runtime::AddBindingParams::new(crate::snapshot::INPUT_RECEIPT_BINDING)).await.map_err(|failure| failure.to_string())?;
+                page.execute(chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(
+                    crate::snapshot::INPUT_GUARD_SCRIPT,
+                )).await.map_err(|failure| failure.to_string())?;
+                let result = page.evaluate(crate::snapshot::INPUT_GUARD_SCRIPT).await.map_err(|failure| failure.to_string())?;
+                result.into_value::<bool>().map_err(|failure| failure.to_string())
+            },
+        ).await {
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => false,
+            Ok(Err(failure)) => {
+                tracing::warn!(%failure, "reference input guard unavailable; native reference interactions disabled");
+                false
+            }
+            Err(failure) => {
+                tracing::warn!(%failure, "reference input guard installation timed out; native reference interactions disabled");
+                false
+            }
+        }
+    }
+
     /// Launch browser and create a session
     async fn launch_and_init(
         tmp_root: &Path,
@@ -935,6 +965,8 @@ impl BrowserSession {
             Err(error) => tracing::warn!(%error, "Auto-inject React helper timed out"),
         }
 
+        let reference_guard_available = Self::install_reference_guard(&page).await;
+
         Ok(Self {
             browser,
             chrome_pid,
@@ -944,6 +976,8 @@ impl BrowserSession {
             console_task: None,
             profiling_tasks: Vec::new(),
             snapshot: None,
+            reference_guard_available,
+            reference_input_lock: Arc::new(tokio::sync::Mutex::new(())),
             page,
             profiling: Arc::new(StdMutex::new(ProfilingState::default())),
             trace_complete: Arc::new(tokio::sync::Notify::new()),

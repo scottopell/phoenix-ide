@@ -14,13 +14,17 @@ use chromiumoxide::cdp::browser_protocol::{
     },
 };
 use chromiumoxide::cdp::js_protocol::runtime::{
-    CallFunctionOnParams, ReleaseObjectParams, RemoteObjectId,
+    CallFunctionOnParams, EventBindingCalled, ReleaseObjectParams, RemoteObjectId,
 };
 use chromiumoxide::{layout::Point, Page};
+use futures::StreamExt;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::{BrowserError, BrowserSession};
+
+pub(crate) const INPUT_RECEIPT_BINDING: &str = "__phoenixReferenceInputReceipt";
+pub(crate) const INPUT_GUARD_SCRIPT: &str = include_str!("snapshot/input_guard.js");
 
 const MAX_NODES: usize = 2_000;
 const MAX_BYTES: usize = 256 * 1024;
@@ -119,8 +123,12 @@ fn ax_value(value: Option<&AxValue>) -> String {
 }
 
 fn interactive(node: &AxNode) -> bool {
+    let role = ax_value(node.role.as_ref());
+    if matches!(role.as_str(), "RootWebArea" | "WebArea") {
+        return false;
+    }
     matches!(
-        ax_value(node.role.as_ref()).as_str(),
+        role.as_str(),
         "button"
             | "link"
             | "textbox"
@@ -327,8 +335,15 @@ impl BrowserSession {
     /// # Errors
     /// Returns an error for stale, detached, obscured or moving targets, or failed CDP input.
     pub async fn click_reference(&self, reference: &str) -> Result<(), BrowserError> {
+        if !self.reference_guard_available {
+            return Err(error(
+                "Reference input guard unavailable; restart the browser before using element refs",
+            ));
+        }
         let object = self.reference_object(reference).await?;
-        click_object(&self.page, &object.id).await
+        let mut guard = click_object(&self.page, &object.id, &self.reference_input_lock).await?;
+        guard.disarm().await;
+        Ok(())
     }
 
     /// # Errors
@@ -339,9 +354,15 @@ impl BrowserSession {
         text: &str,
         clear: bool,
     ) -> Result<(), BrowserError> {
+        if !self.reference_guard_available {
+            return Err(error(
+                "Reference input guard unavailable; restart the browser before using element refs",
+            ));
+        }
         let object = self.reference_object(reference).await?;
+        let mut input_guard =
+            click_object(&self.page, &object.id, &self.reference_input_lock).await?;
         async {
-            click_object(&self.page, &object.id).await?;
             call(&self.page, &object.id, include_str!("snapshot/focused.js")).await?;
             if clear {
                 call(&self.page, &object.id, "function() { if (!this.isConnected) throw Error('stale ref'); if (typeof this.select !== 'function') throw Error('clear requires a text input or textarea'); this.select(); return true; }").await?;
@@ -353,7 +374,7 @@ impl BrowserSession {
                 let key = if character == '\n' { "Enter".to_string() } else { character.to_string() };
                 press(&self.page, &key).await?;
             }
-            Ok(())
+            input_guard.finish_typing().await
         }.await
     }
 }
@@ -395,7 +416,14 @@ async fn call(page: &Page, object: &RemoteObjectId, function: &str) -> Result<Va
     Ok(response.result.result.value.unwrap_or(Value::Null))
 }
 
-async fn click_object(page: &Page, object: &RemoteObjectId) -> Result<(), BrowserError> {
+async fn click_object(
+    page: &Page,
+    object: &RemoteObjectId,
+    input_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+) -> Result<ReferenceInputGuard, BrowserError> {
+    let lease = input_lock.clone().lock_owned().await;
+    let mut input_guard = ReferenceInputGuard::new(page, lease);
+    let mut receipts = page.event_listener::<EventBindingCalled>().await?;
     call(page, object, "function() { if (!this.isConnected || this.ownerDocument !== document) throw Error('stale ref'); this.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); return true; }").await?;
     let point = call(page, object, include_str!("snapshot/click.js")).await?;
     let x = point["x"]
@@ -417,6 +445,16 @@ async fn click_object(page: &Page, object: &RemoteObjectId) -> Result<(), Browse
             "Referenced element moved during hover; call browser_snapshot again",
         ));
     }
+    input_guard.active = true;
+    call(
+        page,
+        object,
+        &format!(
+            "function() {{ globalThis.__phoenixReferenceInputGuard.arm(this, {}); return true; }}",
+            quoted(&input_guard.token)
+        ),
+    )
+    .await?;
     for event in [
         DispatchMouseEventType::MousePressed,
         DispatchMouseEventType::MouseReleased,
@@ -426,7 +464,95 @@ async fn click_object(page: &Page, object: &RemoteObjectId) -> Result<(), Browse
         params.click_count = Some(1);
         page.execute(params).await?;
     }
-    Ok(())
+    while let Some(receipt) = receipts.next().await {
+        if receipt.name != INPUT_RECEIPT_BINDING {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(&receipt.payload).map_err(|failure| error(failure.to_string()))?;
+        if payload["token"] != input_guard.token {
+            continue;
+        }
+        match payload["outcome"].as_str() {
+            Some("clicked") => return Ok(input_guard),
+            Some("rejected") => return Err(error("Reference input rejected at dispatch because the target changed; earlier input events may have occurred. Inspect the page and call browser_snapshot again")),
+            _ => return Err(error("Unrecognized reference input receipt")),
+        }
+    }
+    Err(error("Reference input receipt unavailable; the action may have occurred. Inspect the page before retrying"))
+}
+
+struct ReferenceInputGuard {
+    page: Page,
+    token: String,
+    active: bool,
+    lease: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ReferenceInputGuard {
+    fn new(page: &Page, lease: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self {
+            page: page.clone(),
+            token: uuid::Uuid::new_v4().to_string(),
+            active: false,
+            lease: Some(lease),
+        }
+    }
+
+    async fn disarm(&mut self) {
+        if let Err(failure) = self
+            .page
+            .evaluate(format!(
+                "globalThis.__phoenixReferenceInputGuard?.cancel({})",
+                quoted(&self.token)
+            ))
+            .await
+        {
+            tracing::debug!(%failure, "reference input context unavailable during cleanup");
+        }
+        self.active = false;
+        self.lease.take();
+    }
+
+    async fn finish_typing(&mut self) -> Result<(), BrowserError> {
+        let result = self
+            .page
+            .evaluate(format!(
+                "globalThis.__phoenixReferenceInputGuard.finish({})",
+                quoted(&self.token)
+            ))
+            .await?
+            .into_value::<Value>()
+            .map_err(|failure| error(failure.to_string()))?;
+        self.active = false;
+        self.lease.take();
+        if result["rejected"] == true {
+            return Err(error("Reference input rejected at dispatch because the target changed; text may have been partially entered. Inspect the page and call browser_snapshot again"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReferenceInputGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let page = self.page.clone();
+        let token = quoted(&self.token);
+        let lease = self.lease.take();
+        tokio::spawn(async move {
+            if let Err(failure) = page
+                .evaluate(format!(
+                    "globalThis.__phoenixReferenceInputGuard?.cancel({token})"
+                ))
+                .await
+            {
+                tracing::debug!(%failure, "could not disarm reference input guard");
+            }
+            drop(lease);
+        });
+    }
 }
 
 async fn press(page: &Page, key: &str) -> Result<(), BrowserError> {
@@ -510,6 +636,165 @@ mod tests {
         drop(references);
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_reference_guard_rejects_replacement_at_the_input_boundary() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("snapshot-event-guard-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        {
+            let mut session = session.write().await;
+            assert!(session.reference_guard_available);
+            session
+                .page
+                .goto("data:text/html,<html><body></body></html>")
+                .await
+                .unwrap();
+            for replace_after_mousedown in [false, true] {
+                session.page.evaluate(format!(r#"(() => {{
+                    document.body.innerHTML = '<button id="original" style="position:fixed;left:20px;top:20px;width:100px;height:40px">Original</button>';
+                    window.wrongClick = 0; window.originalDown = 0;
+                    const original = document.getElementById('original');
+                    function replace() {{
+                        original.outerHTML = '<button style="position:fixed;left:20px;top:20px;width:100px;height:40px" onclick="window.wrongClick++">Replacement</button>';
+                    }}
+                    original.onmousedown = () => {{ window.originalDown++; if ({replace_after_mousedown}) replace(); }};
+                    globalThis.__phoenixReferenceInputGuard.arm(original, 'test-token');
+                    if (!{replace_after_mousedown}) replace();
+                }})()"#)).await.unwrap();
+                for event in [
+                    DispatchMouseEventType::MousePressed,
+                    DispatchMouseEventType::MouseReleased,
+                ] {
+                    let mut params = DispatchMouseEventParams::new(event, 50.0, 40.0);
+                    params.button = Some(MouseButton::Left);
+                    params.click_count = Some(1);
+                    session.page.execute(params).await.unwrap();
+                }
+                let result = session.page.evaluate("JSON.stringify({outcome:globalThis.__phoenixReferenceInputGuard.finish('test-token'), wrong:window.wrongClick, down:window.originalDown})").await.unwrap().into_value::<String>().unwrap();
+                let result: Value = serde_json::from_str(&result).unwrap();
+                assert_eq!(result["wrong"], 0, "{result}");
+                assert_eq!(
+                    result["down"],
+                    usize::from(replace_after_mousedown),
+                    "{result}"
+                );
+                assert_eq!(result["outcome"]["rejected"], true, "{result}");
+            }
+            session
+                .page
+                .evaluate("document.body.innerHTML = '<button>Current</button>'")
+                .await
+                .unwrap();
+            let snapshot = session.accessibility_snapshot(false).await.unwrap();
+            assert!(snapshot.contains("Current"));
+        }
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn native_reference_guard_preserves_navigation_and_cancellation() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("snapshot-navigation-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        {
+            let mut session = session.write().await;
+            for html in [
+                "<a href='about:blank%23native-link'>Navigate link</a>",
+                "<button onclick=\"location.href='about:blank?native-handler'\">Navigate handler</button>",
+            ] {
+                session.page.goto(format!("data:text/html,{html}")).await.unwrap();
+                let snapshot = session.accessibility_snapshot(false).await.unwrap();
+                let reference = snapshot.lines().find(|line| line.contains("Navigate")).unwrap().split('[').nth(1).unwrap().split(']').next().unwrap().to_string();
+                tokio::time::timeout(std::time::Duration::from_secs(5), session.click_reference(&reference)).await.expect("native navigation completes").expect("native navigation receipt survives document replacement");
+            }
+            session.page.goto("about:blank").await.unwrap();
+            session.page.evaluate("document.body.innerHTML = '<button onclick=window.clicks++>Current</button>'; window.clicks=0").await.unwrap();
+            let snapshot = session.accessibility_snapshot(false).await.unwrap();
+            let reference = snapshot
+                .lines()
+                .find(|line| line.contains("Current"))
+                .unwrap()
+                .split('[')
+                .nth(1)
+                .unwrap()
+                .split(']')
+                .next()
+                .unwrap()
+                .to_string();
+            let object = session.reference_object(&reference).await.unwrap();
+            let lease = session.reference_input_lock.clone().lock_owned().await;
+            let mut guard = ReferenceInputGuard::new(&session.page, lease);
+            guard.active = true;
+            call(&session.page, &object.id, &format!("function() {{ globalThis.__phoenixReferenceInputGuard.arm(this, {}); return true; }}", quoted(&guard.token))).await.unwrap();
+            drop(guard);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                session.click_reference(&reference),
+            )
+            .await
+            .expect("next operation waits for cancellation cleanup")
+            .unwrap();
+            assert_eq!(
+                session
+                    .page
+                    .evaluate("window.clicks")
+                    .await
+                    .unwrap()
+                    .into_value::<u64>()
+                    .unwrap(),
+                1
+            );
+
+            session.page.evaluate("document.body.innerHTML='<input id=original><input id=other>'; const original=document.getElementById('original'); original.focus(); globalThis.__phoenixReferenceInputGuard.arm(original,'type-token'); document.getElementById('other').focus()").await.unwrap();
+            session
+                .page
+                .execute(InsertTextParams::new("must-not-retarget"))
+                .await
+                .unwrap();
+            let result = session.page.evaluate("JSON.stringify({value:document.getElementById('other').value,outcome:globalThis.__phoenixReferenceInputGuard.finish('type-token')})").await.unwrap().into_value::<String>().unwrap();
+            let result: Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(result["value"], "");
+            assert_eq!(result["outcome"]["rejected"], true);
+        }
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[test]
+    fn snapshot_does_not_offer_document_nodes_as_interaction_targets() {
+        let mut root = node(1, "RootWebArea", "Page", &[2]);
+        root.properties = Some(
+            serde_json::from_value(json!([
+                {"name":"focusable", "value":{"type":"boolean", "value":true}}
+            ]))
+            .unwrap(),
+        );
+        let (output, refs) = render(&[root, node(2, "button", "Target", &[])], false, document());
+        assert!(!output
+            .lines()
+            .find(|line| line.contains("RootWebArea"))
+            .unwrap()
+            .contains('['));
+        assert_eq!(refs.nodes.len(), 1);
     }
 
     #[test]

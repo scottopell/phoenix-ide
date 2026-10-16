@@ -1,0 +1,157 @@
+-- allium: 3
+-- Standalone browser session lifecycle.
+-- REQ-BCLI-002 through REQ-BCLI-006 and REQ-BCLI-011.
+-- Browser operations, accessibility refs, and profiling are governed by
+-- ../browser-tool/requirements.md and its behavioural specifications.
+
+config {
+    idle_timeout: Duration = 30.minutes
+}
+
+value SessionKey {
+    kind: named | directory
+    value: String
+}
+
+entity BrowserDaemon {
+    session: SessionKey
+    daemon_id: String
+    browser_id: String?
+    status: ready | executing | stopping | stopped
+    idle_timeout: Duration
+    last_completed_at: Timestamp
+
+    transitions status {
+        ready -> executing
+        executing -> ready
+        ready -> stopping
+        executing -> stopping
+        stopping -> stopped
+        terminal: stopped
+    }
+}
+
+invariant OneOwnerPerSession {
+    for d in BrowserDaemon where d.status != stopped:
+        count(other in BrowserDaemon where other.session = d.session and other.status != stopped) = 1
+}
+
+invariant LifetimeIdentityIsUnique {
+    for d in BrowserDaemon:
+        for other in BrowserDaemon where other != d:
+            d.daemon_id != other.daemon_id
+            d.browser_id != null and other.browser_id != null implies d.browser_id != other.browser_id
+}
+
+rule OpenStartsAbsentSession {
+    when: OpenRequested(session)
+    requires: not exists BrowserDaemon{session: session, status: ready}
+    requires: not exists BrowserDaemon{session: session, status: executing}
+    requires: not exists BrowserDaemon{session: session, status: stopping}
+
+    ensures: BrowserDaemon.created(
+        session: session,
+        daemon_id: fresh_identity(),
+        browser_id: null,
+        status: ready,
+        idle_timeout: selected_idle_timeout(config.idle_timeout),
+        last_completed_at: now()
+    )
+
+    @guidance
+        -- Ownership admission spans process startup: acquire the session's
+        -- OS lock before publishing its endpoint, and hold ownership until
+        -- browser teardown and endpoint cleanup finish.
+}
+
+rule ExistingOperationStarts {
+    when: BrowserOperationAccepted(daemon)
+    requires: daemon.status = ready
+    ensures: daemon.status = executing
+}
+
+rule BrowserLaunchSucceeds {
+    when: OwnedBrowserLaunchSucceeded(daemon, browser)
+    requires: daemon.status = executing
+    requires: daemon.browser_id = null
+    ensures: daemon.browser_id = browser.fresh_identity
+    ensures: FreshTransientProfileOwned(daemon.session, browser)
+}
+
+rule BrowserLaunchFails {
+    when: OwnedBrowserLaunchFailed(daemon, error)
+    requires: daemon.status = executing
+    requires: daemon.browser_id = null
+    ensures: BrowserStartFailureReported(daemon.session, error)
+    ensures: daemon.browser_id = null
+}
+
+rule OperationCompletes {
+    when: BrowserOperationCompleted(daemon)
+    requires: daemon.status = executing
+    ensures: daemon.status = ready
+    ensures: daemon.last_completed_at = now()
+}
+
+rule MissingBrowserActionFails {
+    when: ExistingBrowserActionRequested(session)
+    requires: not exists BrowserDaemon{session: session, status: ready}
+    requires: not exists BrowserDaemon{session: session, status: executing}
+    requires: not exists BrowserDaemon{session: session, status: stopping}
+    ensures: StateLostReported(session, "Use open to start a fresh browser")
+    ensures: not BrowserDaemon.created
+}
+
+rule StatusOnAbsentSession {
+    when: StatusRequested(session)
+    requires: not exists BrowserDaemon{session: session, status: ready}
+    requires: not exists BrowserDaemon{session: session, status: executing}
+    requires: not exists BrowserDaemon{session: session, status: stopping}
+    ensures: AbsentSessionReported(session)
+    ensures: not BrowserDaemon.created
+}
+
+rule CloseOnAbsentSession {
+    when: CloseRequested(session)
+    requires: not exists BrowserDaemon{session: session, status: ready}
+    requires: not exists BrowserDaemon{session: session, status: executing}
+    requires: not exists BrowserDaemon{session: session, status: stopping}
+    ensures: AbsentSessionReported(session)
+    ensures: not BrowserDaemon.created
+}
+
+rule IdleExpiryStartsShutdown {
+    when: daemon: BrowserDaemon.last_completed_at + daemon.idle_timeout <= now
+    requires: daemon.status = ready
+    ensures: daemon.status = stopping
+    ensures: OwnedBrowserTerminationRequested(daemon)
+}
+
+rule ExplicitShutdownStarts {
+    when: OrderlyShutdownRequested(daemon)
+    requires: daemon.status = ready or daemon.status = executing
+    ensures: daemon.status = stopping
+    ensures: OwnedBrowserTerminationRequested(daemon)
+}
+
+rule ShutdownCompletes {
+    when: OwnedBrowserAndProfileCleanupSucceeded(daemon)
+    requires: daemon.status = stopping
+    ensures: daemon.status = stopped
+    ensures: SessionOwnershipReleased(daemon.session)
+    ensures: LifetimeHandlesInvalidated(daemon.browser_id)
+}
+
+rule ShutdownFailureIsVisible {
+    when: OwnedBrowserOrProfileCleanupFailed(daemon, error)
+    requires: daemon.status = stopping
+    ensures: CleanupFailureReported(daemon.session, error)
+    ensures: not SuccessfulCleanupReported(daemon.session)
+}
+
+rule AmbiguousResponseDoesNotReplay {
+    when: OperationTransportFailedAfterPossibleDelivery(session, operation)
+    ensures: UncertainOutcomeReported(session, operation)
+    ensures: not OperationAutomaticallyReplayed(session, operation)
+    ensures: not BrowserDaemon.created
+}
