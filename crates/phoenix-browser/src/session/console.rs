@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 };
 use futures::StreamExt;
 use serde_json::{json, Value};
-use tokio::sync::{oneshot, Notify, OwnedMutexGuard};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedMutexGuard};
 
 use super::{
     extract_console_arg_text, BrowserError, BrowserSession, ConsoleEntry, MAX_CONSOLE_LOGS,
@@ -44,19 +44,40 @@ struct ContextBoundary {
     document: Document,
 }
 
+struct Context {
+    unique: String,
+    document: Document,
+}
+
+struct ChildTarget {
+    frame: String,
+    contexts: HashMap<ExecutionContextId, Context>,
+}
+
 #[derive(Default)]
 struct State {
-    contexts: HashMap<ExecutionContextId, String>,
+    children: HashMap<String, ChildTarget>,
+    frames: HashMap<String, Document>,
+    contexts: HashMap<ExecutionContextId, Context>,
     document: Document,
     generation: Option<Generation>,
     failure: Option<String>,
     pending: HashMap<String, Pending>,
 }
 
+impl State {
+    fn remove_frame(&mut self, frame: &str) {
+        if !self.children.values().any(|target| target.frame == frame) {
+            self.frames.remove(frame);
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ConsoleCapture {
     state: Mutex<State>,
     navigation: Arc<tokio::sync::Mutex<()>>,
+    drains: Mutex<Option<mpsc::Sender<oneshot::Sender<()>>>>,
 }
 
 /// A navigation's source-event boundary, owned by one browser capture listener.
@@ -112,9 +133,20 @@ impl ConsoleCapture {
         )
     }
 
-    pub(super) fn accept(
+    #[cfg(test)]
+    fn accept(
         &self,
         event: &EventConsoleApiCalled,
+        logs: &Mutex<VecDeque<ConsoleEntry>>,
+        notification: &Notify,
+    ) {
+        self.accept_from(event, None, logs, notification);
+    }
+
+    fn accept_from(
+        &self,
+        event: &EventConsoleApiCalled,
+        child_session: Option<&str>,
         logs: &Mutex<VecDeque<ConsoleEntry>>,
         notification: &Notify,
     ) {
@@ -132,10 +164,11 @@ impl ConsoleCapture {
                 })
                 .flatten();
             if let Some(marker) = marker.filter(|marker| {
-                state
-                    .pending
-                    .get(*marker)
-                    .is_some_and(|pending| pending.context == event.execution_context_id)
+                child_session.is_none()
+                    && state
+                        .pending
+                        .get(*marker)
+                        .is_some_and(|pending| pending.context == event.execution_context_id)
             }) {
                 let pending = state.pending.remove(marker).expect("registered marker");
                 if state.failure.is_some() {
@@ -154,20 +187,26 @@ impl ConsoleCapture {
                 }
                 return;
             }
-            if !state.contexts.contains_key(&event.execution_context_id) {
+            let document = match child_session {
+                None => state
+                    .contexts
+                    .get(&event.execution_context_id)
+                    .map(|context| context.document),
+                Some(session) => state.children.get(session).and_then(|target| {
+                    target
+                        .contexts
+                        .get(&event.execution_context_id)
+                        .map(|context| context.document)
+                }),
+            };
+            if document.is_none() {
                 state.failure = Some(format!(
                     "console event from unknown execution context {:?}",
                     event.execution_context_id
                 ));
                 tracing::warn!(failure = ?state.failure, "console capture lost context ownership");
             }
-            (
-                state.generation,
-                state
-                    .contexts
-                    .contains_key(&event.execution_context_id)
-                    .then_some(state.document),
-            )
+            (state.generation, document)
         };
         let level = event.r#type.clone().into();
         let text = event
@@ -201,126 +240,446 @@ fn capture_error(message: impl std::fmt::Display) -> BrowserError {
 }
 
 impl ConsoleCapture {
+    #[cfg(test)]
     fn observe(
         &self,
         message: &Value,
         logs: &Mutex<VecDeque<ConsoleEntry>>,
         notification: &Notify,
     ) -> Result<(), BrowserError> {
+        self.observe_from(message, None, logs, notification)
+    }
+
+    fn observe_from(
+        &self,
+        message: &Value,
+        child_session: Option<&str>,
+        logs: &Mutex<VecDeque<ConsoleEntry>>,
+        notification: &Notify,
+    ) -> Result<(), BrowserError> {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         match message.get("method").and_then(Value::as_str) {
-            Some("Runtime.executionContextCreated") => {
-                let event: EventExecutionContextCreated =
-                    serde_json::from_value(params).map_err(capture_error)?;
-                self.state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contexts
-                    .insert(event.context.id, event.context.unique_id);
-            }
-            Some("Runtime.executionContextDestroyed") => {
-                let event: EventExecutionContextDestroyed =
-                    serde_json::from_value(params).map_err(capture_error)?;
-                self.state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contexts
-                    .retain(|_, unique| *unique != event.execution_context_unique_id);
-            }
-            Some("Runtime.executionContextsCleared") => {
+            Some("Page.frameAttached") => {
+                let frame = params["frameId"]
+                    .as_str()
+                    .ok_or_else(|| capture_error("frame attachment has no frame identity"))?;
                 let mut state = self
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.contexts.clear();
-                state.document = Document::default();
+                let document = params["parentFrameId"]
+                    .as_str()
+                    .and_then(|parent| state.frames.get(parent))
+                    .copied()
+                    .or_else(|| {
+                        child_session.and_then(|session| {
+                            state
+                                .children
+                                .get(session)
+                                .and_then(|target| state.frames.get(&target.frame).copied())
+                        })
+                    })
+                    .unwrap_or(state.document);
+                state.frames.insert(frame.to_owned(), document);
             }
+            Some("Page.frameDetached") => {
+                if params["reason"] != "swap" {
+                    if let Some(frame) = params["frameId"].as_str() {
+                        self.state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove_frame(frame);
+                    }
+                }
+            }
+            Some("Target.attachedToTarget") => {
+                let session = params["sessionId"]
+                    .as_str()
+                    .ok_or_else(|| capture_error("child attachment has no session"))?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let document = match child_session {
+                    None => state.document,
+                    Some(parent) => {
+                        let parent = state
+                            .children
+                            .get(parent)
+                            .ok_or_else(|| capture_error("unknown parent target"))?;
+                        *state
+                            .frames
+                            .get(&parent.frame)
+                            .ok_or_else(|| capture_error("unknown parent frame ownership"))?
+                    }
+                };
+                let frame = params["targetInfo"]["targetId"]
+                    .as_str()
+                    .ok_or_else(|| capture_error("child attachment has no target identity"))?
+                    .to_owned();
+                state.frames.entry(frame.clone()).or_insert(document);
+                state.children.insert(
+                    session.to_owned(),
+                    ChildTarget {
+                        frame,
+                        contexts: HashMap::new(),
+                    },
+                );
+            }
+            Some("Target.detachedFromTarget") => {
+                if let Some(session) = params["sessionId"].as_str() {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(target) = state.children.remove(session) {
+                        state.remove_frame(&target.frame);
+                    }
+                    notification.notify_waiters();
+                }
+            }
+            Some(
+                method @ ("Runtime.executionContextCreated"
+                | "Runtime.executionContextDestroyed"
+                | "Runtime.executionContextsCleared"),
+            ) => self.observe_context(method, params, child_session)?,
             Some("Runtime.consoleAPICalled") => {
                 let event: EventConsoleApiCalled =
                     serde_json::from_value(params).map_err(capture_error)?;
-                self.accept(&event, logs, notification);
+                self.accept_from(&event, child_session, logs, notification);
             }
             _ => {}
         }
         Ok(())
     }
-
-    async fn command(
+    fn observe_context(
         &self,
-        socket: &mut Socket,
-        request: Value,
-        logs: &Mutex<VecDeque<ConsoleEntry>>,
-        notification: &Notify,
-    ) -> Result<Value, BrowserError> {
-        socket
-            .send(Message::Text(request.to_string().into()))
+        method: &str,
+        params: Value,
+        child_session: Option<&str>,
+    ) -> Result<(), BrowserError> {
+        match method {
+            "Runtime.executionContextCreated" => {
+                let event: EventExecutionContextCreated =
+                    serde_json::from_value(params).map_err(capture_error)?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let document =
+                    match child_session {
+                        None => state.document,
+                        Some(session) => {
+                            let target = state.children.get(session).ok_or_else(|| {
+                                capture_error("context from unknown child target")
+                            })?;
+                            *state.frames.get(&target.frame).ok_or_else(|| {
+                                capture_error("context from unknown frame ownership")
+                            })?
+                        }
+                    };
+                let contexts = match child_session {
+                    None => &mut state.contexts,
+                    Some(session) => {
+                        &mut state
+                            .children
+                            .get_mut(session)
+                            .ok_or_else(|| capture_error("context from unknown child target"))?
+                            .contexts
+                    }
+                };
+                contexts.insert(
+                    event.context.id,
+                    Context {
+                        unique: event.context.unique_id,
+                        document,
+                    },
+                );
+            }
+            "Runtime.executionContextDestroyed" => {
+                let event: EventExecutionContextDestroyed =
+                    serde_json::from_value(params).map_err(capture_error)?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let contexts = match child_session {
+                    None => &mut state.contexts,
+                    Some(session) => {
+                        &mut state
+                            .children
+                            .get_mut(session)
+                            .ok_or_else(|| {
+                                capture_error("context destruction from unknown child target")
+                            })?
+                            .contexts
+                    }
+                };
+                contexts.retain(|_, context| context.unique != event.execution_context_unique_id);
+            }
+            "Runtime.executionContextsCleared" => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match child_session {
+                    None => {
+                        state.contexts.clear();
+                        state.document = Document::default();
+                    }
+                    Some(session) => state
+                        .children
+                        .get_mut(session)
+                        .ok_or_else(|| capture_error("context reset from unknown child target"))?
+                        .contexts
+                        .clear(),
+                }
+            }
+            _ => unreachable!("context event selected by observe_from"),
+        }
+        Ok(())
+    }
+}
+
+struct Command {
+    method: &'static str,
+    session: String,
+}
+
+struct Drain {
+    acknowledged: oneshot::Sender<()>,
+    pending: HashSet<u64>,
+}
+
+struct Listener {
+    socket: Socket,
+    root_session: String,
+    next_id: u64,
+    pending: HashMap<u64, Command>,
+    drain: Option<Drain>,
+    capture: Arc<ConsoleCapture>,
+    logs: Arc<Mutex<VecDeque<ConsoleEntry>>>,
+    notification: Arc<Notify>,
+}
+
+impl Listener {
+    async fn send(
+        &mut self,
+        session: &str,
+        method: &'static str,
+        params: Value,
+    ) -> Result<u64, BrowserError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.socket
+            .send(Message::Text(
+                json!({"id":id,"sessionId":session,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
             .await
             .map_err(capture_error)?;
-        while let Some(message) = socket.next().await {
-            let message = message.map_err(capture_error)?;
-            if let Message::Text(text) = message {
-                let message: Value = serde_json::from_str(&text).map_err(capture_error)?;
-                self.observe(&message, logs, notification)?;
-                if message.get("id") == request.get("id") {
-                    if let Some(error) = message.get("error") {
-                        return Err(capture_error(error));
+        self.pending.insert(
+            id,
+            Command {
+                method,
+                session: session.to_owned(),
+            },
+        );
+        Ok(id)
+    }
+
+    async fn enable_target(&mut self, session: &str) -> Result<(), BrowserError> {
+        self.send(session, "Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"iframe","exclude":false},{"exclude":true}]})).await?;
+        self.send(session, "Page.enable", json!({})).await?;
+        self.send(session, "Runtime.enable", json!({})).await?;
+        self.send(session, "Runtime.runIfWaitingForDebugger", json!({}))
+            .await?;
+        if self.drain.is_some() {
+            self.fence_child(session).await?;
+        }
+        Ok(())
+    }
+
+    async fn fence_child(&mut self, session: &str) -> Result<(), BrowserError> {
+        let id = self
+            .send(
+                session,
+                "Runtime.evaluate",
+                json!({"expression":"0","returnByValue":true}),
+            )
+            .await?;
+        self.drain
+            .as_mut()
+            .expect("drain registered")
+            .pending
+            .insert(id);
+        Ok(())
+    }
+
+    fn acknowledge_drain(&mut self) {
+        if self
+            .drain
+            .as_ref()
+            .is_some_and(|drain| drain.pending.is_empty())
+        {
+            let _ = self
+                .drain
+                .take()
+                .expect("registered drain")
+                .acknowledged
+                .send(());
+        }
+    }
+
+    async fn begin_drain(&mut self, acknowledged: oneshot::Sender<()>) -> Result<(), BrowserError> {
+        self.drain = Some(Drain {
+            acknowledged,
+            pending: HashSet::new(),
+        });
+        let children: Vec<_> = self
+            .capture
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .children
+            .keys()
+            .cloned()
+            .collect();
+        for child in children {
+            self.fence_child(&child).await?;
+        }
+        self.acknowledge_drain();
+        Ok(())
+    }
+
+    async fn read(&mut self) -> Result<(), BrowserError> {
+        let message = self
+            .socket
+            .next()
+            .await
+            .ok_or_else(|| capture_error("console connection ended"))?
+            .map_err(capture_error)?;
+        self.process(message).await
+    }
+
+    async fn process(&mut self, message: Message) -> Result<(), BrowserError> {
+        let Message::Text(text) = message else {
+            return if matches!(message, Message::Close(_)) {
+                Err(capture_error("console connection ended"))
+            } else {
+                Ok(())
+            };
+        };
+        let message: Value = serde_json::from_str(&text).map_err(capture_error)?;
+        if let Some(id) = message["id"].as_u64() {
+            if let Some(command) = self.pending.remove(&id) {
+                if let Some(error) = message.get("error") {
+                    let detached = command.session != self.root_session
+                        && !self
+                            .capture
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .children
+                            .contains_key(&command.session);
+                    if detached {
+                        tracing::debug!(method = command.method, %error, "console target detached before command response");
+                    } else {
+                        return Err(capture_error(format!("{}: {error}", command.method)));
                     }
-                    return Ok(message["result"].clone());
                 }
-            } else if matches!(message, Message::Close(_)) {
-                break;
+                if let Some(drain) = self.drain.as_mut() {
+                    drain.pending.remove(&id);
+                }
             }
         }
-        Err(capture_error("console connection ended"))
+        let session = message["sessionId"]
+            .as_str()
+            .filter(|session| *session != self.root_session);
+        self.capture
+            .observe_from(&message, session, &self.logs, &self.notification)?;
+        if message["method"] == "Target.attachedToTarget" {
+            let child = message["params"]["sessionId"]
+                .as_str()
+                .ok_or_else(|| capture_error("child attachment has no session"))?;
+            self.enable_target(child).await?;
+        }
+        if message["method"] == "Target.detachedFromTarget" {
+            if let Some(detached) = message["params"]["sessionId"].as_str() {
+                let removed: Vec<_> = self
+                    .pending
+                    .iter()
+                    .filter(|(_, command)| command.session == detached)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in removed {
+                    self.pending.remove(&id);
+                    if let Some(drain) = self.drain.as_mut() {
+                        drain.pending.remove(&id);
+                    }
+                }
+            }
+        }
+        self.acknowledge_drain();
+        Ok(())
     }
 }
 
 pub(super) async fn listen(
     session: &BrowserSession,
 ) -> Result<tokio::task::JoinHandle<()>, BrowserError> {
-    let capture = session.console_capture.clone();
-    let logs = session.console_logs.clone();
-    let notification = session.console_event.clone();
-    let mut socket = tokio::time::timeout(Duration::from_secs(5), async {
-        let (mut socket, session_id) = crate::cdp::connect_target(
+    let (drains, mut drain_requests) = mpsc::channel(1);
+    let mut listener = tokio::time::timeout(Duration::from_secs(5), async {
+        let (socket, root_session) = crate::cdp::connect_target(
             session.snapshot_websocket_address(),
             session.page.target_id(),
             8 * 1024 * 1024,
         )
         .await
         .map_err(capture_error)?;
-        capture
-            .command(
-                &mut socket,
-                json!({"id":2,"sessionId":session_id,"method":"Runtime.enable"}),
-                &logs,
-                &notification,
-            )
+        let mut listener = Listener {
+            socket,
+            root_session,
+            next_id: 1,
+            pending: HashMap::new(),
+            drain: None,
+            capture: session.console_capture.clone(),
+            logs: session.console_logs.clone(),
+            notification: session.console_event.clone(),
+        };
+        listener
+            .enable_target(&listener.root_session.clone())
             .await?;
-        Ok::<_, BrowserError>(socket)
+        while !listener.pending.is_empty() {
+            listener.read().await?;
+        }
+        Ok::<_, BrowserError>(listener)
     })
     .await
     .map_err(|_| capture_error("console connection setup timed out"))??;
+    *session
+        .console_capture
+        .drains
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(drains);
     Ok(tokio::spawn(async move {
-        let result = async {
-            while let Some(message) = socket.next().await {
-                let message = message.map_err(capture_error)?;
-                if let Message::Text(text) = message {
-                    let message: Value = serde_json::from_str(&text).map_err(capture_error)?;
-                    capture.observe(&message, &logs, &notification)?;
-                } else if matches!(message, Message::Close(_)) {
-                    break;
-                }
+        let failure = loop {
+            let result = tokio::select! {
+                message = listener.socket.next() => match message {
+                    Some(Ok(message)) => listener.process(message).await,
+                    Some(Err(error)) => Err(capture_error(error)),
+                    None => Err(capture_error("console connection ended")),
+                },
+                Some(acknowledged) = drain_requests.recv(), if listener.drain.is_none() => listener.begin_drain(acknowledged).await,
+            };
+            if let Err(error) = result {
+                break error.to_string();
             }
-            Ok::<_, BrowserError>(())
-        }
-        .await;
-        let failure = result.err().map_or_else(
-            || "console connection ended".to_owned(),
-            |error| error.to_string(),
-        );
+        };
         tracing::warn!(%failure, "console capture stopped");
-        let mut state = capture
+        let mut state = listener
+            .capture
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -369,6 +728,34 @@ impl BrowserSession {
         .map_err(|_| capture_error("source-event acknowledgement timed out"))?
     }
 
+    async fn console_children_boundary(&self) -> Result<(), BrowserError> {
+        let drains = self
+            .console_capture
+            .drains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| capture_error("console listener unavailable"))?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (acknowledged, receiver) = oneshot::channel();
+            drains.send(acknowledged).await.map_err(capture_error)?;
+            receiver.await.map_err(capture_error)
+        })
+        .await
+        .map_err(|_| capture_error("child target drain timed out"))??;
+        if let Some(failure) = self
+            .console_capture
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure
+            .clone()
+        {
+            return Err(capture_error(failure));
+        }
+        Ok(())
+    }
+
     /// Drain earlier console events before starting a navigation's capture.
     ///
     /// # Errors
@@ -377,6 +764,7 @@ impl BrowserSession {
         &self,
     ) -> Result<ConsoleNavigationCapture, BrowserError> {
         let lease = self.console_capture.navigation.clone().lock_owned().await;
+        self.console_children_boundary().await?;
         let generation = Generation(uuid::Uuid::new_v4());
         let boundary = self.console_boundary(Boundary::Begin(generation)).await?;
         Ok(ConsoleNavigationCapture {
@@ -399,6 +787,7 @@ impl BrowserSession {
             return Err(capture_error("capture belongs to another browser"));
         }
         let final_boundary = self.console_boundary(Boundary::Drain).await?;
+        self.console_children_boundary().await?;
         let same_document = capture.boundary.document == final_boundary.document;
         let logs = self
             .console_logs
@@ -537,7 +926,7 @@ mod tests {
                 .unwrap()
                 .contexts
                 .get(&ExecutionContextId::new(2))
-                .map(String::as_str),
+                .map(|context| context.unique.as_str()),
             Some("new-iframe-reused-number")
         );
         capture.accept(
@@ -569,6 +958,56 @@ mod tests {
             .unwrap()
             .contexts
             .contains_key(&ExecutionContextId::new(2)));
+    }
+
+    #[tokio::test]
+    async fn reused_child_session_keeps_context_document_ownership() {
+        let capture = Arc::new(ConsoleCapture::default());
+        let logs = Mutex::new(VecDeque::new());
+        let notification = Notify::new();
+        context(&capture, 9, "main-marker");
+        let generation = Generation(uuid::Uuid::new_v4());
+        let (begin, acknowledged) =
+            capture.register(ExecutionContextId::new(9), Boundary::Begin(generation));
+        capture.accept(&event(9, &begin.marker, "debug"), &logs, &notification);
+        let old = acknowledged.await.unwrap().document;
+        let observe = |message: Value| {
+            let session = message["sessionId"].as_str();
+            capture
+                .observe_from(&message, session, &logs, &notification)
+                .unwrap();
+        };
+        observe(
+            json!({"method":"Target.attachedToTarget","params":{"sessionId":"child","targetInfo":{"targetId":"frame"}}}),
+        );
+        observe(
+            json!({"sessionId":"child","method":"Runtime.executionContextCreated","params":{"context":{"id":1,"uniqueId":"old-child-context","origin":"","name":""}}}),
+        );
+        observe(json!({"method":"Runtime.executionContextsCleared","params":{}}));
+        observe(
+            json!({"method":"Page.frameAttached","params":{"frameId":"frame","parentFrameId":"root"}}),
+        );
+        observe(
+            json!({"sessionId":"child","method":"Runtime.executionContextCreated","params":{"context":{"id":2,"uniqueId":"new-child-context","origin":"","name":""}}}),
+        );
+        capture.accept_from(
+            &event(1, "late-old-child", "error"),
+            Some("child"),
+            &logs,
+            &notification,
+        );
+        capture.accept_from(
+            &event(2, "new-child", "error"),
+            Some("child"),
+            &logs,
+            &notification,
+        );
+        observe(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"child"}}));
+        let logs = logs.lock().unwrap();
+        assert_eq!(logs[0].source_document, Some(old));
+        assert_ne!(logs[1].source_document, Some(old));
+        assert_eq!(logs[1].capture_generation, Some(generation));
+        assert!(capture.state.lock().unwrap().children.is_empty());
     }
 
     #[tokio::test]
@@ -748,5 +1187,137 @@ mod tests {
                 "{ordinary_logs:?}"
             );
         }
+    }
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One browser and HTTP fixture establish real cross-process frame ownership"
+    )]
+    async fn native_console_capture_retains_detached_cross_origin_oopif_errors() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let serving = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = server.accept().await {
+                tokio::spawn(async move {
+                    let mut request = vec![0; 8192];
+                    let Ok(count) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..count]);
+                    let path = request.split_whitespace().nth(1).unwrap_or("/");
+                    let body = if path.starts_with("/child") {
+                        let label = path.trim_start_matches("/child-");
+                        format!("<script>console.error('{label}-oopif-error');parent.postMessage('{label}', '*')</script>")
+                    } else {
+                        let label = if path == "/new" { "new" } else { "old" };
+                        format!("<script>window.seen=[];addEventListener('message',e=>seen.push(e.data))</script><iframe src='http://localhost:{port}/child-{label}'></iframe>")
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("console-oopif-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.unwrap();
+        let (captured, attached_capture) = {
+            let session = session.read().await;
+            session
+                .page
+                .goto(format!("http://127.0.0.1:{port}/old"))
+                .await
+                .unwrap();
+            assert!(
+                !session
+                    .console_capture
+                    .state
+                    .lock()
+                    .unwrap()
+                    .children
+                    .is_empty(),
+                "cross-site iframe must be a separately attached CDP target"
+            );
+            let capture = session.begin_console_navigation_capture().await.unwrap();
+            let mut late = EvaluateParams::new(format!("new Promise(resolve=>{{const f=document.createElement('iframe');f.src='http://localhost:{port}/child-late-old';f.onload=()=>resolve(true);document.body.append(f)}})"));
+            late.await_promise = Some(true);
+            session.page.evaluate(late).await.unwrap();
+            session
+                .page
+                .goto(format!("http://127.0.0.1:{port}/new"))
+                .await
+                .unwrap();
+            assert!(
+                !session
+                    .console_capture
+                    .state
+                    .lock()
+                    .unwrap()
+                    .children
+                    .is_empty(),
+                "new document must also have an OOPIF target"
+            );
+            session
+                .page
+                .evaluate("document.querySelector('iframe').remove();true")
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let changed = session.console_event.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if session
+                        .console_capture
+                        .state
+                        .lock()
+                        .unwrap()
+                        .children
+                        .is_empty()
+                    {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("OOPIF detached from console connection");
+            let detached_capture = session
+                .finish_console_navigation_capture(capture)
+                .await
+                .unwrap();
+            let capture = session.begin_console_navigation_capture().await.unwrap();
+            session
+                .page
+                .goto(format!("http://127.0.0.1:{port}/new"))
+                .await
+                .unwrap();
+            let attached_capture = session
+                .finish_console_navigation_capture(capture)
+                .await
+                .unwrap();
+            (detached_capture, attached_capture)
+        };
+        manager.shutdown_all().await.unwrap();
+        serving.abort();
+        let captured: Vec<_> = captured.iter().map(|entry| entry.text.as_str()).collect();
+        assert!(captured.contains(&"new-oopif-error"), "{captured:?}");
+        assert!(
+            attached_capture
+                .iter()
+                .any(|entry| entry.text == "new-oopif-error"),
+            "{attached_capture:?}"
+        );
+        assert!(!captured.contains(&"old-oopif-error"), "{captured:?}");
+        assert!(!captured.contains(&"late-old-oopif-error"), "{captured:?}");
     }
 }
