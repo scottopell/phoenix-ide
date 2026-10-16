@@ -2046,3 +2046,37 @@ focused files. All executable workflow/Python/Node app pins now select this exac
 integrated SHA/tree; the earlier blocked pin above is retained as history.
 The next gate is the actual hosted two-build inventory and controlled six-report
 collector/export/drain witness. No local heavy build or native run was performed.
+
+### First controlled hosted packet: terminal failure and causal successor
+
+Run `38932424750` at harness `4838341db8bbb6033b8eb76d572bb6b574ba3cd6`
+is terminal failure: witness `117079492200` failed full UI at TS6307; Rust
+`117079632867` and all other jobs succeeded. Both actual canonical Vite builds,
+strict initial artifact admission (454 files per mode), codegen, libtest guards,
+collector/authentication/default-SDK and capacity/privacy passed. Full UI lint,
+stylelint and Vitest passed, but composite `tsc -b --noEmit` rejected the missing
+explicit guard-module include. Native capture was skipped, not failed or passed.
+Remote artifact `12059059498` is 95,559,021B; bounded selected reads were289,072B.
+Independent final-manifest comparison also caught the full-UI production-CSS
+fixture overwriting the stock canonical manifest with its temporary-output
+manifest (457 files), while controlled454 stayed exactly build-owner bound.
+The initial stock454 build-owner/libtest bindings remain failed-run evidence;
+the later manifest is not resealed or promoted. Durable evidence:
+https://github.com/scottopell/phoenix-ide/pull/908#issuecomment-6220316723.
+
+Donors `2c4bbcc9e601270d2434467b7cb2716a2b171f74` and
+`9cb1db2d55ad61814573d9f294712d628a262302` integrate as app
+`cdcbc6e103044c2f7e00d7b0a85cb2475a5c7768`, tree
+`dfbee24aa0886265e43905fffd8bc91a54fc135a`. The first explicitly lists the
+build guard in the strict composite Node TypeScript project. The second limits
+canonical stock-manifest publication to canonical output: ordinary custom-output
+CSS builds retain graph exclusion but cannot read/hash or publish a canonical
+artifact manifest. Controlled exact config/mode/output and all canonical byte/
+complete-inventory gates are unchanged. Independent additive source review
+approved one causal hosted successor; it did not claim actual successor build
+or native results. Genuine parent `tsc -b --noEmit`, focused app30, artifact8,
+lifecycle68, controlled Node16 and joint Node65 passed; YAML parsing/diff checks
+passed. No local bundle/server/install/native work occurred. The next hosted gate
+must prove full UI and preservation of both canonical manifest bindings, followed
+by the controlled exact-six collector/export/normal-drain witness. No overhead,
+full acceptance or native resume claim follows from this source packet.
