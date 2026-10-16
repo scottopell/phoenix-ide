@@ -9,6 +9,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 
 The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
 
+The departing-document delivery evidence decision is [ADR-103](103_pagehide-delivery-uses-collector-and-export-evidence.md), affecting REQ-CVT-004/005/006.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |
@@ -118,6 +120,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
 | [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
 | [102](102_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
+| [103](103_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
 
 ## For agents: which decisions bind your task
 

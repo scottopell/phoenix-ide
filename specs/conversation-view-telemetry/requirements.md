@@ -56,3 +56,13 @@ THE SYSTEM SHALL expose deterministic tests for injected request versus view del
 AND SHALL qualify actual candidate Global and ordinary journeys with a retrievable correlated trace before claiming real-server acceptance.
 
 Synthetic timing controls SHALL be distinguished from candidate-browser/server evidence. Telemetry SHALL NOT claim to reconstruct an incident that occurred before instrumentation existed. Attribution stages SHALL be added only where evidence warrants them, not as a general profiling framework.
+
+### REQ-CVT-006: Lifecycle-specific delivery evidence
+
+WHEN qualification observes a sampled report from an actual departing document
+THE SYSTEM SHALL require independently captured acceptance by the real authenticated collector and actual exported journey evidence for the exact producer-admitted journey identity
+AND SHALL join collector acceptance and exported trace by the browser-admitted journey identity and authoritative backend source/server instance
+AND SHALL match exported frontend source, route, trigger, terminal outcome and observed request correlations against the independent browser inventory
+AND SHALL reject missing, duplicate, foreign, rejected or privacy-invalid evidence.
+
+A departing document's rejected fetch or missing response observation SHALL NOT substitute for collector rejection or acceptance. Collector acceptance SHALL be observed only after authentication, bounded decoding, semantic validation and authoritative server identity resolution succeed. Collector acceptance alone SHALL NOT prove export, and export-derived expected inventories SHALL NOT manufacture browser observations. Synthetic-server response completion SHALL NOT qualify a real candidate. For nondeparting documents, qualification SHALL retain the browser-observed collector204 requirement in addition to exported evidence. An unsampled admission SHALL remain a sampling observation, not a successful delivery case. These evidence rules SHALL NOT add retries, a queue, a delivery guarantee, altered sampling or a longer transport deadline.
