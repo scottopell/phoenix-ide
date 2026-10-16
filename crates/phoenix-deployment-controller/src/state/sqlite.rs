@@ -1,7 +1,12 @@
 //! Controller-only persistence. The phase selects the required relational shape;
 //! recovery rejects missing, extraneous, or contradictory evidence.
 
-use std::{error::Error, fmt, path::Path};
+use std::{
+    error::Error,
+    fmt,
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+};
 
 use rusqlite::{
     params,
@@ -18,19 +23,24 @@ use super::{
 };
 use crate::{
     candidate::RetainedCandidateIdentity,
+    native_binding::{
+        GuardianLifetimeNonce, NativeGuardianBinding, NativeGuardianIdentity,
+        NativeGuardianSession, NativeGuardianSlot, NativeSessionState, NativeSlotLiveness,
+    },
     os::CandidateVerification,
     ownership::CleanupReadiness,
     resource::{ResourceBlock, ResourceWindow, SustainedResourceEvidence},
+    BirthToken, ProcessId, ProcessIdentity,
 };
 
 mod resources;
 mod tree;
 
 const SCHEMA: &str = include_str!("sqlite/schema.sql");
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// An independent controller database, never a Phoenix application connection.
-/// Only schema version 1 is supported; there is no upgrade/downgrade policy.
+/// Only schema version 2 is supported; there is no upgrade/downgrade policy.
 #[derive(Debug)]
 pub struct ControllerSqliteStore {
     connection: Connection,
@@ -179,6 +189,247 @@ impl ControllerSqliteStore {
         Ok(attempt.map(|checkpoint| LoadedAttempt { checkpoint }))
     }
 
+    /// Atomically records diagnostic custody evidence for an already committed attempt.
+    /// No ticket or session capability is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Poisoned` for an unusable handle, `RevisionConflict` if the
+    /// attempt revision or deadline differs or a binding already exists,
+    /// `Malformed` for invalid slot inventory or failed round-trip validation,
+    /// and `UnsupportedSchema` or `Sqlite` for authority/database failures.
+    /// Any error after the usability check poisons this handle.
+    pub fn commit_initial_binding(
+        &mut self,
+        attempt_id: AttemptId,
+        deadline: MonotonicTick,
+        attempt_revision: PersistenceRevision,
+        identity: NativeGuardianIdentity,
+        slots: &[NativeGuardianSlot],
+    ) -> Result<NativeGuardianBinding> {
+        self.ensure_usable()?;
+        let result = self.commit_initial_binding_inner(
+            attempt_id,
+            deadline,
+            attempt_revision,
+            identity,
+            slots,
+        );
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn commit_initial_binding_inner(
+        &mut self,
+        attempt_id: AttemptId,
+        deadline: MonotonicTick,
+        attempt_revision: PersistenceRevision,
+        identity: NativeGuardianIdentity,
+        slots: &[NativeGuardianSlot],
+    ) -> Result<NativeGuardianBinding> {
+        if slots.len() > crate::guardian::MAX_CHILD_SLOTS {
+            return malformed("too many guardian slots");
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_authority(&tx)?;
+        let id = key(attempt_id);
+        let header = required(read_header(&tx, &id)?, "missing binding attempt")?;
+        if header.deadline != deadline || header.revision != attempt_revision {
+            return Err(ControllerStoreError::RevisionConflict);
+        }
+        if read_binding(&tx, attempt_id)?.is_some() {
+            return Err(ControllerStoreError::RevisionConflict);
+        }
+        let guardian = identity.process;
+        tx.execute(
+            "INSERT INTO guardian_bindings VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                id,
+                identity.nonce.bytes().as_slice(),
+                i64::from(guardian.pid().get()),
+                Word(guardian.birth().seconds()),
+                guardian.birth().nanos(),
+                Word(1),
+                Word(attempt_revision.get()),
+                i64::try_from(slots.len())
+                    .map_err(|_| ControllerStoreError::Malformed("slot count overflow"))?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO guardian_sessions VALUES (?1,?2,?3,'active')",
+            params![id, Word(1), Word(attempt_revision.get())],
+        )?;
+        for (ordinal, slot) in slots.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO guardian_slots VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    i64::try_from(ordinal)
+                        .map_err(|_| ControllerStoreError::Malformed("slot ordinal overflow"))?,
+                    i64::from(slot.process.pid().get()),
+                    Word(slot.process.birth().seconds()),
+                    slot.process.birth().nanos(),
+                    slot_liveness_text(slot.liveness)
+                ],
+            )?;
+        }
+        let binding = required(read_binding(&tx, attempt_id)?, "binding write missing")?;
+        if binding.identity != identity
+            || binding.deadline != deadline
+            || binding.slots.as_slice() != slots
+            || binding.dispatch_floor != attempt_revision
+            || binding.revision != PersistenceRevision::first()
+        {
+            return malformed("binding did not round-trip losslessly");
+        }
+        tx.commit()?;
+        Ok(binding)
+    }
+
+    /// Reads diagnostic evidence only; a persisted session is never a live session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Poisoned` for an unusable handle, `UnsupportedSchema` or
+    /// `Malformed` for invalid authority or binding evidence, and `Sqlite` for
+    /// a database failure. Any read error poisons this handle.
+    pub fn load_native_binding(
+        &mut self,
+        attempt_id: AttemptId,
+    ) -> Result<Option<NativeGuardianBinding>> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self.connection.transaction()?;
+            check_authority(&tx)?;
+            let binding = read_binding(&tx, attempt_id)?;
+            tx.commit()?;
+            Ok(binding)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Fences the current durable session. Exact snapshot comparison prevents stale updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Poisoned` for an unusable handle, `RevisionConflict` for a
+    /// stale binding or already detached session, `RevisionExhausted` at the
+    /// revision limit, `Malformed` for invalid evidence or round-trip mismatch,
+    /// and `UnsupportedSchema` or `Sqlite` for authority/database failures.
+    /// Any error after the usability check poisons this handle.
+    pub fn commit_detached_binding(
+        &mut self,
+        expected: &NativeGuardianBinding,
+    ) -> Result<NativeGuardianBinding> {
+        self.advance_binding(expected, None)
+    }
+
+    /// Records a fresh reconciling session after an independently committed interruption.
+    /// The policy checkpoint must already be interrupted, and its revision must strictly
+    /// exceed every prior session interruption floor (including unfinished sessions).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Poisoned` for an unusable handle, `RevisionConflict` for a
+    /// stale binding, non-interrupted attempt, or invalid interruption floor,
+    /// `RevisionExhausted` at a revision or generation limit, `Malformed` for
+    /// invalid evidence or round-trip mismatch, and `UnsupportedSchema` or
+    /// `Sqlite` for authority/database failures. Any error after the usability
+    /// check poisons this handle.
+    pub fn commit_fresh_interruption_binding(
+        &mut self,
+        expected: &NativeGuardianBinding,
+        interruption_revision: PersistenceRevision,
+    ) -> Result<NativeGuardianBinding> {
+        self.advance_binding(expected, Some(interruption_revision))
+    }
+
+    fn advance_binding(
+        &mut self,
+        expected: &NativeGuardianBinding,
+        fresh: Option<PersistenceRevision>,
+    ) -> Result<NativeGuardianBinding> {
+        self.ensure_usable()?;
+        let result = self.advance_binding_inner(expected, fresh);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn advance_binding_inner(
+        &mut self,
+        expected: &NativeGuardianBinding,
+        fresh: Option<PersistenceRevision>,
+    ) -> Result<NativeGuardianBinding> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_authority(&tx)?;
+        let id = key(expected.attempt_id);
+        if read_binding(&tx, expected.attempt_id)?.as_ref() != Some(expected) {
+            return Err(ControllerStoreError::RevisionConflict);
+        }
+        let revision = expected
+            .revision
+            .checked_next()
+            .ok_or(ControllerStoreError::RevisionExhausted)?;
+        let current = expected.current_session();
+        if let Some(interruption) = fresh {
+            let header = required(read_header(&tx, &id)?, "missing binding attempt")?;
+            if header.phase != Phase::Interrupted
+                || header.revision != interruption
+                || interruption <= current.interruption_revision
+                || interruption < expected.dispatch_floor
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            let generation = current
+                .generation
+                .checked_add(1)
+                .ok_or(ControllerStoreError::RevisionExhausted)?;
+            tx.execute("UPDATE guardian_sessions SET state='detached' WHERE attempt_id=?1 AND generation=?2",
+                params![id, Word(current.generation.get())])?;
+            tx.execute(
+                "INSERT INTO guardian_sessions VALUES (?1,?2,?3,'reconciling')",
+                params![id, Word(generation.get()), Word(interruption.get())],
+            )?;
+            tx.execute("UPDATE guardian_bindings SET revision=?2,dispatch_floor=?3 WHERE attempt_id=?1 AND revision=?4",
+                params![id, Word(revision.get()), Word(interruption.get()), Word(expected.revision.get())])?;
+        } else {
+            if current.state == NativeSessionState::Detached {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.execute("UPDATE guardian_sessions SET state='detached' WHERE attempt_id=?1 AND generation=?2",
+                params![id, Word(current.generation.get())])?;
+            tx.execute(
+                "UPDATE guardian_bindings SET revision=?2 WHERE attempt_id=?1 AND revision=?3",
+                params![id, Word(revision.get()), Word(expected.revision.get())],
+            )?;
+        }
+        let result = required(
+            read_binding(&tx, expected.attempt_id)?,
+            "binding update missing",
+        )?;
+        if result.revision != revision
+            || result.identity != expected.identity
+            || result.slots != expected.slots
+            || result.deadline != expected.deadline
+            || result.sessions.len() != expected.sessions.len() + usize::from(fresh.is_some())
+        {
+            return malformed("binding update did not round-trip");
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
     fn ensure_usable(&self) -> Result<()> {
         if self.poisoned {
             Err(ControllerStoreError::Poisoned)
@@ -214,10 +465,27 @@ impl ControllerSqliteStore {
         let mut next = checkpoint.clone();
         next.set_revision(revision);
         // BEGIN IMMEDIATE holds the writer lock across compare, replace, and commit.
-        transaction.execute(
-            "DELETE FROM attempts WHERE attempt_id = ?1",
-            [key(checkpoint.attempt_id())],
-        )?;
+        if let Some(ref old) = durable {
+            if old.deadline() != checkpoint.deadline() {
+                return malformed("original deadline changed");
+            }
+            for table in [
+                "pending_child_scans",
+                "discovery_epochs",
+                "owned_identities",
+                "ownership",
+                "sampling_obligations",
+                "process_identities",
+                "resource_samples",
+                "resource_policies",
+                "retained_candidates",
+            ] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE attempt_id=?1"),
+                    [key(checkpoint.attempt_id())],
+                )?;
+            }
+        }
         write_attempt(&transaction, &next)?;
         if read_attempt(&transaction, checkpoint.attempt_id())?.as_ref() != Some(&next) {
             return malformed("checkpoint did not round-trip losslessly");
@@ -239,6 +507,173 @@ impl AttemptStore for ControllerSqliteStore {
         }
         result
     }
+}
+
+fn binding_revision(word: u64) -> Result<PersistenceRevision> {
+    Ok(PersistenceRevision::new(required(
+        NonZeroU64::new(word),
+        "zero binding revision",
+    )?))
+}
+fn binding_identity(pid: i64, seconds: u64, nanos: i64) -> Result<ProcessIdentity> {
+    let pid = u32::try_from(pid).ok().and_then(NonZeroU32::new);
+    let nanos = u32::try_from(nanos).ok();
+    Ok(ProcessIdentity::new(
+        ProcessId::new(required(pid, "invalid guardian PID")?),
+        BirthToken::new(seconds, required(nanos, "invalid guardian birth nanos")?)
+            .map_err(|_| ControllerStoreError::Malformed("invalid guardian birth nanos"))?,
+    ))
+}
+fn slot_liveness_text(value: NativeSlotLiveness) -> &'static str {
+    match value {
+        NativeSlotLiveness::Running => "running",
+        NativeSlotLiveness::Exited => "exited",
+        NativeSlotLiveness::Unavailable => "unavailable",
+    }
+}
+fn read_binding(
+    connection: &Connection,
+    attempt_id: AttemptId,
+) -> Result<Option<NativeGuardianBinding>> {
+    let id = key(attempt_id);
+    let row = connection.query_row("SELECT nonce,guardian_pid,guardian_birth_seconds,guardian_birth_nanos,revision,dispatch_floor,slot_count FROM guardian_bindings WHERE attempt_id=?1", [&id], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Word>(2)?.0,
+            row.get::<_, i64>(3)?, row.get::<_, Word>(4)?.0, row.get::<_, Word>(5)?.0, row.get::<_, i64>(6)?))
+    }).optional()?;
+    let Some((nonce, pid, seconds, nanos, revision, floor, slot_count)) = row else {
+        return Ok(None);
+    };
+    let header = required(
+        read_header(connection, &id)?,
+        "binding orphaned from attempt",
+    )?;
+    let nonce: [u8; 16] = nonce
+        .try_into()
+        .map_err(|_| ControllerStoreError::Malformed("invalid guardian nonce width"))?;
+    let identity = NativeGuardianIdentity {
+        nonce: required(GuardianLifetimeNonce::new(nonce), "zero guardian nonce")?,
+        process: binding_identity(pid, seconds, nanos)?,
+    };
+    let revision = binding_revision(revision)?;
+    let dispatch_floor = binding_revision(floor)?;
+    if dispatch_floor > header.revision {
+        return malformed("dispatch floor exceeds attempt revision");
+    }
+    let sessions = read_binding_sessions(connection, &id, header.revision, dispatch_floor)?;
+    let slots = read_binding_slots(connection, &id, identity.process, slot_count)?;
+    Ok(Some(NativeGuardianBinding {
+        attempt_id,
+        deadline: header.deadline,
+        identity,
+        revision,
+        dispatch_floor,
+        slots,
+        sessions,
+    }))
+}
+
+fn read_binding_sessions(
+    connection: &Connection,
+    id: &[u8],
+    attempt_revision: PersistenceRevision,
+    dispatch_floor: PersistenceRevision,
+) -> Result<Vec<NativeGuardianSession>> {
+    let mut sessions = Vec::new();
+    let mut statement = connection.prepare("SELECT generation,interruption_revision,state FROM guardian_sessions WHERE attempt_id=?1 ORDER BY generation")?;
+    let rows = statement.query_map([id], |row| {
+        Ok((
+            row.get::<_, Word>(0)?.0,
+            row.get::<_, Word>(1)?.0,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (generation, interruption_revision, state) = row?;
+        let generation = required(NonZeroU64::new(generation), "zero session generation")?;
+        let interruption_revision = binding_revision(interruption_revision)?;
+        if usize::try_from(generation.get()) != Ok(sessions.len() + 1)
+            || sessions
+                .last()
+                .is_some_and(|prior: &NativeGuardianSession| {
+                    prior.interruption_revision >= interruption_revision
+                })
+            || interruption_revision > attempt_revision
+        {
+            return malformed("invalid guardian session progression");
+        }
+        let state = match state.as_str() {
+            "active" => NativeSessionState::Active,
+            "detached" => NativeSessionState::Detached,
+            "reconciling" => NativeSessionState::Reconciling,
+            _ => return malformed("unknown guardian session state"),
+        };
+        if !sessions.is_empty() && state == NativeSessionState::Active {
+            return malformed("active session after first generation");
+        }
+        if sessions
+            .last()
+            .is_some_and(|prior: &NativeGuardianSession| {
+                prior.state != NativeSessionState::Detached
+            })
+        {
+            return malformed("unfinished prior guardian session");
+        }
+        sessions.push(NativeGuardianSession {
+            generation,
+            interruption_revision,
+            state,
+        });
+    }
+    if sessions.is_empty()
+        || sessions
+            .last()
+            .is_some_and(|last| last.interruption_revision > dispatch_floor)
+    {
+        return malformed("missing session or regressed dispatch floor");
+    }
+    Ok(sessions)
+}
+
+fn read_binding_slots(
+    connection: &Connection,
+    id: &[u8],
+    guardian: ProcessIdentity,
+    slot_count: i64,
+) -> Result<Vec<NativeGuardianSlot>> {
+    let mut slots = Vec::new();
+    let mut statement = connection.prepare("SELECT ordinal,pid,birth_seconds,birth_nanos,liveness FROM guardian_slots WHERE attempt_id=?1 ORDER BY ordinal")?;
+    let rows = statement.query_map([id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Word>(2)?.0,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (ordinal, pid, seconds, nanos, liveness) = row?;
+        if usize::try_from(ordinal) != Ok(slots.len())
+            || slots.len() >= crate::guardian::MAX_CHILD_SLOTS
+        {
+            return malformed("guardian slot inventory has gaps or excess");
+        }
+        let liveness = match liveness.as_str() {
+            "running" => NativeSlotLiveness::Running,
+            "exited" => NativeSlotLiveness::Exited,
+            "unavailable" => NativeSlotLiveness::Unavailable,
+            _ => return malformed("unknown guardian slot liveness"),
+        };
+        let process = binding_identity(pid, seconds, nanos)?;
+        if process == guardian {
+            return malformed("guardian appears in slot inventory");
+        }
+        slots.push(NativeGuardianSlot { process, liveness });
+    }
+    if usize::try_from(slot_count) != Ok(slots.len()) {
+        return malformed("guardian slot cardinality mismatch");
+    }
+    Ok(slots)
 }
 
 fn check_authority(connection: &Connection) -> Result<()> {
@@ -358,7 +793,7 @@ fn write_attempt(connection: &Connection, attempt: &DeploymentAttempt) -> Result
     let id = key(attempt.attempt_id());
     let header = Header::from_attempt(attempt)?;
     connection.execute(
-        "INSERT INTO attempts (attempt_id,deadline,phase,interrupted_phase,recovery_resume,ownership_cleanup,block_reason,verification,compatibility,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO attempts (attempt_id,deadline,phase,interrupted_phase,recovery_resume,ownership_cleanup,block_reason,verification,compatibility,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(attempt_id) DO UPDATE SET phase=excluded.phase,interrupted_phase=excluded.interrupted_phase,recovery_resume=excluded.recovery_resume,ownership_cleanup=excluded.ownership_cleanup,block_reason=excluded.block_reason,verification=excluded.verification,compatibility=excluded.compatibility,revision=excluded.revision",
         params![
             id,
             Word(header.deadline.get()),

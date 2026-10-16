@@ -92,4 +92,34 @@ CREATE TABLE discovery_epochs (
     CHECK((gap = 'observation') = (failure IS NOT NULL)),
     CHECK((gap = 'different_process') = (replacement_ordinal IS NOT NULL))
 ) STRICT;
-PRAGMA user_version = 1;
+CREATE TABLE guardian_bindings (
+    attempt_id BLOB PRIMARY KEY NOT NULL REFERENCES attempts(attempt_id),
+    nonce BLOB NOT NULL UNIQUE CHECK(length(nonce) = 16 AND nonce != zeroblob(16)),
+    guardian_pid INTEGER NOT NULL CHECK(guardian_pid BETWEEN 1 AND 4294967295),
+    guardian_birth_seconds BLOB NOT NULL CHECK(length(guardian_birth_seconds) = 8),
+    guardian_birth_nanos INTEGER NOT NULL CHECK(guardian_birth_nanos BETWEEN 0 AND 999999999),
+    revision BLOB NOT NULL CHECK(length(revision) = 8 AND revision != zeroblob(8)),
+    dispatch_floor BLOB NOT NULL CHECK(length(dispatch_floor) = 8 AND dispatch_floor != zeroblob(8)),
+    slot_count INTEGER NOT NULL CHECK(slot_count BETWEEN 0 AND 64),
+    UNIQUE(guardian_pid, guardian_birth_seconds, guardian_birth_nanos)
+) STRICT;
+CREATE TABLE guardian_sessions (
+    attempt_id BLOB NOT NULL REFERENCES guardian_bindings(attempt_id),
+    generation BLOB NOT NULL CHECK(length(generation) = 8 AND generation != zeroblob(8)),
+    interruption_revision BLOB NOT NULL CHECK(length(interruption_revision) = 8 AND interruption_revision != zeroblob(8)),
+    state TEXT NOT NULL CHECK(state IN ('active','detached','reconciling')),
+    PRIMARY KEY(attempt_id, generation),
+    UNIQUE(attempt_id, interruption_revision)
+) STRICT;
+CREATE UNIQUE INDEX guardian_one_live_session ON guardian_sessions(attempt_id) WHERE state IN ('active','reconciling');
+CREATE TABLE guardian_slots (
+    attempt_id BLOB NOT NULL REFERENCES guardian_bindings(attempt_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 64),
+    pid INTEGER NOT NULL CHECK(pid BETWEEN 1 AND 4294967295),
+    birth_seconds BLOB NOT NULL CHECK(length(birth_seconds) = 8),
+    birth_nanos INTEGER NOT NULL CHECK(birth_nanos BETWEEN 0 AND 999999999),
+    liveness TEXT NOT NULL CHECK(liveness IN ('running','exited','unavailable')),
+    PRIMARY KEY(attempt_id, ordinal),
+    UNIQUE(pid, birth_seconds, birth_nanos)
+) STRICT;
+PRAGMA user_version = 2;

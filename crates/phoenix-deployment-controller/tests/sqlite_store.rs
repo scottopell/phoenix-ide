@@ -997,6 +997,9 @@ fn schema_is_normalized_and_unknown_versions_and_unversioned_contents_are_reject
         [
             "attempts",
             "discovery_epochs",
+            "guardian_bindings",
+            "guardian_sessions",
+            "guardian_slots",
             "owned_identities",
             "ownership",
             "pending_child_scans",
@@ -1038,15 +1041,20 @@ fn schema_is_normalized_and_unknown_versions_and_unversioned_contents_are_reject
         1
     );
     assert_eq!(raw.query_row("SELECT count(*) FROM pragma_table_info('resource_samples') WHERE name='ordinal' AND [notnull]=1", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-    raw.pragma_update(None, "user_version", 2).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    raw.pragma_update(None, "user_version", 3).unwrap();
     assert!(matches!(
         store.load_attempt(AttemptId::new(8)),
-        Err(ControllerStoreError::UnsupportedSchema(2))
+        Err(ControllerStoreError::UnsupportedSchema(3))
     ));
     drop(store);
     assert!(matches!(
         ControllerSqliteStore::open(&path),
-        Err(ControllerStoreError::UnsupportedSchema(2))
+        Err(ControllerStoreError::UnsupportedSchema(3))
     ));
     let other = directory.path().join("unversioned.sqlite");
     Connection::open(&other)

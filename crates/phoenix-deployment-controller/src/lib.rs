@@ -1,6 +1,6 @@
 //! Standalone deployment policy with checkpoint-before-effect authority.
 //!
-//! The controller-owned `SQLite` store supports only its exact schema v1. Each
+//! The controller-owned `SQLite` store supports only its exact schema v2. Each
 //! durable write compares and advances the attempt revision atomically. Successful
 //! persistence returns a checkpoint carrying that revision plus its OS effects;
 //! failures drop the transition and poison the store handle until reopen.
@@ -17,6 +17,7 @@ pub mod guardian_ipc;
 mod identity;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod native_binding;
 #[cfg(unix)]
 pub mod native_guardian;
 mod os;
@@ -45,6 +46,10 @@ pub use identity::{
 pub use macos::{
     MacOsControllerOs, MacOsError, MacOsGuardianExecutor, SupervisedChild, SupervisedFinalization,
     SupervisionRisk,
+};
+pub use native_binding::{
+    GuardianLifetimeNonce, NativeGuardianBinding, NativeGuardianIdentity, NativeGuardianSession,
+    NativeGuardianSlot, NativeSessionState, NativeSlotLiveness,
 };
 pub use os::{
     CandidateVerification, ControllerOs, OsEffect, OsQueryError, ResourceObservationFailure,
