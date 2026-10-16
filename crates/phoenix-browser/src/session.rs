@@ -525,7 +525,7 @@ pub struct ConsoleEntry {
     pub level: ConsoleLevel,
     pub text: String,
     pub timestamp: Instant,
-    source_context: Option<String>,
+    source_document: Option<console::Document>,
     capture_generation: Option<console::Generation>,
 }
 

@@ -1,6 +1,6 @@
 # ADR-109: Navigation console capture uses ordered context identities
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-110
 - **Date:** 2026-10-16
 - **Affects:** REQ-BT-004, REQ-BCLI-007
 

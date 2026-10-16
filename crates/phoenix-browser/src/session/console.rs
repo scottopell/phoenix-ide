@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,15 @@ use super::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Generation(uuid::Uuid);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Document(uuid::Uuid);
+
+impl Default for Document {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
 enum Boundary {
     Begin(Generation),
     Drain,
@@ -32,13 +41,13 @@ struct Pending {
 
 #[derive(Clone, Debug)]
 struct ContextBoundary {
-    marker_context: String,
-    contexts: HashSet<String>,
+    document: Document,
 }
 
 #[derive(Default)]
 struct State {
     contexts: HashMap<ExecutionContextId, String>,
+    document: Document,
     generation: Option<Generation>,
     failure: Option<String>,
     pending: HashMap<String, Pending>,
@@ -135,10 +144,9 @@ impl ConsoleCapture {
                 if let Boundary::Begin(generation) = pending.boundary {
                     state.generation = Some(generation);
                 }
-                if let Some(marker_context) = state.contexts.get(&event.execution_context_id) {
+                if state.contexts.contains_key(&event.execution_context_id) {
                     let _ = pending.acknowledged.send(ContextBoundary {
-                        marker_context: marker_context.clone(),
-                        contexts: state.contexts.values().cloned().collect(),
+                        document: state.document,
                     });
                 } else {
                     state.failure =
@@ -155,7 +163,10 @@ impl ConsoleCapture {
             }
             (
                 state.generation,
-                state.contexts.get(&event.execution_context_id).cloned(),
+                state
+                    .contexts
+                    .contains_key(&event.execution_context_id)
+                    .then_some(state.document),
             )
         };
         let level = event.r#type.clone().into();
@@ -176,7 +187,7 @@ impl ConsoleCapture {
             level,
             text,
             timestamp: Instant::now(),
-            source_context: generation.1,
+            source_document: generation.1,
             capture_generation: generation.0,
         });
         notification.notify_one();
@@ -217,11 +228,12 @@ impl ConsoleCapture {
                     .retain(|_, unique| *unique != event.execution_context_unique_id);
             }
             Some("Runtime.executionContextsCleared") => {
-                self.state
+                let mut state = self
+                    .state
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contexts
-                    .clear();
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.contexts.clear();
+                state.document = Document::default();
             }
             Some("Runtime.consoleAPICalled") => {
                 let event: EventConsoleApiCalled =
@@ -387,7 +399,7 @@ impl BrowserSession {
             return Err(capture_error("capture belongs to another browser"));
         }
         let final_boundary = self.console_boundary(Boundary::Drain).await?;
-        let same_document = capture.boundary.marker_context == final_boundary.marker_context;
+        let same_document = capture.boundary.document == final_boundary.document;
         let logs = self
             .console_logs
             .lock()
@@ -396,8 +408,8 @@ impl BrowserSession {
             .iter()
             .filter(|entry| {
                 entry.capture_generation == Some(capture.generation)
-                    && entry.source_context.as_ref().is_some_and(|context| {
-                        same_document || !capture.boundary.contexts.contains(context)
+                    && entry.source_document.is_some_and(|document| {
+                        same_document || capture.boundary.document != document
                     })
             })
             .cloned()
@@ -450,6 +462,20 @@ mod tests {
             &logs,
             &notification,
         );
+        context(&capture, 4, "late-created-old-iframe");
+        capture.accept(
+            &event(4, "late-created old iframe error", "error"),
+            &logs,
+            &notification,
+        );
+        capture
+            .observe(
+                &json!({"method":"Runtime.executionContextsCleared","params":{}}),
+                &logs,
+                &notification,
+            )
+            .unwrap();
+        context(&capture, 10, "new-marker");
         context(&capture, 2, "new-main");
         context(&capture, 3, "new-iframe");
         capture.accept(
@@ -462,20 +488,19 @@ mod tests {
         capture.accept(&event(10, &end.marker, "debug"), &logs, &notification);
         end_ack.await.unwrap();
         let logs = logs.lock().unwrap();
-        let contexts = &initial.contexts;
+        let document = initial.document;
         let selected: Vec<_> = logs
             .iter()
             .filter(|entry| {
                 entry.capture_generation == Some(generation)
                     && entry
-                        .source_context
-                        .as_ref()
-                        .is_some_and(|context| !contexts.contains(context))
+                        .source_document
+                        .is_some_and(|source| source != document)
             })
             .map(|entry| entry.text.as_str())
             .collect();
         assert_eq!(selected, ["new navigation error", "new iframe error"]);
-        assert_eq!(logs.len(), 4, "internal markers are not console entries");
+        assert_eq!(logs.len(), 5, "internal markers are not console entries");
     }
 
     #[tokio::test]
@@ -504,6 +529,17 @@ mod tests {
             )
             .unwrap();
         context(&capture, 2, "new-iframe-reused-number");
+        capture.observe(&json!({"method":"Runtime.executionContextDestroyed","params":{"executionContextUniqueId":"old-iframe"}}), &logs, &notification).unwrap();
+        assert_eq!(
+            capture
+                .state
+                .lock()
+                .unwrap()
+                .contexts
+                .get(&ExecutionContextId::new(2))
+                .map(String::as_str),
+            Some("new-iframe-reused-number")
+        );
         capture.accept(
             &event(2, "removed new iframe error", "error"),
             &logs,
@@ -516,9 +552,8 @@ mod tests {
             .filter(|entry| {
                 entry.capture_generation == Some(generation)
                     && entry
-                        .source_context
-                        .as_ref()
-                        .is_some_and(|context| !initial.contexts.contains(context))
+                        .source_document
+                        .is_some_and(|source| source != initial.document)
             })
             .map(|entry| entry.text.as_str())
             .collect();
@@ -597,6 +632,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One browser lifetime verifies ordered document capture and history retention"
+    )]
     async fn native_console_capture_preserves_new_document_and_iframe_errors() {
         use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
@@ -630,6 +669,16 @@ mod tests {
                 .evaluate("frames[0].console.error('late-old-iframe-error'); true")
                 .await
                 .unwrap();
+            let mut create_old_frame = EvaluateParams::new("new Promise(resolve => { const frame = document.createElement('iframe'); frame.srcdoc = `<script>console.error('late-created-old-iframe-error')</script>`; frame.onload = () => { frame.remove(); resolve(true); }; document.body.append(frame); })");
+            create_old_frame.await_promise = Some(true);
+            create_old_frame.return_by_value = Some(true);
+            assert!(session
+                .page
+                .evaluate(create_old_frame)
+                .await
+                .unwrap()
+                .into_value::<bool>()
+                .unwrap());
             let url = "data:text/html,<script>console.error('new-page-error');console.debug=()=>{throw Error('new-page console override')};</script><iframe srcdoc=\"<script>console.error('new-iframe-error')</script>\"></iframe><iframe srcdoc=\"<script>console.error('removed-iframe-error');frameElement.remove()</script>\"></iframe>";
             session.page.goto(url).await.unwrap();
             let captured = session
@@ -669,6 +718,10 @@ mod tests {
         assert!(!captured.contains(&"old-page-error"), "{captured:?}");
         assert!(!captured.contains(&"old-iframe-error"), "{captured:?}");
         assert!(!captured.contains(&"late-old-iframe-error"), "{captured:?}");
+        assert!(
+            !captured.contains(&"late-created-old-iframe-error"),
+            "{captured:?}"
+        );
         let fragment_captured: Vec<_> = fragment_captured
             .iter()
             .map(|entry| entry.text.as_str())
@@ -676,13 +729,14 @@ mod tests {
         assert_eq!(fragment_captured, ["after-fragment-error"]);
         assert_eq!(
             ordinary_logs.len(),
-            8,
+            9,
             "only application entries are retained"
         );
         for expected in [
             "old-page-error",
             "old-iframe-error",
             "late-old-iframe-error",
+            "late-created-old-iframe-error",
             "new-page-error",
             "removed-iframe-error",
             "new-iframe-error",
