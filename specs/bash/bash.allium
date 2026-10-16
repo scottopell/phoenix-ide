@@ -1102,6 +1102,10 @@ rule HandleKillNotFound {
 -- Rules — conversation hard-delete cascade
 ------------------------------------------------------------
 
+-- These execution-row cascade rules apply only when the ProductConversation
+-- is not being retired. Aggregate Close/Delete uses durable retirement authority:
+-- same-aggregate continuation/subagent rows do not veto resource cleanup; only
+-- a distinct still-Open aggregate retains a scope, with identity conflicts surfaced.
 -- REQ-BASH-006, REQ-BASH-WS-002: conversation hard-delete tears down the
 -- ResourceScope's handle table only when no live conversation OTHER THAN the one
 -- being deleted still owns the same ResourceScope. The cascade receives the

@@ -191,6 +191,10 @@ rule ContinuationReusesSession {
     ensures: not BrowserSessionLifecycleEvent.emitted
 }
 
+-- These execution-row cascade rules apply only when the ProductConversation
+-- is not being retired. Aggregate Close/Delete uses durable retirement authority:
+-- same-aggregate continuation/subagent rows do not veto resource cleanup; only
+-- a distinct still-Open aggregate retains a scope, with identity conflicts surfaced.
 -- REQ-BROWSER-WS-003: cleanup-cascade tear-down when no live conversation
 -- other than the one being deleted still owns the scope. The orchestrator
 -- sets `inheritor_scope` to Some(work_scope) iff a live conversation
