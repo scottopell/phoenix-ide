@@ -1211,7 +1211,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       ),
     );
 
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
@@ -1298,7 +1298,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         });
     rerender(renderList(makeRestoreAfterPrefixExpansionCommand()));
 
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     virtualTranscriptMock.physicalSnapshot.mockImplementation((targetIndex?: number) => targetIndex === undefined
@@ -1665,7 +1665,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 2, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }, messageId: 'msg-3' })), result: 'applied' });
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24, undefined, 'continuity');
   });
 
   it('does not acknowledge jump until the visible target is measured, then finishes exactly once', () => {

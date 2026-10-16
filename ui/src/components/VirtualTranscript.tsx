@@ -54,6 +54,7 @@ export interface VirtualTranscriptHandle {
     align: 'start' | 'end',
     viewportStartOffset?: number,
     targetSelector?: VirtualTranscriptTarget,
+    startPolicy?: 'directional' | 'continuity',
   ): void;
   scrollToOwnedIndex(
     commandKey: string,
@@ -61,6 +62,7 @@ export interface VirtualTranscriptHandle {
     align: 'start' | 'end',
     viewportStartOffset?: number,
     targetSelector?: VirtualTranscriptTarget,
+    startPolicy?: 'directional' | 'continuity',
   ): void;
   cancelPosition(commandKey: string): void;
   scrollToTail(): void;
@@ -136,7 +138,8 @@ interface PhysicalStore<T> {
     key: string;
     align: 'start' | 'end';
     viewportStartOffset: number;
-    selector: VirtualTranscriptTarget;
+    startPolicy: 'directional' | 'continuity';
+    selector: VirtualTranscriptTarget | undefined;
   } | null;
   pinned: boolean;
   revision: number;
@@ -392,8 +395,8 @@ function computeRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
   });
 }
 
-function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void {
-  if (retireUnauthorizedPosition(store)) return;
+function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): boolean {
+  if (retireUnauthorizedPosition(store)) return false;
   const scroller = store.scroller;
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
   const scrollTop = Math.max(0, Math.min(nextTop, maxScrollTop));
@@ -405,13 +408,15 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   if (isLayoutHidden(scroller)) {
     store.pendingScrollTop = scrollTop;
     store.revealPublicationPending = true;
-    return;
+    return false;
   }
   store.pendingScrollTop = null;
   if (scroller && scroller.scrollTop !== scrollTop) {
     store.pendingProgrammaticTop = scrollTop;
     scroller.scrollTop = scrollTop;
+    return true;
   }
+  return false;
 }
 
 function retirePosition<T>(current: PhysicalStore<T>): void {
@@ -435,6 +440,24 @@ function retireUnauthorizedPosition<T>(store: PhysicalStore<T>): boolean {
   return true;
 }
 
+function applyAlignedPosition<T>(
+  current: PhysicalStore<T>, index: number, key: string, physicalOffset: number,
+  target: number, align: 'start' | 'end', startPolicy: 'directional' | 'continuity',
+): void {
+  current.activeAnchor = { index, key, offset: physicalOffset - target };
+  let wrotePosition = setScrollerScrollTop(current, target);
+  if (align !== 'start' || startPolicy === 'continuity' || !current.scroller || isLayoutHidden(current.scroller)) return;
+  const ceiling = Math.max(0, Math.min(target, Math.max(0, totalPhysicalExtent(current) - current.viewportExtent)));
+  const applied = current.scroller.scrollTop;
+  if (applied > ceiling && applied - ceiling <= 1) {
+    wrotePosition = setScrollerScrollTop(current, Math.max(0, ceiling - 1)) || wrotePosition;
+  }
+  const finalTop = current.scroller.scrollTop;
+  current.viewportTop = finalTop;
+  if (wrotePosition) current.pendingProgrammaticTop = finalTop;
+  current.activeAnchor = { index, key, offset: physicalOffset - finalTop };
+}
+
 function positionAtIndex<T>(
   current: PhysicalStore<T>,
   owner: PositionOwner,
@@ -442,6 +465,7 @@ function positionAtIndex<T>(
   align: 'start' | 'end',
   viewportStartOffset: number,
   targetSelector: VirtualTranscriptTarget | undefined,
+  startPolicy: 'directional' | 'continuity',
 ): void {
   if (!positionIsAuthorized(current, owner)) return;
   const unit = current.layout.itemAt(index);
@@ -452,16 +476,15 @@ function positionAtIndex<T>(
   const intraRowOffset = targetElement && row
     ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
     : 0;
-  current.pendingTarget = targetSelector && (!targetElement || isLayoutHidden(current.scroller))
-    ? { key: unit.key, align, viewportStartOffset, selector: targetSelector }
+  current.pendingTarget = isLayoutHidden(current.scroller) || (targetSelector && !targetElement)
+    ? { key: unit.key, align, viewportStartOffset, selector: targetSelector, startPolicy }
     : null;
   const physicalOffset = current.headerExtent + unit.offset + current.drift;
   const physicalEnd = current.headerExtent + unit.end + current.drift;
   const target = align === 'end'
     ? physicalEnd - current.viewportExtent + viewportStartOffset
     : physicalOffset + intraRowOffset - viewportStartOffset;
-  current.activeAnchor = { index, key: unit.key, offset: physicalOffset - target };
-  setScrollerScrollTop(current, target);
+  applyAlignedPosition(current, index, unit.key, physicalOffset, target, align, startPolicy);
   recompute(current);
 }
 
@@ -472,7 +495,7 @@ function resolvePendingTarget<T>(current: PhysicalStore<T>): boolean {
   const key = pending.key;
   const element = current.rowElements.get(key);
   const index = current.keys.indexOf(key);
-  const targetElement = resolveTarget(element, pending.selector);
+  const targetElement = pending.selector ? resolveTarget(element, pending.selector) : element;
   const unit = current.layout.itemAt(index);
   if (!element || !targetElement || !unit) return false;
   current.pendingTarget = null;
@@ -482,8 +505,7 @@ function resolvePendingTarget<T>(current: PhysicalStore<T>): boolean {
   const target = pending.align === 'end'
     ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
     : physicalOffset + intraRowOffset - pending.viewportStartOffset;
-  current.activeAnchor = { index, key, offset: physicalOffset - target };
-  setScrollerScrollTop(current, target);
+  applyAlignedPosition(current, index, key, physicalOffset, target, pending.align, pending.startPolicy);
   return true;
 }
 
@@ -952,16 +974,16 @@ function VirtualTranscriptInner<T>(
   }, [onPinnedChange, pinned]);
 
   useImperativeHandle(ref, () => ({
-    scrollToIndex(index, align, viewportStartOffset = 0, targetSelector) {
+    scrollToIndex(index, align, viewportStartOffset = 0, targetSelector, startPolicy = 'directional') {
       const current = storeRef.current;
       if (!current) return;
-      positionAtIndex(current, { kind: 'unowned' }, index, align, viewportStartOffset, targetSelector);
+      positionAtIndex(current, { kind: 'unowned' }, index, align, viewportStartOffset, targetSelector, startPolicy);
       publish();
     },
-    scrollToOwnedIndex(commandKey, index, align, viewportStartOffset = 0, targetSelector) {
+    scrollToOwnedIndex(commandKey, index, align, viewportStartOffset = 0, targetSelector, startPolicy = 'directional') {
       const current = storeRef.current;
       if (!current) return;
-      positionAtIndex(current, { kind: 'command', commandKey }, index, align, viewportStartOffset, targetSelector);
+      positionAtIndex(current, { kind: 'command', commandKey }, index, align, viewportStartOffset, targetSelector, startPolicy);
       publish();
     },
     cancelPosition(commandKey) {

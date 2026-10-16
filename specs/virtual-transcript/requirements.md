@@ -72,6 +72,8 @@ WHEN navigation targets a renderable message identifier
 THE SYSTEM SHALL resolve it to its physical render unit and position that unit according to the requested alignment
 AND SHALL acknowledge the command only after the target is physically present at the requested position.
 
+For web semantic start alignment, the physical executor SHALL read back the applied native scroll position. If that position exceeds the clamped desired start ceiling by at most one CSS pixel, the executor SHALL issue at most one conservative correction, requesting one CSS pixel below that ceiling, clamped at zero. It SHALL record the final native position in viewport and active-anchor accounting, and associate an own-write echo only with an actual viewport write. Fractional positions accepted without overshoot SHALL NOT trigger a correction. Hidden positioning SHALL retain intent until visible execution under the same authority. This directional correction SHALL NOT apply to end alignment, tail following, or prefix-expansion continuity restoration; restoration retains its captured viewport offset and continuity tolerance. No arbitrary native quantization or device-pixel-ratio guarantee is implied.
+
 WHEN no render unit owns the identifier
 THE SYSTEM SHALL report the target as missing.
 
