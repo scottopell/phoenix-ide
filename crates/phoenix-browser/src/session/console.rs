@@ -117,9 +117,6 @@ impl ConsoleCapture {
                 let pending = state.pending.remove(marker).expect("registered marker");
                 if let Boundary::Begin(generation) = pending.boundary {
                     state.generation = Some(generation);
-                    logs.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clear();
                 }
                 let _ = pending.acknowledged.send(());
                 return;
@@ -262,7 +259,11 @@ mod tests {
         ));
         capture.accept(&event(9, &begin.marker, "debug"), &logs, &notification);
         begin_ack.await.unwrap();
-        assert!(logs.lock().unwrap().is_empty());
+        assert_eq!(
+            logs.lock().unwrap().len(),
+            1,
+            "navigation preserves session history"
+        );
         capture.accept(
             &event(1, "late old-document error", "error"),
             &logs,
@@ -288,7 +289,7 @@ mod tests {
             .map(|entry| entry.text.as_str())
             .collect();
         assert_eq!(selected, ["new navigation error", "new iframe error"]);
-        assert_eq!(logs.len(), 3, "internal markers are not console entries");
+        assert_eq!(logs.len(), 4, "internal markers are not console entries");
     }
 
     #[tokio::test]
@@ -312,9 +313,11 @@ mod tests {
             &notification,
         );
         let logs = logs.lock().unwrap();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].text, "after fragment navigation");
-        assert_eq!(logs[0].capture_generation, Some(generation));
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].text, "before fragment navigation");
+        assert_eq!(logs[0].capture_generation, None);
+        assert_eq!(logs[1].text, "after fragment navigation");
+        assert_eq!(logs[1].capture_generation, Some(generation));
     }
 
     #[tokio::test]
@@ -378,6 +381,22 @@ mod tests {
             .map(|entry| entry.text.as_str())
             .collect();
         assert_eq!(fragment_captured, ["after-fragment-error"]);
-        assert_eq!(ordinary_logs, ["after-fragment-error"]);
+        assert_eq!(
+            ordinary_logs.len(),
+            5,
+            "only application entries are retained"
+        );
+        for expected in [
+            "old-page-error",
+            "new-page-error",
+            "new-iframe-error",
+            "before-fragment-error",
+            "after-fragment-error",
+        ] {
+            assert!(
+                ordinary_logs.iter().any(|entry| entry == expected),
+                "{ordinary_logs:?}"
+            );
+        }
     }
 }

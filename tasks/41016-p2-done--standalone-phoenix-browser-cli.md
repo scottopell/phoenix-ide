@@ -47,3 +47,13 @@ MCP, remote hosting, sharing a live browser with Phoenix, profile cloning/import
 - `crates/phoenix-tools/src/browser/{tools.rs,profile.rs}` and `browser_tools()` registration.
 - `specs/browser-tool/` and the compatibility policy before changing any guarantees.
 - Existing task 45006 tracks idle-reap revalidation; inspect its current implementation/status before reusing or changing idle cleanup. Avoid duplicating it.
+
+## Delivery evidence
+
+Implementation and local acceptance are complete in [PR #925](https://github.com/scottopell/phoenix-ide/pull/925); final hosted CI and Codex qualification are tracked on that PR.
+
+- All 22 executable integration tests passed with actual Chrome, covering session selection/isolation, concurrent startup, native refs and literal input, screenshots/console/profiling, close/reopen, Chrome death, startup signal cleanup, inherited descriptors, idle expiry and active work, semantic/timeout validation, structured failures, and console retention after failed navigation.
+- Four browser-access/catalog tests, two daemon fault/observation tests, engine console/snapshot tests, existing browser journeys, owning Clippy, and repository spec/lint/task checks passed. The cleanup fault regression proves an invalid profile marker retains the owner lock until repair and explicit retry.
+- An isolated debug installation ran help/schema/open/eval/close without the Phoenix server.
+- Codex review findings received concrete corrections and regression evidence; an independent review also reproduced and drove fixes for pointer-capture retargeting and navigation deleting ordinary console history.
+- The broad local check's unchanged macOS database integrity-check failure was reproduced separately and captured as task 41017. It is not represented as a successful full-suite run.

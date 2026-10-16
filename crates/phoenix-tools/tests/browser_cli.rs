@@ -841,6 +841,42 @@ fn executable_browser_journey_preserves_state_and_profiles() {
 }
 
 #[test]
+fn failed_navigation_preserves_session_console_history() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    let opened = cli.ok(&["open", &fixture()]);
+    cli.eval("console.error('history-survives-failed-open'); true");
+    let before = wait_for_observation("console captured the retained history entry", || {
+        let response = cli.ok(&["console"]);
+        response["result"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("history-survives-failed-open"))
+            .then_some(response)
+    });
+    let failed = cli.invoke(&["open", "http://127.0.0.1:1/"], None, false);
+    assert_eq!(failed["lifetime"], opened["lifetime"]);
+    assert_eq!(failed["browser_lifetime"], opened["browser_lifetime"]);
+    let after = cli.ok(&["console"]);
+    assert_eq!(after["lifetime"], before["lifetime"]);
+    assert_eq!(after["browser_lifetime"], before["browser_lifetime"]);
+    let entries = |response: &Value| -> Vec<Value> {
+        serde_json::from_str(response["result"]["text"].as_str().unwrap()).unwrap()
+    };
+    let before = entries(&before);
+    let after = entries(&after);
+    let retained = before
+        .iter()
+        .find(|entry| entry["text"] == "history-survives-failed-open")
+        .unwrap();
+    assert!(
+        after.contains(retained),
+        "failed open discarded history: {after:?}"
+    );
+}
+
+#[test]
 fn concurrent_initial_open_has_one_owner_and_lifetime() {
     // REQ-BCLI-003.
     if !chrome_enabled() {
@@ -1161,22 +1197,68 @@ fn active_work_outlives_idle_budget_then_session_expires() {
         return;
     }
     let cli = BrowserCli::new();
-    let url = fixture();
-    let opened = cli.ok(&["--idle-timeout", "1", "open", &url]);
-    let resources = live_resources(&cli);
-    let active = cli.invoke(
-        &["eval", "--stdin"],
-        Some("new Promise(resolve => setTimeout(() => resolve('finished'), 2200))"),
-        true,
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let opening = cli
+        .command()
+        .args(["--idle-timeout", "1", "open", &url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut page_request =
+        wait_for_observation(
+            "initial navigation reached HTTP boundary",
+            || match listener.accept() {
+                Ok((stream, _)) => Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(error) => panic!("navigation listener failed: {error}"),
+            },
+        );
+    let queue = |request: Value| {
+        let mut stream = UnixStream::connect(cli.socket()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        serde_json::to_writer(&mut stream, &request).unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream
+    };
+    let read_response = |stream: UnixStream| -> Value {
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).unwrap();
+        serde_json::from_str(&response).unwrap()
+    };
+    let status = queue(json!({"command":"status", "input":{}}));
+    let evaluation = queue(json!({"command":"eval", "input":{
+        "expression":"new Promise(resolve => setTimeout(() => resolve('finished'), 2200))",
+        "timeout":"10s"
+    }}));
+    page_request.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 55\r\nConnection: close\r\n\r\n<!doctype html><title>Idle lifetime</title><p>Ready</p>").unwrap();
+    drop(page_request);
+    let status = read_response(status);
+    assert_eq!(status["status"], "success");
+    assert_eq!(status["result"]["idle_timeout_seconds"], 1);
+    let daemon_pid = u32::try_from(status["result"]["daemon_pid"].as_u64().unwrap()).unwrap();
+    let daemon = current_process_identity(daemon_pid).expect("operation owns idle daemon");
+    let chrome_pid = u32::try_from(status["result"]["chrome_pid"].as_u64().unwrap()).unwrap();
+    let resources = (
+        PathBuf::from(status["result"]["profile_path"].as_str().unwrap()),
+        current_process_identity(chrome_pid).expect("operation owns Chrome"),
     );
+    let output = opening.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let opened: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["lifetime"], opened["lifetime"]);
+    let active = read_response(evaluation);
+    assert_eq!(active["status"], "success");
     assert_eq!(active["lifetime"], opened["lifetime"]);
     assert_eq!(evaluation_value(&active), "finished");
-    let status = cli.ok(&["status"]);
-    assert_eq!(status["lifetime"], opened["lifetime"]);
-    assert_eq!(status["result"]["idle_timeout_seconds"], 1);
-
-    let daemon_pid = u32::try_from(status["result"]["daemon_pid"].as_u64().unwrap()).unwrap();
-    let daemon = current_process_identity(daemon_pid).expect("idle daemon is live");
     await_process_exit(daemon);
     assert_eq!(cli.ok(&["status"])["result"]["active"], false);
     assert_eq!(
@@ -1184,7 +1266,7 @@ fn active_work_outlives_idle_budget_then_session_expires() {
         "state_lost"
     );
     assert_resources_removed(&resources);
-    let restarted = cli.ok(&["open", &url]);
+    let restarted = cli.ok(&["open", &fixture()]);
     assert_ne!(restarted["lifetime"], opened["lifetime"]);
     assert_ne!(restarted["browser_lifetime"], opened["browser_lifetime"]);
     cli.ok(&["close"]);

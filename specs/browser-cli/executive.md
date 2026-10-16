@@ -33,4 +33,8 @@ The lifecycle contract is specified in `browser-cli.allium`; browser operation s
 
 Lifecycle and installed-command coverage live in `crates/phoenix-tools/tests/browser_cli.rs`. Browser-free preflight and operation-catalog parity live in `browser::access_tests`; profiling validation and methodology retain their existing unit coverage. Engine snapshot and console tests use actual Chrome for document replacement, native input, artifacts, source-event capture, and iframe diagnostics.
 
+Local acceptance passed 22 CLI integration tests with actual Chrome, four operation-boundary tests, two daemon failure/observation tests, three console tests, the snapshot/native-input suite, and existing browser journeys. Ordinary console history survives navigation, including failed navigation; the navigation result uses generation and context filtering without clearing that history. An isolated debug installation passed help/schema/open/eval/close smoke checks. Final CI and Codex review remain visible on the PR rather than being inferred from local checks.
+
 Local broad validation passed Clippy, E2E, Allium, spec shape/anchors, task validation, and dev-tool tests. Its Rust run stopped on the unchanged database test `current_schema_controller_accepts_compiled_123_and_128_shapes`: the macOS Python SQLite controller reported `unable to open database file` during integrity checking; an isolated rerun reproduced it. Full-suite success is not claimed from that run.
+
+The local database failure is tracked separately in task 41017.
