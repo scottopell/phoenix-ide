@@ -1314,6 +1314,14 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
             "root row should not yet point at a continuation"
         )
 
+        original_scope = exhausted['conversation']['work_scope_id']
+        assert original_scope, 'non-Git creation must own a persisted WorkScope'
+        assert exhausted['conversation']['conv_mode']['type'] == 'direct'
+        original_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{root_conv_id}'}, timeout=10)
+        original_resolution.raise_for_status()
+        original_environment = original_resolution.json()['work_scope']
+        assert original_environment['work_scope_id'] == original_scope
+        assert original_environment['environment_kind'] == 'unowned_cwd'
         handoff = "Continue with the same ProductConversation after natural context exhaustion."
         continue_response = httpx.post(
             f"{base_url}/api/conversations/{root_conv_id}/continue",
@@ -1349,6 +1357,11 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
         assert successor["conversation"].get("continued_in_conv_id") is None, (
             "successor should be the latest leaf row"
         )
+        assert successor['conversation']['work_scope_id'] == original_scope
+        assert successor['conversation']['cwd'] == exhausted['conversation']['cwd']
+        successor_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{successor_id}'}, timeout=10)
+        successor_resolution.raise_for_status()
+        assert successor_resolution.json()['work_scope'] == original_environment
         successor_state = _state_str(successor["conversation"]["state"])
         assert successor_state == "idle", f"successor not idle after handoff: {successor_state}"
         successor_agent_messages = [
