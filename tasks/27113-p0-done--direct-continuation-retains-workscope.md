@@ -52,3 +52,10 @@ Reviews were bounded static evidence, not exhaustive proof. Anchored passes were
 ## Release admission boundary
 
 Implementation and source qualification are complete. Global must independently admit merge/deploy and clear the v0.13 blocker against the integrated exact source. No current production behavior, historical scope repair, data migration, remote federation completion or deployed verification is claimed by this task status.
+
+
+### Final review closeout additions
+
+The later tmux user-facing isolation description and Bedrock rationale were still contradictory despite the earlier lifecycle fixes. `fc25b67fea5d1f57f9d3344af11e0844af36e94a` corrects the actual tool description and REQ-TMUX-009/SocketIsolation to scope—not transcript—isolation, and distinguishes the selected leaf attachment from the product's historical scope set. Independent exact-delta review found no new contradiction; the tool-description string changed but execution logic did not. Terminal-opening guidance was already corrected to persisted environment lookup; the later quoted removed Worktree mapping was checked against actual source rather than assumed current from retargeted GitHub comment metadata.
+
+Source-qualified `3bcab0233` remains retained success evidence. The final published record head's CI and all nine hosted thread dispositions are recorded in PR #926 before Global handoff; task completion is implementation delivery, not authority to merge/deploy or independently clear release admission. No open finding is dismissed solely because an earlier CI run passed. Documentation-only/description successors and their actual check results remain visible in PR history, including the superseded/cancelled record-head run 38955370096.
