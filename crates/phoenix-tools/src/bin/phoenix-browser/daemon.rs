@@ -378,18 +378,13 @@ impl State {
         );
         let (url, title) = {
             let guard = browser.read().await;
-            let url = tokio::time::timeout(Duration::from_secs(5), guard.page.url())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten();
-            let title = tokio::time::timeout(Duration::from_secs(5), guard.page.get_title())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten();
+            let url = navigation_observation(guard.page.url()).await;
+            let title = navigation_observation(guard.page.get_title()).await;
             (url, title)
         };
+        let mut observation_errors = serde_json::Map::new();
+        let url = observed_value("url", url, &mut observation_errors);
+        let title = observed_value("title", title, &mut observation_errors);
         let captured = match capture {
             Ok(capture) => {
                 browser
@@ -422,8 +417,32 @@ impl State {
         Response::success(
             &self.session,
             Some(&self.lifetime),
-            json!({"url":url,"title":title,"navigation":"succeeded","snapshot":snapshot.outcome,"console_errors":errors,"console_capture_error":console_capture_error}),
+            json!({"url":url,"title":title,"observation_errors":observation_errors,"navigation":"succeeded","snapshot":snapshot.outcome,"console_errors":errors,"console_capture_error":console_capture_error}),
         ).with_browser_lifetime(Some(browser_lifetime.into()))
+    }
+}
+
+async fn navigation_observation<E: std::fmt::Display>(
+    observation: impl std::future::Future<Output = Result<Option<String>, E>>,
+) -> Result<String, String> {
+    tokio::time::timeout(Duration::from_secs(5), observation)
+        .await
+        .map_err(|_| "Navigation observation timed out after 5 seconds".to_string())?
+        .map_err(|error| format!("Navigation observation failed: {error}"))?
+        .ok_or_else(|| "Navigation observation returned no value".into())
+}
+
+fn observed_value(
+    field: &str,
+    observation: Result<String, String>,
+    errors: &mut serde_json::Map<String, Value>,
+) -> Option<String> {
+    match observation {
+        Ok(value) => Some(value),
+        Err(error) => {
+            errors.insert(field.into(), Value::String(error));
+            None
+        }
     }
 }
 
@@ -553,31 +572,98 @@ async fn serve(
     let worker_result = task
         .await
         .map_err(|e| format!("browser worker failed: {e}"));
-    let cleanup = state
-        .manager
-        .shutdown_all()
-        .await
-        .map_err(|e| e.to_string());
-    if cleanup.is_ok() {
-        std::fs::remove_file(socket).map_err(|e| format!("retire endpoint: {e}"))?;
-    }
-    if let Some(mut stream) = close_stream {
-        let response = match &cleanup {
-            Ok(()) => Response::success(
-                &state.session,
-                Some(&state.lifetime),
-                json!({"active":false,"closed":true}),
-            ),
-            Err(error) => Response::error(
-                &state.session,
-                Some(&state.lifetime),
-                ErrorCode::CleanupFailed,
-                error,
-            ),
-        };
-        send_response(&mut stream, &response).await;
-    }
+    let browser_lifetime = match state.manager.get_existing(&state.scope).await {
+        Some(browser) => Some(browser.read().await.launch_identity().launch_uuid.clone()),
+        None => None,
+    };
+    let cleanup = finish_shutdown(listener, &state, socket, close_stream, browser_lifetime).await;
     result.and(worker_result).and(cleanup)
+}
+
+async fn finish_shutdown(
+    listener: &UnixListener,
+    state: &State,
+    socket: &Path,
+    mut close_stream: Option<UnixStream>,
+    browser_lifetime: Option<String>,
+) -> Result<(), String> {
+    loop {
+        let cleanup = state.manager.shutdown_all().await;
+        if cleanup.is_ok() {
+            std::fs::remove_file(socket).map_err(|e| format!("retire endpoint: {e}"))?;
+            if let Some(mut stream) = close_stream {
+                let response = Response::success(
+                    &state.session,
+                    Some(&state.lifetime),
+                    json!({"active":false,"closed":true}),
+                )
+                .with_browser_lifetime(browser_lifetime);
+                send_response(&mut stream, &response).await;
+            }
+            return Ok(());
+        }
+        let error = cleanup.expect_err("failed cleanup").to_string();
+        tracing::error!(%error, "browser cleanup failed; retaining session ownership until explicit close retries cleanup");
+        if let Some(mut stream) = close_stream.take() {
+            send_response(
+                &mut stream,
+                &cleanup_failure(state, &error, browser_lifetime.clone()),
+            )
+            .await;
+        }
+        let signal = match shutdown_signal() {
+            Ok(signal) => signal,
+            Err(failure) => retain_owner_forever(failure).await,
+        };
+        tokio::pin!(signal);
+        loop {
+            let accepted = tokio::select! {
+                () = &mut signal => break,
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, _) = match accepted {
+                Ok(accepted) => accepted,
+                Err(failure) => {
+                    retain_owner_forever(failure.to_string()).await;
+                }
+            };
+            let Some(mut job) = read_job(stream, state).await else {
+                continue;
+            };
+            if job.request.command == "close" {
+                close_stream = Some(job.stream);
+                break;
+            }
+            let response = if job.request.command == "status" {
+                Response::success(
+                    &state.session,
+                    Some(&state.lifetime),
+                    json!({
+                        "phase":"stopping", "cleanup_error":error,
+                    "resources": state.manager.cleanup_identifiers(&state.scope).await.into_iter().map(|resource| json!({"chrome_pid":resource.chrome_pid,"profile_path":resource.profile_path})).collect::<Vec<_>>(),
+                    }),
+                )
+                .with_browser_lifetime(browser_lifetime.clone())
+            } else {
+                cleanup_failure(state, &error, browser_lifetime.clone())
+            };
+            send_response(&mut job.stream, &response).await;
+        }
+    }
+}
+
+async fn retain_owner_forever(error: String) -> ! {
+    tracing::error!(%error, "cleanup control unavailable; retaining ownership requires manual process termination");
+    match std::future::pending::<std::convert::Infallible>().await {}
+}
+
+fn cleanup_failure(state: &State, error: &str, browser_lifetime: Option<String>) -> Response {
+    Response::error(
+        &state.session,
+        Some(&state.lifetime),
+        ErrorCode::CleanupFailed,
+        format!("Session cleanup is incomplete and ownership is retained: {error}. Inspect status, repair the reported resource, then retry close."),
+    ).with_browser_lifetime(browser_lifetime)
 }
 
 pub async fn run_from_args(args: &[String]) -> Result<(), String> {
@@ -634,4 +720,136 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
         idle: parse_idle(&args[2])?,
     });
     serve(&listener, state, &socket, signal).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn request(socket: &Path, command: &str) -> Response {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut stream = UnixStream::connect(socket).await.unwrap();
+            protocol::write_message(
+                &mut stream,
+                &Request {
+                    command: command.into(),
+                    input: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+            protocol::read_message(&mut stream).await.unwrap()
+        })
+        .await
+        .expect("daemon response")
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_retains_owner_until_explicit_repair_and_close() {
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("pb-close-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = directory.path().join("session.sock");
+        let lock_path = directory.path().join("owner");
+        let lock = lock_file(&lock_path).unwrap();
+        FileExt::try_lock_exclusive(&lock).unwrap();
+        let probe = lock_file(&lock_path).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let manager = BrowserSessionManager::new();
+        manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
+        let state = Arc::new(State {
+            manager: manager.clone(),
+            scope: ResourceScopeKey::Unattached(format!("cleanup-test:{}", uuid::Uuid::new_v4())),
+            session: "named:cleanup-test".into(),
+            lifetime: uuid::Uuid::new_v4().to_string(),
+            idle: Duration::from_secs(300),
+        });
+        let browser = manager.get_session(&state.scope).await.unwrap();
+        let browser_lifetime = browser.read().await.launch_identity().launch_uuid.clone();
+        let profile = std::path::PathBuf::from(
+            &manager.cleanup_identifiers(&state.scope).await[0].profile_path,
+        );
+        let marker = profile.join("phoenix-profile-owner.json");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, b"broken-owner-marker").unwrap();
+        let task_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            let _owner = Owner {
+                _lock: lock,
+                socket: task_socket.clone(),
+            };
+            serve(&listener, state, &task_socket, std::future::pending()).await
+        });
+        let failed = request(&socket, "close").await;
+        assert_eq!(
+            failed.browser_lifetime.as_deref(),
+            Some(browser_lifetime.as_str())
+        );
+        assert!(
+            matches!(failed.outcome, Outcome::Error { error } if error.code == ErrorCode::CleanupFailed)
+        );
+        assert!(profile.exists());
+        assert!(!task.is_finished());
+        assert_eq!(
+            FileExt::try_lock_exclusive(&probe).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let status = request(&socket, "status").await;
+        assert!(
+            matches!(status.outcome, Outcome::Success { result } if result["phase"] == "stopping")
+        );
+        assert!(
+            matches!(request(&socket, "open").await.outcome, Outcome::Error { error } if error.code == ErrorCode::CleanupFailed)
+        );
+        std::fs::write(&marker, original).unwrap();
+        let closed = request(&socket, "close").await;
+        assert_eq!(
+            closed.browser_lifetime.as_deref(),
+            Some(browser_lifetime.as_str())
+        );
+        assert!(matches!(closed.outcome, Outcome::Success { result } if result["closed"] == true));
+        task.await.unwrap().unwrap();
+        assert!(!profile.exists());
+        assert!(!socket.exists());
+        FileExt::try_lock_exclusive(&probe).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn navigation_observation_preserves_error_absence_and_timeout() {
+        assert_eq!(
+            navigation_observation(async { Ok::<_, String>(Some("https://example.test/".into())) })
+                .await
+                .unwrap(),
+            "https://example.test/"
+        );
+        assert!(
+            navigation_observation(async { Err::<Option<String>, _>("CDP disconnected") })
+                .await
+                .unwrap_err()
+                .contains("CDP disconnected")
+        );
+        assert!(navigation_observation(async { Ok::<_, String>(None) })
+            .await
+            .unwrap_err()
+            .contains("no value"));
+        assert!(
+            navigation_observation(std::future::pending::<Result<Option<String>, String>>())
+                .await
+                .unwrap_err()
+                .contains("timed out")
+        );
+        let mut errors = serde_json::Map::new();
+        assert_eq!(
+            observed_value("url", Err("disconnected".into()), &mut errors),
+            None
+        );
+        assert_eq!(errors["url"], "disconnected");
+    }
 }

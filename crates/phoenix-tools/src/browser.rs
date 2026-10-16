@@ -28,8 +28,8 @@ pub use phoenix_browser::{BrowserError, BrowserSession, BrowserSessionManager};
 pub use profile::BrowserProfileTool;
 pub use snapshot::BrowserSnapshotTool;
 pub use tools::{
-    BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserKeyPressTool,
-    BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
+    parse_duration, BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool,
+    BrowserKeyPressTool, BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
     BrowserTakeScreenshotTool, BrowserTypeTool, BrowserWaitForSelectorTool,
 };
 

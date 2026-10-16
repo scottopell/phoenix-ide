@@ -35,9 +35,13 @@ printf '%s\n' 'document.title' | phoenix-browser --json eval --stdin
 
 `open` returns URL, title, an interactive accessibility snapshot, and console errors captured for that navigation. Snapshot failure appears separately from navigation success. Large snapshots spill to a readable artifact; the returned refs work after reading it. Snapshot refs identify exact nodes and expire on a new snapshot attempt, document replacement, or browser replacement. Refresh the snapshot when a ref is stale. CSS selectors also work with click/type.
 
-`--json` returns `session`, daemon `lifetime`, browser `browser_lifetime`, and a `status` tag: `success` with `result`, or `error` with `error.code` and `error.message`. Tool results include `text`, structured `data`, and explicit `artifacts`. Tool errors preserve structured failure data in `error.details` and any `error.artifacts`. Failed commands exit 1; invalid CLI syntax exits 2. Human output prints concise operation text; JSON is the harness interface.
+Navigation observation failures appear separately in `observation_errors`; console capture failure has its own `console_capture_error`. Reference input fails visibly when the browser cannot verify the native event destination, including a closed shadow root created without the early input guard.
+
+`--json` returns `session`, daemon `lifetime`, browser `browser_lifetime`, and a `status` tag: `success` with `result`, or `error` with `error.code` and `error.message`. Tool results include `text`, structured `data`, and explicit `artifacts`. Tool errors preserve structured failure data in `error.details` and any `error.artifacts`. Failed commands exit 1; invalid input exits 2 before looking up browser state. Human output prints concise operation text; JSON is the harness interface.
 
 Use `schema [COMMAND]` for the full operation parameters. Each command accepts `--input '{...}'`; this is especially useful for profiling. `--timeout 15s` controls operations that accept a timeout.
+
+Use `--` before positional text that matches an option, for example `phoenix-browser type '#field' -- '--json'`.
 
 ## Profile
 
@@ -64,4 +68,6 @@ Navigation starts a daemon and fresh transient Chrome profile lazily. The defaul
 
 Commands in a session are serialized. If a connection fails after a request may have arrived, the CLI reports `transport_uncertain` and never retries it automatically. Inspect page state before repeating a side effect.
 
-Control files and sockets live in a private `browser-cli` directory under Phoenix's data directory. `PHOENIX_BROWSER_RUNTIME_DIR` can select a shorter absolute private directory if a Unix socket path is too long. Browser profiles and accessibility snapshot artifacts use Phoenix's configured scratch root; each command returns its artifact locations. Snapshot artifacts are retired by the next snapshot attempt or browser teardown. The daemon log path appears in startup errors. Close sessions before upgrading/replacing the executable; interoperability with older daemon versions and recovery after an ungraceful daemon death are not promised. No browser profile import or credential extraction is supported.
+If cleanup fails, the daemon retains session ownership and rejects new browser work. Inspect `status`, repair the reported resource, and retry `close`; a replacement browser cannot start under that session until cleanup succeeds.
+
+Control files and sockets live in a private `browser-cli` directory under Phoenix's data directory. `PHOENIX_BROWSER_RUNTIME_DIR` can select a shorter absolute private directory if a Unix socket path is too long. Browser profiles and accessibility snapshot artifacts use Phoenix's configured scratch root; each command returns its artifact locations. Snapshot artifacts are retired by the next snapshot attempt, document replacement, or browser teardown. The daemon log path appears in startup errors. Close sessions before upgrading/replacing the executable; interoperability with older daemon versions and recovery after an ungraceful daemon death are not promised. No browser profile import or credential extraction is supported.

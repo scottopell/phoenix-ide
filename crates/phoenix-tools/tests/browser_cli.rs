@@ -388,7 +388,6 @@ fn invalid_input_and_permissive_runtime_directory_fail_without_startup() {
     let cli = BrowserCli::new();
     for arguments in [
         vec!["--session", "", "status"],
-        vec!["--idle-timeout", "0", "open", "about:blank"],
         vec!["snapshot", "--input", "[1]"],
         vec!["snapshot", "--input", "{"],
         vec!["unknown-command"],
@@ -408,6 +407,75 @@ fn invalid_input_and_permissive_runtime_directory_fail_without_startup() {
         .contains("private directory"));
     assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
     std::fs::set_permissions(cli.directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn parse_errors_preserve_selected_session_and_reject_invalid_budgets_before_startup() {
+    let cli = BrowserCli::new();
+    for arguments in [
+        vec!["snapshot", "--input", "{"],
+        vec!["unknown-command"],
+        vec!["open", "about:blank", "--timeout", "nonsense"],
+        vec![
+            "open",
+            "--input",
+            r#"{"url":"about:blank","timeout":"1hour"}"#,
+        ],
+        vec!["open", "--input", r#"{"url":"about:blank","timeout":15}"#],
+        vec!["open", "about:blank", "--timeout", "18446744073709551615m"],
+        vec!["status", "--idle-timeout"],
+    ] {
+        let output = cli.command().args(&arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["session"], "named:integration", "{arguments:?}");
+        assert_eq!(response["error"]["code"], "invalid_input");
+        assert!(response["lifetime"].is_null());
+        assert!(response["browser_lifetime"].is_null());
+        assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+    }
+    let output = cli
+        .base_command()
+        .env("PHOENIX_BROWSER_SESSION", "environment")
+        .args(["snapshot", "--input", "{"])
+        .output()
+        .unwrap();
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["session"], "named:environment");
+    let cwd = tempfile::tempdir().unwrap();
+    let output = cli
+        .base_command()
+        .current_dir(cwd.path())
+        .args(["snapshot", "--input", "{"])
+        .output()
+        .unwrap();
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["session"],
+        format!("directory:{}", cwd.path().canonicalize().unwrap().display())
+    );
+}
+
+#[test]
+fn help_is_an_option_only_at_the_command_help_position() {
+    let cli = BrowserCli::new();
+    for arguments in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["snapshot", "--help"],
+        vec!["snapshot", "--help", "--json"],
+    ] {
+        let output = cli.command().args(arguments).output().unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: phoenix-browser"));
+    }
+    for payload in ["--help", "-h"] {
+        let response = cli.invoke(&["type", "#name", payload], None, false);
+        assert_eq!(response["error"]["code"], "state_lost");
+    }
+    let response = cli.invoke(&["type", "#name", "--", "--json"], None, false);
+    assert_eq!(response["error"]["code"], "state_lost");
+    assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -537,6 +605,16 @@ fn invalid_idle_environment_does_not_block_browser_free_commands() {
         assert!(response["lifetime"].is_null());
     }
     assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 1);
+    let output = cli
+        .command()
+        .env("PHOENIX_BROWSER_IDLE_TIMEOUT", "not-a-duration")
+        .args(["open", "about:blank"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "invalid_input");
+    assert_eq!(cli.ok(&["status"])["result"]["active"], false);
 }
 
 #[test]
@@ -636,6 +714,12 @@ fn executable_browser_journey_preserves_state_and_profiles() {
     let cli = BrowserCli::new();
     let url = fixture();
     let opened = cli.ok(&["open", &url]);
+    for payload in ["--help", "-h"] {
+        cli.ok(&["type", "#name", payload, "--clear"]);
+        assert_eq!(cli.eval("document.querySelector('#name').value"), payload);
+    }
+    cli.ok(&["type", "#name", "--clear", "--", "--json"]);
+    assert_eq!(cli.eval("document.querySelector('#name').value"), "--json");
     let lifetime = opened["lifetime"].clone();
     let browser_lifetime = opened["browser_lifetime"].clone();
     assert!(lifetime.is_string());
@@ -1012,7 +1096,9 @@ fn consecutive_close_and_immediate_open_replace_owned_resources() {
     let mut previous = cli.ok(&["open", &url]);
     for _ in 0..3 {
         let resources = live_resources(&cli);
-        cli.ok(&["close"]);
+        let closed = cli.ok(&["close"]);
+        assert_eq!(closed["lifetime"], previous["lifetime"]);
+        assert_eq!(closed["browser_lifetime"], previous["browser_lifetime"]);
         let opened = cli.ok(&["open", &url]);
         assert_ne!(opened["lifetime"], previous["lifetime"]);
         assert_ne!(opened["browser_lifetime"], previous["browser_lifetime"]);
@@ -1089,19 +1175,10 @@ fn active_work_outlives_idle_budget_then_session_expires() {
     assert_eq!(status["lifetime"], opened["lifetime"]);
     assert_eq!(status["result"]["idle_timeout_seconds"], 1);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        // test-timing-allow: elapsed idle interval is the behavior; status calls otherwise reset idle.
-        std::thread::sleep(Duration::from_millis(1300));
-        let status = cli.ok(&["status"]);
-        if status["result"]["active"] == false {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "session did not expire: {status}"
-        );
-    }
+    let daemon_pid = u32::try_from(status["result"]["daemon_pid"].as_u64().unwrap()).unwrap();
+    let daemon = current_process_identity(daemon_pid).expect("idle daemon is live");
+    await_process_exit(daemon);
+    assert_eq!(cli.ok(&["status"])["result"]["active"], false);
     assert_eq!(
         cli.invoke(&["snapshot"], None, false)["error"]["code"],
         "state_lost"

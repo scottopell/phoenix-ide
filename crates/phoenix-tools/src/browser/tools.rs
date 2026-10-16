@@ -20,7 +20,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Parse duration from string like "15s", "1m", "500ms"
-pub(super) fn parse_duration(s: &str) -> Option<Duration> {
+#[must_use]
+pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if let Some(ms) = s.strip_suffix("ms") {
         ms.trim().parse().ok().map(Duration::from_millis)
@@ -30,7 +31,8 @@ pub(super) fn parse_duration(s: &str) -> Option<Duration> {
         m.trim()
             .parse::<u64>()
             .ok()
-            .map(|m| Duration::from_secs(m * 60))
+            .and_then(|m| m.checked_mul(60))
+            .map(Duration::from_secs)
     } else {
         s.parse().ok().map(Duration::from_secs)
     }

@@ -81,6 +81,11 @@ WHEN `close`, SIGTERM, or an interrupt requests orderly shutdown
 THE SYSTEM SHALL stop accepting browser work, terminate the owned browser, and release session ownership
 AND SHALL surface cleanup failures rather than report successful cleanup.
 
+WHEN browser or profile cleanup fails
+THE SYSTEM SHALL retain session ownership and reject new browser work
+AND SHALL expose the cleanup failure through status and allow explicit close to retry cleanup
+AND SHALL release ownership only after authoritative cleanup succeeds.
+
 THE SYSTEM SHALL NOT expire an active operation because it exceeds the idle interval.
 
 WHEN `close` or an orderly termination signal arrives during an admitted browser operation
@@ -99,8 +104,8 @@ AND SHALL NOT abandon an initialization future that may own an unregistered Chro
 WHEN `open` successfully navigates
 THE SYSTEM SHALL return the final URL, page title, compact interactive accessibility snapshot with usable references, and relevant console errors observed for that navigation.
 
-WHEN navigation succeeds but snapshot collection fails
-THE SYSTEM SHALL preserve the successful navigation result and report the snapshot failure separately
+WHEN navigation succeeds but snapshot collection, console capture, or final URL/title observation fails
+THE SYSTEM SHALL preserve the successful navigation result and report each observation failure separately
 AND SHALL NOT represent the failed snapshot as an empty successful tree.
 
 THE SYSTEM SHALL NOT attribute console entries retained from earlier navigations to the new navigation.

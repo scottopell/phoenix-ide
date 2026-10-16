@@ -6,7 +6,7 @@ Coding agents can use Phoenix's browser operations through a standalone executab
 
 ## Technical Summary
 
-The CLI reuses the browser-specific operation boundary from `phoenix-tools` and the CDP engine in `phoenix-browser`. A user-private Unix socket connects short-lived callers to a session daemon. An operating-system startup lock prevents competing daemon owners. The daemon serializes operations and owns browser termination, transient profile cleanup, and a configurable idle interval. Session selection, daemon lifetime, and browser lifetime have separate identities. The local transport provides no cross-version interoperability promise.
+The CLI reuses the browser-specific operation boundary from `phoenix-tools` and the CDP engine in `phoenix-browser`. A user-private Unix socket connects short-lived callers to a session daemon. An operating-system startup lock prevents competing daemon owners. A serialized worker executes operations while the daemon independently accepts shutdown. Browser initialization settles under ownership before cancellation; admitted operations can be interrupted with an explicit partial-side-effects warning. The daemon owns browser termination, transient profile cleanup, and a configurable idle interval. Session selection, daemon lifetime, and browser lifetime have separate identities. The local transport provides no cross-version interoperability promise.
 
 The lifecycle contract is specified in `browser-cli.allium`; browser operation semantics remain in `specs/browser-tool/`.
 
@@ -14,17 +14,23 @@ The lifecycle contract is specified in `browser-cli.allium`; browser operation s
 
 | Requirement | Status | Notes |
 | --- | --- | --- |
-| REQ-BCLI-001: Standalone Operation | 🔄 In Progress | Implementation and validation pending. |
-| REQ-BCLI-002: Predictable Session Selection | 🔄 In Progress | Precedence and worktree tests pending. |
-| REQ-BCLI-003: Exclusive Local Ownership | 🔄 In Progress | Concurrent startup and isolation tests pending. |
-| REQ-BCLI-004: Lazy Startup and State Loss | 🔄 In Progress | Lifecycle journey pending. |
-| REQ-BCLI-005: Distinct Lifetimes | 🔄 In Progress | Lifetime and stale-reference tests pending. |
-| REQ-BCLI-006: Idle Expiry and Explicit Shutdown | 🔄 In Progress | Expiry, active-operation, and cleanup tests pending. |
-| REQ-BCLI-007: Actionable Navigation Result | 🔄 In Progress | Navigation and partial snapshot failure tests pending. |
-| REQ-BCLI-008: Complete Browser Operation Surface | 🔄 In Progress | CLI browser journey and existing regression tests pending. |
-| REQ-BCLI-009: File-Only Discovery and Analysis | 🔄 In Progress | Browser-free invocation tests pending. |
-| REQ-BCLI-010: Predictable Output and Errors | 🔄 In Progress | Envelope and exit status tests pending. |
-| REQ-BCLI-011: No Ambiguous Operation Replay | 🔄 In Progress | Transport failure evidence pending. |
-| REQ-BCLI-012: Harness Usage Guidance | 🔄 In Progress | Usage documentation pending. |
+| REQ-BCLI-001: Standalone Operation | ✅ Complete | Installed executable smoke: help, schema, open, eval, close without Phoenix. |
+| REQ-BCLI-002: Predictable Session Selection | ✅ Complete | Explicit/environment precedence, canonical paths, clone and linked-worktree boundaries. |
+| REQ-BCLI-003: Exclusive Local Ownership | ✅ Complete | Concurrent initial opens share one owner; named sessions isolate pages. |
+| REQ-BCLI-004: Lazy Startup and State Loss | ✅ Complete | Absent discovery, idle expiry, dead-Chrome detection and fresh open. |
+| REQ-BCLI-005: Distinct Lifetimes | ✅ Complete | Daemon/browser identities appear on operation success and failure; browser-only replacement rotates identity. |
+| REQ-BCLI-006: Idle Expiry and Explicit Shutdown | ✅ Complete | Active work survives idle; close interrupts blocked eval; startup SIGTERM retains cleanup ownership; immediate reopen and descriptor isolation. |
+| REQ-BCLI-007: Actionable Navigation Result | ✅ Complete | URL/title/interactive refs, partial snapshot failure, isolated console source fences with main-document and iframe errors. |
+| REQ-BCLI-008: Complete Browser Operation Surface | ✅ Complete | Shared operation catalog; real-browser interaction, console, screenshot, scenario, CPU capture and saved summary journey. |
+| REQ-BCLI-009: File-Only Discovery and Analysis | ✅ Complete | Browser-free schema/help/saved analysis; malformed startup idle configuration does not block these commands. |
+| REQ-BCLI-010: Predictable Output and Errors | ✅ Complete | JSON envelopes, typed error codes, structured measurement failures, bounded stdin, semantic preflight and exit statuses. |
+| REQ-BCLI-011: No Ambiguous Operation Replay | ✅ Complete | Missing/malformed response reports transport uncertainty without starting or replaying another request. |
+| REQ-BCLI-012: Harness Usage Guidance | ✅ Complete | [Usage and installation](../../docs/phoenix-browser.md), including session binding and profiling. |
 
-**Progress:** 0 of 12 complete.
+**Progress:** 12 of 12 implemented and covered. PR review and final CI qualification are tracked in [PR #925](https://github.com/scottopell/phoenix-ide/pull/925).
+
+## Verification
+
+Lifecycle and installed-command coverage live in `crates/phoenix-tools/tests/browser_cli.rs`. Browser-free preflight and operation-catalog parity live in `browser::access_tests`; profiling validation and methodology retain their existing unit coverage. Engine snapshot and console tests use actual Chrome for document replacement, native input, artifacts, source-event capture, and iframe diagnostics.
+
+Local broad validation passed Clippy, E2E, Allium, spec shape/anchors, task validation, and dev-tool tests. Its Rust run stopped on the unchanged database test `current_schema_controller_accepts_compiled_123_and_128_shapes`: the macOS Python SQLite controller reported `unable to open database file` during integrity checking; an isolated rerun reproduced it. Full-suite success is not claimed from that run.

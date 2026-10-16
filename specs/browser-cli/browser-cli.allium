@@ -190,6 +190,15 @@ rule ShutdownFailureIsVisible {
     requires: daemon.status = stopping
     ensures: CleanupFailureReported(daemon.session, error)
     ensures: not SuccessfulCleanupReported(daemon.session)
+    ensures: daemon.status = stopping
+    ensures: SessionOwnershipRetained(daemon.session)
+    ensures: BrowserWorkRejectedUntilCleanupSucceeds(daemon)
+}
+
+rule ExplicitCleanupRetry {
+    when: OrderlyShutdownRequested(daemon)
+    requires: daemon.status = stopping
+    ensures: OwnedBrowserTerminationRequested(daemon)
 }
 
 rule AmbiguousResponseDoesNotReplay {

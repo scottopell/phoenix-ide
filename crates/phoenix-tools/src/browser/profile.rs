@@ -243,22 +243,7 @@ enum Step {
     },
 }
 
-/// Parse duration like "5s", "500ms", "1m". Mirrors `tools.rs::parse_duration`.
-fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if let Some(ms) = s.strip_suffix("ms") {
-        ms.trim().parse().ok().map(Duration::from_millis)
-    } else if let Some(v) = s.strip_suffix('s') {
-        v.trim().parse().ok().map(Duration::from_secs)
-    } else if let Some(m) = s.strip_suffix('m') {
-        m.trim()
-            .parse::<u64>()
-            .ok()
-            .map(|m| Duration::from_secs(m * 60))
-    } else {
-        s.parse().ok().map(Duration::from_secs)
-    }
-}
+use super::tools::parse_duration;
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 

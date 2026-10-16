@@ -51,7 +51,11 @@ pub struct Options {
 
 fn take_option(args: &mut Vec<String>, name: &str) -> Result<Option<String>, String> {
     let mut found = None;
-    while let Some(index) = args.iter().position(|arg| arg == name) {
+    while let Some(index) = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .position(|arg| arg == name)
+    {
         args.remove(index);
         if index == args.len() || args[index].starts_with("--") {
             return Err(format!("{name} requires a value"));
@@ -66,7 +70,13 @@ fn take_option(args: &mut Vec<String>, name: &str) -> Result<Option<String>, Str
 
 fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
     let before = args.len();
-    args.retain(|arg| arg != name);
+    let mut options = true;
+    args.retain(|arg| {
+        if arg == "--" {
+            options = false;
+        }
+        !options || arg != name
+    });
     args.len() != before
 }
 
@@ -152,6 +162,9 @@ fn parse_request(mut args: Vec<String>) -> Result<Request, String> {
         input["modifiers"] =
             serde_json::from_str(&modifiers).map_err(|e| format!("invalid modifiers JSON: {e}"))?;
     }
+    if let Some(index) = args.iter().position(|arg| arg == "--") {
+        args.remove(index);
+    }
     positional(&command, &args, &mut input, stdin)?;
     validate_parameters(&command, &input)?;
     for field in ["path", "baseline"] {
@@ -168,6 +181,15 @@ fn parse_request(mut args: Vec<String>) -> Result<Request, String> {
 }
 
 fn validate_parameters(command: &str, input: &Value) -> Result<(), String> {
+    if let Some(value) = input.get("timeout") {
+        let value = value.as_str().ok_or("timeout must be a duration string")?;
+        let valid = phoenix_tools::browser::parse_duration(value)
+            .and_then(|duration| std::time::Instant::now().checked_add(duration))
+            .is_some();
+        if !valid {
+            return Err("timeout must be a representable duration, e.g. 15s, 500ms, or 1m".into());
+        }
+    }
     let Some(operation) = daemon::operation(command) else {
         return Ok(());
     };
@@ -295,17 +317,39 @@ fn positional(
     Ok(())
 }
 
-fn options(mut args: Vec<String>) -> Result<Options, String> {
+struct ParseFailure {
+    session: Option<String>,
+    message: String,
+}
+
+impl From<String> for ParseFailure {
+    fn from(message: String) -> Self {
+        Self {
+            session: None,
+            message,
+        }
+    }
+}
+
+fn options(mut args: Vec<String>) -> Result<Options, ParseFailure> {
     let json = take_flag(&mut args, "--json");
     let explicit = take_option(&mut args, "--session")?;
-    let idle = take_option(&mut args, "--idle-timeout")?
-        .or_else(|| std::env::var("PHOENIX_BROWSER_IDLE_TIMEOUT").ok())
-        .unwrap_or_else(|| "1800".into());
     let session = resolve_session(
         explicit,
         std::env::var("PHOENIX_BROWSER_SESSION").ok(),
         &std::env::current_dir().map_err(|e| e.to_string())?,
     )?;
+    let parsed = (|| -> Result<_, String> {
+        let idle = take_option(&mut args, "--idle-timeout")?
+            .or_else(|| std::env::var("PHOENIX_BROWSER_IDLE_TIMEOUT").ok())
+            .unwrap_or_else(|| "1800".into());
+        let request = parse_request(args)?;
+        Ok((idle, request))
+    })()
+    .map_err(|message| ParseFailure {
+        session: Some(session.clone()),
+        message,
+    })?;
     let key = hex::encode(&Sha256::digest(session.as_bytes())[..12]);
     let directory = std::env::var_os("PHOENIX_BROWSER_RUNTIME_DIR").map_or_else(
         || {
@@ -315,15 +359,30 @@ fn options(mut args: Vec<String>) -> Result<Options, String> {
         },
         PathBuf::from,
     );
-    let paths = SessionPaths { directory, key };
-    let request = parse_request(args)?;
     Ok(Options {
         session,
-        paths,
-        idle,
+        paths: SessionPaths { directory, key },
+        idle: parsed.0,
         json,
-        request,
+        request: parsed.1,
     })
+}
+
+fn help_requested(args: &[String]) -> bool {
+    let mut args = args.to_vec();
+    take_flag(&mut args, "--json");
+    if take_option(&mut args, "--session").is_err()
+        || take_option(&mut args, "--idle-timeout").is_err()
+    {
+        return false;
+    }
+    if args.iter().any(|argument| argument == "--") {
+        return false;
+    }
+    match args.as_slice() {
+        [help] | [_, help] => matches!(help.as_str(), "--help" | "-h"),
+        _ => false,
+    }
 }
 
 async fn startup_lock(
@@ -545,6 +604,13 @@ fn print_response(response: &Response, json_mode: bool) {
             if let Some(error) = result["console_capture_error"].as_str() {
                 eprintln!("Console capture failed: {error}");
             }
+            if let Some(errors) = result["observation_errors"].as_object() {
+                for (field, error) in errors {
+                    if let Some(error) = error.as_str() {
+                        eprintln!("Could not read {field}: {error}");
+                    }
+                }
+            }
         }
         Outcome::Success { result } => {
             if let Some(text) = result.get("text").and_then(Value::as_str) {
@@ -571,7 +637,7 @@ pub async fn main_entry() -> i32 {
             }
         };
     }
-    if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if args.is_empty() || help_requested(&args) {
         println!("{HELP}");
         return 0;
     }
@@ -579,12 +645,17 @@ pub async fn main_entry() -> i32 {
         println!("phoenix-browser {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
-    let json_mode = args.iter().any(|arg| arg == "--json");
+    let json_mode = take_flag(&mut args.clone(), "--json");
     let options = match options(args) {
         Ok(options) => options,
         Err(error) => {
             print_response(
-                &Response::error("unresolved", None, ErrorCode::InvalidInput, error),
+                &Response::error(
+                    error.session.as_deref().unwrap_or("unresolved"),
+                    None,
+                    ErrorCode::InvalidInput,
+                    error.message,
+                ),
                 json_mode,
             );
             return 2;
