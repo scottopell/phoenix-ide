@@ -356,9 +356,17 @@ class OwnedFixtureCompletion:
                 "SELECT terminal_kind, owns_conversation FROM durable_turns "
                 "WHERE conversation_id = ? AND canonical_message_id = ? AND disposition = 'Runtime'",
                 (row, correlation)).fetchall()
+            creation = connection.execute(
+                "SELECT status, claim_worker_id, claim_token, lease_until "
+                "FROM conversation_creation_jobs WHERE conversation_id = ? "
+                "AND (message_id = ? OR conversation_id || ':' || message_id = ?)",
+                (row, correlation, correlation)).fetchall() if message_id is None and not terminal else []
         if queued:
             raise AssertionError("unexpected steering backlog during isolated fixture completion")
-        if active or terminal != [("Failed" if exhausted else "Completed", 0)]:
+        settled = terminal == [("Failed" if exhausted else "Completed", 0)]
+        if message_id is None and not exhausted and not terminal:
+            settled = creation == [("ready", None, None, None)]
+        if active or not settled:
             return False
         if exhausted:
             return True

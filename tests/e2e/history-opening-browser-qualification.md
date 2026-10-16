@@ -1379,8 +1379,13 @@ state and exact Failed terminal/released ownership, not live Idle. Exact app
 `ExecutorRuntime::terminal_obligation_for_state` and continuation settlement
 classify ContextExhausted as Failed even when summary generation succeeds.
 Opening/continuation waits without a caller-supplied chat ID resolve the actual
-persisted user ID and require the same exact terminal lookup; missing user,
-foreign row or non-completed opening cannot pass. This is an isolated single
+persisted user ID. Direct-turn openings require the same exact terminal lookup.
+Ordinary creation instead has its own authority: exact app
+`materialize_conversation_creation_runtime` / `settle_conversation_creation_runtime`
+use `conversation_creation_jobs`, not a Runtime durable-turn row. Its correlated
+message must have a ready job with worker/token/lease cleared; the persisted
+Idle and public effective Idle conditions still apply. Missing user, foreign
+identity, retained claim, failed job or non-completed direct opening cannot pass. This is an isolated single
 fixture writer's quiescence observer, not an atomic public admission guarantee
 under unrelated concurrent producers. No product endpoint, producer, cfg-test
 control signal or production database change is introduced.
@@ -1393,7 +1398,15 @@ original wait in memory without editing source; elapsed sleeps are mocked out.
 Other controls cover absent/foreign exact canonical identity, terminal failure,
 a new active owner, backlog, missing/schema-error/changed-identity DB, and
 opening/exhausted paths. Actual offline ring: shipping Python 16, opening Python
-52, base Node 14, opening Node 30, joint Node 50 passed. An initial bypassed-
+53, base Node 14, opening Node 30, joint Node 50 passed. An initial bypassed-
 constructor shipping test failed on the new member; its test fixture now sets
 the constructor-owned default explicitly. Failed intermediate logs remain
 retained. These are bounded readiness tests, not hosted or joint acceptance.
+
+Before publication, review left real creation-ID tracing explicitly unverified.
+Parent source follow-through caught that ordinary creation uses its separate job
+authority, so the initially frozen uniform-Runtime observer `140da572b` was not
+published. The correction adds only the correlated ready-job branch for waits
+without a supplied chat ID and tests raw/canonical opening IDs and cleared
+claims. An explicit chat ID never falls back to a creation job. Earlier 52-test
+logs and mutation proof remain retained separately from the final 53-test ring.

@@ -866,7 +866,9 @@ class FixtureSettlementTests(unittest.TestCase):
             db.executescript("CREATE TABLE instance_identity(singleton_key INTEGER, instance_id TEXT);"
                              "CREATE TABLE durable_turns(conversation_id TEXT, canonical_message_id TEXT,"
                              "disposition TEXT, terminal_kind TEXT, owns_conversation INTEGER);"
-                             "CREATE TABLE steering_messages(conversation_id TEXT);")
+                             "CREATE TABLE steering_messages(conversation_id TEXT);"
+                             "CREATE TABLE conversation_creation_jobs(conversation_id TEXT, message_id TEXT,"
+                             "status TEXT, claim_worker_id TEXT, claim_token TEXT, lease_until TEXT);")
             db.execute("INSERT INTO instance_identity VALUES(1, ?)", (self.instance,))
             db.execute("INSERT INTO durable_turns VALUES('row', 'row:key', 'Runtime', NULL, 1)")
         self.idle = True
@@ -920,6 +922,23 @@ class FixtureSettlementTests(unittest.TestCase):
         self.sql("UPDATE durable_turns SET terminal_kind='Completed', conversation_id='foreign'")
         self.assertFalse(self.observer("row", False, None, self.data))
         self.assertFalse(self.observer("row", False, None, {"messages": []}))
+
+    def test_creation_opening_uses_own_ready_claim_authority_not_direct_turn(self):
+        self.sql("DELETE FROM durable_turns")
+        self.sql("INSERT INTO conversation_creation_jobs VALUES('row','key','claimed','worker','token','lease')")
+        self.assertFalse(self.observer("row", False, None, self.data))
+        self.sql("UPDATE conversation_creation_jobs SET status='ready'")
+        self.assertFalse(self.observer("row", False, None, self.data))
+        self.sql("UPDATE conversation_creation_jobs SET claim_worker_id=NULL,claim_token=NULL,lease_until=NULL")
+        self.idle = False
+        self.assertFalse(self.observer("row", False, None, self.data))
+        self.idle = True
+        self.assertTrue(self.observer("row", False, None, self.data))
+        self.assertFalse(self.observer("row", False, "row:key", self.data))
+        self.sql("UPDATE conversation_creation_jobs SET message_id='row:key'")
+        self.assertTrue(self.observer("row", False, None, self.data))
+        self.sql("UPDATE conversation_creation_jobs SET message_id='foreign'")
+        self.assertFalse(self.observer("row", False, None, self.data))
 
     def test_exhausted_requires_failed_exact_turn_and_released_owner(self):
         self.assertFalse(self.observer("row", True, "row:key", self.data))
