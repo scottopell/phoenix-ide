@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
 import type { Plugin } from 'vite';
@@ -15,10 +15,18 @@ export function viewReporterBuild(controlled = false): Plugin {
   const factory = controlled ? controlledFactory : stockFactory;
   const config = resolve(root, controlled ? 'ui/vite.controlled-functional.config.ts' : 'ui/vite.config.ts');
   let modules: Record<string, string> = {};
+  let configured = false;
+  let writes = 0;
   return {
     name: 'phoenix-view-reporter-build',
     enforce: 'pre',
     configResolved(resolved) {
+      if (resolved.command === 'build') {
+        if (!resolved.configFile || realpathSync(resolved.configFile) !== realpathSync(config)) throw new Error('reporter requires exact canonical configFile');
+        const rollup = resolved.build.rollupOptions.output;
+        if (Array.isArray(rollup) || (rollup && (rollup.file || (rollup.dir && resolve(rollup.dir) !== output)))) throw new Error('reporter requires single exact output directory');
+        configured = true;
+      }
       if (controlled && (resolved.command !== 'build' || resolved.mode !== 'controlled-functional' || resolve(resolved.root, resolved.build.outDir) !== output)) throw new Error('controlled reporter requires dedicated build recipe and output');
       if (!controlled && resolved.mode === 'controlled-functional') throw new Error('controlled mode requires dedicated config');
       if (!controlled) output = resolve(resolved.root, resolved.build.outDir);
@@ -33,7 +41,9 @@ export function viewReporterBuild(controlled = false): Plugin {
       if (controlled ? !graph.includes(controlledFactory) || graph.includes(stockFactory) : graph.includes(controlledFactory)) throw new Error('reporter graph identity mismatch');
       modules = Object.fromEntries(graph.filter(id => id.startsWith(`${root}ui/`) && !id.includes('/node_modules/') && existsSync(id)).map(id => [local(id), sha256(readFileSync(id))]));
     },
-    writeBundle(_options, bundle) {
+    writeBundle(options, bundle) {
+      if (!configured) throw new Error('reporter manifest requires resolved build config');
+      if (writes++ || options.file || !options.dir || resolve(options.dir) !== output) throw new Error('reporter requires single actual output directory');
       const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', timeout: 1000 }).trim();
       const dirty = git(['status', '--porcelain', '--untracked-files=normal']).length > 0;
       if (controlled && dirty) throw new Error('controlled artifact requires clean pinned source');
@@ -53,7 +63,11 @@ export function viewReporterBuild(controlled = false): Plugin {
         ui_files: Object.fromEntries(Object.keys(bundle).map(name => {
           const path = resolve(output, name);
           if (!path.startsWith(`${output}/`)) throw new Error('invalid emitted artifact path');
-          return [local(path), sha256(readFileSync(path))];
+          const emitted = bundle[name]!;
+          const expected = emitted.type === 'chunk' ? emitted.code : emitted.source;
+          const actual = readFileSync(path);
+          if (!actual.equals(Buffer.from(expected))) throw new Error('emitted artifact bytes do not match actual output');
+          return [local(path), sha256(actual)];
         })),
         admission: controlled ? 'cfgtest_loopback_preview_only' : 'stock',
         full_acceptance: false, overhead_clearance: false,
