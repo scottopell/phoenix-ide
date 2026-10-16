@@ -889,3 +889,39 @@ test('explicitly sampled SPA missing canceled report remains a failure with real
     assert.ok(fake.actions.some(action => action[0] === 'spa_canceled' && action[1] === 'click'));
   } finally { vi.useRealTimers(); }
 });
+
+test.each(['no_post', 'late_post', 'foreign', 'duplicate', 'non204'])('readiness-first capture %s retains optional observed reports without losing primary identity', async mode => {
+  const listeners = {}; const posts = [];
+  const request = { url: () => 'http://127.0.0.1:8123/api/product-conversations/product?open_id=request', method: () => 'GET', timing: () => ({ responseEnd: -1 }) };
+  const page = { on: (event, fn) => { listeners[event] = fn; }, off: () => {}, mainFrame: () => ({}) };
+  const capture = observePendingFiniteRequest(page, request, 'http://127.0.0.1:8123', { productConversationId: 'product' });
+  capture.expectJourney('primary');
+  assert.doesNotThrow(() => capture.assertFinal({ reportRequired: false }));
+  if (mode !== 'no_post') {
+    const report = { open_id: mode === 'foreign' ? 'foreign' : 'primary', outcome: 'ready', product_conversation_id: 'product', marks: {}, correlations: [{ kind: 'request', id: 'request' }] };
+    const post = { url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', method: () => 'POST', postData: () => JSON.stringify(report) };
+    posts.push(post); listeners.request(post);
+    listeners.response({ request: () => post, status: () => mode === 'non204' ? 400 : 204 });
+    if (mode === 'duplicate') listeners.request(post);
+  }
+  if (['no_post', 'late_post'].includes(mode)) assert.doesNotThrow(() => capture.assertFinal({ reportRequired: false }));
+  else assert.throws(() => capture.assertFinal({ reportRequired: false }));
+  assert.equal(capture.reports.length, ['no_post', 'foreign'].includes(mode) ? 0 : mode === 'duplicate' ? 2 : 1);
+});
+
+test('late lifecycle emulation response cannot install listeners or navigate after absolute deadline', async () => {
+  vi.useFakeTimers();
+  let release; let closed = 0; let listeners = 0; let navigations = 0; const trials = [];
+  const pending = new Promise(resolve => { release = resolve; });
+  const page = { on: () => { listeners++; }, goto: async () => { navigations++; } };
+  const context = { exposeBinding: async () => {}, addInitScript: async () => {}, newPage: async () => page,
+    newCDPSession: async () => ({ send: async name => { if (name === 'Network.emulateNetworkConditions') await pending; } }), close: async () => { closed++; } };
+  try {
+    const operation = runLifecycleQualificationStage({ browser: { newContext: async () => context }, storageState: {}, baseURL: 'http://127.0.0.1:8123', fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'sidebar_home' } }, budgetMs: 1, onTrial: t => trials.push(t) });
+    const outcome = operation.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.match((await outcome).message, /absolute lifecycle stage deadline/);
+    release(); await vi.advanceTimersByTimeAsync(0);
+    assert.equal(closed, 1); assert.equal(listeners, 0); assert.equal(navigations, 0);
+  } finally { vi.useRealTimers(); }
+});
