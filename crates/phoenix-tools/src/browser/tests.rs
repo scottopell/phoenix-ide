@@ -790,9 +790,6 @@ async fn test_browser_screenshot_local() {
         result.output()
     );
 
-    // The screenshot must flow to the LLM via the typed `images` channel,
-    // not via `display_data` (which is UI-only and never threaded to the
-    // LLM). Mirrors the read_image.rs regression assertion.
     assert_eq!(
         result.images().len(),
         1,
@@ -804,11 +801,19 @@ async fn test_browser_screenshot_local() {
         result.images()[0].data.starts_with("iVBORw0KGgo"),
         "image data is not a valid PNG (base64 should start with iVBORw0KGgo)"
     );
-    assert!(
-        result.display_data().is_none(),
-        "browser_take_screenshot must not duplicate the image payload into display_data, got {:?}",
-        result.display_data()
+    let metadata = result.display_data().unwrap().as_object().unwrap();
+    assert_eq!(
+        metadata.len(),
+        1,
+        "UI metadata carries only the saved artifact handle"
     );
+    let path = metadata["artifact_path"].as_str().unwrap();
+    let saved = tokio::fs::read(path).await.unwrap();
+    assert_eq!(
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &saved),
+        result.images()[0].data
+    );
+    tokio::fs::remove_file(path).await.unwrap();
 
     shutdown_test(manager, server).await;
 }
@@ -2843,6 +2848,41 @@ async fn assert_stale_click(ctx: &ToolContext, reference: &str) {
 }
 
 #[tokio::test]
+async fn rejected_reference_leaves_selector_and_key_input_available() {
+    require_chrome!();
+    let (ctx, manager) = test_context("rejected-ref-next-input");
+    let html = "<button id=original>Reject me</button><button id=other>Other</button><button id=recovery onclick=window.recovered++>Recover</button><input id=text><script>window.recovered=0; original.onpointerdown=e=>other.setPointerCapture(e.pointerId)</script>";
+    let opened = BrowserNavigateTool
+        .run(json!({"url":format!("data:text/html,{html}")}), ctx.clone())
+        .await;
+    assert!(opened.is_success(), "{}", opened.output());
+    let snapshot = snapshot_text(&ctx, true).await;
+    let reference = snapshot_refs(&snapshot, "button \"Reject me\"")[0].clone();
+    let rejected = BrowserClickTool
+        .run(json!({"ref":reference}), ctx.clone())
+        .await;
+    assert!(!rejected.is_success(), "retargeted ref click succeeded");
+    let clicked = BrowserClickTool
+        .run(json!({"selector":"#recovery"}), ctx.clone())
+        .await;
+    assert!(clicked.is_success(), "{}", clicked.output());
+    let typed = BrowserTypeTool
+        .run(json!({"selector":"#text","text":"s"}), ctx.clone())
+        .await;
+    assert!(typed.is_success(), "{}", typed.output());
+    let keyed = BrowserKeyPressTool
+        .run(json!({"key":"x"}), ctx.clone())
+        .await;
+    assert!(keyed.is_success(), "{}", keyed.output());
+    assert_browser_expression(
+        &ctx,
+        "window.recovered===1 && document.getElementById('text').value==='sx'",
+    )
+    .await;
+    manager.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn browser_interactions_reject_ambiguous_or_missing_targets_without_chrome() {
     // REQ-BT-008, REQ-BT-009: invalid target combinations fail before browser acquisition.
     let (ctx, manager) = test_context("snapshot-invalid-targets");
@@ -2956,6 +2996,12 @@ async fn browser_snapshot_accessibility_and_native_reference_interactions() {
             "window.typed === 'Ada' && document.querySelector('#customer').value === 'Ada'",
         )
         .await;
+        let timed_out = BrowserTypeTool
+            .run(json!({"ref": customer[0], "text": "x".repeat(1000), "timeout": "1ms"}), ctx.clone())
+            .await;
+        assert!(!timed_out.is_success(), "long typing must exceed the tiny budget");
+        assert!(timed_out.output().contains("partial text insertion may already have happened"), "{}", timed_out.output());
+        assert!(timed_out.output().contains("do not append the full text blindly"), "{}", timed_out.output());
         let shadow = snapshot_refs(&full, "button \"Shadow action\"");
         assert_eq!(shadow.len(), 1, "{full}");
         let click = BrowserClickTool

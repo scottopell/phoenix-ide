@@ -4,9 +4,12 @@
 //! REQ-BT-011: State Persistence
 //! REQ-BROWSER-WS-001: Sessions keyed by `ResourceScopeKey` so continuations share Chrome.
 
+mod console;
+pub use console::ConsoleNavigationCapture;
+
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
-    cdp::js_protocol::runtime::{ConsoleApiCalledType, EventConsoleApiCalled, RemoteObject},
+    cdp::js_protocol::runtime::{ConsoleApiCalledType, RemoteObject},
     fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
     Page,
 };
@@ -311,6 +314,7 @@ pub enum SessionInitPhase {
     Launch,
     FirstPage,
     ReactHelper,
+    ReferenceInputGuard,
     ConsoleListener,
     ProfilingListener,
 }
@@ -321,6 +325,7 @@ impl std::fmt::Display for SessionInitPhase {
             Self::Launch => "browser launch",
             Self::FirstPage => "first page creation",
             Self::ReactHelper => "React helper installation",
+            Self::ReferenceInputGuard => "reference input guard installation",
             Self::ConsoleListener => "console listener setup",
             Self::ProfilingListener => "profiling listener setup",
         })
@@ -520,6 +525,8 @@ pub struct ConsoleEntry {
     pub level: ConsoleLevel,
     pub text: String,
     pub timestamp: Instant,
+    source_document: Option<console::Document>,
+    capture_generation: Option<console::Generation>,
 }
 
 /// Conversation-scoped performance-profiling state (REQ-BT-019).
@@ -616,7 +623,9 @@ impl BrowserLaunchIdentity {
 
 /// Per-conversation browser instance
 pub struct BrowserSession {
-    pub(crate) snapshot: Option<crate::snapshot::SnapshotReferences>,
+    pub(crate) snapshot: crate::snapshot::SnapshotState,
+    pub(crate) reference_guard_available: bool,
+    pub(crate) reference_input_lock: Arc<tokio::sync::Mutex<()>>,
     #[allow(dead_code)] // Browser must stay alive
     browser: Browser,
     chrome_pid: Option<u32>,
@@ -641,6 +650,7 @@ pub struct BrowserSession {
     pub trace_complete: Arc<tokio::sync::Notify>,
     /// Console logs captured from the page (separate lock to avoid contention)
     pub console_logs: Arc<StdMutex<VecDeque<ConsoleEntry>>>,
+    console_capture: Arc<console::ConsoleCapture>,
     /// Signals capture of a console event so consumers can await evidence rather
     /// than sleeping for background delivery.
     console_event: Arc<tokio::sync::Notify>,
@@ -775,6 +785,10 @@ impl std::fmt::Display for BrowserTerminationError {
 }
 
 impl BrowserSession {
+    pub(crate) fn snapshot_websocket_address(&self) -> &str {
+        self.browser.websocket_address()
+    }
+
     /// Directory where the fetcher caches downloaded Chrome binaries
     pub(crate) fn fetcher_cache_dir() -> PathBuf {
         fetcher_cache_dir()
@@ -834,6 +848,32 @@ impl BrowserSession {
                 let _ = browser.kill().await;
                 let _ = std::fs::remove_dir_all(user_data_dir);
                 Err(error)
+            }
+        }
+    }
+
+    async fn install_reference_guard(page: &Page) -> bool {
+        match init_phase(
+            SessionInitPhase::ReferenceInputGuard,
+            SESSION_INIT_TIMEOUT,
+            async {
+                page.execute(chromiumoxide::cdp::js_protocol::runtime::AddBindingParams::new(crate::snapshot::INPUT_RECEIPT_BINDING)).await.map_err(|failure| failure.to_string())?;
+                page.execute(chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(
+                    crate::snapshot::INPUT_GUARD_SCRIPT,
+                )).await.map_err(|failure| failure.to_string())?;
+                let result = page.evaluate(crate::snapshot::INPUT_GUARD_SCRIPT).await.map_err(|failure| failure.to_string())?;
+                result.into_value::<bool>().map_err(|failure| failure.to_string())
+            },
+        ).await {
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => false,
+            Ok(Err(failure)) => {
+                tracing::warn!(%failure, "reference input guard unavailable; native reference interactions disabled");
+                false
+            }
+            Err(failure) => {
+                tracing::warn!(%failure, "reference input guard installation timed out; native reference interactions disabled");
+                false
             }
         }
     }
@@ -931,6 +971,8 @@ impl BrowserSession {
             Err(error) => tracing::warn!(%error, "Auto-inject React helper timed out"),
         }
 
+        let reference_guard_available = Self::install_reference_guard(&page).await;
+
         Ok(Self {
             browser,
             chrome_pid,
@@ -939,11 +981,14 @@ impl BrowserSession {
             handler_task,
             console_task: None,
             profiling_tasks: Vec::new(),
-            snapshot: None,
+            snapshot: crate::snapshot::SnapshotState::default(),
+            reference_guard_available,
+            reference_input_lock: Arc::new(tokio::sync::Mutex::new(())),
             page,
             profiling: Arc::new(StdMutex::new(ProfilingState::default())),
             trace_complete: Arc::new(tokio::sync::Notify::new()),
             console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
+            console_capture: Arc::new(console::ConsoleCapture::default()),
             console_event: Arc::new(tokio::sync::Notify::new()),
             last_activity: Instant::now(),
             screencast: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
@@ -1045,6 +1090,24 @@ impl BrowserSession {
         self.chrome_process
     }
 
+    /// Check the owned Chrome child without sending a CDP request.
+    ///
+    /// # Errors
+    /// Returns an error when child status cannot be read and no exact process
+    /// identity establishes whether this browser is still running.
+    pub fn is_running(&mut self) -> Result<bool, BrowserError> {
+        if let Some(child) = self.browser.get_mut_child() {
+            return owned_child_is_running(child.as_mut_inner());
+        }
+        match self.chrome_process.map(exact_process_state) {
+            Some(ExactProcessState::Live) => Ok(true),
+            Some(ExactProcessState::DeadOrReused) => Ok(false),
+            Some(ExactProcessState::Unproven) | None => Err(BrowserError::OperationFailed(
+                "could not establish Chrome process status".to_string(),
+            )),
+        }
+    }
+
     #[must_use]
     pub fn exact_instance_matches(&self, identity: &BrowserSessionInstanceIdentity) -> bool {
         self.launch_identity == identity.durable
@@ -1093,44 +1156,10 @@ impl BrowserSession {
     /// Returns [`BrowserError`] when the CDP console event listener cannot be
     /// installed.
     pub async fn setup_console_listener(session: Arc<RwLock<Self>>) -> Result<(), BrowserError> {
-        // Get the page event listener and console_logs handle
-        let (mut console_events, console_logs, console_event) = {
+        let task = {
             let guard = session.read().await;
-            let events = guard.page.event_listener::<EventConsoleApiCalled>().await?;
-            let logs = guard.console_logs.clone();
-            let event = guard.console_event.clone();
-            (events, logs, event)
+            console::listen(&guard).await?
         };
-
-        // Spawn task to capture console events (uses separate lock, no contention)
-        let task = tokio::spawn(async move {
-            while let Some(event) = console_events.next().await {
-                // Convert the chromiumoxide CDP enum into Phoenix's owned
-                // `ConsoleLevel` via a total `From` match; downgrading to a
-                // free-form string here would lose the closed-set invariant.
-                let level: ConsoleLevel = event.r#type.clone().into();
-                let text = event
-                    .args
-                    .iter()
-                    .map(extract_console_arg_text)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                // Add to console logs using separate lock (won't block tool execution)
-                tracing::debug!(level = %level, text = %text, "Console event captured");
-                if let Ok(mut logs) = console_logs.lock() {
-                    if logs.len() >= MAX_CONSOLE_LOGS {
-                        logs.pop_front();
-                    }
-                    logs.push_back(ConsoleEntry {
-                        level,
-                        text,
-                        timestamp: Instant::now(),
-                    });
-                    console_event.notify_one();
-                }
-            }
-        });
 
         // Store the task handle
         {
@@ -1238,11 +1267,23 @@ impl BrowserSession {
     ///
     /// Falls back to `Browser::kill` when graceful close does not complete.
     async fn terminate(&mut self) -> Result<(), BrowserTerminationError> {
+        self.snapshot.stop();
         if let Some(t) = &self.console_task {
             t.abort();
         }
         for t in &self.profiling_tasks {
             t.abort();
+        }
+
+        match self.is_running() {
+            Ok(false) => {
+                self.handler_task.abort();
+                return Ok(());
+            }
+            Ok(true) => {}
+            Err(failure) => {
+                tracing::debug!(%failure, "Chrome child status unavailable during termination; attempting close");
+            }
         }
 
         let graceful = tokio::time::timeout(SESSION_INIT_TIMEOUT, async {
@@ -1279,6 +1320,38 @@ impl BrowserSession {
 
         self.handler_task.abort();
         Ok(())
+    }
+}
+
+fn owned_child_is_running(child: &mut tokio::process::Child) -> Result<bool, BrowserError> {
+    child
+        .try_wait()
+        .map(|status| status.is_none())
+        .map_err(|failure| {
+            BrowserError::OperationFailed(format!(
+                "could not inspect owned Chrome child: {failure}"
+            ))
+        })
+}
+
+#[cfg(all(test, unix))]
+mod child_status_tests {
+    use super::owned_child_is_running;
+
+    #[tokio::test]
+    async fn owned_child_status_distinguishes_running_and_reaped_exit() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("child");
+        let input = child.stdin.take().expect("open input keeps child alive");
+        assert!(owned_child_is_running(&mut child).unwrap());
+        drop(input);
+        child.wait().await.expect("child exit");
+        assert!(!owned_child_is_running(&mut child).unwrap());
+        assert!(!owned_child_is_running(&mut child).unwrap());
     }
 }
 

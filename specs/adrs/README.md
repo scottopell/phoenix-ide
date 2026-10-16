@@ -123,6 +123,11 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-012, REQ-COMP-001/002/005 |
 | [105](105_qualify-migration-128-for-bounded-current-schema-activation.md) | Qualify migration 128 for bounded current-schema activation | Accepted; supersedes interval portions of 102/103 | REQ-COMP-012/013, REQ-LDD-019–023, REQ-PD-021–022, REQ-CCR-012 |
 | [106](106_pre-stop-capacity-cleanup-is-cleanup-only-recovery.md) | Pre-stop capacity cleanup is a cleanup-only recovery boundary | Accepted | REQ-LDD-024 |
+| [107](107_standalone-browser-uses-session-daemon.md) | Standalone browser commands share a local session daemon | Accepted | REQ-BCLI-001–012 |
+| [108](108_snapshot-input-and-collection-boundaries.md) | Snapshot interactions enforce identity at native input dispatch | Accepted | REQ-BT-008, REQ-BT-009, REQ-BT-025 |
+| [109](109_console-capture-uses-ordered-context-identities.md) | Navigation console capture uses ordered context identities | Superseded by ADR-110 | REQ-BT-004, REQ-BCLI-007 |
+| [110](110_console-capture-tracks-document-incarnations.md) | Navigation console capture tracks document incarnations | Accepted | REQ-BT-004, REQ-BCLI-007 |
+| [111](111_console-capture-attaches-isolated-frame-targets.md) | Console capture attaches isolated frame targets | Accepted | REQ-BT-004, REQ-BCLI-007 |
 
 ## For agents: which decisions bind your task
 
@@ -130,6 +135,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |

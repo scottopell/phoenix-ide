@@ -88,7 +88,7 @@ disclosure: essentials visible by default, details on demand.
 | search | grep + glob over a directory tree, ripgrep-style (any path the server process can access) | — |
 | keyword_search | Semantic code search using LLM-filtered results | [spec](specs/keyword_search/executive.md) |
 | think | Reasoning scratchpad with zero side effects | [spec](specs/think/executive.md) |
-| browser (`browser_*`) | Headless browser — navigate, eval JS, screenshot, click/type/keypress, resize, console logs | [spec](specs/browser-tool/executive.md) |
+| browser (`browser_*`) | Headless browser — navigate, accessibility snapshot, eval JS, screenshot, click/type/keypress, resize, console logs, profiling | [spec](specs/browser-tool/executive.md) |
 | read_image | Read and encode image files for vision models | — |
 | tmux | Drive a persistent tmux session for long-lived / interactive processes | [spec](specs/tmux-integration/executive.md) |
 | terminal_last_command / terminal_command_history | Inspect the in-app terminal's last command and history | [spec](specs/terminal/executive.md) |
@@ -97,6 +97,8 @@ disclosure: essentials visible by default, details on demand.
 | skill | Invoke a user-defined skill (SKILL.md instruction set) | [spec](specs/skills/executive.md) |
 | propose_task | Propose a task file (task-authoring conversations only) | — |
 | MCP tools | Tools exposed by configured MCP servers, registered dynamically at startup | — |
+
+Use the browser from another coding harness with the standalone [phoenix-browser CLI](docs/phoenix-browser.md).
 
 ## Production Deployment
 
