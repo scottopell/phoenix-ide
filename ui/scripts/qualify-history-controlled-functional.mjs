@@ -77,6 +77,10 @@ export async function captureOwnedBrowser({ launch, capture, negative, publish, 
   return result;
 }
 
+export function resolveOwnedChromium(app) {
+  return createRequire(resolve(app, 'ui/package.json'))('playwright').chromium;
+}
+
 async function main() {
   const app = resolve(process.env.APP_ROOT), baseURL = process.env.HISTORY_BASE_URL;
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(new URL(baseURL).hostname));
@@ -87,8 +91,7 @@ async function main() {
   assert.equal(admission.source_sha, config.input.fixtures.identity.appSource);
   await verifyServedArtifact(baseURL, admission);
   const module = await import(pathToFileURL(config.modulePath).href);
-  const require = createRequire(resolve(app, 'ui/package.json'));
-  const { chromium } = require('@playwright/test');
+  const chromium = resolveOwnedChromium(app);
   await captureOwnedBrowser({
     launch: () => chromium.launch({ headless: true, timeout: 10000 }),
     capture: async browser => {

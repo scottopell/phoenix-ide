@@ -2080,3 +2080,28 @@ passed. No local bundle/server/install/native work occurred. The next hosted gat
 must prove full UI and preservation of both canonical manifest bindings, followed
 by the controlled exact-six collector/export/normal-drain witness. No overhead,
 full acceptance or native resume claim follows from this source packet.
+
+### Controlled module-resolution successor
+
+Run `38935238132` at harness `0a085a31d5d7885114b9c575061aad6f1fd5c2dc`
+reached actual app startup after successful two-build admission, all guards,
+codegen and full UI source qualification (full UI receipt exit0). Witness
+`117088967913` failed before Chromium launch because the new controlled CLI
+required undeclared `@playwright/test`; the app declares `playwright`, also used
+by the existing real-server qualifiers. No controlled browser reports or positive
+collector/export results are claimed. The run was followed to terminal failure,
+including the standard Rust job. Remote artifact `12060558409` is96,415,396B;
+selected bounded reads290,368B. Independent final receipt joins verified BOTH
+stock/controlled454-file manifest digests and inventories still equal the original
+build-owner and instrumented receipt bindings after full UI. The prior canonical
+manifest overwrite and composite TypeScript failures are cleared in this run.
+
+The narrow shared CLI correction resolves Chromium through the actual pinned
+app's declared `playwright` dependency with the same app-relative `createRequire`
+boundary. A no-launch regression checks the actual package declaration and real
+module resolution; controlled Node17 passed. Independent narrow review approved
+this source fix only. Local dependencies remain the existing shared cache, not
+independent frozen-install provenance; hosted frozen dependencies remain required.
+No app pin, asset gate, collector/export inventory, outcome or timing policy was
+changed for this correction. Instrumented server startup evidence is not browser
+launch/report acceptance; no native, resume, overhead or full acceptance is inferred.

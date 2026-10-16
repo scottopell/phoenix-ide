@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import { assertControlledInventory, assertOwnedReport, runControlledFunctional } from './history-controlled-functional.mjs';
-import { verifyServedArtifact, captureOwnedBrowser } from './qualify-history-controlled-functional.mjs';
+import { verifyServedArtifact, captureOwnedBrowser, resolveOwnedChromium } from './qualify-history-controlled-functional.mjs';
 import { createHash } from 'node:crypto';
 const LABEL = 'UNIT_ONLY_NOT_RUNTIME_PROOF';
 function inventory() {
@@ -177,4 +177,12 @@ test('UNIT historical ready cannot qualify without actual additional history and
     const runtime=fakeRuntime(options);
     await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT),/additional history/);
   }
+});
+
+test('offline declared Playwright dependency resolves through the actual pinned app without browser launch',async()=>{
+  const {resolve}=await import('node:path');const {readFileSync}=await import('node:fs');
+  const app=resolve(process.env.APP_ROOT??'target/history-hidden-geometry-repair');
+  const pkg=JSON.parse(readFileSync(resolve(app,'ui/package.json'),'utf8'));
+  assert.ok(pkg.devDependencies.playwright);assert.equal(pkg.devDependencies['@playwright/test'],undefined);
+  const chromium=resolveOwnedChromium(app);assert.equal(typeof chromium.launch,'function');
 });
