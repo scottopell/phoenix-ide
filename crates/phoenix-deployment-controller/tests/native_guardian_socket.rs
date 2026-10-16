@@ -1,7 +1,8 @@
 #![cfg(unix)]
 use phoenix_deployment_controller::{
     guardian_ipc::{
-        read_frame, write_frame, GuardianServer, Request, Response, WireError, WireState,
+        read_frame, write_frame, GuardianServer, Request, Response, WireError, WireSnapshot,
+        WireState,
     },
     native_guardian::{bind_disposable, disposable_dir, same_uid, serve_until, GuardianClient},
     AttemptId, ChildSlotId, ChildSlotObservation, DispatchTicket, ExecutedEffect, Guardian,
@@ -11,6 +12,7 @@ use std::{
     fs,
     io::Write,
     os::unix::{fs::PermissionsExt, io::AsRawFd, net::UnixStream},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -43,6 +45,57 @@ impl GuardianExecutor for NoEffects {
     fn poll_observation_only(&self, (): &()) -> ChildSlotObservation {
         ChildSlotObservation::Running
     }
+}
+
+fn exercise_protocol(directory: &Path, hello: WireSnapshot) {
+    let mut raw = UnixStream::connect(directory.join("guardian.sock")).unwrap();
+    same_uid(&raw).unwrap();
+    let mut hello_frame = Vec::new();
+    write_frame(&mut hello_frame, &Request::Hello).unwrap();
+    raw.write_all(&hello_frame[..2]).unwrap();
+    assert!(!readable_within(&raw, 20));
+    raw.write_all(&hello_frame[2..5]).unwrap();
+    assert!(!readable_within(&raw, 20));
+    raw.write_all(&hello_frame[5..]).unwrap();
+    let Response::Hello { snapshot } = read_frame(&mut raw).unwrap() else {
+        panic!("hello")
+    };
+    assert_eq!(snapshot.instance, hello.instance);
+    assert_eq!(snapshot.state, WireState::DetachedFenced);
+    write_frame(
+        &mut raw,
+        &Request::BeginReconciliation {
+            instance: hello.instance,
+            inventory: hello.slots,
+            interruption_revision: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        read_frame::<Response>(&mut raw).unwrap(),
+        Response::Refused(WireError::UnsupportedDurableBinding)
+    );
+    raw.write_all(&0_u32.to_be_bytes()).unwrap();
+    drop(raw);
+    let mut stalled = UnixStream::connect(directory.join("guardian.sock")).unwrap();
+    stalled.write_all(&hello_frame[..2]).unwrap();
+    assert!(readable_within(&stalled, 1000));
+    assert_eq!(std::io::Read::read(&mut stalled, &mut [0; 1]).unwrap(), 0);
+    drop(stalled);
+    let mut oversized = UnixStream::connect(directory.join("guardian.sock")).unwrap();
+    oversized
+        .write_all(
+            &u32::try_from(phoenix_deployment_controller::guardian_ipc::MAX_FRAME_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        )
+        .unwrap();
+    drop(oversized);
+    let mut replacement = GuardianClient::connect(&directory).unwrap();
+    assert_eq!(
+        replacement.hello().unwrap().state,
+        WireState::DetachedFenced
+    );
 }
 
 #[test]
@@ -101,54 +154,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
             )
         ));
         drop(client);
-        let mut raw = UnixStream::connect(directory.join("guardian.sock")).unwrap();
-        same_uid(&raw).unwrap();
-        let mut hello_frame = Vec::new();
-        write_frame(&mut hello_frame, &Request::Hello).unwrap();
-        raw.write_all(&hello_frame[..2]).unwrap();
-        assert!(!readable_within(&raw, 20));
-        raw.write_all(&hello_frame[2..5]).unwrap();
-        assert!(!readable_within(&raw, 20));
-        raw.write_all(&hello_frame[5..]).unwrap();
-        let Response::Hello { snapshot } = read_frame(&mut raw).unwrap() else {
-            panic!("hello")
-        };
-        assert_eq!(snapshot.instance, hello.instance);
-        assert_eq!(snapshot.state, WireState::DetachedFenced);
-        write_frame(
-            &mut raw,
-            &Request::BeginReconciliation {
-                instance: hello.instance,
-                inventory: hello.slots,
-                interruption_revision: 1,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            read_frame::<Response>(&mut raw).unwrap(),
-            Response::Refused(WireError::UnsupportedDurableBinding)
-        );
-        raw.write_all(&0_u32.to_be_bytes()).unwrap();
-        drop(raw);
-        let mut stalled = UnixStream::connect(directory.join("guardian.sock")).unwrap();
-        stalled.write_all(&hello_frame[..2]).unwrap();
-        assert!(readable_within(&stalled, 1000));
-        assert_eq!(std::io::Read::read(&mut stalled, &mut [0; 1]).unwrap(), 0);
-        drop(stalled);
-        let mut oversized = UnixStream::connect(directory.join("guardian.sock")).unwrap();
-        oversized
-            .write_all(
-                &u32::try_from(phoenix_deployment_controller::guardian_ipc::MAX_FRAME_BYTES + 1)
-                    .unwrap()
-                    .to_be_bytes(),
-            )
-            .unwrap();
-        drop(oversized);
-        let mut replacement = GuardianClient::connect(&directory).unwrap();
-        assert_eq!(
-            replacement.hello().unwrap().state,
-            WireState::DetachedFenced
-        );
+        exercise_protocol(&directory, hello);
     });
 }
 
