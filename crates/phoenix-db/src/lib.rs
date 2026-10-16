@@ -27694,7 +27694,9 @@ mod tests {
                     child
                 }
                 ContinueOutcome::AlreadyContinued(child) => child,
-                other => panic!("unexpected outcome: {other:?}"),
+                other @ ContinueOutcome::ParentNotContextExhausted { .. } => {
+                    panic!("unexpected outcome: {other:?}")
+                }
             };
             assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
             assert_eq!(

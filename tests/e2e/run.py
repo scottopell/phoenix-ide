@@ -1316,7 +1316,7 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
 
         original_scope = exhausted['conversation']['work_scope_id']
         assert original_scope, 'non-Git creation must own a persisted WorkScope'
-        assert exhausted['conversation']['conv_mode']['type'] == 'direct'
+        assert exhausted['conversation']['conv_mode']['mode'] == 'Direct'
         original_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{root_conv_id}'}, timeout=10)
         original_resolution.raise_for_status()
         original_environment = original_resolution.json()['work_scope']
