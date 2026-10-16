@@ -15,14 +15,6 @@ fn main() {
             eprintln!("daemon descriptor cleanup failed: {error}");
             std::process::exit(1);
         }
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "warn".into()),
-            )
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .init();
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

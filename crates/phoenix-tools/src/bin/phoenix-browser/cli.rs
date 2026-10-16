@@ -442,6 +442,67 @@ async fn connect(paths: &SessionPaths) -> Result<Option<UnixStream>, String> {
     }
 }
 
+struct UnreadyDaemon(Option<std::process::Child>);
+
+impl Drop for UnreadyDaemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            if let Err(error) = child.kill() {
+                eprintln!(
+                    "Failed to terminate unready browser daemon {}: {error}",
+                    child.id()
+                );
+            }
+            if let Err(error) = child.wait() {
+                eprintln!(
+                    "Failed to reap unready browser daemon {}: {error}",
+                    child.id()
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_daemon(
+    child: std::process::Child,
+    paths: &SessionPaths,
+    budget: Duration,
+) -> Result<UnixStream, String> {
+    let mut daemon = UnreadyDaemon(Some(child));
+    let ready = tokio::time::timeout(budget, async {
+        loop {
+            if let Some(stream) = connect(paths).await? {
+                return Ok(stream);
+            }
+            if let Some(status) = daemon
+                .0
+                .as_mut()
+                .expect("unready daemon")
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "daemon exited {status}; inspect {}",
+                    paths.log().display()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "daemon startup timed out; inspect {}",
+            paths.log().display()
+        )
+    })??;
+    drop(daemon.0.take());
+    Ok(ready)
+}
+
 async fn connect_or_start(options: &Options) -> Result<UnixStream, ConnectionError> {
     if options.paths.directory.exists() {
         daemon::private_directory(&options.paths.directory)?;
@@ -487,29 +548,12 @@ async fn connect_or_start(options: &Options) -> Result<UnixStream, ConnectionErr
         .stdout(Stdio::null())
         .stderr(log);
     command.process_group(0);
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|e| format!("daemon startup: {e}"))?;
-    loop {
-        if let Some(stream) = connect(&options.paths).await? {
-            return Ok(stream);
-        }
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return Err(format!(
-                "daemon exited {status}; inspect {}",
-                options.paths.log().display()
-            )
-            .into());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "daemon startup timed out; inspect {}",
-                options.paths.log().display()
-            )
-            .into());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    wait_for_daemon(child, &options.paths, Duration::from_secs(120))
+        .await
+        .map_err(ConnectionError::Startup)
 }
 
 async fn execute(options: &Options) -> Response {
@@ -692,6 +736,54 @@ pub async fn main_entry() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_daemon_readiness_terminates_and_reaps_the_child() {
+        for (key, budget) in [
+            ("timeout".to_owned(), Duration::ZERO),
+            ("x".repeat(200), Duration::from_secs(30)),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = SessionPaths {
+                directory: directory.path().to_owned(),
+                key,
+            };
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let identity =
+                phoenix_core::process_identity::current_process_identity(child.id()).unwrap();
+            let error = wait_for_daemon(child, &paths, budget).await.unwrap_err();
+            assert!(
+                error.contains("timed out") || error.contains("connect session endpoint"),
+                "{error}"
+            );
+            assert!(!phoenix_core::process_identity::process_identity_matches(
+                identity
+            ));
+            let mut status = 0;
+            // SAFETY: WNOHANG only observes the already-reaped child from this fixture.
+            assert_eq!(
+                unsafe {
+                    libc::waitpid(
+                        libc::pid_t::try_from(identity.pid).unwrap(),
+                        &raw mut status,
+                        libc::WNOHANG,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
 
     #[test]
     fn named_session_selection_does_not_read_the_fallback_directory() {
