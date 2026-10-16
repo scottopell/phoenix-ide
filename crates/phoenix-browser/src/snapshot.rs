@@ -1,10 +1,12 @@
 //! Accessibility snapshots and document-bound interaction targets (REQ-BT-025).
 
+mod collection;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use chromiumoxide::cdp::browser_protocol::{
-    accessibility::{AxNode, AxValue, GetFullAxTreeParams},
+    accessibility::{AxNode, AxValue},
     dom::{BackendNodeId, ResolveNodeParams},
     input::{
         DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
@@ -256,16 +258,18 @@ impl BrowserSession {
             .await?
             .ok_or_else(|| error("Main frame unavailable; call browser_snapshot again"))?;
         tracing::debug!("accessibility snapshot excludes iframe documents");
-        let tree = self
-            .page
-            .execute(GetFullAxTreeParams::builder().frame_id(frame).build())
-            .await?;
+        let tree = collection::collect(
+            self.snapshot_websocket_address(),
+            self.page.target_id(),
+            frame,
+        )
+        .await?;
         if self.page.get_document().await?.backend_node_id != document {
             return Err(error(
                 "Document changed during snapshot; call browser_snapshot again",
             ));
         }
-        let (output, refs) = render(&tree.result.nodes, interactive_only, document);
+        let (output, refs) = render(&tree.nodes, interactive_only, document);
         self.snapshot = Some(refs);
         Ok(output)
     }

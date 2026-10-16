@@ -775,6 +775,10 @@ impl std::fmt::Display for BrowserTerminationError {
 }
 
 impl BrowserSession {
+    pub(crate) fn snapshot_websocket_address(&self) -> &str {
+        self.browser.websocket_address()
+    }
+
     /// Directory where the fetcher caches downloaded Chrome binaries
     pub(crate) fn fetcher_cache_dir() -> PathBuf {
         fetcher_cache_dir()
