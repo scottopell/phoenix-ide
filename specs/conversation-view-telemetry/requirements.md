@@ -66,3 +66,10 @@ AND SHALL match exported frontend source, route, trigger, terminal outcome and b
 AND SHALL reject missing, duplicate, foreign, rejected or privacy-invalid evidence.
 
 A departing document's rejected fetch or missing response observation SHALL NOT substitute for collector rejection or acceptance. Collector acceptance SHALL be observed only after authentication, bounded decoding, semantic validation and authoritative server identity resolution succeed. Collector acceptance alone SHALL NOT prove export, and export-derived expected inventories SHALL NOT manufacture browser observations. Synthetic-server response completion SHALL NOT qualify a real candidate. For nondeparting documents, qualification SHALL retain the browser-observed collector204 requirement in addition to exported evidence. An unsampled admission SHALL remain a sampling observation, not a successful delivery case. These evidence rules SHALL NOT add retries, a queue, a delivery guarantee, altered sampling or a longer transport deadline.
+
+### REQ-CVT-007: Complete bounded exported schemas
+
+WHEN a validated view report is exported
+THE SYSTEM SHALL preserve all declared semantic attributes and their types, including readiness marks, signed timing and bounded correlation counters, without SDK attribute truncation
+AND SHALL budget the complete44-field view schema plus at most8 pinned SDK metadata fields within a52-attribute provider limit shared by both supported exporter configurations
+AND SHALL retain spans-only allowlisting, zero event/event-attribute capacity, four links and four link attributes, existing privacy validation and receiver retention budgets.
