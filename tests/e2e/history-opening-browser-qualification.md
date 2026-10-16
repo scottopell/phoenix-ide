@@ -1607,3 +1607,53 @@ disabled/wrong-element controls, cross-document navigation, wrong destination,
 completed request, wrong ready outcome and rejected report remain failures.
 This source/mock result does not prove the actual mounted path or candidate
 export join; those remain hosted qualification obligations.
+
+
+## Explicit lifecycle admission correction after run 38848525587
+
+Harness `2d790f9a` / app `e494c38c` completed run `38848525587` with witness
+`116804361665` failure and standard Rust `116804432524` success; all standard
+jobs passed. Nine history checks and stock 48 trials (six sampled/six POSTs)
+passed, as did seven negative controls. A naturally sampled pagehide emitted one
+incomplete report and exactly one matching real collector acceptance witness;
+no browser 204 was observed. It remains provisional: final semantic export join
+and normal drain were not reached. Artifact `12023839353` remains remote, with
+203,220 range bytes of selected evidence retained.
+
+The first failure was a missing SPA-canceled report after real sidebar navigation.
+The earlier interpretation as a potentially defective cancellation emission is
+not established: those lifecycle trials recorded no explicit producer sampling
+admission. A finite legacy GET open ID exists independently of sampling, so it
+cannot prove a sampled journey. Source cleanup does invoke canceled finish on
+real unmount, and explicit unsampled journeys correctly emit no report. Actual
+prior sampling therefore remains unknown, not retroactively unsampled or passed.
+
+Exact donors `33c8d9a50ba6e4a4f471ef8bbb8afcd5ddfa6496` and
+`0a0a7c64cfd373ae2199381fcd1cc9ec8d731532` integrate as app
+`9782694428ee7f9749de9ee514be59738663cab6`, tree
+`85ed064ff77440d0592d712d57b54a867bd36046`. All lifecycle contexts install
+bounded producer diagnostics inside the absolute case deadline before page
+creation. Primary admission is explicit before actions: unsampled trials take no
+sampled-only action and expect zero primary reports; sampled captures require
+exact producer request association and bind any report to the admitted UUID.
+Missing/foreign/overflow admission fails, as does a missing report after an
+exercised sampled action. Successor/resume reports remain distinct from primary
+admission and are retained. No producer behavior or sampling rate was changed.
+
+Review caught readiness-first capture identity/mandatory-report inconsistency
+and a late-CDP-emulation cancellation gap before import. The immutable correction
+binds identity before branch selection; a readiness-first unexercised case may
+have zero reports but any observed report must match, be unique and receive204.
+Both final capture checks enforce that same policy. A canceled emulation cannot
+install listeners or navigate after its deadline. Primary errors survive cleanup,
+callback and receipt persistence errors. An independent reviewer also ran
+in-memory full-stage readiness mocks covering late valid, foreign, duplicate,
+missing-response and non-204 POSTs, and late emulation; no native run was claimed.
+
+Actual cached integration ring: 65 opening Python, 16 shipping Python, 99 Node
+selftests and 137 focused telemetry tests across seven files passed. Source/hash
+admission is refreshed; no timeout, retry, forced sampling, capture exemption or
+collector/export acceptance relaxation was added. The reviewed REQ-CVT-006 join
+still requires the full independent report inventory, real collector witnesses,
+actual semantic exports and normal app/receiver drain. New hosted evidence is
+owed; previous unsampled/inconclusive observations are not delivery success.
