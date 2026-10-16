@@ -487,23 +487,21 @@ mod tests {
         let mut value = payload();
         value["frontend_source"] = "f".repeat(40).into();
         for key in [
-            "reconnect_count",
+            "admitted_count",
             "sampled_count",
-            "sampling_dropped_count",
             "transport_dropped_count",
             "transport_failed_count",
             "dropped_correlations",
+            "background_interval_count",
+            "reconnect_count",
+            "observer_inspection_count",
         ] {
-            value[key] = u32::MAX.into();
+            value[key] = 10_000.into();
         }
-        for key in [
-            "frame_delta_count",
-            "frame_over_50_count",
-            "frame_max_delta_ms",
-            "frame_p95_delta_ms",
-        ] {
-            value[key] = 500.into();
-        }
+        value["counters_saturated"] = true.into();
+        value["correlations"] = serde_json::json!([{
+            "kind": "request", "id": uuid::Uuid::new_v4().to_string()
+        }]);
         value["outcome"] = "ready".into();
         value["anchor_result"] = "applied".into();
         value["product_conversation_id"] = serde_json::json!(uuid::Uuid::new_v4());
@@ -755,6 +753,16 @@ mod tests {
                 assert_eq!(child.parent_span_id, view.span_context.span_id());
                 assert_eq!(child.span_context.trace_id(), view.span_context.trace_id());
                 assert_eq!(child.dropped_attributes_count, 0);
+                for (key, expected) in [
+                    ("open.id", value["open_id"].as_str().unwrap()),
+                    ("correlation.kind", "request"),
+                    (
+                        "correlation.id",
+                        value["correlations"][0]["id"].as_str().unwrap(),
+                    ),
+                ] {
+                    assert!(child.attributes.iter().any(|attribute| attribute.key.as_str() == key && matches!(&attribute.value, opentelemetry::Value::String(actual) if actual.as_str() == expected)));
+                }
             }
         }
     }
