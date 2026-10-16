@@ -24,16 +24,10 @@
 --     and the direct-PTY fallback. Multi-attach is deferred to a future
 --     revision.
 --
--- Socket-path keying (task 03001):
---   Work, Branch, and managed (top-level) Explore conversations key the
---   socket to the worktree path (wt-{hash(worktree_path)}.sock) so
---   continuations automatically share the same tmux session — the
---   worktree IS the coding environment.
---   Direct-mode conversations key the socket to the conversation_id
---   (conv-{id}.sock) as a fallback (no worktree to anchor to).
---   Sub-agents are excluded from tmux access entirely (task 03001),
---   so the question of socket keying for sub-agent Explore does not
---   arise: ConvMode::Explore.worktree_path is None for sub-agents.
+-- Ordinary socket-path keying uses the opaque persisted WorkScope ID,
+-- including Direct/non-Git transcripts. Continuations retain that exact key.
+-- Unattached fallback, Coordinator and GlobalTerminal identities remain
+-- separate. Sub-agents do not gain tmux capability from their scope attachment.
 --
 -- Requirement traceability: REQ-TMUX-001 through REQ-TMUX-014
 -- Dependencies: specs/bedrock/bedrock.allium

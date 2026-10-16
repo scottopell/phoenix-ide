@@ -82,11 +82,11 @@ external entity ShellIntegrationProvider {
 -- Value Types
 ------------------------------------------------------------
 
--- The durable-owner key for work-affine resources. Defined in
--- crates/phoenix-ide/src/work_scope.rs. Worktree carries the worktree
--- path; Conversation carries the conversation id; Global carries no
--- payload (singleton). stable_key() makes the three namespaces disjoint
--- via "worktree:", "conversation:", and "global:" prefixes.
+-- The durable-owner key for work-affine resources is ResourceScopeKey.
+-- Work carries an opaque persisted scope ID; Unattached carries a fallback
+-- transcript ID. Coordinator and GlobalTerminal are separate singletons.
+-- stable_key() uses disjoint work:, unattached:, coordinator and global_terminal
+-- encodings; neither cwd nor ConvMode selects ordinary resource ownership.
 --
 -- Terminal mirrors the WorkScope ownership pattern of tmux
 -- (REQ-TMUX-WS-001) and browser (REQ-BROWSER-WS-001): continuation
@@ -147,8 +147,7 @@ enum ShellIntegrationStatus {
 entity Terminal {
     -- The WorkScope this terminal belongs to (REQ-TERM-WS-001).
     -- A conversation accesses "its" terminal by resolving its own
-    -- WorkScope (worktree path if managed/branch, conversation id for
-    -- Direct mode) and looking up the matching Terminal. Continuation
+    -- persisted WorkScope ID and looking up the matching Terminal. Continuation
     -- conversations resolving to the same scope share the terminal.
     -- The Global scope holds a single terminal that is not associated
     -- with any conversation; see the UserOpensTerminal rule.
@@ -632,8 +631,8 @@ rule TerminalTornDownWithWorkScopeCleanup {
     ensures: terminal.status = absent
 
     @guidance
-        -- WorkScopeCleaned fires from the same project-lifecycle hooks
-        -- that drive REQ-TMUX-WS-002. Conversation end alone does NOT
+        -- WorkScopeCleaned is authorized by scope/aggregate retirement,
+        -- including durable Close. Conversation end alone does NOT
         -- fire this — a persisted-scope terminal survives individual
         -- transcript handoffs, including Direct/non-Git continuation.
         --
@@ -806,8 +805,7 @@ rule CwdReportedFromOsc7 {
 
 -- REQ-TERM-003, REQ-TERM-WS-001: at most one live terminal per WorkScope.
 -- The ActiveTerminals registry HashMap is keyed by WorkScope::stable_key()
--- and stable_key() is injective across the three variants (disjoint
--- "worktree:", "conversation:", "global:" prefixes). Two conversations
+-- and stable_key() uses disjoint resource namespaces. Two conversations
 -- that resolve to the same WorkScope therefore address the same Terminal
 -- entry — they share rather than collide.
 invariant OneTerminalPerWorkScope {
