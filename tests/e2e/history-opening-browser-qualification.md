@@ -1917,3 +1917,39 @@ drain/export gates are unchanged. Four telemetry module hashes are unchanged.
 Offline Python 16/67 and Node 14/35/65 passed at the new pin. Corrected actual
 protobuf metrics, three exact capacity/privacy guards, native joint inventory,
 normal drain, outer Global history and overhead acceptance remain hosted gates.
+
+
+## Typed-counter guard passed; full UI reaction restoration blocked native capture
+
+Run `38918233402`, harness `aa2283a962bb9f512534c82860ec2cc242d6759d` /
+app `c466cfb40c6b3ff1428c7611b48d48f005bb7bc9`, is terminal failure. Witness
+`117031150642` failed; Rust `117031295430` and all other standard jobs succeeded.
+The selected-libtest step succeeded with its unchanged mandatory one-pass guards:
+real complete production schema/capacity, logging limits, spans-only filter,
+collector/authentication and default SDK metadata. Full UI then failed one of
+3,527 tests (3,524 passed, two skipped): the retained-reaction older-history
+fixture could not find `Your reaction` at `renderFixture.test.tsx` after returning
+to the passage. Native/browser qualification was skipped, not failed or passed.
+
+Artifact `12053773873` remains remote (88,666,655 bytes). A selected ZIP-range
+read was rejected with HTTP 503 `Egress is over the account limit` before any
+selected receipt was retained; no retries or full download followed. Corrected
+serialized-byte numbers therefore are not claimed from this artifact. A bounded
+workflow console projection now prints only the six fixed numeric
+`collector_capacity` fields already emitted by the real test; full logs and exact
+receipts remain retained, and all assertions/admission checks are unchanged.
+
+The unchanged owning fixture module passed 15 cached local tests; an initial
+`-t draft` attempt matched zero tests and is not pass evidence. Source tracing
+identified async history loading, React source-row commit and pill animation-frame
+positioning as distinct phases, but did not prove CI starvation or a product race.
+Test-only app commit `1ef9a5773446d62f10c60a71eeef69f235653c8a`, tree
+`49907e8c10205f5675291fe031bcc3170807ebe9`, wraps the actual return click in async
+`act`, observes the source row commit, then services positioning through an actual
+animation frame before the existing textbox/body/no-focus/selection/API assertions.
+No timeout, skip, assertion removal, mock return callback or production behavior
+changes. Cached exact named test passed (one), full owning module passed (15),
+and changed-file ESLint passed. Affected Python admission 67 and joint Node 65
+passed at this new pin. The source-backed synchronization change is not claimed
+to prove the cause of the prior hosted failure. Full UI and native qualification
+remain required; no acceptance or overhead clearance follows from these passes.

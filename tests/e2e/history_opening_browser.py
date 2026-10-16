@@ -32,8 +32,8 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "c466cfb40c6b3ff1428c7611b48d48f005bb7bc9"
-TREE_PIN = "e3f4d726df1d31e6f68e386945fe69e052920b38"
+PIN = "1ef9a5773446d62f10c60a71eeef69f235653c8a"
+TREE_PIN = "49907e8c10205f5675291fe031bcc3170807ebe9"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"

@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: c466cfb40c6b3ff1428c7611b48d48f005bb7bc9
+          ref: 1ef9a5773446d62f10c60a71eeef69f235653c8a
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -248,8 +248,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = c466cfb40c6b3ff1428c7611b48d48f005bb7bc9
-          test "$(git rev-parse HEAD^{tree})" = e3f4d726df1d31e6f68e386945fe69e052920b38
+          test "$(git rev-parse HEAD)" = 1ef9a5773446d62f10c60a71eeef69f235653c8a
+          test "$(git rev-parse HEAD^{tree})" = 49907e8c10205f5675291fe031bcc3170807ebe9
           test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -310,7 +310,7 @@ jobs:
         working-directory: pinned-app
         run: |
           python3 - <<'PY'
-          import hashlib, json, pathlib, shutil, subprocess
+          import hashlib, json, pathlib, re, shutil, subprocess
           root = pathlib.Path.cwd()
           selector = ['cargo', 'test', '--no-run', '--message-format=json']
           try:
@@ -383,6 +383,8 @@ jobs:
               assert name + ': test' in listed.stdout
               command = [str(destination), name, '--exact', '--nocapture', '--test-threads=1']
               outcome = subprocess.run(command, capture_output=True, text=True, timeout=120)
+              for metric in re.findall(r'collector_capacity cap=\d+ attributes=\d+ dropped=\d+ otlp_span_bytes=\d+ semantic_kv_bytes=\d+ sdk_kv_bytes=\d+', outcome.stdout):
+                  print(metric, flush=True)
               with (root.parent/'opening-production-capacity-unit.log').open('a') as log:
                   log.write(outcome.stdout+outcome.stderr)
               passed = int('1 passed; 0 failed;' in outcome.stdout)
