@@ -1143,7 +1143,7 @@ mod tests {
     async fn oversized_samples_use_complete_saved_artifact_and_retain_methodology() {
         let directory = tempfile::tempdir().unwrap();
         let saved_path = directory.path().join("samples.json");
-        let raw = json!([{"run_index": 0, "trace": "x".repeat(protocol::MAX_MESSAGE as usize)}]);
+        let raw = json!([{"run_index": 0, "trace": "x".repeat(usize::try_from(protocol::MAX_MESSAGE).unwrap())}]);
         let mut payload = json!({
             "outcome": "completed", "requested_runs": 1, "warmup": 2,
             "raw_samples": raw,
@@ -1197,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_response_returns_explicit_failure_with_identity_and_artifacts() {
         for successful in [true, false] {
-            let huge = "x".repeat(protocol::MAX_MESSAGE as usize);
+            let huge = "x".repeat(usize::try_from(protocol::MAX_MESSAGE).unwrap());
             let mut response = if successful {
                 Response::success(
                     "named:test",
@@ -1244,7 +1244,7 @@ mod tests {
             Some("daemon"),
             json!({
                 "url": "http://localhost/", "title": "Page",
-                "console_errors": ["x".repeat(protocol::MAX_MESSAGE as usize)],
+                "console_errors": ["x".repeat(usize::try_from(protocol::MAX_MESSAGE).unwrap())],
                 "snapshot": {
                     "status": "success",
                     "result": {"text": "snapshot", "artifacts": ["/saved-snapshot"]},
