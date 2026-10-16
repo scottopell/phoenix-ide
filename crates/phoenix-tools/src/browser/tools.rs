@@ -991,7 +991,7 @@ impl BrowserClickTool {
                     Ok(Ok(())) => ToolOutput::success(format!("Clicked {reference}")),
                     Ok(Err(error)) => ToolOutput::error(error.to_string()),
                     Err(_) => ToolOutput::error(format!(
-                        "Reference click timed out after {timeout:?}; take a new browser_snapshot"
+                        "Reference click timed out after {timeout:?}; the click may already have happened. Inspect page state before retrying; do not blindly replay the click. Take a new browser_snapshot for fresh refs."
                     )),
                 };
             }
@@ -1189,7 +1189,7 @@ impl BrowserTypeTool {
                     )),
                     Ok(Err(error)) => ToolOutput::error(error.to_string()),
                     Err(_) => ToolOutput::error(format!(
-                        "Reference typing timed out after {timeout:?}; take a new browser_snapshot"
+                        "Reference typing timed out after {timeout:?}; focus, clearing, and partial text insertion may already have happened. Inspect the actual field value before retrying; do not append the full text blindly. Take a new browser_snapshot for fresh refs."
                     )),
                 };
             }

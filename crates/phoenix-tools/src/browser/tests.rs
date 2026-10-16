@@ -2956,6 +2956,12 @@ async fn browser_snapshot_accessibility_and_native_reference_interactions() {
             "window.typed === 'Ada' && document.querySelector('#customer').value === 'Ada'",
         )
         .await;
+        let timed_out = BrowserTypeTool
+            .run(json!({"ref": customer[0], "text": "x".repeat(1000), "timeout": "1ms"}), ctx.clone())
+            .await;
+        assert!(!timed_out.is_success(), "long typing must exceed the tiny budget");
+        assert!(timed_out.output().contains("partial text insertion may already have happened"), "{}", timed_out.output());
+        assert!(timed_out.output().contains("do not append the full text blindly"), "{}", timed_out.output());
         let shadow = snapshot_refs(&full, "button \"Shadow action\"");
         assert_eq!(shadow.len(), 1, "{full}");
         let click = BrowserClickTool

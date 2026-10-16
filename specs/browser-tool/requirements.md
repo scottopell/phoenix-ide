@@ -221,7 +221,8 @@ WHEN `interactive` is true (default: false)
 
 THE SYSTEM SHALL exclude iframe documents and SHALL include shadow-tree content to the extent Chrome exposes it in the main document's accessibility tree
 
-THE SYSTEM SHALL provide opaque references for supported interactive nodes with a backing DOM node, including supported shadow-tree nodes
+THE SYSTEM SHALL provide opaque references for supported interactive DOM elements, including supported shadow-tree nodes
+AND SHALL NOT issue interaction references for document or web-area roots
 
 THE SYSTEM SHALL bind every reference to the originating browser instance, main document, and exact DOM node, rather than an accessible name, selector, or position
 
@@ -240,7 +241,14 @@ THE SYSTEM SHALL retain that reference until a new snapshot attempt or browser t
 THE SYSTEM SHALL bound snapshot output to 2000 displayed nodes and 256 KiB of text, explicitly report truncation, and issue references only for nodes included in the output
 
 WHEN formatted snapshot output exceeds 4096 bytes
-THE SYSTEM SHALL write the bounded output to a temporary file and return its path with any truncation notice
+THE SYSTEM SHALL write the bounded output to an owner-only temporary file in an owner-only directory and return its path with any truncation notice
+AND SHALL retire that owned artifact when the references are invalidated or the browser is torn down
+
+THE SYSTEM SHALL cap the complete incoming snapshot CDP message and individual frame at 8 MiB before deserializing the accessibility tree
+AND SHALL report oversized collection responses as visible failures
+
+WHEN a reference interaction times out after browser-side input may have begun
+THE SYSTEM SHALL report that the action may have partially executed and instruct the caller to inspect page state before retrying
 
 WHEN collection fails or exceeds its timeout (default: 15 seconds)
 `browser_snapshot` SHALL return a visible error rather than an empty successful snapshot

@@ -39,7 +39,7 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-017:** React Component Access | ✅ Complete | `browser_inject_react_devtools` + `browser_remove_react_devtools`; `window.__phoenix` helper via `__REACT_DEVTOOLS_GLOBAL_HOOK__` |
 | **REQ-BT-018:** Live Browser View Side Panel | ✅ Complete | View-only CDP screencast relay via `/api/conversations/:id/browser-view` WS; mutex with prose/diff slot; auto-mount-when-empty on first `browser_*` tool |
 | **REQ-BT-019:** Systematic Web Performance Testing | 🟡 In Progress | `browser_profile` tool (action enum). Tier 0+1 + cheap Tier 2; lading-style scenario harness returns raw per-run samples (never averaged). Lifecycle in `browser-profiling.allium`. Network emulation deferred (REQ-BT-019-NG-NETEMU) |
-| **REQ-BT-025:** Accessibility Snapshots and Element References | ✅ Complete | `browser_snapshot`; main-document AX tree and interactive filtering; exact-node click/type refs; explicit limits and large-output artifacts. Eight rendering/schema/browser tests cover reference lifetime, native/React input, shadow roots, iframe exclusion, and hover replacement. |
+| **REQ-BT-025:** Accessibility Snapshots and Element References | ✅ Complete | `browser_snapshot`; main-document AX tree and interactive filtering; exact-node click/type refs; explicit limits and large-output artifacts. Rendering/schema/browser regressions cover reference lifetime, native/React input, shadow roots, iframe exclusion, replacement at native input dispatch, navigation, and cancellation. Snapshot collection has an 8 MiB wire cap; spilled files are private and retired with their refs/session. |
 
 ### WorkScope Ownership
 
