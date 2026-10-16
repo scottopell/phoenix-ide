@@ -70,6 +70,48 @@ pub fn initial_release_request(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidBuildIdentity;
+
+/// A clean, exact source revision; arbitrary strings cannot enter the native protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildIdentity(String);
+
+impl BuildIdentity {
+    /// # Errors
+    /// Rejects abbreviated, uppercase, and non-hexadecimal revisions.
+    pub fn parse(value: &str) -> Result<Self, InvalidBuildIdentity> {
+        if value.len() == 40
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(InvalidBuildIdentity)
+        }
+    }
+
+    #[must_use]
+    /// No native identity exists for a dirty or unidentifiable build.
+    pub fn compiled() -> Option<Self> {
+        Self::parse(env!("PHOENIX_SDC_BUILD_ID")).ok()
+    }
+}
+
+impl Serialize for BuildIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BuildIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(|_| serde::de::Error::custom("invalid build identity"))
+    }
+}
+
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
@@ -515,9 +557,16 @@ pub enum WireCandidateVerification {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", content = "data", rename_all = "snake_case")]
+#[serde(
+    tag = "op",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Request {
-    Hello,
+    Hello {
+        build: BuildIdentity,
+    },
     Snapshot,
     Fence {
         session: WireSession,
@@ -569,25 +618,37 @@ pub enum Request {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", content = "data", rename_all = "snake_case")]
 pub enum Response {
-    Hello { snapshot: WireSnapshot },
+    Hello {
+        build: BuildIdentity,
+        snapshot: WireSnapshot,
+    },
     Snapshot(WireSnapshot),
     Fenced,
-    ReconciliationBegun { session: WireSession },
-    InitialReleased { session: WireSession },
+    ReconciliationBegun {
+        session: WireSession,
+    },
+    InitialReleased {
+        session: WireSession,
+    },
     ReconciliationFinished,
     Inventory(Vec<WireSlot>),
     SlotObserved(WireObservation),
     Retained(Option<WireRetained>),
     Acked,
     SignalRoundReserved,
-    Admitted { admission: u64 },
-    Submitted { key: WireKey },
+    Admitted {
+        admission: u64,
+    },
+    Submitted {
+        key: WireKey,
+    },
     Refused(WireError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireError {
     InvalidValue,
+    BuildMismatch,
     UnknownAdmission,
     AdmissionReplayed,
     AdmissionMismatch,
@@ -654,6 +715,8 @@ impl From<GuardianError> for WireError {
 pub struct GuardianServer<E: GuardianExecutor> {
     guardian: Guardian<E>,
     session: ControllerSession,
+    build: BuildIdentity,
+    hello_verified: bool,
     interruption: Option<PersistenceRevision>,
     finish_proof: Option<(PersistenceRevision, crate::ReconciledSessionPermit)>,
     ack_proofs: Vec<(DispatchKey, PersistenceRevision, crate::AppliedResultAck)>,
@@ -672,7 +735,11 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     /// # Errors
     /// Returns the guardian's authentication error if the supplied session
     /// does not match its instance, attempt, deadline, or active authority.
-    pub fn new(guardian: Guardian<E>, session: ControllerSession) -> Result<Self, GuardianError> {
+    pub fn new(
+        guardian: Guardian<E>,
+        session: ControllerSession,
+        build: BuildIdentity,
+    ) -> Result<Self, GuardianError> {
         guardian.authenticate_policy_binding(
             session,
             guardian.attempt_id(),
@@ -681,6 +748,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         Ok(Self {
             guardian,
             session,
+            build,
+            hello_verified: false,
             interruption: None,
             finish_proof: None,
             ack_proofs: Vec::new(),
@@ -921,6 +990,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         }
     }
     pub fn fence_connection(&mut self) {
+        self.hello_verified = false;
         let _ = self.guardian.controller_lost(self.session);
         self.initial_gate.take();
         self.staged.clear();
@@ -931,10 +1001,19 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         self.ack_proofs.clear();
     }
     pub fn handle(&mut self, request: Request) -> Response {
+        if let Request::Hello { build } = &request {
+            if build != &self.build {
+                self.fence_connection();
+                return Response::Refused(WireError::BuildMismatch);
+            }
+            self.hello_verified = true;
+        } else if !self.hello_verified {
+            return Response::Refused(WireError::BuildMismatch);
+        }
         if self.native_unbound
             && !matches!(
                 request,
-                Request::Hello
+                Request::Hello { .. }
                     | Request::Snapshot
                     | Request::Inventory
                     | Request::ObserveSlot { .. }
@@ -1166,7 +1245,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     }
     fn try_handle(&mut self, request: Request) -> Result<Response, WireError> {
         Ok(match request {
-            Request::Hello => Response::Hello {
+            Request::Hello { .. } => Response::Hello {
+                build: self.build.clone(),
                 snapshot: self.snapshot(),
             },
             Request::Snapshot => Response::Snapshot(self.snapshot()),
@@ -1422,8 +1502,14 @@ impl From<&EffectCompletion> for WireCompletion {
 }
 
 #[cfg(test)]
+fn test_build() -> BuildIdentity {
+    BuildIdentity::parse("0123456789abcdef0123456789abcdef01234567").unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
     use std::{
         cell::Cell,
         collections::BTreeMap,
@@ -1483,7 +1569,13 @@ mod tests {
         ));
         let mut unknown = Vec::new();
         let unsupported = PROTOCOL_VERSION.checked_add(1).unwrap();
-        let bytes = format!(r#"{{"version":{unsupported},"body":{{"op":"hello"}}}}"#);
+        let bytes = serde_json::to_string(&Envelope {
+            version: unsupported,
+            body: Request::Hello {
+                build: test_build(),
+            },
+        })
+        .unwrap();
         unknown.extend_from_slice(
             &u32::try_from(bytes.len())
                 .expect("fixed test JSON fits u32")
@@ -1563,17 +1655,59 @@ mod tests {
             OsEffect::SampleResources { sequence: 4 },
         );
         (
-            GuardianServer::new(guardian, session).unwrap(),
+            GuardianServer::new(guardian, session, test_build()).unwrap(),
             calls,
             ticket,
         )
     }
     #[test]
+    fn build_handshake_precedes_all_requests_and_checks_exact_echo() {
+        let (mut server, calls, _) = fixture();
+        assert_eq!(
+            server.handle(Request::Snapshot),
+            Response::Refused(WireError::BuildMismatch)
+        );
+        let other = BuildIdentity::parse("abcdef0123456789abcdef0123456789abcdef01").unwrap();
+        assert_eq!(
+            server.handle(Request::Hello { build: other }),
+            Response::Refused(WireError::BuildMismatch)
+        );
+        let Response::Hello { build, snapshot } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
+            panic!("expected verified hello")
+        };
+        assert_eq!(build, test_build());
+        assert_eq!(snapshot.attempt, 8);
+        assert_eq!(calls.get(), 0);
+        server.fence_connection();
+        assert_eq!(
+            server.handle(Request::Snapshot),
+            Response::Refused(WireError::BuildMismatch)
+        );
+    }
+
+    #[test]
+    fn wire_build_identity_requires_full_lowercase_hex() {
+        for invalid in [
+            "",
+            "01234567",
+            "ABCDEF0123456789abcdef0123456789abcdef01",
+            "g123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(BuildIdentity::parse(invalid).is_err());
+            assert!(serde_json::from_value::<BuildIdentity>(serde_json::json!(invalid)).is_err());
+        }
+    }
+
+    #[test]
     fn admission_is_exact_session_instance_key_effect_and_single_use() {
         let (mut server, calls, ticket) = fixture();
         let key = ticket.key().try_into().unwrap();
         let effect: WireEffect = ticket.effect().into();
-        let Response::Hello { snapshot, .. } = server.handle(Request::Hello) else {
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
             panic!("hello")
         };
         let session = snapshot.session;
@@ -1673,7 +1807,13 @@ mod tests {
         use std::os::unix::net::UnixStream;
         let (mut server, calls, _) = fixture();
         let (mut controller, mut guardian_socket) = UnixStream::pair().unwrap();
-        write_frame(&mut controller, &Request::Hello).unwrap();
+        write_frame(
+            &mut controller,
+            &Request::Hello {
+                build: test_build(),
+            },
+        )
+        .unwrap();
         serve_once(&mut guardian_socket, &mut server).unwrap();
         assert!(matches!(
             read_frame::<Response>(&mut controller).unwrap(),
@@ -1692,7 +1832,9 @@ mod tests {
         let (mut server, calls, ticket) = fixture();
         let key = ticket.key().try_into().unwrap();
         let effect: WireEffect = ticket.effect().into();
-        let Response::Hello { snapshot, .. } = server.handle(Request::Hello) else {
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
             panic!("hello")
         };
         let session = snapshot.session;
@@ -1743,7 +1885,9 @@ mod tests {
     #[test]
     fn stale_reconciliation_and_fence_require_trusted_interruption() {
         let (mut server, calls, _) = fixture();
-        let Response::Hello { snapshot, .. } = server.handle(Request::Hello) else {
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
             panic!("hello")
         };
         let old = snapshot.session;
@@ -1801,6 +1945,7 @@ mod native_evidence_tests {
     };
     use std::{
         collections::BTreeMap,
+        io::Cursor,
         num::{NonZeroU32, NonZeroUsize},
     };
 
@@ -1873,17 +2018,21 @@ mod native_evidence_tests {
             vec![identity(42), identity(44)],
         )
         .unwrap();
-        let mut server = GuardianServer::new(guardian, session).unwrap();
+        let mut server = GuardianServer::new(guardian, session, test_build()).unwrap();
         server.stage_native_identity(NativeGuardianIdentity {
             nonce: GuardianLifetimeNonce::new([8; 16]).unwrap(),
             process: identity(43),
         });
-        let Response::Hello { snapshot } = server.handle(Request::Hello) else {
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
             panic!("hello")
         };
         crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
         server.fence_connection();
-        let Response::Hello { snapshot } = server.handle(Request::Hello) else {
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
             panic!("detached")
         };
         crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
@@ -1958,13 +2107,15 @@ mod native_evidence_tests {
             .unwrap();
         let (guardian, session) =
             Guardian::new(attempt, deadline, Observer, vec![identity(42)]).unwrap();
-        let mut server = GuardianServer::new(guardian, session).unwrap();
+        let mut server = GuardianServer::new(guardian, session, test_build()).unwrap();
         let native_identity = NativeGuardianIdentity {
             nonce: GuardianLifetimeNonce::new([8; 16]).unwrap(),
             process: identity(43),
         };
         server.stage_native_identity(native_identity);
-        let Response::Hello { snapshot } = server.handle(Request::Hello) else {
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
             panic!("hello")
         };
         crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
@@ -2022,7 +2173,7 @@ mod native_evidence_tests {
         server.fence_connection();
         assert_eq!(
             server.handle(request),
-            Response::Refused(WireError::UnsupportedDurableBinding)
+            Response::Refused(WireError::BuildMismatch)
         );
         assert!(!released.load(Ordering::SeqCst));
 
@@ -2072,6 +2223,31 @@ mod native_evidence_tests {
             server.handle(request),
             Response::Refused(WireError::UnsupportedDurableBinding)
         );
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn release_initial_with_unknown_field_is_malformed_before_execution() {
+        let (mut server, request, released, loaded, binding) = initial_fixture(true);
+        server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
+        let mut body = serde_json::to_value(&request).unwrap();
+        body["data"]["unexpected"] = serde_json::json!(true);
+        let bytes = serde_json::to_vec(&Envelope {
+            version: PROTOCOL_VERSION,
+            body,
+        })
+        .unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("fixed test JSON fits u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&bytes);
+        assert!(matches!(
+            read_frame::<Request>(&mut Cursor::new(frame)),
+            Err(CodecError::Malformed(_))
+        ));
         assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
     }
 

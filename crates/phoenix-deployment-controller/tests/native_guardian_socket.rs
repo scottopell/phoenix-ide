@@ -1,8 +1,8 @@
 #![cfg(unix)]
 use phoenix_deployment_controller::{
     guardian_ipc::{
-        read_frame, write_frame, GuardianServer, Request, Response, WireError, WireSnapshot,
-        WireState,
+        read_frame, write_frame, BuildIdentity, GuardianServer, Request, Response, WireError,
+        WireSnapshot, WireState,
     },
     native_guardian::{bind_disposable, disposable_dir, same_uid, serve_until, GuardianClient},
     AttemptId, ChildSlotId, ChildSlotObservation, DispatchTicket, ExecutedEffect, Guardian,
@@ -15,6 +15,10 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+
+fn test_build() -> BuildIdentity {
+    BuildIdentity::parse("0123456789abcdef0123456789abcdef01234567").unwrap()
+}
 
 fn readable_within(stream: &UnixStream, millis: i32) -> bool {
     let mut descriptor = libc::pollfd {
@@ -51,13 +55,19 @@ fn exercise_protocol(directory: &Path, hello: WireSnapshot) {
     let mut raw = UnixStream::connect(directory.join("guardian.sock")).unwrap();
     same_uid(&raw).unwrap();
     let mut hello_frame = Vec::new();
-    write_frame(&mut hello_frame, &Request::Hello).unwrap();
+    write_frame(
+        &mut hello_frame,
+        &Request::Hello {
+            build: test_build(),
+        },
+    )
+    .unwrap();
     raw.write_all(&hello_frame[..2]).unwrap();
     assert!(!readable_within(&raw, 20));
     raw.write_all(&hello_frame[2..5]).unwrap();
     assert!(!readable_within(&raw, 20));
     raw.write_all(&hello_frame[5..]).unwrap();
-    let Response::Hello { snapshot } = read_frame(&mut raw).unwrap() else {
+    let Response::Hello { snapshot, .. } = read_frame(&mut raw).unwrap() else {
         panic!("hello")
     };
     assert_eq!(snapshot.instance, hello.instance);
@@ -92,7 +102,7 @@ fn exercise_protocol(directory: &Path, hello: WireSnapshot) {
         )
         .unwrap();
     drop(oversized);
-    let mut replacement = GuardianClient::connect(directory).unwrap();
+    let mut replacement = GuardianClient::connect_with_build(directory, test_build()).unwrap();
     assert_eq!(
         replacement.hello().unwrap().state,
         WireState::DetachedFenced
@@ -127,7 +137,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
         vec![()],
     )
     .unwrap();
-    let mut server = GuardianServer::new(guardian, session).unwrap();
+    let mut server = GuardianServer::new(guardian, session, test_build()).unwrap();
     server.require_native_binding();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -138,7 +148,7 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
             )
             .unwrap();
         });
-        let mut client = GuardianClient::connect(&directory).unwrap();
+        let mut client = GuardianClient::connect_with_build(&directory, test_build()).unwrap();
         let hello = client.hello().unwrap();
         assert_eq!(hello.slots.len(), 1);
         assert_eq!(client.inventory().unwrap(), hello.slots);

@@ -1,7 +1,7 @@
 //! Disposable same-UID Unix transport; durable diagnostic binding has no policy mutation authority.
 use crate::guardian_ipc::{
-    read_frame, write_frame, CodecError, GuardianServer, NativeEvidenceReadError, Request,
-    Response, WireError, WireObservation, WireSlot, WireSnapshot,
+    read_frame, write_frame, BuildIdentity, CodecError, GuardianServer, NativeEvidenceReadError,
+    Request, Response, WireError, WireObservation, WireSlot, WireSnapshot,
 };
 use crate::GuardianExecutor;
 use std::{
@@ -327,6 +327,7 @@ pub enum ClientError {
     Codec(CodecError),
     Refused(WireError),
     UnexpectedResponse,
+    MissingBuildIdentity,
 }
 impl From<io::Error> for ClientError {
     fn from(value: io::Error) -> Self {
@@ -342,16 +343,26 @@ impl From<CodecError> for ClientError {
 /// Typed observation client. No client method can mint a policy proof.
 pub struct GuardianClient {
     stream: Option<UnixStream>,
+    build: BuildIdentity,
 }
 impl GuardianClient {
     /// # Errors
     /// Rejects insecure socket paths or peer identities.
     pub fn connect(dir: &Path) -> Result<Self, ClientError> {
+        let build = BuildIdentity::compiled().ok_or(ClientError::MissingBuildIdentity)?;
+        Self::connect_with_build(dir, build)
+    }
+
+    /// Explicit identity injection for isolated transport fixtures without Git metadata.
+    /// # Errors
+    /// Rejects insecure socket paths or peer identities.
+    pub fn connect_with_build(dir: &Path, build: BuildIdentity) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(socket_path(dir)?)?;
         same_uid(&stream)?;
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream: Some(stream),
+            build,
         })
     }
     fn exchange(&mut self, request: &Request) -> Result<Response, ClientError> {
@@ -419,8 +430,14 @@ impl GuardianClient {
     /// # Errors
     /// Returns transport or protocol errors rather than inferring a live binding.
     pub fn hello(&mut self) -> Result<WireSnapshot, ClientError> {
-        match self.exchange(&Request::Hello)? {
-            Response::Hello { snapshot } => Ok(snapshot),
+        match self.exchange(&Request::Hello {
+            build: self.build.clone(),
+        })? {
+            Response::Hello { build, snapshot } if build == self.build => Ok(snapshot),
+            Response::Hello { .. } => {
+                self.stream.take();
+                Err(ClientError::UnexpectedResponse)
+            }
             Response::Snapshot(_)
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
@@ -683,6 +700,8 @@ pub fn run_disposable_guardian(
     if !(1..=120).contains(&child_seconds) || !(1..=120).contains(&serve_seconds) {
         return Err(Box::new(permission_denied()));
     }
+    let build = BuildIdentity::compiled()
+        .ok_or_else(|| io::Error::other("clean native build identity required"))?;
     let reader = SqliteNativeEvidenceReader::open(store_path, attempt)?;
     let mut nonce_bytes = [0; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
@@ -707,7 +726,7 @@ pub fn run_disposable_guardian(
         drop(executor);
         error
     })?;
-    let mut server = GuardianServer::new(guardian, session)?;
+    let mut server = GuardianServer::new(guardian, session, build)?;
     server.stage_native_identity(native_identity);
     server.stage_native_reader(Box::new(reader));
     server.stage_initial_gate(Box::new(gate));
