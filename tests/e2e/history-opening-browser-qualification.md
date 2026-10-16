@@ -2245,3 +2245,31 @@ caused the actual earlier clipping. Same-artifact local browser reproduction is
 not claimed: the hosted output is remote and no local heavy build/server/browser
 was admitted or started. Actual successor strict containment and exact-six real
 collector/export/drain remain the next execution gate.
+
+The cohesive correction ran as `38970376574` at harness
+`5e16c608bd46a28b768f5c770326897770804562`, terminal failure. Witness
+`117206992051` failed controlled ordinary/history; Rust `117207113852` and all
+other standard jobs succeeded. Explicit1360x900 and bounded physical acquisition
+did not clear containment: the final probe still has target_seen1, target row/
+message clipped1 each, no target-row-taller counter, row_clipped10, unknown4,
+report1/204, admission1, requests4, pending0/errors0. The failure occurs during
+strict acquisition before any successful baseline/four-frame hold; no completed
+trial exists. It does not show a source-pin mismatch because that assertion is
+not reached. This disproves the sufficiency of viewport matching and physical
+waiting, not the need for those driver contracts. No oracle relaxation or product
+predicate change follows. Artifact `12077047082` is96,448,691B; selected bounded
+reads75,334B retain the exact sanitized failure/browser log.
+
+No more diagnostic-only hosted attempts are planned. The minimal missing actual
+evidence is the offending clip axis and target/virtual-row/scroller/window
+rectangles from the same artifact/runtime, needed to distinguish app positioning/
+layout from a strict-oracle boundary mistake. The retained generic clipped count
+cannot recover that geometry after context closure. Cached source/VM tests cannot
+substitute for it. Same-artifact local browser reproduction was not performed:
+only remote build artifacts and source/cache are available here, and no local
+heavy build, native server/browser or artifact copy was started. The v0.13 blocker
+is unresolved and explicitly geometric, with zero completed controlled scenarios;
+collector/export/full/native acceptance is not claimed. Frozen stock evidence,
+controlled class, resumeunsupported, overheadfalse and fullacceptancefalse remain
+separate. Further execution is held pending an admitted same-artifact bounded
+geometry observation, not an unchanged rerun.
