@@ -180,6 +180,7 @@ enum TmuxRunReadinessMode {
 -- registries, task 03001).
 entity TmuxServer {
     conversation: bedrock/Conversation
+    work_scope_id: String
 
     -- Lifecycle state.
     status: ServerStatus
@@ -190,15 +191,8 @@ entity TmuxServer {
         terminal: gone
     }
 
-    -- The socket file path. Keyed to the worktree path for Work, Branch,
-    -- and managed (top-level) Explore conversations
-    -- (wt-{hash(worktree_path)}.sock) so that context-exhaustion
-    -- continuations automatically share the same session.
-    -- Keyed to conversation_id for Direct-mode conversations (no worktree).
-    -- Sub-agent Explore conversations have no worktree (and no tmux access
-    -- per task 03001), so they never produce a TmuxServer entity.
-    -- Computed once at entry creation and stable for the entity's lifetime.
-    -- (task 03001)
+    -- Ordinary servers are keyed by persisted scope identity; the requesting
+    -- conversation is an actor association, not the registry lookup authority.
     socket_path: String
 }
 
@@ -237,12 +231,13 @@ rule ServerSpawnedLazily {
 
     requires: tmux_binary_available()
     requires: probe_socket(conversation) = no_socket
-    requires: not exists TmuxServer{conversation: conversation}
+    requires: not exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
     let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxServer.created(
         conversation: conversation,
+        work_scope_id: attached_work_scope_id(conversation),
         status:       live,
         socket_path:  path
     )
@@ -284,6 +279,7 @@ rule ServerSpawnedAfterStale {
     ensures: SocketFileUnlinked(path)
     ensures: TmuxServer.created(
         conversation: conversation,
+        work_scope_id: attached_work_scope_id(conversation),
         status:       live,
         socket_path:  path
     )
@@ -305,12 +301,13 @@ rule ServerProbedLive {
 
     requires: tmux_binary_available()
     requires: probe_socket(conversation) = live
-    requires: not exists TmuxServer{conversation: conversation}
+    requires: not exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
     let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxServer.created(
         conversation: conversation,
+        work_scope_id: attached_work_scope_id(conversation),
         status:       live,
         socket_path:  path
     )
@@ -652,13 +649,13 @@ rule ServerKilledByConversationDelete {
     let work_scope = resolve_work_scope(conversation)
 
     requires: inheritor_scope != Some(work_scope)
-    requires: exists TmuxServer{conversation: conversation}
-    let server = TmuxServer{conversation: conversation}
+    requires: exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
+    let server = TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
     requires: server.status != gone
 
     ensures: TmuxServerKilled(server.socket_path)
     ensures: SocketFileUnlinked(server.socket_path)
-    ensures: not exists TmuxServer{conversation: conversation}
+    ensures: not exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
     @guidance
         -- Runs synchronously in the conversation hard-delete handler,
@@ -683,13 +680,13 @@ rule ServerPreservedForLiveOwner {
     let work_scope = resolve_work_scope(conversation)
 
     requires: inheritor_scope = Some(work_scope)
-    requires: exists TmuxServer{conversation: conversation}
-    let server = TmuxServer{conversation: conversation}
+    requires: exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
+    let server = TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
     ensures: not TmuxServerKilled(server.socket_path)
         -- The server keeps running for the surviving owner; the socket file
         -- is not unlinked.
-    ensures: exists TmuxServer{conversation: conversation}
+    ensures: exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
         -- The shared registry entry is left intact. The work-scope inventory
         -- must keep reporting the still-live server — dropping the entry would
         -- show "no tmux server" for a running session until a later
