@@ -32,6 +32,15 @@ impl Tool for BrowserSnapshotTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserSnapshotTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: SnapshotInput = match serde_json::from_value(input) {
             Ok(input) => input,
             Err(error) => return ToolOutput::error(format!("Invalid input: {error}")),
@@ -47,7 +56,7 @@ impl Tool for BrowserSnapshotTool {
             },
             None => Duration::from_secs(15),
         };
-        let session = match ctx.browser().await {
+        let session = match access.browser().await {
             Ok(session) => session,
             Err(error) => return ToolOutput::error(format!("Failed to get browser: {error}")),
         };
@@ -76,7 +85,7 @@ impl Tool for BrowserSnapshotTool {
                     };
                 let path = directory.join(format!("phoenix-snapshot-{}.txt", uuid::Uuid::new_v4()));
                 match tokio::fs::write(&path, output).await {
-                    Ok(()) => ToolOutput::success(format!("Accessibility snapshot saved to {}. Read this file for the tree and element refs.\n{notice}", path.display())),
+                    Ok(()) => ToolOutput::success(format!("Accessibility snapshot saved to {}. Read this file for the tree and element refs.\n{notice}", path.display())).with_display(json!({"artifact_path":path})),
                     Err(error) => {
                         session.invalidate_snapshot();
                         ToolOutput::error(format!("Could not save accessibility snapshot: {error}"))

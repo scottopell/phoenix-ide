@@ -351,6 +351,15 @@ impl Tool for BrowserProfileTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserProfileTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: ProfileInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -377,14 +386,14 @@ impl Tool for BrowserProfileTool {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+            let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
                 Ok(s) => s,
                 Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
             };
             return action_run_scenario(&session, &input, plan).await;
         }
 
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -1380,7 +1389,7 @@ async fn action_cpu_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
     ));
     match rankings.as_ref().and_then(|s| cpu_summary_json(s, &path)) {
         Some(display) => out.with_display(display),
-        None => out,
+        None => out.with_display(json!({"artifact_path": path})),
     }
 }
 
@@ -1411,7 +1420,7 @@ async fn action_cpu_summary(path: Option<&str>) -> ToolOutput {
     let out = ToolOutput::success(format!("CPU profile {path}\n\n{summary_text}"));
     match rankings.as_ref().and_then(|s| cpu_summary_json(s, path)) {
         Some(display) => out.with_display(display),
-        None => out,
+        None => out.with_display(json!({"artifact_path": path})),
     }
 }
 
@@ -2106,7 +2115,8 @@ async fn action_heap_snapshot(
         return ToolOutput::success(format!(
             "Heap snapshot saved to {path} (load in Chrome DevTools → Memory). \
              Pass this path as `baseline` to a later heap_snapshot for a diff."
-        ));
+        ))
+        .with_display(json!({"artifact_path": path}));
     };
 
     // Allium HeapDiffRequiresTwoSnapshots: a diff against a missing
@@ -2233,6 +2243,7 @@ async fn action_coverage_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutp
     ToolOutput::success(format!(
         "Coverage saved to {path} ({script_count} scripts)."
     ))
+    .with_display(json!({"artifact_path": path}))
 }
 
 #[cfg(test)]
