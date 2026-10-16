@@ -327,10 +327,10 @@ rule FailedTeardownRetryFails {
 -- REQ-BROWSER-WS-003: cleanup-cascade preservation when a live conversation
 -- other than the one being deleted still owns the scope — a continuation
 -- that inherits it, or a live sibling such as a Work-mode sub-agent sharing
--- its parent's scope. Scope-equality subsumes per-kind case-analysis: Direct
--- continuations always resolve to Conversation(<child_id>) which is never
--- equal to the parent's Conversation(<parent_id>), so they fall through to
--- CascadeTearsDownWhenNoInheritor automatically.
+-- its parent's scope. Ordinary continuations retain the selected parent's
+-- exact persisted scope, including Direct/non-Git members; new transcript
+-- identity does not select a different browser resource owner. Distinct
+-- historical scope identities remain separate regardless of cwd equality.
 rule CascadePreservesOnScopeMatch {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
