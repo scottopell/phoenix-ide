@@ -1482,25 +1482,27 @@ mod tests {
             Err(CodecError::Malformed(_))
         ));
         let mut unknown = Vec::new();
-        let bytes = br#"{"version":2,"body":{"op":"hello"}}"#;
+        let unsupported = PROTOCOL_VERSION.checked_add(1).unwrap();
+        let bytes = format!(r#"{{"version":{unsupported},"body":{{"op":"hello"}}}}"#);
         unknown.extend_from_slice(
             &u32::try_from(bytes.len())
                 .expect("fixed test JSON fits u32")
                 .to_be_bytes(),
         );
-        unknown.extend_from_slice(bytes);
+        unknown.extend_from_slice(bytes.as_bytes());
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(unknown)),
-            Err(CodecError::UnsupportedVersion(2))
+            Err(CodecError::UnsupportedVersion(version)) if version == unsupported
         ));
         let mut unknown_op = Vec::new();
-        let bytes = br#"{"version":1,"body":{"op":"execute_arbitrary"}}"#;
+        let bytes =
+            format!(r#"{{"version":{PROTOCOL_VERSION},"body":{{"op":"execute_arbitrary"}}}}"#);
         unknown_op.extend_from_slice(
             &u32::try_from(bytes.len())
                 .expect("fixed test JSON fits u32")
                 .to_be_bytes(),
         );
-        unknown_op.extend_from_slice(bytes);
+        unknown_op.extend_from_slice(bytes.as_bytes());
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(unknown_op)),
             Err(CodecError::Malformed(_))
