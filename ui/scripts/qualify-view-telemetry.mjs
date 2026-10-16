@@ -529,14 +529,31 @@ export function assertBackgroundReport(witness, report) {
   assert.ok(report.background_ms > 0, 'actual hidden interval must be retained');
 }
 
-export async function runPendingSPACancellation({ page, baseURL, selector, capture }) {
+export const sidebarHomeSelector = '.sidebar-expanded button.sidebar-brand:visible, .sidebar-collapsed button.sidebar-icon-btn[title="Phoenix"]:visible';
+
+export function validateSPAControl(control) {
+  assert.ok(control && typeof control === 'object', 'existing app SPA control required');
+  if (control.kind === 'sidebar_home') assert.deepEqual(Object.keys(control), ['kind']);
+  else {
+    assert.equal(control.kind, 'anchor');
+    assert.deepEqual(Object.keys(control).sort(), ['kind', 'selector']);
+    assert.ok(typeof control.selector === 'string' && control.selector.length > 0);
+  }
+}
+
+export async function runPendingSPACancellation({ page, baseURL, control, capture }) {
+  validateSPAControl(control);
   capture.assertPending();
   candidateDestination(page.url(), baseURL);
-  const target = page.locator(selector);
-  assert.equal(await target.count(), 1, 'exactly one mounted SPA anchor required');
-  assert.equal(await target.isVisible(), true, 'SPA anchor must be CSS visible');
-  const href = await target.getAttribute('href');
-  assert.ok(href, 'cancellation must use a real navigable anchor');
+  const target = page.locator(control.kind === 'sidebar_home' ? sidebarHomeSelector : control.selector);
+  assert.equal(await target.count(), 1, 'exactly one mounted app SPA control required');
+  assert.equal(await target.isVisible(), true, 'SPA control must be CSS visible');
+  if (control.kind === 'sidebar_home') {
+    assert.equal(await target.evaluate(element => element.tagName), 'BUTTON', 'sidebar navigation must be a real mounted button');
+    assert.equal(await target.isEnabled(), true, 'sidebar navigation must be enabled');
+  }
+  const href = control.kind === 'sidebar_home' ? '/' : await target.getAttribute('href');
+  assert.ok(href, 'cancellation must use a real navigable control');
   const destination = candidateDestination(href, baseURL);
   assert.notEqual(destination, page.url(), 'route replacement must change destination');
   const origin = await observePage(page, () => performance.timeOrigin);
@@ -596,7 +613,7 @@ export function appendLifecycleInventory(result, stage, identity, forbidden = []
 export async function runLifecycleQualificationStage({ browser, storageState, baseURL, fixture, outputDir, forbidden = [], budgetMs = 90000, onTrial = () => {} }) {
   assert.ok(fixture && Object.hasOwn(fixture, 'productConversationId'), 'authoritative lifecycle fixture product identity required');
   const destination = candidateDestination(fixture.route, baseURL);
-  assert.ok(typeof fixture.spaSelector === 'string' && fixture.spaSelector.length > 0, 'existing SPA anchor selector required');
+  validateSPAControl(fixture.spaControl);
   assert.ok(Number.isInteger(budgetMs) && budgetMs > 0 && budgetMs <= 90000);
   const deadline = Date.now() + budgetMs;
   const stage = { scope: 'real_browser_actions_when_invoked_not_candidate_acceptance_or_overhead', trials: [] };
@@ -664,7 +681,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
               trial.witness = await runPendingBackgroundRoundTrip({ page, context: owned, capture });
               trial.status = trial.witness.status;
             } else if (kind === 'spa_canceled') {
-              trial.witness = await runPendingSPACancellation({ page, baseURL, selector: fixture.spaSelector, capture });
+              trial.witness = await runPendingSPACancellation({ page, baseURL, control: fixture.spaControl, capture });
               trial.status = trial.witness.status;
               await page.waitForFunction(visibleReadiness, undefined, { timeout: 10000 });
             } else {
@@ -768,7 +785,7 @@ export async function runTelemetryChecks({ page, context, baseURL, serviceName, 
   });
   assert.ok(fixtures.lifecycle && Object.hasOwn(fixtures.lifecycle, 'productConversationId'), 'authoritative lifecycle fixture required before contexts');
   candidateDestination(fixtures.lifecycle.route, baseURL);
-  assert.ok(fixtures.lifecycle.spaSelector, 'existing SPA navigation anchor required before contexts');
+  validateSPAControl(fixtures.lifecycle.spaControl);
   const result = { runId, serviceName, identity: fixtures.identity, trials: [], journeys: [], forbidden: fixtures.forbidden ?? [],
     capabilities: { physical_mobile: 'not_tested', standalone_resume: 'not_exercised', bfcache_resume: 'not_exercised', background_terminal: 'not_exercised' } };
   mkdirSync(outputDir, { recursive: true });
