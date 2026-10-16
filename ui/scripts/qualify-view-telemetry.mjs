@@ -437,6 +437,7 @@ export function observePendingFiniteRequest(page, request, baseURL, expectedIden
       report = captureReport(body, expectedIdentity.forbidden ?? []);
       if (!report.correlations?.some(correlation => correlation.kind === 'request' && correlation.id === requestId)) return;
       assertRequestCorrelation([requestId], report);
+      if (expectedIdentity.admittedOpenId) assert.equal(report.open_id, expectedIdentity.admittedOpenId, 'terminal report must belong to admitted journey');
       assert.equal(report.product_conversation_id, expectedIdentity.productConversationId, 'terminal report must belong to the fixture view');
     } catch (error) { captureFailure ??= error; accepted({ error }); return; }
     reports.push(report);
@@ -453,6 +454,10 @@ export function observePendingFiniteRequest(page, request, baseURL, expectedIden
   page.on('response', onResponse);
   return {
     requestId, reports,
+    expectJourney(openId) {
+      expectedIdentity = { ...expectedIdentity, admittedOpenId: openId };
+      assert.ok(reports.every(report => report.open_id === openId), 'captured terminal must belong to admitted journey');
+    },
     assertPending() {
       if (navigationFailure) throw navigationFailure;
       assert.ok(!finished && request.timing().responseEnd === -1, 'finite request must still be pending');
@@ -620,7 +625,8 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
   for (const kind of ['pending_background', 'spa_canceled', 'bfcache_resume']) {
     for (let attempt = 0; attempt < 2; attempt++) {
       let owned;
-      const trial = { kind, attempt, reports: [], statuses: [], status: 'started' };
+      const trial = { kind, attempt, reports: [], statuses: [], producer_events: [], status: 'started' };
+      let primaryError;
       let capture;
       let page;
       const posts = new Map();
@@ -629,6 +635,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
       let canceled = false;
       let finiteSeen;
       const pending = new Promise(resolvePending => { finiteSeen = resolvePending; });
+      const signalAdmission = () => { if (captureArmed && trial.producer_events.some(event => event.kind === 'admission')) finiteSeen('pending'); };
       try {
         assert.ok(Date.now() < deadline, 'lifecycle stage admission deadline');
         const operation = (async () => {
@@ -639,10 +646,32 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
             }
             return created;
           }), 5000, 'lifecycle context');
+          await owned.exposeBinding('__phoenixLifecycleDiagnostic', (_source, event) => {
+            if (trial.producer_events.length >= 64) { ledgerFailure ??= new Error('lifecycle producer event bound'); return; }
+            try { trial.producer_events.push(captureDiagnostic(event)); }
+            catch { ledgerFailure ??= new Error('invalid lifecycle producer diagnostic'); }
+            signalAdmission();
+          });
+          assert.ok(!canceled, 'lifecycle binding admission canceled');
+          await owned.addInitScript(() => {
+            const pending = [];
+            let count = 0;
+            let failed = false;
+            window.addEventListener('phoenix:view-diagnostic', event => {
+              if (count++ > 64) return;
+              pending.push(window.__phoenixLifecycleDiagnostic(event.detail).catch(() => { failed = true; }));
+            });
+            window.__phoenixLifecycleDiagnosticDrain = async () => {
+              await Promise.all(pending);
+              if (failed) throw new Error('lifecycle producer diagnostic delivery failed');
+            };
+          });
+          assert.ok(!canceled, 'lifecycle initialization admission canceled');
           page = await boundedObservation(owned.newPage(), 5000, 'lifecycle page');
           assert.ok(!canceled, 'lifecycle page admission canceled');
           const cdp = await owned.newCDPSession(page);
           await cdp.send('Network.enable');
+          assert.ok(!canceled, 'lifecycle network admission canceled');
           await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 400, downloadThroughput: 1000000, uploadThroughput: 1000000 });
           page.on('request', request => {
             const url = new URL(request.url());
@@ -661,7 +690,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
               try {
                 captureArmed = true;
                 capture = observePendingFiniteRequest(page, request, baseURL, { ...fixture, forbidden });
-                finiteSeen('pending');
+                signalAdmission();
               } catch (error) { ledgerFailure ??= error; finiteSeen('invalid_pending'); }
             }
           });
@@ -672,11 +701,21 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
           const ready = page.waitForFunction(visibleReadiness, undefined, { timeout: 10000 }).then(() => 'ready', () => 'unavailable');
           const winner = await Promise.race([pending, ready]);
           await navigation;
+          await page.evaluate(() => window.__phoenixLifecycleDiagnosticDrain());
           if (ledgerFailure) throw ledgerFailure;
-          if (winner === 'ready') {
+          const admission = samplingDecision(trial.producer_events, new URL(destination).pathname.startsWith('/global/') ? 'global' : 'ordinary');
+          trial.admitted_open_id = admission.open_id;
+          trial.sampled = admission.sampled;
+          if (!admission.sampled) {
+            assert.equal(trial.reports.length, 0, 'unsampled lifecycle cannot emit report');
+            trial.status = 'inconclusive_explicit_unsampled';
+            capture?.close(); capture = null;
+          } else if (winner === 'ready') {
             trial.status = 'inconclusive_readiness_preceded_finite_request_sampling_unknown';
           } else {
             assert.equal(winner, 'pending', 'actual pending admission required');
+            assert.ok(trial.producer_events.some(event => event.kind === 'request' && event.open_id === admission.open_id && event.request_id === capture.requestId), 'lifecycle request must belong to admitted producer');
+            capture.expectJourney(admission.open_id);
             if (kind === 'pending_background') {
               trial.witness = await runPendingBackgroundRoundTrip({ page, context: owned, capture });
               trial.status = trial.witness.status;
@@ -725,28 +764,33 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
         })();
         await boundedObservation(operation, Math.max(1, deadline - Date.now()), 'absolute lifecycle stage');
       } catch (error) {
+        primaryError = error;
         trial.failure = error.message;
-        throw error;
       } finally {
         canceled = true;
         try {
           if (owned) await boundedObservation(owned.close(), 5000, 'lifecycle context cleanup');
           if (ledgerFailure) throw ledgerFailure;
           if (!trial.failure) {
+            if (trial.sampled === false) assert.equal(trial.reports.length, 0, 'unsampled lifecycle cannot emit late report');
             assert.equal(trial.statuses.length, trial.reports.length, 'final report-response drain');
             assert.equal(new Set(trial.reports.map(report => report.open_id)).size, trial.reports.length);
             if (trial.status === 'observed_bfcache_fresh_ready_report') assert.equal(trial.reports.length, 2);
           }
           if (!trial.failure && capture && !trial.status.startsWith('unsupported')) capture.assertFinal();
-        } catch (error) { trial.failure ??= error.message; throw error; }
+        } catch (error) { trial.cleanup_failure = error.message; trial.failure ??= error.message; primaryError ??= error; }
         finally {
           capture?.close();
           stage.trials.push(trial);
           try { onTrial(trial, stage); }
-          catch (error) { trial.failure ??= error.message; throw error; }
-          finally { if (outputDir) writeFileSync(resolve(outputDir, 'telemetry-lifecycle-trials.json'), JSON.stringify(stage, null, 2)); }
+          catch (error) { trial.callback_failure = error.message; trial.failure ??= error.message; primaryError ??= error; }
+          finally {
+            if (outputDir) try { writeFileSync(resolve(outputDir, 'telemetry-lifecycle-trials.json'), JSON.stringify(stage, null, 2)); }
+            catch { trial.persistence_failure = 'lifecycle receipt persistence failed'; trial.failure ??= trial.persistence_failure; primaryError ??= new Error(trial.persistence_failure); }
+          }
         }
       }
+      if (primaryError) throw primaryError;
       if (!trial.status.startsWith('inconclusive')) break;
     }
   }
