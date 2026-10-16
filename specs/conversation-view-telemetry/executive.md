@@ -75,3 +75,8 @@ Actual diagnostic run38904633015 proved receiver `attribute_unknown`; the exact 
 ## Complete-schema provider capacity
 
 Actual efce qualification exported ready views missing readiness marks. Exact source disproves the undeclared-dynamic-field hypothesis: marks are declared numeric fields, but production uses a32-attribute backstop while the complete view schema needs44 semantic+8 pinned SDK slots. ADR-108 explicitly chooses minimal52 for both providers; events/link/privacy/receiver budgets are unchanged. The real-handler test now uses actual production limits and emits actual OTLP protobuf-size measurements comparing32 and52. Test source and rustfmt checks do not prove compilation, actual bytes or overhead clearance; hosted exact execution remains owed. Prior failures are retained, with no final joint/export/drain acceptance inferred from the policy change.
+
+
+## Counter wire-type correction
+
+Actual0212 hosted capacity guard compiled and ran: cap32 retained32/dropped20 with OTLP span1497 bytes; cap52 retained52/dropped0 with span2272 bytes, then failed the exact type assertion for browser.admitted_count. Those measurements describe the failed pre-correction fixture, not the corrected wire or overhead clearance. Pinned tracing-opentelemetry0.32.1 records signed integers but inherits unsigned debug fallback, turning raw u32 fields into strings. The source correction explicitly converts all eight validated bounded counters to i64 without changing values, Report validation or receiver acceptance. The real-handler guard additionally requires all eight as I64(10000); corrected protobuf sizes and successful full-schema execution remain hosted obligations.

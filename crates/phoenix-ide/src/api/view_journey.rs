@@ -197,15 +197,15 @@ pub(super) async fn report(
         "browser.message_count_bucket" = report.message_count_bucket.as_str(),
         "browser.chapter_count_bucket" = report.chapter_count_bucket.as_str(),
         "browser.response_size_bucket" = report.response_size_bucket.as_str(),
-        "browser.reconnect_count" = report.reconnect_count,
+        "browser.reconnect_count" = i64::from(report.reconnect_count),
         "browser.anchor_result" = report.anchor_result.as_ref().map(AnchorResult::as_str),
         "server.backend_source" = env!("PHOENIX_GIT_SHA"),
         "server.instance_id" = %instance_id,
         "browser.presentation_evidence" = report.presentation_evidence.as_str(),
         "browser.total_ms" = report.total_ms, "browser.background_ms" = report.background_ms,
-        "browser.background_interval_count" = report.background_interval_count,
+        "browser.background_interval_count" = i64::from(report.background_interval_count),
         "browser.background_open" = report.background_open,
-        "browser.observer_inspection_count" = report.observer_inspection_count,
+        "browser.observer_inspection_count" = i64::from(report.observer_inspection_count),
         "browser.observer_scan_limited" = report.observer_scan_limited,
         "browser.timeline_saturated" = report.timeline_saturated,
         "browser.shell_ms" = report.marks.shell,
@@ -218,10 +218,10 @@ pub(super) async fn report(
         "browser.anchor_settled_ms" = report.marks.anchor_settled,
         "browser.breadcrumb_ready_minus_meaningful_ms" = report.breadcrumb_ready_minus_meaningful_ms,
         "browser.sample_rate" = report.sample_rate,
-        "browser.admitted_count" = report.admitted_count, "browser.sampled_count" = report.sampled_count,
-        "browser.dropped_correlations" = report.dropped_correlations,
-        "browser.transport_dropped_count" = report.transport_dropped_count,
-        "browser.transport_failed_count" = report.transport_failed_count,
+        "browser.admitted_count" = i64::from(report.admitted_count), "browser.sampled_count" = i64::from(report.sampled_count),
+        "browser.dropped_correlations" = i64::from(report.dropped_correlations),
+        "browser.transport_dropped_count" = i64::from(report.transport_dropped_count),
+        "browser.transport_failed_count" = i64::from(report.transport_failed_count),
     );
     let _entered = span.enter();
     for correlation in report.correlations {
@@ -729,6 +729,24 @@ mod tests {
                         ) => assert_eq!(Some(*actual), expected.as_f64()),
                         _ => panic!("wrong type {key}"),
                     }
+                }
+                for key in [
+                    "browser.reconnect_count",
+                    "browser.background_interval_count",
+                    "browser.observer_inspection_count",
+                    "browser.admitted_count",
+                    "browser.sampled_count",
+                    "browser.dropped_correlations",
+                    "browser.transport_dropped_count",
+                    "browser.transport_failed_count",
+                ] {
+                    assert!(
+                        view.attributes
+                            .iter()
+                            .any(|attribute| attribute.key.as_str() == key
+                                && matches!(attribute.value, opentelemetry::Value::I64(10_000))),
+                        "counter must export as signed integer {key}"
+                    );
                 }
                 let metadata = [
                     "code.file.path",
