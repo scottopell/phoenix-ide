@@ -2428,3 +2428,30 @@ settled semantic geometry from expired command capability without retaining
 command authority indefinitely, restoring cancelled intent or changing continuity
 policy. Telemetry owns that representative source fix; parent retains integration/
 actual-browser execution. No further unchanged qualification is dispatched.
+
+### Successful completion settles geometry without retaining command capability
+
+Donor `a9581e81502ed59913de398173d7cd204cf1b23a` integrates after the retained
+db9 parent red as app `302a3733e9013bb09beb1e83c92b29b616ab0706`, tree
+`afd4a76e7b86a7a784d8070b97cc9873d0fca057`. Matching authorized success
+explicitly hands command ownership to typed same-view settled geometry BEFORE
+parent notification; pending target intent is discarded and no new position or
+finish is emitted. Same-view idle preserves only this geometry, not command
+capability. View generation changes, replacement/cancel, user takeover even
+without native scrolling, and detach retire it. Missing/superseded/stale finishes
+do not settle. Restore/end/tail remain continuity; no oracle/readiness/native
+correction tolerance changes. ADR115 records this distinction; requirements and
+Allium executor guarantee are aligned. Fresh remote ADR115 collision check found
+none; pre-existing107/108/109 conflicts with main remain an explicit landing gate.
+
+Independent exact10file review approved import and one actual-browser qualification.
+Parent genuine TypeScript and262focused9file tests passed, including real-reducer
+parent79pass/1red→green, exactly-once handoff, takeover-without-scroll, cancellation,
+replacement, view-reset and stale controls. Lifecycle68/controlled22/joint65 passed.
+Allium validation returned diagnostics[]/findings[]; spec preflight reviewed the
+executor contract/symbols and no changed wire schema applies. Existing fixture/
+mock localhost warnings remain recorded. No local build/browser/native execution.
+The observed f542 continuity writer remains actual failed-artifact evidence; the
+new lifecycle regression is source evidence, not direct observation of the old
+parent authority. Actual newly pinned strict containment and exact-six collector/
+export/drain remain required before any controlled acceptance claim.
