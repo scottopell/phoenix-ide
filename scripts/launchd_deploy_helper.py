@@ -13,6 +13,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -40,6 +41,14 @@ CURRENT_SCHEMA_REQUIRED_MIGRATIONS = {
     128: "product_creation_provisioning_stage",
 }
 MINIMUM_FREE_AFTER_RESERVATION_BYTES = 20 * 1024 * 1024 * 1024
+CURRENT_SCHEMA_GROWTH_MARGIN_MIN_BYTES = 1024 * 1024 * 1024
+CURRENT_SCHEMA_GROWTH_MARGIN_MAX_BYTES = 8 * 1024 * 1024 * 1024
+CURRENT_SCHEMA_GROWTH_MARGIN_DIVISOR = 10
+CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES = 2 * 1024 * 1024
+MAX_DATABASE_PROOF_BYTES = 1024 * 1024
+CAPACITY_EVIDENCE_BUDGET_BYTES = 4096
+PROJECTED_MIGRATION_TIMESTAMP = "9999-12-31T23:59:59.999999+00:00"
+DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
 
 TERMINAL_STATES = {
     "committed",
@@ -92,10 +101,19 @@ class OrdinaryForwardMigration:
 
 
 @dataclasses.dataclass(frozen=True)
+class DatabaseCapacityPlan:
+    reservation_bytes: int
+    ceiling_bytes: int
+
+
+@dataclasses.dataclass(frozen=True)
 class DatabaseCapacityReservation:
     backup_path: Path
     restore_path: Path
     capacity_bytes: int
+    ceiling_bytes: Optional[int] = None
+    observed_source_bytes: Optional[int] = None
+    measured_at: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,6 +189,17 @@ class ConcurrentDeploy(ActivationError):
 
 
 class CurrentSchemaPreconditionFailure(ActivationError):
+    pass
+
+
+class RecoveryModeMismatch(ActivationError):
+    pass
+
+class CleanupPreconditionRejected(ActivationError):
+    pass
+
+
+class DatabaseCapacityCleanupFailure(ActivationError):
     pass
 
 
@@ -279,6 +308,8 @@ def write_status(
     *,
     failure: Optional[str] = None,
     rollback_failure: Optional[str] = None,
+    cleanup_failure: Optional[str] = None,
+    precondition_cleanup_completed: bool = False,
     committed_diagnostic: Optional[str] = None,
     finalization_pending: bool = False,
     recovery_mode: Optional[str] = None,
@@ -302,10 +333,18 @@ def write_status(
         "updated_at": utc_now(),
         "failure": failure,
         "rollback_failure": rollback_failure,
+        "cleanup_failure": cleanup_failure,
+        "precondition_cleanup_completed": precondition_cleanup_completed,
         "committed_diagnostic": committed_diagnostic,
         "finalization_pending": finalization_pending,
         "recovery_mode": recovery_mode,
     }
+    if (
+        isinstance(prior, dict)
+        and prior.get("transaction_id") == manifest.transaction_id
+        and "prepared_mode" in prior
+    ):
+        status["prepared_mode"] = prior["prepared_mode"]
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
 
@@ -778,6 +817,330 @@ def _allocate_private_sqlite(path: Path, size: int) -> None:
         raise ActivationError("could not reserve paired database capacity") from exc
 
 
+def _capacity_pool_key(path: Path) -> tuple[str, object]:
+    device = path.stat().st_dev
+    if sys.platform != "darwin":
+        return ("device", device)
+    mount_point = path if path.is_dir() else path.parent
+    mount_point = mount_point.resolve()
+    while not os.path.ismount(mount_point):
+        parent = mount_point.parent
+        if parent == mount_point:
+            raise ActivationError(f"could not identify mount point for {path}")
+        mount_point = parent
+    result = subprocess.run(
+        ["/usr/sbin/diskutil", "info", "-plist", str(mount_point)],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise ActivationError(f"could not identify capacity pool for {path}")
+    try:
+        info = plistlib.loads(result.stdout)
+    except (plistlib.InvalidFileException, ValueError) as exc:
+        raise ActivationError(f"could not parse capacity pool for {path}") from exc
+    container = info.get("APFSContainerReference")
+    if isinstance(container, str) and container:
+        return ("apfs_container", container)
+    return ("device", device)
+
+
+def _current_schema_live_growth_margin(observed: int) -> int:
+    proportional = (
+        observed + CURRENT_SCHEMA_GROWTH_MARGIN_DIVISOR - 1
+    ) // CURRENT_SCHEMA_GROWTH_MARGIN_DIVISOR
+    return min(
+        CURRENT_SCHEMA_GROWTH_MARGIN_MAX_BYTES,
+        max(CURRENT_SCHEMA_GROWTH_MARGIN_MIN_BYTES, proportional),
+    )
+
+
+def _current_schema_reservation_plan(
+    manifest: Manifest,
+    database: Path,
+    backup: Path,
+    restore: Path,
+    observed: int,
+) -> DatabaseCapacityPlan:
+    reservation_parents = (backup.parent, restore.parent)
+    reservations_per_pool: dict[tuple[str, object], int] = {}
+    parent_by_pool: dict[tuple[str, object], Path] = {}
+    paths_by_pool: dict[tuple[str, object], list[Path]] = {}
+    for parent in reservation_parents:
+        pool = _capacity_pool_key(parent)
+        reservations_per_pool[pool] = reservations_per_pool.get(pool, 0) + 1
+        parent_by_pool[pool] = parent
+        paths_by_pool.setdefault(pool, []).append(parent)
+    affected_paths = (
+        database.parent,
+        Path(manifest.target_binary).parent,
+        Path(manifest.target_plist).parent,
+    )
+    for path in affected_paths:
+        paths_by_pool.setdefault(_capacity_pool_key(path), []).append(path)
+
+    ceilings = []
+    allocation_units = []
+    database_pool = _capacity_pool_key(database)
+    evidence_pool = _capacity_pool_key(backup.parent)
+    for pool, count in reservations_per_pool.items():
+        parent = parent_by_pool[pool]
+        free = min(shutil.disk_usage(path).free for path in paths_by_pool[pool])
+        allocation_unit = max(os.statvfs(parent).f_frsize, 4096)
+        allocation_units.append(allocation_unit)
+        evidence_blocks = (
+            CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES if pool == evidence_pool else 0
+        )
+        holds_live_growth = 1 if pool == database_pool else 0
+        available = (
+            free
+            - MINIMUM_FREE_AFTER_RESERVATION_BYTES
+            - evidence_blocks
+        )
+        divisor = count + holds_live_growth
+        per_reservation = max(0, available // divisor)
+        ceilings.append(per_reservation - (per_reservation % allocation_unit))
+
+    for pool, paths in paths_by_pool.items():
+        if (
+            pool not in reservations_per_pool
+            and min(shutil.disk_usage(path).free for path in paths)
+            < MINIMUM_FREE_AFTER_RESERVATION_BYTES
+        ):
+            raise ActivationError(
+                "current-schema migration requires 20 GiB free after backup and restore reservations"
+            )
+
+    common_unit = math.lcm(*allocation_units)
+    ceiling = min(ceilings)
+    ceiling -= ceiling % common_unit
+    if ceiling < observed:
+        raise ActivationError(
+            "current-schema migration requires 20 GiB free after backup and restore reservations"
+        )
+    desired = observed + _current_schema_live_growth_margin(observed)
+    desired += -desired % common_unit
+    return DatabaseCapacityPlan(
+        reservation_bytes=min(desired, ceiling),
+        ceiling_bytes=ceiling,
+    )
+
+
+def _database_proof_bytes(
+    manifest: Manifest,
+    source: Path,
+    *,
+    backup_sha256: str,
+    source_logical_digest: str,
+    backup_logical_digest: str,
+) -> bytes:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("database proof requires a prepared database transaction")
+    payload = {
+        "transaction_id": manifest.transaction_id,
+        "source_commit": manifest.source_commit,
+        "database": str(source),
+        "sha256": backup_sha256,
+        "candidate_binary_sha256": manifest.candidate_binary_sha256,
+        "candidate_plist_sha256": manifest.candidate_plist_sha256,
+        "previous_binary_sha256": manifest.rollback_binary_sha256,
+        "previous_plist_sha256": manifest.rollback_plist_sha256,
+        "controller_source_commit": upgrade.controller_source_commit,
+        "controller_helper_sha256": upgrade.controller_helper_sha256,
+        "database_mode": (
+            "current_schema"
+            if manifest.current_schema_upgrade is not None
+            else "legacy_paired"
+        ),
+    }
+    if manifest.current_schema_upgrade is not None:
+        registry_path = Path(manifest.current_schema_upgrade.migration_registry_path)
+        payload.update(
+            migration_registry_sha256=(
+                manifest.current_schema_upgrade.migration_registry_sha256
+            ),
+            source_ledger=validate_current_schema_database(source, registry_path),
+            target_ledger=migration_registry(registry_path),
+            source_logical_digest=source_logical_digest,
+            backup_logical_digest=backup_logical_digest,
+        )
+    return _encode_database_proof(payload)
+
+
+def _encode_database_proof(payload: dict) -> bytes:
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode()
+    if len(encoded) > MAX_DATABASE_PROOF_BYTES:
+        raise ActivationError(
+            f"database proof exceeds {MAX_DATABASE_PROOF_BYTES} byte capacity bound"
+        )
+    return encoded
+
+
+def _project_migrated_database_proof(proof_bytes: bytes) -> bytes:
+    payload = json.loads(proof_bytes)
+    payload["migration_committed_at"] = PROJECTED_MIGRATION_TIMESTAMP
+    payload["migrated_ledger"] = payload["target_ledger"]
+    payload["migrated_logical_digest"] = "0" * 64
+    return _encode_database_proof(payload)
+
+
+def _allocated_bytes(size: int, allocation_unit: int) -> int:
+    return size + (-size % allocation_unit)
+
+
+def _validate_database_proof_lifecycle_budget(
+    initial_proof: bytes,
+    migrated_proof: bytes,
+    allocation_unit: int,
+) -> None:
+    capacity_evidence = _allocated_bytes(
+        CAPACITY_EVIDENCE_BUDGET_BYTES, allocation_unit
+    )
+    required = max(
+        _allocated_bytes(len(initial_proof), allocation_unit)
+        + _allocated_bytes(len(migrated_proof), allocation_unit)
+        + capacity_evidence,
+        2 * capacity_evidence,
+    )
+    if required > CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES:
+        raise ActivationError(
+            "database proof lifecycle exceeds durable-evidence capacity bound"
+        )
+
+
+def _capacity_observation_path(reservation: DatabaseCapacityReservation) -> Path:
+    return reservation.backup_path.parent / "capacity.json"
+
+
+def _resident_evidence_bytes(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> int:
+    allocation_unit = max(os.statvfs(reservation.backup_path.parent).f_frsize, 4096)
+    proof_path = Path(manifest.current_schema_upgrade.proof_path)
+    resident = 0
+    for path in (_capacity_observation_path(reservation), proof_path):
+        if not path.exists():
+            continue
+        stat = path.stat()
+        blocks = getattr(stat, "st_blocks", 0)
+        resident += (
+            blocks * 512
+            if isinstance(blocks, int) and blocks > 0
+            else _allocated_bytes(stat.st_size, allocation_unit)
+        )
+    if resident > CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES:
+        raise ActivationError("durable evidence exceeds its reserved capacity")
+    return resident
+
+
+def _remaining_evidence_allowance(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> int:
+    return CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES - _resident_evidence_bytes(
+        manifest, reservation
+    )
+
+
+def _require_current_schema_free_space(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> None:
+    directories = {
+        Path(manifest.current_schema_upgrade.database_path).parent,
+        reservation.backup_path.parent,
+        reservation.restore_path.parent,
+        Path(manifest.target_binary).parent,
+        Path(manifest.target_plist).parent,
+    }
+    free_by_pool: dict[tuple[str, str], int] = {}
+    for directory in directories:
+        pool = _capacity_pool_key(directory)
+        free = shutil.disk_usage(directory).free
+        free_by_pool[pool] = min(free_by_pool.get(pool, free), free)
+    if any(
+        free < MINIMUM_FREE_AFTER_RESERVATION_BYTES
+        for free in free_by_pool.values()
+    ):
+        raise ActivationError(
+            "current-schema capacity no longer preserves the 20 GiB safety floor"
+        )
+    remaining = _remaining_evidence_allowance(manifest, reservation)
+    evidence_pool = _capacity_pool_key(reservation.backup_path.parent)
+    if free_by_pool[evidence_pool] < MINIMUM_FREE_AFTER_RESERVATION_BYTES + remaining:
+        raise ActivationError(
+            "current-schema capacity no longer preserves the 20 GiB floor "
+            "plus its remaining durable-evidence allowance"
+        )
+
+
+def _write_capacity_observation(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+    *,
+    rechecked_source_bytes: Optional[int] = None,
+    rechecked_at: Optional[str] = None,
+) -> None:
+    payload = {
+        "transaction_id": manifest.transaction_id,
+        "observed_source_bytes": reservation.observed_source_bytes,
+        "measured_at": reservation.measured_at,
+        "reserved_capacity_bytes": reservation.capacity_bytes,
+        "reservation_ceiling_bytes": reservation.ceiling_bytes,
+        "rechecked_source_bytes": rechecked_source_bytes,
+        "rechecked_at": rechecked_at,
+    }
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    if len(encoded) > CAPACITY_EVIDENCE_BUDGET_BYTES:
+        raise ActivationError("capacity observation exceeds durable-evidence capacity bound")
+    atomic_write(_capacity_observation_path(reservation), encoded)
+
+
+def _remove_capacity_files(*paths: Path) -> None:
+    failures = []
+    parents = set()
+    for path in paths:
+        parents.add(path.parent)
+        try:
+            if path.is_symlink():
+                raise OSError("refusing symlinked capacity evidence")
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+    for parent in parents:
+        try:
+            fsync_dir(parent)
+        except OSError as exc:
+            failures.append(f"{parent}: {exc}")
+    if failures:
+        raise DatabaseCapacityCleanupFailure("; ".join(failures))
+
+
+def _owned_capacity_cleanup_paths(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> tuple[Path, ...]:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("capacity cleanup requires a prepared database mode")
+    proof = Path(upgrade.proof_path)
+    capacity = _capacity_observation_path(reservation)
+    paths = {
+        reservation.backup_path,
+        reservation.restore_path,
+        capacity,
+    }
+    for evidence in (capacity, proof):
+        paths.update(evidence.parent.glob(f".{evidence.name}.*"))
+    for allocation in (reservation.backup_path, reservation.restore_path):
+        paths.update(
+            allocation.with_name(allocation.name + suffix)
+            for suffix in ("-journal", "-wal", "-shm")
+        )
+    return tuple(sorted(paths, key=str))
+
+
 def reserve_database_capacity(manifest: Manifest) -> DatabaseCapacityReservation:
     """Hold backup and restore space while the service is stopped."""
     if prepared_database_upgrade(manifest) is None:
@@ -789,13 +1152,45 @@ def reserve_database_capacity(manifest: Manifest) -> DatabaseCapacityReservation
     for path, description in ((restore, "restore reservation"),):
         if not path.is_absolute() or path.is_symlink():
             raise ActivationError(f"{description} path must be absolute and non-symlink")
-    capacity = _source_capacity_bytes(database)
+    observed = _source_capacity_bytes(database)
+    measured_at = utc_now()
+    projected_proof = None
+    if manifest.current_schema_upgrade is not None:
+        projected_proof = _database_proof_bytes(
+            manifest,
+            database,
+            backup_sha256="0" * 64,
+            source_logical_digest="0" * 64,
+            backup_logical_digest="0" * 64,
+        )
+    plan = (
+        _current_schema_reservation_plan(
+            manifest, database, backup, restore, observed
+        )
+        if manifest.current_schema_upgrade is not None
+        else DatabaseCapacityPlan(observed, observed)
+    )
+    if projected_proof is not None:
+        allocation_unit = max(os.statvfs(backup.parent).f_frsize, 4096)
+        _validate_database_proof_lifecycle_budget(
+            projected_proof,
+            _project_migrated_database_proof(projected_proof),
+            allocation_unit,
+        )
     # Never replace an existing protected snapshot: recovery must retain it.
     if backup.exists() or backup.is_symlink() or proof.exists() or proof.is_symlink():
         raise ActivationError("paired recovery snapshot is already present")
-    _allocate_private_sqlite(backup, capacity)
+    reservation = DatabaseCapacityReservation(
+        backup,
+        restore,
+        plan.reservation_bytes,
+        ceiling_bytes=plan.ceiling_bytes,
+        observed_source_bytes=observed,
+        measured_at=measured_at,
+    )
     try:
-        _allocate_private_sqlite(restore, capacity)
+        _allocate_private_sqlite(backup, plan.reservation_bytes)
+        _allocate_private_sqlite(restore, plan.reservation_bytes)
         if manifest.current_schema_upgrade is not None:
             affected_directories = (
                 backup.parent,
@@ -813,16 +1208,39 @@ def reserve_database_capacity(manifest: Manifest) -> DatabaseCapacityReservation
                 raise ActivationError(
                     "current-schema migration requires 20 GiB free after backup and restore reservations"
                 )
-    except BaseException:
-        backup.unlink(missing_ok=True)
-        restore.unlink(missing_ok=True)
+    except BaseException as exc:
+        try:
+            _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+        except DatabaseCapacityCleanupFailure as cleanup_exc:
+            raise cleanup_exc from exc
         raise
-    return DatabaseCapacityReservation(backup, restore, capacity)
+    try:
+        if manifest.current_schema_upgrade is not None:
+            _require_current_schema_free_space(manifest, reservation)
+        _write_capacity_observation(manifest, reservation)
+    except BaseException as exc:
+        try:
+            _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+        except DatabaseCapacityCleanupFailure as cleanup_exc:
+            raise cleanup_exc from exc
+        raise ActivationError("could not persist paired capacity observation") from exc
+    return reservation
 
 
 def _reservation_still_sufficient(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
     database, _backup, _proof, _transaction = _paired_path_context(manifest)
     required = _source_capacity_bytes(database)
+    rechecked_at = utc_now()
+    if manifest.current_schema_upgrade is not None:
+        _require_current_schema_free_space(manifest, reservation)
+    _write_capacity_observation(
+        manifest,
+        reservation,
+        rechecked_source_bytes=required,
+        rechecked_at=rechecked_at,
+    )
+    if manifest.current_schema_upgrade is not None:
+        _require_current_schema_free_space(manifest, reservation)
     for path in (reservation.backup_path, reservation.restore_path):
         if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
             raise ActivationError("paired database capacity reservation is unavailable")
@@ -863,33 +1281,24 @@ def create_database_backup(manifest: Manifest, reservation: Optional[DatabaseCap
             and database_logical_digest(source) != database_logical_digest(backup)
         ):
             raise ActivationError("current-schema snapshot contents differ from stopped source")
-        atomic_write(proof_path, (json.dumps({
-            "transaction_id": manifest.transaction_id,
-            "source_commit": manifest.source_commit,
-            "database": str(source),
-            "sha256": observed,
-            "candidate_binary_sha256": manifest.candidate_binary_sha256,
-            "candidate_plist_sha256": manifest.candidate_plist_sha256,
-            "previous_binary_sha256": manifest.rollback_binary_sha256,
-            "previous_plist_sha256": manifest.rollback_plist_sha256,
-            "controller_source_commit": upgrade.controller_source_commit,
-            "controller_helper_sha256": upgrade.controller_helper_sha256,
-            **({
-                "database_mode": "current_schema",
-                "migration_registry_sha256": manifest.current_schema_upgrade.migration_registry_sha256,
-                "source_ledger": validate_current_schema_database(
-                    source,
-                    Path(manifest.current_schema_upgrade.migration_registry_path),
-                ),
-                "target_ledger": migration_registry(
-                    Path(manifest.current_schema_upgrade.migration_registry_path)
-                ),
-                "source_logical_digest": database_logical_digest(source),
-                "backup_logical_digest": database_logical_digest(backup),
-            } if manifest.current_schema_upgrade is not None else {
-                "database_mode": "legacy_paired",
-            }),
-        }, sort_keys=True) + "\n").encode(), 0o600)
+        proof_bytes = _database_proof_bytes(
+            manifest,
+            source,
+            backup_sha256=observed,
+            source_logical_digest=(
+                database_logical_digest(source)
+                if manifest.current_schema_upgrade is not None
+                else ""
+            ),
+            backup_logical_digest=(
+                database_logical_digest(backup)
+                if manifest.current_schema_upgrade is not None
+                else ""
+            ),
+        )
+        if manifest.current_schema_upgrade is not None:
+            _require_current_schema_free_space(manifest, reservation)
+        atomic_write(proof_path, proof_bytes, 0o600)
     except (sqlite3.Error, OSError, ValueError) as exc:
         raise ActivationError(f"database snapshot failed: {exc}") from exc
 
@@ -1280,12 +1689,28 @@ def release_claim(manifest: Manifest) -> bool:
             if claim.read_text().strip() != manifest.transaction_id:
                 return False
             claim.unlink()
+            try:
+                fsync_dir(claim.parent)
+            except OSError:
+                try:
+                    fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    pass
+                else:
+                    try:
+                        os.write(fd, f"{manifest.transaction_id}\n".encode())
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                raise
             return True
         except FileNotFoundError:
             return False
 
 
 def request_helper_bootout(uid: int, helper_label: str) -> None:
+    if not helper_label.startswith(f"{DEPLOY_HELPER_LABEL_PREFIX}."):
+        raise ActivationError("refusing to boot out an unverified helper label")
     subprocess.Popen(
         ["launchctl", "bootout", f"gui/{uid}/{helper_label}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
@@ -1294,11 +1719,20 @@ def request_helper_bootout(uid: int, helper_label: str) -> None:
 
 def validate_manifest_mode(manifest: Manifest) -> None:
     upgrade = prepared_database_upgrade(manifest)
+    if manifest.source_kind not in {
+        "prepared_artifact",
+        "local_head",
+        "published_release",
+    }:
+        raise ActivationError("manifest source kind is unsupported")
     if manifest.source_kind == "prepared_artifact" and upgrade is None:
         raise ActivationError("prepared artifact requires an explicit database upgrade mode")
     ordinary = manifest.ordinary_forward_migration
     if ordinary is not None:
-        if upgrade is not None or manifest.source_kind == "prepared_artifact":
+        if (
+            upgrade is not None
+            or manifest.source_kind not in {"local_head", "published_release"}
+        ):
             raise ActivationError("ordinary forward policy cannot be combined with prepared mode")
         for raw_path in (
             ordinary.database_path,
@@ -1439,7 +1873,10 @@ def current_schema_database_is_uncommitted(manifest: Manifest) -> bool:
         return False
 
 
-def run_current_schema_migration(manifest: Manifest) -> None:
+def run_current_schema_migration(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> None:
     current = manifest.current_schema_upgrade
     if current is None:
         return
@@ -1480,14 +1917,25 @@ def run_current_schema_migration(manifest: Manifest) -> None:
             f"candidate offline migration failed with exit {result.returncode}"
         )
     migrated_ledger = validate_current_schema_database(database, registry, migrated=True)
+    migrated_size = _source_capacity_bytes(database)
+    if migrated_size > reservation.capacity_bytes:
+        raise ActivationError(
+            "migrated database grew beyond its reserved capacity after commit"
+        )
+    _require_current_schema_free_space(manifest, reservation)
     proof["migration_committed_at"] = utc_now()
     proof["migrated_ledger"] = migrated_ledger
     proof["migrated_logical_digest"] = database_logical_digest(database)
-    atomic_write(
-        Path(current.proof_path),
-        (json.dumps(proof, sort_keys=True) + "\n").encode(),
-        0o600,
+    proof_path = Path(current.proof_path)
+    encoded = _encode_database_proof(proof)
+    allocation_unit = max(os.statvfs(proof_path.parent).f_frsize, 4096)
+    _validate_database_proof_lifecycle_budget(
+        b"0" * proof_path.stat().st_size,
+        encoded,
+        allocation_unit,
     )
+    _require_current_schema_free_space(manifest, reservation)
+    atomic_write(proof_path, encoded, 0o600)
 
 
 def validate_manifest_identities(manifest: Manifest) -> None:
@@ -1596,8 +2044,17 @@ def activate(manifest: Manifest) -> str:
         except Exception as exc:
             for prepared in prepared_installs:
                 prepared.unlink(missing_ok=True)
-            write_status(manifest, "precondition_failed", failure=str(exc))
-            if manifest.current_schema_upgrade is not None:
+            cleanup_pending = isinstance(exc, DatabaseCapacityCleanupFailure)
+            if cleanup_pending:
+                write_status(
+                    manifest,
+                    "precondition_cleanup_pending",
+                    failure=str(exc.__cause__ or exc),
+                    cleanup_failure=str(exc),
+                )
+            else:
+                write_status(manifest, "precondition_failed", failure=str(exc))
+            if manifest.current_schema_upgrade is not None and not cleanup_pending:
                 raise CurrentSchemaPreconditionFailure(str(exc)) from exc
             raise
 
@@ -1650,7 +2107,7 @@ def activate(manifest: Manifest) -> str:
                     committed_diagnostic="offline candidate migration may have committed writes; predecessor rollback is forbidden",
                 )
                 current_schema_migration_started = True
-                run_current_schema_migration(manifest)
+                run_current_schema_migration(manifest, capacity_reservation)
                 current_schema_committed = True
                 committed_durable = True
                 write_status(
@@ -1738,8 +2195,23 @@ def activate(manifest: Manifest) -> str:
                 return "activation_failed_database_committed"
             if not disrupted:
                 if capacity_reservation is not None and not database_snapshot:
-                    abandon_capacity_reservation(manifest, capacity_reservation)
-                write_status(manifest, "precondition_failed", failure=failure)
+                    try:
+                        abandon_capacity_reservation(manifest, capacity_reservation)
+                        write_status(manifest, "precondition_failed", failure=failure)
+                    except Exception as cleanup_error:
+                        try:
+                            write_status(
+                                manifest,
+                                "precondition_cleanup_pending",
+                                failure=failure,
+                                cleanup_failure=str(cleanup_error),
+                                precondition_cleanup_completed=False,
+                            )
+                        except Exception:
+                            pass
+                        raise cleanup_error from activation_exc
+                else:
+                    write_status(manifest, "precondition_failed", failure=failure)
                 if manifest.current_schema_upgrade is not None:
                     raise CurrentSchemaPreconditionFailure(failure) from activation_exc
                 raise
@@ -1835,14 +2307,7 @@ def abandon_capacity_reservation(
         or reservation.restore_path != expected_restore
     ):
         raise ActivationError("capacity reservation does not belong to this transaction")
-    parents = set()
-    for path in (reservation.backup_path, reservation.restore_path):
-        if path.is_symlink():
-            raise ActivationError("capacity reservation is a symlink")
-        path.unlink(missing_ok=True)
-        parents.add(path.parent)
-    for parent in parents:
-        fsync_dir(parent)
+    _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
 
 
 def release_capacity_reservation(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
@@ -1861,11 +2326,9 @@ def release_unsnapshotted_capacity(manifest: Manifest) -> None:
     database, backup, proof, _transaction = _paired_path_context(manifest)
     if proof.exists() or proof.is_symlink():
         return
-    for path in (backup, _restore_capacity_path(manifest, database)):
-        if path.is_symlink():
-            raise ActivationError("unsnapshotted capacity is a symlink")
-        path.unlink(missing_ok=True)
-        fsync_dir(path.parent)
+    restore = _restore_capacity_path(manifest, database)
+    reservation = DatabaseCapacityReservation(backup, restore, 0)
+    _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
 
 
 def record_recovery_error(manifest: Manifest, error: str | Exception, *, quarantine: bool = False) -> None:
@@ -1906,6 +2369,82 @@ def require_loaded_plist(manifest: Manifest, launchctl: Launchctl, private: Path
     match = re.search(r"^\s*path = (.+)$", result.stdout, re.MULTILINE)
     if result.returncode != 0 or match is None or not Path(match.group(1).strip()).samefile(private):
         raise ActivationError("loaded configuration does not match retained private plist")
+
+
+def cleanup_precondition_capacity(manifest: Manifest, *, current_schema: bool) -> str:
+    lock_path = Path(manifest.lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment is already activating") from exc
+
+        try:
+            validate_manifest_identities(manifest)
+            validate_manifest_mode(manifest)
+            upgrade = prepared_database_upgrade(manifest)
+            if upgrade is None or (manifest.current_schema_upgrade is not None) != current_schema:
+                raise ActivationError("precondition cleanup mode does not match the retained manifest")
+            status_path = Path(manifest.status_path)
+            if not status_path.is_file() or status_path.is_symlink():
+                raise ActivationError(
+                    "precondition cleanup requires a regular non-symlink status"
+                )
+            status = read_status(manifest)
+            expected_prepared_mode = "current_schema" if current_schema else "paired"
+            cleanup_pending = status.get("state") == "precondition_cleanup_pending"
+            cleanup_release_pending = (
+                status.get("state") == "precondition_failed"
+                and status.get("precondition_cleanup_completed") is True
+            )
+            if (
+                status.get("transaction_id") != manifest.transaction_id
+                or status.get("prepared_mode") != expected_prepared_mode
+                or not (cleanup_pending or cleanup_release_pending)
+            ):
+                raise ActivationError("precondition cleanup requires the matching pending status")
+            claim = Path(manifest.active_path)
+            if (
+                not claim.is_file()
+                or claim.is_symlink()
+                or claim.read_text().strip() != manifest.transaction_id
+            ):
+                raise ActivationError("precondition cleanup requires the matching active claim")
+
+            database, backup, proof, transaction_dir = _paired_path_context(manifest)
+            _private_transaction_dir(transaction_dir)
+            restore = _restore_capacity_path(manifest, database)
+            capacity_evidence = backup.parent / "capacity.json"
+            if proof.exists() or proof.is_symlink():
+                raise ActivationError("precondition cleanup refuses a transaction with snapshot proof")
+            for path in (backup, restore, capacity_evidence):
+                if not path.is_absolute() or path.is_symlink():
+                    raise ActivationError("precondition cleanup paths must be absolute non-symlinks")
+
+            reservation = DatabaseCapacityReservation(backup, restore, 0)
+        except Exception as exc:
+            raise CleanupPreconditionRejected(str(exc)) from exc
+        try:
+            _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+            write_status(
+                manifest,
+                "precondition_failed",
+                failure=status.get("failure"),
+                precondition_cleanup_completed=True,
+            )
+        except Exception as exc:
+            try:
+                write_status(
+                    manifest,
+                    "precondition_cleanup_pending",
+                    failure=status.get("failure"),
+                    cleanup_failure=str(exc),
+                )
+            except Exception:
+                pass
+            raise
+        return "precondition_failed"
 
 
 def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
@@ -2058,7 +2597,9 @@ def recover_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
         if upgrade is None:
             raise ActivationError("prepared recovery requires a prepared database transaction")
         if current_schema != (manifest.current_schema_upgrade is not None):
-            raise ActivationError("recovery command does not match prepared database mode")
+            raise RecoveryModeMismatch(
+                "recovery command does not match prepared database mode"
+            )
         claim = Path(manifest.active_path)
         try:
             status = read_status(manifest)
@@ -2145,7 +2686,16 @@ def main() -> int:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["activate", "recover-paired", "recover-current", "finalize-paired", "finalize-current", "resume-forward"],
+        choices=[
+            "activate",
+            "cleanup-paired",
+            "cleanup-current",
+            "recover-paired",
+            "recover-current",
+            "finalize-paired",
+            "finalize-current",
+            "resume-forward",
+        ],
     )
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--probe-service-absence")
@@ -2162,11 +2712,34 @@ def main() -> int:
     if args.manifest is None or args.helper_label is None or args.uid is None:
         parser.error("activation requires --manifest, --helper-label, and --uid")
     manifest = None
+    verified_helper_label: Optional[str] = None
     try:
-        manifest = Manifest.load(args.manifest)
+        manifest_path = Path(args.manifest)
+        if args.command in {"cleanup-paired", "cleanup-current"} and (
+            not manifest_path.is_file() or manifest_path.is_symlink()
+        ):
+            raise CleanupPreconditionRejected(
+                "precondition cleanup requires a regular non-symlink manifest"
+            )
+        manifest = Manifest.load(manifest_path)
+        identity_rejection = (
+            CleanupPreconditionRejected
+            if args.command in {"cleanup-paired", "cleanup-current"}
+            else ActivationError
+        )
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
-            raise ActivationError("helper identity does not match the immutable manifest")
-        if args.command in {"finalize-paired", "finalize-current"}:
+            raise identity_rejection("helper identity does not match the immutable manifest")
+        expected_helper_label = (
+            f"{DEPLOY_HELPER_LABEL_PREFIX}.{manifest.transaction_id}"
+        )
+        if manifest.helper_label != expected_helper_label:
+            raise identity_rejection("immutable manifest has an invalid helper label")
+        verified_helper_label = expected_helper_label
+        if args.command in {"cleanup-paired", "cleanup-current"}:
+            state = cleanup_precondition_capacity(
+                manifest, current_schema=args.command == "cleanup-current"
+            )
+        elif args.command in {"finalize-paired", "finalize-current"}:
             state = finalize_paired(
                 manifest, current_schema=args.command == "finalize-current"
             )
@@ -2179,11 +2752,27 @@ def main() -> int:
         else:
             state = activate(manifest)
         if state in TERMINAL_STATES:
-            release_durable_terminal_claim(manifest)
+            released = release_durable_terminal_claim(manifest)
+            if args.command in {"cleanup-paired", "cleanup-current"} and not released:
+                raise ActivationError(
+                    "precondition cleanup completed but matching claim release failed"
+                )
         print(state, flush=True)
-        return 0 if state == "committed" or (args.command in {"recover-paired", "recover-current"} and state == "activation_failed_rolled_back") else 1
+        return 0 if (
+            state == "committed"
+            or (
+                args.command in {"cleanup-paired", "cleanup-current"}
+                and state == "precondition_failed"
+            )
+            or (
+                args.command in {"recover-paired", "recover-current"}
+                and state == "activation_failed_rolled_back"
+            )
+        ) else 1
     except ConcurrentDeploy as exc:
         protected_recovery = {
+            "cleanup-paired",
+            "cleanup-current",
             "finalize-paired",
             "finalize-current",
             "resume-forward",
@@ -2204,9 +2793,48 @@ def main() -> int:
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
+        if (
+            manifest is not None
+            and args.command in {"cleanup-paired", "cleanup-current"}
+            and not isinstance(exc, CleanupPreconditionRejected)
+        ):
+            try:
+                cleanup_status = read_status(manifest)
+                original_failure = cleanup_status.get("failure")
+                write_status(
+                    manifest,
+                    "precondition_cleanup_pending",
+                    failure=(
+                        original_failure
+                        if isinstance(original_failure, str)
+                        else None
+                    ),
+                    cleanup_failure=str(exc),
+                    precondition_cleanup_completed=False,
+                )
+            except Exception:
+                pass
         if manifest is not None and args.command in {"recover-paired", "recover-current"}:
-            record_recovery_error(manifest, exc)
-        if manifest is not None and args.command not in {"finalize-paired", "finalize-current", "resume-forward"}:
+            try:
+                recovery_status = read_status(manifest)
+            except Exception:
+                recovery_status = {}
+            cleanup_only_state = (
+                recovery_status.get("state") == "precondition_cleanup_pending"
+                or (
+                    recovery_status.get("state") == "precondition_failed"
+                    and recovery_status.get("precondition_cleanup_completed") is True
+                )
+            )
+            if not cleanup_only_state and not isinstance(exc, RecoveryModeMismatch):
+                record_recovery_error(manifest, exc)
+        if manifest is not None and args.command not in {
+            "cleanup-paired",
+            "cleanup-current",
+            "finalize-paired",
+            "finalize-current",
+            "resume-forward",
+        }:
             if prepared_database_upgrade(manifest) is None:
                 if status_is_durable_terminal(manifest):
                     release_claim(manifest)
@@ -2219,6 +2847,22 @@ def main() -> int:
                         manifest, required_state="precondition_failed"
                     )
                 except Exception as release_exc:
+                    try:
+                        terminal_status = read_status(manifest)
+                        original_failure = terminal_status.get("failure")
+                        write_status(
+                            manifest,
+                            "precondition_cleanup_pending",
+                            failure=(
+                                original_failure
+                                if isinstance(original_failure, str)
+                                else None
+                            ),
+                            cleanup_failure=str(release_exc),
+                            precondition_cleanup_completed=False,
+                        )
+                    except Exception:
+                        pass
                     print(
                         "activation helper could not release durable precondition claim: "
                         f"{release_exc}",
@@ -2227,8 +2871,11 @@ def main() -> int:
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        if args.command not in {"finalize-paired", "finalize-current"}:
-            request_helper_bootout(args.uid, args.helper_label)
+        if (
+            args.command not in {"finalize-paired", "finalize-current"}
+            and verified_helper_label is not None
+        ):
+            request_helper_bootout(args.uid, verified_helper_label)
 
 
 if __name__ == "__main__":

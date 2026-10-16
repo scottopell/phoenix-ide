@@ -12,11 +12,16 @@
 
 config {
     stale_after: Duration = 120_000.ms
+    current_schema_growth_margin_divisor: Integer = 10
+    current_schema_growth_margin_min_bytes: Integer = 1_073_741_824
+    current_schema_growth_margin_max_bytes: Integer = 8_589_934_592
+    current_schema_evidence_budget_bytes: Integer = 2_097_152
+    current_schema_max_proof_bytes: Integer = 1_048_576
 }
 
 enum BackendKind { launchd | systemd | bare_linux }
 enum TransactionState {
-    preparing | prepared | handed_off | activating | committed
+    preparing | prepared | handed_off | precondition_cleanup_pending | activating | committed
     | precondition_failed | activation_failed_rolled_back
     | activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | rejected_concurrent
 }
@@ -88,7 +93,11 @@ entity DeployTransaction {
         prepared -> precondition_failed
         prepared -> activation_failed_rolled_back
         prepared -> activation_failed_rollback_failed
+        handed_off -> precondition_cleanup_pending
+        activating -> precondition_cleanup_pending
+        precondition_cleanup_pending -> precondition_failed
         handed_off -> precondition_failed
+        activating -> precondition_failed
         handed_off -> activating
         handed_off -> activation_failed_rolled_back
         handed_off -> activation_failed_rollback_failed
@@ -228,7 +237,17 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   host-resident before disruption. Ordinary helper comes from selected source;
 --   paired helper comes from the separately verified clean controller commit.
 -- claim_available(transaction) -> Boolean
---   No active or unresolved transaction owns the host deployment claim.
+--   No active or unresolved transaction owns the host deployment claim. A
+--   markerless status is resolved only when it positively names a nonempty
+--   transaction, an exact supported source kind, a recognized terminal state,
+--   finalization_pending absent or literally false, and rollback_failure absent or
+--   literally null; every other markerless status is unresolved. Active-owner
+--   terminal proof also requires a regular non-symlink status with explicit literal
+--   lifecycle fields and an exact source kind coherent with retained mode evidence.
+--   Unreadable/non-regular active
+--   markers remain visible unresolved fences. Active-owner status is rendered even
+--   when the shared last-status record is absent, unreadable, or belongs to another
+--   owner.
 -- current_claim_matches(transaction) -> Boolean
 --   The active claim names transaction.id and transaction.claim_generation.
 -- claim_release_matches(transaction) -> Boolean
@@ -239,8 +258,39 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   or the persistent bare-Linux supervisor owns activation and its child.
 -- helper_capacity_reserved(transaction) -> Boolean
 --   After handoff and before production stop, the launchd paired helper holds
---   private DB-plus-WAL snapshot and atomic-restore capacity. True for other
---   sources/backends with their prepared capacity.
+--   private capacity. Current-schema capacity uses observed live DB plus WAL and
+--   a 10 percent growth margin clamped to 1–8 GiB, capped by each capacity pool's
+--   safe ceiling without crediting live DB/WAL logical bytes against copy-on-write
+--   peak demand, while retaining at least 20 GiB free after prepared install overhead.
+--   APFS volumes in one container share a pool; every evidence check uses the
+--   minimum reported free value among affected paths in that pool. The complete
+--   allocation-unit-rounded atomic evidence lifecycle, including old and replacement
+--   proofs plus capacity evidence, fits 2 MiB; each proof generation is at most 1 MiB.
+--   Both bounds are projected before disruption, and the floor plus pending atomic
+--   evidence peak is proved before initial or replacement evidence publication.
+--   The stopped, exclusively owned size recheck retains the floor plus the
+--   not-yet-resident evidence allowance
+--   and is authoritative. After migration, actual DB+WAL remains within the held
+--   target and every affected capacity pool retains the floor plus its remaining
+--   evidence allowance. True for ordinary sources/backends with prepared capacity.
+-- pre_stop_cleanup_uncertain(transaction) -> Boolean
+--   Reservation/evidence cleanup durability is uncertain before service stop;
+--   no snapshot exists and no runtime or database mutation was authorized.
+-- pre_stop_capacity_cleanup_durable(transaction) -> Boolean
+--   Transaction-owned unsnapshotted reservation/evidence files are absent and
+--   their parent directories were fsynced; true for failures with no such files.
+-- pre_stop_cleanup_retry_context_is_valid(transaction) -> Boolean
+--   Exact retained transaction and matching claim under the operation fence;
+--   uses recorded pre-stop evidence, not runtime inspection.
+-- PreStopCleanupUncertain(transaction, failure)
+--   Capacity reservation failed before stop without durable cleanup proof.
+-- PreStopCleanupRetryRequested(transaction)
+--   Operator requests cleanup-only disposition of the retained transaction.
+-- PreStopCleanupRetryFailed(transaction, failure)
+--   Cleanup or terminal status durability failed; ownership remains retained.
+-- PreStopCleanupFilesRemovedAndParentsSynced(transaction)
+--   Only this transaction's unsnapshotted reservation/evidence files were
+--   removed and all affected parent directories fsynced.
 -- HelperCapacityVerified(transaction)
 --   Independent helper confirmed its pre-stop capacity reservation.
 -- handoff_valid_for_backend(transaction, handoff) -> Boolean
@@ -294,8 +344,15 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- pre_manifest_abandonment_verified(transaction) -> Boolean
 --   Matching preparing status preceded owned claim publication, manifest
 --   is absent or exists; preparation PID is dead and no helper was admitted,
---   or a prepared/helper-handoff attempt ended with confirmed helper absence and
---   helper absence is confirmed. Manifest presence does not imply handoff.
+--   or a prepared/helper-handoff attempt ended with confirmed helper absence.
+--   Retained source kind and requested paired/current-schema recovery mode match
+--   exactly; initial status carries the mode before manifest publication. All
+--   transaction-owned unsnapshotted capacity/evidence files, atomic temporaries, and
+--   SQLite sidecars are removed on reservation abort and cleanup, with parents fsynced
+--   before terminal status. Terminal-status or claim-release durability failure
+--   restores a visible exact-owner fence and cleanup-pending where possible; matching
+--   claim removal is parent-directory-fsynced before success. Manifest presence does
+--   not imply handoff.
 -- PreparedAbandonmentVerified(transaction)
 --   Operator requested recovery and pre_manifest_abandonment_verified holds.
 
@@ -479,7 +536,8 @@ rule ReserveHelperCapacity {
 
 rule HelperCapacityFailureBeforeStop {
     when: HelperCapacityFailed(transaction, failure)
-    requires: transaction.state = handed_off
+    requires: transaction.state in { handed_off, activating }
+    requires: pre_stop_capacity_cleanup_durable(transaction)
     ensures: transaction.state = precondition_failed
     ensures: transaction.failure = failure
     ensures: ProductionStateUnchanged(transaction)
@@ -502,6 +560,51 @@ rule IndependentOwnerBeginsActivation {
 
 -- PairedSnapshotProofPersisted(transaction)
 --   The verified context-bound snapshot proof was atomically written and fsynced.
+
+rule PreservePreStopCleanupUncertainty {
+    when: PreStopCleanupUncertain(transaction, failure)
+    requires: transaction.state in { handed_off, activating }
+    requires: current_claim_matches(transaction)
+    requires: transaction.kind = PreparedArtifactDeployment
+    requires: transaction.backend = launchd
+    requires: pre_stop_cleanup_uncertain(transaction)
+    ensures: transaction.state = precondition_cleanup_pending
+    ensures: transaction.failure = failure
+    ensures: active_claim_retained(transaction)
+    ensures: ProductionStateUnchanged(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule RetryPreStopCleanupOnly {
+    when: PreStopCleanupRetryRequested(transaction)
+    requires: transaction.state = precondition_cleanup_pending
+    requires: pre_stop_cleanup_retry_context_is_valid(transaction)
+    requires: current_claim_matches(transaction)
+    ensures: PreStopCleanupFilesRemovedAndParentsSynced(transaction)
+    ensures: pre_stop_capacity_cleanup_durable(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Remove only transaction-owned unsnapshotted reservation/evidence files
+        -- and fsync their parents. Persist terminal status before releasing only
+        -- the matching claim. Never stop/start/inspect runtime, touch DB contents,
+        -- production plist/binary, perform snapshot recovery, or use
+        -- recover-current/paired.
+        -- Those recovery commands refuse this state without rewriting it.
+        -- Markerless pending status fences deploy/restart/stop. Invalid helper
+        -- identity cannot request bootout; only the exact transaction-derived
+        -- deployment-helper label may be booted out.
+}
+
+rule PreserveFailedPreStopCleanupRetry {
+    when: PreStopCleanupRetryFailed(transaction, failure)
+    requires: transaction.state = precondition_cleanup_pending
+    requires: current_claim_matches(transaction)
+    ensures: transaction.state = precondition_cleanup_pending
+    ensures: transaction.failure = failure
+    ensures: active_claim_retained(transaction)
+}
 
 rule CandidateStartupPrepared {
     when: CandidateStartupReady(transaction)
@@ -783,7 +886,7 @@ rule StaleClaimReleaseRejected {
 
 rule InterruptedTransactionRemainsActionable {
     when: DeploymentStatusRequested(transaction)
-    requires: transaction.state in { preparing, prepared, handed_off, activating }
+    requires: transaction.state in { preparing, prepared, handed_off, precondition_cleanup_pending, activating }
     requires: now() - transaction.updated_at > config.stale_after
     ensures: RecoveryGuidanceShown(transaction)
     ensures: not transaction.state = committed
@@ -838,7 +941,7 @@ invariant PairedUnresolvedFailureAutoloadFence {
 invariant PairedPrecommitAutoloadSafety {
     for transaction in DeployTransactions:
         transaction.kind = PreparedArtifactDeployment
-        and transaction.state in { preparing, prepared, activating } implies
+        and transaction.state in { preparing, prepared, precondition_cleanup_pending, activating } implies
             paired_precommit_autoload_safe(transaction)
 }
 
@@ -890,6 +993,15 @@ invariant BareSupervisorChangeFailsBeforeDisruption {
         transaction.backend = bare_linux
         and not selected_supervisor_artifact_matches_running(transaction) implies
             not RuntimeDisruptionStarted(transaction)
+}
+
+invariant PreStopCleanupPendingKeepsRuntimeAndClaim {
+    for transaction in DeployTransactions:
+        transaction.state = precondition_cleanup_pending implies
+            pre_stop_cleanup_uncertain(transaction)
+            and active_claim_retained(transaction)
+            and not RuntimeDisruptionStarted(transaction)
+            and not DatabaseRollbackCompleted(transaction)
 }
 
 invariant ActiveClaimMatchesTransactionGeneration {

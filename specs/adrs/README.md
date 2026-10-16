@@ -122,6 +122,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [103](103_ordinary-forward-launch-is-the-downgrade-boundary.md) | Ordinary forward candidate launch is the downgrade boundary | Accepted; interval superseded by 105 | REQ-COMP-013, REQ-LDD-023, REQ-PD-022 |
 | [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-012, REQ-COMP-001/002/005 |
 | [105](105_qualify-migration-128-for-bounded-current-schema-activation.md) | Qualify migration 128 for bounded current-schema activation | Accepted; supersedes interval portions of 102/103 | REQ-COMP-012/013, REQ-LDD-019–023, REQ-PD-021–022, REQ-CCR-012 |
+| [106](106_pre-stop-capacity-cleanup-is-cleanup-only-recovery.md) | Pre-stop capacity cleanup is a cleanup-only recovery boundary | Accepted | REQ-LDD-024 |
 
 ## For agents: which decisions bind your task
 
@@ -159,6 +160,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
 | Specifying protected prepared artifacts or paired launchd ProductConversation database recovery | 076, 077, within 034; then 050 and 017 |
 | Qualifying the migration-123 to exact migration-128 current-schema prepared or ordinary activation interval | 105 supersedes the interval portions of 102/103; retain their activation/recovery boundaries, then 104 and 034 |
+| Modifying pre-stop capacity reservation cleanup, cleanup-only recovery, or reservation-evidence ownership | 106, then 010, 034, 102, and 076 |
 | Specifying authoritative build identity, candidate verification, legacy predecessor rollback, or bare-supervisor replacement | 064, then 017 and 010 |
 | Reviewing historical wake registration, observation, or resume records | 098 governs retirement; 006, 011, 012 record former behavior without execution authority |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
@@ -217,6 +219,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
       │   └── applies ADR-024 and ADR-034 to pre-obligation materialized direct turns
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
+      │   ├── ADR-106 (Pre-stop capacity cleanup is a cleanup-only recovery boundary)
       │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
       │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
