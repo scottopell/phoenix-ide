@@ -200,7 +200,10 @@ describe('ProductConversationFixture', () => {
       reactionStore.dispatch(snapshot.product_conversation_id, { type: 'edit', body: 'Keep this guarantee.' });
     });
     const fetchSnapshot = vi.spyOn(api, 'getProductConversationHistorySnapshot');
-    fireEvent.click(await screen.findByRole('button', { name: /Return to passage/ }));
+    const returnButton = await screen.findByRole('button', { name: /Return to passage/ });
+    await act(async () => { fireEvent.click(returnButton); });
+    await waitFor(() => expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).not.toBeNull());
+    await act(async () => { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())); });
     const input = await screen.findByRole('textbox', { name: 'Your reaction' });
     expect(input).toHaveValue('Keep this guarantee.');
     expect(input).not.toHaveFocus();
