@@ -44,6 +44,7 @@ impl AdministrativeRiskAcceptance {
     }
 }
 
+/// Nanoseconds on the platform monotonic clock's process-independent boot timeline.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MonotonicTick(u64);
 
@@ -56,6 +57,37 @@ impl MonotonicTick {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    #[cfg(unix)]
+    /// Read the platform monotonic clock in the same unit used by native deadlines.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS clock error or `InvalidData` if the native value is negative
+    /// or cannot fit the controller's fixed-width tick representation.
+    pub fn native_now() -> std::io::Result<Self> {
+        let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes the timespec on success.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, now.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let now = unsafe { now.assume_init() };
+        let seconds = u64::try_from(now.tv_sec)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        let nanos = u64::try_from(now.tv_nsec)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanos))
+            .map(Self)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))
+    }
+
+    #[must_use]
+    pub fn checked_add(self, duration: std::time::Duration) -> Option<Self> {
+        let nanos = u64::try_from(duration.as_nanos()).ok()?;
+        self.0.checked_add(nanos).map(Self)
     }
 }
 

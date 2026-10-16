@@ -376,6 +376,7 @@ impl GuardianClient {
             | Response::Snapshot(_)
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -386,6 +387,35 @@ impl GuardianClient {
             | Response::Submitted { .. }) => Ok(response),
         }
     }
+    /// Release the exact committed initial session's blocked child once.
+    /// # Errors
+    /// Refuses missing durable evidence, a stale session, or transport failure.
+    pub fn release_initial(
+        &mut self,
+        snapshot: &WireSnapshot,
+        revision: crate::PersistenceRevision,
+    ) -> Result<(), ClientError> {
+        let request = crate::guardian_ipc::initial_release_request(snapshot, revision)
+            .map_err(ClientError::Refused)?;
+        match self.exchange(&request)? {
+            Response::InitialReleased { session } if session == snapshot.session => Ok(()),
+            Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::Acked
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// # Errors
     /// Returns transport or protocol errors rather than inferring a live binding.
     pub fn hello(&mut self) -> Result<WireSnapshot, ClientError> {
@@ -394,6 +424,7 @@ impl GuardianClient {
             Response::Snapshot(_)
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -413,6 +444,7 @@ impl GuardianClient {
             Response::Hello { .. }
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -433,6 +465,7 @@ impl GuardianClient {
             | Response::Snapshot(_)
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
             | Response::ReconciliationFinished
             | Response::SlotObserved(_)
             | Response::Retained(_)
@@ -452,6 +485,7 @@ impl GuardianClient {
             | Response::Snapshot(_)
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::Retained(_)
@@ -470,6 +504,7 @@ impl GuardianClient {
             Response::Hello { .. }
             | Response::Snapshot(_)
             | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -498,6 +533,7 @@ impl GuardianClient {
             Response::Hello { .. }
             | Response::Snapshot(_)
             | Response::Fenced
+            | Response::InitialReleased { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -613,7 +649,7 @@ pub fn verify_native_binding(
                     NativeSessionState::Active | NativeSessionState::Reconciling,
                 ) => {
                     store
-                        .commit_detached_binding(&binding)
+                        .commit_detached_binding(&binding, &slots)
                         .map_err(|e| e.to_string())?;
                     Ok(VerifiedBindingStatus::Detached)
                 }
@@ -644,7 +680,6 @@ pub fn run_disposable_guardian(
         Guardian, GuardianLifetimeNonce, MacOsControllerOs, MacOsGuardianExecutor,
         NativeGuardianIdentity,
     };
-    use std::process::Command;
     if !(1..=120).contains(&child_seconds) || !(1..=120).contains(&serve_seconds) {
         return Err(Box::new(permission_denied()));
     }
@@ -658,9 +693,7 @@ pub fn run_disposable_guardian(
     };
     let listener = bind_disposable(dir)?;
     let os = MacOsControllerOs::new(dir)?;
-    let mut command = Command::new("/bin/sleep");
-    command.arg(child_seconds.to_string());
-    let child = os.spawn_supervised(&mut command)?;
+    let (child, gate) = os.spawn_blocked_sleep(child_seconds)?;
     let identity = child.identity();
     let (guardian, session) = Guardian::new(
         attempt,
@@ -677,6 +710,7 @@ pub fn run_disposable_guardian(
     let mut server = GuardianServer::new(guardian, session)?;
     server.stage_native_identity(native_identity);
     server.stage_native_reader(Box::new(reader));
+    server.stage_initial_gate(Box::new(gate));
     println!(
         "disposable child pid={} birth={}:{}",
         identity.pid().get(),

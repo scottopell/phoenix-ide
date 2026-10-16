@@ -28,6 +28,48 @@ pub trait NativeEvidenceReader: Send {
     ) -> Result<Option<(crate::LoadedAttempt, crate::NativeGuardianBinding)>, NativeEvidenceReadError>;
 }
 
+/// Process-local, one-use release handle. Durable rows and wire values cannot create one.
+pub trait NativeInitialGate: Send {
+    fn identity(&self) -> ProcessIdentity;
+    /// # Errors
+    /// An unsuccessful write never grants permission to retry the consumed gate.
+    fn release(self: Box<Self>) -> io::Result<()>;
+}
+
+fn before_native_deadline(deadline: u64) -> bool {
+    #[cfg(unix)]
+    {
+        crate::MonotonicTick::native_now().is_ok_and(|now| now.get() < deadline)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = deadline;
+        false
+    }
+}
+
+/// Build the exact initial-release request from observed live metadata and the
+/// revision whose binding the runner already committed.
+///
+/// # Errors
+///
+/// Returns `MissingProof` when the snapshot lacks native guardian evidence.
+pub fn initial_release_request(
+    snapshot: &WireSnapshot,
+    revision: PersistenceRevision,
+) -> Result<Request, WireError> {
+    let binding = snapshot
+        .native_binding
+        .as_ref()
+        .ok_or(WireError::MissingProof)?;
+    Ok(Request::ReleaseInitial {
+        session: snapshot.session,
+        attempt: snapshot.attempt,
+        nonce: binding.nonce,
+        attempt_revision: revision.get(),
+    })
+}
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
@@ -490,6 +532,12 @@ pub enum Request {
         applied_revision: u64,
         now: u64,
     },
+    ReleaseInitial {
+        session: WireSession,
+        attempt: u128,
+        nonce: [u8; 16],
+        attempt_revision: u64,
+    },
     Inventory,
     ObserveSlot {
         slot: WireSlot,
@@ -525,6 +573,7 @@ pub enum Response {
     Snapshot(WireSnapshot),
     Fenced,
     ReconciliationBegun { session: WireSession },
+    InitialReleased { session: WireSession },
     ReconciliationFinished,
     Inventory(Vec<WireSlot>),
     SlotObserved(WireObservation),
@@ -615,6 +664,7 @@ pub struct GuardianServer<E: GuardianExecutor> {
     native_unbound: bool,
     native_identity: Option<crate::NativeGuardianIdentity>,
     native_reader: Option<Box<dyn NativeEvidenceReader>>,
+    initial_gate: Option<Box<dyn NativeInitialGate>>,
 }
 impl<E: GuardianExecutor> GuardianServer<E> {
     /// Construct a server bound to an authenticated policy session.
@@ -641,6 +691,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             native_unbound: false,
             native_identity: None,
             native_reader: None,
+            initial_gate: None,
         })
     }
     /// Disable native mutation until durable policy binding can stage affine proof.
@@ -659,6 +710,91 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     /// Pins the trusted native evidence reader for this guardian lifetime.
     pub fn stage_native_reader(&mut self, reader: Box<dyn NativeEvidenceReader>) {
         self.native_reader = Some(reader);
+    }
+
+    pub fn stage_initial_gate(&mut self, gate: Box<dyn NativeInitialGate>) {
+        self.initial_gate = Some(gate);
+    }
+
+    fn release_initial(
+        &mut self,
+        session: WireSession,
+        attempt: u128,
+        nonce: [u8; 16],
+        attempt_revision: u64,
+    ) -> Result<Response, WireError> {
+        if !self.native_unbound || self.native_reader.is_none() || self.initial_gate.is_none() {
+            return Err(WireError::UnsupportedDurableBinding);
+        }
+        self.resolve_session(session)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .read(self.guardian.attempt_id())
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let revision = revision(attempt_revision)?;
+        let current = binding.current_session();
+        let gate = self
+            .initial_gate
+            .as_ref()
+            .ok_or(WireError::UnsupportedDurableBinding)?;
+        if live.state != WireState::Active
+            || session != live.session
+            || session.generation != 1
+            || attempt != live.attempt
+            || attempt != wire.attempt
+            || nonce != wire.nonce
+            || binding.attempt_id() != self.guardian.attempt_id()
+            || checkpoint.attempt_id() != self.guardian.attempt_id()
+            || binding.identity().nonce.bytes() != wire.nonce
+            || WireIdentity::from(binding.identity().process) != wire.guardian
+            || self.native_identity != Some(binding.identity())
+            || binding.deadline().get() != wire.deadline
+            || wire.deadline != live.deadline
+            || !before_native_deadline(wire.deadline)
+            || checkpoint.persistence_revision() != revision
+            || binding.dispatch_floor() != revision
+            || binding.revision() != PersistenceRevision::first()
+            || binding.sessions().len() != 1
+            || current.interruption_revision != revision
+            || current.generation.get() != session.generation
+            || current.state != crate::NativeSessionState::Active
+            || binding.slots().len() != 1
+            || wire.slots.len() != 1
+            || live.slots.len() != 1
+        {
+            return Err(WireError::MissingProof);
+        }
+        if WireIdentity::from(binding.slots()[0].process) != wire.slots[0].identity
+            || binding.slots()[0].process != gate.identity()
+            || binding.slots()[0].liveness != crate::NativeSlotLiveness::Running
+            || wire.slots[0].liveness != WireObservation::Running
+            || live.slots[0].instance != live.instance
+            || live.slots[0].ordinal != 1
+            || self
+                .guardian
+                .diagnostic_slots()
+                .first()
+                .is_none_or(|(identity, liveness)| {
+                    *identity != Some(gate.identity()) || *liveness != ChildSlotObservation::Running
+                })
+        {
+            return Err(WireError::MissingProof);
+        }
+        // Consume before writing: even ambiguous pipe errors cannot authorize a retry.
+        let gate = self
+            .initial_gate
+            .take()
+            .ok_or(WireError::UnsupportedDurableBinding)?;
+        gate.release().map_err(|_| WireError::MissingProof)?;
+        Ok(Response::InitialReleased { session })
     }
 
     /// Returns the live guardian without exposing mutable custody.
@@ -785,6 +921,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     }
     pub fn fence_connection(&mut self) {
         let _ = self.guardian.controller_lost(self.session);
+        self.initial_gate.take();
         self.staged.clear();
         self.refused.clear();
         self.admissions.clear();
@@ -803,6 +940,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ObserveRetained { .. }
                     | Request::Fence { .. }
                     | Request::BeginReconciliation { .. }
+                    | Request::ReleaseInitial { .. }
             )
         {
             return Response::Refused(WireError::UnsupportedDurableBinding);
@@ -869,18 +1007,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 {
                     return Err(WireError::MissingProof);
                 }
-                #[cfg(unix)]
-                {
-                    let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
-                    // SAFETY: clock_gettime initializes the timespec on success.
-                    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, now.as_mut_ptr()) } != 0
-                    {
-                        return Err(WireError::MissingProof);
-                    }
-                    let now = unsafe { now.assume_init() };
-                    if u64::try_from(now.tv_sec).map_or(true, |seconds| seconds >= wire.deadline) {
-                        return Err(WireError::MissingProof);
-                    }
+                if !before_native_deadline(wire.deadline) {
+                    return Err(WireError::MissingProof);
                 }
                 self.interruption = Some(revision);
             }
@@ -1041,6 +1169,12 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 snapshot: self.snapshot(),
             },
             Request::Snapshot => Response::Snapshot(self.snapshot()),
+            Request::ReleaseInitial {
+                session,
+                attempt,
+                nonce,
+                attempt_revision,
+            } => self.release_initial(session, attempt, nonce, attempt_revision)?,
             Request::Inventory => {
                 Response::Inventory(self.guardian.inventory().map(Into::into).collect())
             }
@@ -1049,6 +1183,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 self.guardian
                     .controller_lost(session)
                     .map_err(WireError::from)?;
+                self.initial_gate.take();
                 self.staged.clear();
                 self.refused.clear();
                 self.admissions.clear();
@@ -1778,6 +1913,212 @@ mod native_evidence_tests {
         server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
         server.handle(request)
     }
+    struct Gate {
+        identity: ProcessIdentity,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl NativeInitialGate for Gate {
+        fn identity(&self) -> ProcessIdentity {
+            self.identity
+        }
+        fn release(self: Box<Self>) -> io::Result<()> {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn initial_fixture(
+        native: bool,
+    ) -> (
+        GuardianServer<Observer>,
+        Request,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        crate::LoadedAttempt,
+        NativeGuardianBinding,
+    ) {
+        let attempt = AttemptId::new(919);
+        let deadline = MonotonicTick::native_now()
+            .unwrap()
+            .checked_add(std::time::Duration::from_secs(120))
+            .unwrap();
+        let mut store = ControllerSqliteStore::in_memory().unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(0).unwrap(),
+            MemoryPressure::Critical,
+        );
+        DeploymentAttempt::start(attempt, deadline, policy, identity(41))
+            .persist(&mut store)
+            .unwrap();
+        let (guardian, session) =
+            Guardian::new(attempt, deadline, Observer, vec![identity(42)]).unwrap();
+        let mut server = GuardianServer::new(guardian, session).unwrap();
+        let native_identity = NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([8; 16]).unwrap(),
+            process: identity(43),
+        };
+        server.stage_native_identity(native_identity);
+        let Response::Hello { snapshot } = server.handle(Request::Hello) else {
+            panic!("hello")
+        };
+        crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
+        let loaded = store.load_attempt(attempt).unwrap().unwrap();
+        let binding = store.load_native_binding(attempt).unwrap().unwrap();
+        let request = initial_release_request(&snapshot, loaded.persistence_revision()).unwrap();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if native {
+            server.stage_initial_gate(Box::new(Gate {
+                identity: identity(42),
+                released: released.clone(),
+            }));
+        }
+        (server, request, released, loaded, binding)
+    }
+
+    #[test]
+    fn native_deadline_uses_monotonic_nanoseconds() {
+        let now = MonotonicTick::native_now().unwrap();
+        let future = now.checked_add(std::time::Duration::from_secs(1)).unwrap();
+        assert!(before_native_deadline(future.get()));
+        assert!(!before_native_deadline(now.get()));
+    }
+
+    #[test]
+    fn initial_release_requires_live_gate_reader_and_exact_evidence() {
+        use std::sync::atomic::Ordering;
+        let (mut server, request, released, loaded, binding) = initial_fixture(true);
+        assert_eq!(
+            server.handle(request.clone()),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
+        let response = server.handle(request.clone());
+        assert!(matches!(response, Response::InitialReleased { .. }));
+        assert!(released.load(Ordering::SeqCst));
+        assert_eq!(
+            server.handle(request),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+
+        let (mut server, request, released, loaded, binding) = initial_fixture(false);
+        assert_eq!(
+            server.handle(request.clone()),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
+        assert_eq!(
+            server.handle(request),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        assert!(!released.load(Ordering::SeqCst));
+
+        let (mut server, request, released, _, _) = initial_fixture(true);
+        server.fence_connection();
+        assert_eq!(
+            server.handle(request),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        assert!(!released.load(Ordering::SeqCst));
+
+        for change in 0..8 {
+            let (mut server, mut request, released, loaded, mut binding) = initial_fixture(true);
+            match change {
+                0 => {
+                    if let Request::ReleaseInitial { nonce, .. } = &mut request {
+                        *nonce = [9; 16];
+                    }
+                }
+                1 => {
+                    if let Request::ReleaseInitial { session, .. } = &mut request {
+                        session.generation += 1;
+                    }
+                }
+                2 => binding.identity.process = identity(99),
+                3 => binding.slots[0].process = identity(99),
+                4 => binding.dispatch_floor = PersistenceRevision::new(NonZeroU64::new(2).unwrap()),
+                5 => binding.sessions.last_mut().unwrap().state = NativeSessionState::Detached,
+                6 => binding.deadline = MonotonicTick::new(1),
+                7 => {
+                    if let Request::ReleaseInitial {
+                        attempt_revision, ..
+                    } = &mut request
+                    {
+                        *attempt_revision += 1;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
+            assert!(
+                matches!(server.handle(request), Response::Refused(_)),
+                "case {change}"
+            );
+            assert!(!released.load(Ordering::SeqCst), "case {change}");
+        }
+    }
+
+    #[test]
+    fn generic_transport_cannot_release_even_with_staged_evidence_and_gate() {
+        let (mut server, request, released, loaded, binding) = initial_fixture(true);
+        server.native_unbound = false;
+        server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
+        assert_eq!(
+            server.handle(request),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn native_begin_remains_observation_only() {
+        let (mut server, loaded, binding, begin) = fixture();
+        server.stage_native_reader(Box::new(Reader(Some((loaded, binding)))));
+        let Response::ReconciliationBegun { session } = server.handle(begin) else {
+            panic!("durable begin must succeed")
+        };
+        let key = WireKey {
+            attempt: 918,
+            revision: 2,
+            ordinal: 0,
+        };
+        let forbidden = [
+            Request::FinishReconciliation {
+                session,
+                applied_revision: 2,
+                now: 1,
+            },
+            Request::AckAfterAppliedRevision {
+                session,
+                key,
+                applied_revision: 2,
+            },
+            Request::ReserveSignalRound {
+                session,
+                revision: 2,
+                count: 1,
+            },
+            Request::DispatchAdmit {
+                session,
+                key,
+                effect: WireEffect::SampleResources { sequence: 1 },
+            },
+            Request::DispatchSubmit {
+                session,
+                admission: 1,
+                now: 1,
+            },
+        ];
+        for request in forbidden {
+            assert_eq!(
+                server.handle(request),
+                Response::Refused(WireError::UnsupportedDurableBinding)
+            );
+        }
+    }
+
     #[test]
     fn native_begin_requires_exact_durable_checkpoint_and_full_binding() {
         let (mut server, _, _, request) = fixture();

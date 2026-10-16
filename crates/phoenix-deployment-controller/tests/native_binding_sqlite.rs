@@ -75,7 +75,9 @@ fn binding_survives_policy_checkpoint_advance_and_reopen_in_original_order() {
         store.load_native_binding(id).unwrap(),
         Some(binding.clone())
     );
-    let detached = store.commit_detached_binding(&binding).unwrap();
+    let detached = store
+        .commit_detached_binding(&binding, binding.slots())
+        .unwrap();
     assert_eq!(
         detached.current_session().state,
         NativeSessionState::Detached
@@ -142,9 +144,11 @@ fn stale_duplicate_and_inexact_bindings_fail_stopped() {
     ));
     drop(store);
     let mut store = ControllerSqliteStore::open_existing(&path).unwrap();
-    let detached = store.commit_detached_binding(&binding).unwrap();
+    let detached = store
+        .commit_detached_binding(&binding, binding.slots())
+        .unwrap();
     assert!(matches!(
-        store.commit_detached_binding(&binding),
+        store.commit_detached_binding(&binding, binding.slots()),
         Err(ControllerStoreError::RevisionConflict)
     ));
     assert!(matches!(

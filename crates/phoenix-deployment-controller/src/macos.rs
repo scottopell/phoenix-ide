@@ -1,6 +1,6 @@
 use std::{
     ffi::CString,
-    io,
+    io::{self, Write},
     mem::{self, MaybeUninit},
     num::NonZeroU32,
     os::{
@@ -8,7 +8,7 @@ use std::{
         unix::{ffi::OsStrExt, process::CommandExt},
     },
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -134,6 +134,35 @@ impl MacOsControllerOs {
         }
     }
 
+    /// Spawn a blocked direct child; only the returned process-local pipe can exec sleep.
+    /// # Errors
+    /// Refuses spawn/identity acquisition failure or missing parent pipe custody.
+    pub fn spawn_blocked_sleep(
+        &self,
+        seconds: u64,
+    ) -> Result<(SupervisedChild, NativeSleepGate), MacOsError> {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("IFS= read -r permit && [ \"$permit\" = release ] && exec /bin/sleep \"$1\"")
+            .arg("blocked-sleep")
+            .arg(seconds.to_string())
+            .stdin(Stdio::piped());
+        let mut child = self.spawn_supervised(&mut command)?;
+        let ChildSupervision::Retained(process) = &mut child.state else {
+            return Err(MacOsError::MalformedObservation);
+        };
+        let pipe = process
+            .stdin
+            .take()
+            .ok_or(MacOsError::MalformedObservation)?;
+        let gate = NativeSleepGate {
+            pipe,
+            identity: child.identity(),
+        };
+        Ok((child, gate))
+    }
+
     #[must_use]
     pub const fn supervision_risks() -> [SupervisionRisk; 3] {
         [
@@ -141,6 +170,22 @@ impl MacOsControllerOs {
             SupervisionRisk::SameSessionProcessMayJoinProcessGroup,
             SupervisionRisk::ControllerExitLosesParentAuthority,
         ]
+    }
+}
+
+/// A parent-held pipe for exactly one blocked, original direct child.
+pub struct NativeSleepGate {
+    pipe: ChildStdin,
+    identity: ProcessIdentity,
+}
+
+impl crate::guardian_ipc::NativeInitialGate for NativeSleepGate {
+    fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
+    fn release(mut self: Box<Self>) -> io::Result<()> {
+        self.pipe.write_all(b"release\n")
     }
 }
 
@@ -912,6 +957,55 @@ mod tests {
             reclaimable_memory_bytes(&stats, u64::MAX),
             Err(MacOsError::MalformedObservation)
         );
+    }
+
+    #[test]
+    fn blocked_sleep_keeps_original_identity_until_one_use_release() {
+        use crate::guardian_ipc::NativeInitialGate;
+        let os = MacOsControllerOs::new("/tmp").unwrap();
+        let (mut child, gate) = os.spawn_blocked_sleep(5).unwrap();
+        let identity = child.identity();
+        assert_eq!(gate.identity(), identity);
+        let command = || {
+            let output = Command::new("/bin/ps")
+                .args(["-p", &identity.pid().get().to_string(), "-o", "comm="])
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(
+            Path::new(command().trim()).file_name(),
+            Some(std::ffi::OsStr::new("sh"))
+        );
+        Box::new(gate).release().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if Path::new(command().trim()).file_name() == Some(std::ffi::OsStr::new("sleep")) {
+                break;
+            }
+            assert!(Instant::now() < until, "gate must exec sleep");
+            // test-timing-allow: wait only for the newly released process to exec.
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(observe_process(identity.pid()).unwrap().identity, identity);
+        let _ = child.try_cleanup();
+    }
+
+    #[test]
+    fn dropping_blocked_gate_exits_without_running_sleep() {
+        let os = MacOsControllerOs::new("/tmp").unwrap();
+        let (mut child, gate) = os.spawn_blocked_sleep(5).unwrap();
+        drop(gate);
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(report) = child.try_finalize().unwrap() {
+                assert!(!report.leader_status.success());
+                break;
+            }
+            assert!(Instant::now() < until, "EOF must exit blocked child");
+            // test-timing-allow: wait for the blocked child to observe pipe EOF.
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

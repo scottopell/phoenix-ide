@@ -6,7 +6,8 @@ use phoenix_deployment_controller::{
     },
     native_guardian::{verify_native_binding, VerifiedBindingStatus},
     AttemptId, BirthToken, ControllerSqliteStore, CpuContentionBasisPoints, DeploymentAttempt,
-    MemoryPressure, MonotonicTick, NativeSessionState, ProcessId, ProcessIdentity, ResourcePolicy,
+    MemoryPressure, MonotonicTick, NativeSessionState, NativeSlotLiveness, ProcessId,
+    ProcessIdentity, ResourcePolicy,
 };
 use std::num::{NonZeroU32, NonZeroUsize};
 
@@ -86,6 +87,7 @@ fn initial_and_detached_reconnect_are_exact_and_idempotent() {
         detached.current_session().state,
         NativeSessionState::Detached
     );
+    assert_eq!(detached.slots()[0].liveness, NativeSlotLiveness::Exited);
     assert_eq!(
         verify_native_binding(&mut store, id, &wire).unwrap(),
         VerifiedBindingStatus::Detached
@@ -189,7 +191,9 @@ fn pending_begin_crash_refreshes_interruption_and_advances_durable_generation() 
         verify_native_binding(&mut store, attempt, &wire).unwrap(),
         VerifiedBindingStatus::PendingBegin
     );
-    let detached = store.commit_detached_binding(&pending).unwrap();
+    let detached = store
+        .commit_detached_binding(&pending, pending.slots())
+        .unwrap();
     let refreshed = store
         .load_attempt(attempt)
         .unwrap()

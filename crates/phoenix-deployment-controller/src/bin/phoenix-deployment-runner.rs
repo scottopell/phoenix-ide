@@ -119,7 +119,7 @@ fn catch_up_pending_begin(
         .fence(caught_up)
         .map_err(|e| format!("fence pending: {e:?}"))?;
     store
-        .commit_detached_binding(&pending)
+        .commit_detached_binding(&pending, pending.slots())
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -238,6 +238,15 @@ fn main() -> Result<(), String> {
         ControllerSqliteStore::open_existing(&config.store).map_err(|e| e.to_string())?;
     let (mut client, snapshot) = connect_consistent(&config.socket_dir)?;
     let status = verify_native_binding(&mut store, config.attempt, &snapshot)?;
+    if status == VerifiedBindingStatus::InitialActive {
+        let binding = store
+            .load_native_binding(config.attempt)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing committed initial binding")?;
+        client
+            .release_initial(&snapshot, binding.dispatch_floor())
+            .map_err(|e| format!("initial release: {e:?}"))?;
+    }
     println!("verified binding: {status:?}");
     std::io::stdout().flush().map_err(|e| e.to_string())?;
     if status == VerifiedBindingStatus::PendingBegin {

@@ -9,10 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || args[2] != "--child-seconds"
         || args[4] != "--serve-seconds"
         || args[6] != "--attempt"
-        || args[8] != "--deadline"
+        || args[8] != "--deadline-nanoseconds"
         || args[10] != "--store"
     {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "usage: --socket-dir <new private temporary sdc-disposable-* directory> --child-seconds 1..120 --serve-seconds 1..120 --attempt <u128> --deadline <u64> --store <existing schema-v2 database>").into());
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "usage: --socket-dir <new private temporary sdc-disposable-* directory> --child-seconds 1..120 --serve-seconds 1..120 --attempt <u128> --deadline-nanoseconds <u64> --store <existing schema-v2 database>").into());
     }
     let child = args[3]
         .to_str()

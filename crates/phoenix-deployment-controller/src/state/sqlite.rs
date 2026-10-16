@@ -372,8 +372,9 @@ impl ControllerSqliteStore {
     pub fn commit_detached_binding(
         &mut self,
         expected: &NativeGuardianBinding,
+        observed_slots: &[NativeGuardianSlot],
     ) -> Result<NativeGuardianBinding> {
-        self.advance_binding(expected, None)
+        self.advance_binding(expected, observed_slots, None)
     }
 
     /// Records a fresh reconciling session after an independently committed interruption.
@@ -393,16 +394,17 @@ impl ControllerSqliteStore {
         expected: &NativeGuardianBinding,
         interruption_revision: PersistenceRevision,
     ) -> Result<NativeGuardianBinding> {
-        self.advance_binding(expected, Some(interruption_revision))
+        self.advance_binding(expected, expected.slots(), Some(interruption_revision))
     }
 
     fn advance_binding(
         &mut self,
         expected: &NativeGuardianBinding,
+        observed_slots: &[NativeGuardianSlot],
         fresh: Option<PersistenceRevision>,
     ) -> Result<NativeGuardianBinding> {
         self.ensure_usable()?;
-        let result = self.advance_binding_inner(expected, fresh);
+        let result = self.advance_binding_inner(expected, observed_slots, fresh);
         if result.is_err() {
             self.poisoned = true;
         }
@@ -412,6 +414,7 @@ impl ControllerSqliteStore {
     fn advance_binding_inner(
         &mut self,
         expected: &NativeGuardianBinding,
+        observed_slots: &[NativeGuardianSlot],
         fresh: Option<PersistenceRevision>,
     ) -> Result<NativeGuardianBinding> {
         let tx = self
@@ -419,8 +422,29 @@ impl ControllerSqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_authority(&tx)?;
         let id = key(expected.attempt_id);
-        if read_binding(&tx, expected.attempt_id)?.as_ref() != Some(expected) {
+        if read_binding(&tx, expected.attempt_id)?.as_ref() != Some(expected)
+            || expected.slots.len() != observed_slots.len()
+            || expected
+                .slots
+                .iter()
+                .zip(observed_slots)
+                .any(|(stored, observed)| stored.process != observed.process)
+        {
             return Err(ControllerStoreError::RevisionConflict);
+        }
+        for (ordinal, observed) in observed_slots.iter().enumerate() {
+            let changed = tx.execute(
+                "UPDATE guardian_slots SET liveness=?3 WHERE attempt_id=?1 AND ordinal=?2",
+                params![
+                    id,
+                    i64::try_from(ordinal)
+                        .map_err(|_| ControllerStoreError::Malformed("slot ordinal overflow"))?,
+                    slot_liveness_text(observed.liveness)
+                ],
+            )?;
+            if changed != 1 {
+                return malformed("guardian slot liveness update mismatch");
+            }
         }
         let revision = expected
             .revision
@@ -465,7 +489,7 @@ impl ControllerSqliteStore {
         )?;
         if result.revision != revision
             || result.identity != expected.identity
-            || result.slots != expected.slots
+            || result.slots != observed_slots
             || result.deadline != expected.deadline
             || result.sessions.len() != expected.sessions.len() + usize::from(fresh.is_some())
         {

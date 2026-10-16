@@ -60,6 +60,27 @@ fn runner_command(dir: &Path, path: &Path, observe_seconds: &str) -> Command {
     command
 }
 
+fn process_name(pid: i32) -> String {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .unwrap();
+    Path::new(String::from_utf8(output.stdout).unwrap().trim())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn wait_for_process_name(pid: i32, expected: &str) {
+    let until = Instant::now() + Duration::from_secs(2);
+    while process_name(pid) != expected {
+        assert!(Instant::now() < until, "child did not exec {expected}");
+        // test-timing-allow: bounded polling observes the gated exec transition.
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn start_fixture() -> NativeProcessFixture {
     let parent = tempfile::Builder::new()
         .prefix("sdc-")
@@ -69,7 +90,10 @@ fn start_fixture() -> NativeProcessFixture {
     let dir = parent.path().join("sdc-disposable-process");
     let path = parent.path().join("controller.sqlite");
     let attempt = AttemptId::new(64);
-    let deadline = MonotonicTick::new(u64::MAX);
+    let deadline = MonotonicTick::native_now()
+        .unwrap()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
     let mut store = ControllerSqliteStore::open(&path).unwrap();
     let policy = ResourcePolicy::new(
         NonZeroUsize::new(2).unwrap(),
@@ -86,6 +110,7 @@ fn start_fixture() -> NativeProcessFixture {
         .persist(&mut store)
         .unwrap();
     drop(store);
+    let deadline_arg = deadline.get().to_string();
     let mut guardian = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"))
         .args([
             "--socket-dir",
@@ -96,8 +121,8 @@ fn start_fixture() -> NativeProcessFixture {
             "16",
             "--attempt",
             "64",
-            "--deadline",
-            "18446744073709551615",
+            "--deadline-nanoseconds",
+            &deadline_arg,
             "--store",
             path.to_str().unwrap(),
         ])
@@ -123,6 +148,7 @@ fn start_fixture() -> NativeProcessFixture {
         birthday[1].parse::<u32>().unwrap(),
     )
     .unwrap();
+    assert_eq!(process_name(child_pid), "sh");
     let mut runner = runner_command(&dir, &path, "5")
         .stdout(Stdio::piped())
         .spawn()
@@ -131,6 +157,7 @@ fn start_fixture() -> NativeProcessFixture {
     let mut ready = String::new();
     runner_output.read_line(&mut ready).unwrap();
     assert_eq!(ready.trim(), "verified binding: InitialActive");
+    wait_for_process_name(child_pid, "sleep");
     NativeProcessFixture {
         _parent: parent,
         dir,
