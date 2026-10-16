@@ -453,6 +453,7 @@ impl BrowserSession {
         let mut input_guard =
             click_object(&self.page, &object.id, &self.reference_input_lock).await?;
         async {
+            call(&self.page, &object.id, &format!("function() {{ globalThis.__phoenixReferenceInputGuard.beginTyping({}); return true; }}", quoted(&input_guard.token))).await?;
             call(&self.page, &object.id, include_str!("snapshot/focused.js")).await?;
             if clear {
                 call(&self.page, &object.id, "function() { if (!this.isConnected) throw Error('stale ref'); if (typeof this.select !== 'function') throw Error('clear requires a text input or textarea'); this.select(); return true; }").await?;
@@ -863,7 +864,27 @@ mod tests {
                     .unwrap(),
                 1
             );
+        }
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
 
+    #[tokio::test]
+    async fn native_reference_guard_rejects_typing_focus_retargeting() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("snapshot-typing-guard-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        {
+            let mut session = session.write().await;
+            session.page.goto("about:blank").await.unwrap();
             session.page.evaluate("document.body.innerHTML='<input id=original><input id=other>'; const original=document.getElementById('original'); original.focus(); globalThis.__phoenixReferenceInputGuard.arm(original,'type-token'); document.getElementById('other').focus()").await.unwrap();
             session
                 .page
@@ -874,8 +895,104 @@ mod tests {
             let result: Value = serde_json::from_str(&result).unwrap();
             assert_eq!(result["value"], "");
             assert_eq!(result["outcome"]["rejected"], true);
+
+            session.page.evaluate("document.body.innerHTML='<input id=original aria-label=Original><input id=other>'; document.getElementById('original').onkeydown=()=>document.getElementById('other').focus()").await.unwrap();
+            let snapshot = session.accessibility_snapshot(false).await.unwrap();
+            let reference = snapshot
+                .lines()
+                .find(|line| line.contains("Original"))
+                .unwrap()
+                .split('[')
+                .nth(1)
+                .unwrap()
+                .split(']')
+                .next()
+                .unwrap();
+            assert!(session.type_reference(reference, "x", false).await.is_err());
+            assert_eq!(
+                session
+                    .page
+                    .evaluate("document.getElementById('other').value")
+                    .await
+                    .unwrap()
+                    .into_value::<String>()
+                    .unwrap(),
+                ""
+            );
         }
         manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn native_reference_guard_preserves_script_forwarded_activation() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("snapshot-forwarded-click-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        let mut outcomes = Vec::new();
+        {
+            let mut session = session.write().await;
+            session.page.goto("about:blank").await.unwrap();
+            for (mode, activation_kind) in ["light", "open", "closed"]
+                .into_iter()
+                .flat_map(|mode| ["script", "label"].map(|kind| (mode, kind)))
+            {
+                session.page.evaluate(format!(r#"(() => {{
+                    document.body.innerHTML = '<div id="host"></div>';
+                    const mode = {mode}, activationKind = {activation_kind};
+                    const root = mode === 'light' ? document.body : document.getElementById('host').attachShadow({{mode}});
+                    root.innerHTML = (activationKind === 'script' ? '<button id="original">Forward activation</button>' : '<label id="original" for="hidden" role="button" tabindex="0">Forward activation</label>') + '<input id="hidden" type="checkbox" hidden>';
+                    const original = root.querySelector('#original'), hidden = root.querySelector('#hidden');
+                    window.activation = {{native: 0, forwarded: 0, input: 0, changed: 0, forwardedTrusted: null}};
+                    original.onclick = event => {{ if (event.isTrusted) window.activation.native++; if (activationKind === 'script') hidden.click(); }};
+                    hidden.onclick = event => {{ window.activation.forwarded++; window.activation.forwardedTrusted = event.isTrusted; }};
+                    hidden.oninput = () => window.activation.input++;
+                    hidden.onchange = () => window.activation.changed++;
+                }})()"#, mode=quoted(mode), activation_kind=quoted(activation_kind))).await.unwrap();
+                let snapshot = session.accessibility_snapshot(false).await.unwrap();
+                let reference = snapshot
+                    .lines()
+                    .find(|line| line.contains("Forward activation"))
+                    .unwrap()
+                    .split('[')
+                    .nth(1)
+                    .unwrap()
+                    .split(']')
+                    .next()
+                    .unwrap();
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    session.click_reference(reference),
+                )
+                .await;
+                let activation = session
+                    .page
+                    .evaluate("window.activation")
+                    .await
+                    .unwrap()
+                    .into_value::<Value>()
+                    .unwrap();
+                outcomes.push((mode, activation_kind, outcome, activation));
+            }
+        }
+        manager.shutdown_all().await.unwrap();
+        for (mode, activation_kind, outcome, activation) in outcomes {
+            outcome.expect("native click completes").unwrap();
+            assert_eq!(
+                activation,
+                json!({"native":1,"forwarded":1,"input":1,"changed":1,"forwardedTrusted":activation_kind == "label"}),
+                "{mode}/{activation_kind}: forwarded application activation"
+            );
+        }
     }
 
     #[tokio::test]

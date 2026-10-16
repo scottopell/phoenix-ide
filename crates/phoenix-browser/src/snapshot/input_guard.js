@@ -37,7 +37,9 @@
     guardedRoots.add(root);
     for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick', 'auxclick', 'keydown', 'keyup', 'keypress', 'beforeinput', 'input']) {
       root.addEventListener(type, event => {
-        if (!active) return;
+        if (!active || !event.isTrusted) return;
+        if (active.phase === 'activated') return;
+        if (active.dispatch && active.dispatch !== event && active.dispatch.eventPhase !== ProbeEvent.NONE) return;
         const keyboard = ['keydown', 'keyup', 'keypress', 'beforeinput', 'input'].includes(event.type);
         const path = event.composedPath();
         const attached = active.node.isConnected && active.node.ownerDocument === document;
@@ -51,9 +53,12 @@
           active.rejected = true;
           event.preventDefault();
           event.stopImmediatePropagation();
-        } else if (event.type === 'click' && !active.clicked && path.includes(active.node)) {
-          active.clicked = true;
-          receipt(JSON.stringify({token:active.token, outcome:'clicked'}));
+        } else if (path.includes(active.node)) {
+          active.dispatch = event;
+          if (event.type === 'click' && active.phase === 'pointer') {
+            active.phase = 'activated';
+            receipt(JSON.stringify({token:active.token, outcome:'clicked'}));
+          }
         }
       }, {capture: true, passive: false});
     }
@@ -77,11 +82,15 @@
           const root = ancestor.getRootNode();
           if (root.mode === 'closed' && !guardedRoots.has(root)) throw Error('Reference input guard unavailable for this closed shadow root; navigate to a fresh document and call browser_snapshot again');
         }
-        active = {node, token, rejected: false, clicked: false};
+        active = {node, token, phase: 'pointer', rejected: false, dispatch: null};
+      },
+      beginTyping(token) {
+        if (!active || active.token !== token || active.phase !== 'activated' || active.rejected) throw Error('Reference input guard unavailable');
+        active.phase = 'typing';
       },
       finish(token) {
         if (!active || active.token !== token) throw Error('Reference input guard unavailable');
-        const result = {rejected: active.rejected, clicked: active.clicked};
+        const result = {rejected: active.rejected, clicked: active.phase !== 'pointer'};
         active = null;
         return result;
       },
