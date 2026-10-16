@@ -86,7 +86,7 @@ function fakeRuntime(options={}){
         setImmediate(()=>{this.reportInFlight=false;this.emit('requestfinished',req);});
       }else this.emit('requestfinished',req);
     }
-    async evaluate(_fn,arg){if(options.completeBeforeAction&&this.pending)this.emit('requestfinished',this.pending);return arg?{...arg.known[0],sourcepin:arg.known[0].sourceRow}:123;}
+    async evaluate(_fn,arg){if(options.completeBeforeAction&&this.pending)this.emit('requestfinished',this.pending);return arg?{observation:options.missingPhysical?null:{...arg.known[0],sourcepin:options.wrongSourcepin?'UNIT-foreign':arg.known[0].sourceRow},predicates:options.missingPhysical?{row_clipped:1}:{}}:123;}
     locator(selector){return {count:async()=>1,isEditable:async()=>true,waitFor:async()=>{},isEnabled:async()=>true,evaluate:async()=> 'BUTTON',click:async()=>{this.location='http://127.0.0.1:12345/';this.report('canceled');}};}
     async waitForURL(){}
   }
@@ -194,7 +194,7 @@ test('UNIT outer lifecycle preserves allowlisted scenario failure location inste
     publish:r=>published.push(structuredClone(r)),timeoutMs:1000}));
   const result=published.at(-1);assert.equal(result.failure,'controlled_scenario_failed');
   assert.deepEqual(result.failure_location,{scope:'scenario',route:'ordinary',kind:'history',
-    phase:'additional_history_owner',error_kind:'assertion',counts:{reports:1,responses:[204],admissions:1,requests:2,pending:1,errors:0}});
+    phase:'additional_history_owner',error_kind:'assertion',counts:{reports:1,responses:[204],admissions:1,requests:2,pending:1,errors:0},physical:{predicates:{},observation_present:true,fixture_identity_matches:true,sourcepin_matches:true}});
 });
 test('UNIT phase receipts expose bounded counts, not raw errors or private setup details',async()=>{
   const runtime=fakeRuntime();const published=[];
@@ -203,4 +203,21 @@ test('UNIT phase receipts expose bounded counts, not raw errors or private setup
     capture:()=>runControlledFunctional(runtime.input,runtime.UNIT),negative:async()=>{},publish:r=>published.push(structuredClone(r))}));
   assert.equal(published.at(-1).failure_location.phase,'authenticate');
   assert.ok(!JSON.stringify(published).includes('SECRET'));
+});
+
+test('UNIT physical failure distinguishes strict oracle null from source-pin mismatch without leaking identity',async()=>{
+  for(const [options,phase,present,pin] of [
+    [{missingPhysical:true},'physical_history_present',false,null],
+    [{wrongSourcepin:true},'physical_history_sourcepin',true,false],
+  ]){
+    const runtime=fakeRuntime(options);let error;
+    try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(e){error=e;}
+    assert.ok(error);const location=error.controlledReceipt.failure_location;
+    assert.equal(location.phase,phase);assert.equal(location.physical.observation_present,present);
+    assert.equal(location.physical.sourcepin_matches,pin);
+    assert.equal(location.physical.fixture_identity_matches,present?true:null);
+    assert.ok(!JSON.stringify(location).includes('UNIT-foreign'));
+    assert.ok(!JSON.stringify(location).includes('UNIT-row'));
+    assert.equal(runtime.getClosed(),1);
+  }
 });

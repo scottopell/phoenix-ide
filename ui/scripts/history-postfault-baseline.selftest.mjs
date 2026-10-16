@@ -26,7 +26,7 @@ function dom(options = {}) {
   const context = { document: { querySelector: () => scroller, querySelectorAll: selector => selector === '[data-virtual-key]' ? rows : allChildren }, innerHeight: 900, innerWidth: 1360,
     getComputedStyle: el => ({ display: 'block', visibility: el.hidden ? 'hidden' : 'visible' }),
     location: { href: 'http://127.0.0.1:123/global/root?source_transcript=middle#message-middle%3Aknown' }, URL };
-  return expected => runInNewContext(`(${observePhysicalHistoricalRow.toString()})`, context)({ known, expected });
+  return (expected, diagnostics = false) => runInNewContext(`(${observePhysicalHistoricalRow.toString()})`, context)({ known, expected, diagnostics });
 }
 
 test('serialized installed DOM probe declares exact root source, independently of unchanged middle pin and obsolete pixel restore', async () => {
@@ -164,4 +164,17 @@ for (const physicalCase of [true, false]) test(`sameAnchor observes ${physicalCa
   assert.equal(frames, 4); assert.equal(physicalReads, physicalCase ? 4 : 0); assert.equal(genericReads, physicalCase ? 0 : 4);
   assert.equal(receipt.after.key, before.key);
   if (physicalCase) assert.ok(physicalBaselineMatches(before, receipt.after));
+});
+
+
+test('UNIT diagnostic oracle preserves strict null results and exposes only bounded predicate counts', () => {
+  for (const [options, predicate] of [[{rowBox:box(99,50)},'row_clipped'],[{childBox:box(99,20)},'message_clipped'],
+      [{hidden:true},'row_hidden'],[{rowBox:box(110,0)},'row_nonpositive_geometry'],
+      [{data:'middle:known'},'conflicting_identity'],[{children:[{},{}]},'duplicate_physical_identity']]) {
+    const read=dom(options);assert.equal(read(),null);
+    const probe=read(null,true);assert.equal(probe.observation,null);assert.ok(probe.predicates[predicate]>0);
+    assert.ok(Object.values(probe.predicates).every(n=>Number.isInteger(n)&&n>0&&n<=512));
+    assert.ok(!JSON.stringify(probe.predicates).includes('known'));
+  }
+  const read=dom();assert.deepEqual(read(null,true).observation,read());
 });

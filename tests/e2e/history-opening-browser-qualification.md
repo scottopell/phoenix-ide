@@ -2145,3 +2145,28 @@ browser log and startup identity. The next step is source/target/physical-oracle
 diagnosis, not another unchanged execution or weakening of the fully-visible
 persisted-identity assertion. No additional run is dispatched by recording this
 result. Resumeunsupported, overheadfalse and fullacceptancefalse remain explicit.
+
+### Source-only physical-oracle failure distinction
+
+A source-only diagnostic delta splits the prior physical_history stage into
+observation presence, fixture identity binding, and source-pin equality. The
+existing serialized oracle optionally returns its observation plus bounded
+static rejection-predicate counts. Default callers still receive the identical
+observation-or-null contract. Both the virtual row and persisted child must still
+be fully contained on all four clip edges, finite/positive, visible and unique;
+all ownership/key/alias/identity checks and existing assertions remain intact.
+Diagnostic counters saturate at512 and contain no raw keys, IDs, source strings,
+URL, geometry, DOM text or errors. Predicate counts describe rejected candidates
+encountered during traversal, not necessarily the target's unique root cause.
+
+The returned sourceRow is the caller's known persisted-ID→fixture-source mapping,
+not independently observed DOM source provenance. Accordingly the new diagnostic
+is named fixture_identity_matches; sourcepin_matches separately compares the URL
+pin. Neither is promoted into independent DOM source attribution. Independent
+read-only review approved source-only freeze of this delta. Cached controlled20,
+physical-oracle44 (one external retained-fixture test skipped), existing opening35
+and Python68 passed; diff checks passed. Tests use fabricated DOM/geometry and
+existing cached dependencies, not a local or hosted browser qualification. No
+app source, pin, admission, sampler, timeout or acceptance rule changed. No push
+or hosted execution is part of this source-only boundary; the exact prior hosted
+physical failure remains unresolved until actual bounded diagnostic evidence.

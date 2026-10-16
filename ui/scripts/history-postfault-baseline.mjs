@@ -17,9 +17,12 @@ export function historicalMessageIdentities(a) {
 }
 
 // Self-contained: this exact function is serialized by Playwright into the real document.
-export function observePhysicalHistoricalRow({ known, expected = null }) {
+export function observePhysicalHistoricalRow({ known, expected = null, diagnostics = false }) {
+  const counts = {};
+  const reject = predicate => { counts[predicate] = Math.min(512, (counts[predicate] ?? 0) + 1); };
+  const finish = observation => diagnostics ? { observation, predicates: counts } : observation;
   const scroller = document.querySelector('#messages');
-  if (!scroller) return null;
+  if (!scroller) { reject('missing_scroller'); return finish(null); }
   const bounds = el => {
     const b = el.getBoundingClientRect();
     return { top: b.top, bottom: b.bottom, left: b.left, right: b.right, height: b.height, width: b.width };
@@ -27,11 +30,14 @@ export function observePhysicalHistoricalRow({ known, expected = null }) {
   const viewport = bounds(scroller);
   const clip = { top: Math.max(0, viewport.top), bottom: Math.min(innerHeight, viewport.bottom),
     left: Math.max(0, viewport.left), right: Math.min(innerWidth, viewport.right) };
-  const fullyVisible = (el, b) => {
+  const visibilityFailure = (el, b) => {
     const style = getComputedStyle(el);
-    return Object.values(b).every(Number.isFinite) && b.height > 0 && b.width > 0
-      && el.getClientRects().length > 0 && style.display !== 'none' && style.visibility === 'visible'
-      && b.top >= clip.top && b.bottom <= clip.bottom && b.left >= clip.left && b.right <= clip.right;
+    if (!Object.values(b).every(Number.isFinite)) return 'nonfinite_geometry';
+    if (!(b.height > 0 && b.width > 0)) return 'nonpositive_geometry';
+    if (!(el.getClientRects().length > 0)) return 'no_client_rect';
+    if (style.display === 'none' || style.visibility !== 'visible') return 'hidden';
+    if (!(b.top >= clip.top && b.bottom <= clip.bottom && b.left >= clip.left && b.right <= clip.right)) return 'clipped';
+    return null;
   };
   const identities = new Map(known.map(k => [k.persistedMessageID, k.sourceRow]));
   const allRows = [...document.querySelectorAll('[data-virtual-key]')];
@@ -54,29 +60,34 @@ export function observePhysicalHistoricalRow({ known, expected = null }) {
   }
   for (const row of scroller.querySelectorAll('[data-virtual-key]')) {
     const key = row.dataset.virtualKey, rowBounds = bounds(row);
-    if (!key || rowKeys.get(key)?.size !== 1 || (expected && key !== expected.key) || !fullyVisible(row, rowBounds)) continue;
+    if (!key) { reject('missing_row_key'); continue; }
+    if (rowKeys.get(key)?.size !== 1) { reject('duplicate_row_key'); continue; }
+    if (expected && key !== expected.key) { reject('unexpected_row_key'); continue; }
+    const rowFailure = visibilityFailure(row, rowBounds);
+    if (rowFailure) { reject('row_' + rowFailure); continue; }
     for (const child of row.querySelectorAll('[id], [data-message-id]')) {
-      if (child.closest('[data-virtual-key]') !== row) continue;
+      if (child.closest('[data-virtual-key]') !== row) { reject('foreign_row_child'); continue; }
       // MessageList/MessageComponents wrap persisted IDs with exactly one `message-` for DOM IDs.
       const elementID = child.getAttribute('id'), dataMessageID = child.getAttribute('data-message-id');
       const wrappedID = elementID?.startsWith('message-') ? elementID.slice('message-'.length) : null;
-      if (wrappedID && dataMessageID && wrappedID !== dataMessageID) continue;
+      if (wrappedID && dataMessageID && wrappedID !== dataMessageID) { reject('conflicting_identity'); continue; }
       const persistedMessageID = dataMessageID || wrappedID;
       const sourceRow = identities.get(persistedMessageID);
-      if (!sourceRow || (expected && (persistedMessageID !== expected.persistedMessageID || sourceRow !== expected.sourceRow))) continue;
+      if (!sourceRow || (expected && (persistedMessageID !== expected.persistedMessageID || sourceRow !== expected.sourceRow))) { reject('unknown_or_unexpected_identity'); continue; }
       const matches = identityElements.get(persistedMessageID);
-      if (matches?.size !== 1 || !matches.has(child)) continue;
+      if (matches?.size !== 1 || !matches.has(child)) { reject('duplicate_physical_identity'); continue; }
       const messageBounds = bounds(child);
-      if (!fullyVisible(child, messageBounds)) continue;
-      return { key, offset: rowBounds.top - viewport.top, persistedMessageID, sourceRow,
+      const messageFailure = visibilityFailure(child, messageBounds);
+      if (messageFailure) { reject('message_' + messageFailure); continue; }
+      return finish({ key, offset: rowBounds.top - viewport.top, persistedMessageID, sourceRow,
         messageOffset: messageBounds.top - viewport.top, elementID, dataMessageID,
         DOMbounds: { viewport, row: rowBounds, message: messageBounds },
         currentURL: location.href, sourcepin: new URL(location.href).searchParams.get('source_transcript'),
         layoutdimensions: { scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight,
-          clientHeight: scroller.clientHeight, innerHeight, innerWidth } };
+          clientHeight: scroller.clientHeight, innerHeight, innerWidth } });
     }
   }
-  return null;
+  return finish(null);
 }
 
 export function physicalBaselineMatches(before, after) {

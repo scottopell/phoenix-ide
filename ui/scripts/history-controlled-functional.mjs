@@ -141,7 +141,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
       clock.remaining();
       assert.ok(!canceled);
       const route = fixture.kind, context = await bounded(createContext, 10000);
-      let page, observer, scenarioFailure, collectedTrial, phase = 'authenticate';
+      let page, observer, scenarioFailure, collectedTrial, physicalDiagnostics = null, phase = 'authenticate';
       try {
         const trial = await bounded(async () => {
           await (UNIT?.authenticate ?? authenticateOwnedContext)(context, baseURL);
@@ -179,10 +179,17 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             phase = 'history_report_wait';
             await observer.wait(() => observer.getReports().length === 1 && observer.getStatuses().length === 1, Math.min(12000, check()));
             phase = 'physical_history';
-            const physical = await page.evaluate(observePhysicalHistoricalRow, { known: [target.anchor] });
+            const probe = await page.evaluate(observePhysicalHistoricalRow, { known: [target.anchor], diagnostics: true });
+            const physical = probe.observation;
+            physicalDiagnostics = { predicates: probe.predicates, observation_present: physical !== null,
+              fixture_identity_matches: physical ? physical.persistedMessageID === target.anchor.persistedMessageID && physical.sourceRow === target.anchor.sourceRow : null,
+              sourcepin_matches: physical ? physical.sourcepin === target.anchor.sourceRow : null };
+            phase = 'physical_history_present';
             assert.ok(physical, 'actual retained historical source must be visible');
+            phase = 'physical_history_fixture_identity';
             assert.equal(physical.persistedMessageID, target.anchor.persistedMessageID);
             assert.equal(physical.sourceRow, target.anchor.sourceRow);
+            phase = 'physical_history_sourcepin';
             assert.equal(physical.sourcepin, target.anchor.sourceRow);
             phase = 'composer_owner';
             assert.equal(await page.locator('textarea[placeholder="Message..."]').count(), 1, 'exactly one current composer');
@@ -259,7 +266,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
         failure.controlledReceipt = { evidence_class: CONTROLLED_CLASS, status: 'failed', trials,
           failure_location: { scope: 'scenario', route, kind, phase,
             error_kind: error instanceof assert.AssertionError ? 'assertion' : 'operation',
-            counts: observer?.failureCounts() ?? null },
+            counts: observer?.failureCounts() ?? null, physical: physicalDiagnostics },
           failed_trial: collectedTrial ? { ...collectedTrial, reports: observer.getReports(), status: 'failed_assertions' } : null,
           overhead_clearance: false, full_acceptance: false, failure: 'controlled_scenario_failed' };
         scenarioFailure = failure;
