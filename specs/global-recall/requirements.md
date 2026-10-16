@@ -130,11 +130,24 @@ WHILE the singleton Global Coordinator is answering a user request
 THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
 AND MAY provide a Coordinator-only built-in skill documenting supported Phoenix HTTP APIs
 
-WHEN the user authorizes a Coordinator lifecycle action supported by a documented Phoenix HTTP API
+WHEN the user authorizes a Coordinator action supported by a public Phoenix HTTP API
 THE Coordinator MAY invoke that API through explicitly WorkScope-targeted Bash
-AND SHALL preserve normal API authorization
-AND SHALL verify both the HTTP response and the resulting Phoenix state
-AND SHALL distinguish request acceptance from observed execution
+AND SHALL ground the operation in inspected current deployment/source contracts applicable to the selected destination
+AND SHALL treat built-in API recipes as non-exhaustive best practices rather than an endpoint allowlist
+AND SHALL treat gap inventories as illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads within user authority
+AND SHALL NOT invent guarantees or receipts, bypass enforcement through databases/private handlers, or create background monitors to substitute for missing API semantics
+AND SHALL preserve normal API authorization, destination identity, authenticated encrypted nonlocal transport, destination-bound nonserialized credential handling, and server-enforced lifecycle admission
+AND SHALL retain the original target and exact intent across uncertain outcomes, retry only under the endpoint's supported idempotency contract, and never mint a new identity for an uncertain retry
+AND SHALL freshly read the relevant target state before acting, verify both the HTTP response and the resulting Phoenix state, and distinguish request acceptance from observed execution
+AND SHALL NOT use private handlers or database writes to bypass public API enforcement
+
+WHEN the Coordinator submits answers to a pending structured question through the public API
+THE instructions SHALL permit exact user-provided answers or decisions made within explicit delegated decision scope for every question, with exact full question-text keys and exact option labels or authorized custom text
+AND SHALL NOT treat a generic instruction to inspect or unblock work as decision authority, fabricate approvals, or extend delegation
+AND SHALL require the exact current opaque question request identity, distinct from provider tool-use identity, under `../ask-user-question/requirements.md` REQ-AUQ-009
+AND SHALL require complete answers without claiming server-enforced completeness
+AND SHALL direct one POST followed by a fresh read of the original target, treating the question request identity as a freshness guard rather than an idempotency key
+AND SHALL NOT transplant answers to a new identity, automatically replay an uncertain submission, or treat a conflict as success
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior except for explicit Global Coordinator subscriptions governed by REQ-GR-015
 
