@@ -72,3 +72,37 @@ it.each(['extra', 'missingPublic', 'badPublic', 'gitkeep'])('final close invento
   expect(() => plugin.closeBundle.handler()).toThrow(/inventory or bytes mismatch/);
   expect(writes.files).toHaveLength(0);
 });
+
+it('stock custom-output CSS fixture builds cannot overwrite an existing canonical manifest', () => {
+  const root = resolve(stockFactory, '../../..');
+  const plugin = viewReporterBuild(false) as unknown as {
+    configResolved: (config: object) => void;
+    generateBundle: (this: {getModuleIds: () => string[]}) => void;
+    writeBundle: (options: object, bundle: object) => void;
+    closeBundle: {handler: () => void};
+  };
+  const canonical = {
+    path: resolve(root, 'stock-natural-build.json'),
+    data: 'retained canonical stock manifest'
+  };
+  writes.files.push(canonical);
+  plugin.configResolved({
+    root, configFile: resolve(root, 'vite.config.ts'),
+    command: 'build', mode: 'production',
+    build: {outDir: '/tmp/phoenix-product-list-css-synthetic', rollupOptions: {}}
+  });
+  expect(() => plugin.generateBundle.call({getModuleIds: () => [controlledFactory]})).toThrow(/graph identity mismatch/);
+  plugin.generateBundle.call({getModuleIds: () => [stockFactory]});
+  expect(() => plugin.writeBundle(
+    {dir: '/tmp/phoenix-product-list-css-synthetic'},
+    {'fixture.js': {type: 'chunk', code: 'not canonical bytes'}}
+  )).not.toThrow();
+  plugin.closeBundle.handler();
+  const controlled = viewReporterBuild(true) as unknown as {configResolved: (config: object) => void};
+  expect(() => controlled.configResolved({
+    root, configFile: resolve(root, 'vite.controlled-functional.config.ts'),
+    command: 'build', mode: 'controlled-functional',
+    build: {outDir: '/tmp/phoenix-product-list-css-synthetic', rollupOptions: {}}
+  })).toThrow(/dedicated build recipe and output/);
+  expect(writes.files).toEqual([canonical]);
+});

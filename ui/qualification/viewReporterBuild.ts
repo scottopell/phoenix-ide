@@ -11,7 +11,8 @@ export const controlledFactory = resolve(root, 'ui/qualification/conversationVie
 const sha256 = (data: string | Uint8Array) => createHash('sha256').update(data).digest('hex');
 const local = (path: string) => relative(root, path).replace(/\\/g, '/');
 export function viewReporterBuild(controlled = false): Plugin {
-  let output = resolve(root, controlled ? 'ui/dist-controlled-functional' : 'ui/dist');
+  const canonicalOutput = resolve(root, controlled ? 'ui/dist-controlled-functional' : 'ui/dist');
+  let output = canonicalOutput;
   const factory = controlled ? controlledFactory : stockFactory;
   const config = resolve(root, controlled ? 'ui/vite.controlled-functional.config.ts' : 'ui/vite.config.ts');
   let modules: Record<string, string> = {};
@@ -49,6 +50,7 @@ export function viewReporterBuild(controlled = false): Plugin {
     },
     writeBundle(options, bundle) {
       if (!configured) throw new Error('reporter manifest requires resolved build config');
+      if (!controlled && output !== canonicalOutput) return;
       if (writes++ || options.file || !options.dir || resolve(options.dir) !== output) throw new Error('reporter requires single actual output directory');
       emittedHashes = Object.fromEntries(Object.keys(bundle).map(name => {
           const path = resolve(output, name);
