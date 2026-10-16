@@ -13,6 +13,11 @@ value SessionKey {
     value: String
 }
 
+value ReadyWaitResult {
+    daemon: BrowserDaemon
+    outcome: operation_accepted | idle_expired
+}
+
 entity BrowserDaemon {
     session: SessionKey
     daemon_id: String
@@ -44,7 +49,7 @@ invariant LifetimeIdentityIsUnique {
 }
 
 rule OpenStartsAbsentSession {
-    when: OpenRequested(session)
+    when: OpenRequested(session, caller)
     requires: not exists BrowserDaemon{session: session, status: ready}
     requires: not exists BrowserDaemon{session: session, status: executing}
     requires: not exists BrowserDaemon{session: session, status: stopping}
@@ -65,8 +70,9 @@ rule OpenStartsAbsentSession {
 }
 
 rule ExistingOperationStarts {
-    when: BrowserOperationAccepted(daemon)
+    when: ReadyWaitResolved(daemon, decision, runtime)
     requires: daemon.status = ready
+    requires: decision.outcome = operation_accepted
     ensures: daemon.status = executing
 }
 
@@ -94,7 +100,7 @@ rule OperationCompletes {
 }
 
 rule MissingBrowserActionFails {
-    when: ExistingBrowserActionRequested(session)
+    when: ExistingBrowserActionRequested(session, caller)
     requires: not exists BrowserDaemon{session: session, status: ready}
     requires: not exists BrowserDaemon{session: session, status: executing}
     requires: not exists BrowserDaemon{session: session, status: stopping}
@@ -103,7 +109,7 @@ rule MissingBrowserActionFails {
 }
 
 rule StatusOnAbsentSession {
-    when: StatusRequested(session)
+    when: StatusRequested(session, caller)
     requires: not exists BrowserDaemon{session: session, status: ready}
     requires: not exists BrowserDaemon{session: session, status: executing}
     requires: not exists BrowserDaemon{session: session, status: stopping}
@@ -112,7 +118,7 @@ rule StatusOnAbsentSession {
 }
 
 rule CloseOnAbsentSession {
-    when: CloseRequested(session)
+    when: CloseRequested(session, caller)
     requires: not exists BrowserDaemon{session: session, status: ready}
     requires: not exists BrowserDaemon{session: session, status: executing}
     requires: not exists BrowserDaemon{session: session, status: stopping}
@@ -121,8 +127,10 @@ rule CloseOnAbsentSession {
 }
 
 rule IdleExpiryStartsShutdown {
-    when: daemon: BrowserDaemon.last_completed_at + daemon.idle_timeout <= now
+    when: ReadyWaitResolved(daemon, decision, runtime)
     requires: daemon.status = ready
+    requires: decision.outcome = idle_expired
+    requires: daemon.last_completed_at + daemon.idle_timeout <= now
     ensures: daemon.status = stopping
     ensures: OwnedBrowserTerminationRequested(daemon)
 }
@@ -150,8 +158,56 @@ rule ShutdownFailureIsVisible {
 }
 
 rule AmbiguousResponseDoesNotReplay {
-    when: OperationTransportFailedAfterPossibleDelivery(session, operation)
+    when: OperationTransportFailedAfterPossibleDelivery(session, operation, caller)
     ensures: UncertainOutcomeReported(session, operation)
     ensures: not OperationAutomaticallyReplayed(session, operation)
     ensures: not BrowserDaemon.created
+}
+
+actor CliCaller {}
+actor DaemonRuntime {}
+
+surface BrowserCliRequests {
+    facing caller: CliCaller
+
+    provides:
+        OpenRequested(session, caller)
+        ExistingBrowserActionRequested(session, caller)
+        StatusRequested(session, caller)
+        CloseRequested(session, caller)
+        OperationTransportFailedAfterPossibleDelivery(session, operation, caller)
+}
+
+surface BrowserDaemonRuntime {
+    facing runtime: DaemonRuntime
+    context daemon: BrowserDaemon
+    context decision: ReadyWaitResult where decision.daemon = daemon
+
+    exposes:
+        daemon.session
+        daemon.daemon_id
+        daemon.browser_id
+        daemon.status
+        daemon.idle_timeout
+
+    provides:
+        ReadyWaitResolved(daemon, decision, runtime)
+            when daemon.status = ready
+        OwnedBrowserLaunchSucceeded(daemon, browser)
+            when daemon.status = executing and daemon.browser_id = null
+        OwnedBrowserLaunchFailed(daemon, error)
+            when daemon.status = executing and daemon.browser_id = null
+        BrowserOperationCompleted(daemon)
+            when daemon.status = executing
+        OrderlyShutdownRequested(daemon)
+            when daemon.status = ready or daemon.status = executing
+        OwnedBrowserAndProfileCleanupSucceeded(daemon)
+            when daemon.status = stopping
+        OwnedBrowserOrProfileCleanupFailed(daemon, error)
+            when daemon.status = stopping
+
+    @guarantee ExclusiveReadyWaitOutcome
+        -- Waiting for work resolves exactly once to an accepted operation
+        -- or an expired idle interval. One ready wait cannot select both.
+        -- An active operation does not participate in the idle wait.
 }
