@@ -1,5 +1,0 @@
-# Preserve Direct continuation WorkScope identity — v0.13 release blocker
-
-Ordinary Direct/non-Git context continuation must keep the same persisted WorkScope, environment and resource ownership while creating only a new transcript in the same ProductConversation. ADR-026 and REQ-BED-030 are authoritative; new non-Git creation still uses Direct, so this affects current creation, not just historical data.
-
-Acceptance: atomic continuation reuses scope with concurrent/replayed requests; exact environment and scope counts stay unchanged; current/live-owner scoped Bash resolves after predecessor handoff; shared resource routing/cleanup preserve one ownership identity; ordinary and Coordinator behavior remain distinct. Add focused regressions, update contradictory tests/docs, independent review, and exact-head hosted qualification. Preserve PR921; no historical cwd-based scope coalescing, hand DB repair, production migration, merge or deploy. Heavy local compilation requires actual host admission; use bounded hosted qualification.
