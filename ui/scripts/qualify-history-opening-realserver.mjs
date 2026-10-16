@@ -8,7 +8,7 @@ import { createConnection } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { loopback, sourceLink, anchorMatches, COMPOSER_SELECTOR, belongsToAggregate, aggregateBoundaries } from './qualify-history-realserver.mjs';
 import { historicalMessageIdentities, observePhysicalHistoricalRow, physicalBaselineMatches, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
-import { prepareJointTelemetry, runJointTelemetryStage, installObservedHistoryTelemetry, authenticateOwnedContext } from './history-joint-telemetry.mjs';
+import { prepareJointTelemetry, runJointTelemetryStage, installObservedHistoryTelemetry, installHistoryRequestOwnership, authenticateOwnedContext } from './history-joint-telemetry.mjs';
 
 export function ownedWireCursor(event, observedEvents) {
   const payload = JSON.parse(event.data);
@@ -882,8 +882,9 @@ async function run() {
     const context = await browser.newContext({ viewport: { width: 1360, height: 900 } });
     sessionCookie = await authenticateOwnedContext(context, api);
     result.authentication = { auth_required: true, authenticated: true, session: 'existing_login_cookie' };
+    const requestOwnership = jointTelemetry ? await installHistoryRequestOwnership(context, jointTelemetry) : null;
     page = await context.newPage(); page.setDefaultTimeout(10000); page.setDefaultNavigationTimeout(10000);
-    if (jointTelemetry) historyTelemetry = installObservedHistoryTelemetry(page, ui);
+    if (jointTelemetry) historyTelemetry = installObservedHistoryTelemetry(page, ui, requestOwnership);
     recorder = installAggregateRecorder(page, a, record, snapshots, {
       expectedRequestFailure: entry => faultTarget(entry.method, entry.url, JSON.parse(readFileSync(fault)), 'roster'),
     });

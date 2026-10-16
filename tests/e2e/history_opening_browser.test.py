@@ -50,6 +50,8 @@ class OpeningQualificationTests(unittest.TestCase):
             "focused_test_exit": 0, "ignored_driver": opening.DRIVER,
             "collector_witness_exit": 0,
             "collector_witness_command": [opening.COLLECTOR_TEST, "--exact", "--nocapture", "--test-threads=1"],
+            "sdk_metadata_exit": 0, "sdk_metadata_passed": 1,
+            "sdk_metadata_command": [opening.SDK_METADATA_TEST, "--exact", "--nocapture", "--test-threads=1"],
             "compiler_artifact_selector": ["cargo", "test", "--no-run", "--message-format=json"]}
         self.write()
 
@@ -855,6 +857,21 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("--ignored", source)
         self.assertIn("Fixture(h, base, case)", source)
 
+
+    def test_sdk_layer_unit_must_run_exactly_once_and_succeed(self):
+        for field, values in (("sdk_metadata_exit", (None, False, 1)),
+                              ("sdk_metadata_passed", (None, False, True, 0, 2)),
+                              ("sdk_metadata_command", (None, [opening.SDK_METADATA_TEST],
+                                [opening.COLLECTOR_TEST, "--exact", "--nocapture", "--test-threads=1"]))):
+            for value in values:
+                original = self.value[field]
+                self.value[field] = value
+                self.write()
+                with self.assertRaisesRegex(ValueError, "real default SDK layer test"):
+                    self.identity()
+                self.value[field] = original
+        self.write()
+        self.identity()
 
     def test_collector_unit_must_actually_be_named_and_successful(self):
         for value in (None, False, 1):

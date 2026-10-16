@@ -1730,3 +1730,64 @@ selftests passed. No listeners, browser, install or heavy local build were run.
 Review confirmed unchanged predicates and finite literals; tests are not claimed
 exhaustive over every code. Acceptance still requires zero receiver errors,
 actual semantic exports, exact real collector inventory and normal owned drain.
+
+
+## Typed SDK projection and independently owned history correlations
+
+Run `38904633015`, harness `42c8bd2730c0d0befe26d0172f62a352aadc71fe` /
+app `ea2d362b33a2558564d61911e156f7a6562e3b07`, is terminal failure.
+Witness `116985013660` failed; Rust `116985121090` and the other standard jobs
+succeeded. The bounded receiver receipt proves `attribute_unknown`, after a
+successful prefix of ten batches, 2,094 spans and 1,144,558 wire bytes. The
+rejected batch/key was not retained; the exact offending key is unknown.
+Separately, browser `cleanup_failures` records `appendObservedHistory` rejecting
+an independently observed finite request after nine history checks and a
+`passed_assertions` donor browser stage. Journey UUID and finite transport UUID
+are different namespaces. The former equality check was incorrect; merely
+trusting reported correlations against any observed request would also be wrong.
+Artifact `12048202108` remains remote (89,665,822 bytes); the retained bounded
+facts used 304,042 range bytes. No final join or normal-drain acceptance resulted.
+
+Reviewed immutable telemetry deltas `df931bb4d65a6e12f429125aa812e972a342d1f6`
+and `01fb489b254a91b120113c5b243708d025c9686e` integrate directly above `ea2d362`
+as app `7a36dd28191a1f32f65f68b037543ab924526189`, tree
+`5e908a223e26e3cf8f264c65cd82ed33080d7ccf`. The receiver intentionally consumes
+exactly eight typed default SDK metadata keys before semantic projection:
+`code.file.path`, `code.module.name`, `thread.name`, `target` (bounded strings),
+`code.line.number`, `thread.id`, `busy_ns`, `idle_ns` (nonnegative signed-i64,
+not booleans). `level` and unknown application attributes remain rejected.
+Count, duplicate, scalar, finite and size checks precede consumption. The raw
+protobuf remains separately bounded and retained; semantic capture excludes
+metadata and final re-decoding uses the identical projection. This explains a
+real schema mismatch in the pinned default layer, not the unrecoverable exact
+key from the failed run. Production export configuration is unchanged.
+
+The shared history collector now observes independent producer admission and
+journey-to-request edges, plus accepted journey-to-SSE-attempt edges. The latter
+is emitted only after actual correlation acceptance; it is not SSE connection
+success. Context binding/init installation precedes page creation and navigation;
+only the designated original page's main frame may contribute. All reported
+request and SSE IDs must have same-journey producer edges and actual original-page
+network observations. Trace headers must belong to an owned, reported finite
+request. Foreign pages/frames cannot supply admissions or consume bounds.
+The combined ownership cap is 512 and diagnostic event cap is 2,048. Setup has
+a ten-second deadline, cancellation checkpoints, sanitized phase-coded failures
+and deterministic unit-only timer/parser seams that cannot enter runtime config.
+Observer errors are latched to a bounded fixed code, not private exception text.
+
+The hosted selected-libtest stage additionally names, executes and retains
+`api::view_journey::tests::pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields`.
+The build receipt records its exact command, zero exit and exactly-one-pass
+witness; shared admission rejects missing, boolean, zero-test or wrong-command
+attestations. This actual default-layer test has not been compiled or run locally.
+The original eleven instrumentation guards and real collector test stay intact.
+
+Actual cached offline checks passed: shipping Python 16, opening Python 66,
+base Node 14, opening Node 35, joint Node 65, receiver no-network subset 18 and
+focused UI 140 across seven files. A stale opening source-order assertion first
+failed and was updated to check authentication, ownership install and observation
+in order; that failed log is retained separately. No local native capture,
+listener, install, Cargo build or large artifact copy was performed. Full UI,
+codegen, real default-layer execution and actual joint qualification remain hosted
+obligations. Collector/export inventory, normal app-first/receiver-second drain,
+outer Global physical history and overhead gates are not yet accepted.

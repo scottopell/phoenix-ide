@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: ea2d362b33a2558564d61911e156f7a6562e3b07
+          ref: 7a36dd28191a1f32f65f68b037543ab924526189
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -248,8 +248,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = ea2d362b33a2558564d61911e156f7a6562e3b07
-          test "$(git rev-parse HEAD^{tree})" = 04d2ff2c2c99f336fe43f969b072c61a46841051
+          test "$(git rev-parse HEAD)" = 7a36dd28191a1f32f65f68b037543ab924526189
+          test "$(git rev-parse HEAD^{tree})" = 5e908a223e26e3cf8f264c65cd82ed33080d7ccf
           test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -362,6 +362,16 @@ jobs:
           (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
           assert witness.returncode == 0, 'real collector witness regression failed; see retained log'
           assert '1 passed; 0 failed;' in witness.stdout, witness.stdout
+          sdk_name = 'api::view_journey::tests::pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields'
+          assert sdk_name + ': test' in listed.stdout
+          sdk_command = [str(destination), sdk_name, '--exact', '--nocapture', '--test-threads=1']
+          sdk = subprocess.run(sdk_command, capture_output=True, text=True, timeout=120)
+          (root.parent/'opening-sdk-metadata-unit.log').write_text(sdk.stdout+sdk.stderr)
+          sdk_passed = int('1 passed; 0 failed;' in sdk.stdout)
+          receipt.update({'sdk_metadata_command':sdk_command[1:], 'sdk_metadata_exit':sdk.returncode,
+                          'sdk_metadata_passed':sdk_passed})
+          (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          assert sdk.returncode == 0 and sdk_passed == 1, 'real default SDK layer regression failed or ran zero tests; see retained log'
           PY
       - name: Compiler-free instrumented harness regressions
         working-directory: harness
@@ -439,6 +449,7 @@ jobs:
             opening-instrumented-receipt.json
             opening-instrumented-unit.log
             opening-collector-witness-unit.log
+            opening-sdk-metadata-unit.log
             opening-instrumented-selector.log
             opening-browser-evidence/
             pinned-app-full-ui.log

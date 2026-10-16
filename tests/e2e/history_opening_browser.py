@@ -32,18 +32,19 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "ea2d362b33a2558564d61911e156f7a6562e3b07"
-TREE_PIN = "04d2ff2c2c99f336fe43f969b072c61a46841051"
+PIN = "7a36dd28191a1f32f65f68b037543ab924526189"
+TREE_PIN = "5e908a223e26e3cf8f264c65cd82ed33080d7ccf"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
+SDK_METADATA_TEST = "api::view_journey::tests::pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
     "ui/scripts/qualify-view-telemetry.mjs": "1c702c78bb06f74f3dae4c8f97d1932fc308959596f3602375bc65d7d99fb9e1",
-    "ui/scripts/view-telemetry-diagnostics.mjs": "fa442b6f4ea65c12fc2a05ec1c37c1e565430baa6d3151e6a8c180d21ed110a1",
-    "tests/e2e/view_telemetry_sink.py": "db4ccebab3b97e09291171f827901167d0c36d31a3959073f454802c2263a3e3",
+    "ui/scripts/view-telemetry-diagnostics.mjs": "e06232a39200d88e0a98aedb3d9e6183537f97a6e9498f27fe57a7e2a9a4696b",
+    "tests/e2e/view_telemetry_sink.py": "cdb1744c69eee7db301c990e53c8e636eee00ff3d5550d9097ba0cb96b0bd695",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",
 }
 TELEMETRY_KEYS = frozenset({"PHOENIX_TRACE_EXPORTER", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
@@ -85,6 +86,10 @@ def identity(app, exe, receipt_path):
     if (type(receipt.get("collector_witness_exit")) is not int or receipt["collector_witness_exit"] != 0
             or receipt.get("collector_witness_command") != [COLLECTOR_TEST, "--exact", "--nocapture", "--test-threads=1"]):
         raise ValueError("real collector witness test was not successfully executed")
+    if (type(receipt.get("sdk_metadata_exit")) is not int or receipt["sdk_metadata_exit"] != 0
+            or type(receipt.get("sdk_metadata_passed")) is not int or receipt["sdk_metadata_passed"] != 1
+            or receipt.get("sdk_metadata_command") != [SDK_METADATA_TEST, "--exact", "--nocapture", "--test-threads=1"]):
+        raise ValueError("real default SDK layer test was not successfully executed exactly once")
     return measured | {"rustc": receipt["rustc"], "receipt_sha256": shipping.digest(receipt_path),
         "harness_files": {str(p.relative_to(ROOT)): shipping.digest(p) for p in
             [Path(__file__), SCRIPT, Path(shipping.__file__),

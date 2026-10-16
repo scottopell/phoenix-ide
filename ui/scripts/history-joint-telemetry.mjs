@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = 'ea2d362b33a2558564d61911e156f7a6562e3b07';
+export const APP_PIN = '7a36dd28191a1f32f65f68b037543ab924526189';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
 export const TELEMETRY_MODULE_SHA256 = '1c702c78bb06f74f3dae4c8f97d1932fc308959596f3602375bc65d7d99fb9e1';
-export const TELEMETRY_DIAGNOSTICS_SHA256 = 'fa442b6f4ea65c12fc2a05ec1c37c1e565430baa6d3151e6a8c180d21ed110a1';
+export const TELEMETRY_DIAGNOSTICS_SHA256 = 'e06232a39200d88e0a98aedb3d9e6183537f97a6e9498f27fe57a7e2a9a4696b';
 export const TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE = 'ui/scripts/view-telemetry-diagnostics.mjs';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';
 const ENV_KEYS = ['HISTORY_TELEMETRY_JOINT', 'HISTORY_TELEMETRY_FIXTURE', 'HISTORY_TELEMETRY_MODULE', 'HISTORY_TELEMETRY_MODULE_SHA256'];
@@ -126,7 +126,62 @@ export function validateTelemetryResult(result) {
   }));
 }
 
-export function installObservedHistoryTelemetry(page, baseURL) {
+export async function installHistoryRequestOwnership(context, config, UNIT) {
+  assert.equal(config.unitOnly, UNIT !== undefined, 'UNIT history diagnostics cannot become runtime proof');
+  if (UNIT) assert.equal(UNIT.label, UNIT_LABEL);
+  const clock = UNIT?.clock ?? { setTimeout, clearTimeout };
+  let captureDiagnostic;
+  try {
+    if (UNIT) ({ captureDiagnostic } = UNIT.module);
+    else {
+      const helper = resolve(dirname(config.modulePath), 'view-telemetry-diagnostics.mjs');
+      assert.equal(sha256(readFileSync(helper)), TELEMETRY_DIAGNOSTICS_SHA256);
+      ({ captureDiagnostic } = await import(pathToFileURL(helper).href));
+    }
+  } catch { throw new Error('history diagnostic parser setup failed'); }
+  const pairs = [], streams = [], admissions = new Set();
+  let events = 0, failure = null, canceled = false, timer, observedPage, phase = 'binding';
+  const binding = '__phoenixHistoryDiagnostic';
+  const operation = (async () => {
+    await context.exposeBinding(binding, (source, raw) => {
+      if (canceled || failure || !observedPage || source.page !== observedPage || source.frame !== observedPage.mainFrame()) return;
+      try {
+        assert.ok(++events <= 2048, 'history producer diagnostic event bound');
+        const event = captureDiagnostic(raw);
+        if (event.kind === 'admission' && event.sampled) admissions.add(event.open_id);
+        if (event.kind === 'request' || event.kind === 'sse') {
+          assert.ok(admissions.has(event.open_id), 'history correlation owner must be admitted');
+          assert.ok(pairs.length + streams.length < 512, 'history correlation owner bound');
+          if (event.kind === 'request') pairs.push({ journey_id: event.open_id, request_id: event.request_id });
+          else streams.push({ journey_id: event.open_id, stream_id: event.stream_id });
+        }
+      } catch { failure = 'invalid_or_overflow_history_request_ownership'; }
+    });
+    assert.ok(!canceled, 'history diagnostics installation canceled');
+    phase = 'init_script';
+    await context.addInitScript(({ binding }) => {
+      window.addEventListener('phoenix:view-diagnostic', event => {
+        void Promise.resolve(window[binding](event.detail)).catch(() => {});
+      });
+    }, { binding });
+    assert.ok(!canceled, 'history diagnostics installation canceled');
+  })();
+  try {
+    await Promise.race([operation, new Promise((_, reject) => {
+      timer = clock.setTimeout(() => { canceled = true; reject(new Error('history diagnostic installation deadline')); }, 10000);
+    })]);
+  } catch {
+    canceled = true;
+    throw new Error(`history diagnostic ${phase} setup failed_or_deadline`);
+  } finally { clock.clearTimeout(timer); }
+  return {
+    bindPage(page) { assert.ok(!observedPage, 'history observed page must bind once'); observedPage = page; },
+    snapshot: () => structuredClone({ pairs, streams, failure }),
+  };
+}
+
+export function installObservedHistoryTelemetry(page, baseURL, ownership) {
+  ownership?.bindPage(page);
   const origin = new URL(baseURL).origin, requests = [], reports = [], statuses = [], errors = [];
   const postReports = new Map(), requestRecords = new Map();
   page.on('request', request => {
@@ -144,7 +199,7 @@ export function installObservedHistoryTelemetry(page, baseURL) {
           kind: /\/api\/conversations\/[^/]+\/stream$/.test(url.pathname) ? 'sse' : 'request', trace_id: null };
         requests.push(record); requestRecords.set(request, record);
       }
-    } catch (error) { errors.push(String(error.message)); }
+    } catch { if (errors.length === 0) errors.push('invalid_or_overflow_history_network_observation'); }
   });
   page.on('response', response => {
     try {
@@ -155,13 +210,22 @@ export function installObservedHistoryTelemetry(page, baseURL) {
         const trace = response.headers().traceparent?.match(/^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$/i);
         if (trace && !/^0{32}$/.test(trace[1]) && !/^0{16}$/.test(trace[2])) record.trace_id = trace[1].toLowerCase();
       }
-    } catch (error) { errors.push(String(error.message)); }
+    } catch { if (errors.length === 0) errors.push('invalid_or_overflow_history_network_observation'); }
   });
-  return { snapshot() { return structuredClone({ scope: 'independently_captured_original_history_page_not_receiver_derived', reports, requestRecords: requests, statuses, errors }); } };
+  return { snapshot() {
+    const owned = ownership?.snapshot();
+    return structuredClone({ scope: 'independently_captured_original_history_page_not_receiver_derived',
+      reports, requestRecords: requests, statuses, errors, requestOwners: owned?.pairs ?? [],
+      streamOwners: owned?.streams ?? [], ownershipFailure: owned?.failure ?? null });
+  } };
 }
 
 export function appendObservedHistory(result, inventory, identity, module) {
   assert.deepEqual(inventory.errors, [], 'history report observer errors');
+  assert.equal(inventory.ownershipFailure, null, 'history producer ownership observation must succeed');
+  assert.ok(Array.isArray(inventory.requestOwners) && Array.isArray(inventory.streamOwners)
+    && inventory.requestOwners.length + inventory.streamOwners.length <= 512,
+    'bounded independent history correlation ownership required');
   assert.equal(inventory.statuses.length, inventory.reports.length, 'history report response drain');
   assert.ok(inventory.reports.length <= 7 && inventory.requestRecords.length <= 128);
   const seen = new Set(result.journeys.map(journey => journey.open_id));
@@ -172,13 +236,18 @@ export function appendObservedHistory(result, inventory, identity, module) {
     const statuses = inventory.statuses.filter(status => status.open_id === report.open_id);
     assert.equal(statuses.length, 1, 'every captured history report has one response');
     assert.equal(statuses[0].status, 204, 'actual history collector acceptance');
-    const finite = inventory.requestRecords.filter(record => record.kind === 'request' && record.open_id === report.open_id);
+    const reportedRequests = new Set(report.correlations.filter(c => c.kind === 'request').map(c => c.id));
+    const ownedRequests = new Set(inventory.requestOwners.filter(pair => pair.journey_id === report.open_id).map(pair => pair.request_id));
+    const ownedStreams = new Set(inventory.streamOwners.filter(pair => pair.journey_id === report.open_id).map(pair => pair.stream_id));
+    assert.ok(report.correlations.filter(c => c.kind === 'sse').every(c => ownedStreams.has(c.id)),
+      'history SSE must belong to independently observed journey');
+    assert.ok([...reportedRequests].every(id => ownedRequests.has(id)), 'history report request must belong to independently observed journey');
+    const finite = inventory.requestRecords.filter(record => record.kind === 'request' && reportedRequests.has(record.open_id) && ownedRequests.has(record.open_id));
     assert.ok(finite.length > 0, 'history report needs independently observed finite request');
     module.assertRequestCorrelation(finite.map(record => record.open_id), report);
-    const reportedRequests = new Set(report.correlations.filter(c => c.kind === 'request').map(c => c.id));
     for (const correlation of report.correlations) {
       const observed = inventory.requestRecords.some(record => correlation.kind === 'trace'
-        ? record.kind === 'request' && record.open_id === report.open_id && reportedRequests.has(record.open_id)
+        ? record.kind === 'request' && reportedRequests.has(record.open_id) && ownedRequests.has(record.open_id)
           && record.trace_id === correlation.id
         : record.kind === correlation.kind && record.open_id === correlation.id);
       assert.ok(observed, 'history report correlation must have independent request/response provenance');

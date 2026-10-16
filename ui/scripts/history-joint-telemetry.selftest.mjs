@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, UNIT_ONLY,
   prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage, authenticateOwnedContext,
-  installObservedHistoryTelemetry, appendObservedHistory } from './history-joint-telemetry.mjs';
+  installObservedHistoryTelemetry, installHistoryRequestOwnership, appendObservedHistory } from './history-joint-telemetry.mjs';
 
 // All positive fake browser/module/fixture values in this file are UNIT ONLY, not runtime proof.
 function input() {
@@ -201,7 +201,10 @@ test('source stage remains after sealed physical history and before server stop;
 
 function historyInventory() {
   const report = { ...structuredClone(stock().trials[0].reports[0]), open_id: 'unit-history', correlations: [{ kind: 'request', id: 'unit-history' }] };
-  return { scope: 'UNIT_ONLY_original_history', errors: [], reports: [report], statuses: [{ open_id: report.open_id, status: 204 }],
+  return { scope: 'UNIT_ONLY_original_history', errors: [], ownershipFailure: null,
+    requestOwners: [{ journey_id: report.open_id, request_id: report.open_id }],
+    streamOwners: [],
+    reports: [report], statuses: [{ open_id: report.open_id, status: 204 }],
     requestRecords: [{ kind: 'request', open_id: report.open_id, trace_id: null }] };
 }
 const unitModule = {
@@ -215,7 +218,29 @@ test('UNIT ONLY independently captured original history views join exact stock i
   assert.equal(result.journeys.length, 2); assert.equal(result.additional_history.reports, 1);
   assert.deepEqual(result.trials.at(-1).reports.map(r => r.open_id), ['unit-history']);
 });
+test('UNIT ONLY journey UUID differs from independently observed finite request UUID and trace stays attached to that request', () => {
+  const inventory = historyInventory();
+  inventory.reports[0].correlations = [{ kind: 'request', id: 'distinct-request-id' },
+    { kind: 'trace', id: 'a'.repeat(32) }];
+  inventory.requestRecords = [{ kind: 'request', open_id: 'distinct-request-id', trace_id: 'a'.repeat(32) }];
+  inventory.requestOwners = [{ journey_id: 'unit-history', request_id: 'distinct-request-id' }];
+  const result = appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule);
+  assert.equal(result.journeys.at(-1).open_id, 'unit-history');
+  assert.equal(result.trials.at(-1).requestRecords[0].open_id, 'distinct-request-id');
+  const foreign = structuredClone(inventory);
+  foreign.requestRecords = [{ kind: 'request', open_id: 'unit-history', trace_id: 'a'.repeat(32) }];
+  assert.throws(() => appendObservedHistory(stock(), foreign, input().fixtures.identity, unitModule),
+    /independently observed finite request/);
+  const borrowed = structuredClone(inventory);
+  borrowed.requestRecords[0].trace_id = null;
+  borrowed.requestRecords.push({ kind: 'request', open_id: 'unreported-request', trace_id: 'a'.repeat(32) });
+  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule),
+    /independent request\/response provenance/);
+});
+
 for (const [name, mutate] of Object.entries({
+  missing_independent_owner: i => { i.requestOwners = []; },
+  ownership_capture_failure: i => { i.ownershipFailure = 'invalid_or_overflow_history_request_ownership'; },
   missing_capture_status: i => { i.statuses = []; },
   unexpected_export_without_browser_report: i => { i.reports = []; },
   missing_request: i => { i.requestRecords = []; },
@@ -229,7 +254,10 @@ for (const [name, mutate] of Object.entries({
   const i = historyInventory(); mutate(i); assert.throws(() => appendObservedHistory(stock(), i, input().fixtures.identity, unitModule));
 });
 test('UNIT ONLY late report capture retains raw body/response and independent header trace provenance', () => {
-  const page = new EventEmitter(), capture = installObservedHistoryTelemetry(page, 'http://127.0.0.1:12345');
+  const page = new EventEmitter(), capture = installObservedHistoryTelemetry(page, 'http://127.0.0.1:12345', {
+    bindPage: () => {},
+    snapshot: () => ({ pairs: historyInventory().requestOwners, failure: null }),
+  });
   const request = { method: () => 'GET', url: () => 'http://127.0.0.1:12345/api/product-conversations/unit?open_id=unit-history' };
   page.emit('request', request);
   page.emit('response', { request: () => request, status: () => 200, headers: () => ({ traceparent: '00-' + 'a'.repeat(32) + '-' + 'b'.repeat(16) + '-01' }) });
@@ -242,7 +270,7 @@ test('UNIT ONLY late report capture retains raw body/response and independent he
 });
 test('source observer precedes first history navigation and union follows browser close before server stop', () => {
   const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
-  const observer = source.indexOf('historyTelemetry = installObservedHistoryTelemetry(page, ui)');
+  const observer = source.indexOf('historyTelemetry = installObservedHistoryTelemetry(page, ui, requestOwnership)');
   const navigation = source.indexOf('await recorder.navigateAfterRequiredBodies(');
   assert.ok(observer > 0 && navigation > observer);
   assert.ok(source.indexOf('() => page.goto(', navigation) > navigation);
@@ -262,5 +290,166 @@ test('UNIT ONLY history trace belongs to the same report request, never a differ
   borrowed.reports[0].correlations.find(c => c.kind === 'trace').id = 'b'.repeat(32);
   assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule), /independent request\/response provenance/);
   borrowed.reports[0].correlations.push({ kind: 'request', id: 'unit-other-journey' });
-  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule), /independent request\/response provenance/);
+  borrowed.requestOwners.push({ journey_id: 'foreign-journey', request_id: 'unit-other-journey' });
+  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule), /independently observed journey/);
+  borrowed.requestOwners.push({ journey_id: 'unit-history', request_id: 'unit-other-journey' });
+  appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule);
+});
+
+
+test('UNIT ONLY independently captured producer admission owns distinct transport UUID; malformed and overflow fail closed', async () => {
+  const config = { unitOnly: true };
+  const UNIT = ownershipUnit();
+  const frame = {}, page = { mainFrame: () => frame }, source = { page, frame };
+  const journey = '11111111-1111-4111-8111-111111111111', request = '22222222-2222-4222-8222-222222222222';
+  let callback, installed = 0;
+  const context = { exposeBinding: async (_name, cb) => { callback = cb; }, addInitScript: async () => { installed++; } };
+  const owner = await installHistoryRequestOwnership(context, config, UNIT);
+  assert.equal(installed, 1);
+  owner.bindPage(page);
+  callback(source, { version: 1, kind: 'admission', route: 'ordinary', open_id: journey, sampled: true });
+  callback(source, { version: 1, kind: 'request', open_id: journey, request_id: request });
+  assert.deepEqual(owner.snapshot(), { pairs: [{ journey_id: journey, request_id: request }], streams: [], failure: null });
+  callback(source, { version: 1, kind: 'request', open_id: request, request_id: request });
+  assert.equal(owner.snapshot().failure, 'invalid_or_overflow_history_request_ownership');
+  const overflow = await installHistoryRequestOwnership(context, config, UNIT);
+  overflow.bindPage(page);
+  callback(source, { version: 1, kind: 'admission', route: 'ordinary', open_id: journey, sampled: true });
+  for (let n = 0; n < 513; n++) callback(source, { version: 1, kind: 'request', open_id: journey, request_id: request });
+  assert.equal(overflow.snapshot().pairs.length, 512);
+  assert.equal(overflow.snapshot().failure, 'invalid_or_overflow_history_request_ownership');
+  const invalid = await installHistoryRequestOwnership(context, config, UNIT);
+  invalid.bindPage(page);
+  callback(source, { version: 1, kind: 'request', open_id: journey, request_id: request, body: 'private' });
+  assert.equal(invalid.snapshot().failure, 'invalid_or_overflow_history_request_ownership');
+  assert.ok(!JSON.stringify(invalid.snapshot()).includes('private'));
+});
+
+test('history diagnostic installation is awaited before page creation/navigation and has a finite deadline', () => {
+  const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  const install = source.indexOf('await installHistoryRequestOwnership(context, jointTelemetry)');
+  assert.ok(install > 0 && install < source.indexOf('page = await context.newPage()', install));
+  const helper = readFileSync(new URL('./history-joint-telemetry.mjs', import.meta.url), 'utf8');
+  assert.match(helper, /history diagnostic installation deadline/);
+  assert.match(helper, /history diagnostics installation canceled/);
+});
+
+function ownershipUnit(clock) {
+  return { label: UNIT_ONLY, clock, module: { captureDiagnostic: raw => {
+    assert.equal(raw.version, 1);
+    const keys = raw.kind === 'admission'
+      ? ['version', 'kind', 'route', 'open_id', 'sampled']
+      : ['version', 'kind', 'open_id', raw.kind === 'sse' ? 'stream_id' : 'request_id'];
+    assert.deepEqual(Object.keys(raw).sort(), keys.sort());
+    return structuredClone(raw);
+  } } };
+}
+function ownershipClock() {
+  let fire, cleared = 0;
+  return { setTimeout(callback, ms) { assert.equal(ms, 10000); fire = callback; return 1; },
+    clearTimeout(id) { assert.equal(id, 1); cleared++; }, expire() { fire(); }, get cleared() { return cleared; } };
+}
+function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
+
+for (const phase of ['binding', 'init_script']) test(`UNIT ONLY ownership ${phase} deadline blocks late work and sanitizes errors`, async () => {
+  const clock = ownershipClock(), pending = deferred(), reached = deferred(), calls = [];
+  let callback;
+  const context = {
+    exposeBinding: async (_name, cb) => { callback = cb; calls.push('binding'); if (phase === 'binding') { reached.resolve(); await pending.promise; } },
+    addInitScript: async () => { calls.push('init_script'); if (phase === 'init_script') { reached.resolve(); await pending.promise; } },
+  };
+  const operation = installHistoryRequestOwnership(context, { unitOnly: true }, ownershipUnit(clock));
+  const rejected = assert.rejects(operation, new RegExp(`^Error: history diagnostic ${phase} setup failed_or_deadline$`));
+  await reached.promise; clock.expire(); await rejected;
+  assert.equal(clock.cleared, 1);
+  pending.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(calls, phase === 'binding' ? ['binding'] : ['binding', 'init_script']);
+  callback({}, { private: 'UNIT_PRIVATE_SENTINEL' });
+});
+for (const phase of ['binding', 'init_script']) test(`UNIT ONLY ownership ${phase} rejection never exposes private setup error`, async () => {
+  const clock = ownershipClock();
+  const fail = async () => { throw new Error('UNIT_PRIVATE_SENTINEL'); };
+  const context = { exposeBinding: phase === 'binding' ? fail : async () => {}, addInitScript: fail };
+  await assert.rejects(installHistoryRequestOwnership(context, { unitOnly: true }, ownershipUnit(clock)), error => {
+    assert.equal(error.message, `history diagnostic ${phase} setup failed_or_deadline`);
+    assert.ok(!error.stack.includes('UNIT_PRIVATE_SENTINEL')); return true;
+  });
+  assert.equal(clock.cleared, 1);
+});
+test('UNIT ONLY original page/main frame scope cannot borrow foreign admissions or exhaust bounds', async () => {
+  let callback;
+  const frame = {}, page = { mainFrame: () => frame }, source = { page, frame };
+  const owner = await installHistoryRequestOwnership({ exposeBinding: async (_, cb) => { callback = cb; }, addInitScript: async () => {} },
+    { unitOnly: true }, ownershipUnit(ownershipClock()));
+  const admission = { version: 1, kind: 'admission', route: 'ordinary', open_id: 'UNIT-journey', sampled: true };
+  callback(source, admission);
+  owner.bindPage(page);
+  assert.throws(() => owner.bindPage(page), /bind once/);
+  for (const foreign of [{ page: {}, frame }, { page, frame: {} }]) {
+    for (let i = 0; i < 2050; i++) callback(foreign, admission);
+  }
+  assert.deepEqual(owner.snapshot(), { pairs: [], streams: [], failure: null });
+  callback(source, { version: 1, kind: 'request', open_id: admission.open_id, request_id: 'UNIT-request' });
+  assert.equal(owner.snapshot().failure, 'invalid_or_overflow_history_request_ownership');
+  const clock = ownershipClock();
+  const valid = await installHistoryRequestOwnership({ exposeBinding: async (_, cb) => { callback = cb; }, addInitScript: async () => {} },
+    { unitOnly: true }, ownershipUnit(clock));
+  valid.bindPage(page); callback(source, admission);
+  callback(source, { version: 1, kind: 'request', open_id: admission.open_id, request_id: 'UNIT-request' });
+  assert.deepEqual(valid.snapshot(), { pairs: [{ journey_id: admission.open_id, request_id: 'UNIT-request' }], streams: [], failure: null });
+  assert.equal(clock.cleared, 1);
+});
+test('UNIT ONLY ownership injection cannot enter runtime config', async () => {
+  await assert.rejects(installHistoryRequestOwnership({}, { unitOnly: false }, ownershipUnit()), /cannot become runtime proof/);
+  await assert.rejects(installHistoryRequestOwnership({}, { unitOnly: true }), /cannot become runtime proof/);
+  await assert.rejects(installHistoryRequestOwnership({}, { unitOnly: true }, { label: 'wrong' }));
+});
+
+test('UNIT ONLY SSE correlation needs independent same-journey producer edge AND original-page network observation', () => {
+  const inventory = historyInventory();
+  inventory.reports[0].correlations.push({ kind: 'sse', id: 'UNIT-stream' });
+  inventory.requestRecords.push({ kind: 'sse', open_id: 'UNIT-stream', trace_id: null });
+  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule), /SSE must belong/);
+  inventory.streamOwners.push({ journey_id: 'UNIT-foreign', stream_id: 'UNIT-stream' });
+  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule), /SSE must belong/);
+  inventory.streamOwners.push({ journey_id: 'unit-history', stream_id: 'UNIT-stream' });
+  appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule);
+  inventory.requestRecords.pop();
+  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule), /independent request\/response provenance/);
+});
+test('UNIT ONLY request and SSE producer edges share the fixed ownership cap', async () => {
+  let callback;
+  const frame = {}, page = { mainFrame: () => frame }, source = { page, frame };
+  const owner = await installHistoryRequestOwnership({ exposeBinding: async (_, cb) => { callback = cb; }, addInitScript: async () => {} },
+    { unitOnly: true }, ownershipUnit(ownershipClock()));
+  owner.bindPage(page);
+  callback(source, { version: 1, kind: 'admission', route: 'ordinary', open_id: 'UNIT-journey', sampled: true });
+  callback(source, { version: 1, kind: 'sse', open_id: 'UNIT-journey', stream_id: 'UNIT-stream' });
+  assert.deepEqual(owner.snapshot().streams, [{ journey_id: 'UNIT-journey', stream_id: 'UNIT-stream' }]);
+  for (let n = 0; n < 511; n++) callback(source, { version: 1, kind: 'request', open_id: 'UNIT-journey', request_id: 'UNIT-request' });
+  assert.equal(owner.snapshot().failure, null);
+  callback(source, { version: 1, kind: 'sse', open_id: 'UNIT-journey', stream_id: 'UNIT-overflow' });
+  assert.equal(owner.snapshot().failure, 'invalid_or_overflow_history_request_ownership');
+  assert.equal(owner.snapshot().streams.length + owner.snapshot().pairs.length, 512);
+});
+
+test('UNIT ONLY original-page network observer latches sanitized bounded errors', () => {
+  const page = new EventEmitter(), observer = installObservedHistoryTelemetry(page, 'http://127.0.0.1:12345');
+  const request = { url() { throw new Error('UNIT_PRIVATE_SENTINEL'); } };
+  for (let n = 0; n < 2050; n++) page.emit('request', request);
+  assert.deepEqual(observer.snapshot().errors, ['invalid_or_overflow_history_network_observation']);
+  assert.ok(!JSON.stringify(observer.snapshot()).includes('UNIT_PRIVATE_SENTINEL'));
+});
+test('UNIT ONLY producer event bound is independent of ownership edge count', async () => {
+  let callback;
+  const frame = {}, page = { mainFrame: () => frame }, source = { page, frame };
+  const owner = await installHistoryRequestOwnership({ exposeBinding: async (_, cb) => { callback = cb; }, addInitScript: async () => {} },
+    { unitOnly: true }, ownershipUnit(ownershipClock()));
+  owner.bindPage(page);
+  const admission = { version: 1, kind: 'admission', route: 'ordinary', open_id: 'UNIT-journey', sampled: true };
+  for (let n = 0; n < 2048; n++) callback(source, admission);
+  assert.equal(owner.snapshot().failure, null);
+  callback(source, admission);
+  assert.equal(owner.snapshot().failure, 'invalid_or_overflow_history_request_ownership');
+  assert.deepEqual(owner.snapshot().pairs, []);
 });

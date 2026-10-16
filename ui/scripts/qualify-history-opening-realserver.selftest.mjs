@@ -359,7 +359,10 @@ test('authenticated opening session precedes observers/navigation and protects d
   const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
   const run = script.slice(script.indexOf('async function run()'));
   assert.ok(run.indexOf('await authenticateOwnedContext(context, api)') < run.indexOf('page = await context.newPage()'));
-  assert.ok(run.indexOf('await authenticateOwnedContext(context, api)') < run.indexOf('installObservedHistoryTelemetry(page, ui)'));
+  const auth = run.indexOf('await authenticateOwnedContext(context, api)');
+  const ownership = run.indexOf('await installHistoryRequestOwnership(context, jointTelemetry)');
+  const observed = run.indexOf('installObservedHistoryTelemetry(page, ui, requestOwnership)');
+  assert.ok(auth > 0 && auth < ownership && ownership < observed);
   assert.match(run, /fetch\(api \+ path, \{ method, headers: \{ Cookie: sessionCookie/);
   assert.match(run, /\/stream`, \{ headers: \{ Cookie: sessionCookie \}/);
   assert.doesNotMatch(run, /record\([^\n]*sessionCookie/);
