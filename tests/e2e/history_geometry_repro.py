@@ -19,7 +19,7 @@ out=Path(os.environ['GEOMETRY_OUTPUT']).resolve();out.mkdir(parents=True,exist_o
 receipt=json.loads((artifact/'opening-instrumented-receipt.json').read_text())
 owner=json.loads((artifact/'opening-ui-build-owner.json').read_text())
 assert receipt['app_source']==opening.PIN and receipt['app_tree']==opening.TREE_PIN
-assert receipt['harness_source']=='5e16c608bd46a28b768f5c770326897770804562'
+assert receipt['harness_source']=='c47c678ecc2e0f8121889fe2bd7e3787eafbc526'
 exe=artifact/'opening-instrumented-libtest';assert s.digest(exe)==receipt['executable_sha256'];exe.chmod(0o700)
 with exe.open('rb') as stream: assert stream.read(20)[:4]==b'\x7fELF'
 assert s.git(app,'rev-parse','HEAD')==opening.PIN and s.git(app,'rev-parse','HEAD^{tree}')==opening.TREE_PIN
@@ -32,7 +32,7 @@ assert binding['ui_files']['ui/dist-controlled-functional/.gitkeep']==hashlib.sh
 (ui/'.gitkeep').write_bytes(b'')
 assert {str(p.relative_to(artifact/'pinned-app')):s.digest(p) for p in ui.rglob('*') if p.is_file()}==binding['ui_files']
 assert s.digest(app/'ui/pnpm-lock.yaml')==receipt['ui_lock_sha256']
-s.write_json(out/'provenance.json',{'scope':'diagnostic_not_acceptance','artifact':12077047082,'app_source':opening.PIN,'app_tree':opening.TREE_PIN,'executable_sha256':s.digest(exe),'controlled_manifest_sha256':s.digest(manifest),'fixture':'recreated_recipe_not_original_database'})
+s.write_json(out/'provenance.json',{'scope':'diagnostic_not_acceptance','artifact':12078389483,'app_source':opening.PIN,'app_tree':opening.TREE_PIN,'executable_sha256':s.digest(exe),'controlled_manifest_sha256':s.digest(manifest),'fixture':'recreated_recipe_not_original_database'})
 h=s.load_app_harness(app);failures=opening.LifecycleFailures()
 with tempfile.TemporaryDirectory(prefix='geo-',dir='/tmp') as owned:
  work=Path(owned);work.chmod(0o700);control=work/'c.sock';port=h._free_port();base=f'http://127.0.0.1:{port}'
