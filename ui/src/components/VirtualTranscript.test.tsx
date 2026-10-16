@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, type ReactElement } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState, type ReactElement } from 'react';
 import { initialTranscriptPositioningState, reduceTranscriptPositioning, transcriptPositioningCommandKey, type TranscriptPositioningInput, type TranscriptPositioningEvent } from '../conversation/transcriptPositioning';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 
@@ -534,6 +534,93 @@ describe('VirtualTranscript', () => {
         expect(actualTop).toBe(43);
       }
     } finally { geometry.mockRestore(); }
+  });
+
+  it.each(['applied', 'user-cancel', 'replacement'] as const)('separates successful anchor continuity from command capability retirement (%s)', terminal => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const items = makeItems(20, 75);
+    const key = (item: TestItem) => item.id;
+    const command: HistoryScrollCommand = {kind: 'jump_to_message', token: 1, requestToken: 1,
+      view: {conversationId: 'late-parent', generation: 1, transcriptGeneration: 1}, targetMessageId: 'item-0'};
+    const commandKey = transcriptPositioningCommandKey(command);
+    const replacement: HistoryScrollCommand = {...command, token: 2};
+    const finishes: string[] = [];
+    const positions: string[] = [];
+    const authorities: string[] = [];
+    const writes: number[] = [];
+    let actualTop = 0;
+    let headerHeight = 0;
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const geometry = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const rect = originalRect.call(this);
+      const row = this.closest<HTMLElement>('[data-virtual-index]');
+      const top = this.classList.contains('virtual-transcript') ? 93
+        : row ? 93 + headerHeight + Number(row.dataset['virtualIndex']) * 75 - actualTop : rect.top;
+      const height = this.classList.contains('virtual-transcript') ? this.clientHeight : rect.height;
+      return {...rect, top, y: top, height, bottom: top + height} as DOMRect;
+    });
+    const attach = (element: HTMLDivElement | null) => {
+      if (element) Object.defineProperty(element, 'scrollTop', {configurable: true,
+        get: () => actualTop, set: (value: number) => {writes.push(value); actualTop = Math.round(value);}});
+    };
+    function Parent({withHeader, begin = false}: {withHeader: boolean; begin?: boolean}) {
+      const [input, setInput] = useState<TranscriptPositioningInput>({kind: 'idle', view: command.view});
+      useLayoutEffect(() => {if (begin) setInput({kind: 'positioning', command});}, [begin]);
+      const state = useRef(initialTranscriptPositioningState(command.view));
+      const dispatch = useCallback((event: TranscriptPositioningEvent): void => {
+        const reduced = reduceTranscriptPositioning(state.current, event);
+        state.current = reduced.state;
+        for (const effect of reduced.effects) {
+          if (effect.type === 'resolve_target' && effect.commandKey === commandKey) {
+            dispatch({type: 'target_resolved', commandKey, targetIndex: 0});
+          } else if (effect.type === 'position') {
+            positions.push(effect.commandKey);
+            ref.current!.scrollToOwnedIndex(effect.commandKey, effect.targetIndex, effect.align, effect.viewportStartOffset);
+            const observed = ref.current!.physicalSnapshot(effect.targetIndex);
+            expect(observed.targetMeasured).toBe(true);
+            dispatch({type: 'position_issued', commandKey, targetIndex: effect.targetIndex, layoutRevision: observed.layoutRevision});
+            if (terminal === 'user-cancel') dispatch({type: 'user_interrupted'});
+            else if (terminal === 'replacement') {
+              setInput({kind: 'positioning', command: replacement});
+              dispatch({type: 'input_changed', input: {kind: 'positioning', command: replacement}});
+            } else dispatch({type: 'physical_observed', commandKey, range: observed.visibleRange,
+              actualOffset: observed.targetOffset ?? null, layoutRevision: observed.layoutRevision, targetMeasured: observed.targetMeasured ?? false});
+          } else if (effect.type === 'finish') {
+            finishes.push(effect.result);
+            if (effect.result === 'superseded') ref.current!.cancelPosition(effect.commandKey);
+            if (terminal !== 'replacement') setInput({kind: 'idle', view: command.view});
+          }
+        }
+      }, []);
+      useLayoutEffect(() => {dispatch({type: 'input_changed', input});}, [dispatch, input]);
+      const authority = input.kind === 'positioning' ? transcriptPositioningCommandKey(input.command) : null;
+      authorities.push(authority ?? 'none');
+      return <VirtualTranscript ariaLabel="Completed parent" ref={ref} items={items} getKey={key}
+        positioningAuthority={authority ? {kind: 'command', commandKey: authority} : {kind: 'absent'}}
+        estimatedExtent={75} initialTail={false} scrollerRef={attach}
+        header={withHeader ? <div data-height={42.5}>Late parent header</div> : undefined}
+        renderItem={renderRow} />;
+    }
+    try {
+      const {rerender} = render(<Parent withHeader={false} />);
+      rerender(<Parent withHeader={false} begin />);
+      expect(positions).toEqual([commandKey]);
+      expect(finishes).toEqual([terminal === 'applied' ? 'applied' : 'superseded']);
+      expect(authorities.at(-1)).toBe(terminal === 'replacement' ? transcriptPositioningCommandKey(replacement) : 'none');
+      writes.length = 0;
+      headerHeight = 42.5;
+      rerender(<Parent withHeader begin />);
+      expect(positions).toEqual([commandKey]);
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-0"]')!;
+      const clip = screen.getByRole('region', {name: 'Completed parent'}).getBoundingClientRect();
+      if (terminal === 'applied') {
+        const physicalOffset = row.getBoundingClientRect().top - clip.top;
+        expect(writes.length).toBeGreaterThan(0);
+        expect(actualTop).toBeGreaterThanOrEqual(41.5);
+        expect(physicalOffset).toBeLessThanOrEqual(1);
+        expect(physicalOffset, JSON.stringify({writes, actualTop, finishes, authorities})).toBeGreaterThanOrEqual(0);
+      } else {expect(writes).toEqual([42.5]); expect(actualTop).toBe(43);}
+    } finally {geometry.mockRestore();}
   });
 
   it('positions an intra-row target through the transcript executor', () => {
