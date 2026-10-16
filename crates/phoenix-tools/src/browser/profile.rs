@@ -229,23 +229,40 @@ enum Step {
     WaitSelector {
         selector: String,
         #[serde(default)]
-        timeout: Option<String>,
+        timeout: Option<ScenarioWaitTimeout>,
     },
     WaitTiming {
         mark: String,
         #[serde(default)]
-        timeout: Option<String>,
+        timeout: Option<ScenarioWaitTimeout>,
     },
     WaitEval {
         expression: String,
         #[serde(default)]
-        timeout: Option<String>,
+        timeout: Option<ScenarioWaitTimeout>,
     },
 }
 
 use super::tools::parse_duration;
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(try_from = "String")]
+struct ScenarioWaitTimeout(Duration);
+
+impl TryFrom<String> for ScenarioWaitTimeout {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let duration = parse_duration(&value)
+            .ok_or_else(|| format!("Invalid scenario step timeout {value:?}"))?;
+        Instant::now().checked_add(duration).ok_or_else(|| {
+            format!("Scenario step timeout {value:?} exceeds the supported deadline")
+        })?;
+        Ok(Self(duration))
+    }
+}
 
 /// Run `f` with the conversation's [`ProfilingState`] mutably locked,
 /// without holding the session read-guard across the std `Mutex` (which
@@ -1289,10 +1306,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             .map(|_| ())
             .map_err(|e| format!("eval failed: {e}")),
         Step::WaitSelector { selector, timeout } => {
-            let to = timeout
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+            let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
             let check = format!(
                 "document.querySelector({}) !== null",
                 serde_json::to_string(selector).unwrap_or_default()
@@ -1300,10 +1314,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             poll(&guard, &check, to, &format!("wait_selector {selector}")).await
         }
         Step::WaitTiming { mark, timeout } => {
-            let to = timeout
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+            let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
             let check = format!(
                 "performance.getEntriesByName({}, 'mark').length > 0",
                 serde_json::to_string(mark).unwrap_or_default()
@@ -1314,10 +1325,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             expression,
             timeout,
         } => {
-            let to = timeout
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+            let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
             poll(&guard, &format!("!!({expression})"), to, "wait_eval").await
         }
     }
@@ -2348,6 +2356,46 @@ mod tests {
         let w: Step = serde_json::from_value(json!({"kind":"wait_timing","mark":"ready"}))
             .expect("wait_timing");
         matches!(w, Step::WaitTiming { .. });
+    }
+
+    #[tokio::test]
+    async fn scenario_wait_timeouts_reject_invalid_values_before_browser_access() {
+        for mut step in [
+            json!({"kind": "wait_selector", "selector": "#ready"}),
+            json!({"kind": "wait_timing", "mark": "ready"}),
+            json!({"kind": "wait_eval", "expression": "window.ready"}),
+        ] {
+            for timeout in [
+                "",
+                "nope",
+                "-1s",
+                "18446744073709551615m",
+                "18446744073709551615s",
+            ] {
+                step["timeout"] = json!(timeout);
+                let input = json!({"action": "run_scenario", "steps": [step], "warmup": 0});
+                let error = BrowserProfileTool::validate_input(input.clone())
+                    .expect_err("invalid nested timeout must fail preflight");
+                assert!(error.output().contains("timeout"), "{}", error.output());
+                let boundary =
+                    super::super::ValidationBoundary(std::sync::atomic::AtomicBool::default());
+                let output = BrowserProfileTool::run_browser(input, &boundary).await;
+                assert!(
+                    !output.is_success(),
+                    "invalid nested timeout must fail execution"
+                );
+                assert!(output.output().contains("timeout"), "{}", output.output());
+                assert!(!boundary.0.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            step.as_object_mut().unwrap().remove("timeout");
+            BrowserProfileTool::validate_input(json!({"action": "run_scenario", "steps": [step]}))
+                .expect("omitted nested timeout uses the default");
+            for timeout in ["0ms", "125ms", "3s", "1m"] {
+                step["timeout"] = json!(timeout);
+                let input = json!({"action": "run_scenario", "steps": [step]});
+                BrowserProfileTool::validate_input(input).expect("valid nested timeout");
+            }
+        }
     }
 
     /// REQ-BT-019.13/.15 + cross-cutting: a not-measured field MUST

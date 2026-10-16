@@ -512,15 +512,6 @@ async fn connect_or_start(options: &Options) -> Result<UnixStream, ConnectionErr
 }
 
 async fn execute(options: &Options) -> Response {
-    if options.request.command == "schema"
-        || (options.request.command == "profile"
-            && matches!(
-                options.request.input["action"].as_str(),
-                Some("help" | "cpu_summary")
-            ))
-    {
-        return daemon::offline(&options.session, &options.request).await;
-    }
     let encoded = match protocol::encode_message(&options.request) {
         Ok(encoded) => encoded,
         Err(error) => {
@@ -543,6 +534,15 @@ async fn execute(options: &Options) -> Response {
             }
             return response;
         }
+    }
+    if options.request.command == "schema"
+        || (options.request.command == "profile"
+            && matches!(
+                options.request.input["action"].as_str(),
+                Some("help" | "cpu_summary")
+            ))
+    {
+        return daemon::offline(&options.session, &options.request).await;
     }
     let mut stream = match connect_or_start(options).await {
         Ok(stream) => stream,
