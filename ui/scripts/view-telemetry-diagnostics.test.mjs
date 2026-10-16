@@ -37,3 +37,11 @@ test('explicit timeout abort is a bounded diagnostic distinct from failed submis
     { version: 1, kind: 'submission', open_id: id, state: 'timeout_abort', status: null });
   assert.throws(() => captureDiagnostic({ version: 1, kind: 'submission', open_id: id, state: 'timeout_abort', status: 204 }));
 });
+test('SSE ownership edge is bound to admitted journey, finite UUIDs only with no inferred network ownership', () => {
+  const stream = '10000000-0000-4000-8000-000000000001';
+  const edge = captureDiagnostic({ version: 1, kind: 'sse', open_id: id, stream_id: stream });
+  assert.equal(samplingDecision([admission(true), edge], 'ordinary').open_id, id);
+  assert.throws(() => captureDiagnostic({ ...edge, stream_id: 'PRIVATE_URL' }));
+  assert.throws(() => captureDiagnostic({ ...edge, conversation_id: stream }));
+  assert.throws(() => samplingDecision([admission(true), { ...edge, open_id: stream }], 'ordinary'));
+});

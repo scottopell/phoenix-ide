@@ -3,12 +3,13 @@ const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const marks = ['shell', 'snapshot_received', 'hydration_ready', 'meaningful_transcript', 'chapter_data_ready', 'breadcrumb_presented', 'breadcrumb_enabled', 'anchor_settled'];
 export function captureDiagnostic(event) {
   assert.ok(event && event.version === 1);
-  const fields = { admission: ['route', 'sampled'], mark: ['mark', 'ms'], request: ['request_id'], anchor: ['result'], terminal: ['outcome'], submission: ['state', 'status'] }[event.kind];
+  const fields = { admission: ['route', 'sampled'], mark: ['mark', 'ms'], request: ['request_id'], sse: ['stream_id'], anchor: ['result'], terminal: ['outcome'], submission: ['state', 'status'] }[event.kind];
   assert.ok(fields && Object.keys(event).every(k => ['version', 'kind', 'open_id', ...fields].includes(k)));
   assert.ok(uuid.test(event.open_id ?? '') || (event.kind === 'admission' && event.sampled === false && event.open_id === null));
   if (event.kind === 'admission') assert.ok(['ordinary', 'global'].includes(event.route) && typeof event.sampled === 'boolean' && event.sampled === (event.open_id !== null));
   if (event.kind === 'mark') assert.ok(marks.includes(event.mark) && Number.isFinite(event.ms) && event.ms >= 0 && event.ms <= 300000);
   if (event.kind === 'request') assert.ok(uuid.test(event.request_id ?? ''));
+  if (event.kind === 'sse') assert.ok(uuid.test(event.stream_id ?? ''));
   if (event.kind === 'anchor') assert.ok(['applied', 'tail_pinned', 'empty', 'target_missing', 'superseded'].includes(event.result));
   if (event.kind === 'terminal') assert.ok(['ready', 'failed', 'canceled', 'incomplete'].includes(event.outcome));
   if (event.kind === 'submission') assert.ok(['attempted', 'timeout_abort', 'busy_drop', 'response', 'failed'].includes(event.state) && (event.state === 'response' ? Number.isInteger(event.status) && event.status >= 100 && event.status <= 599 : event.status === null));
