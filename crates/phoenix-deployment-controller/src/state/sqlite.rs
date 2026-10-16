@@ -282,8 +282,11 @@ impl ControllerSqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_authority(&tx)?;
         let id = key(attempt_id);
-        let header = required(read_header(&tx, &id)?, "missing binding attempt")?;
-        if header.deadline != deadline || header.revision != attempt_revision {
+        let checkpoint = required(read_attempt(&tx, attempt_id)?, "missing binding attempt")?;
+        if checkpoint.phase() != Phase::ResourceSampling
+            || checkpoint.deadline() != deadline
+            || checkpoint.persistence_revision() != Some(attempt_revision)
+        {
             return Err(ControllerStoreError::RevisionConflict);
         }
         if read_binding(&tx, attempt_id)?.is_some() {

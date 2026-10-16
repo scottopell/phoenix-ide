@@ -101,6 +101,33 @@ fn binding_survives_policy_checkpoint_advance_and_reopen_in_original_order() {
 }
 
 #[test]
+fn initial_binding_requires_fresh_resource_sampling_checkpoint() {
+    let mut store = ControllerSqliteStore::in_memory().unwrap();
+    let id = AttemptId::new(45);
+    let interrupted = start(&mut store, id)
+        .interrupt()
+        .unwrap()
+        .persist(&mut store)
+        .unwrap()
+        .into_parts()
+        .0;
+    assert!(matches!(
+        store.commit_initial_binding(
+            id,
+            interrupted.deadline(),
+            interrupted.persistence_revision().unwrap(),
+            guardian(),
+            &slots()
+        ),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+    assert!(matches!(
+        store.load_native_binding(id),
+        Err(ControllerStoreError::Poisoned)
+    ));
+}
+
+#[test]
 fn stale_duplicate_and_inexact_bindings_fail_stopped() {
     let mut store = ControllerSqliteStore::in_memory().unwrap();
     let id = AttemptId::new(3);

@@ -70,7 +70,7 @@ pub fn initial_release_request(
     })
 }
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -753,6 +753,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             || nonce != wire.nonce
             || binding.attempt_id() != self.guardian.attempt_id()
             || checkpoint.attempt_id() != self.guardian.attempt_id()
+            || checkpoint.phase() != crate::Phase::ResourceSampling
             || binding.identity().nonce.bytes() != wire.nonce
             || WireIdentity::from(binding.identity().process) != wire.guardian
             || self.native_identity != Some(binding.identity())
