@@ -300,13 +300,13 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
           while (!trial.statuses.length && Date.now() < deadline) await new Promise(resolveWait => setTimeout(resolveWait, 20));
           assert.ok(!trial.failure, trial.failure);
           assert.equal(trial.reports.length, 1, 'sampled pagehide must report once');
-          assert.deepEqual(trial.statuses, [204]);
+          assert.ok(trial.statuses.length <= 1 && trial.statuses.every(status => status === 204), 'observed pagehide response must be single204; delivery still requires collector/export');
           const report = trial.reports[0];
           assert.equal(report.open_id, admission.open_id, 'pagehide report belongs to producer admission');
           assert.equal(report.outcome, 'incomplete', 'pagehide outcome is incomplete, not synthetic cancellation');
           assertRequestCorrelation([trial.requestId], report);
           assert.equal(report.marks.meaningful_transcript, null, 'incomplete case must precede presentation');
-          trial.status = 'observed_incomplete';
+          trial.status = 'provisional_incomplete_collector_export_pending';
         } else {
           if (!admission.sampled) assert.equal(trial.reports.length, 0, 'unsampled admission cannot emit report');
           trial.status = admission.sampled ? 'sampled_already_ready' : 'unsampled';
@@ -331,9 +331,9 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
           assert.deepEqual(trial.statuses, []);
         }
         assert.ok(!trial.failure, 'pagehide late capture failure');
-        if (trial.status === 'observed_incomplete') {
+        if (trial.status === 'provisional_incomplete_collector_export_pending') {
           assert.equal(trial.reports.length, 1, 'late pagehide duplicate');
-          assert.deepEqual(trial.statuses, [204]);
+          assert.ok(trial.statuses.length <= 1 && trial.statuses.every(status => status === 204), 'late pagehide response must be single204; delivery still requires collector/export');
         }
       } catch (error) {
         trial.cleanup_failure = error.message;
@@ -360,7 +360,7 @@ export async function runPendingPagehideCheck({ browser, storageState, baseURL, 
       }
     }
     if (primaryError) throw primaryError;
-    if (trial.status === 'observed_incomplete') return { status: 'observed_incomplete', trials };
+    if (trial.status === 'provisional_incomplete_collector_export_pending') return { status: 'provisional_incomplete_collector_export_pending', trials };
   }
   return { status: 'inconclusive_sampling_budget', trials };
 }

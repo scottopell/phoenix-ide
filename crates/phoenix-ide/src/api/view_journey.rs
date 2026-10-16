@@ -230,12 +230,162 @@ pub(super) async fn report(
             "correlation.id" = correlation.id);
         drop(child.enter());
     }
+    tracing::info!(target: "phoenix_ide::view_journey_acceptance",
+        schema_version = 1_u32,
+        open_id = %report.open_id,
+        server_instance_id = %instance_id,
+        backend_source = env!("PHOENIX_GIT_SHA"),
+        status = 204_u16,
+        "conversation_view_accepted"
+    );
     StatusCode::NO_CONTENT
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct WitnessWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WitnessWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WitnessWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    async fn collector_test_state() -> AppState {
+        use std::sync::Arc;
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let models = Arc::new(phoenix_llm::ModelRegistry::new_empty());
+        let platform = crate::platform::PlatformCapability::None {
+            details: "collector-test".into(),
+        };
+        let mcp = Arc::new(crate::tools::mcp::McpClientManager::new());
+        let runtime = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            models.clone(),
+            platform.clone(),
+            mcp.clone(),
+            None,
+        ));
+        let retriever: Arc<dyn crate::db::MessageRetriever> = Arc::new(db.fts_retriever());
+        AppState {
+            terminals: runtime.terminals.clone(),
+            runtime,
+            llm_registry: models.clone(),
+            platform,
+            mcp_manager: mcp,
+            chain_qa: crate::chain_qa::ChainQa::new(db.clone(), models, retriever.clone()),
+            message_retriever: retriever,
+            sessions: crate::api::auth::SessionStore::new(
+                db.clone(),
+                "collector-test-password".into(),
+            ),
+            db,
+            federation_tls_trust:
+                phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            credential_helper: None,
+            password: Some(
+                phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                    "collector-test-password".into(),
+                )
+                .unwrap(),
+            ),
+            login_throttle: crate::api::auth::LoginThrottle::new(),
+            codex_login: crate::api::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(crate::api::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
+            resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+        let state = collector_test_state().await;
+        let instance = state.db.instance_id().await.unwrap().to_string();
+        let router = crate::api::create_router(state);
+        let writer = WitnessWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let valid = payload();
+        let mut invalid = valid.clone();
+        invalid["total_ms"] = (-1).into();
+        for (authenticated, body, status) in [
+            (false, valid.clone(), StatusCode::UNAUTHORIZED),
+            (true, invalid, StatusCode::BAD_REQUEST),
+            (
+                true,
+                serde_json::json!({"private": "NEVER_CAPTURE"}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (true, valid.clone(), StatusCode::NO_CONTENT),
+            (true, valid.clone(), StatusCode::NO_CONTENT),
+        ] {
+            let mut request = Request::post("/api/telemetry/conversation-view")
+                .header("Content-Type", "application/json");
+            if authenticated {
+                request = request.header("Authorization", "Bearer collector-test-password");
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .with_subscriber(dispatch.clone())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let bytes = writer.0.lock().unwrap().clone();
+            let witnesses: Vec<serde_json::Value> = String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|line| line["target"] == "phoenix_ide::view_journey_acceptance")
+                .collect();
+            if status != StatusCode::NO_CONTENT {
+                assert!(witnesses.is_empty());
+            }
+        }
+        let bytes = writer.0.lock().unwrap().clone();
+        let witnesses: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["target"] == "phoenix_ide::view_journey_acceptance")
+            .collect();
+        assert_eq!(witnesses.len(), 2);
+        for witness in witnesses {
+            assert_eq!(
+                witness["fields"],
+                serde_json::json!({
+                    "message": "conversation_view_accepted", "schema_version": 1,
+                    "open_id": valid["open_id"], "server_instance_id": instance,
+                    "backend_source": env!("PHOENIX_GIT_SHA"), "status": 204,
+                })
+            );
+        }
+    }
 
     fn payload() -> serde_json::Value {
         serde_json::json!({
