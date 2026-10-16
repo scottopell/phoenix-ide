@@ -2129,3 +2129,19 @@ diagnostic boundary; Node19 tests pass, including label preservation and private
 setup-error sanitation. No scenario assertion, timeout, retry, outcome or exact
 collector/export criterion changes. A successor may localize the failed stage;
 it cannot retroactively establish the previous cause or any acceptance.
+
+The bounded diagnostic successor `20f7b399bdbcb2c7714ac0cf08d448f4d5e2ae88`
+ran as `38940681380`, terminal failure. Witness `117107221064` failed the
+controlled scenario; Rust `117107339361` and all standard jobs passed. The
+retained typed location is ordinary/history/physical_history, assertion, with
+one report, one204 response, one admission, four observed requests, pending0
+and capture errors0. There are no completed trials. This localizes the failure
+to physical target validation after report observation; it does not distinguish
+a null fully-visible oracle from the subsequent identity/source assertions, and
+it does not establish independent collector/export joining or normal final drain.
+No causal claim about app geometry, sampler or transport is inferred. Artifact
+`12063282692` is96,430,001B; selected bounded reads75,314B retain the failure,
+browser log and startup identity. The next step is source/target/physical-oracle
+diagnosis, not another unchanged execution or weakening of the fully-visible
+persisted-identity assertion. No additional run is dispatched by recording this
+result. Resumeunsupported, overheadfalse and fullacceptancefalse remain explicit.
