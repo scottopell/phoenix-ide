@@ -67,6 +67,7 @@ impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
 
 const SOCKET_NAME: &str = "guardian.sock";
 const IO_SLICE: Duration = Duration::from_millis(250);
+const EFFECT_RESPONSE_SLICE: Duration = Duration::from_secs(2);
 
 fn permission_denied() -> io::Error {
     io::Error::new(
@@ -313,6 +314,9 @@ fn serve_frame<E: GuardianExecutor>(
 ) -> Result<(), CodecError> {
     let result = (|| {
         let request: Request = read_frame(stream)?;
+        if matches!(request, Request::DispatchSubmit { .. }) {
+            stream.deadline = (Instant::now() + EFFECT_RESPONSE_SLICE).min(until);
+        }
         let ack_request = matches!(request, Request::AckAfterAppliedRevision { .. });
         let response = server.handle(request);
         if ack_request && matches!(response, Response::Acked { .. }) {
@@ -442,13 +446,21 @@ impl GuardianClient {
         })
     }
     fn exchange(&mut self, request: &Request) -> Result<Response, ClientError> {
+        self.exchange_with_slice(request, IO_SLICE)
+    }
+
+    fn exchange_with_slice(
+        &mut self,
+        request: &Request,
+        slice: Duration,
+    ) -> Result<Response, ClientError> {
         let result = (|| {
             let mut frame = DeadlineStream {
                 stream: self
                     .stream
                     .as_mut()
                     .ok_or(ClientError::UnexpectedResponse)?,
-                deadline: Instant::now() + IO_SLICE,
+                deadline: Instant::now() + slice,
             };
             write_frame(&mut frame, request)?;
             let response = read_frame(&mut frame)?;
@@ -634,11 +646,14 @@ impl GuardianClient {
         };
         let now =
             crate::MonotonicTick::native_now().map_err(|_| ClientError::UnexpectedResponse)?;
-        let Response::Submitted { key: returned } = self.exchange(&Request::DispatchSubmit {
-            session: snapshot.session,
-            admission,
-            now: now.get(),
-        })?
+        let Response::Submitted { key: returned } = self.exchange_with_slice(
+            &Request::DispatchSubmit {
+                session: snapshot.session,
+                admission,
+                now: now.get(),
+            },
+            EFFECT_RESPONSE_SLICE,
+        )?
         else {
             return Err(ClientError::UnexpectedResponse);
         };

@@ -11,8 +11,8 @@ use std::{
 };
 
 use phoenix_deployment_controller::{
-    ControllerOs, IdentityObservation, MacOsControllerOs, ResourceObservationFailure, Signal,
-    SignalOutcome, SupervisedChild, SupervisionRisk,
+    ControllerOs, IdentityObservation, MacOsControllerOs, Signal, SignalOutcome, SupervisedChild,
+    SupervisionRisk,
 };
 
 #[test]
@@ -242,20 +242,10 @@ impl Drop for FixtureDirectory {
 fn native_resource_sample_reports_capacity_and_measured_contention() {
     let mut os = MacOsControllerOs::new(PathBuf::from("/tmp"))
         .expect("native resource baseline is observable");
-    let mut observed = None;
-    for sequence in 0..50 {
-        // test-timing-allow: elapsed time is required for cumulative native CPU counters to advance.
-        thread::sleep(Duration::from_millis(20));
-        match os.sample_resources(sequence) {
-            Ok(sample) => {
-                observed = Some(sample);
-                break;
-            }
-            Err(ResourceObservationFailure::TemporarilyUnavailable) => {}
-            Err(error) => panic!("native resource observation failed: {error:?}"),
-        }
-    }
-    let sample = observed.expect("CPU counters advance within the bounded observation loop");
+    let sample = os
+        .sample_resources(41)
+        .expect("one native sample waits boundedly for measurable CPU counters");
+    assert_eq!(sample.sequence, 41);
     assert!(sample.capacity.available_memory_bytes > 0);
     assert!(sample.capacity.available_storage_bytes > 0);
     assert!(sample.contention.cpu.get() <= 10_000);

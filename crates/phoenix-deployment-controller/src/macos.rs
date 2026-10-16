@@ -65,6 +65,9 @@ struct CpuTicks {
     nice: u32,
 }
 
+const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
+const CPU_SAMPLE_ATTEMPTS: usize = 50;
+
 pub struct MacOsControllerOs {
     storage_path: PathBuf,
     previous_cpu: CpuTicks,
@@ -94,6 +97,33 @@ impl MacOsControllerOs {
     ) -> Result<CpuContentionBasisPoints, ResourceObservationFailure> {
         let previous_cpu = mem::replace(&mut self.previous_cpu, current_cpu);
         cpu_contention(previous_cpu, current_cpu)
+    }
+
+    fn sample_cpu_contention(
+        &mut self,
+    ) -> Result<CpuContentionBasisPoints, ResourceObservationFailure> {
+        self.sample_cpu_contention_with(|| cpu_ticks().map_err(resource_error), thread::sleep)
+    }
+
+    fn sample_cpu_contention_with(
+        &mut self,
+        mut read: impl FnMut() -> Result<CpuTicks, ResourceObservationFailure>,
+        mut wait: impl FnMut(Duration),
+    ) -> Result<CpuContentionBasisPoints, ResourceObservationFailure> {
+        for attempt in 0..CPU_SAMPLE_ATTEMPTS {
+            let previous_cpu = self.previous_cpu;
+            let current_cpu = read()?;
+            match self.observe_cpu_contention(current_cpu) {
+                Ok(contention) => return Ok(contention),
+                Err(ResourceObservationFailure::TemporarilyUnavailable)
+                    if current_cpu == previous_cpu && attempt + 1 < CPU_SAMPLE_ATTEMPTS =>
+                {
+                    wait(CPU_SAMPLE_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ResourceObservationFailure::TemporarilyUnavailable)
     }
 
     /// Spawns a direct child as the leader of a controller-owned process group.
@@ -355,8 +385,7 @@ impl ControllerOs for MacOsControllerOs {
         &mut self,
         sequence: u64,
     ) -> Result<ResourceSample, ResourceObservationFailure> {
-        let current_cpu = cpu_ticks().map_err(resource_error)?;
-        let contention = self.observe_cpu_contention(current_cpu)?;
+        let contention = self.sample_cpu_contention()?;
         let available_memory_bytes = available_memory_bytes().map_err(resource_error)?;
         let available_storage_bytes =
             available_storage_bytes(&self.storage_path).map_err(resource_error)?;
@@ -937,6 +966,112 @@ mod tests {
             .get(),
             5_000
         );
+    }
+
+    #[test]
+    fn one_sample_waits_only_for_an_unchanged_cpu_snapshot() {
+        let baseline = CpuTicks {
+            user: 100,
+            system: 100,
+            idle: 100,
+            nice: 100,
+        };
+        let advanced = CpuTicks {
+            user: 200,
+            idle: 200,
+            ..baseline
+        };
+        let mut os = MacOsControllerOs {
+            storage_path: PathBuf::from("/tmp"),
+            previous_cpu: baseline,
+        };
+        let mut reads = [baseline, advanced].into_iter();
+        let mut waits = Vec::new();
+        let contention = os
+            .sample_cpu_contention_with(
+                || Ok(reads.next().expect("two counter reads")),
+                |duration| waits.push(duration),
+            )
+            .expect("advanced counters produce one real interval");
+        assert_eq!(contention.get(), 5_000);
+        assert_eq!(waits, [CPU_SAMPLE_INTERVAL]);
+        assert_eq!(os.previous_cpu, advanced);
+        assert!(reads.next().is_none());
+    }
+
+    #[test]
+    fn one_sample_exhausts_identical_counters_with_a_typed_failure() {
+        let baseline = CpuTicks {
+            user: 100,
+            system: 100,
+            idle: 100,
+            nice: 100,
+        };
+        let mut os = MacOsControllerOs {
+            storage_path: PathBuf::from("/tmp"),
+            previous_cpu: baseline,
+        };
+        let mut reads = 0;
+        let mut waits = 0;
+        assert_eq!(
+            os.sample_cpu_contention_with(
+                || {
+                    reads += 1;
+                    Ok(baseline)
+                },
+                |duration| {
+                    assert_eq!(duration, CPU_SAMPLE_INTERVAL);
+                    waits += 1;
+                },
+            ),
+            Err(ResourceObservationFailure::TemporarilyUnavailable)
+        );
+        assert_eq!(reads, CPU_SAMPLE_ATTEMPTS);
+        assert_eq!(waits, CPU_SAMPLE_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn one_sample_does_not_retry_regression_or_native_failure() {
+        let baseline = CpuTicks {
+            user: 100,
+            system: 100,
+            idle: 100,
+            nice: 100,
+        };
+        let regression = CpuTicks {
+            user: 99,
+            ..baseline
+        };
+        let mut os = MacOsControllerOs {
+            storage_path: PathBuf::from("/tmp"),
+            previous_cpu: baseline,
+        };
+        let mut waits = 0;
+        assert_eq!(
+            os.sample_cpu_contention_with(|| Ok(regression), |_| waits += 1,),
+            Err(ResourceObservationFailure::TemporarilyUnavailable)
+        );
+        assert_eq!(waits, 0);
+        assert_eq!(os.previous_cpu, regression);
+
+        for failure in [
+            ResourceObservationFailure::TemporarilyUnavailable,
+            ResourceObservationFailure::Malformed,
+        ] {
+            let mut reads = 0;
+            assert_eq!(
+                os.sample_cpu_contention_with(
+                    || {
+                        reads += 1;
+                        Err(failure)
+                    },
+                    |_| waits += 1,
+                ),
+                Err(failure)
+            );
+            assert_eq!(reads, 1);
+            assert_eq!(waits, 0);
+        }
     }
 
     #[test]

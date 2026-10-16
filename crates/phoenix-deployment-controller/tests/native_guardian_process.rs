@@ -548,6 +548,8 @@ fn sample_death_and_recover(lost_response: bool) {
     assert_eq!(before.0, 1);
     assert_eq!(before.1, 1);
     assert_eq!(before.2, 0);
+    assert_eq!(sample.sequence, 0);
+    assert_eq!(before.4, 0);
     drop(observed);
     runner.finish();
     if let Some(mut stream) = control {
