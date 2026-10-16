@@ -1,6 +1,11 @@
 (() => {
   if (globalThis.__phoenixReferenceInputGuard) return true;
   let active = null;
+  let probeAcknowledged = false;
+  const probeType = '__phoenixReferenceProbe_' + Math.random().toString(36).slice(2);
+  const ProbeEvent = Event;
+  const dispatchProbe = EventTarget.prototype.dispatchEvent.bind(window);
+  window.addEventListener(probeType, () => { probeAcknowledged = true; }, {capture: true});
   const receipt = globalThis.__phoenixReferenceInputReceipt;
   if (typeof receipt !== 'function') throw Error('Reference receipt binding unavailable');
   function containsHit(target, x, y) {
@@ -45,6 +50,9 @@
   Object.defineProperty(globalThis, '__phoenixReferenceInputGuard', {
     value: Object.freeze({
       arm(node, token) {
+        probeAcknowledged = false;
+        dispatchProbe(new ProbeEvent(probeType));
+        if (!probeAcknowledged) throw Error('Reference input guard unavailable after document reset; navigate to a fresh document and call browser_snapshot again');
         if (active) throw Error('A reference input operation is already active');
         if (!node.isConnected || node.ownerDocument !== document) throw Error('stale ref');
         active = {node, token, rejected: false, clicked: false};

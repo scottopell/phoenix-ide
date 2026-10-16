@@ -4,6 +4,7 @@ mod collection;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use chromiumoxide::cdp::browser_protocol::{
     accessibility::{AxNode, AxValue},
@@ -12,6 +13,7 @@ use chromiumoxide::cdp::browser_protocol::{
         DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
         DispatchMouseEventType, InsertTextParams, MouseButton,
     },
+    page::EventFrameNavigated,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallFunctionOnParams, EventBindingCalled, ReleaseObjectParams, RemoteObjectId,
@@ -56,6 +58,80 @@ pub(crate) struct SnapshotReferences {
     document: BackendNodeId,
     nodes: HashMap<String, BackendNodeId>,
     artifact: Option<SnapshotArtifact>,
+}
+
+#[derive(Default)]
+pub(crate) struct SnapshotState {
+    current: Arc<StdMutex<SnapshotStorage>>,
+    navigation_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(test)]
+    retirement: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+struct SnapshotStorage {
+    generation: u64,
+    refs: Option<SnapshotReferences>,
+}
+
+impl SnapshotStorage {
+    fn invalidate(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.refs = None;
+        self.generation
+    }
+}
+
+impl SnapshotState {
+    async fn listen(&mut self, page: &Page) -> Result<(), BrowserError> {
+        if self.navigation_task.is_some() {
+            return Ok(());
+        }
+        let mut events = page.event_listener::<EventFrameNavigated>().await?;
+        let current = Arc::downgrade(&self.current);
+        #[cfg(test)]
+        let retirement = self.retirement.clone();
+        self.navigation_task = Some(tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                if event.frame.parent_id.is_some() {
+                    continue;
+                }
+                let Some(current) = current.upgrade() else {
+                    break;
+                };
+                current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .invalidate();
+                #[cfg(test)]
+                retirement.notify_one();
+            }
+        }));
+        Ok(())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SnapshotStorage> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn invalidate(&self) -> u64 {
+        self.lock().invalidate()
+    }
+
+    pub(crate) fn stop(&mut self) {
+        if let Some(task) = self.navigation_task.take() {
+            task.abort();
+        }
+        self.invalidate();
+    }
+}
+
+impl Drop for SnapshotState {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[derive(Debug)]
@@ -258,7 +334,8 @@ impl BrowserSession {
         &mut self,
         interactive_only: bool,
     ) -> Result<String, BrowserError> {
-        self.invalidate_snapshot();
+        self.snapshot.listen(&self.page).await?;
+        let generation = self.snapshot.invalidate();
         let document = self.page.get_document().await?.backend_node_id;
         let frame = self
             .page
@@ -278,12 +355,18 @@ impl BrowserSession {
             ));
         }
         let (output, refs) = render(&tree.nodes, interactive_only, document);
-        self.snapshot = Some(refs);
+        let mut storage = self.snapshot.lock();
+        if storage.generation != generation {
+            return Err(error(
+                "Document changed during snapshot; call browser_snapshot again",
+            ));
+        }
+        storage.refs = Some(refs);
         Ok(output)
     }
 
     pub fn invalidate_snapshot(&mut self) {
-        self.snapshot = None;
+        self.snapshot.invalidate();
     }
 
     /// Save bounded snapshot text in an owner-only session-owned artifact.
@@ -295,7 +378,8 @@ impl BrowserSession {
         runtime_env: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
         output: &str,
     ) -> Result<std::path::PathBuf, BrowserError> {
-        let refs = self.snapshot.as_mut().ok_or_else(|| error(STALE))?;
+        let mut storage = self.snapshot.lock();
+        let refs = storage.refs.as_mut().ok_or_else(|| error(STALE))?;
         let artifact =
             SnapshotArtifact::write(runtime_env.tmp_root(), output).map_err(|failure| {
                 error(format!("Could not save accessibility snapshot: {failure}"))
@@ -306,9 +390,15 @@ impl BrowserSession {
     }
 
     async fn reference_object(&self, reference: &str) -> Result<ReferenceObject, BrowserError> {
-        let refs = self.snapshot.as_ref().ok_or_else(|| error(STALE))?;
-        let backend = refs.nodes.get(reference).ok_or_else(|| error(STALE))?;
-        if self.page.get_document().await?.backend_node_id != refs.document {
+        let (document, backend) = {
+            let storage = self.snapshot.lock();
+            let refs = storage.refs.as_ref().ok_or_else(|| error(STALE))?;
+            (
+                refs.document,
+                *refs.nodes.get(reference).ok_or_else(|| error(STALE))?,
+            )
+        };
+        if self.page.get_document().await?.backend_node_id != document {
             return Err(error(STALE));
         }
         let context = self
@@ -320,7 +410,7 @@ impl BrowserSession {
             .page
             .execute(
                 ResolveNodeParams::builder()
-                    .backend_node_id(*backend)
+                    .backend_node_id(backend)
                     .execution_context_id(context)
                     .build(),
             )
@@ -777,6 +867,147 @@ mod tests {
             assert_eq!(result["outcome"]["rejected"], true);
         }
         manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn native_reference_guard_refuses_document_reset_without_hooks() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("snapshot-reset-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        let (result, clicked) = {
+            let mut session = session.write().await;
+            session.page.goto("about:blank").await.unwrap();
+            session.page.evaluate("document.open(); document.write('<button onclick=window.clicked++>Reset target</button>'); document.close(); window.clicked=0").await.unwrap();
+            let snapshot = session.accessibility_snapshot(false).await.unwrap();
+            let reference = snapshot
+                .lines()
+                .find(|line| line.contains("Reset target"))
+                .unwrap()
+                .split('[')
+                .nth(1)
+                .unwrap()
+                .split(']')
+                .next()
+                .unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                session.click_reference(reference),
+            )
+            .await;
+            let clicked = session
+                .page
+                .evaluate("window.clicked")
+                .await
+                .unwrap()
+                .into_value::<u64>()
+                .unwrap();
+            (result, clicked)
+        };
+        manager.shutdown_all().await.unwrap();
+        let failure = result
+            .expect("guard fails before dispatch without waiting for a receipt")
+            .unwrap_err();
+        assert!(
+            failure.to_string().contains("guard unavailable"),
+            "{failure}"
+        );
+        assert_eq!(
+            clicked, 0,
+            "no native action may escape missing guard hooks"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_artifacts_retire_on_full_navigation_without_new_snapshot() {
+        use chromiumoxide::cdp::browser_protocol::page::EventNavigatedWithinDocument;
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(root.path());
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("snapshot-retirement-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        {
+            let mut session = session.write().await;
+            for via_eval in [false, true] {
+                let html = format!("<button>{}</button>", "Accessible value ".repeat(400));
+                let listening = session.snapshot.navigation_task.is_some();
+                let retirement = session.snapshot.retirement.clone();
+                session
+                    .page
+                    .goto(format!("about:blank?source={via_eval}"))
+                    .await
+                    .unwrap();
+                session
+                    .page
+                    .evaluate(format!("document.body.innerHTML={}", quoted(&html)))
+                    .await
+                    .unwrap();
+                if listening {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), retirement.notified())
+                        .await
+                        .unwrap();
+                }
+                let output = session.accessibility_snapshot(false).await.unwrap();
+                assert!(output.len() > 4096);
+                let path = session.save_snapshot_artifact(&runtime, &output).unwrap();
+                let mut fragments = session
+                    .page
+                    .event_listener::<EventNavigatedWithinDocument>()
+                    .await
+                    .unwrap();
+                session
+                    .page
+                    .evaluate("location.hash='same-document'")
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), fragments.next())
+                    .await
+                    .expect("same-document hash navigation event")
+                    .unwrap();
+                assert!(
+                    path.exists(),
+                    "fragment navigation retains current snapshot"
+                );
+                if via_eval {
+                    session
+                        .page
+                        .evaluate("location.href='about:blank?eval-replacement'")
+                        .await
+                        .unwrap();
+                } else {
+                    session
+                        .page
+                        .goto("about:blank?navigate-replacement")
+                        .await
+                        .unwrap();
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(5), retirement.notified())
+                    .await
+                    .expect("main-frame retirement event");
+                assert!(
+                    !path.exists(),
+                    "full navigation retires artifact while session write lock is held"
+                );
+            }
+        }
+        manager.shutdown_all().await.unwrap();
     }
 
     #[test]
