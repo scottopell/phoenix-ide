@@ -50,6 +50,65 @@ def wire(children=1):
 
 
 class SinkTests(unittest.TestCase):
+    def test_capture_rejection_codes_are_finite_private_free_and_fail_closed_without_network(self):
+        cases = [
+            ("body_byte_budget", {"MAX_BODY": 1}, None),
+            ("capture_byte_budget", {"MAX_BYTES": 1}, None),
+            ("batch_count_budget", {"MAX_BATCHES": 0}, None),
+            ("capture_span_budget", {"MAX_SPANS": 1}, [None, None]),
+            ("decoded_byte_budget", {"MAX_BYTES": 10}, [{"private": "PRIVATE" * 10}]),
+        ]
+        for expected, limits, decoded in cases:
+            with self.subTest(code=expected), tempfile.TemporaryDirectory() as directory:
+                capture = sink.Capture(Path(directory) / "capture")
+                data = b"x" if decoded is not None else wire().SerializeToString()
+                with patch.multiple(sink, **limits):
+                    if decoded is None:
+                        with self.assertRaises(sink.CaptureRejected): capture.accept(data)
+                    else:
+                        with patch.object(sink, "decode", return_value=decoded):
+                            with self.assertRaises(sink.CaptureRejected): capture.accept(data)
+                receipt = json.loads((capture.output / "capture.json").read_text())
+                self.assertEqual(receipt["errors"], [expected])
+                self.assertEqual(receipt["records"], [])
+                self.assertEqual(list(capture.output.glob("*.pb")), [])
+                self.assertNotIn("PRIVATE", json.dumps(receipt))
+                with self.assertRaises(ValueError): sink.final_index(capture.output)
+                with self.assertRaises(ValueError): capture.accept(b"x")
+                self.assertEqual(capture.errors, [expected])
+
+    def test_decode_rejection_predicates_are_retained_without_values_or_attribute_names(self):
+        mutations = {
+            "attribute_unknown": lambda view: view.attributes.add(key="PRIVATE_UNKNOWN").value.__setattr__("string_value", "PRIVATE"),
+            "attribute_duplicate": lambda view: view.attributes.add(key="open.id").value.__setattr__("string_value", "PRIVATE"),
+            "attribute_string_budget": lambda view: view.attributes[0].value.__setattr__("string_value", "PRIVATE" * 1000),
+            "attribute_non_scalar": lambda view: view.attributes[0].value.array_value.values.add().CopyFrom(view.attributes[1].value),
+            "attribute_non_finite": lambda view: view.attributes[0].value.__setattr__("double_value", float("inf")),
+            "trace_identity_invalid": lambda view: setattr(view, "span_id", b""),
+        }
+        for expected, mutate in mutations.items():
+            request = wire(0)
+            mutate(request.resource_spans[0].scope_spans[0].spans[0])
+            with self.subTest(code=expected), tempfile.TemporaryDirectory() as directory:
+                capture = sink.Capture(Path(directory) / "capture")
+                with self.assertRaises(sink.CaptureRejected): capture.accept(request.SerializeToString())
+                receipt = json.loads((capture.output / "capture.json").read_text())
+                self.assertEqual(receipt["errors"], [expected])
+                self.assertNotIn("PRIVATE", json.dumps(receipt))
+        for data, expected in [(b"\xff", "protobuf_invalid")]:
+            with tempfile.TemporaryDirectory() as directory:
+                capture = sink.Capture(Path(directory) / "capture")
+                with self.assertRaises(ValueError): capture.accept(data)
+                self.assertEqual(capture.errors, [expected])
+
+    def test_internal_capture_error_never_persists_exception_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = sink.Capture(Path(directory) / "capture")
+            with patch.object(sink, "decode", side_effect=RuntimeError("PRIVATE")):
+                with self.assertRaises(RuntimeError): capture.accept(b"x")
+            self.assertEqual(capture.errors, ["capture_internal_failure"])
+            self.assertNotIn("PRIVATE", (capture.output / "capture.json").read_text())
+
     def test_semantic_retrieval_not_http_acceptance(self):
         with tempfile.TemporaryDirectory() as directory:
             capture = sink.Capture(Path(directory) / "capture")

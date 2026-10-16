@@ -35,39 +35,48 @@ VIEW_ATTRIBUTES = {
 }
 
 
+class CaptureRejected(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
 def scalar(value):
     kind = value.WhichOneof("value")
     if kind not in {"string_value", "bool_value", "int_value", "double_value"}:
-        raise ValueError("non-scalar trace attribute")
+        raise CaptureRejected("attribute_non_scalar")
     result = getattr(value, kind)
     if isinstance(result, str) and len(result.encode()) > 4096:
-        raise ValueError("trace string budget exceeded")
+        raise CaptureRejected("attribute_string_budget")
     if isinstance(result, float) and not math.isfinite(result):
-        raise ValueError("non-finite trace attribute")
+        raise CaptureRejected("attribute_non_finite")
     return result
 
 
 def decode(data):
-    request = ExportTraceServiceRequest.FromString(data)
+    try:
+        request = ExportTraceServiceRequest.FromString(data)
+    except Exception:
+        raise CaptureRejected("protobuf_invalid") from None
     records = []
     for resource in request.resource_spans:
         service = next((scalar(a.value) for a in resource.resource.attributes if a.key == "service.name"), None)
         for scope in resource.scope_spans:
             for span in scope.spans:
                 if len(records) >= MAX_SPANS:
-                    raise ValueError("span budget exceeded")
+                    raise CaptureRejected("batch_span_budget")
                 attributes = {}
                 for attribute in span.attributes if span.name in {"browser.conversation_view", "browser.view_correlation", "coordinator.history_open"} else ():
                     if len(attributes) >= 128:
-                        raise ValueError("trace attribute budget exceeded")
+                        raise CaptureRejected("attribute_count_budget")
                     if attribute.key in attributes:
-                        raise ValueError("duplicate trace attribute")
+                        raise CaptureRejected("attribute_duplicate")
                     attributes[attribute.key] = scalar(attribute.value)
                 allowed = VIEW_ATTRIBUTES if span.name == "browser.conversation_view" else ({"open.id", "correlation.kind", "correlation.id"} if span.name == "browser.view_correlation" else {"open.id", "product_conversation.id"})
                 if set(attributes) - allowed:
-                    raise ValueError("unknown retained telemetry attribute")
+                    raise CaptureRejected("attribute_unknown")
                 if len(span.trace_id) != 16 or not any(span.trace_id) or len(span.span_id) != 8 or not any(span.span_id):
-                    raise ValueError("invalid trace/span identity")
+                    raise CaptureRejected("trace_identity_invalid")
                 records.append({"service": service, "name": span.name, "trace_id": span.trace_id.hex(),
                                 "span_id": span.span_id.hex(), "parent_span_id": span.parent_span_id.hex(),
                                 "attributes": attributes})
@@ -88,20 +97,24 @@ class Capture:
             if self.errors:
                 raise ValueError("capture already failed")
             try:
-                if len(data) > MAX_BODY or self.bytes + len(data) > MAX_BYTES or self.batches >= MAX_BATCHES:
-                    raise ValueError("capture byte/batch budget exceeded")
+                if len(data) > MAX_BODY:
+                    raise CaptureRejected("body_byte_budget")
+                if self.bytes + len(data) > MAX_BYTES:
+                    raise CaptureRejected("capture_byte_budget")
+                if self.batches >= MAX_BATCHES:
+                    raise CaptureRejected("batch_count_budget")
                 records = decode(data)
                 if self.spans + len(records) > MAX_SPANS:
-                    raise ValueError("capture span budget exceeded")
+                    raise CaptureRejected("capture_span_budget")
                 if len(json.dumps(self.records + records).encode()) > MAX_BYTES:
-                    raise ValueError("decoded record byte budget exceeded")
+                    raise CaptureRejected("decoded_byte_budget")
                 (self.output / f"batch-{self.batches:03d}.pb").write_bytes(data)
                 self.bytes += len(data)
                 self.batches += 1
                 self.spans += len(records)
                 self.records.extend(records)
             except Exception as error:
-                self.errors.append(type(error).__name__)
+                self.errors.append(error.code if isinstance(error, CaptureRejected) else "capture_internal_failure")
                 self.finish()
                 raise
             self.finish()
