@@ -1255,6 +1255,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             .map(|_| ())
             .map_err(|e| format!("reload failed: {e}")),
         Step::Click { selector } => {
+            let _input = guard.lock_native_input().await;
             let el = guard
                 .page
                 .find_element(selector)
@@ -1266,6 +1267,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
                 .map_err(|e| format!("click on {selector} failed: {e}"))
         }
         Step::Type { selector, text } => {
+            let _input = guard.lock_native_input().await;
             let el = guard
                 .page
                 .find_element(selector)
@@ -2159,6 +2161,10 @@ async fn action_heap_snapshot(
         return ToolOutput::error(format!("heap_snapshot failed: {e}"));
     }
 
+    finish_heap_snapshot(&path, baseline).await
+}
+
+async fn finish_heap_snapshot(path: &str, baseline: Option<&str>) -> ToolOutput {
     let Some(baseline_path) = baseline else {
         return ToolOutput::success(format!(
             "Heap snapshot saved to {path} (load in Chrome DevTools → Memory). \
@@ -2167,29 +2173,30 @@ async fn action_heap_snapshot(
         .with_display(json!({"artifact_path": path}));
     };
 
-    // Allium HeapDiffRequiresTwoSnapshots: a diff against a missing
-    // baseline is an error, not a zero-delta result.
-    let baseline_text = match tokio::fs::read_to_string(baseline_path).await {
-        Ok(t) => t,
-        Err(e) => {
-            return ToolOutput::error(format!(
-                "baseline snapshot {baseline_path} not readable: {e} \
-                 (\"no leak\" and \"never measured\" must stay distinguishable)"
-            ));
+    match heap_snapshot_diff(path, baseline_path).await {
+        Ok(output) => output,
+        Err(error) => {
+            ToolOutput::error(error).with_display(json!({"post": path, "baseline": baseline_path}))
         }
-    };
-    let post_text = match tokio::fs::read_to_string(&path).await {
-        Ok(t) => t,
-        Err(e) => return ToolOutput::error(format!("post snapshot not readable: {e}")),
-    };
-    let base_stats = match parse_heap_stats(&baseline_text) {
-        Ok(s) => s,
-        Err(e) => return ToolOutput::error(format!("parsing baseline: {e}")),
-    };
-    let post_stats = match parse_heap_stats(&post_text) {
-        Ok(s) => s,
-        Err(e) => return ToolOutput::error(format!("parsing post snapshot: {e}")),
-    };
+    }
+}
+
+async fn heap_snapshot_diff(path: &str, baseline_path: &str) -> Result<ToolOutput, String> {
+    let baseline_text = tokio::fs::read_to_string(baseline_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "baseline snapshot {baseline_path} not readable: {error} \
+                 (\"no leak\" and \"never measured\" must stay distinguishable)"
+            )
+        })?;
+    let post_text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("post snapshot not readable: {error}"))?;
+    let base_stats =
+        parse_heap_stats(&baseline_text).map_err(|error| format!("parsing baseline: {error}"))?;
+    let post_stats =
+        parse_heap_stats(&post_text).map_err(|error| format!("parsing post snapshot: {error}"))?;
 
     let node_delta = i64::try_from(post_stats.node_count).unwrap_or(i64::MAX)
         - i64::try_from(base_stats.node_count).unwrap_or(i64::MAX);
@@ -2209,7 +2216,7 @@ async fn action_heap_snapshot(
         base_stats.detached_dom_nodes,
         post_stats.detached_dom_nodes,
     );
-    ToolOutput::success(summary).with_display(json!({
+    Ok(ToolOutput::success(summary).with_display(json!({
         "baseline": baseline_path,
         "post": path,
         "node_count_delta": node_delta,
@@ -2219,7 +2226,7 @@ async fn action_heap_snapshot(
             "baseline": base_stats.detached_dom_nodes,
             "post": post_stats.detached_dom_nodes,
         },
-    }))
+    })))
 }
 
 // ============================================================================
@@ -2346,6 +2353,71 @@ mod tests {
             ]
         );
         assert!((summary.long_task_total_ms() - 125.001).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn captured_heap_snapshot_remains_discoverable_when_diff_fails() {
+        let scratch = tempfile::tempdir().expect("snapshot scratch directory");
+        let post_path = scratch.path().join("post.heapsnapshot");
+        let baseline_path = scratch.path().join("baseline.heapsnapshot");
+        let post = post_path.to_str().unwrap();
+        let baseline = baseline_path.to_str().unwrap();
+        let snapshot = r#"{"snapshot":{"meta":{"node_fields":["name","self_size"]}},"nodes":[0,42],"strings":["Object"]}"#;
+        tokio::fs::write(post, snapshot).await.unwrap();
+
+        let missing_baseline = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!missing_baseline.is_success());
+        assert!(missing_baseline.output().contains("not readable"));
+        assert_eq!(
+            missing_baseline.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+        assert_eq!(tokio::fs::read_to_string(post).await.unwrap(), snapshot);
+
+        tokio::fs::write(baseline, "bad baseline").await.unwrap();
+        let malformed_baseline = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!malformed_baseline.is_success());
+        assert!(malformed_baseline.output().contains("parsing baseline"));
+        assert_eq!(
+            malformed_baseline.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+
+        tokio::fs::write(baseline, snapshot).await.unwrap();
+        tokio::fs::write(post, "bad post").await.unwrap();
+        let malformed_post = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!malformed_post.is_success());
+        assert!(malformed_post.output().contains("parsing post"));
+        assert_eq!(
+            malformed_post.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+
+        tokio::fs::remove_file(post).await.unwrap();
+        let missing_post = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!missing_post.is_success());
+        assert!(missing_post.output().contains("post snapshot not readable"));
+        assert_eq!(
+            missing_post.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+
+        tokio::fs::write(post, snapshot).await.unwrap();
+        let diff = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(diff.is_success(), "{}", diff.output());
+        let data = diff.display_data().unwrap();
+        assert_eq!(data["post"], post);
+        assert_eq!(data["baseline"], baseline);
+        assert_eq!(data["self_size_delta_bytes"], 0);
+        assert_eq!(data["node_count_delta"], 0);
+        assert!(data.get("artifact_path").is_none());
+
+        let standalone = finish_heap_snapshot(post, None).await;
+        assert!(standalone.is_success());
+        assert_eq!(
+            standalone.display_data(),
+            Some(&json!({"artifact_path": post}))
+        );
     }
 
     #[test]
