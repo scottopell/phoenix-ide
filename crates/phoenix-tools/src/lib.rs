@@ -1258,7 +1258,7 @@ mod tests {
             Arc::new(BrowserSessionManager::default()),
             Arc::new(BashHandleRegistry::new()),
             Arc::new(NoLlm),
-            ActiveTerminals::new(),
+            phoenix_terminal::ActiveTerminals::new(),
             registry,
             None,
             phoenix_core::work_scope::WorkScopeId::parse("legacy-test-scope").unwrap(),
