@@ -10284,6 +10284,22 @@ class DeployManifestKind(enum.Enum):
     UNKNOWN = "unknown"
 
 
+_PAIRED_DATABASE_UPGRADE_FIELDS = frozenset(
+    {
+        "database_path",
+        "backup_path",
+        "proof_path",
+        "controller_source_commit",
+        "controller_helper_sha256",
+        "controller_helper_path",
+    }
+)
+_CURRENT_SCHEMA_UPGRADE_FIELDS = _PAIRED_DATABASE_UPGRADE_FIELDS | {
+    "migration_registry_sha256",
+    "migration_registry_path",
+}
+
+
 def _deploy_manifest_kind(transaction: Path) -> DeployManifestKind:
     manifest_path = transaction / "manifest.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -10317,6 +10333,13 @@ def _deploy_manifest_kind(transaction: Path) -> DeployManifestKind:
         source_kind = payload.get("source_kind")
         if kind in {DeployManifestKind.PAIRED, DeployManifestKind.CURRENT_SCHEMA}:
             if source_kind != "prepared_artifact":
+                return DeployManifestKind.UNKNOWN
+            required_fields = (
+                _CURRENT_SCHEMA_UPGRADE_FIELDS
+                if kind is DeployManifestKind.CURRENT_SCHEMA
+                else _PAIRED_DATABASE_UPGRADE_FIELDS
+            )
+            if set(mode_payloads[kind]) != required_fields:
                 return DeployManifestKind.UNKNOWN
         elif source_kind not in {"local_head", "published_release"}:
             return DeployManifestKind.UNKNOWN
@@ -10375,6 +10398,7 @@ def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
                     os.fsync(fd)
                 finally:
                     os.close(fd)
+                _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
             raise
         return True
     except FileNotFoundError:
@@ -10976,6 +11000,16 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
 
 
+def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:
+    prefix = f".{evidence.name}."
+    with os.scandir(evidence.parent) as entries:
+        return tuple(
+            evidence.parent / entry.name
+            for entry in entries
+            if entry.name.startswith(prefix)
+        )
+
+
 def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False) -> None:
     mode_name = "current-schema" if current_schema else "paired"
     mode_key = "current_schema_upgrade" if current_schema else "paired_database_upgrade"
@@ -11064,15 +11098,17 @@ def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False
                     if backup.parent != staging or proof.parent != staging or proof.exists() or proof.is_symlink():
                         raise SystemExit("abandonment allocation context is ambiguous")
                     capacity_evidence = staging / "capacity.json"
-                    cleanup_paths = {backup, reserve, capacity_evidence}
-                    for evidence in (capacity_evidence, proof):
-                        cleanup_paths.update(evidence.parent.glob(f".{evidence.name}.*"))
-                    for allocation in (backup, reserve):
-                        cleanup_paths.update(
-                            allocation.with_name(allocation.name + suffix)
-                            for suffix in ("-journal", "-wal", "-shm")
-                        )
                     try:
+                        cleanup_paths = {backup, reserve, capacity_evidence}
+                        for evidence in (capacity_evidence, proof):
+                            cleanup_paths.update(
+                                _atomic_write_temporary_paths(evidence)
+                            )
+                        for allocation in (backup, reserve):
+                            cleanup_paths.update(
+                                allocation.with_name(allocation.name + suffix)
+                                for suffix in ("-journal", "-wal", "-shm")
+                            )
                         for allocation in cleanup_paths:
                             if allocation.is_symlink():
                                 raise OSError("abandonment allocation is symlink")

@@ -1436,9 +1436,12 @@ sys.exit({7 if partial else 0})
         manifest = self.manifest(database)
         claim = Path(manifest.active_path)
         claim.write_text(manifest.transaction_id + "\n")
-        with mock.patch.object(helper, "fsync_dir", side_effect=OSError("fsync failed")):
+        with mock.patch.object(
+            helper, "fsync_dir", side_effect=[OSError("fsync failed"), None]
+        ) as fsync_dir:
             with self.assertRaisesRegex(OSError, "fsync failed"):
                 helper.release_claim(manifest)
+        self.assertEqual(fsync_dir.call_args_list, [mock.call(claim.parent)] * 2)
         self.assertEqual(claim.read_text().strip(), manifest.transaction_id)
 
     def test_current_recovery_rechecks_unchanged_source_after_teardown(self) -> None:
@@ -2132,6 +2135,34 @@ sys.exit({7 if partial else 0})
         status = json.loads(Path(manifest.status_path).read_text())
         self.assertEqual(status["state"], "precondition_cleanup_pending")
         self.assertIn("fsync still uncertain", status["cleanup_failure"])
+
+    def test_cleanup_enumeration_failure_retains_pending_state_and_claim(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        self.write_current_status(
+            manifest,
+            "precondition_cleanup_pending",
+            failure="reservation failed",
+        )
+
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper.os, "scandir", side_effect=PermissionError("enumeration denied")
+        ), mock.patch.object(helper, "Launchctl") as launchctl:
+            with self.assertRaisesRegex(
+                helper.DatabaseCapacityCleanupFailure,
+                "could not enumerate atomic evidence temporaries.*enumeration denied",
+            ):
+                helper.cleanup_precondition_capacity(manifest, current_schema=True)
+
+        launchctl.assert_not_called()
+        self.assertEqual(claim.read_text(), manifest.transaction_id)
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_cleanup_pending")
+        self.assertIn("enumeration denied", status["cleanup_failure"])
 
     def test_cleanup_main_preserves_original_failure_when_retry_fails(self) -> None:
         database = self.database()

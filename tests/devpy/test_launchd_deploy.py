@@ -30,6 +30,24 @@ def load(path, name):
 helper = load(ROOT / "scripts" / "launchd_deploy_helper.py", "launchd_deploy_helper_test")
 
 
+def retained_mode_payload(mode: str, **overrides):
+    payload = {
+        "database_path": "/database.sqlite3",
+        "backup_path": "/backup.sqlite3",
+        "proof_path": "/proof.json",
+        "controller_source_commit": "a" * 40,
+        "controller_helper_sha256": "b" * 64,
+        "controller_helper_path": "/launchd_deploy_helper.py",
+    }
+    if mode == "current_schema":
+        payload.update(
+            migration_registry_sha256="c" * 64,
+            migration_registry_path="/migrations.rs",
+        )
+    payload.update(overrides)
+    return payload
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0
@@ -1810,7 +1828,12 @@ class PreparationTests(unittest.TestCase):
             transaction = root / "transactions" / "broken-pair"
             transaction.mkdir(parents=True)
             (transaction / "manifest.json").write_text(
-                json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {}})
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "paired_database_upgrade": retained_mode_payload("paired"),
+                    }
+                )
             )
             with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), \
                  mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), \
@@ -1860,7 +1883,7 @@ class PreparationTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "source_kind": "prepared_artifact",
-                                manifest_key: {},
+                                manifest_key: retained_mode_payload(expected_mode),
                             }
                         )
                     )
@@ -2099,7 +2122,19 @@ class PreparationTests(unittest.TestCase):
             staging = root / "transactions" / "preparing"
             staging.mkdir(parents=True)
             manifest = staging / "manifest.json"
-            manifest.write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {"backup_path": str(staging / "backup.sqlite3"), "proof_path": str(staging / "proof.json"), "database_path": str(root / "prod.db")}}))
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "paired_database_upgrade": retained_mode_payload(
+                            "paired",
+                            backup_path=str(staging / "backup.sqlite3"),
+                            proof_path=str(staging / "proof.json"),
+                            database_path=str(root / "prod.db"),
+                        ),
+                    }
+                )
+            )
             active, status = root / "active", root / "status.json"
             active.write_text("preparing\n")
             status.write_text(json.dumps({"transaction_id": "preparing", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "preparing", "preparing_pid": 123}))
@@ -2120,7 +2155,19 @@ class PreparationTests(unittest.TestCase):
             root = Path(td)
             staging = root / "transactions" / "prepared"
             staging.mkdir(parents=True)
-            (staging / "manifest.json").write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {"backup_path": str(staging / "backup.sqlite3"), "proof_path": str(staging / "proof.json"), "database_path": str(root / "prod.db")}}))
+            (staging / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "paired_database_upgrade": retained_mode_payload(
+                            "paired",
+                            backup_path=str(staging / "backup.sqlite3"),
+                            proof_path=str(staging / "proof.json"),
+                            database_path=str(root / "prod.db"),
+                        ),
+                    }
+                )
+            )
             active, status = root / "active", root / "status.json"
             active.write_text("prepared\n")
             status.write_text(json.dumps({"transaction_id": "prepared", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "prepared", "preparing_pid": 123}))
@@ -2155,11 +2202,12 @@ class PreparationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "source_kind": "prepared_artifact",
-                        "paired_database_upgrade": {
-                            "backup_path": str(backup),
-                            "proof_path": str(proof),
-                            "database_path": str(database),
-                        },
+                        "paired_database_upgrade": retained_mode_payload(
+                            "paired",
+                            backup_path=str(backup),
+                            proof_path=str(proof),
+                            database_path=str(database),
+                        ),
                     }
                 )
             )
@@ -2216,6 +2264,73 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(pending["state"], "precondition_cleanup_pending")
             self.assertIn("fsync failed", pending["cleanup_failure"])
 
+    def test_pre_handoff_cleanup_enumeration_failure_retains_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction_id = "cleanup-enumeration-failure"
+            staging = root / "transactions" / transaction_id
+            staging.mkdir(parents=True)
+            database = root / "prod.db"
+            backup = staging / "backup.sqlite3"
+            proof = staging / "proof.json"
+            (staging / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "paired_database_upgrade": retained_mode_payload(
+                            "paired",
+                            database_path=str(database),
+                            backup_path=str(backup),
+                            proof_path=str(proof),
+                        ),
+                    }
+                )
+            )
+            active = root / "active"
+            status = root / "status.json"
+            active.write_text(transaction_id + "\n")
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": transaction_id,
+                        "source_kind": "prepared_artifact",
+                        "prepared_mode": "paired",
+                        "state": "prepared",
+                        "preparing_pid": 123,
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev.sys, "platform", "darwin"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev.os, "kill", side_effect=ProcessLookupError
+            ), mock.patch.object(
+                self.dev.os,
+                "scandir",
+                side_effect=PermissionError("enumeration denied"),
+            ), mock.patch.object(
+                self.dev.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit, "cleanup is incomplete"
+                ):
+                    self.dev.cmd_prod_recover_paired(transaction_id)
+
+            self.assertEqual(active.read_text().strip(), transaction_id)
+            pending = json.loads(status.read_text())
+            self.assertEqual(pending["state"], "precondition_cleanup_pending")
+            self.assertIn("enumeration denied", pending["cleanup_failure"])
+
     def test_pre_handoff_abandonment_rejects_wrong_recovery_mode_without_mutation(self):
         cases = (
             ("paired_database_upgrade", True),
@@ -2238,11 +2353,16 @@ class PreparationTests(unittest.TestCase):
                     json.dumps(
                         {
                             "source_kind": "prepared_artifact",
-                            retained_mode: {
-                                "backup_path": str(backup),
-                                "proof_path": str(proof),
-                                "database_path": str(database),
-                            },
+                            retained_mode: retained_mode_payload(
+                                (
+                                    "paired"
+                                    if retained_mode == "paired_database_upgrade"
+                                    else "current_schema"
+                                ),
+                                backup_path=str(backup),
+                                proof_path=str(proof),
+                                database_path=str(database),
+                            ),
                         }
                     )
                 )
@@ -2380,7 +2500,14 @@ class PreparationTests(unittest.TestCase):
                 root = Path(td)
                 staging = root / "transactions" / "lost"
                 staging.mkdir(parents=True)
-                (staging / "manifest.json").write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {}}))
+                (staging / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "source_kind": "prepared_artifact",
+                            "paired_database_upgrade": retained_mode_payload("paired"),
+                        }
+                    )
+                )
                 active, status = root / "active", root / "status.json"
                 active.write_text("lost\n")
                 if contents is not None:
@@ -2511,7 +2638,12 @@ class PreparationTests(unittest.TestCase):
             transaction = root / "transactions" / "pending"
             transaction.mkdir(parents=True)
             (transaction / "manifest.json").write_text(
-                json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {}})
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "paired_database_upgrade": retained_mode_payload("paired"),
+                    }
+                )
             )
             with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status):
                 guidance = self.dev._paired_recovery_refusal("pending")
@@ -2641,7 +2773,7 @@ class PreparationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "source_kind": "prepared_artifact",
-                        "current_schema_upgrade": {},
+                        "current_schema_upgrade": retained_mode_payload("current_schema"),
                     }
                 )
             )
@@ -2680,11 +2812,12 @@ class PreparationTests(unittest.TestCase):
             payload = {
                 "source_kind": "prepared_artifact",
                 "transaction_id": "failed.current",
-                "current_schema_upgrade": {
-                    "controller_helper_path": str(retained),
-                    "controller_helper_sha256": self.dev._file_sha256(retained),
-                    "proof_path": str(transaction / "proof.json"),
-                },
+                "current_schema_upgrade": retained_mode_payload(
+                    "current_schema",
+                    controller_helper_path=str(retained),
+                    controller_helper_sha256=self.dev._file_sha256(retained),
+                    proof_path=str(transaction / "proof.json"),
+                ),
                 "helper_label": "com.phoenix-ide.deploy.failed.current",
             }
             (transaction / "manifest.json").write_text(json.dumps(payload))
@@ -3085,10 +3218,15 @@ class PreparationTests(unittest.TestCase):
             ), mock.patch.object(
                 self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
             ), mock.patch.object(
-                self.dev, "_fsync_directory", side_effect=OSError("fsync failed")
-            ):
+                self.dev,
+                "_fsync_directory",
+                side_effect=[OSError("fsync failed"), None],
+            ) as fsync_directory:
                 with self.assertRaisesRegex(OSError, "fsync failed"):
                     self.dev._release_launchd_deploy_claim("owner")
+            self.assertEqual(
+                fsync_directory.call_args_list, [mock.call(active.parent)] * 2
+            )
             self.assertEqual(active.read_text().strip(), "owner")
 
     def test_symlinked_manifest_is_unknown_and_retained_by_pruning(self):
@@ -3135,6 +3273,108 @@ class PreparationTests(unittest.TestCase):
                         self.dev._deploy_manifest_kind(transaction),
                         self.dev.DeployManifestKind.UNKNOWN,
                     )
+
+    def test_prepared_manifest_mode_requires_exact_helper_loadable_shape(self):
+        cases = (
+            ("paired_database_upgrade", "paired", self.dev.DeployManifestKind.PAIRED),
+            (
+                "current_schema_upgrade",
+                "current_schema",
+                self.dev.DeployManifestKind.CURRENT_SCHEMA,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            transaction = Path(td)
+            manifest = transaction / "manifest.json"
+            for key, mode, expected_kind in cases:
+                complete = retained_mode_payload(mode)
+                candidates = [({}, self.dev.DeployManifestKind.UNKNOWN)]
+                candidates.extend(
+                    (
+                        {name: value for name, value in complete.items() if name != missing},
+                        self.dev.DeployManifestKind.UNKNOWN,
+                    )
+                    for missing in complete
+                )
+                candidates.append(
+                    ({**complete, "unexpected": "field"}, self.dev.DeployManifestKind.UNKNOWN)
+                )
+                candidates.append((complete, expected_kind))
+                for payload, expected in candidates:
+                    with self.subTest(mode=mode, fields=sorted(payload)):
+                        manifest.write_text(
+                            json.dumps(
+                                {
+                                    "source_kind": "prepared_artifact",
+                                    key: payload,
+                                }
+                            )
+                        )
+                        self.assertIs(
+                            self.dev._deploy_manifest_kind(transaction), expected
+                        )
+
+    def test_incomplete_prepared_manifest_never_releases_terminal_claim(self):
+        cases = (
+            ("paired_database_upgrade", "paired"),
+            ("current_schema_upgrade", "current_schema"),
+        )
+        for manifest_key, prepared_mode in cases:
+            for admission_name in ("_claim_launchd_deploy", "_claim_launchd_restart"):
+                with self.subTest(
+                    prepared_mode=prepared_mode, admission=admission_name
+                ), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    owner = f"incomplete-{prepared_mode}"
+                    active = root / "active"
+                    active.write_text(owner + "\n")
+                    status = root / "status.json"
+                    status.write_text(
+                        json.dumps(
+                            {
+                                "transaction_id": owner,
+                                "state": "committed",
+                                "source_kind": "prepared_artifact",
+                                "prepared_mode": prepared_mode,
+                                "finalization_pending": False,
+                                "rollback_failure": None,
+                            }
+                        )
+                    )
+                    transaction = root / "transactions" / owner
+                    transaction.mkdir(parents=True)
+                    (transaction / "manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "source_kind": "prepared_artifact",
+                                manifest_key: {},
+                            }
+                        )
+                    )
+                    with mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_DIR", root
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+                    ), mock.patch.object(
+                        self.dev,
+                        "LAUNCHD_RESTART_ACTIVE_PATH",
+                        root / "restart-active",
+                    ):
+                        self.assertFalse(
+                            self.dev._status_is_terminal_for_owner(
+                                status, owner, self.dev._DEPLOY_TERMINAL_STATES
+                            )
+                        )
+                        admission = getattr(self.dev, admission_name)
+                        with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                            admission("new-operation")
+                    self.assertEqual(active.read_text(), owner + "\n")
 
     def test_malformed_mode_payload_is_unknown_and_has_no_recovery_guidance(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3428,11 +3668,12 @@ class PreparationTests(unittest.TestCase):
                     {
                         "transaction_id": "failed.current",
                         "source_kind": "prepared_artifact",
-                        "current_schema_upgrade": {
-                            "controller_helper_path": str(retained),
-                            "controller_helper_sha256": self.dev._file_sha256(retained),
-                            "proof_path": str(transaction / "proof.json"),
-                        },
+                        "current_schema_upgrade": retained_mode_payload(
+                            "current_schema",
+                            controller_helper_path=str(retained),
+                            controller_helper_sha256=self.dev._file_sha256(retained),
+                            proof_path=str(transaction / "proof.json"),
+                        ),
                         "helper_label": "test.phoenix.server",
                     }
                 )
@@ -4112,8 +4353,14 @@ class PreparationTests(unittest.TestCase):
                 transaction = root / "transactions" / "tx"
                 transaction.mkdir(parents=True)
                 (transaction / "manifest.json").write_text(
-                    json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {}})
+                    json.dumps(
+                        {
+                            "source_kind": "prepared_artifact",
+                            "paired_database_upgrade": retained_mode_payload("paired"),
+                        }
+                    )
                 )
+
                 with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch("builtins.print") as output:
                     self.dev._print_launchd_deploy_status()
                 rendered = " ".join(str(c) for c in output.call_args_list)
@@ -4320,10 +4567,11 @@ class PreparationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "source_kind": "prepared_artifact",
-                        "current_schema_upgrade": {
-                            "controller_helper_path": str(helper_path),
-                            "controller_helper_sha256": "hash",
-                        },
+                        "current_schema_upgrade": retained_mode_payload(
+                            "current_schema",
+                            controller_helper_path=str(helper_path),
+                            controller_helper_sha256="hash",
+                        ),
                     }
                 )
             )
@@ -4404,7 +4652,9 @@ class PreparationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "source_kind": "prepared_artifact",
-                        "paired_database_upgrade": {"database_path": "/db"},
+                        "paired_database_upgrade": retained_mode_payload(
+                            "paired", database_path="/db"
+                        ),
                     }
                 )
             )
