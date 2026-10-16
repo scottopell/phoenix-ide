@@ -16159,6 +16159,73 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn actual_direct_handoff_keeps_resource_scope_live_until_successor_terminates() {
+        let mgr = test_manager().await;
+        let parent = mgr
+            .db()
+            .create_conversation_with_project(
+                "direct-cleanup",
+                "direct-cleanup",
+                "/tmp",
+                false,
+                None,
+                None,
+                None,
+                &ConvMode::Direct,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let scope = ResourceScopeKey::Work(parent.attached_work_scope_id.clone().unwrap());
+        mgr.db()
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::ContextExhausted {
+                    summary: "continue".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(child) =
+            mgr.db().continue_conversation(&parent.id).await.unwrap()
+        else {
+            panic!();
+        };
+        mgr.db()
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::HandedOff {
+                    successor_conv_id: child.id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(conversation_resource_scope(&child), Some(scope.clone()));
+        assert!(mgr
+            .scope_has_live_conversation_excluding(&scope, &parent.id)
+            .await
+            .unwrap());
+        assert!(!mgr
+            .scope_has_live_conversation_excluding(&scope, &child.id)
+            .await
+            .unwrap());
+        mgr.db()
+            .update_conversation_state(
+                &child.id,
+                &ConvState::Failed {
+                    error: "finished".into(),
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!mgr.scope_has_live_conversation(&scope).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn handed_off_scope_is_owned_only_by_live_continuation() {
         let mgr = test_manager().await;
         let worktree = "/repo/.phoenix/worktrees/shared";

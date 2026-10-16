@@ -9436,22 +9436,6 @@ impl Database {
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
 
-        let mapped_product_work_scope_id: Option<String> = sqlx::query_scalar(
-            "SELECT work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
-        )
-        .bind(parent.product_conversation_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
-        let mapped_product_work_scope_id = mapped_product_work_scope_id
-            .map(|scope_id| {
-                scope_id.parse::<WorkScopeId>().map_err(|error| {
-                    DbError::Serialization(format!(
-                        "invalid mapped work scope for product conversation {}: {error}",
-                        parent.product_conversation_id
-                    ))
-                })
-            })
-            .transpose()?;
         let continuation_work_scope_id = if parent.runtime_role == RuntimeRole::Coordinator {
             let owned = Self::coordinator_work_scope_tx(&mut tx)
                 .await?
@@ -9462,14 +9446,6 @@ impl Database {
                 ));
             }
             owned
-        } else if matches!(parent.conv_mode, ConvMode::Direct) {
-            let (scope_id, authority_kind, environment) =
-                Self::new_scope_for_conversation(&parent.cwd, &cm);
-            Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
-                .await?;
-            Some(scope_id)
-        } else if let Some(mapped_scope_id) = mapped_product_work_scope_id {
-            Some(mapped_scope_id)
         } else {
             parent.attached_work_scope_id.clone()
         };
@@ -27660,7 +27636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_continuation_gets_fresh_work_scope() {
+    async fn direct_continuation_retains_work_scope_and_environment() {
         let db = Database::open_in_memory().await.unwrap();
         let parent =
             setup_exhausted_parent(&db, "direct-root", "direct", "/tmp", &ConvMode::Direct).await;
@@ -27673,8 +27649,146 @@ mod tests {
             }
         };
 
-        assert_ne!(child.attached_work_scope_id, parent.attached_work_scope_id);
+        assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
+        assert_eq!(
+            child.product_conversation_id,
+            parent.product_conversation_id
+        );
         assert_eq!(child.cwd, parent.cwd);
+        assert_eq!(
+            db.get_conversation_work_scope_context(&child.id)
+                .await
+                .unwrap(),
+            db.get_conversation_work_scope_context(&parent.id)
+                .await
+                .unwrap(),
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn direct_continuation_concurrent_requests_and_replay_keep_one_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent =
+            setup_exhausted_parent(&db, "direct-race", "direct-race", "/tmp", &ConvMode::Direct)
+                .await;
+        let (left, right) = tokio::join!(
+            db.continue_conversation(&parent.id),
+            db.continue_conversation(&parent.id)
+        );
+        let mut created = 0;
+        let mut successor = None;
+        for result in [left.unwrap(), right.unwrap()] {
+            let child = match result {
+                ContinueOutcome::Created(child) => {
+                    created += 1;
+                    child
+                }
+                ContinueOutcome::AlreadyContinued(child) => child,
+                other => panic!("unexpected outcome: {other:?}"),
+            };
+            assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
+            assert_eq!(
+                child.product_conversation_id,
+                parent.product_conversation_id
+            );
+            if let Some(previous) = &successor {
+                assert_eq!(previous, &child.id);
+            }
+            successor = Some(child.id);
+        }
+        assert_eq!(created, 1);
+        let ContinueOutcome::AlreadyContinued(replayed) =
+            db.continue_conversation(&parent.id).await.unwrap()
+        else {
+            panic!("expected replay");
+        };
+        assert_eq!(Some(replayed.id), successor);
+        assert_eq!(
+            replayed.attached_work_scope_id,
+            parent.attached_work_scope_id
+        );
+        let scopes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let owners: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((scopes, owners), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn continuation_retains_exact_parent_scope_when_product_owns_multiple_scopes() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = setup_exhausted_parent(
+            &db,
+            "multi-root",
+            "multi-root",
+            "/old/environment",
+            &ConvMode::Direct,
+        )
+        .await;
+        let ContinueOutcome::Created(first) = db.continue_conversation(&root.id).await.unwrap()
+        else {
+            panic!();
+        };
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO work_scopes (id,authority_kind,lifecycle,environment_kind,cwd,created_at,updated_at) VALUES ('z-current-scope','work','active','unowned_cwd','/different/environment',?1,?1)")
+            .bind(now).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE conversations SET work_scope_id='z-current-scope' WHERE id=?1")
+            .bind(&first.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &first.id,
+            &ConvState::ContextExhausted {
+                summary: "again".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let selected = db.get_conversation(&first.id).await.unwrap();
+        let environment = db
+            .get_conversation_work_scope_context(&first.id)
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(next) = db.continue_conversation(&first.id).await.unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(next.attached_work_scope_id, selected.attached_work_scope_id);
+        assert_eq!(next.cwd, "/different/environment");
+        assert_eq!(
+            db.get_conversation_work_scope_context(&next.id)
+                .await
+                .unwrap(),
+            environment
+        );
+        assert_eq!(
+            db.get_conversation(&root.id)
+                .await
+                .unwrap()
+                .attached_work_scope_id,
+            root.attached_work_scope_id
+        );
+        let scopes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let owners: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((scopes, owners), (2, 2));
     }
 
     /// Sequential slugs: first continuation is `{root}-2`, multi-level chains
