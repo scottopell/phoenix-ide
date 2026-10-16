@@ -1,6 +1,7 @@
 //! Accessibility snapshots and document-bound interaction targets (REQ-BT-025).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use chromiumoxide::cdp::browser_protocol::{
     accessibility::{AxNode, AxValue, GetFullAxTreeParams},
@@ -131,14 +132,14 @@ fn render(
             let reference = if interactive(node) {
                 node.backend_dom_node_id.map(|backend| {
                     let reference = format!("@{generation}:{}", refs.nodes.len() + 1);
-                    line.push_str(&format!(" [{reference}]"));
+                    let _ = write!(line, " [{reference}]");
                     (reference, backend)
                 })
             } else {
                 None
             };
             if let Some(value) = node.value.as_ref() {
-                line.push_str(&format!(" value={}", quoted(&ax_value(Some(value)))));
+                let _ = write!(line, " value={}", quoted(&ax_value(Some(value))));
             }
             for property in node.properties.iter().flatten() {
                 if matches!(
@@ -154,11 +155,12 @@ fn render(
                         | "focused"
                         | "invalid"
                 ) {
-                    line.push_str(&format!(
+                    let _ = write!(
+                        line,
                         " {}={}",
                         property.name.as_ref(),
                         quoted(&ax_value(Some(&property.value)))
-                    ));
+                    );
                 }
             }
             line.push('\n');
@@ -186,6 +188,8 @@ fn render(
 }
 
 impl BrowserSession {
+    /// # Errors
+    /// Returns a CDP error or a document-change error if collection is interrupted.
     pub async fn accessibility_snapshot(
         &mut self,
         interactive_only: bool,
@@ -243,11 +247,15 @@ impl BrowserSession {
         })
     }
 
+    /// # Errors
+    /// Returns an error for stale, detached, obscured or moving targets, or failed CDP input.
     pub async fn click_reference(&self, reference: &str) -> Result<(), BrowserError> {
         let object = self.reference_object(reference).await?;
         click_object(&self.page, &object.id).await
     }
 
+    /// # Errors
+    /// Returns an error for stale or unfocused targets, unsupported clearing, or failed CDP input.
     pub async fn type_reference(
         &self,
         reference: &str,
