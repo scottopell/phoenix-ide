@@ -281,13 +281,46 @@ impl Write for DeadlineStream<'_> {
     }
 }
 
+fn pass_ack_response_barrier(listener: &UnixListener, until: Instant) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+    if !wait_ready(listener.as_raw_fd(), libc::POLLIN, until)? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ACK response barrier accept deadline expired",
+        ));
+    }
+    let (mut control, _) = listener.accept()?;
+    same_uid(&control)?;
+    control.set_nonblocking(true)?;
+    let mut control = DeadlineStream {
+        stream: &mut control,
+        deadline: until,
+    };
+    control.write_all(b"A")?;
+    let mut release = [0];
+    control.read_exact(&mut release)?;
+    if release != [b'R'] {
+        return Err(io::Error::other("invalid ACK barrier release"));
+    }
+    Ok(())
+}
+
 fn serve_frame<E: GuardianExecutor>(
     stream: &mut DeadlineStream<'_>,
     server: &mut GuardianServer<E>,
+    ack_response_barrier: &mut Option<&UnixListener>,
+    until: Instant,
 ) -> Result<(), CodecError> {
     let result = (|| {
         let request: Request = read_frame(stream)?;
-        write_frame(stream, &server.handle(request))
+        let ack_request = matches!(request, Request::AckAfterAppliedRevision { .. });
+        let response = server.handle(request);
+        if ack_request && matches!(response, Response::Acked { .. }) {
+            if let Some(listener) = ack_response_barrier.take() {
+                pass_ack_response_barrier(listener, until).map_err(CodecError::Io)?;
+            }
+        }
+        write_frame(stream, &response)
     })();
     if result.is_err() {
         server.fence_connection();
@@ -305,7 +338,17 @@ pub fn serve_until<E: GuardianExecutor>(
     server: &mut GuardianServer<E>,
     until: Instant,
 ) -> io::Result<()> {
+    serve_until_with_ack_response_barrier(listener, server, until, None)
+}
+
+fn serve_until_with_ack_response_barrier<E: GuardianExecutor>(
+    listener: &UnixListener,
+    server: &mut GuardianServer<E>,
+    until: Instant,
+    ack_response_barrier: Option<&UnixListener>,
+) -> io::Result<()> {
     listener.set_nonblocking(true)?;
+    let mut ack_response_barrier = ack_response_barrier;
     while Instant::now() < until {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -321,7 +364,7 @@ pub fn serve_until<E: GuardianExecutor>(
                         stream: &mut stream,
                         deadline: (Instant::now() + IO_SLICE).min(until),
                     };
-                    if serve_frame(&mut frame, server).is_err() {
+                    if serve_frame(&mut frame, server, &mut ack_response_barrier, until).is_err() {
                         break;
                     }
                 }
@@ -1003,6 +1046,7 @@ pub fn run_disposable_guardian(
     attempt: crate::AttemptId,
     deadline: crate::MonotonicTick,
     store_path: &Path,
+    ack_response_barrier: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
         Guardian, GuardianLifetimeNonce, MacOsControllerOs, MacOsGuardianExecutor,
@@ -1021,6 +1065,14 @@ pub fn run_disposable_guardian(
         process: crate::macos::own_process_identity()?,
     };
     let listener = bind_disposable(dir)?;
+    let barrier = if ack_response_barrier {
+        let path = dir.join("ack-response-barrier.sock");
+        let listener = UnixListener::bind(&path)?;
+        fs::set_permissions(path, Permissions::from_mode(0o600))?;
+        Some(listener)
+    } else {
+        None
+    };
     let os = MacOsControllerOs::new(dir)?;
     let (child, gate) = os.spawn_blocked_sleep(child_seconds)?;
     let identity = child.identity();
@@ -1047,10 +1099,11 @@ pub fn run_disposable_guardian(
         identity.birth().nanos()
     );
     io::stdout().flush()?;
-    serve_until(
+    serve_until_with_ack_response_barrier(
         &listener,
         &mut server,
         Instant::now() + Duration::from_secs(serve_seconds),
+        barrier.as_ref(),
     )?;
     Ok(())
 }

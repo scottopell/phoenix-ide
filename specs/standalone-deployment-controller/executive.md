@@ -98,11 +98,15 @@ not the Phoenix application database and is not a Phoenix application-database m
 Existing schema-v3 controller stores fail closed; no v3-to-v4 upgrade, downgrade, mixed-build,
 or guardian-replacement promise is made.
 
-The remaining native contract requires runner orchestration, reconciliation completion,
-generalized mutation dispatch, full `PolicyLoop` execution over IPC, actual disposable
-process-death/lost-response qualification, launchd ownership, and production-exclusive store
-ownership. Guardian replacement, cross-boot recovery, installer integration, and production
-adoption remain outside this pre-adoption qualification.
+The disposable runner has structurally separate observe-only, initial-sample, and
+applied-ACK-recovery modes. The initial runner creates and retains the committed transition
+and affine ticket in-process through dispatch and application. A replacement runner discovers
+only a typed pending-ACK obligation, reconnects to the same live guardian, begins a newer
+observation-only reconciliation session, and confirms the ACK without redispatch or reapplication.
+The remaining native contract requires reconciliation completion before new mutation,
+generalized mutation dispatch, a continuing `PolicyLoop` over IPC, launchd ownership, and
+production-exclusive store ownership. Guardian replacement, cross-boot recovery, installer
+integration, and production adoption remain outside this pre-adoption qualification.
 
 ## Requirement coverage
 
@@ -122,27 +126,26 @@ adoption remain outside this pre-adoption qualification.
 | REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. Native disconnect fences, fresh interruption revisions outpace unfinished reconciliation, and the original monotonic deadline refuses expired release/begin. Guardian replacement, launchd ownership, and production recovery remain unresolved risk. |
 | REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor, CLI, completion-to-checkpoint, guardian integration, replay, and capacity-reservation coverage pass full CI/macOS at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
-| REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The guardian is the harmless child's original parent and survives forced runner death; launchd ownership and a durable runnable policy loop remain gaps. |
+| REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The disposable initial runner owns one committed sampling round end to end; a distinct replacement runner settles its pending ACK after death. The guardian remains the harmless child's original parent. Launchd ownership and a continuing runnable policy loop remain gaps. |
 | REQ-SDC-016 | Owner-only path checks, same-UID peer admission, exact source-input digest Hello identity, protocol-v3 four-byte big-endian bounded typed JSON framing, strict request fields, version/malformed/oversized-frame fencing, and replacement connections pass Unix/macOS hosted tests. |
 | REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The native server independently validates durable evidence before consuming its initial gate, entering reconciliation, minting one-use exact sampling admission, or dropping retained successful-sample custody after application; general mutation and reconciliation finish remain refused. |
-| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Schema v4 persists exact sampling issue/application/confirmation evidence. Deterministic tests cover same-guardian successful ACK, lost-response receipt retry during a newer reconciling session, and `AppliedPendingAck` load-to-confirm recovery without redispatch or reapplication. Runner orchestration and disposable process-death ACK qualification remain gaps. |
+| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Schema v4 persists exact sampling issue/application/confirmation evidence. The disposable runner executes the initial sampling round and a fresh process settles `AppliedPendingAck` in a newer reconciling session without redispatch or reapplication. Reconciliation completion remains a gap and is not required merely to release acknowledged custody. |
 | REQ-SDC-019 | Exact controller-store schema compatibility, source-input build identity, protocol-v3 rejection, and platform capability checks exist. The transport remains pre-adoption and same-build-only; no controller-store v3 upgrade, downgrade, rolling/replacement/cross-boot promise is made, and no Phoenix application-DB migration is involved. |
-| REQ-SDC-020 | Linux policy/IPC/SQLite tests and hosted macOS exact source-input handshake, gated-start, exact binding, original parenthood, runner-death, reconnect-begin, Clippy, and formatting qualification exist. Deterministic ACK tests cover the lost-response crash window; a disposable two-process ACK/recovery journey, guardian replacement refusal, native mutation, launchd, updater, and rollback scenarios remain required. |
+| REQ-SDC-020 | Linux policy/IPC/SQLite tests and macOS process tests cover exact source-input handshake, gated start, one native sample, original parenthood, runner death after application/before ACK, guardian receipt before a lost ACK response, same-live reconnection, and durable confirmation with one issue/application. Runner death before application commit, reconciliation completion/new mutation, guardian replacement, launchd, updater, and rollback scenarios remain required. |
 
 ## Next work
 
-The qualified units are the in-process custodian/event loop and a disposable native
-transport with durable initial binding/release, real runner-death survival, and
-observation-only durable reconciliation begin. Controller-owned schema v4 establishes the
-normalized sampling issue, atomic verified-result application, and authenticated successful
-ACK-confirmation boundary. The next controller-owned work is runner orchestration and native
-reconciliation completion, then a runnable policy loop over the IPC boundary, launchd ownership,
-and the remaining disposable process-death E2E matrix. Those
-surfaces must complete REQ-SDC-015–020 and ADR-109 while preserving ADR-108
-**detach-and-fence**, exact-instance recovery, the original absolute deadline, retained
-results, monotonic reconciliation generations, and whole-round signal-result
-reservation. Qualification must include runner death before application commit,
-after commit/before ACK, lost ACK, and refusal of stale or mismatched authority.
+The implemented test units are the in-process custodian/event loop and a disposable native
+transport with durable initial binding/release, one exact sampling application, real runner
+death after application/before ACK, a guardian-processed response lost before runner receipt,
+and same-live replacement-runner ACK confirmation during observation-only reconciliation.
+Controller-owned schema v4 retains one issue/application/confirmation across both journeys.
+The next controller-owned work is runner death before application commit, native reconciliation
+completion before any new mutation, then a continuing policy loop over the IPC boundary,
+launchd ownership, and the remaining process-death matrix. Those surfaces must complete
+REQ-SDC-015–020 and ADR-109 while preserving ADR-108 **detach-and-fence**, exact-instance
+recovery, the original absolute deadline, retained results, monotonic reconciliation generations,
+and whole-round signal-result reservation.
 
 Installer and `dev.py` integration remain separately owned. The future boundary may
 invoke only the supported prepared current-schema deploy seam; helper-owned schema,

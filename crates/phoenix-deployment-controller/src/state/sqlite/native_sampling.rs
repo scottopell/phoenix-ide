@@ -294,6 +294,52 @@ impl ControllerSqliteStore {
         result
     }
 
+    /// Finds the sole successful application awaiting ACK, without recreating execution authority.
+    /// # Errors
+    /// Any malformed, partial, or ambiguous native row poisons this handle.
+    pub fn pending_native_sampling_ack(
+        &mut self,
+        attempt: crate::AttemptId,
+    ) -> Result<Option<(DispatchKey, NativeSamplingStatus)>> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self.connection.transaction()?;
+            check_authority(&tx)?;
+            let mut statement = tx.prepare(
+                "SELECT dispatch_revision, ordinal FROM native_sampling_issues WHERE attempt_id=?1",
+            )?;
+            let rows = statement.query_map(params![key(attempt)], |row| {
+                Ok((row.get::<_, Word>(0)?.0, row.get::<_, i64>(1)?))
+            })?;
+            let mut pending = None;
+            for row in rows {
+                let (revision, ordinal) = row?;
+                let dispatch = DispatchKey::from_committed_parts(
+                    attempt,
+                    binding_revision(revision)?,
+                    usize::try_from(ordinal)
+                        .map_err(|_| ControllerStoreError::Malformed("invalid native ordinal"))?,
+                );
+                match read_status(&tx, dispatch)? {
+                    Some(status @ NativeSamplingStatus::AppliedPendingAck { .. }) => {
+                        if pending.replace((dispatch, status)).is_some() {
+                            return malformed("multiple pending native ACKs");
+                        }
+                    }
+                    Some(_) => {}
+                    None => return malformed("missing native issue"),
+                }
+            }
+            drop(statement);
+            tx.commit()?;
+            Ok(pending)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     /// Reads the checkpoint, binding, and exact sampling status from one `SQLite` snapshot.
     /// # Errors
     /// Malformed rows or storage failures poison this handle.
@@ -606,4 +652,101 @@ fn read_status(
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod pending_lookup_tests {
+    use super::*;
+    use crate::{
+        BirthToken, GuardianLifetimeNonce, LoopProgress, PolicyLoop, ProcessId, ProcessIdentity,
+        ResourcePolicy,
+    };
+    use std::num::{NonZeroU32, NonZeroUsize};
+
+    #[test]
+    fn pending_ack_lookup_returns_only_success_and_poisons_malformed_rows() {
+        let mut store = ControllerSqliteStore::in_memory().unwrap();
+        let attempt = crate::AttemptId::new(71);
+        let process = |pid| {
+            ProcessIdentity::new(
+                ProcessId::new(NonZeroU32::new(pid).unwrap()),
+                BirthToken::new(1, 0).unwrap(),
+            )
+        };
+        let committed = DeploymentAttempt::start(
+            attempt,
+            crate::MonotonicTick::new(100),
+            ResourcePolicy::new(
+                NonZeroUsize::new(2).unwrap(),
+                0,
+                0,
+                CpuContentionBasisPoints::new(0).unwrap(),
+                MemoryPressure::Critical,
+            ),
+            process(42),
+        )
+        .persist(&mut store)
+        .unwrap();
+        let binding = store
+            .commit_initial_binding(
+                attempt,
+                crate::MonotonicTick::new(100),
+                PersistenceRevision::first(),
+                crate::NativeGuardianIdentity {
+                    nonce: GuardianLifetimeNonce::new([1; 16]).unwrap(),
+                    process: process(100),
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.pending_native_sampling_ack(attempt).unwrap(), None);
+        let mut policy = PolicyLoop::from_committed(committed);
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        assert_eq!(store.pending_native_sampling_ack(attempt).unwrap(), None);
+        let sample = ResourceSample {
+            sequence: issue.sequence(),
+            capacity: ResourceCapacity {
+                available_memory_bytes: 100,
+                available_storage_bytes: 100,
+            },
+            contention: ResourceContention {
+                cpu: CpuContentionBasisPoints::new(0).unwrap(),
+                memory_pressure: MemoryPressure::Nominal,
+            },
+        };
+        let verified = VerifiedNativeSamplingCompletion::new(
+            NativeSamplingDispatch::new(ticket, issue),
+            NativeSamplingCompletion::Sample(sample),
+        );
+        assert!(matches!(
+            policy.apply_native_sampling(verified, &mut store).unwrap(),
+            LoopProgress::Applied { .. }
+        ));
+        assert!(
+            matches!(store.pending_native_sampling_ack(attempt).unwrap(),
+            Some((key, NativeSamplingStatus::AppliedPendingAck { sample: stored, .. })) if key == issue.key() && stored == sample)
+        );
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE native_sampling_applications SET outcome='corrupt' WHERE attempt_id=?1",
+                params![key(attempt)],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.pending_native_sampling_ack(attempt),
+            Err(ControllerStoreError::Malformed(_))
+        ));
+        assert!(matches!(
+            store.pending_native_sampling_ack(attempt),
+            Err(ControllerStoreError::Poisoned)
+        ));
+    }
 }

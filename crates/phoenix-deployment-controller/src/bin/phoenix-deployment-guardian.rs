@@ -4,7 +4,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use phoenix_deployment_controller::native_guardian::run_disposable_guardian;
     use std::{io, path::Path};
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 12
+    let ack_response_barrier = args.len() == 13 && args[12] == "--fixture-ack-response-barrier";
+    if !(args.len() == 12 || ack_response_barrier)
         || args[0] != "--socket-dir"
         || args[2] != "--child-seconds"
         || args[4] != "--serve-seconds"
@@ -35,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         attempt,
         deadline,
         Path::new(&args[11]),
+        ack_response_barrier,
     )
 }
 
