@@ -968,6 +968,11 @@ impl RuntimeManager {
             }
             Some(CapturedWorktreeIdentity::Unresolved { .. }) | None => None,
         };
+        let legacy_conversation_id = self
+            .db()
+            .get_work_scope_legacy_conversation_id(&scope)
+            .await
+            .map_err(|error| error.to_string())?;
         let key = ResourceScopeKey::Work(scope.clone());
         self.bash_handles().fence_retirement_admission(&key).await;
         let terminal = self.terminals.begin_retirement(&key);
@@ -975,7 +980,12 @@ impl RuntimeManager {
         let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
         let tmux_discovery = match self
             .tmux_registry()
-            .discover_persistent_identity(&key, legacy_worktree_path.as_deref(), None, tmux_expires)
+            .discover_persistent_identity(
+                &key,
+                legacy_worktree_path.as_deref(),
+                legacy_conversation_id.as_deref(),
+                tmux_expires,
+            )
             .await
         {
             Ok(discovery) => discovery,

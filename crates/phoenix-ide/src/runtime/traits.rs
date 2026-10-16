@@ -120,6 +120,13 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        _work_scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     async fn coordinator_home_scope(
         &self,
     ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
@@ -1582,6 +1589,16 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        work_scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        self.db
+            .get_work_scope_legacy_conversation_id(work_scope_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn coordinator_home_scope(
         &self,
     ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {

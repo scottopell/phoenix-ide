@@ -10430,6 +10430,134 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn retirement_inventory_direct_continuations_capture_original_shared_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation_with_project(
+                "direct-retirement-root",
+                "direct-retirement-root",
+                "/tmp/direct-retirement",
+                true,
+                None,
+                None,
+                None,
+                &phoenix_core::domain::db_schema::ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let scope = root.attached_work_scope_id.clone().unwrap();
+        let mut transcript_ids = vec![root.id.clone()];
+        for _ in 0..2 {
+            let parent_id = transcript_ids.last().unwrap();
+            set_state(
+                &db,
+                parent_id,
+                ConvState::ContextExhausted {
+                    summary: "continue Direct work".to_string(),
+                },
+            )
+            .await;
+            let crate::ContinueOutcome::Created(successor) =
+                db.continue_conversation(parent_id).await.unwrap()
+            else {
+                panic!("expected a new Direct continuation");
+            };
+            assert_eq!(
+                successor.product_conversation_id,
+                root.product_conversation_id
+            );
+            assert_eq!(successor.attached_work_scope_id.as_ref(), Some(&scope));
+            assert!(matches!(
+                successor.conv_mode,
+                phoenix_core::domain::db_schema::ConvMode::Direct
+            ));
+            transcript_ids.push(successor.id);
+        }
+
+        let attempt_id = "attempt-direct-continuation-inventory";
+        db.begin_close_foundation(
+            &root.product_conversation_id,
+            &transcript_id(transcript_ids.last().unwrap()),
+            attempt_id,
+        )
+        .await
+        .unwrap();
+        let members = db.list_close_attempt_members(attempt_id).await.unwrap();
+        assert_eq!(members.len(), transcript_ids.len());
+        for (member, id) in members.iter().zip(&transcript_ids) {
+            assert_eq!(member.conversation_id.as_str(), id);
+            assert_eq!(member.captured_work_scope_id.as_ref(), Some(&scope));
+        }
+        let scopes = db.list_close_attempt_scopes(attempt_id).await.unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].scope, scope);
+        assert!(scopes[0].captured_worktree.is_none());
+        let worktree_path: Option<String> =
+            sqlx::query_scalar("SELECT worktree_path FROM work_scopes WHERE id = ?1")
+                .bind(scope.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(worktree_path.is_none());
+
+        set_close_phase(&db, attempt_id, ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt_id).await;
+        let inventory = CloseOwnedResourceInventory {
+            work_scopes: std::collections::BTreeSet::new(),
+            worktree: None,
+            bash_process_groups: [OpaqueIdentity::parse("direct-shared-bash").unwrap()]
+                .into_iter()
+                .collect(),
+            tmux_servers: [OpaqueIdentity::parse("direct-shared-tmux").unwrap()]
+                .into_iter()
+                .collect(),
+            pty_sessions: std::collections::BTreeSet::new(),
+            browser_sessions: [OpaqueIdentity::parse("direct-shared-browser").unwrap()]
+                .into_iter()
+                .collect(),
+            equivalent_live_resources: std::collections::BTreeSet::new(),
+        };
+        let mut expected = inventory.resources().into_iter().collect::<Vec<_>>();
+        expected.push(
+            RetiredResourceIdentity::parse(
+                RetiredResourceKind::WorkScope,
+                LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.as_str()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: CloseAttemptId::parse(attempt_id).unwrap(),
+                snapshot: snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory,
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(resources.len(), 4);
+        assert_eq!(resources.len(), expected.len());
+        for resource in &resources {
+            assert_eq!(resource.scope, scope);
+            assert_eq!(resource.snapshot, snapshot);
+            assert!(expected.contains(&resource.resource));
+            assert_ne!(resource.resource.kind(), RetiredResourceKind::Worktree);
+        }
+        assert_eq!(
+            db.list_close_expected_retirement_resources(attempt_id)
+                .await
+                .unwrap(),
+            resources
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn retirement_inventory_round_trips_exact_expected_resources() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
