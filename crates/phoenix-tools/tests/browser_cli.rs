@@ -7,7 +7,7 @@ use phoenix_core::process_identity::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
@@ -496,15 +496,11 @@ fn screenshots_save_to_requested_paths_and_reuse_the_saved_artifact() {
 
 fn serve_reload_fixture(listener: &TcpListener, stop: &AtomicBool, requests: &AtomicUsize) {
     std::thread::scope(|connections| {
-        while !stop.load(Ordering::Relaxed) {
-            let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-                Err(error) => panic!("reload fixture accept: {error}"),
-            };
+        while !stop.load(Ordering::Acquire) {
+            let (mut stream, _) = listener.accept().unwrap();
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             let requests = &requests;
             connections.spawn(move || {
                 stream.set_nonblocking(false).unwrap();
@@ -532,10 +528,14 @@ fn serve_reload_fixture(listener: &TcpListener, stop: &AtomicBool, requests: &At
     });
 }
 
-struct StopOnExit<'a>(&'a AtomicBool);
+struct StopOnExit<'a> {
+    stop: &'a AtomicBool,
+    address: SocketAddr,
+}
 impl Drop for StopOnExit<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
     }
 }
 
@@ -545,12 +545,15 @@ fn repeated_open_reloads_the_document_and_retains_browser_session_state() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}/reload", listener.local_addr().unwrap());
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}/reload");
     let stop = AtomicBool::new(false);
     let requests = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let _stop = StopOnExit(&stop);
+        let _stop = StopOnExit {
+            stop: &stop,
+            address,
+        };
         scope.spawn(|| serve_reload_fixture(&listener, &stop, &requests));
         let cli = BrowserCli::new();
         let first = cli.ok(&["open", &url]);
@@ -632,8 +635,8 @@ fn reload_reports_server_failure_and_keeps_the_session_usable() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}/reload", listener.local_addr().unwrap());
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}/reload");
     let stop = AtomicBool::new(false);
     let requests = AtomicUsize::new(0);
     let cli = BrowserCli::new();
@@ -641,7 +644,7 @@ fn reload_reports_server_failure_and_keeps_the_session_usable() {
         let stop = &stop;
         let requests = &requests;
         scope.spawn(move || serve_reload_fixture(&listener, stop, requests));
-        let _stop = StopOnExit(stop);
+        let _stop = StopOnExit { stop, address };
         cli.ok(&["open", &url])
     });
     let failed = cli.invoke(&["open", &url], None, false);
