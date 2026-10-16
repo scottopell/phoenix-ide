@@ -64,20 +64,28 @@ materialize internal affine authority. The guardian mints one-use dispatch admis
 bound to the exact live instance, session, key, and full effect. The safe
 `phoenix-deployment-controller` binary remains status/closeout only.
 
-A disposable native transport is implemented and hosted-qualified at commit
-`3481095630f86bc7e88828949a109918af3cc12f`: full CI run `38820157087` and macOS
-run `38820157097` pass. Separate guardian and runner executables use an owner-only,
-same-UID, bounded framed Unix socket. The guardian originally parents a harmless child,
-retains it across forced runner death, fences on EOF/malformed frames, and accepts a
-replacement observer only against the same live instance and inventory. Reconciliation
-and mutation remain typed `UnsupportedDurableBinding` refusals rather than fabricated
-authority.
+The disposable native transport uses separate guardian and runner executables over an
+owner-only, same-UID, bounded protocol-v2 Unix socket whose Hello exchange requires the
+same clean full-commit build identity. Initial workload execution remains
+blocked behind a process-local one-use gate until the runner commits a normalized exact
+binding for a fresh resource-sampling checkpoint and the guardian independently rereads
+the attempt, revision, nonce, guardian PID/birth identity, original nanosecond monotonic
+deadline, active session, and ordered child PID/birth inventory. Persisted rows and wire
+values cannot reconstruct that gate.
 
-The remaining native contract requires normalized guardian/session/inventory/result
-binding, durable policy application before ACK, fresh interruption/reconciliation within
-the original deadline, and actual launchd ownership. Schema-v1 upgrades, downgrade,
-rolling versions, guardian replacement, cross-boot recovery, installer integration, and
-production adoption remain explicitly outside this pre-adoption qualification.
+The guardian retains the original child across forced runner death and fences on EOF or
+malformed frames. A replacement runner verifies the same live guardian and inventory,
+durably fences unfinished sessions, refreshes crash-loaded interruption evidence to a
+newer revision, and may enter observation-only `BeginReconciliation` after another pinned
+store read. Changed slot liveness is persisted without replacing identity. Generic IPC,
+reconciliation finish, native dispatch, mutation, result application, and ACK remain typed
+refusals.
+
+The remaining native contract requires reconciliation completion, durable result
+application before ACK, mutation dispatch, full `PolicyLoop` execution over IPC, actual
+launchd ownership, and production-exclusive store ownership. Schema-v1 upgrades,
+downgrade, rolling versions, guardian replacement, cross-boot recovery, installer
+integration, and production adoption remain outside this pre-adoption qualification.
 
 ## Requirement coverage
 
@@ -93,23 +101,24 @@ production adoption remain explicitly outside this pre-adoption qualification.
 | REQ-SDC-008 | Recovery marks owned identities for fresh observation and preserves the original deadline before exposing signal effects. |
 | REQ-SDC-009 | `CompatibilityBoundary::CandidateMigrationInvoked` retains full commit plus artifact digest and recovers only through candidate reverification. |
 | REQ-SDC-010 | `ControllerOs` is typed and fake-backed; hosted macOS tests qualify native observation and fail-closed capacity/contention sampling, including counter-regression and capacity-arithmetic regressions. |
-| REQ-SDC-011 | `ControllerSqliteStore` owns an independent schema with normalized policy child rows, full-transaction checkpoint replacement, revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning; hosted tests and Clippy pass. Native guardian/session/inventory/result rows required by REQ-SDC-018 remain an implementation/qualification gap. |
-| REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. The hosted-qualified in-process `Guardian`/`PolicyLoop` enforce detach-and-fence custody, exact instance/session binding, retained-result acknowledgement, strictly increasing reconciliation generations, and whole-signal-round capacity reservation. A disposable native guardian now remains the original parent across forced runner death; launchd ownership and durable policy recovery remain gaps. |
+| REQ-SDC-011 | `ControllerSqliteStore` owns exact schema-v2 normalized attempt, policy-child, guardian-binding, guardian-session, and ordered guardian-slot rows with full-transaction replacement, revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning. Production-exclusive store ownership plus retained-result/application/ACK rows remain gaps. |
+| REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. Native disconnect fences, fresh interruption revisions outpace unfinished reconciliation, and the original monotonic deadline refuses expired release/begin. Guardian replacement, launchd ownership, and production recovery remain unresolved risk. |
 | REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor, CLI, completion-to-checkpoint, guardian integration, replay, and capacity-reservation coverage pass full CI/macOS at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The guardian is the harmless child's original parent and survives forced runner death; launchd ownership and a durable runnable policy loop remain gaps. |
-| REQ-SDC-016 | Owner-only path checks, same-UID peer admission, four-byte big-endian bounded typed JSON framing, malformed/oversized-frame fencing, and replacement connections pass Unix/macOS hosted tests. Exact-build artifact identity is not yet carried in the handshake. |
-| REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The in-memory server qualifies one-use staged admissions, but cross-process mutation remains refused until durable binding exists. |
-| REQ-SDC-018 | A replacement observer proves the same live instance and inventory after runner death. Normalized native binding, durable-before-ACK custody, fresh interruption/reconciliation, and ACK crash windows remain unimplemented. |
-| REQ-SDC-019 | The transport is pre-adoption and same-build-only by construction; no v1 upgrade, downgrade, rolling/replacement/cross-boot promise is made. Explicit artifact-version handshake rejection remains a gap. |
-| REQ-SDC-020 | A real disposable guardian/runner/harmless-child test proves original parenthood, runner death, surviving child/guardian identity, EOF fencing, and observation-only reconnect. Launchd bootstrap, SQLite recovery, mutation, and ACK-window cases remain required. |
+| REQ-SDC-016 | Owner-only path checks, same-UID peer admission, exact clean full-commit Hello identity, protocol-v2 four-byte big-endian bounded typed JSON framing, strict request fields, version/malformed/oversized-frame fencing, and replacement connections pass Unix/macOS hosted tests. |
+| REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The native server independently validates durable evidence before consuming its process-local initial gate or entering reconciliation; generic transport, finish, mutation, application, and ACK remain refused. |
+| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Reconciliation completion and retained-result application/ACK custody are not. |
+| REQ-SDC-019 | Exact schema compatibility, clean full-commit build identity, protocol-v2 rejection, and platform capability checks exist. The transport remains pre-adoption and same-build-only; no v1 upgrade, downgrade, rolling/replacement/cross-boot promise is made. |
+| REQ-SDC-020 | Linux policy/IPC/SQLite tests and hosted macOS exact-build handshake, gated-start, exact binding, original parenthood, runner-death, reconnect-begin, Clippy, and formatting qualification exist. Real guardian replacement, native mutation/ACK crash windows, launchd, updater, and rollback scenarios remain required. |
 
 ## Next work
 
 The qualified units are the in-process custodian/event loop and a disposable native
-observation transport with real runner-death survival. The next controller-owned work is
-a normalized durable binding, a runnable policy loop over the IPC boundary, launchd
-ownership, and the remaining process-death/reconnect/ACK-window E2E matrix. Those
+transport with durable initial binding/release, real runner-death survival, and
+observation-only durable reconciliation begin. The next controller-owned work is native
+reconciliation completion, retained-result application/ACK recovery, a runnable policy
+loop over the IPC boundary, launchd ownership, and the remaining process-death E2E matrix. Those
 surfaces must complete REQ-SDC-015–020 and ADR-109 while preserving ADR-108
 **detach-and-fence**, exact-instance recovery, the original absolute deadline, retained
 results, monotonic reconciliation generations, and whole-round signal-result
