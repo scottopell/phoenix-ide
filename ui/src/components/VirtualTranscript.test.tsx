@@ -472,7 +472,7 @@ describe('VirtualTranscript', () => {
     expect(ref.current?.physicalSnapshot().viewportTop).toBe(1);
   });
 
-  it.each(['directional', 'continuity', 'interrupted'] as const)('preserves %s positioning when the actual header ref mounts after the start command', mode => {
+  it.each(['directional', 'fraction-accepted', 'continuity', 'interrupted', 'cancelled', 'replacement'] as const)('preserves %s positioning when the actual header ref mounts after the start command', mode => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let actualTop = 0;
     let headerHeight = 0;
@@ -492,17 +492,24 @@ describe('VirtualTranscript', () => {
     const attachScroller = (element: HTMLDivElement | null) => {
       if (element) Object.defineProperty(element, 'scrollTop', {
         configurable: true, get: () => actualTop,
-        set: (value: number) => { writes.push(value); actualTop = Math.round(value); },
+        set: (value: number) => { writes.push(value); actualTop = mode === 'fraction-accepted' ? value : Math.round(value); },
       });
     };
+    let currentItems = items;
     const view = (withHeader: boolean) => <VirtualTranscript ariaLabel="Late header" ref={ref}
-      items={items} getKey={key} estimatedExtent={75} initialTail={false}
+      positioningAuthority={{kind: 'command', commandKey: 'late-start'}}
+      items={currentItems} getKey={key} estimatedExtent={75} initialTail={false}
       header={withHeader ? <div data-height={42.5}>Late header</div> : undefined}
       renderItem={rowPayload} scrollerRef={attachScroller} />;
     try {
       const {rerender} = render(view(false));
       act(() => ref.current?.scrollToIndex(0, 'start', 0, undefined, mode === 'continuity' ? 'continuity' : 'directional'));
       if (mode === 'interrupted') fireEvent.scroll(screen.getByRole('region', {name: 'Late header'}), {target: {scrollTop: 0}});
+      if (mode === 'cancelled') {
+        act(() => ref.current?.scrollToOwnedIndex('late-start', 0, 'start'));
+        act(() => ref.current?.cancelPosition('late-start'));
+      }
+      if (mode === 'replacement') act(() => ref.current?.scrollToIndex(0, 'start', 0, undefined, 'continuity'));
       writes.length = 0;
       headerHeight = 42.5;
       rerender(view(true));
@@ -510,9 +517,18 @@ describe('VirtualTranscript', () => {
       const child = screen.getByTestId('late-item-0');
       const row = child.closest<HTMLElement>('[data-virtual-index]')!;
       expect(ref.current?.physicalSnapshot().viewportTop).toBe(actualTop);
-      if (mode === 'directional') {
+      if (mode === 'directional' || mode === 'fraction-accepted') {
+        expect(writes).toEqual(mode === 'directional' ? [42.5, 41.5] : [42.5]);
         expect.soft(row.getBoundingClientRect().top - scroller.getBoundingClientRect().top, JSON.stringify(writes)).toBeGreaterThanOrEqual(0);
         expect(child.getBoundingClientRect().top - scroller.getBoundingClientRect().top).toBeGreaterThanOrEqual(0);
+        headerHeight = 43;
+        const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+        act(() => resizeObservers[0]!.triggerEntries([[header, headerHeight]]));
+        expect(child.getBoundingClientRect().top - scroller.getBoundingClientRect().top).toBeGreaterThanOrEqual(0);
+        const offset = child.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+        currentItems = [...items];
+        rerender(view(true));
+        expect(child.getBoundingClientRect().top - scroller.getBoundingClientRect().top).toBe(offset);
       } else {
         expect(writes).toEqual([42.5]);
         expect(actualTop).toBe(43);

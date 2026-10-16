@@ -41,6 +41,8 @@ export interface VirtualTranscriptAnchor {
   offset: number;
 }
 
+type PhysicalAnchor = VirtualTranscriptAnchor & { intent: 'directional_start' | 'continuity' };
+
 export type VirtualTranscriptTarget = string | ((row: HTMLElement) => Range | null);
 
 function resolveTarget(row: HTMLElement | undefined, target: VirtualTranscriptTarget | undefined): Element | Range | null {
@@ -125,7 +127,7 @@ interface PhysicalStore<T> {
   viewportExtent: number;
   overscan: number;
   revealPublicationPending: boolean;
-  activeAnchor: VirtualTranscriptAnchor | null;
+  activeAnchor: PhysicalAnchor | null;
   scroller: HTMLDivElement | null;
   headerElement: HTMLDivElement | null;
   rowElements: Map<string, HTMLDivElement>;
@@ -199,12 +201,17 @@ function tailFollows<T>(store: PhysicalStore<T>): boolean {
 }
 
 /** Null selects tail-following; an anchor preserves the current position. */
-function anchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+function anchorForChange<T>(store: PhysicalStore<T>): PhysicalAnchor | null {
   return tailFollows(store) ? null : (store.activeAnchor ?? captureTopAnchor(store));
 }
 
-function topAnchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
-  return tailFollows(store) ? null : captureTopAnchor(store);
+function topAnchorForChange<T>(store: PhysicalStore<T>): PhysicalAnchor | null {
+  if (tailFollows(store)) return null;
+  const captured = captureTopAnchor(store);
+  const active = store.activeAnchor;
+  return captured && active?.intent === 'directional_start' && active.key === captured.key
+    ? { ...captured, intent: 'directional_start' }
+    : captured;
 }
 
 function clampNonNegative(value: number): number {
@@ -444,7 +451,8 @@ function applyAlignedPosition<T>(
   current: PhysicalStore<T>, index: number, key: string, physicalOffset: number,
   target: number, align: 'start' | 'end', startPolicy: 'directional' | 'continuity',
 ): void {
-  current.activeAnchor = { index, key, offset: physicalOffset - target };
+  const intent = align === 'start' && startPolicy === 'directional' ? 'directional_start' : 'continuity';
+  current.activeAnchor = { index, key, offset: physicalOffset - target, intent };
   let wrotePosition = setScrollerScrollTop(current, target);
   if (align !== 'start' || startPolicy === 'continuity' || !current.scroller || isLayoutHidden(current.scroller)) return;
   const ceiling = Math.max(0, Math.min(target, Math.max(0, totalPhysicalExtent(current) - current.viewportExtent)));
@@ -455,7 +463,7 @@ function applyAlignedPosition<T>(
   const finalTop = current.scroller.scrollTop;
   current.viewportTop = finalTop;
   if (wrotePosition) current.pendingProgrammaticTop = finalTop;
-  current.activeAnchor = { index, key, offset: physicalOffset - finalTop };
+  current.activeAnchor = { index, key, offset: physicalOffset - finalTop, intent };
 }
 
 function positionAtIndex<T>(
@@ -514,7 +522,7 @@ function isProgrammaticScrollTop<T>(store: PhysicalStore<T>, scrollTop: number):
     && Math.abs(scrollTop - store.pendingProgrammaticTop) <= 1;
 }
 
-function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+function captureTopAnchor<T>(store: PhysicalStore<T>): PhysicalAnchor | null {
   if (store.layout.count === 0) return null;
   const index = store.layout.indexAtOffset(rowViewportOffset(store));
   const unit = store.layout.itemAt(index);
@@ -523,20 +531,26 @@ function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor |
     index,
     key: unit.key,
     offset: store.headerExtent + unit.offset + store.drift - settledViewportTop(store),
+    intent: 'continuity',
   };
 }
 
-function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null): void {
+function applyAnchor<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null): PhysicalAnchor | null {
   if (!anchor) {
     setScrollerScrollTop(store, settledViewportTop(store));
-    return;
+    return null;
   }
   const nextOffset = store.layout.offsetForKey(anchor.key);
   if (nextOffset === undefined) {
     setScrollerScrollTop(store, settledViewportTop(store));
-    return;
+    return null;
   }
   const target = store.headerExtent + nextOffset + store.drift - anchor.offset;
+  if (anchor.intent === 'directional_start') {
+    const index = store.keys.indexOf(anchor.key);
+    applyAlignedPosition(store, index, anchor.key, store.headerExtent + nextOffset + store.drift, target, 'start', 'directional');
+    return store.activeAnchor;
+  }
   const delta = target - settledViewportTop(store);
   // Mid-scroll absorption (REQ-VT-004); requires leading-spacer room and no
   // correction already owed as a write — a correction lives in the spacer or
@@ -546,10 +560,11 @@ function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor
     const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
     if (firstOffset + driftNext >= 0) {
       store.drift = driftNext;
-      return;
+      return anchor;
     }
   }
   setScrollerScrollTop(store, target);
+  return anchor;
 }
 
 function recompute<T>(store: PhysicalStore<T>): void {
@@ -582,7 +597,7 @@ function measureMountedExtents<T>(store: PhysicalStore<T>): boolean {
   return changed;
 }
 
-function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null, wasPinned: boolean): void {
+function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null, wasPinned: boolean): void {
   store.layout = buildStoreLayout(store);
   const followTail = wasPinned && store.tailFollowAllowed;
   if (resolvePendingTarget(store)) {
@@ -591,8 +606,9 @@ function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscri
   } else if (store.scroller && (followTail || store.initialTailPending)) {
     store.initialTailPending = false;
     setScrollerScrollTop(store, totalPhysicalExtent(store));
+    anchor = null;
   } else if (!store.initialTailPending) {
-    applyAnchor(store, anchor);
+    anchor = applyAnchor(store, anchor);
   }
   store.activeAnchor = anchor;
   recompute(store);
@@ -1032,7 +1048,7 @@ function VirtualTranscriptInner<T>(
       current.activeAnchor = anchor;
       recompute(current);
       publish();
-      return anchor;
+      return anchor ? { index: anchor.index, key: anchor.key, offset: anchor.offset } : null;
     },
     preserveViewportOnNextItemsChange() {
       const current = storeRef.current;
