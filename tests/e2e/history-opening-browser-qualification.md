@@ -2393,3 +2393,38 @@ replacement controls. Harness lifecycle68/controlled22/joint65 passed. Existing
 MessageList fixture warning remains recorded. No local build/native run occurred.
 Exact pinned corrected-artifact strict containment/collector/export/drain remain
 required; the old observed write trace remains failed-artifact evidence only.
+
+### Actual typed-anchor failure and representative parent completion regression
+
+Qualification `38978290925` at harness `e7a03e028908719c610a18863a8aff6c7cd2f5e3`
+is terminal FAIL: witness `117232892530` still fails first strict historical
+acquisition, Rust `117232971215` and all standard jobs pass. Zero controlled
+trials complete. Artifact `12079698600` is96,431,157B; bounded failure reads75,193B.
+Typed-anchor unit success is not actual browser resolution.
+
+Approved passive same-artifact trace `38981645495`, job `117243634289`, source
+`cbc66dd22616f27b7b849341e9ec00f46019f9b2`, is terminal diagnostic SUCCESS.
+Exact f542 executable/UI provenance reused, no builds/fullsuite, new recipeDB
+not originalDB. Healthy trace installed/drops0/errors0 again shows initial start0
+before header, then LAST native write42.5→43 from late header, row/message top92.5
+versus clip93. All five final frames remain clipped. Callsite in exact
+`MessageList-DE8weF38.js` maps to setter15622, applyAnchor CONTINUITY branch18222,
+applyPhysicalChange18838, header-ref22288, line1. Manifest-verified SHA256 is
+`eb3912046f401161a88bf85f41aac7e9449a9b8624c5d704f1b249c466c5ad1e`.
+This proves the later write uses continuity; the trace does not expose the parent
+authority value or independently prove why intent was demoted. Artifact
+`12081153181` is56,898B; original source-pin/identity checks and cleanup remain
+private-safe diagnostic evidence, not acceptance.
+
+Test-only donor `db9aed7e9f809f38546efb19dca1d6069e1a919d` integrates as
+`b6fd1c69a70b483706bf3cb6618a8697fba60a10`. Parent independently reproduced
+79pass/1red with real reducer plus real VirtualTranscript parent: positioning→
+owned native command→measured physical snapshot→physical_observed→finish applied
+exactly once→input idle/authority NONE→late header. It requests42.5/applies43 and
+clips-0.5. User interruption and replacement controls retain continuity. This
+covers the missing success-lifecycle seam; full MessageList integration/callbacks
+and actual gesture delivery are not claimed. Next correction must distinguish
+settled semantic geometry from expired command capability without retaining
+command authority indefinitely, restoring cancelled intent or changing continuity
+policy. Telemetry owns that representative source fix; parent retains integration/
+actual-browser execution. No further unchanged qualification is dispatched.
