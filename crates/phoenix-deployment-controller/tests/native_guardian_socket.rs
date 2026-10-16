@@ -61,6 +61,7 @@ fn exercise_protocol(directory: &Path, hello: WireSnapshot) {
         panic!("hello")
     };
     assert_eq!(snapshot.instance, hello.instance);
+    assert!(snapshot.native_binding.is_none());
     assert_eq!(snapshot.state, WireState::DetachedFenced);
     write_frame(
         &mut raw,

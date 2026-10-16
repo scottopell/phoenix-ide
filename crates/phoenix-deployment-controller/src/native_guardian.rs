@@ -1,4 +1,4 @@
-//! Disposable same-UID Unix transport; no durable binding or policy mutation authority.
+//! Disposable same-UID Unix transport; durable diagnostic binding has no policy mutation authority.
 use crate::guardian_ipc::{
     read_frame, write_frame, CodecError, GuardianServer, Request, Response, WireError,
     WireObservation, WireSlot, WireSnapshot,
@@ -429,6 +429,113 @@ impl GuardianClient {
     }
 }
 
+/// Verified diagnostic outcome, not a live controller session or execution permit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifiedBindingStatus {
+    InitialActive,
+    Detached,
+}
+
+/// Compare all durable continuity evidence before recording a detached session.
+/// # Errors
+/// Refuses missing/invalid wire identity, wrong attempt, stale binding, or store failure.
+pub fn verify_native_binding(
+    store: &mut crate::ControllerSqliteStore,
+    attempt: crate::AttemptId,
+    snapshot: &crate::guardian_ipc::WireSnapshot,
+) -> Result<VerifiedBindingStatus, String> {
+    use crate::guardian_ipc::{WireObservation, WireState};
+    use crate::{
+        GuardianLifetimeNonce, NativeGuardianIdentity, NativeGuardianSlot, NativeSessionState,
+        NativeSlotLiveness,
+    };
+    let reject = || "native binding mismatch".to_owned();
+    if snapshot.attempt != attempt.get()
+        || snapshot.session.instance != snapshot.instance
+        || snapshot.session.generation != 1
+    {
+        return Err(reject());
+    }
+    let wire = snapshot.native_binding.as_ref().ok_or_else(reject)?;
+    if wire.attempt != snapshot.attempt
+        || wire.deadline != snapshot.deadline
+        || wire.slots.len() != snapshot.slots.len()
+        || snapshot.slots.iter().enumerate().any(|(index, slot)| {
+            slot.instance != snapshot.instance || slot.ordinal != index as u64 + 1
+        })
+    {
+        return Err(reject());
+    }
+    let identity = NativeGuardianIdentity {
+        nonce: GuardianLifetimeNonce::new(wire.nonce).ok_or_else(reject)?,
+        process: wire.guardian.try_into().map_err(|_| reject())?,
+    };
+    let slots: Vec<NativeGuardianSlot> = wire
+        .slots
+        .iter()
+        .map(|slot| {
+            Ok(NativeGuardianSlot {
+                process: slot.identity.try_into().map_err(|_| reject())?,
+                liveness: match slot.liveness {
+                    WireObservation::Running => NativeSlotLiveness::Running,
+                    WireObservation::Exited => NativeSlotLiveness::Exited,
+                    WireObservation::Unavailable => NativeSlotLiveness::Unavailable,
+                },
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    let loaded = store
+        .load_attempt(attempt)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(reject)?;
+    match store
+        .load_native_binding(attempt)
+        .map_err(|e| e.to_string())?
+    {
+        None if snapshot.state == WireState::Active => {
+            store
+                .commit_initial_binding(
+                    attempt,
+                    crate::MonotonicTick::new(snapshot.deadline),
+                    loaded.persistence_revision(),
+                    identity,
+                    &slots,
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(VerifiedBindingStatus::InitialActive)
+        }
+        Some(binding) => {
+            if binding.identity() != identity
+                || binding.deadline().get() != snapshot.deadline
+                || binding.slots().len() != slots.len()
+                || !binding
+                    .slots()
+                    .iter()
+                    .zip(&slots)
+                    .all(|(a, b)| a.process == b.process)
+            {
+                return Err(reject());
+            }
+            match (snapshot.state, binding.current_session().state) {
+                (
+                    WireState::DetachedFenced,
+                    NativeSessionState::Active | NativeSessionState::Reconciling,
+                ) => {
+                    store
+                        .commit_detached_binding(&binding)
+                        .map_err(|e| e.to_string())?;
+                    Ok(VerifiedBindingStatus::Detached)
+                }
+                (WireState::DetachedFenced, NativeSessionState::Detached) => {
+                    Ok(VerifiedBindingStatus::Detached)
+                }
+                _ => Err(reject()),
+            }
+        }
+        None => Err(reject()),
+    }
+}
+
 #[cfg(target_os = "macos")]
 /// Spawn one harmless direct child and hold its original parent slot until the
 /// explicitly bounded disposable fixture ends.
@@ -438,12 +545,24 @@ pub fn run_disposable_guardian(
     dir: &Path,
     child_seconds: u64,
     serve_seconds: u64,
+    attempt: crate::AttemptId,
+    deadline: crate::MonotonicTick,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::{AttemptId, Guardian, MacOsControllerOs, MacOsGuardianExecutor, MonotonicTick};
+    use crate::{
+        Guardian, GuardianLifetimeNonce, MacOsControllerOs, MacOsGuardianExecutor,
+        NativeGuardianIdentity,
+    };
     use std::process::Command;
     if !(1..=120).contains(&child_seconds) || !(1..=120).contains(&serve_seconds) {
         return Err(Box::new(permission_denied()));
     }
+    let mut nonce_bytes = [0; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+    let native_identity = NativeGuardianIdentity {
+        nonce: GuardianLifetimeNonce::new(nonce_bytes)
+            .ok_or_else(|| io::Error::other("zero random nonce"))?,
+        process: crate::macos::own_process_identity()?,
+    };
     let listener = bind_disposable(dir)?;
     let os = MacOsControllerOs::new(dir)?;
     let mut command = Command::new("/bin/sleep");
@@ -451,8 +570,8 @@ pub fn run_disposable_guardian(
     let child = os.spawn_supervised(&mut command)?;
     let identity = child.identity();
     let (guardian, session) = Guardian::new(
-        AttemptId::new(1),
-        MonotonicTick::new(u64::MAX),
+        attempt,
+        deadline,
         MacOsGuardianExecutor::new(os),
         vec![child],
     )
@@ -463,7 +582,7 @@ pub fn run_disposable_guardian(
         error
     })?;
     let mut server = GuardianServer::new(guardian, session)?;
-    server.require_native_binding();
+    server.stage_native_identity(native_identity);
     println!(
         "disposable child pid={} birth={}:{}",
         identity.pid().get(),

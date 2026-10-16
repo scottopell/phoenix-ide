@@ -296,6 +296,10 @@ impl crate::GuardianExecutor for MacOsGuardianExecutor {
         }
     }
 
+    fn diagnostic_slot_identity(&self, slot: &SupervisedChild) -> Option<ProcessIdentity> {
+        Some(slot.identity())
+    }
+
     fn poll_observation_only(&self, slot: &SupervisedChild) -> crate::ChildSlotObservation {
         MacOsControllerOs::observe_supervised_slot(slot.identity())
     }
@@ -441,6 +445,14 @@ fn observe_process(pid: ProcessId) -> Result<ObservedProcess, MacOsError> {
         parent_pid,
         process_group,
     })
+}
+
+/// Observe the exact PID/birth identity of this guardian process.
+/// # Errors
+/// Fails closed when native process inspection is unavailable.
+pub(crate) fn own_process_identity() -> Result<ProcessIdentity, MacOsError> {
+    let pid = process_id(std::process::id()).ok_or(MacOsError::MalformedObservation)?;
+    Ok(observe_process(pid)?.identity)
 }
 
 fn require_same_identity(identity: ProcessIdentity) -> Result<(), MacOsError> {

@@ -14,7 +14,7 @@ use std::{
 
 use crate::{
     AttemptId, DispatchKey, DispatchTicket, ExecutedEffect, MonotonicTick, OsEffect,
-    PersistenceRevision,
+    PersistenceRevision, ProcessIdentity,
 };
 
 pub const MAX_CHILD_SLOTS: usize = 64;
@@ -138,6 +138,12 @@ pub trait GuardianExecutor {
         ticket: DispatchTicket,
         slots: &mut BTreeMap<ChildSlotId, Self::ChildSlot>,
     ) -> ExecutedEffect;
+
+    /// Diagnostic native identity of a retained slot, if available. No handle or
+    /// execution authority is transferred.
+    fn diagnostic_slot_identity(&self, _slot: &Self::ChildSlot) -> Option<ProcessIdentity> {
+        None
+    }
 
     /// Trusted semantic contract: do not signal, reap, finalize, remove, replace,
     /// or otherwise mutate a slot or start follow-up work. A shared borrow alone
@@ -663,6 +669,21 @@ impl<E: GuardianExecutor> Guardian<E> {
 
     pub fn inventory(&self) -> impl ExactSizeIterator<Item = ChildSlotId> + '_ {
         self.slots.keys().copied()
+    }
+
+    /// Ordered native identities and liveness, borrowed from original custody.
+    /// Missing identities remain explicit rather than being silently omitted.
+    #[must_use]
+    pub fn diagnostic_slots(&self) -> Vec<(Option<ProcessIdentity>, ChildSlotObservation)> {
+        self.slots
+            .values()
+            .map(|slot| {
+                (
+                    self.executor.diagnostic_slot_identity(slot),
+                    self.executor.poll_observation_only(slot),
+                )
+            })
+            .collect()
     }
 
     #[must_use]

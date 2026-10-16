@@ -1,5 +1,11 @@
 #![cfg(target_os = "macos")]
-use phoenix_deployment_controller::{guardian_ipc::WireState, native_guardian::GuardianClient};
+use phoenix_deployment_controller::{
+    guardian_ipc::WireState, native_guardian::GuardianClient, AttemptId, BirthToken, ControllerOs,
+    ControllerSqliteStore, CpuContentionBasisPoints, DeploymentAttempt, IdentityObservation,
+    MacOsControllerOs, MemoryPressure, MonotonicTick, NativeSessionState, ProcessId,
+    ProcessIdentity, ResourcePolicy,
+};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::{
     io::{BufRead, BufReader},
     os::unix::fs::PermissionsExt,
@@ -34,6 +40,25 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = parent.path().join("sdc-disposable-process");
+    let path = parent.path().join("controller.sqlite");
+    let attempt = AttemptId::new(64);
+    let deadline = MonotonicTick::new(u64::MAX);
+    let mut store = ControllerSqliteStore::open(&path).unwrap();
+    let policy = ResourcePolicy::new(
+        NonZeroUsize::new(2).unwrap(),
+        0,
+        0,
+        CpuContentionBasisPoints::new(0).unwrap(),
+        MemoryPressure::Critical,
+    );
+    let root = ProcessIdentity::new(
+        ProcessId::new(NonZeroU32::new(42).unwrap()),
+        BirthToken::new(1, 0).unwrap(),
+    );
+    DeploymentAttempt::start(attempt, deadline, policy, root)
+        .persist(&mut store)
+        .unwrap();
+    drop(store);
     let mut guardian = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"))
         .args([
             "--socket-dir",
@@ -42,6 +67,10 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
             "7",
             "--serve-seconds",
             "8",
+            "--attempt",
+            "64",
+            "--deadline",
+            "18446744073709551615",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -59,24 +88,16 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         .unwrap()
         .parse()
         .unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
-    let mut client = loop {
-        if let Ok(client) = GuardianClient::connect(&dir) {
-            break client;
-        }
-        assert!(Instant::now() < until, "guardian socket not ready");
-        // test-timing-allow: bounded polling waits for socket readiness.
-        thread::sleep(Duration::from_millis(25));
-    };
-    let original = client.hello().unwrap();
-    assert_eq!(original.slots.len(), 1);
-    drop(client);
     let mut runner = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
         .args([
             "--socket-dir",
             dir.to_str().unwrap(),
             "--observe-seconds",
             "5",
+            "--store",
+            path.to_str().unwrap(),
+            "--attempt",
+            "64",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -84,7 +105,29 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
     let mut runner_output = BufReader::new(runner.stdout.take().unwrap());
     let mut ready = String::new();
     runner_output.read_line(&mut ready).unwrap();
-    assert!(ready.starts_with("guardian instance="));
+    assert_eq!(ready.trim(), "verified binding: InitialActive");
+    let mut store = ControllerSqliteStore::open_existing(&path).unwrap();
+    let binding = store.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(binding.identity().process.pid().get(), guardian.id());
+    let mut observer = MacOsControllerOs::new(&dir).unwrap();
+    assert!(
+        matches!(
+            observer.observe_identity(binding.identity().process),
+            IdentityObservation::SameIdentity { .. }
+        ),
+        "guardian PID and birth token must match OS observation"
+    );
+    assert_eq!(binding.slots().len(), 1);
+    assert_eq!(binding.slots()[0].process.pid().get(), pid as u32);
+    let birthday: Vec<_> = line.split("birth=").nth(1).unwrap().split(':').collect();
+    assert_eq!(
+        binding.slots()[0].process.birth().seconds(),
+        birthday[0].parse().unwrap()
+    );
+    assert_eq!(
+        binding.slots()[0].process.birth().nanos(),
+        birthday[1].parse().unwrap()
+    );
     runner.kill().unwrap();
     runner.wait().unwrap();
     let reconnect_deadline = Instant::now() + Duration::from_secs(5);
@@ -103,8 +146,11 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
         // test-timing-allow: bounded polling observes the protocol state transition.
         thread::sleep(Duration::from_millis(25));
     };
-    assert_eq!(snapshot.instance, original.instance);
-    assert_eq!(snapshot.slots, original.slots);
+    assert_eq!(snapshot.slots.len(), 1);
+    assert_eq!(
+        snapshot.native_binding.as_ref().unwrap().nonce,
+        binding.identity().nonce.bytes()
+    );
     assert!(guardian.try_wait().unwrap().is_none());
     assert_eq!(
         unsafe { libc::kill(pid, 0) },
@@ -118,10 +164,23 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
             dir.to_str().unwrap(),
             "--observe-seconds",
             "1",
+            "--store",
+            path.to_str().unwrap(),
+            "--attempt",
+            "64",
         ])
         .stdout(Stdio::null())
         .status()
         .unwrap();
     assert!(runner_status.success());
+    assert_eq!(
+        store
+            .load_native_binding(attempt)
+            .unwrap()
+            .unwrap()
+            .current_session()
+            .state,
+        NativeSessionState::Detached
+    );
     assert!(guardian.wait().unwrap().success());
 }

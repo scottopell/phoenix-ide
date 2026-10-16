@@ -318,6 +318,24 @@ impl From<ChildSlotObservation> for WireObservation {
         }
     }
 }
+/// Diagnostic metadata only; never a session or dispatch capability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireNativeBinding {
+    pub attempt: u128,
+    pub deadline: u64,
+    pub nonce: [u8; 16],
+    pub guardian: WireIdentity,
+    pub slots: Vec<WireNativeSlot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireNativeSlot {
+    pub identity: WireIdentity,
+    pub liveness: WireObservation,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireSnapshot {
@@ -328,6 +346,7 @@ pub struct WireSnapshot {
     pub session: WireSession,
     pub slots: Vec<WireSlot>,
     pub retained: Vec<WireRetained>,
+    pub native_binding: Option<WireNativeBinding>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -580,6 +599,7 @@ pub struct GuardianServer<E: GuardianExecutor> {
     admissions: BTreeMap<u64, (ControllerSession, DispatchTicket)>,
     next_admission: u64,
     native_unbound: bool,
+    native_identity: Option<crate::NativeGuardianIdentity>,
 }
 impl<E: GuardianExecutor> GuardianServer<E> {
     /// Construct a server bound to an authenticated policy session.
@@ -604,6 +624,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             admissions: BTreeMap::new(),
             next_admission: 1,
             native_unbound: false,
+            native_identity: None,
         })
     }
     /// Disable native mutation until durable policy binding can stage affine proof.
@@ -611,6 +632,12 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     /// committed transition, interruption, reconciliation or applied ACK.
     pub fn require_native_binding(&mut self) {
         self.native_unbound = true;
+    }
+
+    /// Stage this process's diagnostic identity; mutation remains unsupported.
+    pub fn stage_native_identity(&mut self, identity: crate::NativeGuardianIdentity) {
+        self.native_identity = Some(identity);
+        self.require_native_binding();
     }
 
     /// Returns the live guardian without exposing mutable custody.
@@ -714,6 +741,25 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 .retained_results()
                 .map(WireRetained::from)
                 .collect(),
+            native_binding: self.native_identity.and_then(|identity| {
+                self.guardian
+                    .diagnostic_slots()
+                    .into_iter()
+                    .map(|(process, liveness)| {
+                        Some(WireNativeSlot {
+                            identity: process?.into(),
+                            liveness: liveness.into(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .map(|slots| WireNativeBinding {
+                        attempt: self.guardian.attempt_id().get(),
+                        deadline: self.guardian.original_deadline().get(),
+                        nonce: identity.nonce.bytes(),
+                        guardian: identity.process.into(),
+                        slots,
+                    })
+            }),
         }
     }
     pub fn fence_connection(&mut self) {
@@ -900,7 +946,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     return Err(error.into());
                 }
                 Err(crate::guardian::PolicySubmissionError::ExecutorCorrelationMismatch) => {
-                    return Err(GuardianError::ExecutorCorrelationMismatch.into())
+                    return Err(GuardianError::ExecutorCorrelationMismatch.into());
                 }
             }
         })
