@@ -59,6 +59,9 @@ THE SYSTEM SHALL report the absent state without launching a daemon or browser.
 THE SYSTEM SHALL distinguish the stable selected session identity from each daemon lifetime and browser lifetime
 AND SHALL expose the applicable lifetime identifiers in operation results.
 
+WHEN its owned Chrome process exits while the daemon remains alive
+THE SYSTEM SHALL report the browser as absent, reject state-dependent actions with state loss, and let a subsequent `open` retire the ended lifetime and start fresh
+
 WHEN a browser lifetime ends
 THE SYSTEM SHALL invalidate its accessibility references and active profiling state
 AND SHALL NOT transfer those handles to a replacement browser.
@@ -80,7 +83,16 @@ AND SHALL surface cleanup failures rather than report successful cleanup.
 
 THE SYSTEM SHALL NOT expire an active operation because it exceeds the idle interval.
 
-**Rationale:** Abandoned sessions release resources without interrupting long profiling scenarios.
+WHEN `close` or an orderly termination signal arrives during an admitted browser operation
+THE SYSTEM SHALL cancel the operation independently of its page-side completion
+AND SHALL report `operation_cancelled` with an explicit warning that side effects may have occurred
+AND SHALL retain ownership until the operation worker has exited and browser cleanup completes.
+
+WHEN shutdown arrives while browser initialization is in progress
+THE SYSTEM SHALL let initialization settle and register any successfully created browser before cancellation and cleanup
+AND SHALL NOT abandon an initialization future that may own an unregistered Chrome process.
+
+**Rationale:** Idle expiry preserves active work. Explicit shutdown releases resources promptly while retaining ownership across initialization and cancellation.
 
 ### REQ-BCLI-007: Actionable Navigation Result
 
@@ -102,7 +114,8 @@ THE SYSTEM SHALL expose navigation, accessibility snapshots, JavaScript evaluati
 THE SYSTEM SHALL accept both accessibility references and CSS selectors for click and text input under REQ-BT-008, REQ-BT-009, and REQ-BT-025
 AND SHALL support `eval --stdin` for JavaScript input.
 
-THE SYSTEM SHALL preserve profiling readiness boundaries, reset and warmup behavior, raw per-run samples, unavailable/null distinctions, warnings, and artifacts under REQ-BT-019.
+THE SYSTEM SHALL preserve profiling readiness boundaries, reset and warmup behavior, raw per-run samples, unavailable/null distinctions, warnings, and artifacts under REQ-BT-019
+AND SHALL preserve structured failure data, including blocked-step and methodology information, when the operation fails.
 
 **Rationale:** Moving between coding harnesses should preserve the debugging and measurement workflow.
 

@@ -77,7 +77,7 @@ const TRACKED_METRICS: &[&str] = &[
 
 #[derive(Debug, Deserialize)]
 struct ProfileInput {
-    action: String,
+    action: ProfileAction,
     /// `trace_start`: comma-separated category override.
     #[serde(default)]
     categories: Option<String>,
@@ -115,6 +115,35 @@ struct ProfileInput {
     /// `cpu_summary`: path to a saved CPU profile JSON to summarise.
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProfileAction {
+    Help,
+    CpuSummary,
+    RunScenario,
+    Metrics,
+    Throttle,
+    GcHeap,
+    CpuStart,
+    CpuStop,
+    TraceStart,
+    TraceStop,
+    WhyRender,
+    HeapSnapshot,
+    CoverageStart,
+    CoverageStop,
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_profile_input(input: Value) -> Result<ProfileInput, ToolOutput> {
+    let input: ProfileInput = serde_json::from_value(input)
+        .map_err(|error| ToolOutput::error(format!("Invalid input: {error}")))?;
+    if input.action == ProfileAction::Throttle {
+        validate_throttle_rate(input.rate)?;
+    }
+    Ok(input)
 }
 
 /// Per-run reset directive (REQ-BT-019.18). Accepts either the string
@@ -356,63 +385,72 @@ impl Tool for BrowserProfileTool {
 }
 
 impl BrowserProfileTool {
+    #[allow(clippy::result_large_err)]
+    pub(super) fn validate_input(input: Value) -> Result<(), ToolOutput> {
+        let input = parse_profile_input(input)?;
+        if input.action == ProfileAction::RunScenario {
+            validate_run_scenario(&input)?;
+        }
+        if input.action == ProfileAction::CpuSummary && input.path.is_none() {
+            return Err(ToolOutput::error(
+                "cpu_summary requires `path` (a saved CPU profile JSON)",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn run_browser(
         input: Value,
         access: &(impl super::BrowserAccess + ?Sized),
     ) -> ToolOutput {
-        let input: ProfileInput = match serde_json::from_value(input) {
+        macro_rules! on_browser {
+            ($session:ident => $action:expr) => {{
+                let $session: Arc<RwLock<BrowserSession>> = match access.browser().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        return ToolOutput::error(format!("Failed to get browser: {error}"))
+                    }
+                };
+                $action
+            }};
+        }
+
+        let input = match parse_profile_input(input) {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+            Err(error) => return error,
         };
 
-        // help and cpu_summary need no browser (cpu_summary parses a
-        // file on disk — works even after the session died).
-        if input.action == "help" {
-            return ToolOutput::success(help_text());
-        }
-        if input.action == "cpu_summary" {
-            return action_cpu_summary(input.path.as_deref()).await;
-        }
-
-        // run_scenario's structural validation (empty steps, navigate/
-        // reload-in-steps, runs/throttle bounds) is pure input checking
-        // and MUST run BEFORE acquiring the browser — otherwise an
-        // invalid scenario in a no-Chrome env returns "Failed to get
-        // browser" instead of the real validation error, defeating the
-        // non-browser validation guarantee (Codex P2). Mirrors how
-        // `help` / `cpu_summary` are dispatched pre-browser.
-        if input.action == "run_scenario" {
-            let plan = match validate_run_scenario(&input) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
-                Ok(s) => s,
-                Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-            };
-            return action_run_scenario(&session, &input, plan).await;
-        }
-
-        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-        };
-
-        match input.action.as_str() {
-            "metrics" => action_metrics(&session).await,
-            "throttle" => action_throttle(&session, input.rate).await,
-            "gc_heap" => action_gc_heap(&session).await,
-            "cpu_start" => action_cpu_start(&session).await,
-            "cpu_stop" => action_cpu_stop(&session).await,
-            "trace_start" => action_trace_start(&session, input.categories.as_deref()).await,
-            "trace_stop" => action_trace_stop(&session).await,
-            "why_render" => action_why_render(&session).await,
-            "heap_snapshot" => action_heap_snapshot(&session, input.baseline.as_deref()).await,
-            "coverage_start" => action_coverage_start(&session).await,
-            "coverage_stop" => action_coverage_stop(&session).await,
-            other => ToolOutput::error(format!(
-                "Unknown action {other:?} — call action=\"help\" for the list"
-            )),
+        match input.action {
+            ProfileAction::Help => ToolOutput::success(help_text()),
+            ProfileAction::CpuSummary => action_cpu_summary(input.path.as_deref()).await,
+            ProfileAction::RunScenario => {
+                let plan = match validate_run_scenario(&input) {
+                    Ok(plan) => plan,
+                    Err(error) => return error,
+                };
+                on_browser!(session => action_run_scenario(&session, &input, plan).await)
+            }
+            ProfileAction::Metrics => on_browser!(session => action_metrics(&session).await),
+            ProfileAction::Throttle => {
+                on_browser!(session => action_throttle(&session, input.rate).await)
+            }
+            ProfileAction::GcHeap => on_browser!(session => action_gc_heap(&session).await),
+            ProfileAction::CpuStart => on_browser!(session => action_cpu_start(&session).await),
+            ProfileAction::CpuStop => on_browser!(session => action_cpu_stop(&session).await),
+            ProfileAction::TraceStart => {
+                on_browser!(session => action_trace_start(&session, input.categories.as_deref()).await)
+            }
+            ProfileAction::TraceStop => on_browser!(session => action_trace_stop(&session).await),
+            ProfileAction::WhyRender => on_browser!(session => action_why_render(&session).await),
+            ProfileAction::HeapSnapshot => {
+                on_browser!(session => action_heap_snapshot(&session, input.baseline.as_deref()).await)
+            }
+            ProfileAction::CoverageStart => {
+                on_browser!(session => action_coverage_start(&session).await)
+            }
+            ProfileAction::CoverageStop => {
+                on_browser!(session => action_coverage_stop(&session).await)
+            }
         }
     }
 }
@@ -597,17 +635,28 @@ async fn apply_throttle(session: &Arc<RwLock<BrowserSession>>, rate: f64) -> Res
     Ok(())
 }
 
-async fn action_throttle(session: &Arc<RwLock<BrowserSession>>, rate: Option<f64>) -> ToolOutput {
+#[allow(clippy::result_large_err)]
+fn validate_throttle_rate(rate: Option<f64>) -> Result<f64, ToolOutput> {
     let Some(rate) = rate else {
-        return ToolOutput::error("throttle requires `rate` (number >= 1; 1 = no throttle)");
+        return Err(ToolOutput::error(
+            "throttle requires `rate` (number >= 1; 1 = no throttle)",
+        ));
     };
     // Allium ThrottleRateWellFormed / invariant: rate < 1 must never be
     // representable as established override state.
     if rate < 1.0 {
-        return ToolOutput::error(format!(
+        return Err(ToolOutput::error(format!(
             "Invalid rate {rate}: must be >= 1 (1 = no throttling)"
-        ));
+        )));
     }
+    Ok(rate)
+}
+
+async fn action_throttle(session: &Arc<RwLock<BrowserSession>>, rate: Option<f64>) -> ToolOutput {
+    let rate = match validate_throttle_rate(rate) {
+        Ok(rate) => rate,
+        Err(error) => return error,
+    };
     if let Err(e) = apply_throttle(session, rate).await {
         return ToolOutput::error(e);
     }
@@ -1022,6 +1071,7 @@ struct ScenarioPlan {
     steps: Vec<Step>,
     runs: u32,
     warmup: u32,
+    total_runs: u32,
     gc_per_run: bool,
     reset: Reset,
 }
@@ -1071,6 +1121,10 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
     if runs < 1 {
         return Err(ToolOutput::error("run_scenario requires `runs` >= 1"));
     }
+    let warmup = resolve_warmup(input.warmup);
+    let total_runs = warmup.checked_add(runs).ok_or_else(|| {
+        ToolOutput::error("run_scenario warmup + runs exceeds the supported u32 run count")
+    })?;
     if let Some(tr) = input.throttle_rate {
         if tr < 1.0 {
             return Err(ToolOutput::error(format!(
@@ -1083,7 +1137,8 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
         steps,
         runs,
         // REQ-BT-019.16: warmup defaults to 1 (cold JIT/first-paint excluded).
-        warmup: resolve_warmup(input.warmup),
+        warmup,
+        total_runs,
         gc_per_run: input.gc_per_run.unwrap_or(true),
         reset: Reset::resolve(input.reset.as_ref()),
     })
@@ -1098,6 +1153,7 @@ async fn action_run_scenario(
         steps,
         runs,
         warmup,
+        total_runs,
         gc_per_run,
         reset,
     } = plan;
@@ -1119,7 +1175,6 @@ async fn action_run_scenario(
         }
     }
 
-    let total_runs = warmup + runs;
     let mut samples: Vec<RunSample> = Vec::with_capacity(runs as usize);
 
     // Warmup runs execute identically but their samples are discarded

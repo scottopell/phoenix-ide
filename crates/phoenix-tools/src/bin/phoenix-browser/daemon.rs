@@ -1,5 +1,5 @@
 use super::cli::parse_idle;
-use super::protocol::{self, Outcome, Request, Response, SessionPaths};
+use super::protocol::{self, ErrorCode, Outcome, Request, Response, SessionPaths};
 use async_trait::async_trait;
 use fs2::FileExt;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
@@ -14,8 +14,9 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
+use tokio::sync::{mpsc, watch};
 
 /// Called before creating the daemon's Tokio runtime or starting any threads.
 pub fn close_inherited_descriptors() -> Result<(), String> {
@@ -179,7 +180,17 @@ fn adapt(session: &str, lifetime: Option<&str>, output: &ToolOutput) -> Response
             json!({"text": output.output(), "data":data, "artifacts":artifacts}),
         )
     } else {
-        Response::error(session, lifetime, "operation_failed", output.output())
+        let mut response = Response::error(
+            session,
+            lifetime,
+            ErrorCode::OperationFailed,
+            output.output(),
+        );
+        if let Outcome::Error { error } = &mut response.outcome {
+            error.details = data;
+            error.artifacts = artifacts;
+        }
+        response
     }
 }
 
@@ -188,7 +199,12 @@ pub async fn offline(session: &str, request: &Request) -> Response {
         let selected = request.input["command"].as_str();
         let entries: Vec<_> = BrowserOperation::ALL.iter().copied().filter(|op| selected.is_none() || selected.and_then(operation) == Some(*op) || selected == Some(op.name())).map(|op| json!({"name":op.name(),"description":op.description(),"input_schema":op.input_schema()})).collect();
         if entries.is_empty() {
-            return Response::error(session, None, "invalid_input", "unknown schema command");
+            return Response::error(
+                session,
+                None,
+                ErrorCode::InvalidInput,
+                "unknown schema command",
+            );
         }
         return Response::success(session, None, json!({"operations":entries}));
     }
@@ -209,10 +225,44 @@ struct State {
     idle: Duration,
 }
 
+struct ReadyOperation {
+    browser: Arc<RwLock<BrowserSession>>,
+    operation: BrowserOperation,
+    browser_lifetime: String,
+}
+
+enum Admission {
+    Reply(Response),
+    Ready(ReadyOperation),
+}
+
 impl State {
-    async fn execute(&self, request: &Request) -> Response {
+    async fn live_browser(&self) -> Result<Option<Arc<RwLock<BrowserSession>>>, String> {
+        let Some(browser) = self.manager.get_existing(&self.scope).await else {
+            return Ok(None);
+        };
+        let running = browser
+            .write()
+            .await
+            .is_running()
+            .map_err(|e| e.to_string())?;
+        Ok(running.then_some(browser))
+    }
+
+    async fn admit(&self, request: &Request) -> Admission {
+        let existing = match self.live_browser().await {
+            Ok(browser) => browser,
+            Err(error) => {
+                return Admission::Reply(Response::error(
+                    &self.session,
+                    Some(&self.lifetime),
+                    ErrorCode::BrowserStateUnavailable,
+                    error,
+                ))
+            }
+        };
         if request.command == "status" {
-            let browser = self.manager.get_existing(&self.scope).await;
+            let browser = existing;
             let browser_lifetime = match browser {
                 Some(browser) => Some(browser.read().await.launch_identity().launch_uuid.clone()),
                 None => None,
@@ -223,65 +273,90 @@ impl State {
                 .await
                 .into_iter()
                 .next();
-            return Response::success(
+            return Admission::Reply(Response::success(
                 &self.session,
                 Some(&self.lifetime),
-                json!({"active":browser_lifetime.is_some(),"browser_lifetime":browser_lifetime,"idle_timeout_seconds":self.idle.as_secs(),"daemon_pid":std::process::id(),"chrome_pid":identity.as_ref().and_then(|id|id.chrome_pid),"profile_path":identity.map(|id|id.profile_path)}),
-            );
+                json!({"active":browser_lifetime.is_some(),"idle_timeout_seconds":self.idle.as_secs(),"daemon_pid":std::process::id(),"chrome_pid":identity.as_ref().and_then(|id|id.chrome_pid),"profile_path":identity.map(|id|id.profile_path)}),
+            ).with_browser_lifetime(browser_lifetime));
         }
         let Some(operation) = operation(&request.command) else {
-            return Response::error(
+            return Admission::Reply(Response::error(
                 &self.session,
                 Some(&self.lifetime),
-                "invalid_input",
+                ErrorCode::InvalidInput,
                 "unknown command",
-            );
+            ));
         };
-        let browser = if request.command == "open" {
-            match self.manager.get_session(&self.scope).await {
-                Ok(browser) => browser,
-                Err(error) => {
-                    return Response::error(
+        let browser = match (request.command.as_str(), existing) {
+            (_, Some(browser)) => browser,
+            ("open", None) => {
+                if let Err(error) = self.manager.kill_session(&self.scope).await {
+                    return Admission::Reply(Response::error(
                         &self.session,
                         Some(&self.lifetime),
-                        "browser_start_failed",
+                        ErrorCode::CleanupFailed,
                         error.to_string(),
-                    )
+                    ));
+                }
+                match self.manager.get_session(&self.scope).await {
+                    Ok(browser) => browser,
+                    Err(error) => {
+                        return Admission::Reply(Response::error(
+                            &self.session,
+                            Some(&self.lifetime),
+                            ErrorCode::BrowserStartFailed,
+                            error.to_string(),
+                        ))
+                    }
                 }
             }
-        } else {
-            match self.manager.get_existing(&self.scope).await {
-                Some(browser) => browser,
-                None => {
-                    return Response::error(
-                        &self.session,
-                        Some(&self.lifetime),
-                        "state_lost",
-                        "browser state is gone; use open URL to start fresh",
-                    )
-                }
+            (_, None) => {
+                return Admission::Reply(Response::error(
+                    &self.session,
+                    Some(&self.lifetime),
+                    ErrorCode::StateLost,
+                    "browser state is gone; use open URL to start fresh",
+                ))
             }
         };
         let browser_lifetime = browser.read().await.launch_identity().launch_uuid.clone();
+        Admission::Ready(ReadyOperation {
+            browser,
+            operation,
+            browser_lifetime,
+        })
+    }
+
+    async fn execute(&self, request: &Request, ready: &ReadyOperation) -> Response {
+        let ReadyOperation {
+            browser,
+            operation,
+            browser_lifetime,
+        } = ready;
         let access = Existing(browser.clone());
-        if request.command == "open" {
-            browser
-                .read()
-                .await
-                .console_logs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
-        }
+        let console_capture = if request.command == "open" {
+            Some(
+                browser
+                    .read()
+                    .await
+                    .begin_console_navigation_capture()
+                    .await,
+            )
+        } else {
+            None
+        };
         let output = operation.execute(request.input.clone(), &access).await;
         if request.command != "open" || !output.is_success() {
-            let mut response = adapt(&self.session, Some(&self.lifetime), &output);
-            if let Outcome::Success { result } = &mut response.outcome {
-                result["browser_lifetime"] = json!(browser_lifetime);
-            }
-            return response;
+            return adapt(&self.session, Some(&self.lifetime), &output)
+                .with_browser_lifetime(Some(browser_lifetime.clone()));
         }
-        self.open_result(&access, &browser, &browser_lifetime).await
+        self.open_result(
+            &access,
+            browser,
+            browser_lifetime,
+            console_capture.expect("open capture attempted"),
+        )
+        .await
     }
 
     async fn open_result(
@@ -289,6 +364,10 @@ impl State {
         access: &Existing,
         browser: &Arc<RwLock<BrowserSession>>,
         browser_lifetime: &str,
+        capture: Result<
+            phoenix_browser::session::ConsoleNavigationCapture,
+            phoenix_browser::BrowserError,
+        >,
     ) -> Response {
         let snapshot = adapt(
             &self.session,
@@ -311,97 +390,194 @@ impl State {
                 .flatten();
             (url, title)
         };
-        let errors: Vec<_> = browser
-            .read()
-            .await
-            .console_logs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.level,
-                    phoenix_browser::ConsoleLevel::Error | phoenix_browser::ConsoleLevel::Assert
-                )
-            })
-            .map(|entry| json!({"level":entry.level,"text":entry.text}))
-            .collect();
+        let captured = match capture {
+            Ok(capture) => {
+                browser
+                    .read()
+                    .await
+                    .finish_console_navigation_capture(capture)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let (errors, console_capture_error) = match captured {
+            Ok(entries) => (
+                Some(
+                    entries
+                        .into_iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry.level,
+                                phoenix_browser::ConsoleLevel::Error
+                                    | phoenix_browser::ConsoleLevel::Assert
+                            )
+                        })
+                        .map(|entry| json!({"level":entry.level,"text":entry.text}))
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+            ),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Response::success(
             &self.session,
             Some(&self.lifetime),
-            json!({"url":url,"title":title,"navigation":"succeeded","browser_lifetime":browser_lifetime,"snapshot":snapshot.outcome,"console_errors":errors}),
-        )
+            json!({"url":url,"title":title,"navigation":"succeeded","snapshot":snapshot.outcome,"console_errors":errors,"console_capture_error":console_capture_error}),
+        ).with_browser_lifetime(Some(browser_lifetime.into()))
     }
 }
 
-async fn wait_signal() {
+fn shutdown_signal() -> Result<impl std::future::Future<Output = ()> + Send, String> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install SIGTERM handler");
-    tokio::select! { _ = terminate.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+        .map_err(|e| e.to_string())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|e| e.to_string())?;
+    Ok(async move {
+        tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
+    })
 }
 
-async fn serve(listener: &UnixListener, state: &State, socket: &Path) -> Result<(), String> {
-    loop {
-        let accepted = tokio::time::timeout(state.idle, listener.accept()).await;
-        let (mut stream, _) = match accepted {
-            Err(_) => return Ok(()),
-            Ok(Err(error)) => return Err(format!("accept: {error}")),
-            Ok(Ok(stream)) => stream,
-        };
-        let request: Request = match tokio::time::timeout(
-            Duration::from_secs(10),
-            protocol::read_message(&mut stream),
-        )
-        .await
-        {
-            Ok(Ok(request)) => request,
-            Ok(Err(error)) => {
-                let _ = protocol::write_message(
-                    &mut stream,
-                    &Response::error(
-                        &state.session,
-                        Some(&state.lifetime),
-                        "invalid_input",
-                        error,
-                    ),
-                )
-                .await;
-                continue;
-            }
-            Err(_) => continue,
-        };
-        if request.command == "close" {
-            let response = match state.manager.shutdown_all().await {
-                Ok(()) => Response::success(
-                    &state.session,
-                    Some(&state.lifetime),
-                    json!({"active":false,"closed":true}),
-                ),
-                Err(error) => Response::error(
-                    &state.session,
-                    Some(&state.lifetime),
-                    "cleanup_failed",
-                    error.to_string(),
-                ),
-            };
-            if response.is_success() {
-                std::fs::remove_file(socket).map_err(|e| format!("retire endpoint: {e}"))?;
-            }
-            let _ = protocol::write_message(&mut stream, &response).await;
-            return if response.is_success() {
-                Ok(())
-            } else {
-                Err("browser cleanup failed; inspect daemon log".into())
-            };
-        }
-        let response = state.execute(&request).await;
-        // A disconnected client does not cancel or replay the completed operation.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(10),
-            protocol::write_message(&mut stream, &response),
-        )
-        .await;
+struct Job {
+    request: Request,
+    stream: UnixStream,
+}
+
+async fn send_response(stream: &mut UnixStream, response: &Response) {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        protocol::write_message(stream, response),
+    )
+    .await;
+}
+
+fn cancelled(state: &State, browser_lifetime: Option<String>) -> Response {
+    Response::error(&state.session, Some(&state.lifetime), ErrorCode::OperationCancelled, "Shutdown interrupted the operation; browser-side effects may have partially executed. The browser is being closed; do not replay the action automatically.").with_browser_lifetime(browser_lifetime)
+}
+
+async fn run_job(state: &State, job: &mut Job, shutdown: &mut watch::Receiver<bool>) -> Response {
+    if *shutdown.borrow() {
+        return cancelled(state, None);
     }
+    // Startup retains ownership until the manager can authoritatively tear down its session.
+    let admission = state.admit(&job.request).await;
+    let ready = match admission {
+        Admission::Reply(response) => return response,
+        Admission::Ready(ready) => ready,
+    };
+    if *shutdown.borrow() {
+        return cancelled(state, Some(ready.browser_lifetime));
+    }
+    tokio::select! {
+        response = state.execute(&job.request, &ready) => response,
+        _ = shutdown.changed() => cancelled(state, Some(ready.browser_lifetime.clone())),
+    }
+}
+
+async fn worker(
+    state: Arc<State>,
+    mut jobs: mpsc::Receiver<Job>,
+    mut shutdown: watch::Receiver<bool>,
+    completed: mpsc::UnboundedSender<()>,
+) {
+    while let Some(mut job) = jobs.recv().await {
+        let response = run_job(&state, &mut job, &mut shutdown).await;
+        send_response(&mut job.stream, &response).await;
+        let _ = completed.send(());
+    }
+}
+
+async fn read_job(mut stream: UnixStream, state: &State) -> Option<Job> {
+    match tokio::time::timeout(Duration::from_secs(10), protocol::read_message(&mut stream)).await {
+        Ok(Ok(request)) => Some(Job { request, stream }),
+        failure => {
+            let message = match failure {
+                Ok(Err(error)) => error,
+                Err(_) => "request read timed out".into(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            send_response(
+                &mut stream,
+                &Response::error(
+                    &state.session,
+                    Some(&state.lifetime),
+                    ErrorCode::InvalidInput,
+                    message,
+                ),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+async fn serve(
+    listener: &UnixListener,
+    state: Arc<State>,
+    socket: &Path,
+    signal: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let (jobs_tx, jobs_rx) = mpsc::channel(16);
+    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(worker(state.clone(), jobs_rx, shutdown_rx, completed_tx));
+    let mut pending = 0_u32;
+    let mut deadline = tokio::time::Instant::now() + state.idle;
+    let mut close_stream = None;
+    tokio::pin!(signal);
+    let result = loop {
+        tokio::select! {
+            () = &mut signal => break Ok(()),
+            () = tokio::time::sleep_until(deadline), if pending == 0 => break Ok(()),
+            completion = completed_rx.recv(), if pending > 0 => {
+                if completion.is_none() { break Err("browser worker stopped unexpectedly".into()); }
+                pending -= 1;
+                deadline = tokio::time::Instant::now() + state.idle;
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted { Ok(accepted) => accepted, Err(error) => break Err(format!("accept: {error}")) };
+                let Some(mut job) = read_job(stream, &state).await else { continue; };
+                if job.request.command == "close" { close_stream = Some(job.stream); break Ok(()); }
+                match jobs_tx.try_send(job) {
+                    Ok(()) => pending += 1,
+                    Err(mpsc::error::TrySendError::Full(returned)) => {
+                        job = returned;
+                        send_response(&mut job.stream, &Response::error(&state.session, Some(&state.lifetime), ErrorCode::Busy, "Session request queue is full; this request was not executed.")).await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break Err("browser worker stopped unexpectedly".into()),
+                }
+            }
+        }
+    };
+    let _ = shutdown_tx.send(true);
+    drop(jobs_tx);
+    let worker_result = task
+        .await
+        .map_err(|e| format!("browser worker failed: {e}"));
+    let cleanup = state
+        .manager
+        .shutdown_all()
+        .await
+        .map_err(|e| e.to_string());
+    if cleanup.is_ok() {
+        std::fs::remove_file(socket).map_err(|e| format!("retire endpoint: {e}"))?;
+    }
+    if let Some(mut stream) = close_stream {
+        let response = match &cleanup {
+            Ok(()) => Response::success(
+                &state.session,
+                Some(&state.lifetime),
+                json!({"active":false,"closed":true}),
+            ),
+            Err(error) => Response::error(
+                &state.session,
+                Some(&state.lifetime),
+                ErrorCode::CleanupFailed,
+                error,
+            ),
+        };
+        send_response(&mut stream, &response).await;
+    }
+    result.and(worker_result).and(cleanup)
 }
 
 pub async fn run_from_args(args: &[String]) -> Result<(), String> {
@@ -435,6 +611,7 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
         }
         std::fs::remove_file(&socket).map_err(|e| e.to_string())?;
     }
+    let signal = shutdown_signal()?;
     let listener =
         UnixListener::bind(&socket).map_err(|e| format!("bind {}: {e}", socket.display()))?;
     let _owner = Owner {
@@ -449,17 +626,12 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
     );
     manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
     let lifetime = uuid::Uuid::new_v4().to_string();
-    let state = State {
+    let state = Arc::new(State {
         manager: manager.clone(),
         scope: ResourceScopeKey::Unattached(format!("cli:{lifetime}")),
         session: args[1].clone(),
         lifetime,
         idle: parse_idle(&args[2])?,
-    };
-    let result = tokio::select! { result = serve(&listener,&state,&socket) => result, () = wait_signal() => Ok(()) };
-    let cleanup = manager
-        .shutdown_all()
-        .await
-        .map_err(|e| format!("browser cleanup failed: {e}"));
-    result.and(cleanup)
+    });
+    serve(&listener, state, &socket, signal).await
 }

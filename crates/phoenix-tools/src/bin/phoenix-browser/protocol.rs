@@ -16,6 +16,7 @@ pub struct Request {
 pub struct Response {
     pub session: String,
     pub lifetime: Option<String>,
+    pub browser_lifetime: Option<String>,
     #[serde(flatten)]
     pub outcome: Outcome,
 }
@@ -27,10 +28,27 @@ pub enum Outcome {
     Error { error: Failure },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    InvalidInput,
+    StateLost,
+    StartupFailed,
+    TransportUncertain,
+    OperationFailed,
+    BrowserStartFailed,
+    CleanupFailed,
+    BrowserStateUnavailable,
+    OperationCancelled,
+    Busy,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Failure {
-    pub code: String,
+    pub code: ErrorCode,
     pub message: String,
+    pub details: Option<Value>,
+    pub artifacts: Vec<Value>,
 }
 
 impl Response {
@@ -38,6 +56,7 @@ impl Response {
         Self {
             session: session.into(),
             lifetime: lifetime.map(str::to_string),
+            browser_lifetime: None,
             outcome: Outcome::Success { result },
         }
     }
@@ -45,23 +64,27 @@ impl Response {
     pub fn error(
         session: &str,
         lifetime: Option<&str>,
-        code: &str,
+        code: ErrorCode,
         message: impl Into<String>,
     ) -> Self {
         Self {
             session: session.into(),
             lifetime: lifetime.map(str::to_string),
+            browser_lifetime: None,
             outcome: Outcome::Error {
                 error: Failure {
-                    code: code.into(),
+                    code,
                     message: message.into(),
+                    details: None,
+                    artifacts: Vec::new(),
                 },
             },
         }
     }
 
-    pub fn is_success(&self) -> bool {
-        matches!(self.outcome, Outcome::Success { .. })
+    pub fn with_browser_lifetime(mut self, lifetime: Option<String>) -> Self {
+        self.browser_lifetime = lifetime;
+        self
     }
 }
 

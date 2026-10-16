@@ -7,6 +7,7 @@ use phoenix_core::process_identity::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -90,6 +91,8 @@ impl BrowserCli {
         let response: Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("CLI {arguments:?}: {error}\n{stdout}\n{stderr}"));
         assert_eq!(response["session"], "named:integration");
+        assert!(response.get("browser_lifetime").is_some());
+        assert!(response["result"].get("browser_lifetime").is_none());
         assert_eq!(
             response["status"],
             if success { "success" } else { "error" }
@@ -123,6 +126,8 @@ impl BrowserCli {
         );
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(response["session"], format!("named:{name}"));
+        assert!(response.get("browser_lifetime").is_some());
+        assert!(response["result"].get("browser_lifetime").is_none());
         response
     }
 
@@ -217,6 +222,57 @@ fn assert_resources_removed(resources: &(PathBuf, ProcessIdentity)) {
     );
 }
 
+fn signal_owned(process: ProcessIdentity, signal: libc::c_int) {
+    assert!(
+        process_identity_matches(process),
+        "owned process exited before signal"
+    );
+    let pid = libc::pid_t::try_from(process.pid).unwrap();
+    // SAFETY: this PID is the exact process identity captured by this test.
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+}
+
+#[track_caller]
+fn wait_for_observation<T>(reason: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(value) = observe() {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "observation never arrived: {reason}"
+        );
+        // test-timing-allow: poll an explicit external OS/file condition under a liveness deadline; elapsed time never establishes readiness.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn await_process_exit(process: ProcessIdentity) {
+    wait_for_observation("owned process exited", || {
+        (!process_identity_matches(process)).then_some(())
+    });
+}
+
+struct PendingLaunchCleanup {
+    release: PathBuf,
+    processes: Vec<ProcessIdentity>,
+}
+
+impl Drop for PendingLaunchCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"release");
+        for process in &self.processes {
+            if process_identity_matches(*process) {
+                if let Ok(pid) = libc::pid_t::try_from(process.pid) {
+                    // SAFETY: only an exact process created by this test is signaled.
+                    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+                }
+            }
+        }
+    }
+}
+
 fn selected_session(
     cli: &BrowserCli,
     cwd: &Path,
@@ -243,7 +299,7 @@ fn selected_session(
 }
 
 fn git(cwd: &Path, arguments: &[&str]) {
-    let output = Command::new("git")
+    let output = phoenix_core::git::command()
         .current_dir(cwd)
         .args(arguments)
         .output()
@@ -332,7 +388,7 @@ fn invalid_input_and_permissive_runtime_directory_fail_without_startup() {
     let cli = BrowserCli::new();
     for arguments in [
         vec!["--session", "", "status"],
-        vec!["--idle-timeout", "0", "status"],
+        vec!["--idle-timeout", "0", "open", "about:blank"],
         vec!["snapshot", "--input", "[1]"],
         vec!["snapshot", "--input", "{"],
         vec!["unknown-command"],
@@ -397,6 +453,154 @@ fn missing_or_malformed_response_reports_uncertainty_without_replay() {
 }
 
 #[test]
+fn oversized_stdin_is_rejected_before_starting_or_evaluating() {
+    // REQ-BCLI-010, REQ-BCLI-011: truncated JavaScript must never execute.
+    let cli = BrowserCli::new();
+    let mut child = cli
+        .base_command()
+        .args(["eval", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = vec![b' '; 32 * 1024 * 1024 + 1];
+    child.stdin.take().unwrap().write_all(&input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "invalid_input");
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not evaluated"));
+    assert!(response["lifetime"].is_null());
+    assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+}
+
+fn assert_semantic_rejections(cli: &BrowserCli) {
+    for arguments in [
+        vec!["click"],
+        vec!["click", "--input", "{\"selector\":\"#x\",\"ref\":\"@x\"}"],
+        vec!["profile", "run_scenario", "--input", "{\"steps\":[]}"],
+        vec!["profile", "unknown-action"],
+        vec!["profile", "throttle", "--input", "{\"rate\":0}"],
+    ] {
+        let output = cli.command().args(&arguments).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["error"]["code"], "invalid_input");
+    }
+}
+
+#[test]
+fn semantic_input_errors_are_reported_before_looking_up_browser_state() {
+    let cli = BrowserCli::new();
+    assert_semantic_rejections(&cli);
+    assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn invalid_idle_environment_does_not_block_browser_free_commands() {
+    let cli = BrowserCli::new();
+    let profile = cli.directory.path().join("saved.cpuprofile");
+    std::fs::write(
+        &profile,
+        br#"{"nodes":[],"startTime":0,"endTime":1,"samples":[],"timeDeltas":[]}"#,
+    )
+    .unwrap();
+    let input = json!({"path":profile}).to_string();
+    for arguments in [
+        vec!["status"],
+        vec!["close"],
+        vec!["schema"],
+        vec!["profile", "help"],
+        vec!["profile", "cpu_summary", "--input", input.as_str()],
+    ] {
+        let output = cli
+            .command()
+            .env("PHOENIX_BROWSER_IDLE_TIMEOUT", "not-a-duration")
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(response["lifetime"].is_null());
+    }
+    assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn live_session_input_errors_and_close_ignore_startup_only_idle_config() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    let opened = cli.ok(&["open", &fixture()]);
+    assert_semantic_rejections(&cli);
+    assert_eq!(cli.ok(&["status"])["lifetime"], opened["lifetime"]);
+    let resources = live_resources(&cli);
+    for command in ["status", "close"] {
+        let output = cli
+            .command()
+            .env("PHOENIX_BROWSER_IDLE_TIMEOUT", "not-a-duration")
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    assert_resources_removed(&resources);
+}
+
+#[test]
+fn close_interrupts_an_active_evaluation_and_cleans_up() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    cli.ok(&["open", &fixture()]);
+    let resources = live_resources(&cli);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let expression = format!("(() => {{ void fetch('http://{}/active').catch(() => {{}}); return new Promise(() => {{}}); }})()", listener.local_addr().unwrap());
+    std::thread::scope(|scope| {
+        let evaluation =
+            scope.spawn(|| cli.invoke(&["eval", &expression, "--timeout", "1m"], None, false));
+        let mut stream = wait_for_observation("evaluation reached its HTTP boundary", || {
+            match listener.accept() {
+                Ok((stream, _)) => Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(error) => panic!("evaluation readiness listener failed: {error}"),
+            }
+        });
+        stream.write_all(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        drop(stream);
+        let close_started = Instant::now();
+        cli.ok(&["close"]);
+        assert!(
+            close_started.elapsed() < Duration::from_secs(10),
+            "close waited for the evaluation timeout"
+        );
+        let cancelled = evaluation.join().unwrap();
+        assert_eq!(cancelled["error"]["code"], "operation_cancelled");
+    });
+    assert_resources_removed(&resources);
+}
+
+#[test]
 fn discovery_does_not_start_a_daemon_or_browser() {
     // REQ-BCLI-004, REQ-BCLI-009, REQ-BCLI-010.
     let cli = BrowserCli::new();
@@ -433,7 +637,7 @@ fn executable_browser_journey_preserves_state_and_profiles() {
     let url = fixture();
     let opened = cli.ok(&["open", &url]);
     let lifetime = opened["lifetime"].clone();
-    let browser_lifetime = opened["result"]["browser_lifetime"].clone();
+    let browser_lifetime = opened["browser_lifetime"].clone();
     assert!(lifetime.is_string());
     assert!(browser_lifetime.is_string());
     let mut malformed = UnixStream::connect(cli.socket()).unwrap();
@@ -513,7 +717,7 @@ fn executable_browser_journey_preserves_state_and_profiles() {
     .to_string();
     let scenario = cli.ok(&["profile", "run_scenario", "--input", &plan]);
     assert_eq!(scenario["lifetime"], lifetime);
-    assert_eq!(scenario["result"]["browser_lifetime"], browser_lifetime);
+    assert_eq!(scenario["browser_lifetime"], browser_lifetime);
     let data = &scenario["result"]["data"];
     assert_eq!(data["requested_runs"], 2);
     assert_eq!(data["warmup"], 1);
@@ -542,7 +746,7 @@ fn executable_browser_journey_preserves_state_and_profiles() {
 
     let reopened = cli.ok(&["open", &url]);
     assert_ne!(reopened["lifetime"], lifetime);
-    assert_ne!(reopened["result"]["browser_lifetime"], browser_lifetime);
+    assert_ne!(reopened["browser_lifetime"], browser_lifetime);
     let rejected = cli.invoke(&["click", &stale], None, false);
     assert!(rejected["error"]["message"]
         .as_str()
@@ -571,10 +775,7 @@ fn concurrent_initial_open_has_one_owner_and_lifetime() {
         (first.join().unwrap(), second.join().unwrap())
     });
     assert_eq!(first["lifetime"], second["lifetime"]);
-    assert_eq!(
-        first["result"]["browser_lifetime"],
-        second["result"]["browser_lifetime"]
-    );
+    assert_eq!(first["browser_lifetime"], second["browser_lifetime"]);
     assert_eq!(cli.ok(&["status"])["lifetime"], first["lifetime"]);
     cli.ok(&["close"]);
 }
@@ -591,10 +792,7 @@ fn separate_named_sessions_isolate_live_page_state() {
     cli.eval("window.onlyFirstSession = 'first'; true");
     let second = cli.named("isolated", &["open", &url]);
     assert_ne!(first["lifetime"], second["lifetime"]);
-    assert_ne!(
-        first["result"]["browser_lifetime"],
-        second["result"]["browser_lifetime"]
-    );
+    assert_ne!(first["browser_lifetime"], second["browser_lifetime"]);
     assert_eq!(
         evaluation_value(&cli.named("isolated", &["eval", "typeof window.onlyFirstSession"])),
         "undefined"
@@ -631,6 +829,179 @@ fn navigation_success_survives_snapshot_response_limit_failure() {
 }
 
 #[test]
+fn blocked_profile_preserves_structured_measurement_failure() {
+    // REQ-BCLI-008, REQ-BCLI-010: failed measurements retain their methodology data.
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    let opened = cli.ok(&["open", &fixture()]);
+    let plan = json!({"runs":2,"warmup":0,"reset":"none","gc_per_run":false,
+        "steps":[{"kind":"wait_selector","selector":"#never-present","timeout":"20ms"}]})
+    .to_string();
+    let blocked = cli.invoke(&["profile", "run_scenario", "--input", &plan], None, false);
+    assert_eq!(blocked["error"]["code"], "operation_failed");
+    assert_eq!(blocked["lifetime"], opened["lifetime"]);
+    assert_eq!(blocked["browser_lifetime"], opened["browser_lifetime"]);
+    let details = &blocked["error"]["details"];
+    assert_eq!(details["outcome"], "blocked");
+    assert!(details["blocked_step"]
+        .as_str()
+        .unwrap()
+        .contains("#never-present"));
+    assert_eq!(details["raw_samples"], json!([]));
+    assert!(!details["methodology_warnings"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(blocked["error"]["artifacts"], json!([]));
+    cli.ok(&["close"]);
+}
+
+#[test]
+fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
+    // REQ-BCLI-004, REQ-BCLI-005: the daemon can outlive its owned Chrome.
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    let url = fixture();
+    let opened = cli.ok(&["open", &url]);
+    let tree = &opened["result"]["snapshot"]["result"]["text"];
+    let stale = reference(tree.as_str().unwrap(), "Increment");
+    cli.ok(&["profile", "cpu_start"]);
+    let resources = live_resources(&cli);
+    let sentinel = resources.0.join("old-lifetime-sentinel");
+    std::fs::write(&sentinel, b"old browser state").unwrap();
+    signal_owned(resources.1, libc::SIGKILL);
+    let status = wait_for_observation("owned Chrome was reaped", || {
+        let status = cli.ok(&["status"]);
+        (status["result"]["active"] == false).then_some(status)
+    });
+    await_process_exit(resources.1);
+    assert_eq!(status["lifetime"], opened["lifetime"]);
+    assert_eq!(status["result"]["active"], false);
+    let missing = cli.invoke(&["snapshot"], None, false);
+    assert_eq!(missing["error"]["code"], "state_lost");
+    assert_eq!(missing["lifetime"], opened["lifetime"]);
+    let reopened = cli.ok(&["open", &url]);
+    assert_eq!(reopened["lifetime"], opened["lifetime"]);
+    assert_ne!(reopened["browser_lifetime"], opened["browser_lifetime"]);
+    assert!(
+        !sentinel.exists(),
+        "old browser profile contents survived replacement"
+    );
+    assert!(!process_identity_matches(resources.1));
+    let rejected = cli.invoke(&["click", &stale], None, false);
+    assert_eq!(rejected["browser_lifetime"], reopened["browser_lifetime"]);
+    assert!(rejected["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("snapshot"));
+    assert_eq!(cli.eval("window.clicks"), 0);
+    let retired_profile = cli.invoke(&["profile", "cpu_stop"], None, false);
+    assert_eq!(
+        retired_profile["browser_lifetime"],
+        reopened["browser_lifetime"]
+    );
+    assert!(retired_profile["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not active"));
+    cli.ok(&["close"]);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "One launch barrier proves shutdown waits for ownership publication"
+)]
+fn sigterm_during_chrome_startup_cleans_up_the_published_browser() {
+    // REQ-BCLI-006: shutdown cannot abandon a browser initialization future.
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    let executable = std::env::var_os("PHOENIX_CHROME_EXECUTABLE")
+        .map(PathBuf::from)
+        .or_else(|| which::which("google-chrome").ok())
+        .or_else(|| which::which("chromium").ok())
+        .or_else(|| {
+            let chrome =
+                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+            chrome.is_file().then_some(chrome)
+        })
+        .expect("dev.py supplies the Chrome executable for browser tests");
+    let wrapper = cli.directory.path().join("chrome-launch-barrier.sh");
+    let ready = cli.directory.path().join("launch-ready");
+    let release = cli.directory.path().join("launch-release");
+    std::fs::write(&wrapper, b"#!/bin/sh\nprintf '%s %s\\n' \"$$\" \"$PPID\" > \"$PHOENIX_BROWSER_TEST_READY\"\nwhile [ ! -e \"$PHOENIX_BROWSER_TEST_RELEASE\" ]; do sleep 0.02; done\nexec \"$PHOENIX_BROWSER_TEST_CHROME\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cleanup = PendingLaunchCleanup {
+        release: release.clone(),
+        processes: Vec::new(),
+    };
+    let mut opening = cli
+        .command()
+        .args(["open", &fixture()])
+        .env("PHOENIX_CHROME_EXECUTABLE", &wrapper)
+        .env("PHOENIX_BROWSER_TEST_READY", &ready)
+        .env("PHOENIX_BROWSER_TEST_RELEASE", &release)
+        .env("PHOENIX_BROWSER_TEST_CHROME", &executable)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (chrome, daemon) = wait_for_observation("Chrome launch barrier was reached", || {
+        if let Ok(contents) = std::fs::read_to_string(&ready) {
+            let pids: Vec<_> = contents
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+                .collect();
+            if pids.len() == 2 {
+                return Some((
+                    current_process_identity(pids[0]).unwrap(),
+                    current_process_identity(pids[1]).unwrap(),
+                ));
+            }
+        }
+        assert!(
+            opening.try_wait().unwrap().is_none(),
+            "CLI exited before launch barrier"
+        );
+        None
+    });
+    cleanup.processes.extend([daemon, chrome]);
+    let profiles: Vec<_> = std::fs::read_dir(cli.directory.path().join("scratch"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("phoenix-chrome-")
+        })
+        .collect();
+    assert_eq!(profiles.len(), 1);
+    signal_owned(daemon, libc::SIGTERM);
+    std::fs::write(&release, b"release").unwrap();
+    wait_for_observation("accepted startup operation completed", || {
+        opening.try_wait().unwrap()
+    });
+    let output = opening.wait_with_output().unwrap();
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    if !output.status.success() {
+        assert_eq!(response["error"]["code"], "operation_cancelled");
+    }
+    await_process_exit(daemon);
+    await_process_exit(chrome);
+    assert!(!profiles[0].exists(), "startup profile was orphaned");
+    assert_eq!(cli.ok(&["status"])["result"]["active"], false);
+}
+
+#[test]
 fn consecutive_close_and_immediate_open_replace_owned_resources() {
     // REQ-BCLI-003, REQ-BCLI-005, REQ-BCLI-006.
     if !chrome_enabled() {
@@ -644,10 +1015,7 @@ fn consecutive_close_and_immediate_open_replace_owned_resources() {
         cli.ok(&["close"]);
         let opened = cli.ok(&["open", &url]);
         assert_ne!(opened["lifetime"], previous["lifetime"]);
-        assert_ne!(
-            opened["result"]["browser_lifetime"],
-            previous["result"]["browser_lifetime"]
-        );
+        assert_ne!(opened["browser_lifetime"], previous["browser_lifetime"]);
         assert_resources_removed(&resources);
         previous = opened;
     }
@@ -723,7 +1091,7 @@ fn active_work_outlives_idle_budget_then_session_expires() {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        // Poll only after a full quiet interval: status itself is activity.
+        // test-timing-allow: elapsed idle interval is the behavior; status calls otherwise reset idle.
         std::thread::sleep(Duration::from_millis(1300));
         let status = cli.ok(&["status"]);
         if status["result"]["active"] == false {
@@ -741,9 +1109,6 @@ fn active_work_outlives_idle_budget_then_session_expires() {
     assert_resources_removed(&resources);
     let restarted = cli.ok(&["open", &url]);
     assert_ne!(restarted["lifetime"], opened["lifetime"]);
-    assert_ne!(
-        restarted["result"]["browser_lifetime"],
-        opened["result"]["browser_lifetime"]
-    );
+    assert_ne!(restarted["browser_lifetime"], opened["browser_lifetime"]);
     cli.ok(&["close"]);
 }

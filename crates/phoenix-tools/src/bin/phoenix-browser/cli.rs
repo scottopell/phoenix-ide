@@ -1,5 +1,5 @@
 use super::daemon;
-use super::protocol::{self, Outcome, Request, Response, SessionPaths};
+use super::protocol::{self, ErrorCode, Outcome, Request, Response, SessionPaths};
 use fs2::FileExt;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde_json::{json, Value};
@@ -44,7 +44,7 @@ See docs/phoenix-browser.md for profiling and lifecycle examples.";
 pub struct Options {
     pub session: String,
     pub paths: SessionPaths,
-    pub idle: Duration,
+    pub idle: String,
     pub json: bool,
     pub request: Request,
 }
@@ -81,7 +81,7 @@ pub fn resolve_session(
         }
         return Ok(format!("named:{name}"));
     }
-    let root = std::process::Command::new("git")
+    let root = phoenix_core::git::command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
@@ -212,9 +212,12 @@ fn positional(
             }
             let mut expression = String::new();
             std::io::stdin()
-                .take(protocol::MAX_MESSAGE)
+                .take(protocol::MAX_MESSAGE + 1)
                 .read_to_string(&mut expression)
                 .map_err(|e| e.to_string())?;
+            if expression.len() as u64 > protocol::MAX_MESSAGE {
+                return Err("stdin exceeds 32 MiB; expression was not evaluated".into());
+            }
             input["expression"] = json!(expression);
             0
         }
@@ -317,7 +320,7 @@ fn options(mut args: Vec<String>) -> Result<Options, String> {
     Ok(Options {
         session,
         paths,
-        idle: parse_idle(&idle)?,
+        idle,
         json,
         request,
     })
@@ -344,6 +347,7 @@ async fn startup_lock(
 enum ConnectionError {
     StateLost,
     Startup(String),
+    InvalidInput(String),
 }
 impl From<String> for ConnectionError {
     fn from(message: String) -> Self {
@@ -395,6 +399,7 @@ async fn connect_or_start(options: &Options) -> Result<UnixStream, ConnectionErr
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     drop(owner);
+    let idle = parse_idle(&options.idle).map_err(ConnectionError::InvalidInput)?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = daemon::append_log(&options.paths.log())?;
     let mut command = std::process::Command::new(executable);
@@ -403,7 +408,7 @@ async fn connect_or_start(options: &Options) -> Result<UnixStream, ConnectionErr
             "__daemon",
             &options.paths.key,
             &options.session,
-            &options.idle.as_secs().to_string(),
+            &idle.as_secs().to_string(),
         ])
         .arg(&options.paths.directory)
         .stdin(Stdio::null())
@@ -445,6 +450,23 @@ async fn execute(options: &Options) -> Response {
     {
         return daemon::offline(&options.session, &options.request).await;
     }
+    if let Some(operation) = daemon::operation(&options.request.command) {
+        if let Err(output) = operation
+            .validate_input(options.request.input.clone())
+            .await
+        {
+            let mut response = Response::error(
+                &options.session,
+                None,
+                ErrorCode::InvalidInput,
+                output.output(),
+            );
+            if let Outcome::Error { error } = &mut response.outcome {
+                error.details = output.display_data().cloned();
+            }
+            return response;
+        }
+    }
     let mut stream = match connect_or_start(options).await {
         Ok(stream) => stream,
         Err(ConnectionError::StateLost)
@@ -456,19 +478,22 @@ async fn execute(options: &Options) -> Response {
             return Response::error(
                 &options.session,
                 None,
-                "state_lost",
+                ErrorCode::StateLost,
                 "No live browser for this session; use open URL to start fresh",
             )
         }
+        Err(ConnectionError::InvalidInput(error)) => {
+            return Response::error(&options.session, None, ErrorCode::InvalidInput, error)
+        }
         Err(ConnectionError::Startup(error)) => {
-            return Response::error(&options.session, None, "startup_failed", error)
+            return Response::error(&options.session, None, ErrorCode::StartupFailed, error)
         }
     };
     if let Err(error) = protocol::write_message(&mut stream, &options.request).await {
         return Response::error(
             &options.session,
             None,
-            "transport_uncertain",
+            ErrorCode::TransportUncertain,
             format!("request may have run; not replayed: {error}"),
         );
     }
@@ -477,7 +502,7 @@ async fn execute(options: &Options) -> Response {
         Err(error) => Response::error(
             &options.session,
             None,
-            "transport_uncertain",
+            ErrorCode::TransportUncertain,
             format!("request may have run; not replayed: {error}"),
         ),
     }
@@ -517,6 +542,9 @@ fn print_response(response: &Response, json_mode: bool) {
                     );
                 }
             }
+            if let Some(error) = result["console_capture_error"].as_str() {
+                eprintln!("Console capture failed: {error}");
+            }
         }
         Outcome::Success { result } => {
             if let Some(text) = result.get("text").and_then(Value::as_str) {
@@ -528,7 +556,7 @@ fn print_response(response: &Response, json_mode: bool) {
                 );
             }
         }
-        Outcome::Error { error } => eprintln!("{}: {}", error.code, error.message),
+        Outcome::Error { error } => eprintln!("{:?}: {}", error.code, error.message),
     }
 }
 
@@ -556,7 +584,7 @@ pub async fn main_entry() -> i32 {
         Ok(options) => options,
         Err(error) => {
             print_response(
-                &Response::error("unresolved", None, "invalid_input", error),
+                &Response::error("unresolved", None, ErrorCode::InvalidInput, error),
                 json_mode,
             );
             return 2;
@@ -564,5 +592,9 @@ pub async fn main_entry() -> i32 {
     };
     let response = execute(&options).await;
     print_response(&response, options.json);
-    i32::from(!response.is_success())
+    match response.outcome {
+        Outcome::Success { .. } => 0,
+        Outcome::Error { error } if error.code == ErrorCode::InvalidInput => 2,
+        Outcome::Error { .. } => 1,
+    }
 }

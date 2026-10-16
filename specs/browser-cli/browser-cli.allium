@@ -78,7 +78,7 @@ rule ExistingOperationStarts {
 
 rule BrowserLaunchSucceeds {
     when: OwnedBrowserLaunchSucceeded(daemon, browser)
-    requires: daemon.status = executing
+    requires: daemon.status = executing or daemon.status = stopping
     requires: daemon.browser_id = null
     ensures: daemon.browser_id = browser.fresh_identity
     ensures: FreshTransientProfileOwned(daemon.session, browser)
@@ -86,10 +86,25 @@ rule BrowserLaunchSucceeds {
 
 rule BrowserLaunchFails {
     when: OwnedBrowserLaunchFailed(daemon, error)
-    requires: daemon.status = executing
+    requires: daemon.status = executing or daemon.status = stopping
     requires: daemon.browser_id = null
     ensures: BrowserStartFailureReported(daemon.session, error)
     ensures: daemon.browser_id = null
+}
+
+rule BrowserExitIsObserved {
+    when: OwnedBrowserExitConfirmed(daemon)
+    requires: daemon.browser_id != null
+    ensures: LifetimeHandlesInvalidated(daemon.browser_id)
+    ensures: daemon.browser_id = null
+    ensures: BrowserAbsenceAvailableToStatusAndAdmission(daemon)
+}
+
+rule DrainingOperationCompletes {
+    when: BrowserOperationCompleted(daemon)
+    requires: daemon.status = stopping
+    ensures: AcceptedWorkerExitedBeforeBrowserTeardown(daemon)
+    ensures: OwnedBrowserTerminationRequested(daemon)
 }
 
 rule OperationCompletes {
@@ -137,9 +152,29 @@ rule IdleExpiryStartsShutdown {
 
 rule ExplicitShutdownStarts {
     when: OrderlyShutdownRequested(daemon)
-    requires: daemon.status = ready or daemon.status = executing
+    requires: daemon.status = ready
     ensures: daemon.status = stopping
     ensures: OwnedBrowserTerminationRequested(daemon)
+}
+
+rule ExplicitShutdownDuringStartup {
+    when: OrderlyShutdownRequested(daemon)
+    requires: daemon.status = executing
+    requires: daemon.browser_id = null
+    ensures: daemon.status = stopping
+    ensures: BrowserInitializationRetainsOwnershipUntilSettled(daemon)
+    ensures: WorkerCancellationFollowsBrowserPublication(daemon)
+    ensures: BrowserTerminationFollowsWorkerExit(daemon)
+}
+
+rule ExplicitShutdownDuringOperation {
+    when: OrderlyShutdownRequested(daemon)
+    requires: daemon.status = executing
+    requires: daemon.browser_id != null
+    ensures: daemon.status = stopping
+    ensures: AcceptedOperationCancellationRequested(daemon)
+    ensures: OperationCancelledReportedWithUncertainSideEffects(daemon)
+    ensures: BrowserTerminationFollowsWorkerExit(daemon)
 }
 
 rule ShutdownCompletes {
@@ -194,11 +229,13 @@ surface BrowserDaemonRuntime {
         ReadyWaitResolved(daemon, decision, runtime)
             when daemon.status = ready
         OwnedBrowserLaunchSucceeded(daemon, browser)
-            when daemon.status = executing and daemon.browser_id = null
+            when (daemon.status = executing or daemon.status = stopping) and daemon.browser_id = null
         OwnedBrowserLaunchFailed(daemon, error)
-            when daemon.status = executing and daemon.browser_id = null
+            when (daemon.status = executing or daemon.status = stopping) and daemon.browser_id = null
+        OwnedBrowserExitConfirmed(daemon)
+            when daemon.browser_id != null
         BrowserOperationCompleted(daemon)
-            when daemon.status = executing
+            when daemon.status = executing or daemon.status = stopping
         OrderlyShutdownRequested(daemon)
             when daemon.status = ready or daemon.status = executing
         OwnedBrowserAndProfileCleanupSucceeded(daemon)

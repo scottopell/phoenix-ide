@@ -35,7 +35,7 @@ printf '%s\n' 'document.title' | phoenix-browser --json eval --stdin
 
 `open` returns URL, title, an interactive accessibility snapshot, and console errors captured for that navigation. Snapshot failure appears separately from navigation success. Large snapshots spill to a readable artifact; the returned refs work after reading it. Snapshot refs identify exact nodes and expire on a new snapshot attempt, document replacement, or browser replacement. Refresh the snapshot when a ref is stale. CSS selectors also work with click/type.
 
-`--json` returns `session`, daemon `lifetime`, and a `status` tag: `success` with `result`, or `error` with `error.code` and `error.message`. Browser results include `browser_lifetime`. Tool results include `text`, structured `data`, and explicit `artifacts`. Failed commands exit 1; invalid CLI syntax exits 2. Human output prints concise operation text; JSON is the harness interface.
+`--json` returns `session`, daemon `lifetime`, browser `browser_lifetime`, and a `status` tag: `success` with `result`, or `error` with `error.code` and `error.message`. Tool results include `text`, structured `data`, and explicit `artifacts`. Tool errors preserve structured failure data in `error.details` and any `error.artifacts`. Failed commands exit 1; invalid CLI syntax exits 2. Human output prints concise operation text; JSON is the harness interface.
 
 Use `schema [COMMAND]` for the full operation parameters. Each command accepts `--input '{...}'`; this is especially useful for profiling. `--timeout 15s` controls operations that accept a timeout.
 
@@ -60,7 +60,7 @@ phoenix-browser close
 phoenix-browser --idle-timeout 600 open http://localhost:3000
 ```
 
-Navigation starts a daemon and fresh transient Chrome profile lazily. The default idle timeout is 1800 seconds; `--idle-timeout SECONDS` overrides `PHOENIX_BROWSER_IDLE_TIMEOUT` when starting a daemon. An existing daemon retains its configuration, shown by status. Active operations can exceed the idle timeout. After close or idle expiry, interaction/eval/profile commands report `state_lost`; `open URL` intentionally starts fresh. Status and close report absence without launching anything.
+Navigation starts a daemon and fresh transient Chrome profile lazily. The default idle timeout is 1800 seconds; `--idle-timeout SECONDS` overrides `PHOENIX_BROWSER_IDLE_TIMEOUT` when starting a daemon. An existing daemon retains its configuration, shown by status. Idle configuration is read only when starting a daemon; a malformed setting does not block status, close, schema, or file-only profiling commands. Active operations can exceed the idle timeout. Explicit close and orderly signals interrupt admitted operations with `operation_cancelled`; page side effects may already have occurred. Browser initialization settles under ownership before cancellation and cleanup, so shutdown cannot abandon an unregistered Chrome. After close or idle expiry, interaction/eval/profile commands report `state_lost`; `open URL` intentionally starts fresh. Status and close report absence without launching anything.
 
 Commands in a session are serialized. If a connection fails after a request may have arrived, the CLI reports `transport_uncertain` and never retries it automatically. Inspect page state before repeating a side effect.
 

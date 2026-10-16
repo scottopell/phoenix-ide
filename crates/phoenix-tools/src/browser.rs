@@ -36,6 +36,7 @@ pub use tools::{
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -47,6 +48,16 @@ pub trait BrowserAccess: Send + Sync {
     /// # Errors
     /// Returns an error when the session is unavailable or cannot be started.
     async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String>;
+}
+
+struct ValidationBoundary(AtomicBool);
+
+#[async_trait]
+impl BrowserAccess for ValidationBoundary {
+    async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String> {
+        self.0.store(true, Ordering::Relaxed);
+        Err("input validation reached the browser boundary".into())
+    }
 }
 
 #[async_trait]
@@ -102,6 +113,23 @@ macro_rules! browser_operations {
             ) -> ToolOutput {
                 match self {
                     $(Self::$variant => $tool::run_browser(input, access).await),+
+                }
+            }
+
+            /// Validate input without launching a browser or performing an operation.
+            ///
+            /// # Errors
+            /// Returns the operation's structured input rejection.
+            pub async fn validate_input(self, input: Value) -> Result<(), ToolOutput> {
+                if self == Self::Profile {
+                    return BrowserProfileTool::validate_input(input);
+                }
+                let boundary = ValidationBoundary(AtomicBool::new(false));
+                let output = self.execute(input, &boundary).await;
+                if boundary.0.load(Ordering::Relaxed) || output.is_success() {
+                    Ok(())
+                } else {
+                    Err(output)
                 }
             }
         }
@@ -167,6 +195,41 @@ mod access_tests {
             "Failed to get browser: session expired; navigate to create a new browser"
         );
         assert_eq!(access.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_preflight_rejects_input_without_browser_or_file_access() {
+        for (operation, input) in [
+            (BrowserOperation::Click, json!({})),
+            (BrowserOperation::Click, json!({"selector":"#x","ref":"@x"})),
+            (
+                BrowserOperation::Profile,
+                json!({"action":"run_scenario","steps":[]}),
+            ),
+            (BrowserOperation::Profile, json!({"action":"unknown"})),
+            (BrowserOperation::Profile, json!({"action":"throttle"})),
+            (
+                BrowserOperation::Profile,
+                json!({"action":"throttle","rate":0}),
+            ),
+            (
+                BrowserOperation::Profile,
+                json!({"action":"run_scenario","runs":u32::MAX,"warmup":1,
+                    "steps":[{"kind":"eval","expression":"true"}]}),
+            ),
+        ] {
+            assert!(operation.validate_input(input).await.is_err());
+        }
+        assert!(BrowserOperation::Snapshot
+            .validate_input(json!({}))
+            .await
+            .is_ok());
+        assert!(BrowserOperation::Profile
+            .validate_input(json!({
+                "action":"cpu_summary", "path":"/nonexistent/preflight-must-not-read.cpuprofile"
+            }))
+            .await
+            .is_ok());
     }
 
     #[test]
