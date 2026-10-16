@@ -474,9 +474,9 @@ remains available for detailed tmux operations.
 
 Phoenix MUST key tmux server ownership by the conversation's opaque persisted `work_scope_id`. Tool execution, inventory, cleanup, and SSE routing MUST consume that same identity rather than deriving a resource key from a conversation id, working directory, or worktree path. Filesystem paths belong to the scope's environment and MUST NOT determine whether two scopes share a tmux server.
 
-### REQ-TMUX-WS-002: Continuation Sharing Within Worktree Scope
+### REQ-TMUX-WS-002: Continuation Sharing Within Persisted Scope
 
-Continuations that retain the same persisted `work_scope_id` MUST share the same tmux socket/session. A continuation assigned a fresh `work_scope_id` MUST use a distinct server even when its environment points at the same filesystem path.
+Ordinary continuations MUST retain their selected parent's exact persisted `work_scope_id` and share the same tmux socket/session, including Direct/non-Git continuations. Distinct historical scopes remain distinct even when their environments point at the same filesystem path; they are not coalesced by cwd.
 
 The cleanup cascade MUST decide preservation by whether a DISTINCT still-open ProductConversation other than the one being torn down resolves to the same persisted `work_scope_id`: skip the kill/unlink iff Phoenix can prove such a distinct open product aggregate exists, or iff conflicting identity evidence prevents Phoenix from proving whether such a distinct aggregate exists. Same-aggregate continuation rows and subordinate execution conversations that belong to the very same ProductConversation MUST NOT count as separate preservers even when they also resolve to that scope. A distinct still-open ProductConversation here is one whose product-lifecycle state remains Open; runtime handles are irrelevant. A non-terminal aggregate with no runtime handle (after a server restart or runtime eviction) is still a preserving owner when it is distinct and Open. Archival or predecessor-row status inside the same product aggregate does not create an independent preserving owner. A continuation with a fresh persisted identity is a different scope, so preservation is determined by identity equality without mode- or path-specific case analysis.
 

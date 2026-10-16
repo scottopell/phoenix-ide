@@ -65,3 +65,8 @@ REQ-BED-021's atomic pending-intent consumption is enforced for live opening ins
 ## Approval capability repair
 
 REQ-BED-046 is implemented by atomic approved-objective/state/message/obligation persistence and runtime capability publication, with actor reconstruction after post-mutation failures. Focused migration and approval retry tests cover provenance and promoted task paths. Full exact-head qualification is recorded on PR #765. Task66007 restores trusted unsandboxed Git-backed Work children under ADR-068; parent approval remains independent.
+
+
+### Direct/non-Git continuation ownership
+
+The REQ-BED-030/ADR-026 correction preserves the selected parent's exact persisted WorkScope/environment/resource identity for ordinary Direct and Git-backed continuation. It removes both fresh Direct scope allocation and unordered selection from a product's historical ownership set. Current non-Git creation uses Direct, so this is not limited to historical data. Regression coverage includes concurrent/replayed creation, historical multi-scope parent selection, two-hop live-owner Bash resolution, resource authority and cleanup liveness. Qualification is in progress for the v0.13 blocker. No historical scope coalescing, production data repair or migration is performed.

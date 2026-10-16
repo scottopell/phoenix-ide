@@ -1223,8 +1223,14 @@ THE SYSTEM SHALL create a new transcript row that explicitly belongs to the same
   - every unconsumed steering entry, preserving its immutable acceptance identity, exact payload, attachments, and FIFO order without retaining a second pending copy on the predecessor
   - deferred continuation work, including tool calls rejected at the context threshold, without executing it before the successor owns the handoff
 
+WHEN an ordinary conversation creates a continuation
+THE SYSTEM SHALL keep the selected parent's exact attached `WorkScope`, environment and resource ownership atomically in a single database transaction while keeping the durable ProductConversation identity unchanged
+AND SHALL apply this rule to Direct/non-Git and worktree-backed conversations alike
+AND SHALL create no replacement scope or select a different scope from the ProductConversation's historical ownership set
+AND SHALL retain the same identity under concurrent requests and idempotent replay.
+
 WHEN the current execution row has a worktree
-THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single database transaction while keeping the durable ProductConversation identity unchanged:
+THE SYSTEM SHALL also preserve its filesystem state:
   - the parent retains its `worktree_path` field as a read-only reference for history navigation
   - the continuation's `worktree_path` is set to the same value
   - the continuation inherits the same `work_scope_id`

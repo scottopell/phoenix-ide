@@ -1149,8 +1149,8 @@ rule HandlesTornDownWhenNoInheritor {
 -- sibling such as a Work-mode sub-agent sharing its parent's scope. The
 -- surviving owner keeps the running processes and tombstones; a handle spawned
 -- before the boundary stays addressable. Scope equality subsumes per-kind
--- analysis: a Direct continuation resolves to a distinct Conversation scope
--- and falls through to teardown.
+-- analysis: ordinary continuation retains its exact parent scope, including
+-- Direct/non-Git continuation. A new transcript is not a new resource owner.
 rule HandlesPreservedOnScopeMatch {
     when: ConversationHardDeleted(conversation, inheritor_scope)
 

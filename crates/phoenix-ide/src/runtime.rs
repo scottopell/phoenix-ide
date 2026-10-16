@@ -16172,10 +16172,10 @@ mod scope_liveness_tests {
                 None,
                 None,
                 &ConvMode::Direct,
-                false,
                 None,
                 None,
                 None,
+                phoenix_core::llm_language::LlmLanguage::default(),
             )
             .await
             .unwrap();
