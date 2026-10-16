@@ -2,7 +2,7 @@
 
 ## Dependency
 
-Blocked on task 41015 (`browser-accessibility-snapshots`) landing on main. Record and build from its merge commit; do not duplicate snapshot/reference behavior on a parallel branch.
+Task 41015 (`browser-accessibility-snapshots`) landed on main in [PR #923](https://github.com/scottopell/phoenix-ide/pull/923), merge commit [`7b12499fdcfd2c51f7ec998ca53b5c6e9aac1053`](https://github.com/scottopell/phoenix-ide/commit/7b12499fdcfd2c51f7ec998ca53b5c6e9aac1053). Build on that implementation; do not duplicate snapshot/reference behavior on a parallel branch.
 
 ## Goal and user scope
 
