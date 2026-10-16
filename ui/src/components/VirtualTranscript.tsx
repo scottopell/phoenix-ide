@@ -66,6 +66,8 @@ export interface VirtualTranscriptHandle {
     targetSelector?: VirtualTranscriptTarget,
     startPolicy?: 'directional' | 'continuity',
   ): void;
+  completePosition(commandKey: string): void;
+  interruptPosition(): void;
   cancelPosition(commandKey: string): void;
   scrollToTail(): void;
   scrollBy(delta: number): void;
@@ -96,6 +98,7 @@ export interface VirtualTranscriptProps<T> {
   renderItem: (item: T, index: number) => ReactNode;
   /** Omission denies owned writes; generic scroll operations remain unowned. */
   readonly positioningAuthority?: VirtualTranscriptPositioningAuthority;
+  positioningViewKey?: string;
   header?: ReactNode;
   empty?: ReactNode;
   overscan?: number;
@@ -112,7 +115,9 @@ export interface VirtualTranscriptProps<T> {
   onPinnedChange?: (pinned: boolean) => void;
 }
 
-type PositionOwner = { kind: 'unowned' } | { kind: 'command'; commandKey: string };
+type PositionOwner = { kind: 'unowned' }
+  | { kind: 'command'; commandKey: string }
+  | { kind: 'settled'; commandKey: string; viewKey: string | null };
 
 interface PhysicalStore<T> {
   items: readonly T[];
@@ -136,6 +141,7 @@ interface PhysicalStore<T> {
   preservedViewport: { top: number; firstKey: string | null } | null;
   positionOwner: PositionOwner;
   positioningAuthority: VirtualTranscriptPositioningAuthority;
+  positioningViewKey: string | null;
   pendingTarget: {
     key: string;
     align: 'start' | 'end';
@@ -435,7 +441,9 @@ function retirePosition<T>(current: PhysicalStore<T>): void {
 
 function positionIsAuthorized<T>(store: PhysicalStore<T>, owner: PositionOwner = store.positionOwner): boolean {
   return owner.kind === 'unowned'
-    || (store.positioningAuthority.kind === 'command' && store.positioningAuthority.commandKey === owner.commandKey);
+    || (owner.kind === 'settled' && owner.viewKey === store.positioningViewKey && store.positioningAuthority.kind === 'absent')
+    || (store.positioningAuthority.kind === 'command' && store.positioningAuthority.commandKey === owner.commandKey
+      && (owner.kind !== 'settled' || owner.viewKey === store.positioningViewKey));
 }
 
 function retireUnauthorizedPosition<T>(store: PhysicalStore<T>): boolean {
@@ -721,6 +729,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     preservedViewport: null,
     positionOwner: { kind: 'unowned' },
     positioningAuthority: props.positioningAuthority ?? NO_POSITIONING_AUTHORITY,
+    positioningViewKey: props.positioningViewKey ?? null,
     pendingTarget: null,
     pinned: true,
     revision: 0,
@@ -762,6 +771,7 @@ function VirtualTranscriptInner<T>(
   }
   const store = storeRef.current;
   store.positioningAuthority = props.positioningAuthority ?? NO_POSITIONING_AUTHORITY;
+  store.positioningViewKey = props.positioningViewKey ?? null;
   retireUnauthorizedPosition(store);
   const resolvedPhysicalKeys = useMemo(
     () => resolvePhysicalKeys(items, getKey),
@@ -1002,9 +1012,24 @@ function VirtualTranscriptInner<T>(
       positionAtIndex(current, { kind: 'command', commandKey }, index, align, viewportStartOffset, targetSelector, startPolicy);
       publish();
     },
+    completePosition(commandKey) {
+      const current = storeRef.current;
+      if (!current || current.positionOwner.kind !== 'command' || current.positionOwner.commandKey !== commandKey
+        || !positionIsAuthorized(current, current.positionOwner)) return;
+      current.pendingTarget = null;
+      current.positionOwner = { kind: 'settled', commandKey, viewKey: current.positioningViewKey };
+    },
+    interruptPosition() {
+      const current = storeRef.current;
+      if (!current) return;
+      retirePosition(current);
+      current.viewportTop = current.scroller?.scrollTop ?? current.viewportTop;
+      current.activeAnchor = captureTopAnchor(current);
+      recompute(current);
+    },
     cancelPosition(commandKey) {
       const current = storeRef.current;
-      if (!current || current.positionOwner.kind !== 'command' || current.positionOwner.commandKey !== commandKey) return;
+      if (!current || current.positionOwner.kind === 'unowned' || current.positionOwner.commandKey !== commandKey) return;
       retirePosition(current);
       current.viewportTop = current.scroller?.scrollTop ?? current.viewportTop;
       current.activeAnchor = captureTopAnchor(current);

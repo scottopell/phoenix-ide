@@ -127,6 +127,7 @@ Controlled-functional build isolation is governed by [ADR-109](109_separate-cont
 | [107](107_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
 | [108](108_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
 | [109](109_separate-controlled-functional-telemetry-build.md) | Separate controlled-functional telemetry build | Accepted | REQ-CVT-001, REQ-CVT-005, REQ-CVT-006 |
+| [115](115_successful-position-settles-geometric-anchor.md) | Successful positioning settles geometry without retaining command capability | Accepted | REQ-VT-003, REQ-VT-006, REQ-VT-007 |
 
 ## For agents: which decisions bind your task
 

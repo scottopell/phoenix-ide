@@ -1713,6 +1713,7 @@ function MessageListImpl({
           if (viewAnchorCommandOwnerRef.current?.key === effect.commandKey) {
             viewAnchorTerminalRef.current = { scope: viewAnchorCommandOwnerRef.current.scope, command: effect.command, result: effect.result };
           }
+          if (effect.result === 'applied') transcriptRef.current?.completePosition(effect.commandKey);
           if (effect.result === 'superseded') transcriptRef.current?.cancelPosition(effect.commandKey);
           if (effect.command.kind === 'restore_after_prefix_expansion') {
             continuityRestoreInFlightRef.current = false;
@@ -1724,6 +1725,7 @@ function MessageListImpl({
   }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted, sourceToolId]);
 
   const dispatchTranscriptPositioning = useCallback((event: TranscriptPositioningEvent) => {
+    if (event.type === 'user_interrupted' || event.type === 'executor_detached') transcriptRef.current?.interruptPosition();
     if ((event.type === 'physical_observed' || event.type === 'position_issued' || event.type === 'target_resolved' || event.type === 'target_missing')
       && event.commandKey !== authoritativePositioningKey) return;
     const next = reduceTranscriptPositioning(transcriptPositioningStateRef.current, event);
@@ -1931,6 +1933,7 @@ function MessageListImpl({
             key={conversationId ?? '__empty__'}
             ref={transcriptRef}
             scrollerId="messages"
+            positioningViewKey={currentHistoryViewKey}
             positioningAuthority={authoritativePositioningKey === null
               ? { kind: 'absent' }
               : { kind: 'command', commandKey: authoritativePositioningKey }}

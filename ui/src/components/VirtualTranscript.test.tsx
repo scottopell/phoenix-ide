@@ -587,6 +587,7 @@ describe('VirtualTranscript', () => {
               actualOffset: observed.targetOffset ?? null, layoutRevision: observed.layoutRevision, targetMeasured: observed.targetMeasured ?? false});
           } else if (effect.type === 'finish') {
             finishes.push(effect.result);
+            if (effect.result === 'applied') ref.current!.completePosition(effect.commandKey);
             if (effect.result === 'superseded') ref.current!.cancelPosition(effect.commandKey);
             if (terminal !== 'replacement') setInput({kind: 'idle', view: command.view});
           }
@@ -611,6 +612,7 @@ describe('VirtualTranscript', () => {
       headerHeight = 42.5;
       rerender(<Parent withHeader begin />);
       expect(positions).toEqual([commandKey]);
+      expect(finishes).toEqual([terminal === 'applied' ? 'applied' : 'superseded']);
       const row = document.querySelector<HTMLElement>('[data-virtual-key="item-0"]')!;
       const clip = screen.getByRole('region', {name: 'Completed parent'}).getBoundingClientRect();
       if (terminal === 'applied') {
@@ -621,6 +623,41 @@ describe('VirtualTranscript', () => {
         expect(physicalOffset, JSON.stringify({writes, actualTop, finishes, authorities})).toBeGreaterThanOrEqual(0);
       } else {expect(writes).toEqual([42.5]); expect(actualTop).toBe(43);}
     } finally {geometry.mockRestore();}
+  });
+
+  it.each(['keep', 'user-scroll', 'takeover-without-scroll', 'cancel', 'replacement', 'view-reset', 'stale-completion'] as const)('does not resurrect a settled start anchor after %s', transition => {
+    const ref = {current: null as VirtualTranscriptHandle | null};
+    const items = makeItems(20, 75);
+    const key = (item: TestItem) => item.id;
+    const writes: number[] = [];
+    let actualTop = 0;
+    const attach = (element: HTMLDivElement | null) => {
+      if (element) Object.defineProperty(element, 'scrollTop', {configurable: true,
+        get: () => actualTop, set: (value: number) => {writes.push(value); actualTop = Math.round(value);}});
+    };
+    let viewKey = 'view-1';
+    const view = (authority: 'first' | 'next' | null, header: boolean) => <VirtualTranscript ref={ref}
+      positioningViewKey={viewKey}
+      ariaLabel="Settled controls" items={items} getKey={key} initialTail={false} estimatedExtent={75}
+      positioningAuthority={authority ? {kind: 'command', commandKey: authority} : {kind: 'absent'}}
+      header={header ? <div data-height={42.5}>Header</div> : undefined} renderItem={renderRow} scrollerRef={attach} />;
+    const {rerender} = render(view('first', false));
+    act(() => {ref.current!.scrollToOwnedIndex('first', 0, 'start'); ref.current!.completePosition('first');});
+    rerender(view(null, false));
+    let authority: 'next' | null = null;
+    if (transition === 'user-scroll') fireEvent.scroll(screen.getByRole('region', {name: 'Settled controls'}), {target: {scrollTop: 0}});
+    if (transition === 'cancel') act(() => ref.current!.cancelPosition('first'));
+    if (transition === 'takeover-without-scroll') act(() => ref.current!.interruptPosition());
+    if (transition === 'view-reset') viewKey = 'view-2';
+    if (transition === 'replacement' || transition === 'stale-completion') {
+      authority = 'next';
+      rerender(view(authority, false));
+      if (transition === 'stale-completion') act(() => ref.current!.completePosition('first'));
+    }
+    writes.length = 0;
+    rerender(view(authority, true));
+    expect(writes).toEqual(transition === 'keep' ? [42.5, 41.5] : [42.5]);
+    expect(actualTop).toBe(transition === 'keep' ? 42 : 43);
   });
 
   it('positions an intra-row target through the transcript executor', () => {
