@@ -478,3 +478,85 @@ test('manual full-edge oracle rejects each field independently for fixture and r
   assert.match(script, /validateOwnedAggregate\([^;]*fetchedLatestAccepted, restoredResponse.url\(\)\)/);
   assert.match(script, /openingMatches\(fetchedLatestAccepted.latest_opening, entered, 'accepted'\)/);
 });
+
+function documentDispatch(f, target, before = () => {}) {
+  return () => {
+    before();
+    f.page.url = () => target;
+    const req = { ...f.request('/c/product'), url: () => target,
+      isNavigationRequest: () => true, frame: () => f.page };
+    const response = { request: () => req, url: () => target, status: () => 200 };
+    f.page.emit('request', req); f.page.emit('response', response); f.page.emit('framenavigated', f.page);
+    return response;
+  };
+}
+const navigationIntent = { kind: 'explicit_document_navigation', phase: 'pending_historical',
+  target: 'http://127.0.0.1:1234/c/product?source_transcript=root' };
+
+test('driver navigation waits for live required headers/body and new admissions, retaining actual raw receipts', async () => {
+  const clock = controlledClock(), f = recorderFixture({ clock }, { ...aggregate, route: '/c/product' });
+  const a = f.request(), b = f.request(); f.page.emit('request', a);
+  let navigations = 0, finishA, finishB;
+  const nav = f.recorder.navigateAfterRequiredBodies(navigationIntent,
+    documentDispatch(f, navigationIntent.target, () => {
+      navigations++; assert.equal(f.snapshots.length, 2);
+      assert.ok(f.snapshots.every(s => s.raw_sha256 && s.raw === JSON.stringify(aggregateBody)));
+    }));
+  await flush(); assert.equal(navigations, 0);
+  assert.ok(!f.receipts.some(r => r.value.outcome === 'navigation_intent'));
+  f.respond(a, () => new Promise(resolve => { finishA = resolve; })); await flush();
+  f.page.emit('request', b); finishA(JSON.stringify(aggregateBody)); await flush();
+  assert.equal(navigations, 0);
+  f.respond(b, () => new Promise(resolve => { finishB = resolve; })); await flush();
+  assert.equal(navigations, 0); finishB(JSON.stringify(aggregateBody)); await nav;
+  assert.equal(navigations, 1); assert.equal(clock.pending().length, 0);
+  const current = f.request(); f.page.emit('request', current); f.respond(current); await flush();
+  await f.recorder.sealAndDrain(); f.recorder.assertQualified();
+});
+
+test('pre-navigation absolute deadline and close fail without goto, reset or late body admission', async () => {
+  for (const mode of ['headers', 'body', 'close']) {
+    const clock = controlledClock(), f = recorderFixture({ clock }, { ...aggregate, route: '/c/product' });
+    const req = f.request(); f.page.emit('request', req); let complete, navigations = 0;
+    if (mode === 'body') { f.respond(req, () => new Promise(resolve => { complete = resolve; })); await flush(); }
+    const nav = f.recorder.navigateAfterRequiredBodies(navigationIntent, () => { navigations++; });
+    const rejected = assert.rejects(nav);
+    if (mode === 'close') f.page.emit('close');
+    else { clock.advance(10000); f.page.emit('request', f.request()); clock.advance(1000); }
+    await rejected; await flush(); assert.equal(navigations, 0);
+    complete?.(JSON.stringify(aggregateBody)); await flush();
+    assert.equal(f.snapshots.length, 0); assert.equal(clock.pending().length, 0);
+    await f.recorder.sealAndDrain(); assert.throws(() => f.recorder.assertQualified());
+  }
+});
+
+test('required body failure still blocks driver navigation; no supersession or replacement receipt rescue', async () => {
+  const f = recorderFixture({}, { ...aggregate, route: '/c/product' });
+  const req = f.request(); f.page.emit('request', req); let navigations = 0;
+  const nav = f.recorder.navigateAfterRequiredBodies(navigationIntent, () => { navigations++; });
+  const rejected = assert.rejects(nav, /pre-navigation capture errors/);
+  f.respond(req, async () => { throw new Error('Network.getResponseBody: No resource with given identifier found'); });
+  await rejected; assert.equal(navigations, 0);
+  const later = f.request(); f.page.emit('request', later); f.respond(later); await flush();
+  await f.recorder.sealAndDrain(); assert.throws(() => f.recorder.assertQualified());
+  assert.equal(f.recorder.captureErrors[0].reason, 'body_transport');
+});
+
+test('request admitted at navigation handoff remains required and failed body cannot disappear', async () => {
+  const clock = controlledClock(), f = recorderFixture({ clock }, { ...aggregate, route: '/c/product' });
+  let finish;
+  await f.recorder.navigateAfterRequiredBodies(navigationIntent, documentDispatch(f, navigationIntent.target, () => {
+    const late = f.request(); f.page.emit('request', late);
+    f.respond(late, () => new Promise(resolve => { finish = resolve; }));
+  }));
+  await flush(); finish(Promise.reject(new Error('body lost'))); await flush();
+  await f.recorder.sealAndDrain(); assert.throws(() => f.recorder.assertQualified());
+  assert.equal(f.recorder.captureErrors[0].reason, 'body_transport');
+});
+
+test('both actual driver document navigations use tested body-settling wrapper without a capture exception', () => {
+  const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  assert.equal((script.match(/await recorder\.navigateAfterRequiredBodies\(/g) ?? []).length, 2);
+  assert.doesNotMatch(script, /const (?:manual_identity|pending_historical)Navigation = recorder\.beginNavigation/);
+  assert.match(script, /const response = await dispatch\(\);\s*this\.confirmNavigation\(token, response\)/);
+});

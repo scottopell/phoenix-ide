@@ -242,7 +242,10 @@ test('UNIT ONLY late report capture retains raw body/response and independent he
 });
 test('source observer precedes first history navigation and union follows browser close before server stop', () => {
   const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
-  assert.ok(source.indexOf('historyTelemetry = installObservedHistoryTelemetry(page, ui)') < source.indexOf('await page.goto('));
+  const observer = source.indexOf('historyTelemetry = installObservedHistoryTelemetry(page, ui)');
+  const navigation = source.indexOf('await recorder.navigateAfterRequiredBodies(');
+  assert.ok(observer > 0 && navigation > observer);
+  assert.ok(source.indexOf('() => page.goto(', navigation) > navigation);
   const closed = source.indexOf('await browser.close(); browser = undefined;');
   const union = source.indexOf('finalizeHistoryTelemetry(inventory)', closed);
   const stopped = source.indexOf("command({ command: 'stop' })", union);

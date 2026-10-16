@@ -421,7 +421,7 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
   const requests = [], failed = [], applicationErrors = [], captureErrors = [];
   const identities = new WeakMap(), required = new Map(), tasks = new Set();
   let ordinal = 0, navigationEpoch = 0, sealed = false, drain, drainDeadline, drainTimer, drainComplete = false;
-  let scope = 0, transition = null;
+  let scope = 0, transition = null, navigationWaiting = false, navigationWake, pageClosed = false;
   const documents = new WeakMap();
   const navigationReceipts = [];
   const navigationRecord = value => { navigationReceipts.push(value); record('browser-navigation.jsonl', value); };
@@ -437,7 +437,10 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     notify();
   };
   let wake;
-  const notify = () => { wake?.(); wake = undefined; };
+  const notify = () => {
+    wake?.(); wake = undefined;
+    navigationWake?.(); navigationWake = undefined;
+  };
   const pending = () => [...required.values()].filter(s => ['awaiting_response', 'reading_body', 'awaiting_independent_committed_evidence', 'awaiting_document_supersession_confirmation'].includes(s.outcome));
   const inventory = (partial) => ({ sealed, partial, pending_required: pending().length, pending_body_tasks: tasks.size,
     pending_metadata: pending().map(s => ({ ...s.metadata, outcome: s.outcome })),
@@ -605,7 +608,7 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
     }
     notify();
   };
-  const onClose = () => terminatePending('disposed');
+  const onClose = () => { pageClosed = true; terminatePending('disposed'); };
   page.on('request', onRequest); page.on('requestfailed', onFailed); page.on('response', onResponse);
   page.on('pageerror', onPageError); page.on('framenavigated', onNavigation); page.on('close', onClose);
   return { requests, failed, applicationErrors, captureErrors,
@@ -642,6 +645,37 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
         record('browser-authority.jsonl', { outcome: 'independent_committed_opening', evidence, source, reservation_epoch: reservation.epoch });
         for (const state of pending()) if (state.candidate) { state.committed_evidence_source = structuredClone(source); state.commit?.(); }
       } catch (error) { terminatePending('independent_evidence_mismatch'); throw error; }
+    },
+    async navigateAfterRequiredBodies(intent, dispatch) {
+      assert.ok(!sealed && !navigationWaiting, 'exclusive live pre-navigation drain required');
+      navigationWaiting = true;
+      const deadline = clock.now() + deadlineMs;
+      let timer;
+      const expired = new Promise((_, reject) => {
+        timer = clock.setTimeout(() => {
+          terminatePending('pre_navigation_deadline');
+          reject(new Error('required pre-navigation capture deadline'));
+        }, deadlineMs);
+      });
+      try {
+        while (true) {
+          assert.ok(!pageClosed && !sealed, 'live page required before navigation');
+          assert.ok(clock.now() < deadline, 'required pre-navigation absolute deadline');
+          assert.deepEqual(captureErrors, [], 'pre-navigation capture errors');
+          assert.ok([...required.values()].every(state => state.outcome !== 'request_failed'
+            || state.expected_transport_failure === true), 'unexpected required transport failure before navigation');
+          if (!pending().length && !tasks.size) break;
+          await Promise.race([new Promise(resolve => { navigationWake = resolve; }), expired]);
+        }
+      } finally {
+        clock.clearTimeout(timer); navigationWake = undefined; navigationWaiting = false;
+      }
+      navigationRecord({ outcome: 'required_bodies_settled_before_navigation', phase: intent.phase,
+        navigation_scope: scope, required_count: required.size, at: clock.now() });
+      const token = this.beginNavigation(intent);
+      const response = await dispatch();
+      this.confirmNavigation(token, response);
+      return response;
     },
     /** @param {NavigationIntent} intent */
     beginNavigation(intent) {
@@ -691,6 +725,7 @@ export function installAggregateRecorder(page, aggregate, record, snapshots, {
       record('browser-authority.jsonl', { outcome: 'explicit_known_fact_not_held_gate_evidence', evidence });
     },
     sealAndDrain() {
+      assert.ok(!navigationWaiting, 'cannot seal during live pre-navigation drain');
       if (drain) return drain;
       sealed = true;
       drainDeadline = clock.now() + deadlineMs;
@@ -874,9 +909,9 @@ async function run() {
     const predecessor = await http('GET', `/api/conversations/${oldEdge.predecessor_transcript_row_id}`);
     const boundaryMessage = predecessor.messages.find(m => m.message_id === oldEdge.continuation_message_id);
     assert.ok(boundaryMessage); assert.equal(boundaryMessage.content.summary, openingMessage.content.text);
-    const manual_identityNavigation = recorder.beginNavigation({ kind: 'explicit_document_navigation', phase: 'manual_identity', target: ui + sourceLink(a, gate.predecessor, openingId) });
-    const manual_identityDocument = await page.goto(ui + sourceLink(a, gate.predecessor, openingId), { waitUntil: 'domcontentloaded' });
-    recorder.confirmNavigation(manual_identityNavigation, manual_identityDocument);
+    await recorder.navigateAfterRequiredBodies(
+      { kind: 'explicit_document_navigation', phase: 'manual_identity', target: ui + sourceLink(a, gate.predecessor, openingId) },
+      () => page.goto(ui + sourceLink(a, gate.predecessor, openingId), { waitUntil: 'domcontentloaded' }));
     await page.locator(persistedMessageSelector(openingId)).first().waitFor({ state: 'visible' });
     checked('manual equal-text accepted opening remains separate', { edge: oldEdge, opening_id: openingId, boundary_id: oldEdge.continuation_message_id });
 
@@ -911,9 +946,9 @@ async function run() {
     updateFault(fault, { streamPath: `/api/conversations/${latest}/stream` });
     const start = snapshots.length;
     const middle = a.occurrences.filter(k => k[0] === 1)[20][2];
-    const pending_historicalNavigation = recorder.beginNavigation({ kind: 'explicit_document_navigation', phase: 'pending_historical', target: ui + sourceLink(a, a.members[1], middle) });
-    const pending_historicalDocument = await page.goto(ui + sourceLink(a, a.members[1], middle), { waitUntil: 'domcontentloaded' });
-    recorder.confirmNavigation(pending_historicalNavigation, pending_historicalDocument);
+    await recorder.navigateAfterRequiredBodies(
+      { kind: 'explicit_document_navigation', phase: 'pending_historical', target: ui + sourceLink(a, a.members[1], middle) },
+      () => page.goto(ui + sourceLink(a, a.members[1], middle), { waitUntil: 'domcontentloaded' }));
     await poll(() => snapshots.slice(start).find(s => belongsToAggregate(a, s) && s.data.latest_transcript_row_id === latest && openingMatches(s.data.latest_opening, entered, 'pending')), 'browser Pending aggregate');
     await page.locator(persistedMessageSelector(middle)).first().waitFor({ state: 'visible' });
     await poll(composerReadonly, 'Pending composer readonly');

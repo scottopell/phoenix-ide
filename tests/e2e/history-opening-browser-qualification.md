@@ -1526,3 +1526,43 @@ ring; failed logs remain retained. No local Rust build, server/listener/browser,
 installation, cache cleanup, deployment or production action was performed.
 Full new-source hosted qualification and actual collector/export join remain
 owed; no current candidate/joint or overhead acceptance is claimed.
+
+
+## Required-body navigation ordering after run 38844570559
+
+Harness `42508a870a2a357c993e9c3f978ef239358ee04d` / app `194e42b7`
+produced witness `116792049706` failure in run `38844570559` before stock or
+pagehide qualification. The new real-router collector witness unit actually
+compiled and executed successfully (one test); codegen, the existing opening
+guards and pinned full UI also passed. This is not collector/export acceptance.
+At inspection standard Rust `116792137738` was running and uncancelled.
+Artifact `12022663186` (89,658,923 bytes) remains remote and protected.
+
+The first required-capture failure was ordinal 58, scope one: GET request at
+2051.115 ms, next pending-historical navigation intent 2118.116, response headers
+HTTP 200 at 2120.248, then CDP body retrieval failed with no resource identifier.
+The new document confirmed at 2136.240. A later successful document/body does
+not repair the missing old actual body. Primary capture error remains distinct
+from cleanup. Selected result/runtime/unit receipts used 119,573 range bytes;
+additional bounded request/response/navigation records retain the exact order.
+
+The successor changes ordering, not evidence policy: a recorder-owned bounded
+live drain waits for already-admitted required headers, actual body reads and
+validation/commit tasks before synchronously starting the explicit navigation.
+It recomputes live pending work and includes new admissions during the wait.
+Both explicit driver navigations use this wrapper. One absolute existing
+11-second cap applies without reset; close, deadline, wrong status/identity or
+body failure rejects without invoking goto. Listeners stay installed; final
+seal/drain is mutually exclusive. Actual document confirmation and strict
+current-document aggregate capture remain required. A request arriving at the
+handoff remains required and its body loss still fails. This reduces the
+observed race; it does not prove the renderer cannot create future requests.
+No No-resource/reading-body supersession exception, retry, alternate fetch,
+quiet-period sleep, sealed admission or successor-body substitution was added.
+
+Deterministic controls hold old headers/body, admit a second required request,
+and require both exact raw/hash captures before goto; they cover timeout with
+non-sliding arrivals, page close, late completion, unavailable-body failure,
+new handoff requests and both real driver callsites. All 35 opening Node tests
+passed, including existing unavailable-body rejection controls. This ordering
+repair is independent of the reviewed pagehide collector/export contract.
