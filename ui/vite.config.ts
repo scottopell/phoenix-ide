@@ -1,3 +1,4 @@
+import { viewReporterBuild } from './qualification/viewReporterBuild';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { readFileSync, realpathSync, writeFileSync } from 'fs';
@@ -182,7 +183,7 @@ export default defineConfig(isLadle ? {
   server: { fs: { allow: [resolve(__dirname), realpathSync(resolve(__dirname, 'node_modules'))] } },
 } : {
   define: sourceDefines,
-  plugins: [react(), shikiLangPrune(), gitkeep()],
+  plugins: [viewReporterBuild(), react(), shikiLangPrune(), gitkeep()],
   server: {
     allowedHosts: true,
     ...(httpsServer ? { https: httpsServer } : {}),

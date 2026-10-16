@@ -135,3 +135,19 @@ Metadata is intentionally terminated at this typed sink, not copied into semanti
 ### Complete exported view capacity
 
 REQ-CVT-007 and ADR-108 require all44 semantic collector fields plus at most8 pinned metadata fields within production52. Both exporter constructors use `phoenix_span_limits()`; do not test with an unrelated default128 provider. Exact real-handler guard `api::view_journey::tests::production_attribute_capacity_preserves_complete_ready_collector_schema` compares the old32 cap with actual production52, checks exact typed values/readiness/correlation parentage/drop counts and prints protobuf span/semantic/SDK encoded bytes. These bounded-fixture sizes are not overhead clearance, absolute memory bounds or evidence that every span grows. Existing default-layer metadata, spans-only, privacy and limit guards remain required. Receiver attribute128/wire/decoded retention bounds do not change.
+
+
+## Separate controlled-functional artifact
+
+ADR-109 and REQ-CVT-005 permit100% admission only in the separate controlled-functional artifact; the stock no-force-sampling contract is unchanged. Build from clean pinned source in `ui/`:
+
+```
+node node_modules/vite/bin/vite.js build
+node node_modules/vite/bin/vite.js build --config vite.controlled-functional.config.ts --mode controlled-functional
+```
+
+Outputs are `ui/dist` and `ui/dist-controlled-functional`; out-of-root manifests are `ui/stock-natural-build.json` and `ui/controlled-functional-build.json`. Fields include schema_version1, evidence_class, sample_rate, source_sha/tree/dirty, exact factory/config/guard relative paths and SHA256s, resolved_module_files and ui_files maps. All paths are repository-relative; source graph scope is explicitly ui_source_not_dependency_provenance. Shared admission must verify exact source/tree/clean state, expected config/factory/guard paths and every module/asset hash, reject missing/extra/foreign paths or public URL inputs, confirm stock graph excludes the controlled factory and controlled graph excludes the stock factory, and admit only through the existing cfgtest loopback preview. Artifact files are not evidence of host admission by themselves. Neither manifest asserts functional success or overhead clearance.
+
+Factory paths: stock `ui/src/hooks/conversationViewReporterFactory.ts`; controlled `ui/qualification/conversationViewReporterFactory.controlled.ts`; guard `ui/qualification/viewReporterBuild.ts`; dedicated config `ui/vite.controlled-functional.config.ts`. The normal hook singleton calls the factory once; alias substitution is limited to that owning hook. Qualification source is not imported into the normal runtime graph.
+
+The controlled driver is separate from the stock driver: exactly original-owner ready/pagehide incomplete/SPA canceled for each of two routes, six accepted reports total, plus auth negative with zero acceptance. Use real initial finite requests and real navigation/controls; all original admission/request/SSE ownership, report privacy/caps, browser204 for nondeparting cases, real collector/export join and normal drain are required. Record any unexpected admission/report and fail exact inventory rather than discard it. No resume-positive case is authorized on unsupported Chromium: real standalone PWA or persisted BFCache capability must be established separately. Preserve the green stock42a2 baseline independently; do not rerun stock merely for symmetry. Controlled evidence cannot contribute to overhead cohorts; numeric overhead policy remains unresolved and does not block functional source work.
