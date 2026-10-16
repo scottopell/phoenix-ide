@@ -205,7 +205,7 @@ test('SPA driver requires real same-document replacement and correlated canceled
       assert.notEqual(mode, 'rejected_report');
       return report;
     } };
-    const args = { page, baseURL: 'http://127.0.0.1:8123', selector: 'a', capture };
+    const args = { page, baseURL: 'http://127.0.0.1:8123', control: { kind: 'anchor', selector: 'a' }, capture };
     if (mode === 'canceled') assert.equal((await runPendingSPACancellation(args)).status, 'observed_spa_canceled');
     else await assert.rejects(runPendingSPACancellation(args));
     assert.equal(clicked, !['off_host', 'duplicate_anchor', 'hidden_anchor'].includes(mode));
@@ -348,7 +348,7 @@ test('wired lifecycle stage actually runs background, SPA and native BFCache pat
   const result = { journeys: [], capabilities: {} };
   const identity = { appSource: 'a'.repeat(40), frontendSource: 'b'.repeat(40), serverInstanceId: 'instance' };
   const stage = await runLifecycleQualificationStage({ browser: fixture.browser, storageState: {}, baseURL: 'http://127.0.0.1:8123',
-    fixture: { route: '/c/product', productConversationId: 'product', spaSelector: 'a[href="/c/successor"]' },
+    fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'anchor', selector: 'a[href="/c/successor"]' } },
     onTrial: trial => appendLifecycleInventory(result, { trials: [trial] }, identity) });
   assert.equal(fixture.count(), 3);
   assert.deepEqual(stage.trials.map(trial => trial.status), ['actual_hidden_response_then_visible_readiness', 'observed_spa_canceled', 'observed_bfcache_fresh_ready_report']);
@@ -362,7 +362,7 @@ test('wired lifecycle stage rejects precompleted, preterminal and late duplicate
     const fixture = lifecycleBrowserFixture(mode);
     const trials = [];
     await assert.rejects(runLifecycleQualificationStage({ browser: fixture.browser, storageState: {}, baseURL: 'http://127.0.0.1:8123',
-      fixture: { route: '/c/product', productConversationId: 'product', spaSelector: 'a' }, onTrial: trial => trials.push(trial) }));
+      fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'anchor', selector: 'a' } }, onTrial: trial => trials.push(trial) }));
     assert.equal(trials.length, 1);
     assert.ok(trials[0].failure);
     assert.equal(fixture.actions.filter(action => action[1] === 'closed').length, 1);
@@ -441,7 +441,7 @@ test.each(['normal', 'precompleted', 'preterminal', 'late_duplicate', 'initial_l
   try {
     const execution = runTelemetryChecks({ page: { context: () => context }, context, baseURL, serviceName: 'synthetic-main', runId: 'main', outputDir,
       fixtures: { identity, aggregates: [{ kind: 'ordinary', route: '/c/product' }, { kind: 'global', route: '/global/coordinator' }],
-        lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a[href="/c/successor"]' }, forbidden: ['PRIVATE_CANARY'] } });
+        lifecycle: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'anchor', selector: 'a[href="/c/successor"]' } }, forbidden: ['PRIVATE_CANARY'] } });
     if (mode !== 'normal') {
       const rejection = assert.rejects(execution);
       if (timedFailure) await vi.advanceTimersByTimeAsync(mode === 'initial_timeout' ? 285000 : 5020);
@@ -526,7 +526,7 @@ test('wired lifecycle receipts reject private payload before writing and record 
     if (mode === 'context_failure') fixture.browser.newContext = async () => { throw new Error('context unavailable'); };
     try {
       await assert.rejects(runLifecycleQualificationStage({ browser: fixture.browser, storageState: {}, baseURL: 'http://127.0.0.1:8123', outputDir,
-        forbidden: ['PRIVATE_CANARY'], fixture: { route: '/c/product', productConversationId: 'product', spaSelector: 'a' },
+        forbidden: ['PRIVATE_CANARY'], fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'anchor', selector: 'a' } },
         onTrial: () => { if (mode === 'callback_failure') throw new Error('inventory callback failed'); } }));
       const text = readFileSync(join(outputDir, 'telemetry-lifecycle-trials.json'), 'utf8');
       assert.equal(text.includes('PRIVATE_CANARY'), false);
@@ -557,7 +557,7 @@ test('absolute lifecycle deadline preserves receipt and closes a context arrivin
   const browser = { newContext: () => new Promise(resolve => { create = resolve; }) };
   try {
     const execution = runLifecycleQualificationStage({ browser, storageState: {}, baseURL: 'http://127.0.0.1:8123', budgetMs: 100,
-      fixture: { route: '/c/product', productConversationId: 'product', spaSelector: 'a' }, onTrial: trial => trials.push(trial) });
+      fixture: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'anchor', selector: 'a' } }, onTrial: trial => trials.push(trial) });
     const rejection = assert.rejects(execution, /absolute lifecycle stage deadline/);
     await vi.advanceTimersByTimeAsync(100);
     await rejection;
@@ -643,7 +643,7 @@ test.each(['disabled', 'transport'])('main auth prerequisite %s fails before coh
     await assert.rejects(runTelemetryChecks({ page: { context: () => context }, context, baseURL: 'http://127.0.0.1:8123', serviceName: 'synthetic-auth', runId: 'auth', outputDir,
       fixtures: { identity: { appSource: 'a'.repeat(40), frontendSource: 'b'.repeat(40), serverInstanceId: 'instance' },
         aggregates: [{ kind: 'ordinary', route: '/c/product' }, { kind: 'global', route: '/global/coordinator' }],
-        lifecycle: { route: '/c/product', productConversationId: 'product', spaSelector: 'a' } } }), mode === 'transport' ? /authentication status GET transport failed/ : /must require authentication/);
+        lifecycle: { route: '/c/product', productConversationId: 'product', spaControl: { kind: 'anchor', selector: 'a' } } } }), mode === 'transport' ? /authentication status GET transport failed/ : /must require authentication/);
     const receipt = JSON.parse(readFileSync(join(outputDir, 'telemetry-browser-result.json'), 'utf8'));
     assert.equal(contexts, 0); assert.deepEqual(receipt.trials, []);
     assert.match(receipt.failure, mode === 'transport' ? /authentication status GET transport failed/ : /must require authentication/);
@@ -804,4 +804,24 @@ test.each(['binding', 'initialization'])('pagehide stalled diagnostic %s obeys a
     await vi.advanceTimersByTimeAsync(0);
     assert.equal(pages, 0); assert.equal(closed, 1);
   } finally { vi.useRealTimers(); }
+});
+
+test.each(['expanded', 'collapsed', 'missing', 'duplicate', 'hidden', 'disabled', 'wrong_element', 'cross_document', 'completed_request', 'wrong_destination', 'ready_report', 'rejected_report'])('pending SPA uses real shell home control %s without needing snapshot-owned anchor', async mode => {
+  let url = 'http://127.0.0.1:8123/c/product'; let clicked = false; let reads = 0; let pendingChecks = 0;
+  const target = { count: async () => mode === 'missing' ? 0 : mode === 'duplicate' ? 2 : 1,
+    isVisible: async () => mode !== 'hidden', isEnabled: async () => mode !== 'disabled', evaluate: async () => mode === 'wrong_element' ? 'DIV' : 'BUTTON',
+    click: async () => { clicked = true; url = mode === 'wrong_destination' ? 'http://127.0.0.1:8123/new' : 'http://127.0.0.1:8123/'; } };
+  const page = { url: () => url, locator: selector => {
+    assert.match(selector, /sidebar-expanded button.sidebar-brand:visible/);
+    assert.match(selector, /sidebar-collapsed button.sidebar-icon-btn\[title="Phoenix"\]:visible/);
+    assert.ok(!selector.includes('statebar'));
+    return target;
+  }, evaluate: async () => ++reads === 1 || mode !== 'cross_document' ? 1 : 2,
+    waitForURL: async destination => { assert.equal(url, destination); } };
+  const capture = { requestId: 'request', assertPending: () => { pendingChecks++; if (mode === 'completed_request' && pendingChecks === 2) throw new Error('request already completed'); },
+    waitReport: async () => { assert.notEqual(mode, 'rejected_report'); return { outcome: mode === 'ready_report' ? 'ready' : 'canceled', correlations: [{ kind: 'request', id: 'request' }] }; } };
+  const operation = runPendingSPACancellation({ page, baseURL: 'http://127.0.0.1:8123', control: { kind: 'sidebar_home' }, capture });
+  if (['expanded', 'collapsed'].includes(mode)) assert.equal((await operation).status, 'observed_spa_canceled');
+  else await assert.rejects(operation);
+  assert.equal(clicked, !['missing', 'duplicate', 'hidden', 'disabled', 'wrong_element', 'completed_request'].includes(mode));
 });
