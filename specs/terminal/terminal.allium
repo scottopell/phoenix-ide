@@ -246,9 +246,9 @@ config {
 
 -- REQ-TERM-001, REQ-TERM-002, REQ-TERM-WS-001: Terminal opened, PTY spawned
 rule TerminalOpened {
-    -- A UserOpensTerminal is keyed by WorkScope. For Conversation and
-    -- Worktree scopes the cwd is derived from the scope (conversation
-    -- working_dir or worktree path). For Global, the cwd is $HOME.
+    -- A UserOpensTerminal is keyed by resource identity. Ordinary Work cwd
+    -- resolves from the persisted environment, not the opaque ID payload.
+    -- Unattached fallback uses its transcript cwd; Global uses $HOME.
     when: UserOpensTerminal(terminal, scope)
 
     requires: terminal.status = absent
@@ -271,9 +271,9 @@ rule TerminalOpened {
         --        dup2(slave_fd, 0/1/2)         slave is stdin, stdout, stderr
         --        close(slave_fd)               fd already dup'd
         --        chdir(spawn_cwd_for_scope(scope))
-        --        --   WorkScope::Conversation(id) -> conv.working_dir (REQ-BED-010)
-        --        --   WorkScope::Worktree(path)   -> path
-        --        --   WorkScope::Global           -> $HOME
+        --        --   Work(id) -> persisted environment effective path (REQ-BED-010)
+        --        --   Unattached(id) -> fallback transcript cwd
+        --        --   GlobalTerminal -> $HOME
         --        execvp($SHELL, ["-i"])         with explicit env (REQ-TERM-002)
         --      [parent]:
         --        close(slave_fd)               parent must not hold slave open

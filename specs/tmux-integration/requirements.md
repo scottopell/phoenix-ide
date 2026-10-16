@@ -504,3 +504,10 @@ before the feature (or before an upgrade) is reused, not re-spawned. The stamp
 distinguishes a current server (no-op) from a stale one, and the refresh
 restores `phx` + OSC-8 for new windows without disrupting running work. See
 `specs/command-suggestion` and `design.md` §"Companion refresh on reuse".
+
+
+WHEN existing legacy conversation-named tmux adoption is needed for an ordinary scope
+THE SYSTEM SHALL resolve the legacy transcript hint from persisted ordinary ownership and continuation topology restricted to that exact scope
+AND SHALL use the earliest ordinary transcript attached to that same scope rather than the current successor actor ID or a different historically owned scope
+AND SHALL share that resolution between agent tools, terminal attachment and durable retirement discovery.
+This does not coalesce scopes by cwd, move socket files, repair historical database ownership or expand cross-version compatibility guarantees.

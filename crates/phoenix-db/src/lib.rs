@@ -8583,6 +8583,54 @@ impl Database {
         Ok(rows)
     }
 
+    /// Earliest ordinary user transcript attached to this exact persisted scope.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] when persisted lineage or ownership cannot be read.
+    pub async fn get_work_scope_legacy_conversation_id(
+        &self,
+        work_scope_id: &WorkScopeId,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "WITH RECURSIVE transcript(id, product_conversation_id, ordinal) AS (
+                 SELECT root.id, root.product_conversation_id, 0
+                 FROM product_conversation_work_scopes owner
+                 JOIN product_conversations product ON product.id = owner.product_conversation_id
+                 JOIN conversations root ON root.product_conversation_id = product.id
+                 WHERE owner.work_scope_id = ?1
+                   AND product.kind = 'ordinary'
+                   AND root.runtime_role = 'user'
+                   AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations predecessor
+                       WHERE predecessor.product_conversation_id = root.product_conversation_id
+                         AND predecessor.continued_in_conv_id = root.id
+                   )
+                 UNION ALL
+                 SELECT successor.id, successor.product_conversation_id, transcript.ordinal + 1
+                 FROM transcript
+                 JOIN conversations predecessor ON predecessor.id = transcript.id
+                 JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+                 WHERE successor.product_conversation_id = transcript.product_conversation_id
+                   AND successor.runtime_role = 'user'
+                   AND successor.parent_conversation_id IS NULL
+             )
+             SELECT conversation.id
+             FROM transcript
+             JOIN conversations conversation ON conversation.id = transcript.id
+             JOIN product_conversation_work_scopes owner
+               ON owner.work_scope_id = conversation.work_scope_id
+              AND owner.product_conversation_id = conversation.product_conversation_id
+             WHERE conversation.work_scope_id = ?1
+             ORDER BY transcript.ordinal, conversation.id
+             LIMIT 1",
+        )
+        .bind(work_scope_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// List conversations that share one persisted work-scope identity.
     ///
     /// # Errors
@@ -27671,6 +27719,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_continuation_keeps_legacy_socket_owner_on_exact_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root =
+            setup_exhausted_parent(&db, "legacy-root", "legacy-root", "/tmp", &ConvMode::Direct)
+                .await;
+        let scope = root.attached_work_scope_id.clone().unwrap();
+        let ContinueOutcome::Created(first) = db.continue_conversation(&root.id).await.unwrap()
+        else {
+            panic!();
+        };
+        db.update_conversation_state(
+            &first.id,
+            &ConvState::ContextExhausted {
+                summary: "again".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ContinueOutcome::Created(second) = db.continue_conversation(&first.id).await.unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(second.attached_work_scope_id.as_ref(), Some(&scope));
+        assert_eq!(
+            db.get_work_scope_legacy_conversation_id(&scope)
+                .await
+                .unwrap(),
+            Some(root.id)
+        );
+    }
+
+    #[tokio::test]
     async fn direct_continuation_concurrent_requests_and_replay_keep_one_scope() {
         let mut db = Database::open_in_memory().await.unwrap();
         db.continuation_test_hook = Some(std::sync::Arc::new(
@@ -27797,6 +27877,20 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((scopes, owners), (2, 2));
+        assert_eq!(
+            db.get_work_scope_legacy_conversation_id(root.attached_work_scope_id.as_ref().unwrap())
+                .await
+                .unwrap(),
+            Some(root.id)
+        );
+        assert_eq!(
+            db.get_work_scope_legacy_conversation_id(
+                selected.attached_work_scope_id.as_ref().unwrap()
+            )
+            .await
+            .unwrap(),
+            Some(first.id)
+        );
     }
 
     /// Sequential slugs: first continuation is `{root}-2`, multi-level chains

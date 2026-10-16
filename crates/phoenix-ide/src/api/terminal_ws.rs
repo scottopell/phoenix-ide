@@ -376,7 +376,18 @@ async fn acquire_handle(
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
     // conversation's project directory rather than Phoenix's own CWD.
-    let plan = resolve_exec_plan(conversation_id, scope, cwd, legacy_worktree_path, runtime).await;
+    let plan =
+        match resolve_exec_plan(conversation_id, scope, cwd, legacy_worktree_path, runtime).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                terminals.release_spawn(scope);
+                tracing::warn!(%error, "Terminal tmux owner resolution failed");
+                let _ = ws_sender
+                    .send(Message::Text("error: terminal unavailable".into()))
+                    .await;
+                return None;
+            }
+        };
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -430,21 +441,35 @@ async fn resolve_exec_plan(
     cwd: &std::path::Path,
     legacy_worktree_path: Option<&std::path::Path>,
     runtime: &Arc<RuntimeManager>,
-) -> PtyExecPlan {
+) -> Result<PtyExecPlan, String> {
     let registry = runtime.tmux_registry();
     if !registry.binary_available() {
-        return PtyExecPlan::Shell;
+        return Ok(PtyExecPlan::Shell);
     }
+    let legacy_conversation_id = match scope {
+        ResourceScopeKey::Work(id) => runtime
+            .db()
+            .get_work_scope_legacy_conversation_id(id)
+            .await
+            .map_err(|error| error.to_string())?,
+        ResourceScopeKey::Unattached(id) => Some(id.clone()),
+        ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal => None,
+    };
     match registry
-        .ensure_live(scope, cwd, legacy_worktree_path, Some(conversation_id))
+        .ensure_live(
+            scope,
+            cwd,
+            legacy_worktree_path,
+            legacy_conversation_id.as_deref(),
+        )
         .await
     {
         Ok(server_arc) => {
             let server = server_arc.read().await;
-            PtyExecPlan::Tmux {
+            Ok(PtyExecPlan::Tmux {
                 socket_path: server.socket_path.clone(),
                 config_path: registry.config_path(),
-            }
+            })
         }
         Err(e) => {
             tracing::warn!(
@@ -452,7 +477,7 @@ async fn resolve_exec_plan(
                 error = %e,
                 "Terminal: tmux ensure_live failed, falling back to direct shell"
             );
-            PtyExecPlan::Shell
+            Ok(PtyExecPlan::Shell)
         }
     }
 }
