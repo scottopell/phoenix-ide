@@ -576,7 +576,10 @@ def validate_controlled_receipt(receipt):
                 history = trial.get('additional_history', {})
                 if (history.get('report_count') != 1 or history.get('original_owner') != identifier
                         or type(history.get('request_count')) is not int or history['request_count'] < 1
-                        or trial.get('physical_history', {}).get('original_page') is not True):
+                        or trial.get('physical_history', {}).get('original_page') is not True
+                        or trial['physical_history'].get('viewport') != {'width': 1360, 'height': 900}
+                        or type(trial['physical_history'].get('stability_frames')) is not int
+                        or trial['physical_history']['stability_frames'] != 4):
                     raise ValueError('controlled positive original-owner historical evidence missing')
             if kind == 'pagehide' and trial.get('transport_settled_before_context_close') is not True:
                 raise ValueError('controlled departing context closed before transport settled')

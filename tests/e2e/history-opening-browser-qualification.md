@@ -2224,3 +2224,24 @@ is not integrated speculatively into this frozen evidence baseline, and is not
 claimed deployed. Native source-link acceptance remains release-blocking; stock
 baseline, controlled proof, overheadfalse, resumeunsupported and fullacceptancefalse
 remain separate.
+
+The installed app-relative Playwright1.61.0 core `validateBrowserContextOptions`
+confirms omitted viewport defaults to1280x720; this is a concrete harness mismatch
+from the old explicit1360x900 qualifier. A cohesive driver correction now pins
+1360x900 for all six scenario contexts and observes strict original-target
+containment independently of report204. Acquisition and the unchanged shared
+four-animation-frame/2px hold run within a5s stage inside the existing30s history
+and195s absolute budgets. All reads retain exact persisted-ID/fixture-source,
+URL source-pin, original route and acquired virtual-key identity. Null after
+acquisition, identity/pin/URL changes or >2px instability fail without restarting
+the hold. No scroll mutation, alternate target, retry, app change or weaker
+containment is introduced. Python receipt admission requires the declared
+viewport and4 stability frames. Cached controlled22 and lifecycle68 passed,
+including delayed first physical observation, permanent clipping, unstable
+identity/URL/pin/offset, and wrong receipt viewport/frame-count negatives.
+Independent cohesive source review approved one causal hosted successor. This
+corrects two source-demonstrated driver discrepancies; it does not assert which
+caused the actual earlier clipping. Same-artifact local browser reproduction is
+not claimed: the hosted output is remote and no local heavy build/server/browser
+was admitted or started. Actual successor strict containment and exact-six real
+collector/export/drain remain the next execution gate.

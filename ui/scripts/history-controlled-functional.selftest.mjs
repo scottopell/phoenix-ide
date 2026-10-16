@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
-import { assertControlledInventory, assertOwnedReport, runControlledFunctional } from './history-controlled-functional.mjs';
+import { assertControlledInventory, assertOwnedReport, runControlledFunctional, settleControlledHistoricalTarget, CONTROLLED_VIEWPORT } from './history-controlled-functional.mjs';
 import { verifyServedArtifact, captureOwnedBrowser, resolveOwnedChromium } from './qualify-history-controlled-functional.mjs';
 import { createHash } from 'node:crypto';
 const LABEL = 'UNIT_ONLY_NOT_RUNTIME_PROOF';
@@ -86,14 +86,22 @@ function fakeRuntime(options={}){
         setImmediate(()=>{this.reportInFlight=false;this.emit('requestfinished',req);});
       }else this.emit('requestfinished',req);
     }
-    async evaluate(_fn,arg){if(options.completeBeforeAction&&this.pending)this.emit('requestfinished',this.pending);return arg?{observation:options.missingPhysical?null:{...arg.known[0],sourcepin:options.wrongSourcepin?'UNIT-foreign':arg.known[0].sourceRow},predicates:options.missingPhysical?{row_clipped:1}:{}}:123;}
+    async evaluate(_fn,arg){
+      if(options.completeBeforeAction&&this.pending)this.emit('requestfinished',this.pending);
+      if(!arg){await new Promise(resolve=>setImmediate(resolve));return 123;}
+      this.physicalReads=(this.physicalReads??0)+1;
+      const missing=options.missingPhysical||(options.delayedPhysical&&this.physicalReads===1);
+      return {observation:missing?null:{...arg.known[0],key:'UNIT-virtual',offset:0,messageOffset:0,currentURL:this.location,
+        sourcepin:options.wrongSourcepin?'UNIT-foreign':arg.known[0].sourceRow},predicates:missing?{known_target_row_clipped:1}:{}};
+    }
     locator(selector){return {count:async()=>1,isEditable:async()=>true,waitFor:async()=>{},isEnabled:async()=>true,evaluate:async()=> 'BUTTON',click:async()=>{this.location='http://127.0.0.1:12345/';this.report('canceled');}};}
     async waitForURL(){}
   }
-  const browser={newContext:async()=>new Context()};
+  const contextOptions=[];
+  const browser={newContext:async settings=>{contextOptions.push(settings);return new Context();}};
   const module={captureReport:raw=>JSON.parse(raw),journeyExpectation:r=>({open_id:r.open_id}),sidebarHomeSelector:'UNIT-home'};
   const UNIT={label:LABEL,authenticate:async()=>{},ownership:{label:'UNIT_ONLY_NOT_FIXTURE_PROOF',module:{captureDiagnostic:raw=>raw}}};
-  return {input:{browser,baseURL:'http://127.0.0.1:12345',fixtures,module,historyTargets:targets,config:{unitOnly:true,evidence_class:'controlled_functional'}},UNIT,getClosed:()=>closed,pages};
+  return {input:{browser,baseURL:'http://127.0.0.1:12345',fixtures,module,historyTargets:targets,config:{unitOnly:true,evidence_class:'controlled_functional'}},UNIT,getClosed:()=>closed,pages,contextOptions};
 }
 test('UNIT full six-report driver traverses real action interfaces and closes all contexts without stock cohorts',async()=>{
   const runtime=fakeRuntime();const result=await runControlledFunctional(runtime.input,runtime.UNIT);
@@ -211,6 +219,7 @@ test('UNIT physical failure distinguishes strict oracle null from source-pin mis
     [{wrongSourcepin:true},'physical_history_sourcepin',true,false],
   ]){
     const runtime=fakeRuntime(options);let error;
+    if(options.missingPhysical)runtime.input.deadlineMs=10;
     try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(e){error=e;}
     assert.ok(error);const location=error.controlledReceipt.failure_location;
     assert.equal(location.phase,phase);assert.equal(location.physical.observation_present,present);
@@ -219,5 +228,29 @@ test('UNIT physical failure distinguishes strict oracle null from source-pin mis
     assert.ok(!JSON.stringify(location).includes('UNIT-foreign'));
     assert.ok(!JSON.stringify(location).includes('UNIT-row'));
     assert.equal(runtime.getClosed(),1);
+  }
+});
+
+test('UNIT explicit qualification viewport and physical settlement are independent of first report204',async()=>{
+  const runtime=fakeRuntime({delayedPhysical:true});
+  const result=await runControlledFunctional(runtime.input,runtime.UNIT);
+  assert.deepEqual(runtime.contextOptions,Array.from({length:6},()=>({viewport:{width:1360,height:900}})));
+  assert.deepEqual(CONTROLLED_VIEWPORT,{width:1360,height:900});
+  for(const trial of result.trials.filter(t=>t.kind==='history')){
+    assert.equal(trial.physical_history.stability_frames,4);
+    assert.equal(trial.physical_history.anchor.stability_frames.length,4);
+  }
+  assert.equal(runtime.pages[0].physicalReads,6,'null after204 then strict acquisition then four frames');
+});
+test('UNIT physical settlement is bounded and cannot accept permanent clipping or substitute unstable identity',async()=>{
+  let remaining=4,frames=0;
+  await assert.rejects(settleControlledHistoricalTarget({read:async()=>null,nextFrame:async()=>{frames++;},
+    check:()=>assert.ok(remaining-->0,'UNIT budget exhausted')}),/budget/);
+  assert.ok(frames>0);
+  const first={key:'UNIT-key',persistedMessageID:'UNIT-id',sourceRow:'UNIT-source',sourcepin:'UNIT-source',currentURL:'UNIT-url',offset:0,messageOffset:0};
+  for(const change of [{offset:3},{persistedMessageID:'UNIT-other'},{sourcepin:'UNIT-other'},{currentURL:'UNIT-other'}]){
+    let reads=0;
+    await assert.rejects(settleControlledHistoricalTarget({read:async()=>++reads===1?first:{...first,...change},nextFrame:async()=>{},check:()=>{}}),/four frames/);
+    assert.equal(reads,2);
   }
 });

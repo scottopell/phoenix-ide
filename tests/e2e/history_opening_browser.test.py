@@ -879,7 +879,7 @@ class OpeningQualificationTests(unittest.TestCase):
                     'admission': {'open_id': identifier, 'sampled': True, 'route': route}, 'statuses': [] if kind == 'pagehide' else [204],
                     'delivery_proof': 'provisional_until_real_collector_and_export_join',
                     'transport_settled_before_context_close': True,
-                    'physical_history': {'original_page': True},
+                    'physical_history': {'original_page': True, 'viewport': {'width': 1360, 'height': 900}, 'stability_frames': 4},
                     'additional_history': {'report_count': 1, 'request_count': 1, 'original_owner': identifier}})
         receipt = {'evidence_class': 'controlled_functional', 'status': 'passed_assertions',
             'full_acceptance': False, 'overhead_clearance': False, 'resume': {'status': 'unsupported'},
@@ -899,6 +899,8 @@ class OpeningQualificationTests(unittest.TestCase):
             lambda r: r['trials'][0]['additional_history'].update(request_count=0),
             lambda r: r['trials'][0]['additional_history'].update(original_owner='foreign'),
             lambda r: r['trials'][0]['physical_history'].update(original_page=False),
+            lambda r: r['trials'][0]['physical_history'].update(stability_frames=0),
+            lambda r: r['trials'][0]['physical_history'].update(viewport={'width': 1280, 'height': 720}),
             lambda r: r['trials'][2].update(transport_settled_before_context_close=False),
             lambda r: r['trials'][0]['reports'][0].update(outcome='canceled'),
             lambda r: r['trials'][0].update(statuses=[]), lambda r: r['auth_negative'].update(response_status=204)]

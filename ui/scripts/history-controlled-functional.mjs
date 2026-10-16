@@ -1,9 +1,25 @@
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
-import { observePhysicalHistoricalRow } from './history-postfault-baseline.mjs';
+import { observePhysicalHistoricalRow, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
 import { installHistoryRequestOwnership, installObservedHistoryTelemetry, authenticateOwnedContext } from './history-joint-telemetry.mjs';
 
 export const CONTROLLED_CLASS = 'controlled_functional';
+export const CONTROLLED_VIEWPORT = Object.freeze({ width: 1360, height: 900 });
+
+export async function settleControlledHistoricalTarget({ read, nextFrame, check }) {
+  let physical;
+  while (!physical) {
+    check();
+    physical = await read(null);
+    if (!physical) { await nextFrame(); check(); }
+  }
+  const baseline = await holdPostFaultBaseline(physical, async expected => {
+    check(); return read(expected);
+  }, async () => { check(); await nextFrame(); check(); });
+  check();
+  return { ...baseline, observation_scope: 'controlled original-page strict historical target held four animation frames' };
+}
+
 const rows = ['history', 'pagehide', 'cancellation'];
 
 export function assertControlledInventory(result) {
@@ -125,7 +141,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
   let canceled = false, primaryFailure;
   const createContext = async () => {
     assert.ok(!canceled); clock.remaining();
-    const context = await browser.newContext();
+    const context = await browser.newContext({ viewport: { ...CONTROLLED_VIEWPORT } });
     contexts.add(context);
     if (canceled) { await context.close(); contexts.delete(context); throw new Error('controlled late context creation canceled'); }
     return context;
@@ -178,19 +194,29 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             await page.goto(baseURL + target.route, { waitUntil: 'domcontentloaded', timeout: Math.min(15000, clock.remaining()) });
             phase = 'history_report_wait';
             await observer.wait(() => observer.getReports().length === 1 && observer.getStatuses().length === 1, Math.min(12000, check()));
-            phase = 'physical_history';
-            const probe = await page.evaluate(observePhysicalHistoricalRow, { known: [target.anchor], diagnostics: true });
-            const physical = probe.observation;
-            physicalDiagnostics = { predicates: probe.predicates, observation_present: physical !== null,
-              fixture_identity_matches: physical ? physical.persistedMessageID === target.anchor.persistedMessageID && physical.sourceRow === target.anchor.sourceRow : null,
-              sourcepin_matches: physical ? physical.sourcepin === target.anchor.sourceRow : null };
-            phase = 'physical_history_present';
-            assert.ok(physical, 'actual retained historical source must be visible');
-            phase = 'physical_history_fixture_identity';
-            assert.equal(physical.persistedMessageID, target.anchor.persistedMessageID);
-            assert.equal(physical.sourceRow, target.anchor.sourceRow);
-            phase = 'physical_history_sourcepin';
-            assert.equal(physical.sourcepin, target.anchor.sourceRow);
+            phase = 'physical_history_settlement';
+            const physical = await bounded(() => settleControlledHistoricalTarget({
+              check,
+              nextFrame: () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve))),
+              read: async expected => {
+                check();
+                const probe = await page.evaluate(observePhysicalHistoricalRow, { known: [target.anchor], expected, diagnostics: true });
+                check();
+                const observed = probe.observation;
+                physicalDiagnostics = { predicates: probe.predicates, observation_present: observed !== null,
+                  fixture_identity_matches: observed ? observed.persistedMessageID === target.anchor.persistedMessageID && observed.sourceRow === target.anchor.sourceRow : null,
+                  sourcepin_matches: observed ? observed.sourcepin === target.anchor.sourceRow : null };
+                if (!observed) { phase = 'physical_history_present'; return null; }
+                phase = 'physical_history_fixture_identity';
+                assert.equal(observed.persistedMessageID, target.anchor.persistedMessageID);
+                assert.equal(observed.sourceRow, target.anchor.sourceRow);
+                phase = 'physical_history_sourcepin';
+                assert.equal(observed.sourcepin, target.anchor.sourceRow);
+                assert.equal(page.url(), new URL(target.route, baseURL).href, 'physical settlement retains original route');
+                phase = 'physical_history_stability';
+                return observed;
+              },
+            }), 5000);
             phase = 'composer_owner';
             assert.equal(await page.locator('textarea[placeholder="Message..."]').count(), 1, 'exactly one current composer');
             assert.equal(await page.locator('textarea[placeholder="Message..."]').isEditable(), true, 'current composer is writable');
@@ -206,7 +232,8 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             trial.additional_history = { report_count: 1, request_count: historicalRequests.length, original_owner: trial.reports[0].open_id };
             phase = 'stream_owner';
             assert.ok(network.snapshot().requestRecords.some(r => r.kind === 'sse' && new URL(r.url).pathname === `/api/conversations/${target.composerOwner}/stream`), 'stream must belong to independently selected writable owner');
-            trial.physical_history = { original_page: true, anchor: physical, composer_owner: target.composerOwner };
+            trial.physical_history = { original_page: true, anchor: physical, composer_owner: target.composerOwner,
+              viewport: { ...CONTROLLED_VIEWPORT }, stability_frames: physical.stability_frames.length };
             return trial;
           }
           phase = 'pending_navigation';
