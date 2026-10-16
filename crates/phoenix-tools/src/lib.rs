@@ -334,9 +334,6 @@ pub struct ToolContext {
     pub worktree_path: Option<PathBuf>,
 
     /// Durable owner for work-affine resources created by this tool call.
-    /// Worktree-backed conversations scope to the worktree path so resources
-    /// survive context-exhaustion continuations; Direct conversations fall
-    /// back to the conversation id.
     pub work_scope: ResourceScopeKey,
 
     /// Optional sink for typed ephemeral bash progress snapshots.

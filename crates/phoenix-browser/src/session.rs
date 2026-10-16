@@ -1319,10 +1319,7 @@ impl Drop for BrowserSessionGuard<'_> {
 /// Preservation is scope equality — when the inheritor resolves to the
 /// *same* scope, the Chrome window is still in use and we skip the kill.
 /// Different-scope or no inheritor falls through to teardown. The
-/// equality rule subsumes the per-kind case-analysis (Worktree vs
-/// Conversation): Direct continuations resolve to their own
-/// `Conversation` scope, never equal to the parent's, so they take the
-/// kill path automatically.
+/// equality rule uses opaque persisted resource identity.
 ///
 /// REQ-BROWSER-WS-003, REQ-BROWSER-WS-002.
 ///
@@ -2005,11 +2002,7 @@ impl BrowserSessionManager {
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
-    /// Session identity starts with `ResourceScopeKey::stable_key()`: continuations
-    /// of a worktree-backed conversation resolve to the same scope and therefore
-    /// inherit the same Chrome window (REQ-BROWSER-WS-001), while Direct
-    /// conversations fall back to per-conversation scoping (no shared owner
-    /// exists for them to inherit).
+    /// Session identity starts with `ResourceScopeKey::stable_key()`.
     ///
     /// # Errors
     /// Returns [`BrowserError`] when Chrome cannot be launched for a

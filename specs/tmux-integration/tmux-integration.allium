@@ -875,3 +875,15 @@ deferred TmuxSocketRelocation    -- see: src/tools/tmux/registry.rs
 --     `Result<Arc<RwLock<TmuxServer>>, TmuxError>` matching the existing
 --     `ctx.browser()` and the `ctx.bash_handles()` defined in
 --     specs/bash/.
+
+
+-- Black-box identity helpers used by ordinary tmux lifecycle rules:
+-- attached_work_scope_id(conversation) -> String is the exact persisted
+-- attachment on the selected ordinary execution transcript. It is not selected
+-- from an unordered product ownership set and is not derived from cwd or mode.
+-- socket_path_for_scope(work_scope_id) -> String joins the configured socket
+-- directory with wt-<digest>.sock, digest = first eight SHA-256 bytes of the
+-- opaque scope ID as sixteen lowercase hex digits. Pure and deterministic;
+-- it performs no filesystem discovery, migration, fallback or ownership grant.
+-- Unattached conversation, Coordinator and Global terminal routing are outside
+-- these ordinary identity helpers and retain their separate scope contracts.
