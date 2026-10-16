@@ -71,12 +71,11 @@ external entity TmuxBinary {
         -- equivalent; cached on the registry.
 }
 
--- The Unix-domain socket the tmux server binds. Filesystem path is
--- keyed to the worktree path for Work/Branch/top-level-Explore conversations
--- (~/.phoenix-ide/tmux-sockets/wt-{hash}.sock, task 03001) and to
--- conversation_id for Direct mode (conv-<id>.sock). Phoenix's role is
--- creating the directory, unlinking stale files on detection, and deleting
--- the file on conversation hard-delete.
+-- The Unix-domain socket the tmux server binds. Ordinary socket identity
+-- hashes the persisted WorkScope ID (wt-<digest>.sock), not a worktree path
+-- or transcript ID. Unattached conversation fallback, Coordinator and Global
+-- terminal identities are separate. File removal requires the owning cleanup
+-- authority; a single continued transcript does not own the shared socket.
 external entity TmuxSocketFile {
     path: String
 }
