@@ -387,6 +387,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::prelude::*;
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("collector-metadata-contract"));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let parent = tracing::info_span!(target: "phoenix_ide::otel", "browser.conversation_view", "open.id" = "test-open", "view.outcome" = "incomplete");
+            let entered = parent.enter();
+            let child = tracing::info_span!(target: "phoenix_ide::otel", "browser.view_correlation", "open.id" = "test-open", "correlation.kind" = "request", "correlation.id" = "test-request");
+            drop(child.enter());
+            drop(child);
+            drop(entered);
+            drop(parent);
+        });
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 2);
+        let strings = [
+            "code.file.path",
+            "code.module.name",
+            "thread.name",
+            "target",
+        ];
+        let integers = ["code.line.number", "thread.id", "busy_ns", "idle_ns"];
+        for span in &spans {
+            for key in [
+                "code.file.path",
+                "code.module.name",
+                "code.line.number",
+                "thread.id",
+                "target",
+                "busy_ns",
+                "idle_ns",
+            ] {
+                assert!(
+                    span.attributes
+                        .iter()
+                        .any(|attribute| attribute.key.as_str() == key),
+                    "missing default metadata {key}"
+                );
+            }
+            for attribute in &span.attributes {
+                if strings.contains(&attribute.key.as_str()) {
+                    assert!(matches!(attribute.value, opentelemetry::Value::String(_)));
+                } else if integers.contains(&attribute.key.as_str()) {
+                    assert!(
+                        matches!(attribute.value, opentelemetry::Value::I64(value) if value >= 0)
+                    );
+                } else {
+                    assert!(
+                        [
+                            "open.id",
+                            "view.outcome",
+                            "correlation.kind",
+                            "correlation.id"
+                        ]
+                        .contains(&attribute.key.as_str()),
+                        "unexpected pinned layer field"
+                    );
+                }
+            }
+            assert!(!span
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key.as_str() == "level"));
+            assert!(span
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key.as_str() == "open.id"));
+        }
+        let view = spans
+            .iter()
+            .find(|span| span.name == "browser.conversation_view")
+            .unwrap();
+        let child = spans
+            .iter()
+            .find(|span| span.name == "browser.view_correlation")
+            .unwrap();
+        assert_eq!(child.parent_span_id, view.span_context.span_id());
+        assert_eq!(child.span_context.trace_id(), view.span_context.trace_id());
+    }
+
     fn payload() -> serde_json::Value {
         serde_json::json!({
             "open_id": uuid::Uuid::new_v4(), "product_conversation_id": null, "segment_id": null,
