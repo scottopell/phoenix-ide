@@ -1881,3 +1881,39 @@ boolean or zero-test capacity/privacy attestations. Actual cached offline checks
 passed: Python 16 and 67; Node 14, 35 and 65. Production Rust execution and byte
 receipts are still owed to the hosted successor. No new native capture, install,
 Cargo compilation, listener or large artifact copy ran locally.
+
+
+## Production-capacity execution exposed unsigned counter stringification
+
+Run `38914624547`, exact harness `0212fad79dd5c8b5cb98d16462fb37836a20b0da` /
+app `78f5a75e470c02fd967c160aaa5527820f5c28d8`, is fully terminal failure.
+Witness `117018808475` failed; Rust `117018938843` and all other standard jobs
+succeeded. The new real-collector capacity test actually compiled and executed
+one test; it failed after printing these pre-correction fixture measurements:
+
+| Capacity | Retained attributes | Dropped attributes | OTLP Span bytes | Semantic KeyValue bytes | SDK KeyValue bytes |
+|---|---:|---:|---:|---:|---:|
+| 32 | 32 | 20 | 1,497 | 1,051 | 295 |
+| 52 | 52 | 0 | 2,272 | 1,758 | 325 |
+
+It then rejected `browser.admitted_count` with `wrong type`. Pinned tracing-core
+records `u32` through `record_u64`; pinned tracing-opentelemetry's span visitor
+has no unsigned override, so the default debug path yields strings. This is a
+real producer type loss, not justification to weaken the all-typed-field test.
+The capacity/drop observations are valid failed-run facts, not a passing schema
+receipt or corrected measurements. Original eleven guards, separate collector
+and default-SDK tests passed. The capacity guard failed first, so logging guard
+executions, full UI and native/browser qualification were not reached in this
+witness. Artifact `12051334489` remains remote (88,689,483 bytes); selected unit
+logs/receipt required 53,454 ZIP range bytes. No unchanged rerun was dispatched.
+
+Immutable reviewed correction `ae127d11f2b7dcf5ce9e9ee861f4ef47cb1ff1b1` integrates
+as app `c466cfb40c6b3ff1428c7611b48d48f005bb7bc9`, tree
+`e3f4d726df1d31e6f68e386945fe69e052920b38`. All eight validated `u32` counter
+emissions use lossless `i64::from` and the real collector test additionally
+requires all eight to be `I64(10000)`. Report input/validation, 44-field schema,
+52 capacity, metadata projection, privacy/event/link/receiver budgets and normal
+drain/export gates are unchanged. Four telemetry module hashes are unchanged.
+Offline Python 16/67 and Node 14/35/65 passed at the new pin. Corrected actual
+protobuf metrics, three exact capacity/privacy guards, native joint inventory,
+normal drain, outer Global history and overhead acceptance remain hosted gates.
