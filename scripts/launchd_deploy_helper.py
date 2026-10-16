@@ -671,10 +671,13 @@ def validate_current_schema_database(
     validate_database(path)
     registry = migration_registry(registry_path)
     ledger = database_ledger(path)
-    expected_version = registry[-1][0] if migrated else CURRENT_SCHEMA_BASELINE_VERSION
-    expected = tuple(item for item in registry if item[0] <= expected_version)
-    if not ledger or ledger != expected or ledger[-1][0] != expected_version:
-        qualification = "candidate target" if migrated else "supported current baseline"
+    target = tuple(registry)
+    baseline = tuple(
+        item for item in registry if item[0] <= CURRENT_SCHEMA_BASELINE_VERSION
+    )
+    admitted = (target,) if migrated else (baseline, target)
+    if not ledger or ledger not in admitted:
+        qualification = "candidate target" if migrated else "qualified source"
         raise ActivationError(
             f"current-schema migration ledger differs from {qualification}"
         )
@@ -1838,11 +1841,9 @@ def _snapshot_proof(manifest: Manifest) -> dict:
         "database_mode": "current_schema" if manifest.current_schema_upgrade is not None else "legacy_paired",
     }
     if manifest.current_schema_upgrade is not None:
-        registry = migration_registry(_current_schema_registry(manifest))
+        registry_path = _current_schema_registry(manifest)
+        registry = migration_registry(registry_path)
         expected["migration_registry_sha256"] = manifest.current_schema_upgrade.migration_registry_sha256
-        expected["source_ledger"] = [
-            list(item) for item in registry if item[0] <= CURRENT_SCHEMA_BASELINE_VERSION
-        ]
         expected["target_ledger"] = [list(item) for item in registry]
     if not isinstance(proof, dict) or any(proof.get(key) != value for key, value in expected.items()):
         raise ActivationError("database snapshot proof context mismatch")
@@ -1851,7 +1852,9 @@ def _snapshot_proof(manifest: Manifest) -> dict:
     if sha256(backup) != proof.get("sha256"):
         raise ActivationError("database backup checksum mismatch")
     if manifest.current_schema_upgrade is not None:
-        validate_current_schema_database(backup, _current_schema_registry(manifest))
+        source_ledger = validate_current_schema_database(backup, registry_path)
+        if proof.get("source_ledger") != [list(item) for item in source_ledger]:
+            raise ActivationError("database snapshot proof context mismatch")
         if database_logical_digest(backup) != proof.get("source_logical_digest"):
             raise ActivationError("database backup contents differ from snapshot proof")
     return proof

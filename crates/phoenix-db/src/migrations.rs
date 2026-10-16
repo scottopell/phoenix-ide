@@ -14272,6 +14272,7 @@ module.validate_current_schema_database(
         db.pool().close().await;
         drop(db);
 
+        validate_current_schema_with_controller(&path, false);
         validate_current_schema_with_controller(&path, true);
     }
 
