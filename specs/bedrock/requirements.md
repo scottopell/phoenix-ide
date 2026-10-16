@@ -1260,9 +1260,11 @@ ceremony or a separate auto-stash feature. Keeping the same attached `WorkScope`
 and filesystem path across continuation, rather than destroying and recreating,
 is the only shape that preserves uncommitted work structurally without a separate
 auto-stash mechanism. Single-continuation policy keeps execution topology
-unambiguous: at any moment, continuation identifies the latest execution row for
-one product conversation while that conversation keeps one attached `WorkScope`
-and therefore one inherited worktree.
+unambiguous: continuation identifies the latest execution row for one product
+conversation. The selected row inherits its parent's exact attached WorkScope
+and environment. The product's historical ownership set may contain other
+scopes; those are neither substituted for the selected attachment nor coalesced
+by cwd, and aggregate retirement accounts for every historically owned scope.
 
 **Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 

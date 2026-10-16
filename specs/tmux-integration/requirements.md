@@ -267,8 +267,9 @@ contracts for the matching API and orchestrator requirements.
 ### REQ-TMUX-009: Tool Description Communicates Two-Tier Persistence Model
 
 THE `tmux` tool's description SHALL state explicitly:
-- The tool runs against a per-conversation tmux server with kernel-level
-  isolation from other conversations.
+- The tool runs against the selected persisted WorkScope's tmux server.
+  Continuation transcripts retaining that scope share the server; distinct
+  persisted scopes and host tmux servers remain isolated.
 - Processes started inside this tmux server survive Phoenix process
   restarts (but not system reboots).
 - The full tmux CLI is available; common subcommands include

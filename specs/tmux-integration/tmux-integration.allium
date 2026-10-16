@@ -3,7 +3,7 @@
 --
 -- Tmux Integration: Behavioural Specification
 --
--- Scope: per-conversation tmux server lifecycle, the `tmux` and `tmux_run`
+-- Scope: persisted-WorkScope tmux server lifecycle, the `tmux` and `tmux_run`
 -- agent tools, and the in-app terminal's tmux-attach behaviour when the
 -- binary is available.
 --
@@ -753,9 +753,9 @@ surface AgentTmuxAccess {
             and (readiness_mode = return_immediately or readiness_mode = wait_for_text)
 
     @guarantee SocketIsolation
-        -- The agent's tmux invocations cannot reach another conversation's
-        -- tmux server, the user's host tmux server, or any other tmux
-        -- instance not owned by Phoenix. Mechanism: `-S <conv-sock>` is
+        -- Ordinary continuation transcripts retaining a scope share its server.
+        -- The selected scope cannot reach another scope's tmux server or the
+        -- user's host tmux server. Mechanism: `-S <scope-sock>` is
         -- prepended by Phoenix and the kernel-level Unix-socket boundary
         -- prevents reaching foreign tmux servers regardless of the agent's
         -- arguments. An agent's stray `-L` or `-S` triggers a tmux usage
