@@ -74,6 +74,12 @@ struct SnapshotStorage {
     refs: Option<SnapshotReferences>,
 }
 
+pub struct SnapshotCheckpoint {
+    owner: std::sync::Weak<StdMutex<SnapshotStorage>>,
+    generation: u64,
+    document: BackendNodeId,
+}
+
 impl SnapshotStorage {
     fn invalidate(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
@@ -365,6 +371,42 @@ impl BrowserSession {
         Ok(output)
     }
 
+    #[must_use]
+    pub fn snapshot_checkpoint(&self) -> Option<SnapshotCheckpoint> {
+        let storage = self.snapshot.lock();
+        Some(SnapshotCheckpoint {
+            owner: Arc::downgrade(&self.snapshot.current),
+            generation: storage.generation,
+            document: storage.refs.as_ref()?.document,
+        })
+    }
+
+    /// # Errors
+    /// Returns a CDP error or a stale-snapshot error after document or reference replacement.
+    pub async fn validate_snapshot_checkpoint(
+        &self,
+        checkpoint: &SnapshotCheckpoint,
+    ) -> Result<(), BrowserError> {
+        if !checkpoint
+            .owner
+            .ptr_eq(&Arc::downgrade(&self.snapshot.current))
+        {
+            return Err(error(STALE));
+        }
+        let document = self.page.get_document().await?.backend_node_id;
+        let mut storage = self.snapshot.lock();
+        if document != checkpoint.document && storage.generation == checkpoint.generation {
+            storage.invalidate();
+        }
+        if document != checkpoint.document
+            || storage.generation != checkpoint.generation
+            || storage.refs.is_none()
+        {
+            return Err(error(STALE));
+        }
+        Ok(())
+    }
+
     pub fn invalidate_snapshot(&mut self) {
         self.snapshot.invalidate();
     }
@@ -436,6 +478,10 @@ impl BrowserSession {
         Ok(())
     }
 
+    pub async fn lock_native_input(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.reference_input_lock.clone().lock_owned().await
+    }
+
     /// # Errors
     /// Returns an error for stale or unfocused targets, unsupported clearing, or failed CDP input.
     pub async fn type_reference(
@@ -452,7 +498,7 @@ impl BrowserSession {
         let object = self.reference_object(reference).await?;
         let mut input_guard =
             click_object(&self.page, &object.id, &self.reference_input_lock).await?;
-        async {
+        let result = async {
             call(&self.page, &object.id, &format!("function() {{ globalThis.__phoenixReferenceInputGuard.beginTyping({}); return true; }}", quoted(&input_guard.token))).await?;
             call(&self.page, &object.id, include_str!("snapshot/focused.js")).await?;
             if clear {
@@ -466,7 +512,11 @@ impl BrowserSession {
                 press(&self.page, &key).await?;
             }
             input_guard.finish_typing().await
-        }.await
+        }.await;
+        if result.is_err() {
+            input_guard.disarm().await;
+        }
+        result
     }
 }
 
@@ -514,63 +564,72 @@ async fn click_object(
 ) -> Result<ReferenceInputGuard, BrowserError> {
     let lease = input_lock.clone().lock_owned().await;
     let mut input_guard = ReferenceInputGuard::new(page, lease);
-    let mut receipts = page.event_listener::<EventBindingCalled>().await?;
-    call(page, object, "function() { if (!this.isConnected || this.ownerDocument !== document) throw Error('stale ref'); this.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); return true; }").await?;
-    let point = call(page, object, include_str!("snapshot/click.js")).await?;
-    let x = point["x"]
-        .as_f64()
-        .ok_or_else(|| error("Missing reference click coordinates"))?;
-    let y = point["y"]
-        .as_f64()
-        .ok_or_else(|| error("Missing reference click coordinates"))?;
-    page.move_mouse(Point::new(x, y)).await?;
-    let hovered = call(page, object, include_str!("snapshot/click.js")).await?;
-    let stable = hovered["x"]
-        .as_f64()
-        .is_some_and(|next| (next - x).abs() < 0.5)
-        && hovered["y"]
+    let result = async {
+        let mut receipts = page.event_listener::<EventBindingCalled>().await?;
+        call(page, object, "function() { if (!this.isConnected || this.ownerDocument !== document) throw Error('stale ref'); this.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); return true; }").await?;
+        let point = call(page, object, include_str!("snapshot/click.js")).await?;
+        let x = point["x"]
             .as_f64()
-            .is_some_and(|next| (next - y).abs() < 0.5);
-    if !stable {
-        return Err(error(
-            "Referenced element moved during hover; call browser_snapshot again",
-        ));
-    }
-    input_guard.active = true;
-    call(
-        page,
-        object,
-        &format!(
-            "function() {{ globalThis.__phoenixReferenceInputGuard.arm(this, {}); return true; }}",
-            quoted(&input_guard.token)
-        ),
-    )
-    .await?;
-    for event in [
-        DispatchMouseEventType::MousePressed,
-        DispatchMouseEventType::MouseReleased,
-    ] {
-        let mut params = DispatchMouseEventParams::new(event, x, y);
-        params.button = Some(MouseButton::Left);
-        params.click_count = Some(1);
-        page.execute(params).await?;
-    }
-    while let Some(receipt) = receipts.next().await {
-        if receipt.name != INPUT_RECEIPT_BINDING {
-            continue;
+            .ok_or_else(|| error("Missing reference click coordinates"))?;
+        let y = point["y"]
+            .as_f64()
+            .ok_or_else(|| error("Missing reference click coordinates"))?;
+        page.move_mouse(Point::new(x, y)).await?;
+        let hovered = call(page, object, include_str!("snapshot/click.js")).await?;
+        let stable = hovered["x"]
+            .as_f64()
+            .is_some_and(|next| (next - x).abs() < 0.5)
+            && hovered["y"]
+                .as_f64()
+                .is_some_and(|next| (next - y).abs() < 0.5);
+        if !stable {
+            return Err(error(
+                "Referenced element moved during hover; call browser_snapshot again",
+            ));
         }
-        let payload: Value =
-            serde_json::from_str(&receipt.payload).map_err(|failure| error(failure.to_string()))?;
-        if payload["token"] != input_guard.token {
-            continue;
+        input_guard.active = true;
+        call(
+            page,
+            object,
+            &format!(
+                "function() {{ globalThis.__phoenixReferenceInputGuard.arm(this, {}); return true; }}",
+                quoted(&input_guard.token)
+            ),
+        )
+        .await?;
+        for event in [
+            DispatchMouseEventType::MousePressed,
+            DispatchMouseEventType::MouseReleased,
+        ] {
+            let mut params = DispatchMouseEventParams::new(event, x, y);
+            params.button = Some(MouseButton::Left);
+            params.click_count = Some(1);
+            page.execute(params).await?;
         }
-        match payload["outcome"].as_str() {
-            Some("clicked") => return Ok(input_guard),
-            Some("rejected") => return Err(error("Reference input rejected at dispatch because the target changed; earlier input events may have occurred. Inspect the page and call browser_snapshot again")),
-            _ => return Err(error("Unrecognized reference input receipt")),
+        while let Some(receipt) = receipts.next().await {
+            if receipt.name != INPUT_RECEIPT_BINDING {
+                continue;
+            }
+            let payload: Value =
+                serde_json::from_str(&receipt.payload).map_err(|failure| error(failure.to_string()))?;
+            if payload["token"] != input_guard.token {
+                continue;
+            }
+            match payload["outcome"].as_str() {
+                Some("clicked") => return Ok(()),
+                Some("rejected") => return Err(error("Reference input rejected at dispatch because the target changed; earlier input events may have occurred. Inspect the page and call browser_snapshot again")),
+                _ => return Err(error("Unrecognized reference input receipt")),
+            }
+        }
+        Err(error("Reference input receipt unavailable; the action may have occurred. Inspect the page before retrying"))
+    }.await;
+    match result {
+        Ok(()) => Ok(input_guard),
+        Err(failure) => {
+            input_guard.disarm().await;
+            Err(failure)
         }
     }
-    Err(error("Reference input receipt unavailable; the action may have occurred. Inspect the page before retrying"))
 }
 
 struct ReferenceInputGuard {
@@ -591,17 +650,19 @@ impl ReferenceInputGuard {
     }
 
     async fn disarm(&mut self) {
-        if let Err(failure) = self
-            .page
-            .evaluate(format!(
-                "globalThis.__phoenixReferenceInputGuard?.cancel({})",
-                quoted(&self.token)
-            ))
-            .await
-        {
-            tracing::debug!(%failure, "reference input context unavailable during cleanup");
+        if self.active {
+            if let Err(failure) = self
+                .page
+                .evaluate(format!(
+                    "globalThis.__phoenixReferenceInputGuard?.cancel({})",
+                    quoted(&self.token)
+                ))
+                .await
+            {
+                tracing::debug!(%failure, "reference input context unavailable during cleanup");
+            }
+            self.active = false;
         }
-        self.active = false;
         self.lease.take();
     }
 
@@ -847,13 +908,21 @@ mod tests {
             guard.active = true;
             call(&session.page, &object.id, &format!("function() {{ globalThis.__phoenixReferenceInputGuard.arm(this, {}); return true; }}", quoted(&guard.token))).await.unwrap();
             drop(guard);
-            tokio::time::timeout(
+            let _input = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                session.click_reference(&reference),
+                session.lock_native_input(),
             )
             .await
-            .expect("next operation waits for cancellation cleanup")
-            .unwrap();
+            .expect("selector and key input wait for cancellation cleanup");
+            session
+                .page
+                .find_element("button")
+                .await
+                .unwrap()
+                .click()
+                .await
+                .unwrap();
+            press(&session.page, "Enter").await.unwrap();
             assert_eq!(
                 session
                     .page
@@ -862,7 +931,7 @@ mod tests {
                     .unwrap()
                     .into_value::<u64>()
                     .unwrap(),
-                1
+                2
             );
         }
         manager.shutdown_all().await.expect("browser shutdown");
@@ -909,6 +978,7 @@ mod tests {
                 .next()
                 .unwrap();
             assert!(session.type_reference(reference, "x", false).await.is_err());
+            assert!(session.reference_input_lock.try_lock().is_ok());
             assert_eq!(
                 session
                     .page
@@ -1045,6 +1115,10 @@ mod tests {
                     session.click_reference(reference),
                 )
                 .await;
+                assert!(
+                    session.reference_input_lock.try_lock().is_ok(),
+                    "{mode}: rejected reference returned before cleanup released native input"
+                );
                 let wrong = session
                     .page
                     .evaluate("window.wrong")

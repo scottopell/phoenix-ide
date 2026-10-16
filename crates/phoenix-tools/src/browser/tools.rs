@@ -999,6 +999,7 @@ impl BrowserClickTool {
             }
         };
 
+        let _input = guard.lock_native_input().await;
         // Optionally wait for element
         if input.wait {
             let check_script = format!(
@@ -1196,6 +1197,7 @@ impl BrowserTypeTool {
                 };
             }
         };
+        let _input = guard.lock_native_input().await;
         type_selector(&guard.page, selector, &input.text, input.clear, timeout).await
     }
 }
@@ -1479,6 +1481,7 @@ impl BrowserKeyPressTool {
         };
         let guard = session.read().await;
 
+        let _input = guard.lock_native_input().await;
         let chord = if input.modifiers.is_empty() {
             input.key.clone()
         } else {

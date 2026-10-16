@@ -2848,6 +2848,41 @@ async fn assert_stale_click(ctx: &ToolContext, reference: &str) {
 }
 
 #[tokio::test]
+async fn rejected_reference_leaves_selector_and_key_input_available() {
+    require_chrome!();
+    let (ctx, manager) = test_context("rejected-ref-next-input");
+    let html = "<button id=original>Reject me</button><button id=other>Other</button><button id=recovery onclick=window.recovered++>Recover</button><input id=text><script>window.recovered=0; original.onpointerdown=e=>other.setPointerCapture(e.pointerId)</script>";
+    let opened = BrowserNavigateTool
+        .run(json!({"url":format!("data:text/html,{html}")}), ctx.clone())
+        .await;
+    assert!(opened.is_success(), "{}", opened.output());
+    let snapshot = snapshot_text(&ctx, true).await;
+    let reference = snapshot_refs(&snapshot, "button \"Reject me\"")[0].clone();
+    let rejected = BrowserClickTool
+        .run(json!({"ref":reference}), ctx.clone())
+        .await;
+    assert!(!rejected.is_success(), "retargeted ref click succeeded");
+    let clicked = BrowserClickTool
+        .run(json!({"selector":"#recovery"}), ctx.clone())
+        .await;
+    assert!(clicked.is_success(), "{}", clicked.output());
+    let typed = BrowserTypeTool
+        .run(json!({"selector":"#text","text":"s"}), ctx.clone())
+        .await;
+    assert!(typed.is_success(), "{}", typed.output());
+    let keyed = BrowserKeyPressTool
+        .run(json!({"key":"x"}), ctx.clone())
+        .await;
+    assert!(keyed.is_success(), "{}", keyed.output());
+    assert_browser_expression(
+        &ctx,
+        "window.recovered===1 && document.getElementById('text').value==='sx'",
+    )
+    .await;
+    manager.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn browser_interactions_reject_ambiguous_or_missing_targets_without_chrome() {
     // REQ-BT-008, REQ-BT-009: invalid target combinations fail before browser acquisition.
     let (ctx, manager) = test_context("snapshot-invalid-targets");
