@@ -170,6 +170,30 @@ fn take_artifacts(value: &mut Value, paths: &mut Vec<String>) {
     }
 }
 
+async fn externalize_saved_samples(data: &mut Value) -> Result<(), String> {
+    let Some(object) = data.as_object_mut() else {
+        return Ok(());
+    };
+    let (Some(path), Some(samples)) = (
+        object.get("samples_path").and_then(Value::as_str),
+        object.get("raw_samples"),
+    ) else {
+        return Ok(());
+    };
+    let saved = tokio::fs::read(path)
+        .await
+        .map_err(|error| format!("Read saved scenario samples {path}: {error}"))?;
+    let saved: Value = serde_json::from_slice(&saved)
+        .map_err(|error| format!("Decode saved scenario samples {path}: {error}"))?;
+    if saved.get("raw_samples") != Some(samples) {
+        return Err(format!(
+            "Saved scenario samples {path} do not match the complete result"
+        ));
+    }
+    object.remove("raw_samples");
+    Ok(())
+}
+
 struct CliImageArtifact(std::path::PathBuf);
 
 struct PendingImageArtifact(Option<std::path::PathBuf>);
@@ -245,9 +269,13 @@ async fn adapt(
 ) -> Response {
     let mut artifacts = Vec::new();
     let mut data = output.display_data().cloned();
-    if let Some(data) = &mut data {
+    let samples_error = if let Some(data) = &mut data {
+        let error = externalize_saved_samples(data).await.err();
         take_artifacts(data, &mut artifacts);
-    }
+        error
+    } else {
+        None
+    };
     for image in output.images() {
         let artifact = match CliImageArtifact::from_image(image, &artifacts, image_directory).await
         {
@@ -272,6 +300,19 @@ async fn adapt(
         if !artifacts.contains(&path) {
             artifacts.push(path);
         }
+    }
+    if let Some(error) = samples_error {
+        let mut response = Response::error(
+            session,
+            lifetime,
+            ErrorCode::OperationFailed,
+            format!("Browser operation completed but its saved samples could not be verified: {error}. Do not replay the operation automatically."),
+        );
+        if let Outcome::Error { error } = &mut response.outcome {
+            error.details = Some(json!({"tool_text": output.output(), "data": data}));
+            error.artifacts = artifacts;
+        }
+        return response;
     }
     if output.is_success() {
         Response::success(
@@ -600,12 +641,68 @@ struct Job {
     stream: UnixStream,
 }
 
+fn collect_artifacts(value: &Value, artifacts: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if key == "artifacts" {
+                    if let Some(paths) = value.as_array() {
+                        for path in paths.iter().filter_map(Value::as_str) {
+                            if !artifacts.iter().any(|existing| existing == path) {
+                                artifacts.push(path.to_owned());
+                            }
+                        }
+                    }
+                } else {
+                    collect_artifacts(value, artifacts);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_artifacts(value, artifacts);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
 async fn send_response(stream: &mut UnixStream, response: &Response) {
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        protocol::write_message(stream, response),
-    )
-    .await;
+    let encoded = match protocol::encode_message(response) {
+        Ok(encoded) => encoded,
+        Err(reason) => {
+            eprintln!("browser CLI response could not be encoded: {reason}");
+            let mut fallback = Response::error(
+                &response.session,
+                response.lifetime.as_deref(),
+                ErrorCode::OperationFailed,
+                format!("Browser operation produced a response that could not be delivered: {reason}. Browser-side effects may have completed. Do not replay the operation automatically; inspect any returned artifacts."),
+            ).with_browser_lifetime(response.browser_lifetime.clone());
+            if let Outcome::Error { error } = &mut fallback.outcome {
+                match &response.outcome {
+                    Outcome::Success { result } => collect_artifacts(result, &mut error.artifacts),
+                    Outcome::Error { error: original } => {
+                        error.artifacts.clone_from(&original.artifacts);
+                        if let Some(details) = &original.details {
+                            collect_artifacts(details, &mut error.artifacts);
+                        }
+                    }
+                }
+            }
+            match protocol::encode_message(&fallback) {
+                Ok(encoded) => encoded,
+                Err(reason) => {
+                    eprintln!("browser CLI error response could not be encoded: {reason}");
+                    return;
+                }
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(10), encoded.write_to(stream)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("browser CLI response write failed: {error}"),
+        Err(error) => eprintln!("browser CLI response write timed out: {error}"),
+    }
 }
 
 fn cancelled(state: &State, browser_lifetime: Option<String>) -> Response {
@@ -1040,6 +1137,133 @@ mod tests {
         for mut peer in peers {
             assert_eq!(peer.read(&mut [0_u8; 1]).await.unwrap(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_samples_use_complete_saved_artifact_and_retain_methodology() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved_path = directory.path().join("samples.json");
+        let raw = json!([{"run_index": 0, "trace": "x".repeat(protocol::MAX_MESSAGE as usize)}]);
+        let mut payload = json!({
+            "outcome": "completed", "requested_runs": 1, "warmup": 2,
+            "raw_samples": raw,
+            "methodology_warnings": ["no throttle"],
+        });
+        std::fs::write(&saved_path, serde_json::to_vec(&payload).unwrap()).unwrap();
+        payload["samples_path"] = json!(saved_path);
+        let output =
+            ToolOutput::success("run_scenario completed; full samples saved").with_display(payload);
+        let response = adapt("named:test", Some("daemon"), &output, directory.path())
+            .await
+            .with_browser_lifetime(Some("browser".into()));
+        protocol::encode_message(&response).expect("response fits the wire budget");
+        let Outcome::Success { result } = response.outcome else {
+            panic!("saved raw samples should be delivered successfully");
+        };
+        assert!(result["data"].get("raw_samples").is_none());
+        assert_eq!(result["data"]["requested_runs"], 1);
+        assert_eq!(result["data"]["warmup"], 2);
+        assert_eq!(
+            result["data"]["methodology_warnings"],
+            json!(["no throttle"])
+        );
+        assert_eq!(result["artifacts"], json!([saved_path]));
+        let saved: Value = serde_json::from_slice(&std::fs::read(saved_path).unwrap()).unwrap();
+        assert_eq!(saved["raw_samples"], raw);
+    }
+
+    #[tokio::test]
+    async fn saved_sample_mismatch_is_explicit_and_does_not_discard_samples() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved_path = directory.path().join("samples.json");
+        std::fs::write(&saved_path, br#"{"raw_samples":[]}"#).unwrap();
+        let raw = json!([{"run_index": 0, "script_ms": 1}]);
+        let output = ToolOutput::success("experiment completed").with_display(json!({
+            "samples_path": saved_path, "raw_samples": raw,
+            "methodology_warnings": ["no throttle"],
+        }));
+        let response = adapt("named:test", None, &output, directory.path()).await;
+        let Outcome::Error { error } = response.outcome else {
+            panic!("mismatched samples reported successful");
+        };
+        assert!(error.message.contains("do not match"));
+        assert_eq!(
+            error.artifacts,
+            vec![saved_path.to_string_lossy().into_owned()]
+        );
+        assert_eq!(error.details.unwrap()["data"]["raw_samples"], raw);
+    }
+
+    #[tokio::test]
+    async fn oversized_response_returns_explicit_failure_with_identity_and_artifacts() {
+        for successful in [true, false] {
+            let huge = "x".repeat(protocol::MAX_MESSAGE as usize);
+            let mut response = if successful {
+                Response::success(
+                    "named:test",
+                    Some("daemon"),
+                    json!({
+                        "text": huge, "artifacts": ["/saved-result"],
+                    }),
+                )
+            } else {
+                let mut response = Response::error(
+                    "named:test",
+                    Some("daemon"),
+                    ErrorCode::OperationFailed,
+                    huge,
+                );
+                if let Outcome::Error { error } = &mut response.outcome {
+                    error.artifacts.push("/saved-result".into());
+                }
+                response
+            };
+            response.browser_lifetime = Some("browser".into());
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let ((), delivered) = tokio::join!(
+                send_response(&mut server, &response),
+                protocol::read_message::<Response>(&mut client)
+            );
+            let delivered = delivered.unwrap();
+            assert_eq!(delivered.session, "named:test");
+            assert_eq!(delivered.lifetime.as_deref(), Some("daemon"));
+            assert_eq!(delivered.browser_lifetime.as_deref(), Some("browser"));
+            let Outcome::Error { error } = delivered.outcome else {
+                panic!("oversized result unexpectedly succeeded");
+            };
+            assert_eq!(error.code, ErrorCode::OperationFailed);
+            assert!(error.message.contains("Do not replay"));
+            assert_eq!(error.artifacts, ["/saved-result"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_open_response_retains_nested_snapshot_artifact() {
+        let response = Response::success(
+            "named:test",
+            Some("daemon"),
+            json!({
+                "url": "http://localhost/", "title": "Page",
+                "console_errors": ["x".repeat(protocol::MAX_MESSAGE as usize)],
+                "snapshot": {
+                    "status": "success",
+                    "result": {"text": "snapshot", "artifacts": ["/saved-snapshot"]},
+                },
+            }),
+        )
+        .with_browser_lifetime(Some("browser".into()));
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let ((), delivered) = tokio::join!(
+            send_response(&mut server, &response),
+            protocol::read_message::<Response>(&mut client)
+        );
+        let delivered = delivered.unwrap();
+        let Outcome::Error { error } = delivered.outcome else {
+            panic!("oversized open response unexpectedly succeeded");
+        };
+        assert_eq!(error.code, ErrorCode::OperationFailed);
+        assert_eq!(error.artifacts, ["/saved-snapshot"]);
+        assert!(error.message.contains("Do not replay"));
     }
 
     fn image(bytes: &[u8]) -> ToolImage {

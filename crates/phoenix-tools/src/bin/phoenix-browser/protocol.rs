@@ -143,6 +143,7 @@ pub fn encode_message(message: &impl Serialize) -> Result<EncodedMessage, String
     Ok(EncodedMessage(bytes))
 }
 
+#[cfg(test)]
 pub async fn write_message(
     stream: &mut (impl AsyncWrite + Unpin),
     message: &impl Serialize,
