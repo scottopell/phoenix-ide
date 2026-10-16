@@ -95,3 +95,42 @@ test('stalled binding times out, preserves bounded failure and cannot admit a pa
     assert.equal(pages, 0); assert.equal(closed, 1);
   } finally { vi.useRealTimers(); }
 });
+
+test.each(['enable', 'destination'])('late %s completion after deadline cannot start another operation', async mode => {
+  vi.useFakeTimers();
+  let release; let emulations = 0; let waits = 0; let closed = 0; let gotos = 0;
+  const stalled = new Promise(resolve => { release = resolve; });
+  const context = { on: () => {}, exposeBinding: async () => {}, close: async () => { closed++; },
+    newPage: async () => ({ on: () => {}, waitForFunction: async () => {}, goto: async () => { if (++gotos === 2 && mode === 'destination') await stalled; } }),
+    newCDPSession: async () => ({ on: () => {}, send: async name => {
+      if (name === 'Network.enable' && mode === 'enable') await stalled;
+      if (name === 'Network.emulateNetworkConditions') emulations++;
+    } }) };
+  try {
+    const operation = runProbeCell({ newContext: async () => context }, 'http://127.0.0.1:1234', probeMatrix[0], new Map(), { wait: async () => { waits++; } });
+    await vi.advanceTimersByTimeAsync(10000);
+    const result = await operation;
+    assert.equal(result.failure, 'probe cell operation failed'); assert.equal(closed, 1);
+    release(); await vi.advanceTimersByTimeAsync(0);
+    assert.equal(emulations, mode === 'enable' ? 0 : 1); assert.equal(waits, 0);
+  } finally { vi.useRealTimers(); }
+});
+
+test.each(['stalled', 'rejected'])('late context cleanup %s is bounded and cannot rewrite pending receipt as clean', async mode => {
+  vi.useFakeTimers();
+  let created; let closes = 0; let pages = 0;
+  const creation = new Promise(resolve => { created = resolve; });
+  try {
+    const operation = runProbeCell({ newContext: () => creation }, 'http://127.0.0.1:1234', probeMatrix[0], new Map());
+    await vi.advanceTimersByTimeAsync(10000);
+    const result = await operation;
+    assert.equal(result.failure, 'probe cell operation failed');
+    assert.equal(result.context_cleanup, 'pending_or_unknown');
+    const snapshot = JSON.stringify(result);
+    created({ close: async () => { closes++; if (mode === 'rejected') throw new Error('PRIVATE'); await new Promise(() => {}); }, newPage: async () => { pages++; } });
+    await vi.advanceTimersByTimeAsync(2000);
+    assert.equal(closes, 1); assert.equal(pages, 0);
+    assert.equal(JSON.stringify(result), snapshot);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally { vi.useRealTimers(); }
+});
