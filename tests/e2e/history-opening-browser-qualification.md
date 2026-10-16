@@ -1791,3 +1791,93 @@ listener, install, Cargo build or large artifact copy was performed. Full UI,
 codegen, real default-layer execution and actual joint qualification remain hosted
 obligations. Collector/export inventory, normal app-first/receiver-second drain,
 outer Global physical history and overhead gates are not yet accepted.
+
+
+## Exact efce successor: SDK transport accepted, readiness export truncated
+
+The single reviewed successor run `38909280148` binds harness
+`efce1fa84df13268827dbd892c68477a6b102a4b` and app
+`7a36dd28191a1f32f65f68b037543ab924526189`. It is terminal failure:
+witness `117000716935` failed; Rust `117000846117` and all other standard
+jobs succeeded. Genuine codegen, original eleven instrumentation guards, real
+collector test, full UI gate and the new actual default-layer test passed.
+The latter executed exactly one test, not a zero-test successful process.
+
+The browser completed nine ordinary history checks with `passed_assertions`;
+its cleanup failures are absent. The original history page produced zero sampled
+reports in this run, so the new ownership join was not positively exercised by
+an original-history report. The donor browser inventory contained eight journeys.
+Receiver capture now has no errors: 34 batches, 5,357 spans, 2,549,532 wire bytes
+and eight real `browser.conversation_view` exports. However, every ready view
+lacks `browser.meaningful_transcript_ms`, `browser.breadcrumb_presented_ms`,
+`browser.breadcrumb_enabled_ms` and `browser.anchor_settled_ms`; total duration
+and anchor result are present. `receiver.assert_receipt` correctly fails at
+`validate_view` with `missing ready evidence`. No collector/export delivery
+certificate was sealed. `server-completion.json` says `force_cleanup_required`,
+not normal shutdown. Outer Global and overhead acceptance remain unproved.
+
+Artifact `12049943021` remains remote (89,965,825 bytes). Selected receipts,
+capture and runtime log used 376,921 ZIP range bytes and are retained under
+`.phoenix/evidence/continuous-history/integration7af-source-only/runefce-bounded-facts`
+on this harness. The new default-layer test had used SDK defaults rather than
+Phoenix's production span limit; its pass did not cover production capacity.
+Source investigation found 44 semantic view attributes plus up to eight pinned
+SDK attributes versus production `phoenix_span_limits()` capacity 32. A proposed
+capacity correction must be independently reviewed and exercised through the
+real collector with the actual shared production limits, zero dropped attributes,
+typed complete readiness fields and measured serialized OTLP bytes. Merely
+reordering fields, removing the semantic gate or claiming normal drain would
+conceal rather than fix the loss. No unchanged rerun was dispatched.
+
+
+## Reviewed production capacity correction and mandatory hosted proof
+
+Immutable donor commits `9b0808aa8c6db08f070f5bee0e3fcd5880a7e539` and additive
+fixture correction `e619d5754e8543873de320628b2ed71b20143a73` integrate above
+`7a36dd281` as app `78f5a75e470c02fd967c160aaa5527820f5c28d8`, tree
+`faf6bed6849ace0ea0d6abd0323a887b5b80dc23`. Independent exact-object source
+review approved the corrected packet for hosted compilation/execution, not
+acceptance. The first source review caught invented fixture fields, invalid
+counter values and an absent correlation child; the additive correction uses
+only the actual validated report schema, consistent saturated counters at 10,000
+and one actual typed request correlation. Report validation is unchanged.
+
+ADR-108 and REQ-CVT-007 make the capacity decision explicit. Both production
+exporters use shared `phoenix_span_limits()` with 52 attributes: exactly 44
+semantic view fields plus at most eight pinned default SDK fields. This is a
+provider-wide ceiling, not signal-specific isolation. Original PR #519's 32 was
+a conservative defensive backstop; content-free span allowlisting is the privacy
+boundary. Disabling SDK metadata still leaves 44 fields; reordering or discarding
+fields conceals loss; separate providers or decomposed spans would change
+lifecycle/routing or the schema/join contract. Sixty-four adds unnecessary headroom.
+The 52 decision permits 20 more slots per span (62.5% count capacity), not a
+proven memory/traffic/timing increase. At the SDK's default queue of 2,048 that is
+40,960 potential additional attribute slots, not a byte or process-memory bound.
+Other allowed emitters can retain pre-existing fields formerly truncated: the
+LLM schema can reach 29 semantic fields plus SDK metadata. Direct-turn settlement
+has 14 ordinary declared fields plus special SDK-consumed status metadata and
+still fits 32. Existing error strings are not claimed to have universal size
+bounds. Zero-event capacities, four-link/four-link-attribute limits, exact span
+allowlist, receiver caps and overhead acceptance gates are unchanged.
+
+The hosted selected-libtest stage must run these exact tests individually,
+retaining commands, strict zero exits and exactly-one-pass receipts:
+
+- `api::view_journey::tests::production_attribute_capacity_preserves_complete_ready_collector_schema`
+- `logging::tests::otel_limits_are_conservative_and_event_free`
+- `logging::tests::otel_filter_is_a_spans_only_allowlist`
+
+The first invokes the actual validated collector handler through a real default
+layer (authentication remains covered by the separate collector guard), compares
+old 32 against the actual production limits, and asserts
+all 44 typed semantic values, required readiness fields, zero production drops,
+no events and correlation-child identity/parentage. It prints actual official
+OTLP-protobuf encoded Span and semantic/SDK KeyValue byte measurements. These
+are fixture measurements, not whole-wire or universal byte bounds. The already
+locked proto/prost crates gain direct dev-dependency edges only. Existing real
+collector/default-metadata tests and original eleven guards remain mandatory.
+Shared admission rejects missing, reordered, duplicate, wrong-command, failed,
+boolean or zero-test capacity/privacy attestations. Actual cached offline checks
+passed: Python 16 and 67; Node 14, 35 and 65. Production Rust execution and byte
+receipts are still owed to the hosted successor. No new native capture, install,
+Cargo compilation, listener or large artifact copy ran locally.

@@ -52,6 +52,8 @@ class OpeningQualificationTests(unittest.TestCase):
             "collector_witness_command": [opening.COLLECTOR_TEST, "--exact", "--nocapture", "--test-threads=1"],
             "sdk_metadata_exit": 0, "sdk_metadata_passed": 1,
             "sdk_metadata_command": [opening.SDK_METADATA_TEST, "--exact", "--nocapture", "--test-threads=1"],
+            "production_capacity_tests": [{"command": [test, "--exact", "--nocapture", "--test-threads=1"],
+                "exit": 0, "passed": 1} for test in opening.PRODUCTION_CAPACITY_TESTS],
             "compiler_artifact_selector": ["cargo", "test", "--no-run", "--message-format=json"]}
         self.write()
 
@@ -857,6 +859,28 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("--ignored", source)
         self.assertIn("Fixture(h, base, case)", source)
 
+
+    def test_production_capacity_and_privacy_units_are_mandatory_and_exact(self):
+        original = json.loads(json.dumps(self.value["production_capacity_tests"]))
+        invalid = [None, [], original[:2], original + [original[0]], list(reversed(original))]
+        for index in range(len(original)):
+            for field, values in (("exit", (None, False, 1)), ("passed", (None, False, True, 0, 2)),
+                                  ("command", (None, [opening.PRODUCTION_CAPACITY_TESTS[index]]))):
+                for value in values:
+                    altered = json.loads(json.dumps(original))
+                    altered[index][field] = value
+                    invalid.append(altered)
+            altered = json.loads(json.dumps(original))
+            altered[index]["extra"] = True
+            invalid.append(altered)
+        for value in invalid:
+            self.value["production_capacity_tests"] = value
+            self.write()
+            with self.assertRaisesRegex(ValueError, "production collector capacity and privacy guards"):
+                self.identity()
+        self.value["production_capacity_tests"] = original
+        self.write()
+        self.identity()
 
     def test_sdk_layer_unit_must_run_exactly_once_and_succeed(self):
         for field, values in (("sdk_metadata_exit", (None, False, 1)),

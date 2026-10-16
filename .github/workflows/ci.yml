@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 7a36dd28191a1f32f65f68b037543ab924526189
+          ref: 78f5a75e470c02fd967c160aaa5527820f5c28d8
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -248,8 +248,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 7a36dd28191a1f32f65f68b037543ab924526189
-          test "$(git rev-parse HEAD^{tree})" = 5e908a223e26e3cf8f264c65cd82ed33080d7ccf
+          test "$(git rev-parse HEAD)" = 78f5a75e470c02fd967c160aaa5527820f5c28d8
+          test "$(git rev-parse HEAD^{tree})" = faf6bed6849ace0ea0d6abd0323a887b5b80dc23
           test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -372,6 +372,23 @@ jobs:
                           'sdk_metadata_passed':sdk_passed})
           (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
           assert sdk.returncode == 0 and sdk_passed == 1, 'real default SDK layer regression failed or ran zero tests; see retained log'
+          production_tests = [
+              'api::view_journey::tests::production_attribute_capacity_preserves_complete_ready_collector_schema',
+              'logging::tests::otel_limits_are_conservative_and_event_free',
+              'logging::tests::otel_filter_is_a_spans_only_allowlist',
+          ]
+          receipt['production_capacity_tests'] = []
+          (root.parent/'opening-production-capacity-unit.log').write_text('')
+          for name in production_tests:
+              assert name + ': test' in listed.stdout
+              command = [str(destination), name, '--exact', '--nocapture', '--test-threads=1']
+              outcome = subprocess.run(command, capture_output=True, text=True, timeout=120)
+              with (root.parent/'opening-production-capacity-unit.log').open('a') as log:
+                  log.write(outcome.stdout+outcome.stderr)
+              passed = int('1 passed; 0 failed;' in outcome.stdout)
+              receipt['production_capacity_tests'].append({'command':command[1:], 'exit':outcome.returncode, 'passed':passed})
+              (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+              assert outcome.returncode == 0 and passed == 1, 'production capacity/privacy guard failed or ran zero tests; see retained log'
           PY
       - name: Compiler-free instrumented harness regressions
         working-directory: harness
@@ -450,6 +467,7 @@ jobs:
             opening-instrumented-unit.log
             opening-collector-witness-unit.log
             opening-sdk-metadata-unit.log
+            opening-production-capacity-unit.log
             opening-instrumented-selector.log
             opening-browser-evidence/
             pinned-app-full-ui.log

@@ -32,12 +32,17 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "7a36dd28191a1f32f65f68b037543ab924526189"
-TREE_PIN = "5e908a223e26e3cf8f264c65cd82ed33080d7ccf"
+PIN = "78f5a75e470c02fd967c160aaa5527820f5c28d8"
+TREE_PIN = "faf6bed6849ace0ea0d6abd0323a887b5b80dc23"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
 SDK_METADATA_TEST = "api::view_journey::tests::pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields"
+PRODUCTION_CAPACITY_TESTS = [
+    "api::view_journey::tests::production_attribute_capacity_preserves_complete_ready_collector_schema",
+    "logging::tests::otel_limits_are_conservative_and_event_free",
+    "logging::tests::otel_filter_is_a_spans_only_allowlist",
+]
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
@@ -90,6 +95,15 @@ def identity(app, exe, receipt_path):
             or type(receipt.get("sdk_metadata_passed")) is not int or receipt["sdk_metadata_passed"] != 1
             or receipt.get("sdk_metadata_command") != [SDK_METADATA_TEST, "--exact", "--nocapture", "--test-threads=1"]):
         raise ValueError("real default SDK layer test was not successfully executed exactly once")
+    capacity = receipt.get("production_capacity_tests")
+    if not isinstance(capacity, list) or len(capacity) != len(PRODUCTION_CAPACITY_TESTS):
+        raise ValueError("production collector capacity and privacy guards missing")
+    for test, result in zip(PRODUCTION_CAPACITY_TESTS, capacity, strict=True):
+        if (not isinstance(result, dict) or set(result) != {"command", "exit", "passed"}
+                or result["command"] != [test, "--exact", "--nocapture", "--test-threads=1"]
+                or type(result["exit"]) is not int or result["exit"] != 0
+                or type(result["passed"]) is not int or result["passed"] != 1):
+            raise ValueError("production collector capacity and privacy guards did not execute exactly once")
     return measured | {"rustc": receipt["rustc"], "receipt_sha256": shipping.digest(receipt_path),
         "harness_files": {str(p.relative_to(ROOT)): shipping.digest(p) for p in
             [Path(__file__), SCRIPT, Path(shipping.__file__),
