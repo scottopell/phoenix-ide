@@ -351,6 +351,65 @@ describe('VirtualTranscript', () => {
     expect(ref.current?.isProgrammaticScroll(65)).toBe(true);
   });
 
+  it.each([
+    { deferred: false, headerHeight: 42 },
+    { deferred: true, headerHeight: 42 },
+    { deferred: false, headerHeight: 42.5 },
+    { deferred: true, headerHeight: 42.5 },
+  ])('keeps the physical first-user start inside the clip with integer scroll quantization ($deferred, $headerHeight)', ({ deferred, headerHeight }) => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    let actualTop = 0;
+    const requested: number[] = [];
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const rect = originalRect.call(this);
+      const row = this.closest<HTMLElement>('[data-virtual-index]');
+      const top = this.classList.contains('virtual-transcript') ? 93
+        : row ? 93 + headerHeight + Number(row.dataset['virtualIndex']) * 75 - actualTop
+          : rect.top;
+      const height = this.classList.contains('virtual-transcript') ? this.clientHeight : rect.height;
+      return { ...rect, top, y: top, height, bottom: top + height } as DOMRect;
+    });
+    try {
+      render(<div data-testid="quantized-wrapper"><VirtualTranscript ariaLabel="Quantized transcript" ref={ref}
+        items={makeItems(20, 75)} getKey={(item) => item.id} estimatedExtent={75}
+        overscan={0} initialTail={false} header={<div data-height={headerHeight}>Header</div>}
+        renderItem={(item) => <div data-height={75}><div data-testid={`quantized-${item.id}`} data-height={67}>First user</div></div>}
+        scrollerRef={(element) => {
+          scroller = element;
+          if (element) Object.defineProperty(element, 'scrollTop', {
+            configurable: true,
+            get: () => actualTop,
+            set: (value: number) => { requested.push(value); actualTop = Math.round(value); },
+          });
+        }} /></div>);
+      const wrapper = screen.getByTestId('quantized-wrapper');
+      const selector = '[data-testid="quantized-item-0"]';
+      if (deferred) wrapper.style.display = 'none';
+      act(() => ref.current?.scrollToIndex(0, 'start', 0, selector));
+      if (deferred) {
+        expect(ref.current?.physicalSnapshot(0, selector).targetMeasured).toBe(false);
+        wrapper.style.display = '';
+        const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+        act(() => resizeObservers[0]!.triggerEntries([[scroller!, 100], [header, headerHeight]]));
+      }
+      expect(requested.length).toBeGreaterThan(0);
+      expect(Number.isInteger(actualTop)).toBe(true);
+      expect(ref.current?.physicalSnapshot(0, selector).targetMeasured).toBe(true);
+      const child = screen.getByTestId('quantized-item-0');
+      const row = child.closest<HTMLElement>('[data-virtual-index]')!;
+      const clip = scroller!.getBoundingClientRect();
+      expect(child.getBoundingClientRect().bottom).toBeLessThanOrEqual(clip.bottom);
+      expect(row.getBoundingClientRect().bottom).toBeLessThanOrEqual(clip.bottom);
+      const writes = JSON.stringify({ requested, actualTop });
+      expect.soft(row.getBoundingClientRect().top - clip.top, writes).toBeGreaterThanOrEqual(0);
+      expect(child.getBoundingClientRect().top - clip.top, writes).toBeGreaterThanOrEqual(0);
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
+
   it('positions an intra-row target through the transcript executor', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;
