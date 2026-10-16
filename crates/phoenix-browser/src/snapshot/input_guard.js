@@ -32,21 +32,39 @@
     }
     return false;
   }
-  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick', 'auxclick', 'keydown', 'keyup', 'keypress', 'beforeinput', 'input']) {
-    window.addEventListener(type, event => {
-      if (!active) return;
-      const keyboard = ['keydown', 'keyup', 'keypress', 'beforeinput', 'input'].includes(event.type);
-      if (active.rejected || !(keyboard ? hasFocus(active.node) : containsHit(active.node, event.clientX, event.clientY))) {
-        if (!active.rejected) receipt(JSON.stringify({token:active.token, outcome:'rejected'}));
-        active.rejected = true;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      } else if (event.type === 'click') {
-        active.clicked = true;
-        receipt(JSON.stringify({token:active.token, outcome:'clicked'}));
-      }
-    }, {capture: true, passive: false});
+  const guardedRoots = new WeakSet();
+  function install(root) {
+    guardedRoots.add(root);
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick', 'auxclick', 'keydown', 'keyup', 'keypress', 'beforeinput', 'input']) {
+      root.addEventListener(type, event => {
+        if (!active) return;
+        const keyboard = ['keydown', 'keyup', 'keypress', 'beforeinput', 'input'].includes(event.type);
+        const path = event.composedPath();
+        const attached = active.node.isConnected && active.node.ownerDocument === document;
+        let projected = active.node;
+        for (let ancestor = active.node; attached && ancestor.getRootNode() !== document && ancestor.getRootNode() !== root; ancestor = ancestor.getRootNode().host) {
+          const shadow = ancestor.getRootNode();
+          if (shadow.mode === 'closed') projected = shadow.host;
+        }
+        if (active.rejected || !attached || !path.includes(projected) || !(keyboard ? hasFocus(active.node) : containsHit(active.node, event.clientX, event.clientY))) {
+          if (!active.rejected) receipt(JSON.stringify({token:active.token, outcome:'rejected'}));
+          active.rejected = true;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        } else if (event.type === 'click' && !active.clicked && path.includes(active.node)) {
+          active.clicked = true;
+          receipt(JSON.stringify({token:active.token, outcome:'clicked'}));
+        }
+      }, {capture: true, passive: false});
+    }
   }
+  install(window);
+  const attachShadow = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function(options) {
+    const root = attachShadow.call(this, options);
+    install(root);
+    return root;
+  };
   Object.defineProperty(globalThis, '__phoenixReferenceInputGuard', {
     value: Object.freeze({
       arm(node, token) {
@@ -55,6 +73,10 @@
         if (!probeAcknowledged) throw Error('Reference input guard unavailable after document reset; navigate to a fresh document and call browser_snapshot again');
         if (active) throw Error('A reference input operation is already active');
         if (!node.isConnected || node.ownerDocument !== document) throw Error('stale ref');
+        for (let ancestor = node; ancestor.getRootNode() !== document; ancestor = ancestor.getRootNode().host) {
+          const root = ancestor.getRootNode();
+          if (root.mode === 'closed' && !guardedRoots.has(root)) throw Error('Reference input guard unavailable for this closed shadow root; navigate to a fresh document and call browser_snapshot again');
+        }
         active = {node, token, rejected: false, clicked: false};
       },
       finish(token) {

@@ -815,7 +815,16 @@ mod tests {
                 session.page.goto(format!("data:text/html,{html}")).await.unwrap();
                 let snapshot = session.accessibility_snapshot(false).await.unwrap();
                 let reference = snapshot.lines().find(|line| line.contains("Navigate")).unwrap().split('[').nth(1).unwrap().split(']').next().unwrap().to_string();
+                let mut loaded = session
+                    .page
+                    .event_listener::<chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired>()
+                    .await
+                    .unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(5), session.click_reference(&reference)).await.expect("native navigation completes").expect("native navigation receipt survives document replacement");
+                tokio::time::timeout(std::time::Duration::from_secs(5), loaded.next())
+                    .await
+                    .expect("clicked document finishes loading")
+                    .expect("load event stream remains available");
             }
             session.page.goto("about:blank").await.unwrap();
             session.page.evaluate("document.body.innerHTML = '<button onclick=window.clicks++>Current</button>'; window.clicks=0").await.unwrap();
@@ -867,6 +876,79 @@ mod tests {
             assert_eq!(result["outcome"]["rejected"], true);
         }
         manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn native_reference_guard_rejects_pointer_capture_retargeting() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("snapshot-pointer-capture-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        let mut outcomes = Vec::new();
+        {
+            let mut session = session.write().await;
+            session.page.goto("about:blank").await.unwrap();
+            for mode in ["light", "open", "closed", "declarative-closed"] {
+                if mode == "declarative-closed" {
+                    session.page.goto("data:text/html,<div><template shadowrootmode=closed><button onclick='window.wrong++'>Capture target</button></template></div><script>window.wrong=0</script>").await.unwrap();
+                } else {
+                    session.page.evaluate(format!(r#"(() => {{
+                    document.body.innerHTML = '<div id="host"></div>';
+                    const mode = {mode};
+                    const root = mode === 'light' ? document.body : document.getElementById('host').attachShadow({{mode}});
+                    root.innerHTML = '<button id="original" style="position:fixed;left:20px;top:20px;width:100px;height:40px">Capture target</button><button id="other" style="position:fixed;left:200px;top:20px;width:100px;height:40px">Other target</button>';
+                    const original = root.querySelector('#original'), other = root.querySelector('#other');
+                    window.wrong = 0;
+                    for (const type of ['pointerup', 'mouseup', 'click']) other.addEventListener(type, () => window.wrong++);
+                    original.onpointerdown = event => other.setPointerCapture(event.pointerId);
+                }})()"#, mode=quoted(mode))).await.unwrap();
+                }
+                let snapshot = session.accessibility_snapshot(false).await.unwrap();
+                let reference = snapshot
+                    .lines()
+                    .find(|line| line.contains("Capture target"))
+                    .unwrap()
+                    .split('[')
+                    .nth(1)
+                    .unwrap()
+                    .split(']')
+                    .next()
+                    .unwrap();
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    session.click_reference(reference),
+                )
+                .await;
+                let wrong = session
+                    .page
+                    .evaluate("window.wrong")
+                    .await
+                    .unwrap()
+                    .into_value::<u64>()
+                    .unwrap();
+                outcomes.push((mode, outcome, wrong));
+            }
+        }
+        manager.shutdown_all().await.unwrap();
+        for (mode, outcome, wrong) in outcomes {
+            assert!(
+                outcome.expect("guard rejection receipt").is_err(),
+                "{mode}: retargeted click succeeded"
+            );
+            assert_eq!(
+                wrong, 0,
+                "{mode}: retargeted native event reached other node"
+            );
+        }
     }
 
     #[tokio::test]
