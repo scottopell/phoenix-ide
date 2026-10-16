@@ -27672,7 +27672,12 @@ mod tests {
 
     #[tokio::test]
     async fn direct_continuation_concurrent_requests_and_replay_keep_one_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let mut db = Database::open_in_memory().await.unwrap();
+        db.continuation_test_hook = Some(std::sync::Arc::new(
+            ContinuationTestHook::PreReservationBarrier(std::sync::Arc::new(
+                tokio::sync::Barrier::new(2),
+            )),
+        ));
         let parent =
             setup_exhausted_parent(&db, "direct-race", "direct-race", "/tmp", &ConvMode::Direct)
                 .await;
@@ -27702,6 +27707,7 @@ mod tests {
             successor = Some(child.id);
         }
         assert_eq!(created, 1);
+        db.continuation_test_hook = None;
         let ContinueOutcome::AlreadyContinued(replayed) =
             db.continue_conversation(&parent.id).await.unwrap()
         else {
