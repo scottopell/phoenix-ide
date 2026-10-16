@@ -1283,3 +1283,56 @@ passed again: 16 shipping Python, 14 base Node, 46 opening Python, 30 opening
 Node, 50 joint Node and 61 donor tests across two files. The prior uncorrected
 admission packet was not published; these remain source/mock checks, not runtime
 acceptance or proof of the earlier missing response's cause.
+
+
+## Synchronous keepalive dispatch successor after run 38810704870
+
+Harness `95707d666b4529bbaf849430788bbf7eb099cd7d` / app `89a9e8e`
+completed run `38810704870` with witness `116682903480` failure. Standard Rust
+`116683030501` and all other standard check jobs succeeded separately; this is
+not joint acceptance. Artifact `12009500583` remains remote and preserved.
+Selected receipts were inspected in memory with 54,735 bytes of ZIP range reads,
+not a full artifact audit. Trial zero explicitly admitted unsampled and correctly
+remained inconclusive. Trial one explicitly admitted sampled, bound its request
+and incomplete report to the same journey, and produced one report with no page
+response status. Producer attempted then failed submission; page/context request
+failure occurred during pagehide navigation before context cleanup. A separate
+CDP-local POST observation recorded canceled=true. Channel-local ordinals are
+not cross-channel identity. These facts establish actual pre-cleanup transport
+failure, not which actor canceled it. The strict `[] != [204]` assertion remains
+primary, with late cleanup capture failure separate.
+
+Source already used keepalive. Lifecycle cleanup does not abort fetch; the
+reporter's three-second timer is its sole explicit abort. Donor `05513cb` removes
+promise-microtask deferral of fetch initiation: dispatch starts inside report,
+while completion stays asynchronous. Synchronous exceptions become handled,
+sanitized rejection. A finite `timeout_abort` diagnostic immediately precedes
+the explicit abort, and the existing helper parser admits that fixed event.
+No retry, timeout increase, forced sampling, readiness relaxation, status
+substitution, session change or normal-shutdown exemption was introduced.
+Removing the deferral is a causal-order correction/hypothesis, not a proven
+explanation or native-browser delivery fix for the failed run.
+
+Exact donor deltas `05513cb0638e9969928cf41919bd505fe87cdca6`,
+`8eac8010d15e7a799e5caef9b67b1a273bb49c98`, and
+`10eaa7273dd5e778ccf01f8148793e1998a391a9` are integrated atop app `89a9e8e`
+as `f9355ade31138f06229808d8d5ca5a0d0f1df74b`, tree
+`39b3306f93d1d68807c4e0f77f1f0223383a906b`. The latter two are test-only.
+Independent donor review found no introduced production defect, but caught
+assertions inside the injected send that the reporter could swallow; the final
+test correction asserts options outside that catch before any await. Injected
+controls prove dispatch before handler return, handled synchronous throws and
+already-rejected promises, unchanged busy-drop and failure counters, reusable
+inflight slot, cleared timers on settlement, no false timeout after ten seconds,
+no private failure text and exact timeout-event-before-abort ordering. They do
+not simulate native teardown delivery.
+
+Actual cached offline validation: shipping Python 16, base Node 14, opening
+Python 46, opening Node 30, joint Node 50, and focused telemetry Vitest 105 across
+six files passed. A pre-pin opening check correctly failed its actual-byte hash
+regression when the helper changed; its failed log is retained. Rebinding the
+actual app HEAD/tree and helper SHA made the final check pass. Syntax/diff checks
+passed. No local compile, install, application server, browser capture, cache
+cleanup or large artifact copy was performed. Full new-source hosted codegen,
+UI/Rust, ordinary and outer Global history, export inventory, normal drain and
+overhead qualification remain owed; no joint acceptance is claimed.
