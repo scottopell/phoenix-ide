@@ -56,3 +56,5 @@ Screenshot output paths resolve in the caller's working directory before transpo
 Repeated `open` reloads the current URL within the same browser lifetime, retaining cookies and origin storage while replacing page state. Fragment navigation follows native CDP semantics without depending on a document-load event for same-document completion. Real HTTP coverage checks document generations, fresh refs, navigation-local console errors, and server-loss reload failure followed by recovery in the same browser.
 
 Evaluation exceptions retain one typed CDP diagnostic until rendering. Human output uses a bounded single-line message and source location; CLI structured errors retain the full exception context without interpreting user-thrown values as artifact metadata.
+
+Command help includes a complete documentation URL in every build profile. Browser-free executable coverage invokes help outside the source checkout and checks that discovery does not create session state.

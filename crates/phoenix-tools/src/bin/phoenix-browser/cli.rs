@@ -40,7 +40,7 @@ Idle timeout: --idle-timeout > PHOENIX_BROWSER_IDLE_TIMEOUT > 1800 seconds;
 chosen when a daemon starts. Active requests do not count as idle.
 Errors: exit 1; invalid CLI input: exit 2. --json emits a tagged success/error.
 Only open starts a browser; after state loss, inspect with status then open again.
-See docs/phoenix-browser.md for profiling and lifecycle examples.";
+Documentation: https://github.com/scottopell/phoenix-ide/blob/main/docs/phoenix-browser.md";
 
 pub struct Options {
     pub session: String,

@@ -183,4 +183,6 @@ AND SHALL NOT automatically replay that operation or substitute a new browser li
 
 THE SYSTEM SHALL provide concise usage guidance covering session binding and fallback sharing, open/snapshot/reference interaction, debugging artifacts, profiling, and explicit close.
 
+THE SYSTEM SHALL include a complete documentation URL in command help that remains useful outside the source checkout.
+
 **Rationale:** Harness authors should discover the intended workflow without reverse engineering daemon internals.

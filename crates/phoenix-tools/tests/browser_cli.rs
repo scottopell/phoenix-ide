@@ -1025,9 +1025,17 @@ fn help_is_an_option_only_at_the_command_help_position() {
         vec!["snapshot", "--help"],
         vec!["snapshot", "--help", "--json"],
     ] {
-        let output = cli.command().args(arguments).output().unwrap();
+        let output = cli
+            .command()
+            .current_dir(cli.directory.path())
+            .args(arguments)
+            .output()
+            .unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: phoenix-browser"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(
+            "https://github.com/scottopell/phoenix-ide/blob/main/docs/phoenix-browser.md"
+        ));
     }
     for payload in ["--help", "-h"] {
         let response = cli.invoke(&["type", "#name", payload], None, false);
