@@ -12,7 +12,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).parent))
@@ -866,15 +866,20 @@ class FixtureSettlementTests(unittest.TestCase):
             db.executescript("CREATE TABLE instance_identity(singleton_key INTEGER, instance_id TEXT);"
                              "CREATE TABLE durable_turns(conversation_id TEXT, canonical_message_id TEXT,"
                              "disposition TEXT, terminal_kind TEXT, owns_conversation INTEGER);"
-                             "CREATE TABLE steering_messages(conversation_id TEXT);"
-                             "CREATE TABLE conversation_creation_jobs(conversation_id TEXT, message_id TEXT,"
-                             "status TEXT, claim_worker_id TEXT, claim_token TEXT, lease_until TEXT);")
+                             "CREATE TABLE steering_messages(conversation_id TEXT);")
+            import subprocess
+            migrations = subprocess.check_output([
+                "git", "-C", str(Path(os.environ.get("APP_ROOT", str(opening.ROOT / "target/history-hidden-geometry-repair"))).resolve()),
+                "show", f"{opening.PIN}:crates/phoenix-db/src/migrations.rs"], text=True)
+            product_schema = migrations.rsplit("CREATE TABLE product_creation_jobs (", 1)[1]
+            product_schema = product_schema.split("CREATE INDEX product_creation_jobs_claim_order", 1)[0]
+            db.executescript("CREATE TABLE product_creation_jobs (" + product_schema)
             db.execute("INSERT INTO instance_identity VALUES(1, ?)", (self.instance,))
             db.execute("INSERT INTO durable_turns VALUES('row', 'row:key', 'Runtime', NULL, 1)")
         self.idle = True
         self.correlation = "row:key"
         self.calls = []
-        self.fixture = types.SimpleNamespace(request=self.request)
+        self.fixture = types.SimpleNamespace(request=self.request, out=self.root)
         self.observer = opening.OwnedFixtureCompletion(
             {"db": str(self.db), "git_sha": opening.PIN}, self.fixture)
         self.data = {"conversation": {"state": {"type": "idle"}},
@@ -923,22 +928,79 @@ class FixtureSettlementTests(unittest.TestCase):
         self.assertFalse(self.observer("row", False, None, self.data))
         self.assertFalse(self.observer("row", False, None, {"messages": []}))
 
-    def test_creation_opening_uses_own_ready_claim_authority_not_direct_turn(self):
+    def product_job(self, request_id="row:key", row="row"):
+        self.sql("INSERT INTO product_creation_jobs(request_id, product_conversation_id, cwd, objective, "
+                 "llm_language, status, accepted_at_unix_micros, updated_at_unix_micros, "
+                 "published_product_id, published_conversation_id, claim_worker_id, claim_token, "
+                 "claim_lease_until_unix_micros) VALUES(?, 'product', '/fixture', 'objective', "
+                 "'phoenix-native', 'delivery_pending', 0, 0, 'product', ?, 'worker', 'token', 1)",
+                 (request_id, row))
+
+    def publish_job(self):
+        self.sql("UPDATE product_creation_jobs SET status='published', claim_worker_id=NULL, "
+                 "claim_token=NULL, claim_lease_until_unix_micros=NULL")
+
+    def test_product_opening_uses_actual_published_schema_not_legacy_ready_job(self):
+        import sqlite3
         self.sql("DELETE FROM durable_turns")
-        self.sql("INSERT INTO conversation_creation_jobs VALUES('row','key','claimed','worker','token','lease')")
+        self.product_job()
         self.assertFalse(self.observer("row", False, None, self.data))
-        self.sql("UPDATE conversation_creation_jobs SET status='ready'")
-        self.assertFalse(self.observer("row", False, None, self.data))
-        self.sql("UPDATE conversation_creation_jobs SET claim_worker_id=NULL,claim_token=NULL,lease_until=NULL")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.sql("UPDATE product_creation_jobs SET status='published'")
+        self.publish_job()
         self.idle = False
         self.assertFalse(self.observer("row", False, None, self.data))
         self.idle = True
         self.assertTrue(self.observer("row", False, None, self.data))
         self.assertFalse(self.observer("row", False, "row:key", self.data))
-        self.sql("UPDATE conversation_creation_jobs SET message_id='row:key'")
-        self.assertTrue(self.observer("row", False, None, self.data))
-        self.sql("UPDATE conversation_creation_jobs SET message_id='foreign'")
+        self.sql("UPDATE product_creation_jobs SET request_id='foreign'")
         self.assertFalse(self.observer("row", False, None, self.data))
+        self.sql("UPDATE product_creation_jobs SET request_id='row:key', published_conversation_id='foreign'")
+        self.assertFalse(self.observer("row", False, None, self.data))
+
+    def test_shipping_build_product_creation_waits_on_actual_publication_path(self):
+        class OpeningObserved(Exception):
+            pass
+        self.sql("DELETE FROM durable_turns")
+        self.product_job(request_id="key")
+        self.correlation = "key"
+        self.data["messages"][0]["message_id"] = "key"
+        gets, creations = [], []
+        harness = types.SimpleNamespace(_terminal_event=lambda *a: True,
+            _context_exhausted_event=lambda *a: True, _wait_for_sse_signal=lambda *a: None,
+            _state_str=lambda state: state["type"], _default_model=lambda *a: "mock")
+        fixture = opening.shipping.Fixture(harness, "http://127.0.0.1:1", self.root,
+                                          completion=self.observer)
+        self.addCleanup(fixture.client.close)
+        def request(method, path, body=None):
+            if method == "POST":
+                self.assertEqual(path, "/api/product-conversations/new")
+                self.assertEqual(body["request_id"], "key")
+                self.assertIn("qualification ordinary", body["objective"])
+                self.assertNotIn("text", body)
+                creations.append(body)
+                return {"transcript_row_id": "row", "product_conversation_id": "product",
+                        "canonical_route": "/c/product"}
+            if method == "PUT":
+                return {"auto_continue_on_context_exhaustion": False}
+            gets.append(path)
+            if len(gets) == 2:
+                self.publish_job()
+                self.sql("UPDATE product_creation_jobs SET request_id='foreign'")
+            if len(gets) == 3:
+                self.sql("UPDATE product_creation_jobs SET request_id='key', published_conversation_id='foreign'")
+            if len(gets) == 4:
+                self.sql("UPDATE product_creation_jobs SET published_conversation_id='row'")
+            self.idle = len(gets) >= 5
+            return self.data
+        fixture.request = request
+        fixture.send = MagicMock(side_effect=OpeningObserved)
+        with patch.object(opening.shipping.uuid, "uuid4", return_value="key"), \
+                patch.object(opening.shipping.time, "sleep"), self.assertRaises(OpeningObserved):
+            fixture.build("ordinary", self.root)
+        self.assertEqual(len(creations), 1)
+        self.assertEqual(len(gets), 5)
+        fixture.send.assert_called_once()
 
     def test_exhausted_requires_failed_exact_turn_and_released_owner(self):
         self.assertFalse(self.observer("row", True, "row:key", self.data))

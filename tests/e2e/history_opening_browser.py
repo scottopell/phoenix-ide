@@ -357,15 +357,21 @@ class OwnedFixtureCompletion:
                 "WHERE conversation_id = ? AND canonical_message_id = ? AND disposition = 'Runtime'",
                 (row, correlation)).fetchall()
             creation = connection.execute(
-                "SELECT status, claim_worker_id, claim_token, lease_until "
-                "FROM conversation_creation_jobs WHERE conversation_id = ? "
-                "AND (message_id = ? OR conversation_id || ':' || message_id = ?)",
-                (row, correlation, correlation)).fetchall() if message_id is None and not terminal else []
+                "SELECT status, claim_worker_id, claim_token, claim_lease_until_unix_micros "
+                "FROM product_creation_jobs WHERE published_conversation_id = ? AND request_id = ?",
+                (row, correlation)).fetchall() if message_id is None and not terminal else []
+        facts = {"conversation_id": row, "message_id": correlation,
+                 "active_runtime_owner": bool(active), "steering_backlog": bool(queued),
+                 "runtime_terminal": terminal[0][0] if len(terminal) == 1 else None,
+                 "runtime_owner_released": terminal == [("Failed" if exhausted else "Completed", 0)],
+                 "product_opening_published": creation == [("published", None, None, None)],
+                 "live_idle": None}
+        shipping.write_json(self.fixture.out / "fixture-completion.json", facts)
         if queued:
             raise AssertionError("unexpected steering backlog during isolated fixture completion")
         settled = terminal == [("Failed" if exhausted else "Completed", 0)]
         if message_id is None and not exhausted and not terminal:
-            settled = creation == [("ready", None, None, None)]
+            settled = creation == [("published", None, None, None)]
         if active or not settled:
             return False
         if exhausted:
@@ -379,6 +385,8 @@ class OwnedFixtureCompletion:
             raise ValueError("fixture completion reconciliation identity mismatch")
         if not isinstance(result.get("conversation_idle"), bool):
             raise ValueError("fixture completion requires authoritative runtime idle status")
+        facts["live_idle"] = result["conversation_idle"]
+        shipping.write_json(self.fixture.out / "fixture-completion.json", facts)
         return result["conversation_idle"]
 
 

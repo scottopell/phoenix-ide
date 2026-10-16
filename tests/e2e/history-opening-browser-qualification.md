@@ -1410,3 +1410,51 @@ published. The correction adds only the correlated ready-job branch for waits
 without a supplied chat ID and tests raw/canonical opening IDs and cleared
 claims. An explicit chat ID never falls back to a creation job. Earlier 52-test
 logs and mutation proof remain retained separately from the final 53-test ring.
+
+
+## Product-creation authority correction after run 38835967561
+
+Harness `11cdc0f7c5afab85c5ae358ec105568532edadf6` / unchanged app `f9355ade`
+produced witness `116765054229` failure in run `38835967561`, timing out on the
+very first ordinary `Fixture.build` opening, before browser qualification. At
+inspection, standard Rust `116765139606` remained running and uncancelled; other
+standard jobs passed. Artifact `12019671980` (88,607,696 bytes) remains remote.
+Two bounded 42,330-byte range reads retained first/final-five API/SSE records and
+runtime facts, not the DB, executable, credential or entire artifact. The API
+records show POST `/api/product-conversations/new` with `request_id` equal to
+the actual raw persisted user message ID. Idle plus agent then repeated without
+reaching reconciliation.
+
+This is an introduced harness bug: the preceding parent/reviewer source trace
+followed the **legacy** conversation creation endpoint and its
+`conversation_creation_jobs` authority, not the actual shipping fixture's
+product-creation endpoint. That earlier conclusion is explicitly retracted for
+this fixture. Its failed run, reviewed commits and receipts are preserved.
+
+The correction **replaces**, rather than supplements, the wrong branch with
+`product_creation_jobs`: exact `request_id` equals the persisted opening user ID,
+exact `published_conversation_id` equals the fixture row, status `published`, and
+worker/token/`claim_lease_until_unix_micros` all cleared. Explicit chat IDs still
+cannot fall back to creation. `create_product_conversation` dispatches through
+`process_product_creation_request`; the creation worker delivers a SteerMessage
+whose message ID is `job.request_id`. Product creation DB delivery completion
+then atomically changes delivery_pending to published and clears the claim
+under its live claim CAS. Public effective Idle and no Runtime owner/backlog are
+still required; published alone does not establish runtime completion. No
+legacy-table fallback, timeout increase, added sleep, loop or retry exists.
+A bounded latest-evaluation `fixture-completion.json` records only opaque IDs,
+boolean ownership/backlog/publication facts, finite terminal kind and nullable
+live Idle, never claim tokens, errors, bodies or credentials.
+
+The corrected regression executes the SAME shipping `Fixture.build('ordinary')`
+POST and response path, using the complete product-creation table DDL read from
+the exact pinned app migration, not hand-selected substitute columns. It holds
+delivery claim, rejects wrong request and wrong published row, releases the
+matching publication and separately holds live runtime Idle before advancing
+to the first fixture send. One creation request is asserted. The actual schema
+rejects a published row with retained claim by CHECK; the observer also demands
+all claim fields be null. The original 11cdc observer fails this same-path test
+on its nonexistent legacy table in memory, without source edits. Current ring:
+54 opening Python, 16 shipping Python and 94 Node tests passed. Initial test
+import/name errors are retained separately. These checks establish the fixture
+correction, not native pagehide or joint acceptance.
