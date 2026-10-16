@@ -29,7 +29,7 @@ const MAX_CORRELATIONS = 16;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const traceId = /^[0-9a-f]{32}$/i;
 
-type JourneyObservation = { kind: 'mark'; mark: JourneyMark; ms: number } | { kind: 'anchor'; result: AnchorResult } | { kind: 'request'; request_id: string };
+type JourneyObservation = { kind: 'mark'; mark: JourneyMark; ms: number } | { kind: 'anchor'; result: AnchorResult } | { kind: 'request'; request_id: string } | { kind: 'sse'; stream_id: string };
 
 export class ConversationViewJourney {
   readonly #observe: (event: JourneyObservation) => void;
@@ -81,6 +81,7 @@ export class ConversationViewJourney {
     }
     this.#correlations.push({ kind, id });
     if (kind === 'request') this.#observe({ kind: 'request', request_id: id });
+    if (kind === 'sse') this.#observe({ kind: 'sse', stream_id: id });
   }
 
   observerInspection(): void {

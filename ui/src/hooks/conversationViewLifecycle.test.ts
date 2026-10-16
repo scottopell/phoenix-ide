@@ -370,4 +370,39 @@ describe('ViewJourneyLifecycle', () => {
     expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledTimes(1);
   });
+
+  it('emits an independent SSE owner edge only for a correlation accepted by the active sampled lifecycle', () => {
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+    const reporter = new ViewJourneyReporter({ sampleRate: 1, send });
+    const identity = { ...defaultViewIdentity('ordinary', 'navigation'), segment_id: segmentId };
+    const controller = new ViewJourneyLifecycle(identity, reporter, () => now);
+    controllers.push(controller);
+    const stream = crypto.randomUUID();
+    controller.streamStarted(crypto.randomUUID(), crypto.randomUUID(), 0);
+    controller.streamStarted(segmentId, 'PRIVATE_INVALID', 0);
+    controller.streamStarted(segmentId, stream, 0);
+    controller.streamStarted(segmentId, stream, 1);
+    const edges = dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail).filter(event => event?.kind === 'sse');
+    expect(edges).toEqual([{ version: 1, kind: 'sse', open_id: controller.openId, stream_id: stream }]);
+    controller.finish('canceled');
+    controller.streamStarted(segmentId, crypto.randomUUID(), 2);
+    expect(dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail).filter(event => event?.kind === 'sse')).toHaveLength(1);
+    expect(payload().correlations).toContainEqual({ kind: 'sse', id: stream });
+  });
+
+  it('does not emit an SSE ownership edge for unsampled lifecycle or a correlation rejected by the cap', () => {
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+    const unsampled = new ViewJourneyLifecycle(defaultViewIdentity('ordinary', 'navigation'), new ViewJourneyReporter({ random: () => 0.9, send }), () => now);
+    controllers.push(unsampled);
+    unsampled.streamStarted(segmentId, crypto.randomUUID(), 0);
+    expect(dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail).filter(event => event?.kind === 'sse')).toHaveLength(0);
+    const { controller } = view();
+    for (let index = 0; index < 16; index++) controller.requestStarted(crypto.randomUUID());
+    controller.streamStarted(segmentId, crypto.randomUUID(), 0);
+    expect(dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail).filter(event => event?.kind === 'sse')).toHaveLength(0);
+    controller.finish('incomplete');
+    expect(payload().correlations).toHaveLength(16);
+    expect(payload().dropped_correlations).toBe(1);
+  });
+
 });
