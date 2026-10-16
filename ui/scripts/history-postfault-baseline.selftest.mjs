@@ -174,7 +174,19 @@ test('UNIT diagnostic oracle preserves strict null results and exposes only boun
     const read=dom(options);assert.equal(read(),null);
     const probe=read(null,true);assert.equal(probe.observation,null);assert.ok(probe.predicates[predicate]>0);
     assert.ok(Object.values(probe.predicates).every(n=>Number.isInteger(n)&&n>0&&n<=512));
-    assert.ok(!JSON.stringify(probe.predicates).includes('known'));
+    assert.ok(!JSON.stringify(probe.predicates).includes('root:known'));
   }
   const read=dom();assert.deepEqual(read(null,true).observation,read());
+});
+
+test('UNIT visible exact persisted target inside oversized row still fails strict whole-row oracle', () => {
+  const read=dom({rowBox:box(110,1000),childBox:box(120,20)});
+  assert.equal(read(),null);
+  assert.equal(read(null,true).predicates.row_clipped,1);
+  assert.equal(read(null,true).predicates.known_target_row_taller_than_clip,1);
+  assert.equal(read(null,true).predicates.known_target_message_fully_visible,1);
+  const oversizedUser=dom({rowBox:box(110,1000),childBox:box(110,1000)});
+  assert.equal(oversizedUser(),null);
+  assert.equal(oversizedUser(null,true).predicates.row_clipped,1);
+  assert.equal(oversizedUser(null,true).predicates.known_target_message_clipped,1);
 });

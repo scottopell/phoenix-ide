@@ -60,6 +60,21 @@ export function observePhysicalHistoricalRow({ known, expected = null, diagnosti
   }
   for (const row of scroller.querySelectorAll('[data-virtual-key]')) {
     const key = row.dataset.virtualKey, rowBounds = bounds(row);
+    if (diagnostics) {
+      for (const child of row.querySelectorAll('[id], [data-message-id]')) {
+        if (child.closest('[data-virtual-key]') !== row) continue;
+        const id = child.getAttribute('id'), data = child.getAttribute('data-message-id');
+        const wrapped = id?.startsWith('message-') ? id.slice('message-'.length) : null;
+        if (!identities.has(data) && !identities.has(wrapped)) continue;
+        reject('known_target_seen');
+        if (rowBounds.height > clip.bottom - clip.top) reject('known_target_row_taller_than_clip');
+        const rowFailure = visibilityFailure(row, rowBounds);
+        if (rowFailure) reject('known_target_row_' + rowFailure);
+        const childFailure = visibilityFailure(child, bounds(child));
+        if (childFailure) reject('known_target_message_' + childFailure);
+        else reject('known_target_message_fully_visible');
+      }
+    }
     if (!key) { reject('missing_row_key'); continue; }
     if (rowKeys.get(key)?.size !== 1) { reject('duplicate_row_key'); continue; }
     if (expected && key !== expected.key) { reject('unexpected_row_key'); continue; }

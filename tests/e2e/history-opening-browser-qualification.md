@@ -2170,3 +2170,19 @@ existing cached dependencies, not a local or hosted browser qualification. No
 app source, pin, admission, sampler, timeout or acceptance rule changed. No push
 or hosted execution is part of this source-only boundary; the exact prior hosted
 physical failure remains unresolved until actual bounded diagnostic evidence.
+
+Release-critical follow-through retains the frozen app baseline rather than
+unreviewedly rebasing to merged main. Source inspection confirms the production
+source-link syntax and keyed virtual wrapper are consistent. A local serialized-
+DOM equivalent reproduces strict null for a fully visible exact target inside
+an oversized virtual row, including an oversized standalone first-user message;
+this proves an oracle rejection class, not the prior hosted dimensions. Optional
+target-ID prepass counters now distinguish a seen exact fixture attribute, row
+height exceeding the clip, row rejection and child visibility/rejection, even
+when the row is rejected before normal child selection. These are diagnostics,
+not accepted-identity evidence; conflicting aliases and duplicates still fail.
+Independent additive review approved one bounded actual hosted attempt. Combined
+cached tests65 passed with1 external-fixture skip; no local native/build/server
+was run. This publication supersedes the prior source-only execution hold solely
+to collect the reviewed target-specific actual distinction, without thresholds,
+timeout, retry, source-pin, app-pin or acceptance changes.
