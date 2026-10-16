@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, RemoteObjectType};
 use chromiumoxide::page::ScreenshotParams;
+use phoenix_browser::snapshot::BrowserTarget;
 use phoenix_browser::BrowserSession;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Parse duration from string like "15s", "1m", "500ms"
-fn parse_duration(s: &str) -> Option<Duration> {
+pub(super) fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if let Some(ms) = s.strip_suffix("ms") {
         ms.trim().parse().ok().map(Duration::from_millis)
@@ -844,8 +845,8 @@ impl Tool for BrowserWaitForSelectorTool {
 
 #[derive(Debug, Deserialize)]
 struct ClickInput {
-    /// CSS selector for element to click
-    selector: String,
+    #[serde(flatten)]
+    target: BrowserTarget,
     /// If true, wait for element to appear before clicking (default: false)
     #[serde(default)]
     wait: bool,
@@ -863,7 +864,7 @@ impl Tool for BrowserClickTool {
     }
 
     fn description(&self) -> String {
-        "Click an element by CSS selector using CDP-level mouse events. Prefer this over browser_eval for clicks — CDP events reliably trigger React/Vue/Angular handlers. Set wait:true to automatically wait for the element to appear before clicking.".to_string()
+        "Click using CDP mouse events. Provide exactly one of selector (CSS) or ref (from browser_snapshot). Set wait:true to wait for a selector. A stale ref requires a new snapshot and is never retargeted.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -874,6 +875,7 @@ impl Tool for BrowserClickTool {
                     "type": "string",
                     "description": "CSS selector for the element to click"
                 },
+                "ref": {"type":"string", "description":"Opaque element ref from browser_snapshot; alternative to selector."},
                 "wait": {
                     "type": "boolean",
                     "description": "If true, wait for element to appear before clicking (default: false)"
@@ -882,8 +884,7 @@ impl Tool for BrowserClickTool {
                     "type": "string",
                     "description": "Timeout for waiting (default: 30s)"
                 }
-            },
-            "required": ["selector"]
+            }
         })
     }
 
@@ -905,13 +906,28 @@ impl Tool for BrowserClickTool {
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
 
-        let guard = session.read().await;
+        let mut guard = session.write().await;
+        guard.last_activity = std::time::Instant::now();
+        let selector = match &input.target {
+            BrowserTarget::Selector(selector) => selector,
+            BrowserTarget::Reference(reference) => {
+                let result = tokio::time::timeout(timeout, guard.click_reference(reference)).await;
+                guard.last_activity = std::time::Instant::now();
+                return match result {
+                    Ok(Ok(())) => ToolOutput::success(format!("Clicked {reference}")),
+                    Ok(Err(error)) => ToolOutput::error(error.to_string()),
+                    Err(_) => ToolOutput::error(format!(
+                        "Reference click timed out after {timeout:?}; take a new browser_snapshot"
+                    )),
+                };
+            }
+        };
 
         // Optionally wait for element
         if input.wait {
             let check_script = format!(
                 "document.querySelector({}) !== null",
-                serde_json::to_string(&input.selector).unwrap()
+                serde_json::to_string(selector).unwrap()
             );
             let poll_interval = Duration::from_millis(100);
             let start = std::time::Instant::now();
@@ -931,36 +947,29 @@ impl Tool for BrowserClickTool {
                     }
                     Err(_) => {
                         return ToolOutput::error(format!(
-                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{}'",
-                            input.selector
+                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{selector}'"
                         ));
                     }
                     _ => {}
                 }
                 if start.elapsed() >= timeout {
-                    return ToolOutput::error(format!(
-                        "Timeout waiting for element '{}'",
-                        input.selector
-                    ));
+                    return ToolOutput::error(format!("Timeout waiting for element '{selector}'"));
                 }
                 tokio::time::sleep(poll_interval).await;
             }
         }
 
         // Find the element
-        let element = match guard.page.find_element(&input.selector).await {
+        let element = match guard.page.find_element(selector).await {
             Ok(el) => el,
             Err(e) => {
-                return ToolOutput::error(format!(
-                    "Could not find element '{}': {}",
-                    input.selector, e
-                ));
+                return ToolOutput::error(format!("Could not find element '{selector}': {e}"));
             }
         };
 
         // Click using CDP (works with React, Vue, etc.)
         match element.click().await {
-            Ok(_) => ToolOutput::success(format!("Clicked element '{}'", input.selector)),
+            Ok(_) => ToolOutput::success(format!("Clicked element '{selector}'")),
             Err(e) => ToolOutput::error(format!("Click failed: {e}")),
         }
     }
@@ -972,8 +981,8 @@ impl Tool for BrowserClickTool {
 
 #[derive(Debug, Deserialize)]
 struct TypeInput {
-    /// CSS selector for input element
-    selector: String,
+    #[serde(flatten)]
+    target: BrowserTarget,
     /// Text to type
     text: String,
     /// If true, clear existing text before typing (default: false)
@@ -1032,7 +1041,7 @@ impl Tool for BrowserTypeTool {
     }
 
     fn description(&self) -> String {
-        "Type text into an input element using CDP-level keyboard events. Prefer this over browser_eval for form input — CDP events fire the key events that React/Vue/Angular listen to. Set clear:true to replace existing text instead of appending.".to_string()
+        "Type text using CDP keyboard input. Provide exactly one of selector (CSS) or ref (from browser_snapshot). Set clear:true to replace existing text instead of appending. Stale refs require a new snapshot.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -1043,6 +1052,7 @@ impl Tool for BrowserTypeTool {
                     "type": "string",
                     "description": "CSS selector for the input element"
                 },
+                "ref": {"type":"string", "description":"Opaque element ref from browser_snapshot; alternative to selector."},
                 "text": {
                     "type": "string",
                     "description": "Text to type into the element"
@@ -1056,7 +1066,7 @@ impl Tool for BrowserTypeTool {
                     "description": "Timeout (default: 30s)"
                 }
             },
-            "required": ["selector", "text"]
+            "required": ["text"]
         })
     }
 
@@ -1078,95 +1088,123 @@ impl Tool for BrowserTypeTool {
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
 
-        let guard = session.read().await;
-        let Some(deadline) = checked_deadline(timeout) else {
-            return ToolOutput::error(
-                "Invalid timeout: duration exceeds the supported deadline range",
-            );
-        };
-
-        let selector = serde_json::to_string(&input.selector).unwrap();
-        let element = match focus_element_until(&guard.page, &input.selector, deadline).await {
-            Ok(element) => element,
-            Err(message) => return ToolOutput::error(message),
-        };
-
-        // Clear existing text if requested
-        if input.clear {
-            match operation_phase(
-                BrowserOperationPhase::TypeClear,
-                deadline.saturating_duration_since(std::time::Instant::now()),
-                guard
-                    .page
-                    .evaluate(format!("document.querySelector({selector}).select()")),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return ToolOutput::error(format!("Failed to select text: {error}"));
-                }
-                Err(message) => return ToolOutput::error(message),
-            }
-            match operation_phase(
-                BrowserOperationPhase::TypeClear,
-                deadline.saturating_duration_since(std::time::Instant::now()),
-                element.press_key("Backspace"),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return ToolOutput::error(format!("Failed to clear text: {error}"));
-                }
-                Err(message) => return ToolOutput::error(message),
-            }
-        }
-
-        // Type the text using CDP keyboard events
-        // Handle newlines specially since type_str doesn't support them
-        let parts: Vec<&str> = input.text.split('\n').collect();
-        for (i, part) in parts.iter().enumerate() {
-            // Type the text part
-            if !part.is_empty() {
-                match operation_phase(
-                    BrowserOperationPhase::TypeInput,
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                    element.type_str(part),
+        let mut guard = session.write().await;
+        guard.last_activity = std::time::Instant::now();
+        let selector = match &input.target {
+            BrowserTarget::Selector(selector) => selector,
+            BrowserTarget::Reference(reference) => {
+                let result = tokio::time::timeout(
+                    timeout,
+                    guard.type_reference(reference, &input.text, input.clear),
                 )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return ToolOutput::error(format!("Type failed: {error}"));
-                    }
-                    Err(message) => return ToolOutput::error(message),
-                }
+                .await;
+                guard.last_activity = std::time::Instant::now();
+                return match result {
+                    Ok(Ok(())) => ToolOutput::success(format!(
+                        "Typed {} characters into {reference}",
+                        input.text.len()
+                    )),
+                    Ok(Err(error)) => ToolOutput::error(error.to_string()),
+                    Err(_) => ToolOutput::error(format!(
+                        "Reference typing timed out after {timeout:?}; take a new browser_snapshot"
+                    )),
+                };
             }
-            // Add Enter between parts (not after last)
-            if i < parts.len() - 1 {
-                match operation_phase(
-                    BrowserOperationPhase::TypeInput,
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                    element.press_key("Enter"),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return ToolOutput::error(format!("Failed to press Enter: {error}"));
-                    }
-                    Err(message) => return ToolOutput::error(message),
-                }
-            }
-        }
-
-        ToolOutput::success(format!(
-            "Typed {} characters into '{}'",
-            input.text.len(),
-            input.selector
-        ))
+        };
+        type_selector(&guard.page, selector, &input.text, input.clear, timeout).await
     }
+}
+
+async fn type_selector(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    text: &str,
+    clear: bool,
+    timeout: Duration,
+) -> ToolOutput {
+    let Some(deadline) = checked_deadline(timeout) else {
+        return ToolOutput::error("Invalid timeout: duration exceeds the supported deadline range");
+    };
+
+    let selector_json = serde_json::to_string(selector).unwrap();
+    let element = match focus_element_until(page, selector, deadline).await {
+        Ok(element) => element,
+        Err(message) => return ToolOutput::error(message),
+    };
+
+    // Clear existing text if requested
+    if clear {
+        match operation_phase(
+            BrowserOperationPhase::TypeClear,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            page.evaluate(format!("document.querySelector({selector_json}).select()")),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return ToolOutput::error(format!("Failed to select text: {error}"));
+            }
+            Err(message) => return ToolOutput::error(message),
+        }
+        match operation_phase(
+            BrowserOperationPhase::TypeClear,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            element.press_key("Backspace"),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return ToolOutput::error(format!("Failed to clear text: {error}"));
+            }
+            Err(message) => return ToolOutput::error(message),
+        }
+    }
+
+    // Type the text using CDP keyboard events
+    // Handle newlines specially since type_str doesn't support them
+    let parts: Vec<&str> = text.split('\n').collect();
+    for (i, part) in parts.iter().enumerate() {
+        // Type the text part
+        if !part.is_empty() {
+            match operation_phase(
+                BrowserOperationPhase::TypeInput,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.type_str(part),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Type failed: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
+            }
+        }
+        // Add Enter between parts (not after last)
+        if i < parts.len() - 1 {
+            match operation_phase(
+                BrowserOperationPhase::TypeInput,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.press_key("Enter"),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Failed to press Enter: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
+            }
+        }
+    }
+
+    ToolOutput::success(format!(
+        "Typed {} characters into '{}'",
+        text.len(),
+        selector
+    ))
 }
 
 // ============================================================================

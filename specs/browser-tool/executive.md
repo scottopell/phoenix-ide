@@ -4,11 +4,11 @@
 
 The Phoenix Browser Tool enables AI agents to interact with web pages during development, testing, and debugging. Three user stories drive the scope: web development (navigate, screenshot, debug), automated testing (interact via click/type/JS, capture evidence), and PWA testing (service workers, offline mode — post-MVP).
 
-The core set covers navigation, JavaScript evaluation, screenshots, viewport control, console log capture with accurate object representation, and dedicated click/type/wait tools that reliably trigger framework event handlers. Browser availability is automatic — if no system browser is found, a compatible Chromium is downloaded and cached transparently. Post-MVP scope covers PWA-specific inspection (service workers, network sources, offline simulation) and network request capture.
+The core set covers navigation, JavaScript evaluation, screenshots, viewport control, console log capture with accurate object representation, accessibility snapshots, and dedicated click/type/wait tools that reliably trigger framework event handlers. Click/type accept CSS selectors or snapshot references. Browser availability is automatic — if no system browser is found, a compatible Chromium is downloaded and cached transparently. Post-MVP scope covers PWA-specific inspection (service workers, network sources, offline simulation) and network request capture.
 
 ## Technical Summary
 
-Built using the `chromiumoxide` crate for async CDP communication. Tools are stateless, receiving all context via `ToolContext`. The `ctx.browser()` method provides correct-by-construction session access — conversation ID is derived internally, preventing cross-session contamination.
+Built using the `chromiumoxide` crate for async CDP communication. Tools are stateless, receiving all context via `ToolContext`. The `ctx.browser()` method provides correct-by-construction session access — WorkScope identity is derived internally, preventing cross-session contamination.
 
 `BrowserSessionManager` maps `WorkScope` keys to Chrome instances (REQ-BROWSER-WS-001). Worktree-backed conversations share a single Chrome window across continuation members so context-exhaustion continuations inherit the same tabs, cookies, and dev-tools state; Direct conversations fall back to per-conversation scoping. Sessions auto-start on first `browser()` call and auto-clean after 30-minute idle. The resource-cleanup cascade tears the Chrome process down on archive/abandon/mark-merged/hard-delete using scope-equality preservation — the same shape as tmux (REQ-BROWSER-WS-003). When no system Chrome is present, `BrowserFetcher` downloads a compatible binary to `~/.cache/phoenix-ide/chromium/` and caches it for future runs.
 
@@ -39,6 +39,7 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-017:** React Component Access | ✅ Complete | `browser_inject_react_devtools` + `browser_remove_react_devtools`; `window.__phoenix` helper via `__REACT_DEVTOOLS_GLOBAL_HOOK__` |
 | **REQ-BT-018:** Live Browser View Side Panel | ✅ Complete | View-only CDP screencast relay via `/api/conversations/:id/browser-view` WS; mutex with prose/diff slot; auto-mount-when-empty on first `browser_*` tool |
 | **REQ-BT-019:** Systematic Web Performance Testing | 🟡 In Progress | `browser_profile` tool (action enum). Tier 0+1 + cheap Tier 2; lading-style scenario harness returns raw per-run samples (never averaged). Lifecycle in `browser-profiling.allium`. Network emulation deferred (REQ-BT-019-NG-NETEMU) |
+| **REQ-BT-025:** Accessibility Snapshots and Element References | ✅ Complete | `browser_snapshot`; main-document AX tree and interactive filtering; exact-node click/type refs; explicit limits and large-output artifacts. Eight rendering/schema/browser tests cover reference lifetime, native/React input, shadow roots, iframe exclusion, and hover replacement. |
 
 ### WorkScope Ownership
 
@@ -59,6 +60,6 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-023:** Multi-Context Console | ❌ Not Started | PWA-specific |
 | **REQ-BT-024:** Capture Network Requests | ❌ Not Started | API debugging |
 
-**Core Progress:** 18 of 18 complete (REQ-BT-019 performance suite in progress)
+**Core Progress:** 19 of 20 complete; performance suite in progress
 **WorkScope Progress:** 4 of 4 complete
-**Total Progress:** 22 of 28 complete
+**Total Progress:** 23 of 29 complete

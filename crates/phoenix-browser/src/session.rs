@@ -616,6 +616,7 @@ impl BrowserLaunchIdentity {
 
 /// Per-conversation browser instance
 pub struct BrowserSession {
+    pub(crate) snapshot: Option<crate::snapshot::SnapshotReferences>,
     #[allow(dead_code)] // Browser must stay alive
     browser: Browser,
     chrome_pid: Option<u32>,
@@ -938,6 +939,7 @@ impl BrowserSession {
             handler_task,
             console_task: None,
             profiling_tasks: Vec::new(),
+            snapshot: None,
             page,
             profiling: Arc::new(StdMutex::new(ProfilingState::default())),
             trace_complete: Arc::new(tokio::sync::Notify::new()),
