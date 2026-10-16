@@ -165,6 +165,10 @@ The system SHALL treat the migration-123 production baseline to the exact candid
 
 Before offline candidate migration is invoked, rollback MAY restore only the transaction-bound predecessor snapshot/runtime pair after proving unchanged source ledger and logical contents under exclusive offline ownership. At or after invocation, the system SHALL prohibit snapshot replay or predecessor startup, including after failed or interrupted migration, partial commits, or ambiguous reconciliation writes. Any committed migration or reconciliation write makes the predecessor database/runtime pair incompatible for automatic activation. This guarantee does not authorize downgrade, later-writer restore, mixed-version live operation, or compatibility for any other schema interval.
 
+WHEN a more-specific prepared-deployment requirement admits a source ledger already exactly equal to that migration-128 candidate registry,
+THE SYSTEM SHALL retain the same offline snapshot, mandatory candidate invocation, exact target verification, and post-invocation forward-only boundary
+AND SHALL treat that admission as one bounded prepared replacement, not as another schema interval or a generic cross-binary compatibility guarantee.
+
 ### REQ-COMP-013: Ordinary forward activation is not downgrade-safe after candidate start
 
 For the qualified ordinary in-place transition from the migration-123 baseline to the exact candidate migration-128 registry, the system SHALL treat the first candidate startup attempt as the conservative predecessor-compatibility boundary. Before that boundary, runtime artifact rollback MAY restart the unchanged predecessor database. At or after that boundary, failure or uncertainty SHALL retain the exact candidate and fail stopped/forward-only; it SHALL NOT infer predecessor compatibility from failed health, unchanged highest ledger, or absent production row evidence.

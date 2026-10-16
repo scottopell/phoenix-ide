@@ -116,8 +116,8 @@ THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an ol
 
 ### REQ-LDD-019: Explicit current-schema prepared-artifact mode
 
-**Condition:** When an authorized operator selects a prepared artifact to replace a production database at the qualified current-schema baseline,
-**System:** the deployment controller SHALL require an explicit current-schema mode distinct from paired legacy upgrade, preserve every prepared-artifact receipt/signature/identity check, bind the retained controller helper and candidate migration registry by exact path and SHA-256, reject release and runtime-only sources, and fail closed for a missing, unknown, mismatched, or newer migration ledger.
+**Condition:** When an authorized operator selects a prepared artifact to replace a production database whose complete ordered ledger is either the qualified migration-123 baseline or exactly equal to the qualified migration-128 candidate registry,
+**System:** the deployment controller SHALL require an explicit current-schema mode distinct from paired legacy upgrade, preserve every prepared-artifact receipt/signature/identity check, bind the retained controller helper and candidate migration registry by exact path and SHA-256, reject release and runtime-only sources, and fail closed for a missing, partial, unknown, mismatched, or newer migration ledger.
 
 **Rationale:** Relaxing the legacy eligibility gate would make incompatible database families indistinguishable and would weaken the signed-artifact handoff.
 
@@ -131,7 +131,7 @@ THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an ol
 ### REQ-LDD-021: Offline migration commit boundary and rollback prohibition
 
 **Condition:** When a qualified current-schema snapshot exists,
-**System:** the activation helper SHALL install the exact candidate binary, invoke that binary's bounded `--migrate-only` operation against the manifest-bound database while exclusive ownership remains proven, and verify the exact target ledger, SQLite integrity, and foreign keys before admitting candidate runtime traffic.
+**System:** the activation helper SHALL install the exact candidate binary, invoke that binary's bounded `--migrate-only` operation against the manifest-bound database while exclusive ownership remains proven, and verify the exact target ledger, SQLite integrity, and foreign keys before admitting candidate runtime traffic. It SHALL invoke that offline operation even when the admitted source ledger already equals the target registry, because candidate-owned reconciliation may write and invocation remains the irreversible forward boundary.
 
 **Condition:** When current-schema activation fails before offline candidate migration was invoked and the stopped, exclusively owned database retains the exact source ledger and logical contents,
 **System:** the activation helper MAY restore only the matching verified snapshot and predecessor binary/configuration, then SHALL verify predecessor identity before releasing ownership.
@@ -153,7 +153,7 @@ THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an ol
 
 ### REQ-LDD-023: Ordinary forward activation failure boundary
 
-**Condition:** When ordinary in-place launchd deployment detects the exact migration-123 baseline and exact migration-128 candidate registry qualified by [ADR-105](../adrs/105_qualify-migration-128-for-bounded-current-schema-activation.md) and REQ-COMP-012,
+**Condition:** When ordinary in-place launchd deployment detects the exact migration-123 baseline and exact migration-128 candidate registry defined by REQ-COMP-012,
 **System:** the controller SHALL retain the complete candidate registry and its SHA-256 digest as immutable transaction evidence bound to the exact candidate and helper without requiring a standalone database backup; SHALL re-verify that evidence before activation; SHALL reject any different, missing, or newer registry; and the helper SHALL preserve ordinary predecessor rollback only for failures before candidate startup is attempted.
 
 **Condition:** When candidate startup is attempted,

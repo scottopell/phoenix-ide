@@ -268,6 +268,19 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.assertEqual(ledger[-1], compiled_ledger(123)[-1])
         self.assertEqual(ledger, tuple(compiled_ledger(123)))
 
+    def test_exact_candidate_target_is_also_an_admitted_prepared_source(self) -> None:
+        database = self.database(through=128)
+
+        ledger = helper.validate_current_schema_database(database, self.registry)
+
+        self.assertEqual(ledger, tuple(compiled_ledger()))
+
+    def test_partial_target_is_not_an_admitted_prepared_source(self) -> None:
+        database = self.database(through=127)
+
+        with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
+            helper.validate_current_schema_database(database, self.registry)
+
     def test_qualified_registry_ends_at_product_creation_stage_migration(self) -> None:
         registry = helper.migration_registry(self.registry)
         self.assertEqual(
@@ -321,7 +334,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
 
     def test_unknown_newer_and_name_mismatched_ledgers_fail_closed(self) -> None:
         newer = self.database(through=124)
-        with self.assertRaisesRegex(helper.ActivationError, "supported current baseline"):
+        with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
             helper.validate_current_schema_database(newer, self.registry)
 
         mismatch = self.database()
@@ -329,7 +342,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             connection.execute(
                 "UPDATE _migrations SET name = 'forged' WHERE version = 123"
             )
-        with self.assertRaisesRegex(helper.ActivationError, "supported current baseline"):
+        with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
             helper.validate_current_schema_database(mismatch, self.registry)
 
     def test_actual_product_conversation_relationship_is_required(self) -> None:
@@ -726,6 +739,46 @@ sys.exit({7 if partial else 0})
         proof = json.loads(Path(manifest.current_schema_upgrade.proof_path).read_text())
         self.assertEqual(proof["migrated_ledger"], [list(item) for item in ledger])
         self.assertIn("migration_committed_at", proof)
+
+    def test_exact_target_source_still_invokes_offline_candidate(self) -> None:
+        database = self.database(through=128)
+        manifest = self.manifest(database)
+        current = manifest.current_schema_upgrade
+        assert current is not None
+        target = Path(manifest.target_binary)
+        target.write_text(
+            """#!/usr/bin/env python3
+import os, sqlite3
+connection = sqlite3.connect(os.environ['PHOENIX_DB_PATH'])
+connection.execute('CREATE TABLE same_schema_reconciliation (value TEXT NOT NULL)')
+connection.execute("INSERT INTO same_schema_reconciliation VALUES ('invoked')")
+connection.commit()
+connection.close()
+"""
+        )
+        target.chmod(0o755)
+        object.__setattr__(manifest, "candidate_binary_sha256", helper.sha256(target))
+        self.write_snapshot_proof(manifest)
+        reservation = self.migration_reservation(manifest)
+
+        with mock.patch.object(helper, "assert_database_exclusive"):
+            helper.run_current_schema_migration(manifest, reservation)
+
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM same_schema_reconciliation"
+                ).fetchone(),
+                ("invoked",),
+            )
+        proof = json.loads(Path(current.proof_path).read_text())
+        target_ledger = [list(item) for item in compiled_ledger()]
+        self.assertEqual(proof["source_ledger"], target_ledger)
+        self.assertEqual(proof["target_ledger"], target_ledger)
+        self.assertEqual(proof["migrated_ledger"], target_ledger)
+        self.assertNotEqual(
+            proof["source_logical_digest"], proof["migrated_logical_digest"]
+        )
 
     def test_post_migration_growth_cannot_exceed_reserved_capacity(self) -> None:
         database = self.database()
