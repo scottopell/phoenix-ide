@@ -48,3 +48,5 @@ Named session selection does not read the fallback working directory. Oversized 
 Nested cross-site target teardown retires descendant sessions and their pending barriers together. Deterministic subtree ownership and native repeated A→B→A frame navigation regressions cover this cleanup boundary.
 
 Open revalidates its snapshot document/generation after later observations and reports invalidation as a partial snapshot failure. Native-input paths share the guard cleanup lease; ordinary rejection awaits disarming. Heap-diff failure retains the completed post capture. Daemon readiness receives its own startup budget, and failed readiness terminates and reaps the unready child.
+
+Typed evaluation uses one shared value producer and separate Phoenix-text/CLI-data renderers. CLI JSON retains native JSON values, distinguishes undefined and non-JSON scalars, and identifies JSON/text artifacts for outputs above 4 KiB. Evaluation data bypasses generic artifact extraction, preserving user object keys such as `path`, `post`, and `artifact_path`. Human output renders the authoritative value or artifact handle.

@@ -190,12 +190,105 @@ fn chrome_enabled() -> bool {
 }
 
 fn evaluation_value(response: &Value) -> Value {
-    let text = response["result"]["text"].as_str().unwrap();
-    let value = text
-        .strip_prefix("<javascript_result>")
-        .and_then(|text| text.strip_suffix("</javascript_result>"))
-        .unwrap_or(text);
-    serde_json::from_str(value).unwrap()
+    assert_eq!(response["result"]["data"]["kind"], "json", "{response}");
+    response["result"]["data"]["value"].clone()
+}
+
+#[test]
+fn eval_returns_typed_values_without_reinterpreting_user_objects() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    cli.ok(&["open", "data:text/html,<title>Typed evaluation</title>"]);
+    for (expression, expected) in [
+        ("42", json!(42)),
+        ("'hello'", json!("hello")),
+        ("true", json!(true)),
+        ("null", Value::Null),
+        ("[1, false, null, {nested: ['value']}]", json!([1, false, null, {"nested":["value"]}])),
+        ("Promise.resolve({answer:42})", json!({"answer":42})),
+        ("({path:'/user/path', post:'/user/post', artifact_path:'/user/artifact', raw_samples:[{path:'user'}]})", json!({"path":"/user/path", "post":"/user/post", "artifact_path":"/user/artifact", "raw_samples":[{"path":"user"}]})),
+        ("window.evalCount = (window.evalCount || 0) + 1; ({count:window.evalCount})", json!({"count":1})),
+    ] {
+        let response = cli.ok(&["eval", expression]);
+        assert_eq!(evaluation_value(&response), expected);
+        assert_eq!(response["result"]["artifacts"], json!([]));
+        assert_eq!(response["result"]["text"], "JavaScript evaluated");
+    }
+    let human = |expression: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"))
+            .env("PHOENIX_BROWSER_RUNTIME_DIR", cli.directory.path())
+            .env("PHOENIX_TMP_DIR", cli.directory.path().join("scratch"))
+            .args(["--session", "integration", "eval", expression])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(human("({answer:42})"), "{\n  \"answer\": 42\n}\n");
+    assert_eq!(human("undefined"), "undefined\n");
+    assert_eq!(human("123n"), "123n\n");
+    let large_human = human("'x'.repeat(5000)");
+    let human_path = large_human
+        .trim()
+        .strip_prefix("Output written to ")
+        .unwrap()
+        .strip_suffix(" (JSON)")
+        .unwrap();
+    cli.artifacts
+        .lock()
+        .unwrap()
+        .push(PathBuf::from(human_path));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(human_path).unwrap()).unwrap(),
+        json!("x".repeat(5000))
+    );
+    let undefined = cli.ok(&["eval", "undefined"]);
+    assert_eq!(undefined["result"]["data"], json!({"kind":"undefined"}));
+    for expression in ["123n", "NaN", "Infinity", "-Infinity", "-0"] {
+        let response = cli.ok(&["eval", expression]);
+        assert_eq!(
+            response["result"]["data"],
+            json!({"kind":"unserializable", "value":expression})
+        );
+    }
+    let large = cli.ok(&["eval", "({nested: ['x'.repeat(5000)]})"]);
+    assert_eq!(large["result"]["data"], json!({"kind":"json_artifact"}));
+    let paths = large["result"]["artifacts"].as_array().unwrap();
+    assert_eq!(paths.len(), 1);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(paths[0].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(saved, json!({"nested":["x".repeat(5000)]}));
+    let large_scalar = cli.ok(&["eval", "BigInt('9'.repeat(5000))"]);
+    assert_eq!(
+        large_scalar["result"]["data"],
+        json!({"kind":"unserializable_artifact"})
+    );
+    let scalar_path = large_scalar["result"]["artifacts"][0].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(scalar_path).unwrap(),
+        format!("{}n", "9".repeat(5000))
+    );
+    let error = cli.invoke(
+        &["eval", "throw new Error('typed-eval-marker')"],
+        None,
+        false,
+    );
+    assert_eq!(error["error"]["code"], "operation_failed");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("typed-eval-marker"));
+    let function = cli.invoke(&["eval", "() => 42"], None, false);
+    assert!(function["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("function object"));
 }
 
 fn live_resources(cli: &BrowserCli) -> (PathBuf, ProcessIdentity) {

@@ -9,7 +9,9 @@
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, RemoteObjectType};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    EvaluateParams, RemoteObjectSubtype, RemoteObjectType,
+};
 use chromiumoxide::page::ScreenshotParams;
 use phoenix_browser::snapshot::BrowserTarget;
 use phoenix_browser::BrowserSession;
@@ -240,98 +242,147 @@ impl Tool for BrowserEvalTool {
     }
 }
 
+/// The value produced by one JavaScript evaluation, before harness-specific rendering.
+#[derive(Debug)]
+pub enum BrowserEvaluation {
+    Json(Value),
+    Undefined,
+    Unserializable(String),
+    JsonArtifact(SavedEvaluationArtifact),
+    UnserializableArtifact(SavedEvaluationArtifact),
+}
+
+/// A result artifact successfully written by the evaluator.
+#[derive(Debug)]
+pub struct SavedEvaluationArtifact(String);
+
+impl SavedEvaluationArtifact {
+    #[must_use]
+    pub fn into_path(self) -> String {
+        self.0
+    }
+}
+
+impl BrowserEvaluation {
+    fn into_tool_output(self) -> ToolOutput {
+        let text = match self {
+            Self::Json(value) => {
+                serde_json::to_string_pretty(&value).expect("JSON values serialize")
+            }
+            Self::Undefined => "undefined".into(),
+            Self::Unserializable(value) => value,
+            Self::JsonArtifact(artifact) | Self::UnserializableArtifact(artifact) => {
+                let path = artifact.into_path();
+                return ToolOutput::success(format!(
+                    "Output written to {path} (use `cat` to view)"
+                ))
+                .with_display(json!({"artifact_path": path}));
+            }
+        };
+        ToolOutput::success(format!("<javascript_result>{text}</javascript_result>"))
+    }
+}
+
+async fn save_evaluation_output(
+    text: &str,
+    extension: &str,
+) -> Result<SavedEvaluationArtifact, String> {
+    let path = format!(
+        "/tmp/phoenix-js-result-{}.{extension}",
+        uuid::Uuid::new_v4()
+    );
+    tokio::fs::write(&path, text)
+        .await
+        .map_err(|error| format!("Failed to write large output: {error}"))?;
+    Ok(SavedEvaluationArtifact(path))
+}
+
 impl BrowserEvalTool {
     pub(super) async fn run_browser(
         input: Value,
         access: &(impl super::BrowserAccess + ?Sized),
     ) -> ToolOutput {
-        let input: EvalInput = match serde_json::from_value(input) {
-            Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
-        };
+        match Self::evaluate(input, access).await {
+            Ok(value) => value.into_tool_output(),
+            Err(error) => ToolOutput::error(error),
+        }
+    }
 
+    /// Evaluate once and retain the JavaScript value's type for the calling harness.
+    ///
+    /// # Errors
+    /// Returns input, browser, evaluation, or output-file errors.
+    pub async fn evaluate(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> Result<BrowserEvaluation, String> {
+        let input: EvalInput =
+            serde_json::from_value(input).map_err(|error| format!("Invalid input: {error}"))?;
         let timeout = input
             .timeout
             .as_deref()
             .and_then(parse_duration)
             .unwrap_or(DEFAULT_TIMEOUT);
-
-        // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-        };
-
+        let session = access
+            .browser()
+            .await
+            .map_err(|error| format!("Failed to get browser: {error}"))?;
         let mut guard = session.write().await;
         guard.last_activity = std::time::Instant::now();
-
-        // Evaluate JavaScript with timeout.
-        // Use EvaluateParams directly instead of wrapping in an async IIFE —
-        // the IIFE approach returns a Promise that CDP must await AND serialize,
-        // which may silently fail on complex pages. Direct evaluation with
-        // await_promise set via CDP is more reliable and explicit.
         let params = EvaluateParams::builder()
             .expression(&input.expression)
             .await_promise(input.r#await)
             .build()
-            .unwrap();
-
+            .map_err(|error| format!("Invalid evaluation parameters: {error}"))?;
         let result = operation_phase(
             BrowserOperationPhase::Evaluation,
             timeout,
             guard.page.evaluate(params),
         )
-        .await;
-
-        match result {
-            Ok(Ok(eval_result)) => {
-                let json_str = if let Some(v) = eval_result.value() {
-                    serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".to_string())
-                } else {
-                    // Log the full RemoteObject so we can diagnose why value is None
-                    let obj = eval_result.object();
-                    tracing::warn!(
-                        r#type = ?obj.r#type,
-                        subtype = ?obj.subtype,
-                        class_name = ?obj.class_name,
-                        description = ?obj.description,
-                        has_object_id = obj.object_id.is_some(),
-                        expression = %input.expression,
-                        await_mode = input.r#await,
-                        "browser_eval: value() returned None"
-                    );
-                    if obj.r#type == RemoteObjectType::Function {
-                        return ToolOutput::error(format!(
-                            "Expression evaluated to a function object, not a value. \
-                             The expression `{}` defines a function but does not call it. \
-                             To get a value, either write the expression directly \
-                             (e.g. `typeof window.__phoenix`) or wrap it as an IIFE \
-                             (e.g. `(() => typeof window.__phoenix)()`). \
-                             Playwright-style `() => expr` syntax does not work with browser_eval.",
-                            input.expression
-                        ));
-                    }
-                    "undefined".to_string()
-                };
-
-                // Check if output is large
-                if json_str.len() > 4096 {
-                    // Write to temp file
-                    let path = format!("/tmp/phoenix-js-result-{}.json", uuid::Uuid::new_v4());
-                    if let Err(e) = tokio::fs::write(&path, &json_str).await {
-                        return ToolOutput::error(format!("Failed to write large output: {e}"));
-                    }
-                    ToolOutput::success(format!("Output written to {path} (use `cat` to view)"))
-                        .with_display(json!({"artifact_path": path}))
-                } else {
-                    ToolOutput::success(format!(
-                        "<javascript_result>{json_str}</javascript_result>"
-                    ))
-                }
-            }
-            Ok(Err(e)) => ToolOutput::error(format!("JavaScript error: {e}")),
-            Err(error) => ToolOutput::error(error),
+        .await?
+        .map_err(|error| format!("JavaScript error: {error}"))?;
+        let object = result.object();
+        if object.r#type == RemoteObjectType::Function {
+            return Err(format!(
+                "Expression evaluated to a function object, not a value. \
+                 The expression `{}` defines a function but does not call it. \
+                 To get a value, either write the expression directly \
+                 (e.g. `typeof window.__phoenix`) or wrap it as an IIFE \
+                 (e.g. `(() => typeof window.__phoenix)()`). \
+                 Playwright-style `() => expr` syntax does not work with browser_eval.",
+                input.expression
+            ));
         }
+        if let Some(value) = &object.unserializable_value {
+            let text = value.inner().clone();
+            return if text.len() > 4096 {
+                Ok(BrowserEvaluation::UnserializableArtifact(
+                    save_evaluation_output(&text, "txt").await?,
+                ))
+            } else {
+                Ok(BrowserEvaluation::Unserializable(text))
+            };
+        }
+        if let Some(value) = result.value() {
+            let text = serde_json::to_string_pretty(value)
+                .map_err(|error| format!("Failed to serialize JavaScript result: {error}"))?;
+            if text.len() > 4096 {
+                return Ok(BrowserEvaluation::JsonArtifact(
+                    save_evaluation_output(&text, "json").await?,
+                ));
+            }
+            return Ok(BrowserEvaluation::Json(value.clone()));
+        }
+        if object.subtype == Some(RemoteObjectSubtype::Null) {
+            return Ok(BrowserEvaluation::Json(Value::Null));
+        }
+        if object.r#type == RemoteObjectType::Undefined {
+            return Ok(BrowserEvaluation::Undefined);
+        }
+        Err(format!(
+            "JavaScript result cannot be represented as JSON: {:?}",
+            object.r#type
+        ))
     }
 }
 

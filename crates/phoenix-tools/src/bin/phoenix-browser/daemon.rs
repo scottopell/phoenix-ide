@@ -6,7 +6,8 @@ use fs2::FileExt;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_tools::browser::{
-    BrowserAccess, BrowserOperation, BrowserSession, BrowserSessionManager,
+    BrowserAccess, BrowserEvalTool, BrowserEvaluation, BrowserOperation, BrowserSession,
+    BrowserSessionManager,
 };
 use phoenix_tools::{ToolImage, ToolOutput};
 use serde_json::{json, Value};
@@ -506,6 +507,51 @@ impl State {
             browser_lifetime,
         } = ready;
         let access = Existing(browser.clone());
+        if *operation == BrowserOperation::Eval {
+            let response = match BrowserEvalTool::evaluate(request.input.clone(), &access).await {
+                Ok(value) => {
+                    let (text, data, artifacts) = match value {
+                        BrowserEvaluation::Json(value) => (
+                            "JavaScript evaluated",
+                            json!({"kind":"json", "value":value}),
+                            Vec::new(),
+                        ),
+                        BrowserEvaluation::Undefined => (
+                            "JavaScript returned undefined",
+                            json!({"kind":"undefined"}),
+                            Vec::new(),
+                        ),
+                        BrowserEvaluation::Unserializable(value) => (
+                            "JavaScript returned a non-JSON value",
+                            json!({"kind":"unserializable", "value":value}),
+                            Vec::new(),
+                        ),
+                        BrowserEvaluation::UnserializableArtifact(path) => (
+                            "JavaScript non-JSON result saved to artifact",
+                            json!({"kind":"unserializable_artifact"}),
+                            vec![path.into_path()],
+                        ),
+                        BrowserEvaluation::JsonArtifact(path) => (
+                            "JavaScript result saved to artifact",
+                            json!({"kind":"json_artifact"}),
+                            vec![path.into_path()],
+                        ),
+                    };
+                    Response::success(
+                        &self.session,
+                        Some(&self.lifetime),
+                        json!({"kind":"evaluation","text":text,"data":data,"artifacts":artifacts}),
+                    )
+                }
+                Err(error) => Response::error(
+                    &self.session,
+                    Some(&self.lifetime),
+                    ErrorCode::OperationFailed,
+                    error,
+                ),
+            };
+            return response.with_browser_lifetime(Some(browser_lifetime.clone()));
+        }
         let console_capture = if request.command == "open" {
             Some(
                 browser

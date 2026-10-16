@@ -639,6 +639,42 @@ fn print_response(response: &Response, json_mode: bool) {
         return;
     }
     match &response.outcome {
+        Outcome::Success { result } if result["kind"] == "evaluation" => {
+            match result["data"]["kind"].as_str() {
+                Some("json") => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result["data"]["value"])
+                        .expect("JSON value serializes")
+                ),
+                Some("undefined") => println!("undefined"),
+                Some("unserializable") => println!(
+                    "{}",
+                    result["data"]["value"]
+                        .as_str()
+                        .expect("non-JSON value text")
+                ),
+                Some(kind @ ("json_artifact" | "unserializable_artifact")) => {
+                    let format = if kind == "json_artifact" {
+                        "JSON"
+                    } else {
+                        "JavaScript scalar text"
+                    };
+                    for path in result["artifacts"]
+                        .as_array()
+                        .expect("evaluation artifacts")
+                    {
+                        println!(
+                            "Output written to {} ({format})",
+                            path.as_str().expect("artifact path")
+                        );
+                    }
+                }
+                _ => println!(
+                    "{}",
+                    serde_json::to_string_pretty(result).expect("result serializes")
+                ),
+            }
+        }
         Outcome::Success { result } if result.get("navigation").is_some() => {
             println!(
                 "{} — {}",

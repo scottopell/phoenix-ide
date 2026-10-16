@@ -121,6 +121,15 @@ THE SYSTEM SHALL expose navigation, accessibility snapshots, JavaScript evaluati
 THE SYSTEM SHALL accept both accessibility references and CSS selectors for click and text input under REQ-BT-008, REQ-BT-009, and REQ-BT-025
 AND SHALL support `eval --stdin` for JavaScript input.
 
+WHEN `eval` returns a JSON-representable value
+THE SYSTEM SHALL expose that value as typed JSON in machine-readable output without requiring callers to parse a text wrapper.
+
+THE SYSTEM SHALL distinguish JavaScript `undefined` and non-JSON scalar values from JSON `null`
+AND SHALL preserve user-returned object keys as data, including names also used for artifact metadata.
+
+WHEN an evaluation result is externalized under REQ-BT-002
+THE SYSTEM SHALL identify the artifact's encoding and expose its saved handle explicitly.
+
 THE SYSTEM SHALL preserve profiling readiness boundaries, reset and warmup behavior, raw per-run samples, unavailable/null distinctions, warnings, and artifacts under REQ-BT-019
 AND SHALL preserve structured failure data, including blocked-step and methodology information, when the operation fails.
 

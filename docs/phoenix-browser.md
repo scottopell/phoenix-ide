@@ -45,6 +45,14 @@ Console capture includes errors from new child frames, including isolated cross-
 
 Use `schema [COMMAND]` for the full operation parameters. Each command accepts `--input '{...}'`; this is especially useful for profiling. `--timeout 15s` controls operations that accept a timeout.
 
+`eval --json` returns `result.kind = "evaluation"`. Its `result.data` contains `{"kind":"json","value":...}` for JSON values, including `null`, or `{"kind":"undefined"}` for JavaScript `undefined`. Non-JSON scalars such as `NaN`, `Infinity`, `-0`, and BigInt use `{"kind":"unserializable","value":"..."}` with their JavaScript spelling. Returned object keys remain ordinary data, even when named `path` or `post`.
+
+```sh
+phoenix-browser --json eval '({title: document.title})' | jq '.result.data.value'
+```
+
+Results larger than 4 KiB use `json_artifact` or `unserializable_artifact` instead, with the saved path in `result.artifacts`: read the former as JSON and the latter as UTF-8 JavaScript scalar text. Human-readable eval output prints the value directly or the saved path.
+
 Use `--` before positional text that matches an option, for example `phoenix-browser type '#field' -- '--json'`.
 
 The complete encoded JSON request, including framing, must fit within 32 MiB. Quotes, backslashes, and the request envelope reduce the usable raw expression budget. Oversized input fails before connecting to a session. Inline images become file artifacts; an existing artifact is reused only after its bytes are verified.

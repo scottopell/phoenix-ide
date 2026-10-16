@@ -330,6 +330,22 @@ async fn test_browser_eval_local() {
         result.output()
     );
 
+    for (expression, rendered) in [
+        ("null", "null"),
+        ("undefined", "undefined"),
+        ("123n", "123n"),
+    ] {
+        let result = eval_tool
+            .run(json!({"expression":expression}), ctx.clone())
+            .await;
+        assert!(result.is_success(), "{expression}: {}", result.output());
+        assert_eq!(
+            result.output(),
+            format!("<javascript_result>{rendered}</javascript_result>")
+        );
+        assert!(result.display_data().is_none());
+    }
+
     let resize = BrowserResizeTool
         .run(json!({"width": 1024, "height": 768}), ctx.clone())
         .await;
