@@ -181,7 +181,7 @@ fn render(
             }
         }
     }
-    if count == 0 {
+    if count == 0 && !output.ends_with(TRUNCATED) {
         output.push_str("(no matching accessible nodes)\n");
     }
     (output, refs)
@@ -477,6 +477,7 @@ mod tests {
         assert!(output.contains(TRUNCATED));
         assert!(output.len() <= MAX_BYTES);
         assert!(refs.nodes.is_empty());
+        assert!(!output.contains("no matching accessible nodes"));
     }
 
     #[test]
