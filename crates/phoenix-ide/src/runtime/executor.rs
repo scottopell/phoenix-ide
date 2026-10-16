@@ -8666,6 +8666,7 @@ where
                     .get_work_scope_legacy_conversation_id(scope_id)
                     .await?
             }
+            phoenix_core::work_scope::ResourceScopeKey::Unattached(id) => Some(id.clone()),
             phoenix_core::work_scope::ResourceScopeKey::Coordinator
             | phoenix_core::work_scope::ResourceScopeKey::GlobalTerminal => None,
         };

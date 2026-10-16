@@ -970,7 +970,7 @@ impl RuntimeManager {
         };
         let legacy_conversation_id = self
             .db()
-            .get_work_scope_legacy_conversation_id(scope)
+            .get_work_scope_legacy_conversation_id(&scope)
             .await
             .map_err(|error| error.to_string())?;
         let key = ResourceScopeKey::Work(scope.clone());
