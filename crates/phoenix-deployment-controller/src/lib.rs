@@ -1,6 +1,6 @@
 //! Standalone deployment policy with checkpoint-before-effect authority.
 //!
-//! The controller-owned `SQLite` store supports only its exact schema v3. Each
+//! The controller-owned `SQLite` store supports only its exact schema v4. Each
 //! durable write compares and advances the attempt revision atomically. Successful
 //! persistence returns a checkpoint carrying that revision plus its OS effects;
 //! failures drop the transition and poison the store handle until reopen.
@@ -70,7 +70,8 @@ pub use runtime::{
 };
 pub use state::sqlite::{
     ControllerSqliteStore, ControllerStoreError, NativeSamplingCompletion, NativeSamplingDispatch,
-    NativeSamplingIssue, NativeSamplingStatus, VerifiedNativeSamplingCompletion,
+    NativeSamplingIssue, NativeSamplingStatus, VerifiedNativeSamplingAckConfirmation,
+    VerifiedNativeSamplingCompletion,
 };
 pub use state::{
     ActiveAttempt, AdministrativeRiskAcceptance, AttemptId, AttemptStore, CleanupOutcome,

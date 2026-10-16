@@ -48,7 +48,7 @@ fn setup(path: &std::path::Path) -> (ControllerSqliteStore, PolicyLoop) {
 }
 
 #[test]
-fn schema_v3_is_empty_and_v2_is_rejected_without_mutating_it() {
+fn schema_v4_is_empty_and_v3_is_rejected_without_mutating_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fresh.sqlite");
     let store = ControllerSqliteStore::open(&path).unwrap();
@@ -57,9 +57,13 @@ fn schema_v3_is_empty_and_v2_is_rejected_without_mutating_it() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
-    for table in ["native_sampling_issues", "native_sampling_applications"] {
+    for table in [
+        "native_sampling_issues",
+        "native_sampling_applications",
+        "native_sampling_ack_confirmations",
+    ] {
         assert_eq!(
             raw.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
                 .get::<_, i64>(0))
@@ -67,13 +71,27 @@ fn schema_v3_is_empty_and_v2_is_rejected_without_mutating_it() {
             0
         );
     }
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('native_sampling_ack_requires_successful_sample','native_sampling_confirmed_application_is_immutable')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2
+    );
     let old = dir.path().join("old.sqlite");
     let raw = Connection::open(&old).unwrap();
-    raw.execute_batch("CREATE TABLE marker (sentinel TEXT); INSERT INTO marker VALUES ('untouched'); PRAGMA user_version=2;").unwrap();
+    raw.execute_batch(include_str!("fixtures/controller_v3.sql"))
+        .unwrap();
+    raw.execute_batch(
+        "CREATE TABLE marker (sentinel TEXT); INSERT INTO marker VALUES ('untouched');",
+    )
+    .unwrap();
     drop(raw);
     assert!(matches!(
         ControllerSqliteStore::open(&old),
-        Err(ControllerStoreError::UnsupportedSchema(2))
+        Err(ControllerStoreError::UnsupportedSchema(3))
     ));
     let raw = Connection::open(&old).unwrap();
     assert_eq!(
@@ -84,7 +102,16 @@ fn schema_v3_is_empty_and_v2_is_rejected_without_mutating_it() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='native_sampling_ack_confirmations'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
     );
 }
 
@@ -160,6 +187,10 @@ fn sqlite_enforces_native_issue_identity_and_total_outcome_shape() {
     raw.pragma_update(None, "foreign_keys", true).unwrap();
     let id = 9_u128.to_be_bytes();
     let revision = 1_u64.to_be_bytes();
+    assert!(raw.execute(
+        "INSERT INTO native_sampling_ack_confirmations (attempt_id,dispatch_revision,ordinal,applying_revision,confirming_session_generation) VALUES (?1,?2,0,?3,?4)",
+        rusqlite::params![id.as_slice(), revision.as_slice(), 2_u64.to_be_bytes().as_slice(), 1_u64.to_be_bytes().as_slice()],
+    ).is_err());
     for (ordinal, generation, sequence) in [(1, 1_u64, 0_u64), (0, 2, 1), (0, 1, 0)] {
         assert!(raw
             .execute(

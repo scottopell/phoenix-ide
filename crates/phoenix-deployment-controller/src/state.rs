@@ -247,6 +247,11 @@ impl LoadedAttempt {
     }
 
     #[must_use]
+    pub const fn deadline(&self) -> MonotonicTick {
+        self.checkpoint.deadline()
+    }
+
+    #[must_use]
     pub const fn phase(&self) -> Phase {
         self.checkpoint.phase()
     }

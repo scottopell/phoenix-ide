@@ -114,6 +114,54 @@ impl VerifiedNativeSamplingCompletion {
     }
 }
 
+/// Affine confirmation proof minted only after a correlated positive guardian response.
+/// Stored diagnostics and wire DTOs cannot construct this value.
+#[derive(Debug)]
+pub struct VerifiedNativeSamplingAckConfirmation {
+    issue: NativeSamplingIssue,
+    sample: ResourceSample,
+    applying_revision: PersistenceRevision,
+    confirming_session_generation: NonZeroU64,
+}
+
+impl VerifiedNativeSamplingAckConfirmation {
+    pub(crate) const fn new(
+        issue: NativeSamplingIssue,
+        sample: ResourceSample,
+        applying_revision: PersistenceRevision,
+        confirming_session_generation: NonZeroU64,
+    ) -> Self {
+        Self {
+            issue,
+            sample,
+            applying_revision,
+            confirming_session_generation,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        NativeSamplingIssue,
+        ResourceSample,
+        PersistenceRevision,
+        NonZeroU64,
+    ) {
+        let Self {
+            issue,
+            sample,
+            applying_revision,
+            confirming_session_generation,
+        } = self;
+        (
+            issue,
+            sample,
+            applying_revision,
+            confirming_session_generation,
+        )
+    }
+}
+
 /// Durable diagnostic classification; loading it never reconstructs authority.
 ///
 /// ```compile_fail
@@ -129,6 +177,12 @@ pub enum NativeSamplingStatus {
         issue: NativeSamplingIssue,
         sample: ResourceSample,
         applying_revision: PersistenceRevision,
+    },
+    SampleAckConfirmed {
+        issue: NativeSamplingIssue,
+        sample: ResourceSample,
+        applying_revision: PersistenceRevision,
+        confirming_session_generation: NonZeroU64,
     },
     ParkedRetained {
         issue: NativeSamplingIssue,
@@ -270,6 +324,68 @@ impl ControllerSqliteStore {
         result
     }
 
+    /// Atomically confirms an authenticated, positively acknowledged successful sample.
+    /// # Errors
+    /// Any mismatch, duplicate, or ambiguous write poisons this handle.
+    pub fn confirm_native_sampling_ack(
+        &mut self,
+        verified: VerifiedNativeSamplingAckConfirmation,
+    ) -> Result<NativeSamplingStatus> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let (issue, sample, applying_revision, confirming_session_generation) =
+                verified.into_parts();
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            let binding = required(
+                read_binding(&tx, issue.key.attempt_id())?,
+                "missing binding",
+            )?;
+            let header = required(
+                read_header(&tx, &key(issue.key.attempt_id()))?,
+                "missing attempt",
+            )?;
+            if binding.identity() != issue.guardian_identity
+                || binding.current_session().generation != confirming_session_generation
+                || confirming_session_generation < issue.session_generation
+                || !matches!(
+                    binding.current_session().state,
+                    NativeSessionState::Active | NativeSessionState::Reconciling
+                )
+                || binding.deadline() != header.deadline
+                || header.revision < applying_revision
+                || read_status(&tx, issue.key)?
+                    != Some(NativeSamplingStatus::AppliedPendingAck {
+                        issue,
+                        sample,
+                        applying_revision,
+                    })
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            let (id, revision, ordinal) = issue_params(issue);
+            tx.execute("INSERT INTO native_sampling_ack_confirmations (attempt_id,dispatch_revision,ordinal,applying_revision,confirming_session_generation) VALUES (?1,?2,?3,?4,?5)",
+                params![id, revision, ordinal, Word(applying_revision.get()), Word(confirming_session_generation.get())])?;
+            let status = NativeSamplingStatus::SampleAckConfirmed {
+                issue,
+                sample,
+                applying_revision,
+                confirming_session_generation,
+            };
+            if read_status(&tx, issue.key)? != Some(status) {
+                return malformed("native confirmation did not round-trip");
+            }
+            tx.commit()?;
+            Ok(status)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     pub(crate) fn persist_native_sampling(
         &mut self,
         checkpoint: &DeploymentAttempt,
@@ -350,15 +466,16 @@ fn read_status(
     let ordinal =
         i64::try_from(dispatch.ordinal()).map_err(|_| ControllerStoreError::RevisionConflict)?;
     let row = connection.query_row(
-        "SELECT i.session_generation,i.sequence,a.applying_revision,a.outcome,a.available_memory,a.available_storage,a.cpu,a.pressure FROM native_sampling_issues i LEFT JOIN native_sampling_applications a ON a.attempt_id=i.attempt_id AND a.dispatch_revision=i.dispatch_revision AND a.ordinal=i.ordinal WHERE i.attempt_id=?1 AND i.dispatch_revision=?2 AND i.ordinal=?3",
+        "SELECT i.session_generation,i.sequence,a.applying_revision,a.outcome,a.available_memory,a.available_storage,a.cpu,a.pressure,c.confirming_session_generation FROM native_sampling_issues i LEFT JOIN native_sampling_applications a ON a.attempt_id=i.attempt_id AND a.dispatch_revision=i.dispatch_revision AND a.ordinal=i.ordinal LEFT JOIN native_sampling_ack_confirmations c ON c.attempt_id=i.attempt_id AND c.dispatch_revision=i.dispatch_revision AND c.ordinal=i.ordinal WHERE i.attempt_id=?1 AND i.dispatch_revision=?2 AND i.ordinal=?3",
         params![id, Word(dispatch.revision().get()), ordinal], |row| Ok((
             row.get::<_, Word>(0)?.0, row.get::<_, Word>(1)?.0,
             row.get::<_, Option<Word>>(2)?, row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<Word>>(4)?, row.get::<_, Option<Word>>(5)?,
-            row.get::<_, Option<i64>>(6)?, row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<i64>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<Word>>(8)?,
         ))
     ).optional()?;
-    let Some((generation, sequence, applying, outcome, memory, storage, cpu, pressure)) = row
+    let Some((generation, sequence, applying, outcome, memory, storage, cpu, pressure, confirming)) =
+        row
     else {
         return Ok(None);
     };
@@ -392,7 +509,8 @@ fn read_status(
         return malformed("invalid native issue revision");
     }
     let Some(applying) = applying else {
-        if outcome.is_some()
+        if confirming.is_some()
+            || outcome.is_some()
             || memory.is_some()
             || storage.is_some()
             || cpu.is_some()
@@ -446,15 +564,46 @@ fn read_status(
         return malformed("failure with sample columns");
     }
     Ok(Some(match completion {
-        NativeSamplingCompletion::Sample(sample) => NativeSamplingStatus::AppliedPendingAck {
-            issue,
-            sample,
-            applying_revision,
-        },
-        NativeSamplingCompletion::Failure(failure) => NativeSamplingStatus::ParkedRetained {
-            issue,
-            failure,
-            applying_revision,
-        },
+        NativeSamplingCompletion::Sample(sample) => {
+            if let Some(generation) = confirming {
+                let confirming_session_generation =
+                    required(NonZeroU64::new(generation.0), "zero confirming generation")?;
+                if confirming_session_generation < issue.session_generation() {
+                    return malformed("confirming session predates native issue");
+                }
+                let confirming_session = required(
+                    binding
+                        .sessions()
+                        .iter()
+                        .find(|s| s.generation == confirming_session_generation),
+                    "missing confirming session",
+                )?;
+                if confirming_session.interruption_revision > header.revision {
+                    return malformed("invalid confirming session revision");
+                }
+                NativeSamplingStatus::SampleAckConfirmed {
+                    issue,
+                    sample,
+                    applying_revision,
+                    confirming_session_generation,
+                }
+            } else {
+                NativeSamplingStatus::AppliedPendingAck {
+                    issue,
+                    sample,
+                    applying_revision,
+                }
+            }
+        }
+        NativeSamplingCompletion::Failure(failure) => {
+            if confirming.is_some() {
+                return malformed("confirmed failed native sample");
+            }
+            NativeSamplingStatus::ParkedRetained {
+                issue,
+                failure,
+                applying_revision,
+            }
+        }
     }))
 }

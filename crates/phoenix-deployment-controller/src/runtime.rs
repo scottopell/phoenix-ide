@@ -1401,7 +1401,7 @@ mod native_sampling_tests {
         ProcessIdentity, ResourceCapacity, ResourceContention, ResourceObservationFailure,
         ResourcePolicy, ResourceSample, VerifiedNativeSamplingCompletion,
     };
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
     fn identity(pid: u32) -> ProcessIdentity {
         ProcessIdentity::new(
@@ -1410,8 +1410,9 @@ mod native_sampling_tests {
         )
     }
 
-    fn setup() -> (crate::ControllerSqliteStore, PolicyLoop) {
-        let mut store = crate::ControllerSqliteStore::in_memory().unwrap();
+    fn setup_with_store(
+        mut store: crate::ControllerSqliteStore,
+    ) -> (crate::ControllerSqliteStore, PolicyLoop) {
         let policy = ResourcePolicy::new(
             NonZeroUsize::new(2).unwrap(),
             0,
@@ -1440,6 +1441,10 @@ mod native_sampling_tests {
             )
             .unwrap();
         (store, PolicyLoop::from_committed(committed))
+    }
+
+    fn setup() -> (crate::ControllerSqliteStore, PolicyLoop) {
+        setup_with_store(crate::ControllerSqliteStore::in_memory().unwrap())
     }
 
     fn sample(sequence: u64) -> ResourceSample {
@@ -1510,6 +1515,205 @@ mod native_sampling_tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn native_ack_confirmation_is_atomic_exact_and_nonrepeatable() {
+        let (mut store, mut policy) = setup();
+        let binding = store
+            .load_native_binding(crate::AttemptId::new(9))
+            .unwrap()
+            .unwrap();
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let sample = sample(issue.sequence());
+        let verified = VerifiedNativeSamplingCompletion::new(
+            NativeSamplingDispatch::new(ticket, issue),
+            NativeSamplingCompletion::Sample(sample),
+        );
+        policy.apply_native_sampling(verified, &mut store).unwrap();
+        let crate::NativeSamplingStatus::AppliedPendingAck {
+            applying_revision, ..
+        } = store
+            .load_native_sampling_status(issue.key())
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("applied")
+        };
+        let generation = binding.current_session().generation;
+        let proof = || {
+            crate::VerifiedNativeSamplingAckConfirmation::new(
+                issue,
+                sample,
+                applying_revision,
+                generation,
+            )
+        };
+        let confirmed = store.confirm_native_sampling_ack(proof()).unwrap();
+        assert_eq!(
+            confirmed,
+            NativeSamplingStatus::SampleAckConfirmed {
+                issue,
+                sample,
+                applying_revision,
+                confirming_session_generation: generation,
+            }
+        );
+        assert_eq!(
+            store.load_native_sampling_status(issue.key()).unwrap(),
+            Some(confirmed)
+        );
+        assert!(matches!(
+            store.confirm_native_sampling_ack(proof()),
+            Err(crate::ControllerStoreError::RevisionConflict)
+        ));
+        assert!(matches!(
+            store.load_native_sampling_status(issue.key()),
+            Err(crate::ControllerStoreError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn confirmation_from_a_session_before_issue_is_corrupt_and_poisons() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-corrupt-confirmation.sqlite");
+        let (mut store, mut policy) =
+            setup_with_store(crate::ControllerSqliteStore::open(&path).unwrap());
+        let binding = store
+            .load_native_binding(crate::AttemptId::new(9))
+            .unwrap()
+            .unwrap();
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let verified = VerifiedNativeSamplingCompletion::new(
+            NativeSamplingDispatch::new(ticket, issue),
+            NativeSamplingCompletion::Sample(sample(issue.sequence())),
+        );
+        policy.apply_native_sampling(verified, &mut store).unwrap();
+
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "foreign_keys", false).unwrap();
+        let id = 9_u128.to_be_bytes();
+        let one = 1_u64.to_be_bytes();
+        let three = 3_u64.to_be_bytes();
+        let four = 4_u64.to_be_bytes();
+        raw.execute(
+            "UPDATE attempts SET revision=?2 WHERE attempt_id=?1",
+            rusqlite::params![id.as_slice(), four.as_slice()],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE guardian_bindings SET revision=?2,dispatch_floor=?2 WHERE attempt_id=?1",
+            rusqlite::params![id.as_slice(), three.as_slice()],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE guardian_sessions SET state='detached' WHERE attempt_id=?1 AND generation=?2",
+            rusqlite::params![id.as_slice(), one.as_slice()],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO guardian_sessions VALUES (?1,?2,?3,'reconciling')",
+            rusqlite::params![
+                id.as_slice(),
+                2_u64.to_be_bytes().as_slice(),
+                three.as_slice()
+            ],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE native_sampling_issues SET dispatch_revision=?2,session_generation=?3 WHERE attempt_id=?1",
+            rusqlite::params![id.as_slice(), three.as_slice(), 2_u64.to_be_bytes().as_slice()],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE native_sampling_applications SET dispatch_revision=?2,applying_revision=?3 WHERE attempt_id=?1",
+            rusqlite::params![id.as_slice(), three.as_slice(), four.as_slice()],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO native_sampling_ack_confirmations (attempt_id,dispatch_revision,ordinal,applying_revision,confirming_session_generation) VALUES (?1,?2,0,?3,?4)",
+            rusqlite::params![id.as_slice(), three.as_slice(), four.as_slice(), one.as_slice()],
+        )
+        .unwrap();
+        drop(raw);
+
+        let corrupted_key = DispatchKey::from_committed_parts(
+            crate::AttemptId::new(9),
+            PersistenceRevision::new(NonZeroU64::new(3).unwrap()),
+            0,
+        );
+        assert!(matches!(
+            store.load_native_sampling_status(corrupted_key),
+            Err(crate::ControllerStoreError::Malformed(_))
+        ));
+        assert!(matches!(
+            store.load_native_sampling_status(corrupted_key),
+            Err(crate::ControllerStoreError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn failed_native_sample_cannot_be_confirmed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("failed-native-confirmation.sqlite");
+        let (mut store, mut policy) =
+            setup_with_store(crate::ControllerSqliteStore::open(&path).unwrap());
+        let binding = store
+            .load_native_binding(crate::AttemptId::new(9))
+            .unwrap()
+            .unwrap();
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let verified = VerifiedNativeSamplingCompletion::new(
+            NativeSamplingDispatch::new(ticket, issue),
+            NativeSamplingCompletion::Failure(ResourceObservationFailure::Unsupported),
+        );
+        policy.apply_native_sampling(verified, &mut store).unwrap();
+        let NativeSamplingStatus::ParkedRetained {
+            applying_revision, ..
+        } = store
+            .load_native_sampling_status(issue.key())
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("parked")
+        };
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "foreign_keys", true).unwrap();
+        assert!(raw
+            .execute(
+                "INSERT INTO native_sampling_ack_confirmations (attempt_id,dispatch_revision,ordinal,applying_revision,confirming_session_generation) VALUES (?1,?2,0,?3,?4)",
+                rusqlite::params![
+                    9_u128.to_be_bytes().as_slice(),
+                    issue.key().revision().get().to_be_bytes().as_slice(),
+                    applying_revision.get().to_be_bytes().as_slice(),
+                    binding.current_session().generation.get().to_be_bytes().as_slice(),
+                ],
+            )
+            .is_err());
+        drop(raw);
+        let proof = crate::VerifiedNativeSamplingAckConfirmation::new(
+            issue,
+            sample(issue.sequence()),
+            applying_revision,
+            binding.current_session().generation,
+        );
+        assert!(matches!(
+            store.confirm_native_sampling_ack(proof),
+            Err(crate::ControllerStoreError::RevisionConflict)
+        ));
+        assert!(matches!(
+            store.load_native_sampling_status(issue.key()),
+            Err(crate::ControllerStoreError::Poisoned)
+        ));
     }
 
     #[test]

@@ -143,6 +143,7 @@ CREATE TABLE native_sampling_applications (
     cpu INTEGER CHECK(cpu BETWEEN 0 AND 10000),
     pressure TEXT CHECK(pressure IN ('nominal','warning','critical')),
     PRIMARY KEY(attempt_id, dispatch_revision, ordinal),
+    UNIQUE(attempt_id, dispatch_revision, ordinal, applying_revision),
     FOREIGN KEY(attempt_id, dispatch_revision, ordinal)
         REFERENCES native_sampling_issues(attempt_id, dispatch_revision, ordinal),
     CHECK((outcome = 'sample') = (available_memory IS NOT NULL)),
@@ -150,4 +151,44 @@ CREATE TABLE native_sampling_applications (
     CHECK((outcome = 'sample') = (cpu IS NOT NULL)),
     CHECK((outcome = 'sample') = (pressure IS NOT NULL))
 ) STRICT;
-PRAGMA user_version = 3;
+CREATE TABLE native_sampling_ack_confirmations (
+    attempt_id BLOB NOT NULL,
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision) = 8 AND dispatch_revision != zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal = 0),
+    applying_revision BLOB NOT NULL CHECK(length(applying_revision) = 8 AND applying_revision != zeroblob(8)),
+    confirming_session_generation BLOB NOT NULL CHECK(length(confirming_session_generation) = 8 AND confirming_session_generation != zeroblob(8)),
+    PRIMARY KEY(attempt_id, dispatch_revision, ordinal),
+    FOREIGN KEY(attempt_id, dispatch_revision, ordinal, applying_revision)
+        REFERENCES native_sampling_applications(attempt_id, dispatch_revision, ordinal, applying_revision),
+    FOREIGN KEY(attempt_id, confirming_session_generation)
+        REFERENCES guardian_sessions(attempt_id, generation)
+) STRICT;
+CREATE TRIGGER native_sampling_ack_requires_successful_sample
+BEFORE INSERT ON native_sampling_ack_confirmations
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM native_sampling_applications
+    WHERE attempt_id = NEW.attempt_id
+      AND dispatch_revision = NEW.dispatch_revision
+      AND ordinal = NEW.ordinal
+      AND applying_revision = NEW.applying_revision
+      AND outcome = 'sample'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'native sampling ACK requires successful sample application');
+END;
+CREATE TRIGGER native_sampling_confirmed_application_is_immutable
+BEFORE UPDATE ON native_sampling_applications
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM native_sampling_ack_confirmations
+    WHERE attempt_id = OLD.attempt_id
+      AND dispatch_revision = OLD.dispatch_revision
+      AND ordinal = OLD.ordinal
+)
+BEGIN
+    SELECT RAISE(ABORT, 'confirmed native sampling application is immutable');
+END;
+PRAGMA user_version = 4;

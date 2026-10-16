@@ -425,7 +425,7 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }) => Ok(response),
@@ -452,7 +452,7 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
@@ -482,7 +482,7 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
@@ -505,7 +505,7 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
@@ -525,7 +525,7 @@ impl GuardianClient {
             | Response::ReconciliationFinished
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
@@ -545,7 +545,7 @@ impl GuardianClient {
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
@@ -634,7 +634,7 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
@@ -698,6 +698,72 @@ impl GuardianClient {
             dispatch, completion,
         ))
     }
+    /// ACK an exact successful durable application, including one loaded for recovery.
+    /// The authenticated live snapshot is refreshed; no dispatch or policy authority is minted.
+    /// # Errors
+    /// Refuses stale identity/session, failed outcomes, or uncorrelated guardian responses.
+    pub fn ack_native_sampling(
+        &mut self,
+        status: crate::NativeSamplingStatus,
+    ) -> Result<crate::VerifiedNativeSamplingAckConfirmation, ClientError> {
+        let crate::NativeSamplingStatus::AppliedPendingAck {
+            issue,
+            sample,
+            applying_revision,
+        } = status
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if self.verified_snapshot.is_none() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        let native = snapshot
+            .native_binding
+            .as_ref()
+            .ok_or(ClientError::UnexpectedResponse)?;
+        let identity = issue.guardian_identity();
+        if !matches!(
+            snapshot.state,
+            crate::guardian_ipc::WireState::Active | crate::guardian_ipc::WireState::Reconciling
+        ) || snapshot.attempt != issue.key().attempt_id().get()
+            || snapshot.session.instance != snapshot.instance
+            || snapshot.session.generation == 0
+            || native.attempt != snapshot.attempt
+            || native.deadline != snapshot.deadline
+            || native.nonce != identity.nonce.bytes()
+            || native.guardian != identity.process.into()
+            || sample.sequence != issue.sequence()
+            || !crate::MonotonicTick::native_now().is_ok_and(|now| now.get() < snapshot.deadline)
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let Response::Acked {
+            key: returned,
+            applied_revision: returned_revision,
+        } = self.exchange(&Request::AckAfterAppliedRevision {
+            session: snapshot.session,
+            key,
+            applied_revision: applying_revision.get(),
+        })?
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if returned != key || returned_revision != applying_revision.get() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let generation = std::num::NonZeroU64::new(snapshot.session.generation)
+            .ok_or(ClientError::UnexpectedResponse)?;
+        Ok(crate::VerifiedNativeSamplingAckConfirmation::new(
+            issue,
+            sample,
+            applying_revision,
+            generation,
+        ))
+    }
+
     /// # Errors
     /// Refuses stale sessions or transport failure.
     pub fn fence(&mut self, session: crate::guardian_ipc::WireSession) -> Result<(), ClientError> {
@@ -714,7 +780,7 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
@@ -743,13 +809,53 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::SlotObserved(_)
             | Response::Retained(_)
-            | Response::Acked
+            | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
             | Response::Submitted { .. }
             | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
     }
+}
+
+/// Compose diagnostic recovery evidence, authenticated ACK and atomic confirmation.
+/// No dispatch ticket, policy effect, or application is recreated.
+#[derive(Debug)]
+pub enum NativeSamplingAckRecoveryError {
+    Store(crate::ControllerStoreError),
+    Guardian(ClientError),
+    NoPendingApplication,
+}
+
+/// # Errors
+/// Refuses absent/failed application, guardian mismatch, or store failure.
+pub fn recover_native_sampling_ack(
+    store: &mut crate::ControllerSqliteStore,
+    client: &mut GuardianClient,
+    key: crate::DispatchKey,
+) -> Result<crate::NativeSamplingStatus, NativeSamplingAckRecoveryError> {
+    let (_, _, status) = store
+        .read_native_sampling_evidence(key)
+        .map_err(NativeSamplingAckRecoveryError::Store)?
+        .ok_or(NativeSamplingAckRecoveryError::NoPendingApplication)?;
+    if matches!(
+        status,
+        crate::NativeSamplingStatus::SampleAckConfirmed { .. }
+    ) {
+        return Ok(status);
+    }
+    if !matches!(
+        status,
+        crate::NativeSamplingStatus::AppliedPendingAck { .. }
+    ) {
+        return Err(NativeSamplingAckRecoveryError::NoPendingApplication);
+    }
+    let proof = client
+        .ack_native_sampling(status)
+        .map_err(NativeSamplingAckRecoveryError::Guardian)?;
+    store
+        .confirm_native_sampling_ack(proof)
+        .map_err(NativeSamplingAckRecoveryError::Store)
 }
 
 /// Verified diagnostic outcome, not a live controller session or execution permit.
@@ -1107,6 +1213,16 @@ mod native_sampling_snapshot_tests {
         }
     }
 
+    fn assert_confirmed_application_is_immutable(database: &std::path::Path) {
+        assert!(rusqlite::Connection::open(database)
+            .unwrap()
+            .execute(
+                "UPDATE native_sampling_applications SET available_memory=available_memory+1",
+                [],
+            )
+            .is_err());
+    }
+
     #[test]
     fn native_client_dispatch_observation_and_policy_application_are_exact() {
         let parent = tempfile::Builder::new()
@@ -1169,7 +1285,7 @@ mod native_sampling_snapshot_tests {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                for _ in 0..6 {
+                for _ in 0..8 {
                     crate::guardian_ipc::serve_once(&mut stream, &mut server).unwrap();
                 }
             });
@@ -1187,11 +1303,25 @@ mod native_sampling_snapshot_tests {
                     ..
                 } if key == issue.key()
             ));
+            assert!(matches!(
+                recover_native_sampling_ack(&mut store, &mut client, issue.key()).unwrap(),
+                crate::NativeSamplingStatus::SampleAckConfirmed {
+                    issue: stored,
+                    confirming_session_generation,
+                    ..
+                } if stored == issue && confirming_session_generation == binding.current_session().generation
+            ));
+            assert!(matches!(
+                recover_native_sampling_ack(&mut store, &mut client, issue.key()).unwrap(),
+                crate::NativeSamplingStatus::SampleAckConfirmed { issue: stored, .. }
+                    if stored == issue
+            ));
         });
         assert!(matches!(
             store.load_native_sampling_status(issue.key()).unwrap(),
-            Some(crate::NativeSamplingStatus::AppliedPendingAck { issue: stored, .. })
+            Some(crate::NativeSamplingStatus::SampleAckConfirmed { issue: stored, .. })
                 if stored == issue
         ));
+        assert_confirmed_application_is_immutable(&database);
     }
 }

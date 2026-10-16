@@ -37,15 +37,15 @@ mod native_sampling;
 mod resources;
 pub use native_sampling::{
     NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingIssue, NativeSamplingStatus,
-    VerifiedNativeSamplingCompletion,
+    VerifiedNativeSamplingAckConfirmation, VerifiedNativeSamplingCompletion,
 };
 mod tree;
 
 const SCHEMA: &str = include_str!("sqlite/schema.sql");
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// An independent controller database, never a Phoenix application connection.
-/// Only schema version 3 is supported; there is no upgrade/downgrade policy.
+/// Only schema version 4 is supported; there is no upgrade/downgrade policy.
 #[derive(Debug)]
 pub struct ControllerSqliteStore {
     connection: Connection,
@@ -135,7 +135,7 @@ impl ControllerSqliteStore {
         })
     }
 
-    /// Opens an existing schema-v3 store for guardian read-only evidence.
+    /// Opens an existing schema-v4 store for guardian read-only evidence.
     /// # Errors
     /// Rejects missing or incompatible stores.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {

@@ -128,7 +128,7 @@ impl<'de> Deserialize<'de> for BuildIdentity {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -650,7 +650,10 @@ pub enum Response {
     Inventory(Vec<WireSlot>),
     SlotObserved(WireObservation),
     Retained(Option<WireRetained>),
-    Acked,
+    Acked {
+        key: WireKey,
+        applied_revision: u64,
+    },
     SignalRoundReserved,
     Admitted {
         admission: u64,
@@ -769,6 +772,11 @@ pub struct GuardianServer<E: GuardianExecutor> {
     interruption: Option<PersistenceRevision>,
     finish_proof: Option<(PersistenceRevision, crate::ReconciledSessionPermit)>,
     ack_proofs: Vec<(DispatchKey, PersistenceRevision, crate::AppliedResultAck)>,
+    native_ack_receipts: Vec<(
+        crate::NativeSamplingIssue,
+        crate::ResourceSample,
+        PersistenceRevision,
+    )>,
     staged: Vec<DispatchTicket>,
     refused: Vec<DispatchTicket>,
     admissions: BTreeMap<u64, (ControllerSession, DispatchTicket)>,
@@ -803,6 +811,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             interruption: None,
             finish_proof: None,
             ack_proofs: Vec::new(),
+            native_ack_receipts: Vec::new(),
             staged: Vec::new(),
             refused: Vec::new(),
             admissions: BTreeMap::new(),
@@ -1075,6 +1084,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ReleaseInitial { .. }
                     | Request::DispatchAdmit { .. }
                     | Request::DispatchSubmit { .. }
+                    | Request::AckAfterAppliedRevision { .. }
             )
         {
             return Response::Refused(WireError::UnsupportedDurableBinding);
@@ -1200,6 +1210,9 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             let session = self.resolve_session(session)?;
             let key = self.resolve_key(key)?;
             let applied_revision = revision(applied_revision)?;
+            if self.native_unbound {
+                return self.native_sampling_ack(session, key, applied_revision);
+            }
             if applied_revision < key.revision() {
                 return Err(GuardianError::StaleDispatchRevision.into());
             }
@@ -1214,9 +1227,112 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             self.guardian
                 .ack_result(session, ack)
                 .map_err(WireError::from)?;
-            Response::Acked
+            Response::Acked {
+                key: key.try_into()?,
+                applied_revision: applied_revision.get(),
+            }
         })
     }
+    fn native_sampling_ack(
+        &mut self,
+        session: ControllerSession,
+        key: DispatchKey,
+        applied_revision: PersistenceRevision,
+    ) -> Result<Response, WireError> {
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .sampling_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeSamplingStatus::AppliedPendingAck {
+            issue,
+            sample,
+            applying_revision,
+        } = status
+        else {
+            return Err(WireError::MissingProof);
+        };
+        let current = binding.current_session();
+        if applying_revision != applied_revision
+            || issue.key() != key
+            || issue.sequence() != sample.sequence
+            || issue.guardian_identity() != binding.identity()
+            || !binding
+                .sessions()
+                .iter()
+                .any(|s| s.generation == issue.session_generation())
+            || self.native_identity != Some(binding.identity())
+            || wire.guardian != WireIdentity::from(binding.identity().process)
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || binding.attempt_id() != self.guardian.attempt_id()
+            || binding.deadline() != self.guardian.original_deadline()
+            || checkpoint.attempt_id() != self.guardian.attempt_id()
+            || checkpoint.deadline() != self.guardian.original_deadline()
+            || checkpoint.persistence_revision() < applying_revision
+            || current.generation.get() != session.generation()
+            || live.session != session.into()
+            || !matches!(
+                (live.state, current.state),
+                (WireState::Active, crate::NativeSessionState::Active)
+                    | (
+                        WireState::Reconciling,
+                        crate::NativeSessionState::Reconciling
+                    )
+            )
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        let receipt = (issue, sample, applying_revision);
+        if self.native_ack_receipts.contains(&receipt) {
+            if self.guardian.retained_result(key).is_some() {
+                return Err(WireError::MissingProof);
+            }
+        } else {
+            let expected = WireCompletion::SampleResources {
+                sequence: issue.sequence(),
+                result: Ok(WireResourceSample {
+                    sequence: sample.sequence,
+                    memory_bytes: sample.capacity.available_memory_bytes,
+                    storage_bytes: sample.capacity.available_storage_bytes,
+                    cpu_basis_points: sample.contention.cpu.get(),
+                    memory_pressure: match sample.contention.memory_pressure {
+                        crate::MemoryPressure::Nominal => WireMemoryPressure::Normal,
+                        crate::MemoryPressure::Warning => WireMemoryPressure::Elevated,
+                        crate::MemoryPressure::Critical => WireMemoryPressure::Critical,
+                    },
+                }),
+            };
+            if self
+                .guardian
+                .retained_result(key)
+                .is_none_or(|result| WireRetained::from(result).completion != expected)
+            {
+                return Err(WireError::MissingProof);
+            }
+            self.guardian
+                .ack_result(
+                    session,
+                    crate::AppliedResultAck::after_applied(session, key),
+                )
+                .map_err(WireError::from)?;
+            self.native_ack_receipts.push(receipt);
+        }
+        Ok(Response::Acked {
+            key: key.try_into()?,
+            applied_revision: applied_revision.get(),
+        })
+    }
+
     fn validate_native_sampling_evidence(
         &mut self,
         session: ControllerSession,
@@ -2210,7 +2326,7 @@ mod native_evidence_tests {
         }
     }
 
-    struct SamplingExecutor(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    struct SamplingExecutor(std::sync::Arc<std::sync::atomic::AtomicUsize>, bool);
     impl GuardianExecutor for SamplingExecutor {
         type ChildSlot = ProcessIdentity;
         fn execute(
@@ -2226,7 +2342,21 @@ mod native_evidence_tests {
                 ticket.key(),
                 EffectCompletion::SampleResources {
                     sequence: *sequence,
-                    result: Err(crate::ResourceObservationFailure::Unsupported),
+                    result: if self.1 {
+                        Ok(crate::ResourceSample {
+                            sequence: *sequence,
+                            capacity: crate::ResourceCapacity {
+                                available_memory_bytes: 11,
+                                available_storage_bytes: 12,
+                            },
+                            contention: crate::ResourceContention {
+                                cpu: CpuContentionBasisPoints::new(42).unwrap(),
+                                memory_pressure: MemoryPressure::Nominal,
+                            },
+                        })
+                    } else {
+                        Err(crate::ResourceObservationFailure::Unsupported)
+                    },
                 },
             )
         }
@@ -2270,7 +2400,7 @@ mod native_evidence_tests {
         let (guardian, session) = Guardian::new(
             attempt,
             deadline,
-            SamplingExecutor(calls.clone()),
+            SamplingExecutor(calls.clone(), false),
             vec![identity(42)],
         )
         .unwrap();
@@ -2353,7 +2483,7 @@ mod native_evidence_tests {
                 key,
                 applied_revision: key.revision
             }),
-            Response::Refused(WireError::UnsupportedDurableBinding)
+            Response::Refused(WireError::MissingProof)
         );
         assert_eq!(
             server.handle(Request::ReserveSignalRound {
@@ -2363,6 +2493,292 @@ mod native_evidence_tests {
             }),
             Response::Refused(WireError::UnsupportedDurableBinding)
         );
+    }
+
+    struct NativeAckFixture {
+        _directory: tempfile::TempDir,
+        path: std::path::PathBuf,
+        attempt: AttemptId,
+        deadline: MonotonicTick,
+        server: GuardianServer<SamplingExecutor>,
+        issue: crate::NativeSamplingIssue,
+        ticket: Option<DispatchTicket>,
+        policy: crate::PolicyLoop,
+        store: ControllerSqliteStore,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        active_session: WireSession,
+        key: WireKey,
+        binding: NativeGuardianBinding,
+    }
+
+    fn native_ack_fixture() -> NativeAckFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controller.sqlite");
+        let attempt = AttemptId::new(921);
+        let deadline = MonotonicTick::native_now()
+            .unwrap()
+            .checked_add(std::time::Duration::from_secs(120))
+            .unwrap();
+        let mut store = ControllerSqliteStore::open(&path).unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(100).unwrap(),
+            MemoryPressure::Critical,
+        );
+        let committed = DeploymentAttempt::start(attempt, deadline, policy, identity(41))
+            .persist(&mut store)
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (guardian, session) = Guardian::new(
+            attempt,
+            deadline,
+            SamplingExecutor(calls.clone(), true),
+            vec![identity(42)],
+        )
+        .unwrap();
+        let mut server = GuardianServer::new(guardian, session, test_build()).unwrap();
+        server.stage_native_identity(NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([8; 16]).unwrap(),
+            process: identity(43),
+        });
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
+            panic!("hello")
+        };
+        crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
+        let binding = store.load_native_binding(attempt).unwrap().unwrap();
+        let mut policy = crate::PolicyLoop::from_committed(committed);
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let key = WireKey::try_from(issue.key()).unwrap();
+        server.stage_native_reader(Box::new(
+            crate::native_guardian::SqliteNativeEvidenceReader::open(&path, attempt).unwrap(),
+        ));
+        NativeAckFixture {
+            _directory: directory,
+            path,
+            attempt,
+            deadline,
+            server,
+            issue,
+            ticket: Some(ticket),
+            policy,
+            store,
+            calls,
+            active_session: snapshot.session,
+            key,
+            binding,
+        }
+    }
+
+    fn dispatch_and_apply_native_sample(
+        fixture: &mut NativeAckFixture,
+    ) -> crate::NativeSamplingStatus {
+        use crate::{
+            NativeSamplingCompletion, NativeSamplingDispatch, ResourceCapacity, ResourceContention,
+            ResourceSample, VerifiedNativeSamplingCompletion,
+        };
+        let Response::Admitted { admission } = fixture.server.handle(Request::DispatchAdmit {
+            session: fixture.active_session,
+            key: fixture.key,
+            effect: WireEffect::SampleResources {
+                sequence: fixture.issue.sequence(),
+            },
+        }) else {
+            panic!("admit")
+        };
+        assert_eq!(
+            fixture.server.handle(Request::DispatchSubmit {
+                session: fixture.active_session,
+                admission,
+                now: 0
+            }),
+            Response::Submitted { key: fixture.key }
+        );
+        let sample = ResourceSample {
+            sequence: fixture.issue.sequence(),
+            capacity: ResourceCapacity {
+                available_memory_bytes: 11,
+                available_storage_bytes: 12,
+            },
+            contention: ResourceContention {
+                cpu: CpuContentionBasisPoints::new(42).unwrap(),
+                memory_pressure: MemoryPressure::Nominal,
+            },
+        };
+        let verified = VerifiedNativeSamplingCompletion::new(
+            NativeSamplingDispatch::new(fixture.ticket.take().unwrap(), fixture.issue),
+            NativeSamplingCompletion::Sample(sample),
+        );
+        fixture
+            .policy
+            .apply_native_sampling(verified, &mut fixture.store)
+            .unwrap();
+        fixture
+            .store
+            .load_native_sampling_status(fixture.issue.key())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn reconnect_ack_session(fixture: &mut NativeAckFixture) -> WireSession {
+        fixture.server.fence_connection();
+        let Response::Hello {
+            snapshot: detached, ..
+        } = fixture.server.handle(Request::Hello {
+            build: test_build(),
+        })
+        else {
+            panic!("detached hello")
+        };
+        assert_eq!(detached.state, WireState::DetachedFenced);
+        assert_eq!(
+            crate::native_guardian::verify_native_binding(
+                &mut fixture.store,
+                fixture.attempt,
+                &detached,
+            )
+            .unwrap(),
+            crate::native_guardian::VerifiedBindingStatus::Detached
+        );
+        let loaded = fixture
+            .store
+            .load_attempt(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let crate::RecoveryDisposition::Checkpoint(interruption) =
+            loaded.prepare_recovery().unwrap()
+        else {
+            panic!("sampling attempt must checkpoint interruption")
+        };
+        let interruption_revision = (*interruption)
+            .persist(&mut fixture.store)
+            .unwrap()
+            .checkpoint()
+            .persistence_revision()
+            .unwrap();
+        let detached_binding = fixture
+            .store
+            .load_native_binding(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let reconciling = fixture
+            .store
+            .commit_fresh_interruption_binding(&detached_binding, interruption_revision)
+            .unwrap();
+        let Response::ReconciliationBegun { session } =
+            fixture.server.handle(Request::BeginReconciliation {
+                instance: detached.instance,
+                inventory: detached.slots,
+                interruption_revision: interruption_revision.get(),
+            })
+        else {
+            panic!("begin reconciliation")
+        };
+        assert_eq!(
+            session.generation,
+            reconciling.current_session().generation.get()
+        );
+        session
+    }
+
+    fn replacement_server_refuses_ack(fixture: &NativeAckFixture, request: Request) {
+        let (guardian, session) = Guardian::new(
+            fixture.attempt,
+            fixture.deadline,
+            SamplingExecutor(fixture.calls.clone(), true),
+            vec![identity(42)],
+        )
+        .unwrap();
+        let mut replacement = GuardianServer::new(guardian, session, test_build()).unwrap();
+        replacement.stage_native_identity(fixture.binding.identity());
+        replacement.stage_native_reader(Box::new(
+            crate::native_guardian::SqliteNativeEvidenceReader::open(
+                &fixture.path,
+                fixture.attempt,
+            )
+            .unwrap(),
+        ));
+        replacement.handle(Request::Hello {
+            build: test_build(),
+        });
+        assert_eq!(
+            replacement.handle(request),
+            Response::Refused(WireError::Guardian(WireGuardianError::InstanceMismatch))
+        );
+    }
+
+    #[test]
+    fn native_success_ack_is_correlated_idempotent_and_requires_original_receipt() {
+        let mut fixture = native_ack_fixture();
+        let active_session = fixture.active_session;
+        let key = fixture.key;
+        let active_request = || Request::AckAfterAppliedRevision {
+            session: active_session,
+            key,
+            applied_revision: 2,
+        };
+        assert_eq!(
+            fixture.server.handle(active_request()),
+            Response::Refused(WireError::MissingProof)
+        );
+        let status = dispatch_and_apply_native_sample(&mut fixture);
+        assert!(matches!(
+            status,
+            crate::NativeSamplingStatus::AppliedPendingAck { .. }
+        ));
+        for request in [
+            Request::AckAfterAppliedRevision {
+                session: fixture.active_session,
+                key: fixture.key,
+                applied_revision: 3,
+            },
+            Request::AckAfterAppliedRevision {
+                session: fixture.active_session,
+                key: WireKey {
+                    ordinal: 1,
+                    ..fixture.key
+                },
+                applied_revision: 2,
+            },
+        ] {
+            assert_eq!(
+                fixture.server.handle(request),
+                Response::Refused(WireError::MissingProof)
+            );
+        }
+        let acked = Response::Acked {
+            key: fixture.key,
+            applied_revision: 2,
+        };
+        assert_eq!(fixture.server.handle(active_request()), acked);
+        assert_eq!(
+            fixture
+                .server
+                .handle(Request::ObserveRetained { key: fixture.key }),
+            Response::Retained(None)
+        );
+        let recovered = reconnect_ack_session(&mut fixture);
+        let retry = Request::AckAfterAppliedRevision {
+            session: recovered,
+            key: fixture.key,
+            applied_revision: 2,
+        };
+        assert_eq!(fixture.server.handle(retry.clone()), acked);
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .store
+                .load_native_sampling_status(fixture.issue.key())
+                .unwrap(),
+            Some(status)
+        );
+        replacement_server_refuses_ack(&fixture, retry);
     }
 
     #[test]
@@ -2856,7 +3272,9 @@ mod native_evidence_tests {
         ];
         for request in forbidden {
             let expected = match &request {
-                Request::DispatchAdmit { .. } => WireError::MissingProof,
+                Request::DispatchAdmit { .. } | Request::AckAfterAppliedRevision { .. } => {
+                    WireError::MissingProof
+                }
                 Request::DispatchSubmit { .. } => WireError::UnknownAdmission,
                 Request::Hello { .. }
                 | Request::Snapshot
@@ -2867,7 +3285,6 @@ mod native_evidence_tests {
                 | Request::Inventory
                 | Request::ObserveSlot { .. }
                 | Request::ObserveRetained { .. }
-                | Request::AckAfterAppliedRevision { .. }
                 | Request::ReserveSignalRound { .. } => WireError::UnsupportedDurableBinding,
             };
             assert_eq!(server.handle(request), Response::Refused(expected));
