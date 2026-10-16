@@ -637,6 +637,8 @@ with Path(os.environ['CALLS']).open('a') as log:
     log.write(json.dumps([name] + sys.argv[1:]) + '\n')
 if name == 'lipo':
     print(os.environ['ARCH'])
+elif name == 'codesign' and '--verify' in sys.argv and os.environ.get('VERIFY_FAIL') == 'yes':
+    raise SystemExit(1)
 elif name == 'codesign' and '--display' in sys.argv:
     print('Authority=' + os.environ.get('AUTHORITY', 'Developer ID Application: Fixture'))
     print('TeamIdentifier=' + os.environ.get('TEAM', 'ABCDEFGHIJ'))
@@ -668,7 +670,8 @@ elif name == 'browser':
              ({'ARCH': 'x86_64'}, False), ({'TEAM': 'ABCDEFGHIJextra'}, False),
              ({'AUTHORITY': 'ad hoc'}, False), ({'FLAGS': '0x0'}, False),
              ({'TIMESTAMP': 'no'}, False), ({'NOTARY_STATUS': 'Invalid'}, False),
-             ({'SUBMIT_FAIL': 'yes'}, False), ({'SMOKE_FAIL': 'yes'}, False)]
+             ({'VERIFY_FAIL': 'yes'}, False), ({'SUBMIT_FAIL': 'yes'}, False),
+             ({'SMOKE_FAIL': 'yes'}, False)]
     for overrides, success in cases:
         calls = base / 'calls'
         calls.unlink(missing_ok=True)
