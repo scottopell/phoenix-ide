@@ -35,6 +35,22 @@ VIEW_ATTRIBUTES = {
 }
 
 
+SDK_METADATA_STRINGS = frozenset({"code.file.path", "code.module.name", "thread.name", "target"})
+SDK_METADATA_INTEGERS = frozenset({"code.line.number", "thread.id", "busy_ns", "idle_ns"})
+
+
+def consume_sdk_metadata(key, value):
+    if key in SDK_METADATA_STRINGS:
+        if not isinstance(value, str):
+            raise CaptureRejected("sdk_metadata_type")
+        return True
+    if key in SDK_METADATA_INTEGERS:
+        if type(value) is not int or not 0 <= value <= (1 << 63) - 1:
+            raise CaptureRejected("sdk_metadata_type")
+        return True
+    return False
+
+
 class CaptureRejected(ValueError):
     def __init__(self, code):
         self.code = code
@@ -66,12 +82,16 @@ def decode(data):
                 if len(records) >= MAX_SPANS:
                     raise CaptureRejected("batch_span_budget")
                 attributes = {}
+                seen = set()
                 for attribute in span.attributes if span.name in {"browser.conversation_view", "browser.view_correlation", "coordinator.history_open"} else ():
-                    if len(attributes) >= 128:
+                    if len(seen) >= 128:
                         raise CaptureRejected("attribute_count_budget")
-                    if attribute.key in attributes:
+                    if attribute.key in seen:
                         raise CaptureRejected("attribute_duplicate")
-                    attributes[attribute.key] = scalar(attribute.value)
+                    seen.add(attribute.key)
+                    value = scalar(attribute.value)
+                    if not consume_sdk_metadata(attribute.key, value):
+                        attributes[attribute.key] = value
                 allowed = VIEW_ATTRIBUTES if span.name == "browser.conversation_view" else ({"open.id", "correlation.kind", "correlation.id"} if span.name == "browser.view_correlation" else {"open.id", "product_conversation.id"})
                 if set(attributes) - allowed:
                     raise CaptureRejected("attribute_unknown")

@@ -50,6 +50,59 @@ def wire(children=1):
 
 
 class SinkTests(unittest.TestCase):
+    def test_pinned_sdk_metadata_is_validated_consumed_not_semantic_or_private_projection(self):
+        request = wire()
+        child = request.resource_spans[0].scope_spans[0].spans[1]
+        child.attributes.add(key="correlation.kind").value.string_value = "request"
+        child.attributes.add(key="correlation.id").value.string_value = "request-1"
+        for span in request.resource_spans[0].scope_spans[0].spans:
+            for key in sink.SDK_METADATA_STRINGS:
+                span.attributes.add(key=key).value.string_value = "PRIVATE_METADATA"
+            for key in sink.SDK_METADATA_INTEGERS:
+                span.attributes.add(key=key).value.int_value = 1
+        data = request.SerializeToString()
+        with tempfile.TemporaryDirectory() as directory:
+            capture = sink.Capture(Path(directory) / "capture")
+            capture.accept(data)
+            self.assertEqual((capture.output / "batch-000.pb").read_bytes(), data)
+            self.assertEqual(sink.final_index(capture.output)["records"], capture.records)
+            index = sink.final_index(capture.output)
+            span, children = sink.retrieve(index, SERVICE, OPEN)
+            sink.validate_view(span, {"browser.outcome": "ready"}, ["PRIVATE_METADATA"])
+            sink.validate_correlations(index, span, children, [{"kind": "request", "id": "request-1"}])
+            projected = (capture.output / "capture.json").read_text()
+            self.assertNotIn("PRIVATE_METADATA", projected)
+            for key in sink.SDK_METADATA_STRINGS | sink.SDK_METADATA_INTEGERS:
+                self.assertNotIn(key, projected)
+
+    def test_sdk_metadata_rejects_types_size_duplicates_count_and_unknown_fields(self):
+        cases = [
+            ("thread.id", "bool_value", True, "sdk_metadata_type"),
+            ("thread.id", "int_value", -1, "sdk_metadata_type"),
+            ("busy_ns", "double_value", float("inf"), "attribute_non_finite"),
+            ("idle_ns", "double_value", 1.0, "sdk_metadata_type"),
+            ("target", "int_value", 1, "sdk_metadata_type"),
+            ("thread.name", "string_value", "x" * 4097, "attribute_string_budget"),
+            ("level", "string_value", "INFO", "attribute_unknown"),
+            ("PRIVATE_APPLICATION", "string_value", "PRIVATE", "attribute_unknown"),
+        ]
+        for key, kind, value, code in cases:
+            request = wire(0)
+            setattr(request.resource_spans[0].scope_spans[0].spans[0].attributes.add(key=key).value, kind, value)
+            with self.subTest(key=key), self.assertRaises(sink.CaptureRejected) as error:
+                sink.decode(request.SerializeToString())
+            self.assertEqual(error.exception.code, code)
+        request = wire(0)
+        span = request.resource_spans[0].scope_spans[0].spans[0]
+        for _ in range(2): span.attributes.add(key="target").value.string_value = "PRIVATE"
+        with self.assertRaises(sink.CaptureRejected) as error: sink.decode(request.SerializeToString())
+        self.assertEqual(error.exception.code, "attribute_duplicate")
+        request = wire(0)
+        span = request.resource_spans[0].scope_spans[0].spans[0]
+        for i in range(129): span.attributes.add(key=f"unknown-{i}").value.int_value = i
+        with self.assertRaises(sink.CaptureRejected) as error: sink.decode(request.SerializeToString())
+        self.assertEqual(error.exception.code, "attribute_count_budget")
+
     def test_capture_rejection_codes_are_finite_private_free_and_fail_closed_without_network(self):
         cases = [
             ("body_byte_budget", {"MAX_BODY": 1}, None),
