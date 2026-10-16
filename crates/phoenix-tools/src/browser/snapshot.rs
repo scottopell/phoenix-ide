@@ -1,5 +1,6 @@
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -63,8 +64,17 @@ impl Tool for BrowserSnapshotTool {
                     .find(|line| line.starts_with("[TRUNCATED:"))
                     .unwrap_or("")
                     .to_string();
-                let path = std::env::temp_dir()
-                    .join(format!("phoenix-snapshot-{}.txt", uuid::Uuid::new_v4()));
+                let directory =
+                    match PhoenixRuntimeEnvironment::detect().tmp_subdir("browser-snapshots") {
+                        Ok(directory) => directory,
+                        Err(error) => {
+                            session.invalidate_snapshot();
+                            return ToolOutput::error(format!(
+                                "Could not create snapshot directory: {error}"
+                            ));
+                        }
+                    };
+                let path = directory.join(format!("phoenix-snapshot-{}.txt", uuid::Uuid::new_v4()));
                 match tokio::fs::write(&path, output).await {
                     Ok(()) => ToolOutput::success(format!("Accessibility snapshot saved to {}. Read this file for the tree and element refs.\n{notice}", path.display())),
                     Err(error) => {
