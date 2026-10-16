@@ -37,3 +37,13 @@ No standalone executable, daemon, MCP adapter, profile import, credential extrac
 ## Delivery
 
 Implement, review, and land this independently before starting the standalone entrypoint implementation. Link its PR/merge commit from the dependent task.
+
+## Implementation and verification
+
+- Delivery PR: https://github.com/scottopell/phoenix-ide/pull/923
+- `browser_snapshot` exposes the main-document AX tree, interactive filtering, explicit node/text limits, and large-output artifacts under Phoenix's configured scratch root.
+- Click/type accept exactly one CSS selector or opaque reference. Refs bind to browser/document/backend node identity and reject refresh, replacement, detachment, or cross-session reuse. Native input revalidates after hover before mouse press.
+- All 35 browser integration tests passed, including native/React handlers, open/closed shadow roots, iframe exclusion, artifact refs, lifecycle, profiling, and existing CSS interactions. Four engine rendering tests passed.
+- Independent adversarial review reproduced a hover-retargeting failure; the fix and regression were reviewed and verified. No remaining findings in the implementation and selector-typing extraction.
+- Owning crate Clippy, formatting, task validation, spec shape/anchors, and dev.py unit checks passed. Exact-source hosted repository checks are required before merge; their results are attached to the PR.
+- No standalone entrypoint or MCP implementation is included.
