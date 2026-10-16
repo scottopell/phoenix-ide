@@ -13,6 +13,8 @@ The departing-document delivery evidence decision is [ADR-107](107_pagehide-deli
 
 Complete exported span capacity is governed by [ADR-108](108_preserve-complete-span-schemas-with-bounded-capacity.md), affecting REQ-CVT-005/006/007.
 
+Controlled-functional build isolation is governed by [ADR-109](109_separate-controlled-functional-telemetry-build.md), affecting REQ-CVT-001/005/006.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |
@@ -124,6 +126,7 @@ Complete exported span capacity is governed by [ADR-108](108_preserve-complete-s
 | [102](102_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
 | [107](107_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
 | [108](108_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
+| [109](109_separate-controlled-functional-telemetry-build.md) | Separate controlled-functional telemetry build | Accepted | REQ-CVT-001, REQ-CVT-005, REQ-CVT-006 |
 
 ## For agents: which decisions bind your task
 

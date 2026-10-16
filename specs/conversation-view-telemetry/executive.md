@@ -80,3 +80,8 @@ Actual efce qualification exported ready views missing readiness marks. Exact so
 ## Counter wire-type correction
 
 Actual0212 hosted capacity guard compiled and ran: cap32 retained32/dropped20 with OTLP span1497 bytes; cap52 retained52/dropped0 with span2272 bytes, then failed the exact type assertion for browser.admitted_count. Those measurements describe the failed pre-correction fixture, not the corrected wire or overhead clearance. Pinned tracing-opentelemetry0.32.1 records signed integers but inherits unsigned debug fallback, turning raw u32 fields into strings. The source correction explicitly converts all eight validated bounded counters to i64 without changing values, Report validation or receiver acceptance. The real-handler guard additionally requires all eight as I64(10000); corrected protobuf sizes and successful full-schema execution remain hosted obligations.
+
+
+## Controlled-functional factory source packet
+
+ADR-109 introduces a separate build-only100% reporter factory with unchanged real transport and hook singleton, isolated manifests and default-graph rejection. This source packet has focused offline factory/build-hook/manifest tests; actual stock and controlled artifact builds, hash admission, six-report native cases, collector/export join and normal drain remain integration obligations. No build or native execution is claimed here. Resume is unsupported without a real capable lane; no overhead numbers or clearance are adopted. Exact green42a2 stock result remains an independent partial baseline rather than being relabelled by controlled evidence.

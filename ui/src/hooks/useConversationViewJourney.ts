@@ -1,11 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { useLocation, useNavigationType } from 'react-router-dom';
-import { ViewJourneyReporter } from './conversationViewTelemetry';
+import type { ViewJourneyReporter } from './conversationViewTelemetry';
+import { createViewJourneyReporter } from './conversationViewReporterFactory';
 import { ViewJourneyLifecycle, defaultViewIdentity } from './conversationViewLifecycle';
 
 let reporter: ViewJourneyReporter | undefined;
 function tabReporter(): ViewJourneyReporter {
-  return reporter ??= new ViewJourneyReporter({ send: (...args) => fetch(...args) });
+  return reporter ??= createViewJourneyReporter();
 }
 
 export function useConversationViewJourney(route: 'global' | 'ordinary', inherited?: ViewJourneyLifecycle): ViewJourneyLifecycle {

@@ -10,7 +10,7 @@ As the Phoenix operator opening Global and ordinary conversations, I need retrie
 
 WHEN a conversation view is admitted by navigation, reload, Back/Forward, or standalone-PWA resume
 THE SYSTEM SHALL assign a fresh opaque journey/open UUID before observing its outcome
-AND SHALL sample at admission, independently of success, using a default probability of one quarter
+AND SHALL sample at admission, independently of success, using a default probability of one quarter in stock artifacts
 AND SHALL distinguish ready, failed, canceled, and incomplete terminal outcomes
 AND SHALL retain missing observations as null rather than fabricate successful timings.
 
@@ -55,6 +55,8 @@ Admission, sampled, transport-drop, and transport-failure counters are cumulativ
 THE SYSTEM SHALL expose deterministic tests for injected request versus view delay, missing/reordered marks, cancellation, background/resume and duration saturation, privacy projection, correlation bounds, sampling, and transport failure/drop behavior
 AND SHALL qualify actual candidate Global and ordinary journeys with a retrievable correlated trace before claiming real-server acceptance.
 
+A controlled-functional qualification artifact MAY select all journeys only through a structurally separate compile-time reporter factory admitted by a cfgtest loopback preview. It SHALL truthfully declare sampling rate1 and evidence class controlled_functional, remain excluded from stock/release module graphs, and retain the same real lifecycle, transport and collector/export/drain requirements. Its evidence SHALL NOT substitute for stock sampling, overhead clearance, native capability or full acceptance. No public runtime sampling control is permitted.
+
 Synthetic timing controls SHALL be distinguished from candidate-browser/server evidence. Telemetry SHALL NOT claim to reconstruct an incident that occurred before instrumentation existed. Attribution stages SHALL be added only where evidence warrants them, not as a general profiling framework.
 
 ### REQ-CVT-006: Lifecycle-specific delivery evidence
@@ -65,7 +67,7 @@ AND SHALL join collector acceptance and exported trace by the browser-admitted j
 AND SHALL match exported frontend source, route, trigger, terminal outcome and browser-reported request/SSE/trace correlations against the independent browser inventory and observed provenance
 AND SHALL reject missing, duplicate, foreign, rejected or privacy-invalid evidence.
 
-A departing document's rejected fetch or missing response observation SHALL NOT substitute for collector rejection or acceptance. Collector acceptance SHALL be observed only after authentication, bounded decoding, semantic validation and authoritative server identity resolution succeed. Collector acceptance alone SHALL NOT prove export, and export-derived expected inventories SHALL NOT manufacture browser observations. Synthetic-server response completion SHALL NOT qualify a real candidate. For nondeparting documents, qualification SHALL retain the browser-observed collector204 requirement in addition to exported evidence. An unsampled admission SHALL remain a sampling observation, not a successful delivery case. These evidence rules SHALL NOT add retries, a queue, a delivery guarantee, altered sampling or a longer transport deadline.
+A departing document's rejected fetch or missing response observation SHALL NOT substitute for collector rejection or acceptance. Collector acceptance SHALL be observed only after authentication, bounded decoding, semantic validation and authoritative server identity resolution succeed. Collector acceptance alone SHALL NOT prove export, and export-derived expected inventories SHALL NOT manufacture browser observations. Synthetic-server response completion SHALL NOT qualify a real candidate. For nondeparting documents, qualification SHALL retain the browser-observed collector204 requirement in addition to exported evidence. An unsampled admission SHALL remain a sampling observation, not a successful delivery case. These evidence rules SHALL NOT add retries, a queue, a delivery guarantee, altered stock sampling or a longer transport deadline. The separate controlled-functional artifact exception in REQ-CVT-005 changes admission probability only and SHALL NOT force outcome, readiness, native events or delivery.
 
 ### REQ-CVT-007: Complete bounded exported schemas
 
