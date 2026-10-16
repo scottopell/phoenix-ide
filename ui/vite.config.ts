@@ -23,10 +23,12 @@ const sourceDefines = {
 
 // Restore .gitkeep after vite wipes dist/ so fresh worktrees compile.
 function gitkeep(): Plugin {
+  let output = resolve(__dirname, 'dist');
   return {
     name: 'gitkeep',
+    configResolved(config) { output = resolve(config.root, config.build.outDir); },
     closeBundle() {
-      writeFileSync(resolve(__dirname, 'dist/.gitkeep'), '');
+      writeFileSync(resolve(output, '.gitkeep'), '');
     },
   };
 }
