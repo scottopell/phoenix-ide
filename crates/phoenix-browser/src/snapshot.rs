@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use chromiumoxide::cdp::browser_protocol::{
     accessibility::{AxNode, AxValue, GetFullAxTreeParams},
     dom::{BackendNodeId, ResolveNodeParams},
-    input::{DispatchKeyEventParams, DispatchKeyEventType, InsertTextParams},
+    input::{
+        DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
+        DispatchMouseEventType, InsertTextParams, MouseButton,
+    },
 };
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallFunctionOnParams, ReleaseObjectParams, RemoteObjectId,
@@ -308,6 +311,7 @@ async fn call(page: &Page, object: &RemoteObjectId, function: &str) -> Result<Va
 }
 
 async fn click_object(page: &Page, object: &RemoteObjectId) -> Result<(), BrowserError> {
+    call(page, object, "function() { if (!this.isConnected || this.ownerDocument !== document) throw Error('stale ref'); this.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); return true; }").await?;
     let point = call(page, object, include_str!("snapshot/click.js")).await?;
     let x = point["x"]
         .as_f64()
@@ -315,7 +319,28 @@ async fn click_object(page: &Page, object: &RemoteObjectId) -> Result<(), Browse
     let y = point["y"]
         .as_f64()
         .ok_or_else(|| error("Missing reference click coordinates"))?;
-    page.click(Point::new(x, y)).await?;
+    page.move_mouse(Point::new(x, y)).await?;
+    let hovered = call(page, object, include_str!("snapshot/click.js")).await?;
+    let stable = hovered["x"]
+        .as_f64()
+        .is_some_and(|next| (next - x).abs() < 0.5)
+        && hovered["y"]
+            .as_f64()
+            .is_some_and(|next| (next - y).abs() < 0.5);
+    if !stable {
+        return Err(error(
+            "Referenced element moved during hover; call browser_snapshot again",
+        ));
+    }
+    for event in [
+        DispatchMouseEventType::MousePressed,
+        DispatchMouseEventType::MouseReleased,
+    ] {
+        let mut params = DispatchMouseEventParams::new(event, x, y);
+        params.button = Some(MouseButton::Left);
+        params.click_count = Some(1);
+        page.execute(params).await?;
+    }
     Ok(())
 }
 

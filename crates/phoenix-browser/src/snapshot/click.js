@@ -1,6 +1,5 @@
 function() {
   if (!this.isConnected || this.ownerDocument !== document) throw Error('stale ref');
-  this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
   const r = this.getBoundingClientRect();
   if (!r.width || !r.height || this.disabled) throw Error('Referenced element is not actionable');
   const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);

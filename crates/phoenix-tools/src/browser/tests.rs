@@ -2885,6 +2885,7 @@ async fn browser_snapshot_accessibility_and_native_reference_interactions() {
       <main aria-label="Checkout"><h1>Order details</h1>
         <div role="none"><button id="first" onclick="window.chosen=1">Choose</button></div>
         <button id="second" onclick="window.chosen=2">Choose</button>
+        <button id="hover-replace" onmouseenter="this.outerHTML='<button onclick=window.wrongHoverClick=true>Replacement</button>'">Hover target</button>
         <label>Customer<input id="customer" value="before" oninput="window.typed=this.value"></label>
         <label><input type="checkbox" checked>Subscribe</label>
         <button disabled>Unavailable</button><button aria-expanded="true">Options</button>
@@ -2969,6 +2970,10 @@ async fn browser_snapshot_accessibility_and_native_reference_interactions() {
             .await;
         assert!(click.is_success(), "{}", click.output());
         assert_browser_expression(&ctx, "window.hostClicked === true").await;
+        let hover = snapshot_refs(&full, "button \"Hover target\"");
+        assert_eq!(hover.len(), 1, "{full}");
+        assert_stale_click(&ctx, &hover[0]).await;
+        assert_browser_expression(&ctx, "!window.wrongHoverClick && !document.querySelector('#hover-replace')").await;
         let closed_button = snapshot_refs(&full, "button \"Closed action\"");
         assert_eq!(closed_button.len(), 1, "{full}");
         let clicked = BrowserClickTool.run(json!({"ref": closed_button[0]}), ctx.clone()).await;
