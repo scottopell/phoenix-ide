@@ -2365,3 +2365,31 @@ Telemetry owns the next bounded local late-header regression/source correction;
 this writer retains runner/integration ownership. No speculative second product
 patch, full qualification retry, oracle relaxation or full/overhead/native
 acceptance is introduced by recording this cause.
+
+### Grounded late-header anchor intent correction
+
+Test-only donor `92da8ec138ce351694695be2631e4cc1406f4d2a` integrates as
+`268e8d3755fc2a34dc809d343d6929545cd8f9e0`. Parent independently reproduced
+73pass/1red via actual React late-header ref mount with stable callbacks, requested
+42.5/native43/-0.5 physical edges; continuity and user-interrupted controls pass.
+Independent review confirmed fidelity to observed event33, not a fabricated helper.
+
+Correction donor `fb613818ddcbdeb1bda26dd66731534f0a0db85b` integrates as app
+`f542a268f795821e00a118cf348bf9584dd1d58d`, tree
+`d25915d3cffe37c8c363776d3f57486a8438de2d`. Internal typed physical-anchor
+intent distinguishes directional start from continuity. Same-key late-header
+capture preserves live directional intent; generic captures/interruption/cancel/
+retirement/replacement demote to continuity. Directional applyAnchor uses the
+existing bounded readback executor and RETURNS its final actual anchor;
+applyPhysicalChange retains that returned anchor instead of stale input. Public
+capture exports only geometry, so restore/end/tail semantics remain continuity.
+No generic floor, extra retry loop, oracle/readiness/tolerance change or arbitrary
+quantizer guarantee is introduced. Minimal normative/executive wording follows
+the same scoped lifecycle. Independent exact4file review approved source import
+and one actual-browser qualification, not acceptance. Parent genuine TypeScript
+and241focused8file tests passed, including the retained late-header red→green,
+accepted fractions, second fractional resize/item update and interruption/cancel/
+replacement controls. Harness lifecycle68/controlled22/joint65 passed. Existing
+MessageList fixture warning remains recorded. No local build/native run occurred.
+Exact pinned corrected-artifact strict containment/collector/export/drain remain
+required; the old observed write trace remains failed-artifact evidence only.
