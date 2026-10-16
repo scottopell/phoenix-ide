@@ -124,11 +124,11 @@ fn runner_death_does_not_kill_guardian_or_its_original_child() {
     let birthday: Vec<_> = line.split("birth=").nth(1).unwrap().split(':').collect();
     assert_eq!(
         binding.slots()[0].process.birth().seconds(),
-        birthday[0].parse().unwrap()
+        birthday[0].parse::<u64>().unwrap()
     );
     assert_eq!(
         binding.slots()[0].process.birth().nanos(),
-        birthday[1].parse().unwrap()
+        birthday[1].parse::<u32>().unwrap()
     );
     runner.kill().unwrap();
     runner.wait().unwrap();
