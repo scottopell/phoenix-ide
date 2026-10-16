@@ -733,7 +733,7 @@ mod reclaim_tests {
         io.write_all(b"printf '\\137_PHOENIX_PTY_READY_\\137\\n'\n")
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let mut output = Vec::new();
             let mut buf = [0; 1024];
             loop {

@@ -126,7 +126,7 @@ value CommandRecord {
 -- worktree or conversation — used by the /new page and any UI surface
 -- that wants a terminal that outlives every individual conversation.
 enum WorkScopeKind {
-    worktree
+    work
     | conversation
     | global
 }
