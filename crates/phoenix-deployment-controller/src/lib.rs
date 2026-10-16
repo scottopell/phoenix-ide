@@ -69,8 +69,8 @@ pub use runtime::{
     LoopFenceReason, LoopProgress, LoopStatus, LoopSummary, ParkReason, PolicyLoop, SignalResult,
 };
 pub use state::sqlite::{
-    ControllerSqliteStore, ControllerStoreError, NativeSamplingCompletion, NativeSamplingIssue,
-    NativeSamplingStatus, VerifiedNativeSamplingCompletion,
+    ControllerSqliteStore, ControllerStoreError, NativeSamplingCompletion, NativeSamplingDispatch,
+    NativeSamplingIssue, NativeSamplingStatus, VerifiedNativeSamplingCompletion,
 };
 pub use state::{
     ActiveAttempt, AdministrativeRiskAcceptance, AttemptId, AttemptStore, CleanupOutcome,

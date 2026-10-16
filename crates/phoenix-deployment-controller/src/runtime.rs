@@ -494,18 +494,15 @@ impl PolicyLoop {
         round.returned = Some(ticket);
     }
 
-    /// Applies one native `SampleResources` completion with its original affine ticket.
-    /// Only a matching committed issue may cross this bridge; checkpoint and application
-    /// evidence commit together. No generic wire-to-executed-effect path is exposed.
+    /// Applies one verified native `SampleResources` completion.
     /// # Errors
     /// Mismatched issue/ticket/completion or failed persistence grants no ACK evidence.
     pub fn apply_native_sampling(
         &mut self,
-        ticket: DispatchTicket,
         verified: crate::VerifiedNativeSamplingCompletion,
         store: &mut crate::ControllerSqliteStore,
     ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
-        let (issue, completion) = verified.into_parts();
+        let (ticket, issue, completion) = verified.into_parts();
         let key = ticket.key();
         let belongs_to_loop = self.rounds.iter().any(|round| {
             round
@@ -1400,9 +1397,9 @@ mod native_sampling_tests {
     use crate::{
         BirthToken, CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce,
         MemoryPressure, MonotonicTick, NativeGuardianIdentity, NativeSamplingCompletion,
-        NativeSamplingStatus, PersistenceRevision, ProcessId, ProcessIdentity, ResourceCapacity,
-        ResourceContention, ResourceObservationFailure, ResourcePolicy, ResourceSample,
-        VerifiedNativeSamplingCompletion,
+        NativeSamplingDispatch, NativeSamplingStatus, PersistenceRevision, ProcessId,
+        ProcessIdentity, ResourceCapacity, ResourceContention, ResourceObservationFailure,
+        ResourcePolicy, ResourceSample, VerifiedNativeSamplingCompletion,
     };
     use std::num::{NonZeroU32, NonZeroUsize};
 
@@ -1477,10 +1474,11 @@ mod native_sampling_tests {
             let issue = store
                 .commit_native_sampling_issue(&ticket, &binding)
                 .unwrap();
-            let verified = VerifiedNativeSamplingCompletion::new(issue, completion);
-            let progress = loop_
-                .apply_native_sampling(ticket, verified, &mut store)
-                .unwrap();
+            let verified = VerifiedNativeSamplingCompletion::new(
+                NativeSamplingDispatch::new(ticket, issue),
+                completion,
+            );
+            let progress = loop_.apply_native_sampling(verified, &mut store).unwrap();
             let applying_revision = match progress {
                 LoopProgress::Applied { revision, .. } | LoopProgress::Parked { revision, .. } => {
                     revision
@@ -1557,11 +1555,11 @@ mod native_sampling_tests {
         )
         .unwrap();
         let verified = VerifiedNativeSamplingCompletion::new(
-            issue,
+            NativeSamplingDispatch::new(ticket, issue),
             NativeSamplingCompletion::Sample(sample(0)),
         );
         assert!(matches!(
-            loop_.apply_native_sampling(ticket, verified, &mut store),
+            loop_.apply_native_sampling(verified, &mut store),
             Err(LoopError::Persistence(_))
         ));
         drop(raw);
@@ -1593,11 +1591,11 @@ mod native_sampling_tests {
             .commit_native_sampling_issue(&ticket, &binding)
             .unwrap();
         let verified = VerifiedNativeSamplingCompletion::new(
-            issue,
+            NativeSamplingDispatch::new(ticket, issue),
             NativeSamplingCompletion::Sample(sample(1)),
         );
         assert!(matches!(
-            loop_.apply_native_sampling(ticket, verified, &mut store),
+            loop_.apply_native_sampling(verified, &mut store),
             Err(LoopError::NotIssued(_))
         ));
         assert_eq!(loop_.status(), LoopStatus::FailStopped);

@@ -253,12 +253,25 @@ fn pinned_native_reader_observes_committed_rows_only_for_selected_attempt() {
         BirthToken::new(10, 0).unwrap(),
     );
     let attempt = AttemptId::new(71);
-    DeploymentAttempt::start(attempt, MonotonicTick::new(500), policy, root)
+    let committed = DeploymentAttempt::start(attempt, MonotonicTick::new(500), policy, root)
         .persist(&mut store)
         .unwrap();
     verify_native_binding(&mut store, attempt, &wire).unwrap();
+    let binding = store.load_native_binding(attempt).unwrap().unwrap();
+    let mut policy_loop = phoenix_deployment_controller::PolicyLoop::from_committed(committed);
+    let ticket = policy_loop.issue_next().unwrap();
+    let issue = store
+        .commit_native_sampling_issue(&ticket, &binding)
+        .unwrap();
     let mut reader = SqliteNativeEvidenceReader::open(&path, attempt).unwrap();
     assert!(reader.read(AttemptId::new(72)).is_err());
     assert!(reader.read(attempt).unwrap().is_some());
+    let (loaded, loaded_binding, status) = reader.sampling_evidence(issue.key()).unwrap().unwrap();
+    assert_eq!(loaded.attempt_id(), attempt);
+    assert_eq!(loaded_binding, binding);
+    assert_eq!(
+        status,
+        phoenix_deployment_controller::NativeSamplingStatus::IssuedPendingApplication { issue }
+    );
     assert!(SqliteNativeEvidenceReader::open(&dir.path().join("missing.sqlite"), attempt).is_err());
 }

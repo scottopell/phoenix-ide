@@ -77,14 +77,20 @@ The guardian retains the original child across forced runner death and fences on
 malformed frames. A replacement runner verifies the same live guardian and inventory,
 durably fences unfinished sessions, refreshes crash-loaded interruption evidence to a
 newer revision, and may enter observation-only `BeginReconciliation` after another pinned
-store read. Changed slot liveness is persisted without replacing identity. Generic IPC,
-reconciliation finish, native dispatch, mutation, result application, and ACK remain typed
-refusals.
+store read. Changed slot liveness is persisted without replacing identity.
+Native `SampleResources` dispatch consumes the runner's original affine ticket into
+opaque application custody. Admission checks the exact issued-pending-application row,
+active session and full guardian identity against one pinned store snapshot and live
+guardian capacity/deadline before granting a guardian-local one-use admission; submission
+rechecks the durable issue, consumes admission before execution, and retains the exact
+typed completion for observation.
+Other generic dispatch effects, signal/mutation, reconciliation finish, and ACK remain
+refused. This foundation does not wire runner orchestration or recovery settlement.
 
-The remaining native contract requires reconciliation completion, dispatch of the
-persisted sampling issue, verified guardian ACK and durable confirmation, generalized
-mutation dispatch, full `PolicyLoop` execution over IPC, actual
-launchd ownership, and production-exclusive store ownership. Schema-v1 upgrades,
+The remaining native contract requires runner orchestration, reconciliation completion
+and recovery settlement, verified guardian ACK and durable confirmation, generalized
+mutation dispatch, full `PolicyLoop` execution over IPC, actual launchd ownership,
+and production-exclusive store ownership. Schema-v1 upgrades,
 downgrade, rolling versions, guardian replacement, cross-boot recovery, installer
 integration, and production adoption remain outside this pre-adoption qualification.
 
@@ -108,8 +114,8 @@ integration, and production adoption remain outside this pre-adoption qualificat
 | REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The guardian is the harmless child's original parent and survives forced runner death; launchd ownership and a durable runnable policy loop remain gaps. |
 | REQ-SDC-016 | Owner-only path checks, same-UID peer admission, exact source-input digest Hello identity, protocol-v2 four-byte big-endian bounded typed JSON framing, strict request fields, version/malformed/oversized-frame fencing, and replacement connections pass Unix/macOS hosted tests. |
-| REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The native server independently validates durable evidence before consuming its process-local initial gate or entering reconciliation; generic transport, finish, mutation, application, and ACK remain refused. |
-| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Schema v3 also persists exact native sampling issues and atomically couples verified same-guardian sampling completion to its policy checkpoint; native dispatch, reconciliation completion, guardian ACK, and ACK confirmation remain refused/unimplemented. |
+| REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The native server independently validates durable evidence before consuming its process-local initial gate, entering reconciliation, or minting one-use exact sampling admission; general mutation, finish, application, and ACK remain refused. |
+| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Schema v3 also persists exact native sampling issues and atomically couples verified same-guardian sampling completion to its policy checkpoint; narrow native sampling dispatch and retained observation exist, while runner orchestration, recovery settlement, guardian ACK, and ACK confirmation remain unimplemented. |
 | REQ-SDC-019 | Exact schema compatibility, source-input build identity, protocol-v2 rejection, and platform capability checks exist. The transport remains pre-adoption and same-build-only; no v1 upgrade, downgrade, rolling/replacement/cross-boot promise is made. |
 | REQ-SDC-020 | Linux policy/IPC/SQLite tests and hosted macOS exact source-input handshake, gated-start, exact binding, original parenthood, runner-death, reconnect-begin, Clippy, and formatting qualification exist. Real guardian replacement, native mutation/ACK crash windows, launchd, updater, and rollback scenarios remain required. |
 

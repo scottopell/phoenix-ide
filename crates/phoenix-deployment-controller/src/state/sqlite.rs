@@ -36,7 +36,7 @@ use crate::{
 mod native_sampling;
 mod resources;
 pub use native_sampling::{
-    NativeSamplingCompletion, NativeSamplingIssue, NativeSamplingStatus,
+    NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingIssue, NativeSamplingStatus,
     VerifiedNativeSamplingCompletion,
 };
 mod tree;

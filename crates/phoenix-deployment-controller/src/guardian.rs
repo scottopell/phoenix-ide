@@ -820,6 +820,31 @@ impl<E: GuardianExecutor> Guardian<E> {
         Ok(())
     }
 
+    /// # Errors
+    /// Refuses stale session, deadline, key, revision, or unavailable result custody.
+    pub(crate) fn validate_native_sampling_admission(
+        &self,
+        session: ControllerSession,
+        key: DispatchKey,
+        sequence: u64,
+        now: MonotonicTick,
+    ) -> Result<(), GuardianError> {
+        self.require_dispatch(session, key, &OsEffect::SampleResources { sequence })?;
+        if now >= self.deadline {
+            return Err(GuardianError::DeadlineExpired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn submit_native_sampling(
+        &mut self,
+        admission: crate::guardian_ipc::NativeSamplingAdmission,
+        now: MonotonicTick,
+    ) -> Result<DispatchKey, PolicySubmissionError> {
+        let (session, ticket) = admission.into_ticket();
+        self.submit_policy_ticket(session, ticket, now)
+    }
+
     /// Atomic bridge: a raw ticket never escapes with a new public session label.
     pub(crate) fn submit_policy_ticket(
         &mut self,

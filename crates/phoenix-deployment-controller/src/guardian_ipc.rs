@@ -26,6 +26,19 @@ pub trait NativeEvidenceReader: Send {
         &mut self,
         attempt: crate::AttemptId,
     ) -> Result<Option<(crate::LoadedAttempt, crate::NativeGuardianBinding)>, NativeEvidenceReadError>;
+    /// # Errors
+    /// Refuses unreadable or malformed exact native sampling evidence.
+    fn sampling_evidence(
+        &mut self,
+        key: DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeSamplingStatus,
+        )>,
+        NativeEvidenceReadError,
+    >;
 }
 
 /// Process-local, one-use release handle. Durable rows and wire values cannot create one.
@@ -714,6 +727,39 @@ impl From<GuardianError> for WireError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct NativeSamplingAdmission {
+    session: ControllerSession,
+    key: DispatchKey,
+    sequence: u64,
+}
+
+impl NativeSamplingAdmission {
+    const fn key(&self) -> DispatchKey {
+        self.key
+    }
+
+    const fn session(&self) -> ControllerSession {
+        self.session
+    }
+
+    const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn into_ticket(self) -> (ControllerSession, DispatchTicket) {
+        let Self {
+            session,
+            key,
+            sequence,
+        } = self;
+        (
+            session,
+            DispatchTicket::from_committed_parts(key, OsEffect::SampleResources { sequence }),
+        )
+    }
+}
+
 // Affine authority is held server-side; only correlation keys can be decoded.
 pub struct GuardianServer<E: GuardianExecutor> {
     guardian: Guardian<E>,
@@ -726,6 +772,7 @@ pub struct GuardianServer<E: GuardianExecutor> {
     staged: Vec<DispatchTicket>,
     refused: Vec<DispatchTicket>,
     admissions: BTreeMap<u64, (ControllerSession, DispatchTicket)>,
+    native_admissions: BTreeMap<u64, NativeSamplingAdmission>,
     next_admission: u64,
     native_unbound: bool,
     native_identity: Option<crate::NativeGuardianIdentity>,
@@ -759,6 +806,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             staged: Vec::new(),
             refused: Vec::new(),
             admissions: BTreeMap::new(),
+            native_admissions: BTreeMap::new(),
             next_admission: 1,
             native_unbound: false,
             native_identity: None,
@@ -999,6 +1047,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         self.staged.clear();
         self.refused.clear();
         self.admissions.clear();
+        self.native_admissions.clear();
         self.interruption = None;
         self.finish_proof = None;
         self.ack_proofs.clear();
@@ -1024,6 +1073,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::Fence { .. }
                     | Request::BeginReconciliation { .. }
                     | Request::ReleaseInitial { .. }
+                    | Request::DispatchAdmit { .. }
+                    | Request::DispatchSubmit { .. }
             )
         {
             return Response::Refused(WireError::UnsupportedDurableBinding);
@@ -1112,6 +1163,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             self.staged.clear();
             self.refused.clear();
             self.admissions.clear();
+            self.native_admissions.clear();
             self.finish_proof = None;
             self.ack_proofs.clear();
             Response::ReconciliationBegun {
@@ -1165,6 +1217,115 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             Response::Acked
         })
     }
+    fn validate_native_sampling_evidence(
+        &mut self,
+        session: ControllerSession,
+        key: DispatchKey,
+        sequence: u64,
+    ) -> Result<(), WireError> {
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .sampling_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeSamplingStatus::IssuedPendingApplication { issue } = status else {
+            return Err(WireError::MissingProof);
+        };
+        if live.state != WireState::Active
+            || live.session != session.into()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.guardian != WireIdentity::from(binding.identity().process)
+            || self.native_identity != Some(binding.identity())
+            || binding.attempt_id() != self.guardian.attempt_id()
+            || binding.deadline() != self.guardian.original_deadline()
+            || binding.current_session().state != crate::NativeSessionState::Active
+            || binding.current_session().generation.get() != session.generation()
+            || checkpoint.attempt_id() != self.guardian.attempt_id()
+            || checkpoint.phase() != crate::Phase::ResourceSampling
+            || checkpoint.persistence_revision() != key.revision()
+            || binding.dispatch_floor() > key.revision()
+            || issue.key() != key
+            || issue.sequence() != sequence
+            || issue.session_generation().get() != session.generation()
+            || issue.guardian_identity() != binding.identity()
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        Ok(())
+    }
+
+    fn native_dispatch_admit(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        effect: &WireEffect,
+    ) -> Result<Response, WireError> {
+        let WireEffect::SampleResources { sequence } = *effect else {
+            return Err(WireError::UnsupportedDurableBinding);
+        };
+        let session = self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        self.validate_native_sampling_evidence(session, key, sequence)?;
+        if self
+            .native_admissions
+            .values()
+            .any(|admission| admission.key() == key)
+        {
+            return Err(WireError::AdmissionReplayed);
+        }
+        let now = MonotonicTick::native_now().map_err(|_| WireError::MissingProof)?;
+        self.guardian
+            .validate_native_sampling_admission(session, key, sequence, now)
+            .map_err(WireError::from)?;
+        let admission = NativeSamplingAdmission {
+            session,
+            key,
+            sequence,
+        };
+        let handle = self.next_admission;
+        self.next_admission = handle.checked_add(1).ok_or(WireError::InvalidValue)?;
+        self.native_admissions.insert(handle, admission);
+        Ok(Response::Admitted { admission: handle })
+    }
+
+    fn native_dispatch_submit(
+        &mut self,
+        session: WireSession,
+        admission: u64,
+        _now: u64,
+    ) -> Result<Response, WireError> {
+        // Consume first even on a mismatched session or failed execution.
+        let admission = self
+            .native_admissions
+            .remove(&admission)
+            .ok_or(WireError::UnknownAdmission)?;
+        let session = self.resolve_session(session)?;
+        if admission.session() != session {
+            return Err(WireError::AdmissionMismatch);
+        }
+        self.validate_native_sampling_evidence(session, admission.key(), admission.sequence())?;
+        let now = MonotonicTick::native_now().map_err(|_| WireError::MissingProof)?;
+        match self.guardian.submit_native_sampling(admission, now) {
+            Ok(key) => Ok(Response::Submitted {
+                key: key.try_into()?,
+            }),
+            Err(crate::guardian::PolicySubmissionError::Refused { error, .. }) => Err(error.into()),
+            Err(crate::guardian::PolicySubmissionError::ExecutorCorrelationMismatch) => {
+                Err(GuardianError::ExecutorCorrelationMismatch.into())
+            }
+        }
+    }
+
     fn dispatch_admit(
         &mut self,
         session: WireSession,
@@ -1271,6 +1432,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 self.staged.clear();
                 self.refused.clear();
                 self.admissions.clear();
+                self.native_admissions.clear();
                 self.interruption = None;
                 self.finish_proof = None;
                 self.ack_proofs.clear();
@@ -1319,12 +1481,24 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 session,
                 key,
                 effect,
-            } => self.dispatch_admit(session, key, &effect)?,
+            } => {
+                if self.native_unbound {
+                    self.native_dispatch_admit(session, key, &effect)?
+                } else {
+                    self.dispatch_admit(session, key, &effect)?
+                }
+            }
             Request::DispatchSubmit {
                 session,
                 admission,
                 now,
-            } => self.dispatch_submit(session, admission, now)?,
+            } => {
+                if self.native_unbound {
+                    self.native_dispatch_submit(session, admission, now)?
+                } else {
+                    self.dispatch_submit(session, admission, now)?
+                }
+            }
         })
     }
 }
@@ -1982,7 +2156,390 @@ mod native_evidence_tests {
         {
             Ok(self.0.take())
         }
+        fn sampling_evidence(
+            &mut self,
+            _: DispatchKey,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                crate::NativeGuardianBinding,
+                crate::NativeSamplingStatus,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Ok(None)
+        }
     }
+    struct SamplingReader {
+        store: ControllerSqliteStore,
+        status: std::sync::Arc<std::sync::Mutex<Option<crate::NativeSamplingStatus>>>,
+    }
+    impl NativeEvidenceReader for SamplingReader {
+        fn read(
+            &mut self,
+            attempt: AttemptId,
+        ) -> Result<Option<(crate::LoadedAttempt, NativeGuardianBinding)>, NativeEvidenceReadError>
+        {
+            self.store
+                .read_native_evidence(attempt)
+                .map_err(|_| NativeEvidenceReadError)
+        }
+        fn sampling_evidence(
+            &mut self,
+            key: DispatchKey,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                crate::NativeGuardianBinding,
+                crate::NativeSamplingStatus,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            let evidence = self
+                .store
+                .read_native_sampling_evidence(key)
+                .map_err(|_| NativeEvidenceReadError)?;
+            let status = *self.status.lock().unwrap();
+            Ok(match (evidence, status) {
+                (Some((checkpoint, binding, _)), Some(status)) => {
+                    Some((checkpoint, binding, status))
+                }
+                (evidence, None) => evidence,
+                (None, Some(_)) => None,
+            })
+        }
+    }
+
+    struct SamplingExecutor(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl GuardianExecutor for SamplingExecutor {
+        type ChildSlot = ProcessIdentity;
+        fn execute(
+            &mut self,
+            ticket: DispatchTicket,
+            _: &mut BTreeMap<crate::ChildSlotId, ProcessIdentity>,
+        ) -> ExecutedEffect {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let OsEffect::SampleResources { sequence } = ticket.effect() else {
+                panic!("only sampling")
+            };
+            ExecutedEffect::from_parts(
+                ticket.key(),
+                EffectCompletion::SampleResources {
+                    sequence: *sequence,
+                    result: Err(crate::ResourceObservationFailure::Unsupported),
+                },
+            )
+        }
+        fn poll_observation_only(&self, _: &ProcessIdentity) -> ChildSlotObservation {
+            ChildSlotObservation::Running
+        }
+        fn diagnostic_slot_identity(&self, slot: &ProcessIdentity) -> Option<ProcessIdentity> {
+            Some(*slot)
+        }
+    }
+
+    type SamplingFixture = (
+        GuardianServer<SamplingExecutor>,
+        crate::NativeSamplingIssue,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Option<crate::NativeSamplingStatus>>>,
+    );
+
+    fn sampling_fixture() -> SamplingFixture {
+        sampling_fixture_with_status(false)
+    }
+
+    fn sampling_fixture_with_status(wrong_status: bool) -> SamplingFixture {
+        let attempt = AttemptId::new(920);
+        let deadline = MonotonicTick::native_now()
+            .unwrap()
+            .checked_add(std::time::Duration::from_secs(120))
+            .unwrap();
+        let mut store = ControllerSqliteStore::in_memory().unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(0).unwrap(),
+            MemoryPressure::Critical,
+        );
+        let committed = DeploymentAttempt::start(attempt, deadline, policy, identity(41))
+            .persist(&mut store)
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (guardian, session) = Guardian::new(
+            attempt,
+            deadline,
+            SamplingExecutor(calls.clone()),
+            vec![identity(42)],
+        )
+        .unwrap();
+        let mut server = GuardianServer::new(guardian, session, test_build()).unwrap();
+        server.stage_native_identity(NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([8; 16]).unwrap(),
+            process: identity(43),
+        });
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
+            panic!("hello")
+        };
+        crate::native_guardian::verify_native_binding(&mut store, attempt, &snapshot).unwrap();
+        let binding = store.load_native_binding(attempt).unwrap().unwrap();
+        let mut policy = crate::PolicyLoop::from_committed(committed);
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let status = wrong_status.then_some(crate::NativeSamplingStatus::ParkedRetained {
+            issue,
+            failure: crate::ResourceObservationFailure::Unsupported,
+            applying_revision: PersistenceRevision::new(NonZeroU64::new(2).unwrap()),
+        });
+        let status = std::sync::Arc::new(std::sync::Mutex::new(status));
+        server.stage_native_reader(Box::new(SamplingReader {
+            store,
+            status: status.clone(),
+        }));
+        (server, issue, calls, status)
+    }
+
+    #[test]
+    fn native_sampling_admission_executes_once_and_retains_exact_completion() {
+        let (mut server, issue, calls, _status) = sampling_fixture();
+        let key = WireKey::try_from(issue.key()).unwrap();
+        let session = server.snapshot().session;
+        let admit = |session, key, sequence| Request::DispatchAdmit {
+            session,
+            key,
+            effect: WireEffect::SampleResources { sequence },
+        };
+        let Response::Admitted { admission } = server.handle(admit(session, key, issue.sequence()))
+        else {
+            panic!("admit")
+        };
+        assert_eq!(
+            server.handle(admit(session, key, issue.sequence())),
+            Response::Refused(WireError::AdmissionReplayed)
+        );
+        let submit = || Request::DispatchSubmit {
+            session,
+            admission,
+            now: 0,
+        };
+        assert_eq!(server.handle(submit()), Response::Submitted { key });
+        assert_eq!(
+            server.handle(submit()),
+            Response::Refused(WireError::UnknownAdmission)
+        );
+        assert!(matches!(
+            server.handle(admit(session, key, issue.sequence())),
+            Response::Refused(WireError::Guardian(WireGuardianError::DuplicateDispatchKey))
+        ));
+        assert_eq!(
+            server.handle(Request::ObserveRetained { key }),
+            Response::Retained(Some(WireRetained {
+                key,
+                completion: WireCompletion::SampleResources {
+                    sequence: issue.sequence(),
+                    result: Err(WireResourceError::Unsupported),
+                },
+            }))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            server.handle(Request::AckAfterAppliedRevision {
+                session,
+                key,
+                applied_revision: key.revision
+            }),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+        assert_eq!(
+            server.handle(Request::ReserveSignalRound {
+                session,
+                revision: key.revision,
+                count: 1
+            }),
+            Response::Refused(WireError::UnsupportedDurableBinding)
+        );
+    }
+
+    #[test]
+    fn native_sampling_submit_revalidates_durable_issue_before_execution() {
+        let (mut server, issue, calls, status) = sampling_fixture();
+        let key = WireKey::try_from(issue.key()).unwrap();
+        let session = server.snapshot().session;
+        let Response::Admitted { admission } = server.handle(Request::DispatchAdmit {
+            session,
+            key,
+            effect: WireEffect::SampleResources {
+                sequence: issue.sequence(),
+            },
+        }) else {
+            panic!("admit")
+        };
+        *status.lock().unwrap() = Some(crate::NativeSamplingStatus::ParkedRetained {
+            issue,
+            failure: crate::ResourceObservationFailure::Unsupported,
+            applying_revision: PersistenceRevision::new(NonZeroU64::new(2).unwrap()),
+        });
+        let submit = || Request::DispatchSubmit {
+            session,
+            admission,
+            now: 0,
+        };
+        assert_eq!(
+            server.handle(submit()),
+            Response::Refused(WireError::MissingProof)
+        );
+        assert_eq!(
+            server.handle(submit()),
+            Response::Refused(WireError::UnknownAdmission)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_sampling_wrong_submit_session_consumes_admission_and_fence_clears_it() {
+        let (mut server, issue, calls, _status) = sampling_fixture();
+        let key = WireKey::try_from(issue.key()).unwrap();
+        let session = server.snapshot().session;
+        let admit = || Request::DispatchAdmit {
+            session,
+            key,
+            effect: WireEffect::SampleResources {
+                sequence: issue.sequence(),
+            },
+        };
+        let Response::Admitted { admission } = server.handle(admit()) else {
+            panic!("admit")
+        };
+        let wrong = WireSession {
+            generation: session.generation + 1,
+            ..session
+        };
+        assert_eq!(
+            server.handle(Request::DispatchSubmit {
+                session: wrong,
+                admission,
+                now: 0
+            }),
+            Response::Refused(GuardianError::StaleSession.into())
+        );
+        assert_eq!(
+            server.handle(Request::DispatchSubmit {
+                session,
+                admission,
+                now: 0
+            }),
+            Response::Refused(WireError::UnknownAdmission)
+        );
+        let Response::Admitted { admission } = server.handle(admit()) else {
+            panic!("readmit")
+        };
+        server.fence_connection();
+        assert_eq!(server.native_admissions.len(), 0);
+        assert!(matches!(
+            server.handle(Request::Hello {
+                build: test_build()
+            }),
+            Response::Hello { .. }
+        ));
+        assert_eq!(
+            server.handle(Request::DispatchSubmit {
+                session,
+                admission,
+                now: 0
+            }),
+            Response::Refused(WireError::UnknownAdmission)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_sampling_refuses_wrong_session_key_effect_and_durable_status() {
+        for variant in 0..6 {
+            let (mut server, issue, calls, _status) = sampling_fixture();
+            let key = WireKey::try_from(issue.key()).unwrap();
+            let session = server.snapshot().session;
+            let mut request = Request::DispatchAdmit {
+                session,
+                key,
+                effect: WireEffect::SampleResources {
+                    sequence: issue.sequence(),
+                },
+            };
+            match variant {
+                0 => {
+                    if let Request::DispatchAdmit { session, .. } = &mut request {
+                        session.generation += 1;
+                    }
+                }
+                1 => {
+                    if let Request::DispatchAdmit { key, .. } = &mut request {
+                        key.revision += 1;
+                    }
+                }
+                2 => {
+                    if let Request::DispatchAdmit { effect, .. } = &mut request {
+                        *effect = WireEffect::SampleResources {
+                            sequence: issue.sequence() + 1,
+                        };
+                    }
+                }
+                3 => {
+                    if let Request::DispatchAdmit { effect, .. } = &mut request {
+                        *effect = WireEffect::ListChildren {
+                            parent: identity(42).into(),
+                        };
+                    }
+                }
+                4 => {
+                    server.native_identity = None;
+                }
+                5 => {
+                    server.native_reader = None;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(server.handle(request), Response::Refused(_)),
+                "variant {variant}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        let (mut server, issue, calls, _status) = sampling_fixture();
+        let key = WireKey::try_from(issue.key()).unwrap();
+        let session = server.snapshot().session;
+        server.fence_connection();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            server.handle(Request::DispatchAdmit {
+                session,
+                key,
+                effect: WireEffect::SampleResources {
+                    sequence: issue.sequence()
+                }
+            }),
+            Response::Refused(WireError::BuildMismatch)
+        );
+        let (mut server, issue, calls, _status) = sampling_fixture_with_status(true);
+        let key = WireKey::try_from(issue.key()).unwrap();
+        let session = server.snapshot().session;
+        assert_eq!(
+            server.handle(Request::DispatchAdmit {
+                session,
+                key,
+                effect: WireEffect::SampleResources {
+                    sequence: issue.sequence()
+                }
+            }),
+            Response::Refused(WireError::MissingProof)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     fn identity(pid: u32) -> ProcessIdentity {
         ProcessIdentity::new(
             ProcessId::new(NonZeroU32::new(pid).unwrap()),
@@ -2298,10 +2855,22 @@ mod native_evidence_tests {
             },
         ];
         for request in forbidden {
-            assert_eq!(
-                server.handle(request),
-                Response::Refused(WireError::UnsupportedDurableBinding)
-            );
+            let expected = match &request {
+                Request::DispatchAdmit { .. } => WireError::MissingProof,
+                Request::DispatchSubmit { .. } => WireError::UnknownAdmission,
+                Request::Hello { .. }
+                | Request::Snapshot
+                | Request::Fence { .. }
+                | Request::BeginReconciliation { .. }
+                | Request::FinishReconciliation { .. }
+                | Request::ReleaseInitial { .. }
+                | Request::Inventory
+                | Request::ObserveSlot { .. }
+                | Request::ObserveRetained { .. }
+                | Request::AckAfterAppliedRevision { .. }
+                | Request::ReserveSignalRound { .. } => WireError::UnsupportedDurableBinding,
+            };
+            assert_eq!(server.handle(request), Response::Refused(expected));
         }
     }
 

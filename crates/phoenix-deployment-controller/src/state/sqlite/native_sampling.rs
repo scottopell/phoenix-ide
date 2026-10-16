@@ -3,13 +3,13 @@ use std::num::NonZeroU64;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use super::{
-    binding_revision, check_authority, key, malformed, read_binding, read_header, required,
-    ControllerSqliteStore, ControllerStoreError, Result, Word,
+    binding_revision, check_authority, key, malformed, read_attempt, read_binding, read_header,
+    required, ControllerSqliteStore, ControllerStoreError, Result, Word,
 };
 use crate::{
-    CpuContentionBasisPoints, DeploymentAttempt, DispatchKey, DispatchTicket, MemoryPressure,
-    NativeGuardianBinding, NativeSessionState, OsEffect, PersistenceRevision, ResourceCapacity,
-    ResourceContention, ResourceObservationFailure, ResourceSample,
+    CpuContentionBasisPoints, DeploymentAttempt, DispatchKey, DispatchTicket, LoadedAttempt,
+    MemoryPressure, NativeGuardianBinding, NativeSessionState, OsEffect, PersistenceRevision,
+    ResourceCapacity, ResourceContention, ResourceObservationFailure, ResourceSample,
 };
 
 /// A committed native sampling identity, not dispatch or result authority.
@@ -52,25 +52,49 @@ pub enum NativeSamplingCompletion {
     Failure(ResourceObservationFailure),
 }
 
+/// Runner-local application custody after the committed ticket requested admission.
+#[derive(Debug)]
+pub struct NativeSamplingDispatch {
+    ticket: DispatchTicket,
+    issue: NativeSamplingIssue,
+}
+
+impl NativeSamplingDispatch {
+    pub(crate) fn new(ticket: DispatchTicket, issue: NativeSamplingIssue) -> Self {
+        Self { ticket, issue }
+    }
+
+    pub(crate) const fn issue(&self) -> NativeSamplingIssue {
+        self.issue
+    }
+
+    pub(crate) fn into_parts(self) -> (DispatchTicket, NativeSamplingIssue) {
+        (self.ticket, self.issue)
+    }
+}
+
 /// Same-guardian retained sampling observation verified by the authenticated client.
-/// It is process-local evidence, not a dispatch ticket or ACK permit.
+/// It is process-local application evidence, not a dispatch ticket or ACK permit.
 #[derive(Debug)]
 pub struct VerifiedNativeSamplingCompletion {
-    issue: NativeSamplingIssue,
+    dispatch: NativeSamplingDispatch,
     completion: NativeSamplingCompletion,
 }
 
 impl VerifiedNativeSamplingCompletion {
     pub(crate) const fn new(
-        issue: NativeSamplingIssue,
+        dispatch: NativeSamplingDispatch,
         completion: NativeSamplingCompletion,
     ) -> Self {
-        Self { issue, completion }
+        Self {
+            dispatch,
+            completion,
+        }
     }
 
     #[must_use]
     pub const fn issue(&self) -> NativeSamplingIssue {
-        self.issue
+        self.dispatch.issue
     }
 
     #[must_use]
@@ -78,8 +102,15 @@ impl VerifiedNativeSamplingCompletion {
         self.completion
     }
 
-    pub(crate) fn into_parts(self) -> (NativeSamplingIssue, NativeSamplingCompletion) {
-        (self.issue, self.completion)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        DispatchTicket,
+        NativeSamplingIssue,
+        NativeSamplingCompletion,
+    ) {
+        let (ticket, issue) = self.dispatch.into_parts();
+        (ticket, issue, self.completion)
     }
 }
 
@@ -202,6 +233,36 @@ impl ControllerSqliteStore {
             let result = read_status(&tx, dispatch)?;
             tx.commit()?;
             Ok(result)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Reads the checkpoint, binding, and exact sampling status from one `SQLite` snapshot.
+    /// # Errors
+    /// Malformed rows or storage failures poison this handle.
+    pub fn read_native_sampling_evidence(
+        &mut self,
+        dispatch: DispatchKey,
+    ) -> Result<Option<(LoadedAttempt, NativeGuardianBinding, NativeSamplingStatus)>> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self.connection.transaction()?;
+            check_authority(&tx)?;
+            let attempt = read_attempt(&tx, dispatch.attempt_id())?;
+            let binding = read_binding(&tx, dispatch.attempt_id())?;
+            let status = read_status(&tx, dispatch)?;
+            let evidence = match (attempt, binding, status) {
+                (Some(checkpoint), Some(binding), Some(status)) => {
+                    Some((LoadedAttempt { checkpoint }, binding, status))
+                }
+                (Some(_), Some(_), None) | (None, None, None) => None,
+                _ => return malformed("incomplete native sampling evidence"),
+            };
+            tx.commit()?;
+            Ok(evidence)
         })();
         if result.is_err() {
             self.poisoned = true;

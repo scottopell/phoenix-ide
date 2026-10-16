@@ -45,6 +45,24 @@ impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
             .read_native_evidence(attempt)
             .map_err(|_| NativeEvidenceReadError)
     }
+    fn sampling_evidence(
+        &mut self,
+        key: crate::DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeSamplingStatus,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        if key.attempt_id() != self.attempt {
+            return Err(NativeEvidenceReadError);
+        }
+        self.store
+            .read_native_sampling_evidence(key)
+            .map_err(|_| NativeEvidenceReadError)
+    }
 }
 
 const SOCKET_NAME: &str = "guardian.sock";
@@ -535,13 +553,67 @@ impl GuardianClient {
         }
     }
 
+    /// Consumes the exact affine ticket for the durable issue and derives the
+    /// snapshot, wire effect, and guardian admission internally.
+    /// # Errors
+    /// Refuses stale identity/session/deadline or any guardian/transport mismatch.
+    pub fn dispatch_native_sampling(
+        &mut self,
+        ticket: crate::DispatchTicket,
+        issue: crate::NativeSamplingIssue,
+    ) -> Result<crate::NativeSamplingDispatch, ClientError> {
+        if ticket.key() != issue.key()
+            || !matches!(
+                ticket.effect(),
+                crate::OsEffect::SampleResources { sequence } if *sequence == issue.sequence()
+            )
+            || self.verified_snapshot.is_none()
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        if !sampling_snapshot_matches(&snapshot, issue)
+            || !crate::MonotonicTick::native_now().is_ok_and(|now| now.get() < snapshot.deadline)
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let Response::Admitted { admission } = self.exchange(&Request::DispatchAdmit {
+            session: snapshot.session,
+            key,
+            effect: crate::guardian_ipc::WireEffect::SampleResources {
+                sequence: issue.sequence(),
+            },
+        })?
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        let now =
+            crate::MonotonicTick::native_now().map_err(|_| ClientError::UnexpectedResponse)?;
+        let Response::Submitted { key: returned } = self.exchange(&Request::DispatchSubmit {
+            session: snapshot.session,
+            admission,
+            now: now.get(),
+        })?
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if returned == key {
+            Ok(crate::NativeSamplingDispatch::new(ticket, issue))
+        } else {
+            Err(ClientError::UnexpectedResponse)
+        }
+    }
+
     /// Read and verify the exact retained sampling completion from this live guardian.
     /// # Errors
     /// Refuses a stale snapshot, wrong session/key/effect, absent custody, or malformed sample.
     pub fn observe_native_sampling(
         &mut self,
-        issue: crate::NativeSamplingIssue,
+        dispatch: crate::NativeSamplingDispatch,
     ) -> Result<crate::VerifiedNativeSamplingCompletion, ClientError> {
+        let issue = dispatch.issue();
         if self.verified_snapshot.is_none() {
             return Err(ClientError::UnexpectedResponse);
         }
@@ -623,7 +695,7 @@ impl GuardianClient {
             }
         };
         Ok(crate::VerifiedNativeSamplingCompletion::new(
-            issue, completion,
+            dispatch, completion,
         ))
     }
     /// # Errors
@@ -881,11 +953,20 @@ pub fn run_disposable_guardian(
 mod native_sampling_snapshot_tests {
     use super::*;
     use crate::{
-        BirthToken, CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce,
-        MemoryPressure, MonotonicTick, NativeGuardianIdentity, PersistenceRevision, PolicyLoop,
-        ProcessId, ProcessIdentity, ResourcePolicy,
+        AckDisposition, BirthToken, ChildSlotObservation, ControllerSqliteStore,
+        CpuContentionBasisPoints, DeploymentAttempt, DispatchTicket, EffectCompletion,
+        ExecutedEffect, Guardian, GuardianExecutor, GuardianLifetimeNonce, LoopProgress,
+        MemoryPressure, MonotonicTick, NativeGuardianIdentity, OsEffect, PersistenceRevision,
+        PolicyLoop, ProcessId, ProcessIdentity, ResourceCapacity, ResourceContention,
+        ResourcePolicy, ResourceSample,
     };
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        num::{NonZeroU32, NonZeroUsize},
+        os::unix::fs::PermissionsExt,
+        time::Duration,
+    };
 
     fn process(pid: u32) -> ProcessIdentity {
         ProcessIdentity::new(
@@ -964,8 +1045,153 @@ mod native_sampling_snapshot_tests {
         replacement.native_binding.as_mut().unwrap().guardian = process(101).into();
         assert!(!sampling_snapshot_matches(&replacement, issue));
 
+        let mut wrong_generation = snapshot.clone();
+        wrong_generation.session.generation += 1;
+        assert!(!sampling_snapshot_matches(&wrong_generation, issue));
+
+        let mut wrong_nonce = snapshot.clone();
+        wrong_nonce.native_binding.as_mut().unwrap().nonce = [9; 16];
+        assert!(!sampling_snapshot_matches(&wrong_nonce, issue));
+
+        let mut wrong_deadline = snapshot.clone();
+        wrong_deadline.native_binding.as_mut().unwrap().deadline += 1;
+        assert!(!sampling_snapshot_matches(&wrong_deadline, issue));
+
+        let mut wrong_attempt = snapshot.clone();
+        wrong_attempt.attempt += 1;
+        assert!(!sampling_snapshot_matches(&wrong_attempt, issue));
+
         let mut wrong_instance = snapshot;
         wrong_instance.session.instance += 1;
         assert!(!sampling_snapshot_matches(&wrong_instance, issue));
+    }
+
+    struct SamplingExecutor;
+
+    impl GuardianExecutor for SamplingExecutor {
+        type ChildSlot = ProcessIdentity;
+
+        fn execute(
+            &mut self,
+            ticket: DispatchTicket,
+            _: &mut BTreeMap<crate::ChildSlotId, Self::ChildSlot>,
+        ) -> ExecutedEffect {
+            let OsEffect::SampleResources { sequence } = *ticket.effect() else {
+                panic!("sampling test received another effect")
+            };
+            ExecutedEffect::from_parts(
+                ticket.key(),
+                EffectCompletion::SampleResources {
+                    sequence,
+                    result: Ok(ResourceSample {
+                        sequence,
+                        capacity: ResourceCapacity {
+                            available_memory_bytes: 10,
+                            available_storage_bytes: 20,
+                        },
+                        contention: ResourceContention {
+                            cpu: CpuContentionBasisPoints::new(25).unwrap(),
+                            memory_pressure: MemoryPressure::Nominal,
+                        },
+                    }),
+                },
+            )
+        }
+
+        fn poll_observation_only(&self, _: &Self::ChildSlot) -> ChildSlotObservation {
+            ChildSlotObservation::Running
+        }
+
+        fn diagnostic_slot_identity(&self, slot: &Self::ChildSlot) -> Option<ProcessIdentity> {
+            Some(*slot)
+        }
+    }
+
+    #[test]
+    fn native_client_dispatch_observation_and_policy_application_are_exact() {
+        let parent = tempfile::Builder::new()
+            .prefix("sdc-sampling-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = parent.path().join("sdc-disposable-sampling");
+        let listener = bind_disposable(&directory).unwrap();
+        let database = parent.path().join("controller.sqlite");
+        let mut store = ControllerSqliteStore::open(&database).unwrap();
+        let attempt = crate::AttemptId::new(10);
+        let deadline = MonotonicTick::native_now()
+            .unwrap()
+            .checked_add(Duration::from_secs(120))
+            .unwrap();
+        let policy = ResourcePolicy::new(
+            NonZeroUsize::new(2).unwrap(),
+            0,
+            0,
+            CpuContentionBasisPoints::new(100).unwrap(),
+            MemoryPressure::Critical,
+        );
+        let committed = DeploymentAttempt::start(attempt, deadline, policy, process(42))
+            .persist(&mut store)
+            .unwrap();
+        let (guardian, session) =
+            Guardian::new(attempt, deadline, SamplingExecutor, vec![process(43)]).unwrap();
+        let build = crate::guardian_ipc::BuildIdentity::parse(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let mut server =
+            crate::guardian_ipc::GuardianServer::new(guardian, session, build.clone()).unwrap();
+        server.stage_native_identity(NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([7; 16]).unwrap(),
+            process: process(44),
+        });
+        let crate::guardian_ipc::Response::Hello { snapshot, .. } =
+            server.handle(crate::guardian_ipc::Request::Hello {
+                build: build.clone(),
+            })
+        else {
+            panic!("guardian hello failed")
+        };
+        verify_native_binding(&mut store, attempt, &snapshot).unwrap();
+        let binding = store.load_native_binding(attempt).unwrap().unwrap();
+        let mut policy_loop = PolicyLoop::from_committed(committed);
+        let ticket = policy_loop.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        server.stage_native_reader(Box::new(
+            SqliteNativeEvidenceReader::open(&database, attempt).unwrap(),
+        ));
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                for _ in 0..6 {
+                    crate::guardian_ipc::serve_once(&mut stream, &mut server).unwrap();
+                }
+            });
+            let mut client = GuardianClient::connect_with_build(&directory, build).unwrap();
+            client.hello().unwrap();
+            let dispatched = client.dispatch_native_sampling(ticket, issue).unwrap();
+            let verified = client.observe_native_sampling(dispatched).unwrap();
+            assert!(matches!(
+                policy_loop
+                    .apply_native_sampling(verified, &mut store)
+                    .unwrap(),
+                LoopProgress::Applied {
+                    key,
+                    ack: AckDisposition::AcknowledgeNow,
+                    ..
+                } if key == issue.key()
+            ));
+        });
+        assert!(matches!(
+            store.load_native_sampling_status(issue.key()).unwrap(),
+            Some(crate::NativeSamplingStatus::AppliedPendingAck { issue: stored, .. })
+                if stored == issue
+        ));
     }
 }
