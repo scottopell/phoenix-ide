@@ -97,7 +97,7 @@ Choose option 2, refining rather than superseding ADR-107.
 - [Standalone controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium), `DisposableNativeGuardianRunner` and its contracts.
 - [Standalone controller status](../standalone-deployment-controller/executive.md).
 - [ADR-034: Explicit compatibility guarantees](034_compatibility-guarantees-are-explicit-and-data-aware.md).
-- [ADR-106: Controller durability and supervision](106_standalone-controller-owns-durability-and-supervision.md).
-- [ADR-107: Detach-and-fence](107_controller-loss-detaches-and-fences-surviving-guardian.md).
+- [ADR-107: Controller durability and supervision](107_standalone-controller-owns-durability-and-supervision.md).
+- [ADR-108: Detach-and-fence](108_controller-loss-detaches-and-fences-surviving-guardian.md).
 - [Compatibility requirements](../compatibility/requirements.md), REQ-COMP-001 and REQ-COMP-005.
 - [Production deployment requirements](../production-deployment/requirements.md) and [launchd deployment requirements](../launchd-deployment/requirements.md) retain their separate activation boundaries.
