@@ -1657,3 +1657,35 @@ collector/export acceptance relaxation was added. The reviewed REQ-CVT-006 join
 still requires the full independent report inventory, real collector witnesses,
 actual semantic exports and normal app/receiver drain. New hosted evidence is
 owed; previous unsampled/inconclusive observations are not delivery success.
+
+
+## Full-UI disclosure test synchronization after run 38850583279
+
+Exact harness `fa6140ec` / app `97826944` run `38850583279` completed with
+witness `116810677154` failure and standard Rust `116810759426` success; all
+other standard jobs passed. The witness stopped at the full pinned UI gate,
+before application/browser qualification: 167 files/3,521 tests passed, two tests
+skipped, and `MessageComponents.test.tsx` disclosure integration timed out at
+5,000ms. Real collector unit, codegen and opening guards had passed. Artifact
+`12025266655` (88,615,960 bytes) remains remote; 52,173 range bytes of selected
+receipts were inspected. There is no new native sampling/delivery evidence.
+
+The exact failing test and its entire 147-test file passed independently on the
+unchanged source using cached Vitest with one worker. Thus the external scheduler
+cause of the hosted timeout is not established. Source does establish an
+unnecessary timing boundary: MermaidDiagram synchronously renders its figure,
+but this disclosure test awaited `waitFor` merely for that figure's presence.
+Testing Library's async wrapper adds a timer turn even when that assertion is
+already satisfied. The test was not awaiting asynchronous SVG completion.
+
+App `a7b39c0985bbd1419b1f09d599b1d79a5d1fe0fa`, tree
+`429a7cf4cd59a76b7cde182d6c7f82b5641c2a9a`, changes only that test: it now
+asserts the same figure synchronously and removes the async callback. Visibility,
+manual close and fragment-switch assertions are preserved; actual asynchronous
+Mermaid rendering tests are unchanged. No timeout increase, skip, weaker
+assertion, product or telemetry behavior change was made. The patched full
+owning file passes 147/147 locally; shared cached opening Python 65, shipping
+Python 16 and Node 99 pass with refreshed exact source/tree pins. This is a
+source-supported synchronization repair, not a claim that local testing
+reproduced or conclusively explained the external hosted scheduling stall.
+The strict full UI and native collector/export gates remain mandatory.
