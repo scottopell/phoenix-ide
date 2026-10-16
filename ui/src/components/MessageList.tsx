@@ -1665,7 +1665,10 @@ function MessageListImpl({
             }
           } else {
             continuityRestoreInFlightRef.current = true;
-            transcriptRef.current?.scrollToOwnedIndex(effect.commandKey, effect.targetIndex, effect.align, effect.viewportStartOffset);
+            transcriptRef.current?.scrollToOwnedIndex(
+              effect.commandKey, effect.targetIndex, effect.align, effect.viewportStartOffset, undefined,
+              'continuity',
+            );
           }
           const physicalTargetSelector = effect.command.kind === 'jump_to_message'
             ? (() => {

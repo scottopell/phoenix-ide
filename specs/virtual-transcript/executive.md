@@ -16,6 +16,10 @@ Virtual Transcript is the platform-neutral contract and Phoenix-owned web implem
 - `specs/virtual-transcript/virtual_transcript.allium` — reducer-aligned positioning and measurement lifecycle.
 - `specs/messagelist-render-units/` — render-unit construction and conversation scroll ownership policy.
 
+## Directional start alignment
+
+`VirtualTranscript` shares native start-position readback and a single bounded conservative overshoot correction between immediate and deferred target execution. `MessageList` explicitly selects continuity positioning for prefix restoration, excluding it from directional correction. Component coverage includes nearest-integer scroll quantization, accepted fractional positions, integer controls, nonzero target/start offsets, zero/upper clamps, final anchor preservation after header resize, own-write echoes, and no-op user scrolling. Existing hidden authority/supersession and end/tail/restore tests remain in the focused validation set. Source regression coverage does not establish actual browser qualification of a corrected artifact.
+
 ## Verification matrix
 
 | Requirement | Verification |

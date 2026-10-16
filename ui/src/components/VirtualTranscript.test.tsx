@@ -356,17 +356,24 @@ describe('VirtualTranscript', () => {
     { deferred: true, headerHeight: 42 },
     { deferred: false, headerHeight: 42.5 },
     { deferred: true, headerHeight: 42.5 },
-  ])('keeps the physical first-user start inside the clip with integer scroll quantization ($deferred, $headerHeight)', ({ deferred, headerHeight }) => {
+    { deferred: false, headerHeight: 42.5, quantize: false },
+    { deferred: true, headerHeight: 42.5, quantize: false },
+    { deferred: false, headerHeight: 42.5, intra: 8, viewportOffset: 12 },
+    { deferred: true, headerHeight: 42.5, intra: 8, viewportOffset: 12 },
+    { deferred: false, headerHeight: 42.5, viewportOffset: 100 },
+    { deferred: true, headerHeight: 42.5, viewportOffset: 100 },
+  ].map(testCase => ({ quantize: true, intra: 0, viewportOffset: 0, ...testCase })))('keeps the physical first-user start inside the clip ($deferred, $headerHeight, $quantize, $intra, $viewportOffset)', ({ deferred, headerHeight, quantize, intra, viewportOffset }) => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;
     let actualTop = 0;
+    let measuredHeader = headerHeight;
     const requested: number[] = [];
     const originalRect = HTMLElement.prototype.getBoundingClientRect;
     const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
       const rect = originalRect.call(this);
       const row = this.closest<HTMLElement>('[data-virtual-index]');
       const top = this.classList.contains('virtual-transcript') ? 93
-        : row ? 93 + headerHeight + Number(row.dataset['virtualIndex']) * 75 - actualTop
+        : row ? 93 + measuredHeader + Number(row.dataset['virtualIndex']) * 75 - actualTop + (this.hasAttribute('data-testid') ? intra : 0)
           : rect.top;
       const height = this.classList.contains('virtual-transcript') ? this.clientHeight : rect.height;
       return { ...rect, top, y: top, height, bottom: top + height } as DOMRect;
@@ -381,33 +388,88 @@ describe('VirtualTranscript', () => {
           if (element) Object.defineProperty(element, 'scrollTop', {
             configurable: true,
             get: () => actualTop,
-            set: (value: number) => { requested.push(value); actualTop = Math.round(value); },
+            set: (value: number) => { requested.push(value); actualTop = quantize ? Math.round(value) : value; },
           });
         }} /></div>);
       const wrapper = screen.getByTestId('quantized-wrapper');
       const selector = '[data-testid="quantized-item-0"]';
       if (deferred) wrapper.style.display = 'none';
-      act(() => ref.current?.scrollToIndex(0, 'start', 0, selector));
+      act(() => ref.current?.scrollToIndex(0, 'start', viewportOffset, selector));
       if (deferred) {
         expect(ref.current?.physicalSnapshot(0, selector).targetMeasured).toBe(false);
         wrapper.style.display = '';
         const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
         act(() => resizeObservers[0]!.triggerEntries([[scroller!, 100], [header, headerHeight]]));
       }
-      expect(requested.length).toBeGreaterThan(0);
-      expect(Number.isInteger(actualTop)).toBe(true);
+      if (quantize) expect(Number.isInteger(actualTop)).toBe(true);
+      if (viewportOffset === 100) expect(requested).toHaveLength(0);
+      else if (!quantize || Number.isInteger(headerHeight)) expect(requested).toHaveLength(1);
+      else expect(requested).toHaveLength(2);
+      expect(ref.current?.isProgrammaticScroll(actualTop)).toBe(viewportOffset !== 100);
       expect(ref.current?.physicalSnapshot(0, selector).targetMeasured).toBe(true);
       const child = screen.getByTestId('quantized-item-0');
       const row = child.closest<HTMLElement>('[data-virtual-index]')!;
       const clip = scroller!.getBoundingClientRect();
-      expect(child.getBoundingClientRect().bottom).toBeLessThanOrEqual(clip.bottom);
-      expect(row.getBoundingClientRect().bottom).toBeLessThanOrEqual(clip.bottom);
+      if (viewportOffset !== 100) {
+        expect(child.getBoundingClientRect().bottom).toBeLessThanOrEqual(clip.bottom);
+        expect(row.getBoundingClientRect().bottom).toBeLessThanOrEqual(clip.bottom);
+      }
       const writes = JSON.stringify({ requested, actualTop });
       expect.soft(row.getBoundingClientRect().top - clip.top, writes).toBeGreaterThanOrEqual(0);
-      expect(child.getBoundingClientRect().top - clip.top, writes).toBeGreaterThanOrEqual(0);
+      expect(child.getBoundingClientRect().top - clip.top, writes).toBeGreaterThanOrEqual(Math.min(viewportOffset, headerHeight + intra));
+      const beforeResize = ref.current!.physicalSnapshot(0, selector);
+      expect(beforeResize.viewportTop).toBe(actualTop);
+      const initialOffset = child.getBoundingClientRect().top - clip.top;
+      measuredHeader += 10;
+      const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[header, measuredHeader]]));
+      expect(child.getBoundingClientRect().top - clip.top).toBe(initialOffset);
     } finally {
       rectSpy.mockRestore();
     }
+  });
+
+  it.each(['upper', 'end', 'tail', 'continuity', 'large-displacement'] as const)('bounds directional correction without changing %s positioning', mode => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const writes: number[] = [];
+    let actualTop = 0;
+    render(<VirtualTranscript ariaLabel="Quantized controls" ref={ref}
+      items={makeItems(20, 75)} getKey={item => item.id} estimatedExtent={75} overscan={0}
+      initialTail={false} header={<div data-height={42.5}>Header</div>} renderItem={renderRow}
+      scrollerRef={element => {
+        if (element) Object.defineProperty(element, 'scrollTop', {
+          configurable: true, get: () => actualTop,
+          set: (value: number) => { writes.push(value); actualTop = mode === 'large-displacement' ? value + 5 : Math.round(value); },
+        });
+      }} />);
+    act(() => {
+      if (mode === 'upper') ref.current?.setTailFollowAllowed(false);
+      if (mode === 'tail') ref.current?.scrollToTail();
+      else ref.current?.scrollToIndex(mode === 'upper' ? 19 : 0, mode === 'end' ? 'end' : 'start', 0, undefined, mode === 'continuity' ? 'continuity' : 'directional');
+    });
+    if (mode === 'upper') {
+      expect(writes).toEqual([1442.5, 1441.5]);
+      expect(actualTop).toBe(1442);
+    } else {
+      if (mode === 'tail') expect(writes.every(value => value === 1442.5)).toBe(true);
+      else expect(writes).toEqual([mode === 'end' ? 17.5 : 42.5]);
+      expect(actualTop).toBe(mode === 'end' ? 18 : mode === 'tail' ? 1443 : mode === 'large-displacement' ? 47.5 : 43);
+    }
+    expect(ref.current?.isProgrammaticScroll(actualTop)).toBe(true);
+    if (mode === 'upper' || mode === 'large-displacement') expect(ref.current?.physicalSnapshot().viewportTop).toBe(actualTop);
+  });
+
+  it('does not classify user scrolling after a clamped no-op start as an own-write echo', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    render(<VirtualTranscript ariaLabel="No-op start" ref={ref} items={makeItems(20, 75)}
+      getKey={item => item.id} estimatedExtent={75} initialTail={false}
+      header={<div data-height={42.5}>Header</div>} renderItem={renderRow} />);
+    act(() => ref.current?.scrollToIndex(0, 'start', 100));
+    expect(ref.current?.isProgrammaticScroll(0)).toBe(false);
+    const scroller = screen.getByRole('region', {name: 'No-op start'});
+    fireEvent.scroll(scroller, {target: {scrollTop: 1}});
+    expect(ref.current?.isProgrammaticScroll(1)).toBe(false);
+    expect(ref.current?.physicalSnapshot().viewportTop).toBe(1);
   });
 
   it('positions an intra-row target through the transcript executor', () => {
