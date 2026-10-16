@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent f9355ad checkout, independently built ignored
+Inputs are a clean independent 194e42b checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports four hash-attested telemetry harness
@@ -32,15 +32,16 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "f9355ade31138f06229808d8d5ca5a0d0f1df74b"
-TREE_PIN = "39b3306f93d1d68807c4e0f77f1f0223383a906b"
+PIN = "194e42b7e7730ae163aa494193a55c81ff914b87"
+TREE_PIN = "6d09383d282006b34f8c8aedb4fbb871d9dea67d"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
+COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
 SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
-    "ui/scripts/qualify-view-telemetry.mjs": "c19bbc39d35e3adcaa046c0269d2a2d1d111bd644d0e34bd08bee5e0389c6d22",
+    "ui/scripts/qualify-view-telemetry.mjs": "5bf6b2ea3a55255f9cdc53b23e46754bc7dc9159acbe201cc38af1f7a9b9cdb1",
     "ui/scripts/view-telemetry-diagnostics.mjs": "fa442b6f4ea65c12fc2a05ec1c37c1e565430baa6d3151e6a8c180d21ed110a1",
     "tests/e2e/view_telemetry_sink.py": "aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",
@@ -81,6 +82,9 @@ def identity(app, exe, receipt_path):
     if receipt.get("focused_test_exit") != 0 or receipt.get("compiler_artifact_selector") != [
             "cargo", "test", "--no-run", "--message-format=json"]:
         raise ValueError("instrumented build selector/focused tests missing")
+    if (type(receipt.get("collector_witness_exit")) is not int or receipt["collector_witness_exit"] != 0
+            or receipt.get("collector_witness_command") != [COLLECTOR_TEST, "--exact", "--nocapture", "--test-threads=1"]):
+        raise ValueError("real collector witness test was not successfully executed")
     return measured | {"rustc": receipt["rustc"], "receipt_sha256": shipping.digest(receipt_path),
         "harness_files": {str(p.relative_to(ROOT)): shipping.digest(p) for p in
             [Path(__file__), SCRIPT, Path(shipping.__file__),

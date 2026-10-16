@@ -48,6 +48,8 @@ class OpeningQualificationTests(unittest.TestCase):
             "telemetry_modules": opening.TELEMETRY_MODULES,
             "rustc": "rustc 1.95.0 (build attestation)",
             "focused_test_exit": 0, "ignored_driver": opening.DRIVER,
+            "collector_witness_exit": 0,
+            "collector_witness_command": [opening.COLLECTOR_TEST, "--exact", "--nocapture", "--test-threads=1"],
             "compiler_artifact_selector": ["cargo", "test", "--no-run", "--message-format=json"]}
         self.write()
 
@@ -852,6 +854,19 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertNotIn("subprocess.check_output", source)
         self.assertIn("--ignored", source)
         self.assertIn("Fixture(h, base, case)", source)
+
+
+    def test_collector_unit_must_actually_be_named_and_successful(self):
+        for value in (None, False, 1):
+            self.value["collector_witness_exit"] = value
+            self.write()
+            with self.assertRaisesRegex(ValueError, "collector witness test"):
+                self.identity()
+        self.value["collector_witness_exit"] = 0
+        self.value["collector_witness_command"] = [opening.COLLECTOR_TEST]
+        self.write()
+        with self.assertRaisesRegex(ValueError, "collector witness test"):
+            self.identity()
 
 
 class CollectorDeliveryTests(unittest.TestCase):

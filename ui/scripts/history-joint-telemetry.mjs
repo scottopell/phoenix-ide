@@ -4,9 +4,9 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = 'f9355ade31138f06229808d8d5ca5a0d0f1df74b';
+export const APP_PIN = '194e42b7e7730ae163aa494193a55c81ff914b87';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
-export const TELEMETRY_MODULE_SHA256 = 'c19bbc39d35e3adcaa046c0269d2a2d1d111bd644d0e34bd08bee5e0389c6d22';
+export const TELEMETRY_MODULE_SHA256 = '5bf6b2ea3a55255f9cdc53b23e46754bc7dc9159acbe201cc38af1f7a9b9cdb1';
 export const TELEMETRY_DIAGNOSTICS_SHA256 = 'fa442b6f4ea65c12fc2a05ec1c37c1e565430baa6d3151e6a8c180d21ed110a1';
 export const TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE = 'ui/scripts/view-telemetry-diagnostics.mjs';
 export const TELEMETRY_RELATIVE_MODULE = 'ui/scripts/qualify-view-telemetry.mjs';

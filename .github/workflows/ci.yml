@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: f9355ade31138f06229808d8d5ca5a0d0f1df74b
+          ref: 194e42b7e7730ae163aa494193a55c81ff914b87
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -248,8 +248,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = f9355ade31138f06229808d8d5ca5a0d0f1df74b
-          test "$(git rev-parse HEAD^{tree})" = 39b3306f93d1d68807c4e0f77f1f0223383a906b
+          test "$(git rev-parse HEAD)" = 194e42b7e7730ae163aa494193a55c81ff914b87
+          test "$(git rev-parse HEAD^{tree})" = 6d09383d282006b34f8c8aedb4fbb871d9dea67d
           test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -352,6 +352,16 @@ jobs:
           (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
           assert completed.returncode == 0, 'instrumentation guard tests failed; see retained log'
           assert '11 passed; 0 failed; 1 ignored' in completed.stdout, completed.stdout
+          witness_name = 'api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance'
+          assert witness_name + ': test' in listed.stdout
+          witness_command = [str(destination), witness_name, '--exact', '--nocapture', '--test-threads=1']
+          witness = subprocess.run(witness_command, capture_output=True, text=True, timeout=120)
+          (root.parent/'opening-collector-witness-unit.log').write_text(witness.stdout+witness.stderr)
+          receipt.update({'collector_witness_command':witness_command[1:],
+                          'collector_witness_exit':witness.returncode})
+          (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          assert witness.returncode == 0, 'real collector witness regression failed; see retained log'
+          assert '1 passed; 0 failed;' in witness.stdout, witness.stdout
           PY
       - name: Compiler-free instrumented harness regressions
         working-directory: harness
@@ -428,6 +438,7 @@ jobs:
             opening-instrumented-libtest
             opening-instrumented-receipt.json
             opening-instrumented-unit.log
+            opening-collector-witness-unit.log
             opening-instrumented-selector.log
             opening-browser-evidence/
             pinned-app-full-ui.log

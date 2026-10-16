@@ -1458,3 +1458,71 @@ on its nonexistent legacy table in memory, without source edits. Current ring:
 54 opening Python, 16 shipping Python and 94 Node tests passed. Initial test
 import/name errors are retained separately. These checks establish the fixture
 correction, not native pagehide or joint acceptance.
+
+
+## Reviewed collector/export acceptance implementation
+
+Run `38838103037` at harness `1c7b24a` / app `f9355ade` completed with witness
+`116771663445` failure and standard Rust `116771738701` success. Setup reached
+browser qualification: nine history checks, 41 stock trials, 17 sampled/17 POSTs,
+and all seven collector-negative statuses matched. The sampled pagehide again
+reported once with no browser 204, producer rejection and pre-cleanup CDP
+cancellation. There was no captured timeout-abort event. This falsifies
+synchronous dispatch as a sufficient remedy, not the exact transport actor.
+Artifact `12020760357` remains remote; selected receipts used 53,236 range bytes.
+No outer Global/export/overhead acceptance followed that failure.
+
+A separate push-only synthetic experiment at source
+`4ee8d17613a0da0eac4ef322fe51877fd90341ad` completed run `38842011920`,
+job `116784022706`, operation success. All four cells (CDP 0/200 ms × blank/
+same-origin departure) had server body completion/204 response finish while the
+browser reported rejection/request failure/CDP cancellation. No cell had a
+browser 204 or captured own timeout abort. The 2,052-byte artifact `12021448843`
+was fully inspected; this was not application acceptance or export evidence.
+The probe's two late-operation lifecycle findings were fixed before execution.
+
+The user explicitly selected **Collector + export proof**, with contract review
+before a gate change or rerun. The original departing-browser 204 oracle came
+from donor `22e73bffa` and `3726c1d42`, not a normative reliable-delivery promise:
+REQ-CVT-004 requires best-effort nonblocking keepalive without retries/queues.
+The reviewed REQ-CVT-006 / ADR-107 distinguishes that transport contract from
+candidate delivery proof. Exact contract packets `2dba157b` and `047b089f` were
+reviewed independently; the latter fixes ADR-103 collision and preserves exact
+browser-reported correlations, observed provenance and caps/drop accounting.
+They were imported as docs-only commits before executable gate changes.
+
+Donor implementation `a001fd275eeef688e3ec6b6690003151d3f039e9` is imported
+as app `194e42b7e7730ae163aa494193a55c81ff914b87`, tree
+`6d09383d282006b34f8c8aedb4fbb871d9dea67d`, atop frozen `7af06a4`.
+A real authenticated, validated handler completion emits the fixed six-field
+INFO acceptance witness after span/children creation, immediately before 204.
+The pagehide browser stage is provisional; an observed non-204 or duplicate
+response still fails, and nondeparting browser-204 requirements stay unchanged.
+Source review found no introduced issue. A real-router test covers 401/400/422
+with no witness and repeated successful POSTs with two witnesses (no dedupe).
+This Rust test is source-reviewed but **not locally compiled or executed**; the
+existing hosted selected libtest guard explicitly executes its exact name,
+retains a separate log and records success in the build receipt. Harness source
+admission rejects a missing/failed/wrong-name collector-test receipt.
+
+Shared collector projection rejects malformed claimed events, unknown fields,
+noncanonical identities, boolean version/status, duplicates, cross-source or
+instance witnesses and byte/line/count overflow. It preserves only content-free
+allowlisted facts, not JSON envelope spans or arbitrary runtime log content.
+After normal app-first/receiver-second drain and mandatory raw-protobuf/index
+reconciliation plus semantic retrieval, the independent full browser inventory
+must exactly equal both collector and actual-export occurrence inventories.
+Missing either half, foreign/extra/duplicate identity, failed drain or wrong
+outcome/trace prevents the separate `telemetry-delivery.json` seal. It never
+changes browser failures to success or grants joint/overhead acceptance.
+
+Actual cached offline ring on this integration: 65 opening Python, 16 shipping
+Python, 94 Node selftests and **111 focused telemetry tests across seven files**
+passed, with syntax/YAML/diff checks. The log named `focused115` contains the
+actual 111 count, not 115. Serialized-protobuf/corrupt-retained-raw controls prove
+export proof cannot be replaced by a collector log. Earlier intermediate wrong
+new-test function-name and patch-placement errors were corrected before this
+ring; failed logs remain retained. No local Rust build, server/listener/browser,
+installation, cache cleanup, deployment or production action was performed.
+Full new-source hosted qualification and actual collector/export join remain
+owed; no current candidate/joint or overhead acceptance is claimed.
