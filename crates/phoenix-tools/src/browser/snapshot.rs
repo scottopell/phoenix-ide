@@ -73,22 +73,11 @@ impl BrowserSnapshotTool {
                     .find(|line| line.starts_with("[TRUNCATED:"))
                     .unwrap_or("")
                     .to_string();
-                let directory =
-                    match PhoenixRuntimeEnvironment::detect().tmp_subdir("browser-snapshots") {
-                        Ok(directory) => directory,
-                        Err(error) => {
-                            session.invalidate_snapshot();
-                            return ToolOutput::error(format!(
-                                "Could not create snapshot directory: {error}"
-                            ));
-                        }
-                    };
-                let path = directory.join(format!("phoenix-snapshot-{}.txt", uuid::Uuid::new_v4()));
-                match tokio::fs::write(&path, output).await {
-                    Ok(()) => ToolOutput::success(format!("Accessibility snapshot saved to {}. Read this file for the tree and element refs.\n{notice}", path.display())).with_display(json!({"artifact_path":path})),
+                match session.save_snapshot_artifact(&PhoenixRuntimeEnvironment::detect(), &output) {
+                    Ok(path) => ToolOutput::success(format!("Accessibility snapshot saved to {}. Read this file for the tree and element refs.\n{notice}", path.display())).with_display(json!({"artifact_path":path})),
                     Err(error) => {
                         session.invalidate_snapshot();
-                        ToolOutput::error(format!("Could not save accessibility snapshot: {error}"))
+                        ToolOutput::error(error.to_string())
                     }
                 }
             }

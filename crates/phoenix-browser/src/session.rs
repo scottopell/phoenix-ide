@@ -1238,6 +1238,7 @@ impl BrowserSession {
     ///
     /// Falls back to `Browser::kill` when graceful close does not complete.
     async fn terminate(&mut self) -> Result<(), BrowserTerminationError> {
+        self.invalidate_snapshot();
         if let Some(t) = &self.console_task {
             t.abort();
         }

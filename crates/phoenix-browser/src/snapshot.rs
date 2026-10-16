@@ -49,6 +49,59 @@ impl<'de> Deserialize<'de> for BrowserTarget {
 pub(crate) struct SnapshotReferences {
     document: BackendNodeId,
     nodes: HashMap<String, BackendNodeId>,
+    artifact: Option<SnapshotArtifact>,
+}
+
+#[derive(Debug)]
+struct SnapshotArtifact {
+    path: std::path::PathBuf,
+}
+
+impl SnapshotArtifact {
+    #[cfg(unix)]
+    fn write(root: &std::path::Path, output: &str) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        std::fs::create_dir_all(root)?;
+        let directory = root.join(format!("browser-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let artifact = Self {
+            path: directory.join("snapshot.txt"),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&artifact.path)?;
+        file.write_all(output.as_bytes())?;
+        Ok(artifact)
+    }
+
+    #[cfg(not(unix))]
+    fn write(_root: &std::path::Path, _output: &str) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "private snapshot artifacts require owner-only filesystem permissions",
+        ))
+    }
+}
+
+impl Drop for SnapshotArtifact {
+    fn drop(&mut self) {
+        if let Err(failure) = std::fs::remove_file(&self.path) {
+            if failure.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%failure, path = %self.path.display(), "could not retire snapshot artifact");
+            }
+        }
+        if let Some(directory) = self.path.parent() {
+            if let Err(failure) = std::fs::remove_dir(directory) {
+                if failure.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%failure, path = %directory.display(), "could not retire snapshot artifact directory");
+                }
+            }
+        }
+    }
 }
 
 fn error(message: impl Into<String>) -> BrowserError {
@@ -104,6 +157,7 @@ fn render(
     let mut refs = SnapshotReferences {
         document,
         nodes: HashMap::new(),
+        artifact: None,
     };
     let index: HashMap<_, _> = nodes
         .iter()
@@ -194,7 +248,7 @@ impl BrowserSession {
         &mut self,
         interactive_only: bool,
     ) -> Result<String, BrowserError> {
-        self.snapshot = None;
+        self.invalidate_snapshot();
         let document = self.page.get_document().await?.backend_node_id;
         let frame = self
             .page
@@ -218,6 +272,25 @@ impl BrowserSession {
 
     pub fn invalidate_snapshot(&mut self) {
         self.snapshot = None;
+    }
+
+    /// Save bounded snapshot text in an owner-only session-owned artifact.
+    ///
+    /// # Errors
+    /// Returns an error when no snapshot exists or the private artifact cannot be written.
+    pub fn save_snapshot_artifact(
+        &mut self,
+        runtime_env: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
+        output: &str,
+    ) -> Result<std::path::PathBuf, BrowserError> {
+        let refs = self.snapshot.as_mut().ok_or_else(|| error(STALE))?;
+        let artifact =
+            SnapshotArtifact::write(runtime_env.tmp_root(), output).map_err(|failure| {
+                error(format!("Could not save accessibility snapshot: {failure}"))
+            })?;
+        let path = artifact.path.clone();
+        refs.artifact = Some(artifact);
+        Ok(path)
     }
 
     async fn reference_object(&self, reference: &str) -> Result<ReferenceObject, BrowserError> {
@@ -395,6 +468,44 @@ mod tests {
 
     fn document() -> BackendNodeId {
         serde_json::from_value(json!(1)).expect("document backend ID")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_artifacts_are_private_and_retired_with_references() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("artifact root");
+        let artifact = SnapshotArtifact::write(root.path(), "private accessible value")
+            .expect("private artifact");
+        let path = artifact.path.clone();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let (_, mut references) = render(&[node(1, "button", "Secret", &[])], false, document());
+        references.artifact = Some(artifact);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "private accessible value"
+        );
+        references.artifact = None;
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+        let artifact = SnapshotArtifact::write(root.path(), "replacement").unwrap();
+        let path = artifact.path.clone();
+        references.artifact = Some(artifact);
+        drop(references);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]
