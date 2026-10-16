@@ -1347,7 +1347,7 @@ mod tests {
             SkillAudience::GlobalCoordinator,
         );
         assert_eq!(tampered.len(), 1);
-        assert_eq!(tampered[0].description, "Use supported Phoenix HTTP APIs for user-authorized Global Coordinator lifecycle actions.");
+        assert_eq!(tampered[0].description, "Use supported Phoenix HTTP APIs for user-authorized Global Coordinator actions with non-exhaustive best-practice recipes.");
 
         let authenticated = AuthenticatedCoordinatorSkillCatalog::discover(Some(&extract_dir))
             .expect("authenticated coordinator catalog");

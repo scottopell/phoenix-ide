@@ -209,8 +209,19 @@ rule PhoenixApiCreationRecipe {
         -- staged active scoped Bash calls for discovery, UUID generation, POST,
         -- ambiguity reconciliation, and independent verification. Each shell
         -- call receives data through encoded literals; credentials stay out of
-        -- argv/output. Source inspection is a version-mismatch diagnostic, not
-        -- a normal API workflow.
+        -- argv/output. Recipes are non-exhaustive best practices, not an
+        -- endpoint allowlist. Other supported public APIs require inspected
+        -- current deployment/source contracts applicable to the destination
+        -- and user authority. Source inspection establishes contract facts,
+        -- not permission or proof that local source is deployed. Preserve
+        -- destination auth, transport, credentials, explicit active WorkScope,
+        -- immutable targets/intent, endpoint-specific idempotency, fresh reads
+        -- and server enforcement; never bypass with private handlers/DB writes.
+        -- Gap inventories are illustrative and qualified by inspected
+        -- deployment/source, not denylists. Permit verified supported
+        -- alternatives and bounded, deadline-limited state reads within user
+        -- authority. Never invent guarantees/receipts or create background
+        -- monitors to substitute for missing server semantics.
 }
 
 rule PhoenixApiDestinationAuthority {
@@ -233,6 +244,28 @@ rule PhoenixApiDestinationAuthority {
     ensures: action.consumes_destination_cwd = false or action.destination_cwd_is_authoritative = true
     ensures: action.uses_local_message_tool_for_remote_destination = false
     ensures: action.remote_continue_depends_on_federated_messaging = false
+
+    @guidance
+        -- For a user-authorized question response, freshly resolve the target
+        -- and GET its exact transcript. Require awaiting_user_response and
+        -- the opaque current request_id, never the provider tool_use_id.
+        -- For every full question text, permit exact user-provided answers or
+        -- decisions made within explicit delegated decision scope; map to
+        -- exact option labels or authorized custom text. Generic inspect/unblock
+        -- instructions are not decision authority. Never fabricate approvals
+        -- or extend delegation; ask the user when authority is missing.
+        -- UI multiSelect is a comma-space
+        -- string. Require complete answers without claiming backend validation.
+        -- Re-read original identity/questions immediately before one POST to
+        -- /api/conversations/{id}/respond with request_id and answers, then
+        -- re-read that original transcript and answer evidence. Optional
+        -- annotations carry user notes; submitted preview is not consumed.
+        -- request_id guards freshness, not idempotency. An uncertain response
+        -- requires original-identity observation, never automatic replay,
+        -- successor retargeting or answer transplantation to a new request.
+        -- A 409 conflict is not success. API acceptance is not execution.
+        -- See ../ask-user-question/requirements.md REQ-AUQ-009 and
+        -- ../global-recall/requirements.md REQ-GR-007.
 }
 
 ------------------------------------------------------------

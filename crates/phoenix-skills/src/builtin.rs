@@ -312,8 +312,76 @@ mod tests {
         assert!(reference.contains("Do not use `POST /api/conversations/{id}/chat`"));
         assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
         assert!(reference.contains("same original predecessor, message identity, and intent"));
-        assert!(reference.contains("Current APIs do not provide"));
+        assert!(
+            reference.contains("illustrative inventory qualified by inspected deployment/source")
+        );
+        assert!(!reference.contains("Current APIs do not provide"));
+        assert!(reference
+            .contains("Verified supported alternatives and bounded state reads remain available"));
         assert!(!reference.contains("NEVER call Phoenix HTTP API through Bash"));
+    }
+
+    #[test]
+    fn phoenix_api_recipes_are_non_exhaustive_and_source_grounded() {
+        let skill = embedded_skill("phoenix-api").unwrap();
+        let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
+        for content in [&skill, &reference] {
+            assert!(content.contains("non-exhaustive, not an endpoint allowlist"));
+            assert!(content.contains("inspected current deployment/source contracts"));
+            assert!(content.contains("user's authority"));
+            assert!(!content.contains("Inspect source only when"));
+        }
+        assert!(reference.contains("local source alone does not prove deployed behavior"));
+        assert!(
+            reference.contains("a private handler or database path is not a supported public API")
+        );
+    }
+
+    #[test]
+    fn phoenix_api_skill_allows_delegated_decisions_and_verified_alternatives() {
+        let skill = embedded_skill("phoenix-api").unwrap();
+        for permission in [
+            "exact user-provided answers or decisions made within explicit delegated decision scope",
+            "Verified supported alternatives and bounded state reads remain available",
+            "illustrative inventory qualified by inspected deployment/source",
+        ] {
+            assert!(skill.contains(permission), "missing permission: {permission}");
+        }
+        assert!(skill.contains("inspect or unblock work is not decision authority"));
+        assert!(skill.contains("Never fabricate approvals or extend delegation"));
+        assert!(skill.contains("Never invent guarantees or receipts"));
+        assert!(skill.contains("or create background monitors"));
+    }
+
+    #[test]
+    fn phoenix_api_question_recipe_requires_decision_authority_and_single_attempt() {
+        let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
+        for boundary in [
+            "exact user-provided answers or decisions made within explicit delegated decision scope",
+            "Never fabricate approvals or extend delegation",
+            "choose the test runner for this task",
+            "not approving deployment",
+            "does not authorize choosing its answers",
+            "GET /api/conversations/{id}",
+            "conversation.state.type == \"awaiting_user_response\"",
+            "conversation.state.request_id",
+            "not `tool_use_id`",
+            "every exact full question text",
+            "exact selected option `label` or user-authorized custom text",
+            "one comma-space string",
+            "backend does not enforce answer completeness",
+            "Immediately before submission, re-read the same original transcript",
+            "POST once",
+            "POST /api/conversations/{id}/respond",
+            "freshness guard, not an idempotency key",
+            "do not automatically POST again",
+            "not success",
+            "never transplant answers to a new request identity or successor transcript",
+            "Submitted annotation `preview` is not used",
+            "changed state alone does not prove these answers were accepted",
+        ] {
+            assert!(reference.contains(boundary), "missing boundary: {boundary}");
+        }
     }
 
     #[test]
