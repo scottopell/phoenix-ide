@@ -200,10 +200,7 @@ impl Read for DeadlineStream<'_> {
                     if matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue
-                }
+                    ) => {}
                 other => return other,
             }
         }
@@ -224,10 +221,7 @@ impl Write for DeadlineStream<'_> {
                     if matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue
-                }
+                    ) => {}
                 other => return other,
             }
         }
