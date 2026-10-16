@@ -132,6 +132,8 @@ vi.mock('./MessageContextMenu', () => ({
 const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
   scrollToOwnedIndex: vi.fn(),
+  completePosition: vi.fn(),
+  interruptPosition: vi.fn(),
   cancelPosition: vi.fn(),
   scrollToTail: vi.fn(),
   setTailFollowAllowed: vi.fn(),
@@ -162,6 +164,8 @@ beforeEach(() => {
   virtualTranscriptMock.scrollToTail = vi.fn();
   virtualTranscriptMock.setTailFollowAllowed = vi.fn();
   virtualTranscriptMock.isProgrammaticScroll = vi.fn(() => false);
+  virtualTranscriptMock.completePosition = vi.fn();
+  virtualTranscriptMock.interruptPosition = vi.fn();
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.preserveViewportOnNextItemsChange = vi.fn();
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
@@ -228,6 +232,8 @@ vi.mock('./VirtualTranscript', async () => {
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
         scrollToOwnedIndex: virtualTranscriptMock.scrollToOwnedIndex,
+        completePosition: virtualTranscriptMock.completePosition,
+        interruptPosition: virtualTranscriptMock.interruptPosition,
         cancelPosition: virtualTranscriptMock.cancelPosition,
         scrollToTail: virtualTranscriptMock.scrollToTail,
         setTailFollowAllowed: virtualTranscriptMock.setTailFollowAllowed,
@@ -1666,6 +1672,8 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 2, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }, messageId: 'msg-3' })), result: 'applied' });
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24, undefined, 'continuity');
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledWith(transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 2, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }, messageId: 'msg-3' })));
   });
 
   it('does not acknowledge jump until the visible target is measured, then finishes exactly once', () => {
@@ -1699,6 +1707,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     render(renderList(command));
 
+    expect(virtualTranscriptMock.completePosition).not.toHaveBeenCalled();
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
@@ -1735,6 +1744,8 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       targetMeasured: true,
     }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledWith(transcriptPositioningCommandKey(command));
   });
 
   it('supersedes an active restore when its command disappears', () => {
@@ -3949,6 +3960,7 @@ describe('handleTotalListHeightChanged', () => {
     // stayed in its positioning phase and the arrival was refused.
     act(() => listRef.current?.scrollToUnitIndex(0));
     fireEvent.keyDown(scroller, { key: 'PageDown' });
+    expect(virtualTranscriptMock.interruptPosition).toHaveBeenCalled();
     setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
     fireEvent.scroll(scroller);
 
