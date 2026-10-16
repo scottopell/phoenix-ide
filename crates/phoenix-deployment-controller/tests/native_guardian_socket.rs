@@ -91,7 +91,7 @@ fn exercise_protocol(directory: &Path, hello: WireSnapshot) {
         )
         .unwrap();
     drop(oversized);
-    let mut replacement = GuardianClient::connect(&directory).unwrap();
+    let mut replacement = GuardianClient::connect(directory).unwrap();
     assert_eq!(
         replacement.hello().unwrap().state,
         WireState::DetachedFenced
