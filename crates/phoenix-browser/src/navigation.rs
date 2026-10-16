@@ -148,6 +148,16 @@ impl BrowserSession {
                     .as_ref()
                     .map_or_else(|| loaded != &previous_loader, |expected| loaded == expected)
             }) {
+                let tree = connection.command("Page.getFrameTree", json!({})).await?;
+                let frame = &tree["frameTree"]["frame"];
+                if let Some(url) = frame["unreachableUrl"]
+                    .as_str()
+                    .filter(|url| !url.is_empty())
+                {
+                    return Err(navigation_error(format!(
+                        "Failed to load {url}: Chrome loaded an error document"
+                    )));
+                }
                 return Ok(());
             }
             connection.receive().await?;

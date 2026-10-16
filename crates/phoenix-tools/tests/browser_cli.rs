@@ -540,6 +540,35 @@ fn repeated_open_reloads_the_document_and_retains_browser_session_state() {
     });
 }
 
+#[test]
+fn reload_reports_server_failure_and_keeps_the_session_usable() {
+    if !chrome_enabled() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/reload", listener.local_addr().unwrap());
+    let stop = AtomicBool::new(false);
+    let requests = AtomicUsize::new(0);
+    let cli = BrowserCli::new();
+    let first = std::thread::scope(|scope| {
+        let stop = &stop;
+        let requests = &requests;
+        scope.spawn(move || serve_reload_fixture(&listener, stop, requests));
+        let _stop = StopOnExit(stop);
+        cli.ok(&["open", &url])
+    });
+    let failed = cli.invoke(&["open", &url], None, false);
+    assert_eq!(failed["error"]["code"], "operation_failed");
+    assert!(failed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to load"));
+    assert_eq!(failed["browser_lifetime"], first["browser_lifetime"]);
+    let recovered = cli.ok(&["open", "about:blank"]);
+    assert_eq!(recovered["browser_lifetime"], first["browser_lifetime"]);
+}
+
 fn live_resources(cli: &BrowserCli) -> (PathBuf, ProcessIdentity) {
     let status = cli.ok(&["status"]);
     let profile = PathBuf::from(status["result"]["profile_path"].as_str().unwrap());
