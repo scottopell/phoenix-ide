@@ -40,7 +40,7 @@ export async function runProbeCell(browser, baseURL, cell, ledger, { wait = ms =
   assert.ok(probeMatrix.some(value => value.latency === cell.latency && value.departure === cell.departure));
   const id = randomUUID();
   const start = performance.now();
-  const trial = { id, ...cell, facts: [], failure: null, cleanup_failure: null, overflow: false, observer_delivery_complete: false };
+  const trial = { id, ...cell, facts: [], failure: null, cleanup_failure: null, context_cleanup: 'pending_or_unknown', overflow: false, observer_delivery_complete: false };
   let recording = true;
   const record = (kind, extra = {}) => {
     if (!recording) return;
@@ -54,7 +54,11 @@ export async function runProbeCell(browser, baseURL, cell, ledger, { wait = ms =
   try {
     await limit((async () => {
       context = await browser.newContext({ storageState: { cookies: [], origins: [] }, serviceWorkers: 'block' });
-      if (canceled) { await context.close(); return; }
+      if (canceled) {
+        try { await limit(context.close(), 2000, 'late probe context close deadline'); }
+        catch { /* The returned trial retains pending_or_unknown; no false clean claim. */ }
+        return;
+      }
       for (const event of ['request', 'requestfinished', 'requestfailed']) context.on(event, request => { if (post(request)) record(`context_${event}`); });
       context.on('response', response => { if (post(response.request())) record('context_response', { status: response.status() }); });
       context.on('close', () => record('context_closed'));
@@ -69,6 +73,7 @@ export async function runProbeCell(browser, baseURL, cell, ledger, { wait = ms =
       const cdp = await context.newCDPSession(page);
       if (canceled) return;
       await cdp.send('Network.enable');
+      if (canceled) return;
       await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: cell.latency, downloadThroughput: 1000000, uploadThroughput: 1000000 });
       if (canceled) return;
       for (const event of ['request', 'requestfinished', 'requestfailed']) page.on(event, request => { if (post(request)) record(`page_${event}`); });
@@ -85,6 +90,7 @@ export async function runProbeCell(browser, baseURL, cell, ledger, { wait = ms =
       if (canceled) return;
       record('navigation_start');
       await page.goto(cell.departure === 'blank' ? 'about:blank' : `${baseURL}/destination`, { timeout: 5000, waitUntil: 'load' });
+      if (canceled) return;
       record('navigation_return');
       // Observe beyond the fixed producer abort deadline without replacing any delivery assertion.
       await wait(3500);
@@ -95,8 +101,13 @@ export async function runProbeCell(browser, baseURL, cell, ledger, { wait = ms =
     canceled = true;
     if (context) {
       record('context_close_start');
-      try { await limit(context.close(), 2000, 'probe context close deadline'); }
-      catch { trial.cleanup_failure = 'probe context cleanup failed'; }
+      try {
+        await limit(context.close(), 2000, 'probe context close deadline');
+        trial.context_cleanup = 'close_returned';
+      } catch {
+        trial.context_cleanup = 'failed_or_unknown';
+        trial.cleanup_failure = 'probe context cleanup failed';
+      }
       record('context_close_return');
     }
     ledger.delete(id);
