@@ -157,6 +157,8 @@ Each stable asset URL follows:
 https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-<target>
 ```
 
+The same targets also have standalone `phoenix-browser-<target>` binaries. Release candidates use an explicit `/releases/download/<tag>/` URL and leave the latest stable release unchanged. Verify downloaded bytes against the release's `SHA256SUMS` before use; see [browser CLI installation and usage](docs/phoenix-browser.md).
+
 ## Environment Variables
 
 Everything Phoenix reads. The server reads its config from the environment at
