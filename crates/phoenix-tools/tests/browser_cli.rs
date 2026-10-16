@@ -385,6 +385,70 @@ fn session_selection_obeys_precedence_and_canonical_worktree_boundaries() {
 }
 
 #[test]
+fn named_sessions_remain_manageable_from_a_deleted_working_directory() {
+    // REQ-BCLI-002.
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    let profile = cli.directory.path().join("saved.cpuprofile");
+    std::fs::write(
+        &profile,
+        br#"{"nodes":[],"startTime":0,"endTime":1,"samples":[],"timeDeltas":[]}"#,
+    )
+    .unwrap();
+    let input = json!({"path": profile}).to_string();
+    for environment in [false, true] {
+        let opened = cli.ok(&["open", &fixture()]);
+        for (index, arguments) in [
+            vec!["status"],
+            vec!["schema"],
+            vec!["profile", "help"],
+            vec!["profile", "cpu_summary", "--input", &input],
+            vec!["close"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let gone = cli
+                .directory
+                .path()
+                .join(format!("gone-{environment}-{index}"));
+            std::fs::create_dir(&gone).unwrap();
+            let gone_c = std::ffi::CString::new(gone.as_os_str().as_encoded_bytes()).unwrap();
+            let mut command = cli.base_command();
+            if environment {
+                command.env("PHOENIX_BROWSER_SESSION", "integration");
+            } else {
+                command.args(["--session", "integration"]);
+            }
+            command.current_dir(&gone).args(&arguments);
+            // SAFETY: rmdir is async-signal-safe; its path is allocated before fork.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::rmdir(gone_c.as_ptr()) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{arguments:?}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(response["session"], "named:integration");
+            if matches!(arguments[0], "status" | "close") {
+                assert_eq!(response["lifetime"], opened["lifetime"]);
+            }
+        }
+    }
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn non_utf8_worktree_paths_share_sessions_without_lossy_collisions() {
     // REQ-BCLI-002.
@@ -1193,8 +1257,18 @@ fn dead_chrome_cleanup_failure_remains_visible_until_explicit_close() {
     let _restore = RestoreMarker(&marker, &original);
     std::fs::write(&marker, b"broken-owner-marker").unwrap();
     signal_owned(resources.1, libc::SIGKILL);
+    let failed = wait_for_observation("daemon retired the killed Chrome child", || {
+        let output = cli.command().arg("status").output().unwrap();
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if response["error"]["code"] == "cleanup_failed" {
+            Some(response)
+        } else {
+            assert!(output.status.success(), "{response}");
+            assert_eq!(response["result"]["active"], true);
+            None
+        }
+    });
     await_process_exit(resources.1);
-    let failed = cli.invoke(&["status"], None, false);
     assert_eq!(failed["error"]["code"], "cleanup_failed");
     assert_eq!(failed["browser_lifetime"], opened["browser_lifetime"]);
     for _ in 0..2 {

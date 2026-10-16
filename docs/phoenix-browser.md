@@ -37,7 +37,7 @@ printf '%s\n' 'document.title' | phoenix-browser --json eval --stdin
 
 Navigation observation failures appear separately in `observation_errors`; console capture failure has its own `console_capture_error`. Reference input fails visibly when the browser cannot verify the native event destination, including a closed shadow root created without the early input guard.
 
-Console capture includes errors from new child frames even if they detach before `open` returns. Its bounded channel reports capture failure when an incoming message exceeds 8 MiB or source ownership is unavailable; ordinary retained console history remains available.
+Console capture includes errors from new child frames, including isolated cross-origin targets, even if they detach before `open` returns. Its bounded channel reports capture failure when an incoming message exceeds 8 MiB or source ownership is unavailable; ordinary retained console history remains available.
 
 `--json` returns `session`, daemon `lifetime`, browser `browser_lifetime`, and a `status` tag: `success` with `result`, or `error` with `error.code` and `error.message`. Tool results include `text`, structured `data`, and explicit `artifacts`. Tool errors preserve structured failure data in `error.details` and any `error.artifacts`. Failed commands exit 1; invalid input exits 2 before looking up browser state. Human output prints concise operation text; JSON is the harness interface.
 
@@ -59,6 +59,8 @@ phoenix-browser --json profile run_scenario --input '{"runs":5,"warmup":1,"steps
 ```
 
 Use the schema and profiling help for scenario step shapes, readiness, resets, CPU throttling, heap captures, coverage, traces, and React diagnostics. Preserve raw samples and compute statistics separately. CPU captures and other active profiling state persist between invocations. Profiling help and saved CPU-profile analysis run locally without a browser.
+
+Large scenario samples are returned through a verified saved artifact, while methodology and other observations remain in the response. If the remaining response exceeds the transport budget, the CLI returns an explicit failure with available artifact handles and a warning against replaying the completed operation.
 
 ## Lifecycle and recovery
 

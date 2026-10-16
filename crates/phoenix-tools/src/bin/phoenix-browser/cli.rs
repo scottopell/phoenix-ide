@@ -84,7 +84,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 pub fn resolve_session(
     explicit: Option<String>,
     environment: Option<String>,
-    cwd: &Path,
+    cwd: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<String, String> {
     if let Some(name) = explicit.or(environment) {
         if name.trim().is_empty() {
@@ -92,9 +92,10 @@ pub fn resolve_session(
         }
         return Ok(format!("named:{name}"));
     }
+    let cwd = cwd()?;
     let root = phoenix_core::git::command()
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
+        .current_dir(&cwd)
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -106,7 +107,7 @@ pub fn resolve_session(
         });
     let path = root
         .as_deref()
-        .unwrap_or(cwd)
+        .unwrap_or(&cwd)
         .canonicalize()
         .map_err(|e| format!("resolve session directory: {e}"))?;
     Ok(directory_identity(&path))
@@ -349,7 +350,7 @@ fn options(mut args: Vec<String>) -> Result<Options, ParseFailure> {
     let session = resolve_session(
         explicit,
         std::env::var("PHOENIX_BROWSER_SESSION").ok(),
-        &std::env::current_dir().map_err(|e| e.to_string())?,
+        || std::env::current_dir().map_err(|e| e.to_string()),
     )?;
     let parsed = (|| -> Result<_, String> {
         let idle = take_option(&mut args, "--idle-timeout")?
@@ -691,6 +692,28 @@ pub async fn main_entry() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_session_selection_does_not_read_the_fallback_directory() {
+        let unavailable = || Err("cwd is unavailable".to_owned());
+        assert_eq!(
+            resolve_session(
+                Some("explicit".into()),
+                Some("environment".into()),
+                unavailable
+            )
+            .unwrap(),
+            "named:explicit"
+        );
+        assert_eq!(
+            resolve_session(None, Some("environment".into()), unavailable).unwrap(),
+            "named:environment"
+        );
+        assert_eq!(
+            resolve_session(None, None, unavailable).unwrap_err(),
+            "cwd is unavailable"
+        );
+    }
 
     #[test]
     fn directory_identity_preserves_non_utf8_bytes() {
