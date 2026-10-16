@@ -72,7 +72,7 @@ test('unauthenticated collector check uses empty state and cleans up even on fai
   }
 });
 test('pending pagehide case requires actual incomplete report, not relabeled ready, and closes context', async () => {
-  for (const outcome of ['incomplete', 'ready']) {
+  for (const [outcome, status] of [['incomplete', 204], ['incomplete', 400], ['ready', 204]]) {
     const listeners = {};
     let finishReadiness;
     let closed = false;
@@ -86,7 +86,7 @@ test('pending pagehide case requires actual incomplete report, not relabeled rea
       goto: async url => {
         if (url === 'about:blank') {
           listeners.request({ url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', method: () => 'POST', postData: () => JSON.stringify(report) });
-          listeners.response({ url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', status: () => 204 });
+          listeners.response({ url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', status: () => status });
           finishReadiness();
         } else queueMicrotask(() => {
           binding({}, { version: 1, kind: 'admission', route: 'ordinary', sampled: true, open_id: producerId });
@@ -98,7 +98,8 @@ test('pending pagehide case requires actual incomplete report, not relabeled rea
     page.evaluate = async () => {};
     const browser = { newContext: async () => ({ exposeBinding: async (_name, fn) => { binding = fn; }, addInitScript: async () => {}, newPage: async () => page, newCDPSession: async () => ({ send: async () => {} }), close: async () => { closed = true; } }) };
     const args = { browser, storageState: { cookies: [], origins: [] }, baseURL: 'http://127.0.0.1:8123', route: '/c/product', attempts: 1 };
-    if (outcome === 'incomplete') assert.equal((await runPendingPagehideCheck(args)).status, 'observed_incomplete');
+    if (status !== 204) await assert.rejects(runPendingPagehideCheck(args), /response must be single204/);
+    else if (outcome === 'incomplete') assert.equal((await runPendingPagehideCheck(args)).status, 'provisional_incomplete_collector_export_pending');
     else await assert.rejects(runPendingPagehideCheck(args));
     assert.ok(closed);
   }
@@ -110,11 +111,11 @@ test('terminal inventory preserves incomplete/null marks and forbids duplicate o
     total_ms: 2, marks: { meaningful_transcript: null, breadcrumb_presented: null, breadcrumb_enabled: null, anchor_settled: null },
     breadcrumb_ready_minus_meaningful_ms: null, correlations: [{ kind: 'request', id: 'request' }] };
   const result = { journeys: [], capabilities: {} };
-  const terminal = { status: 'observed_incomplete', trials: [{ reports: [report] }] };
+  const terminal = { status: 'provisional_incomplete_collector_export_pending', trials: [{ reports: [report] }] };
   appendTerminalInventory(result, terminal, identity);
   assert.equal(result.journeys[0].expected['browser.outcome'], 'incomplete');
   assert.equal(result.journeys[0].expected['browser.meaningful_transcript_ms'], null);
-  assert.equal(result.capabilities.pagehide_incomplete, 'observed_incomplete');
+  assert.equal(result.capabilities.pagehide_incomplete, 'provisional_incomplete_collector_export_pending');
   assert.throws(() => appendTerminalInventory(result, terminal, identity));
   assert.throws(() => appendTerminalInventory({ journeys: [], capabilities: {} }, terminal, identity, ['request']));
 });
@@ -699,7 +700,7 @@ test.each(['missing_response', 'navigation_and_cleanup', 'callback_and_persisten
   const callbacks = {}; const contextCallbacks = {}; const cdpCallbacks = {};
   const primary = new Error('original navigation failure');
   const id = '00000000-0000-4000-8000-000000000001';
-  const report = { open_id: id, route: 'ordinary', trigger: 'navigation', outcome: 'incomplete', correlations: [{ kind: 'request', id }], total_ms: 1, marks: {} };
+  const report = { open_id: id, route: 'ordinary', trigger: 'navigation', outcome: 'incomplete', correlations: [{ kind: 'request', id }], total_ms: 1, marks: { meaningful_transcript: null } };
   const post = { url: () => 'http://127.0.0.1:8123/api/telemetry/conversation-view', method: () => 'POST', postData: () => JSON.stringify(report) };
   let trial;
   let ready;
@@ -730,14 +731,15 @@ test.each(['missing_response', 'navigation_and_cleanup', 'callback_and_persisten
     await vi.advanceTimersByTimeAsync(4020);
     const error = await result;
     if (mode === 'missing_response') {
-      assert.match(error.message, /deep-equal/);
+      assert.equal(error, null);
+      assert.equal(trial.status, 'provisional_incomplete_collector_export_pending');
       assert.deepEqual(trial.statuses, []);
       assert.equal(trial.reports.length, 1);
       assert.ok(trial.transport_facts.some(f => f.kind === 'context_requestfailed'));
       assert.ok(trial.transport_facts.some(f => f.kind === 'cdp_failed' && f.canceled));
       assert.equal(JSON.stringify(trial).includes('PRIVATE'), false);
     } else assert.equal(error, primary);
-    assert.ok(trial.cleanup_failure);
+    if (mode !== 'missing_response') assert.ok(trial.cleanup_failure);
     if (mode === 'callback_and_persistence') {
       assert.equal(trial.callback_failure, 'callback failed');
       assert.equal(trial.persistence_failure, 'pagehide trial receipt persistence failed');
