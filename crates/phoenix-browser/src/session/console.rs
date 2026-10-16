@@ -50,6 +50,7 @@ struct Context {
 }
 
 struct ChildTarget {
+    parent: Option<String>,
     frame: String,
     contexts: HashMap<ExecutionContextId, Context>,
 }
@@ -66,6 +67,36 @@ struct State {
 }
 
 impl State {
+    fn detach_subtree(&mut self, session: &str) {
+        let mut retired = HashSet::from([session.to_owned()]);
+        loop {
+            let before = retired.len();
+            for (session, child) in &self.children {
+                if child
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| retired.contains(parent))
+                {
+                    retired.insert(session.clone());
+                }
+            }
+            if retired.len() == before {
+                break;
+            }
+        }
+        let frames: Vec<_> = self
+            .children
+            .iter()
+            .filter(|(session, _)| retired.contains(*session))
+            .map(|(_, target)| target.frame.clone())
+            .collect();
+        self.children
+            .retain(|session, _| !retired.contains(session));
+        for frame in frames {
+            self.remove_frame(&frame);
+        }
+    }
+
     fn remove_frame(&mut self, frame: &str) {
         if !self.children.values().any(|target| target.frame == frame) {
             self.frames.remove(frame);
@@ -321,6 +352,7 @@ impl ConsoleCapture {
                 state.children.insert(
                     session.to_owned(),
                     ChildTarget {
+                        parent: child_session.map(str::to_owned),
                         frame,
                         contexts: HashMap::new(),
                     },
@@ -332,9 +364,7 @@ impl ConsoleCapture {
                         .state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(target) = state.children.remove(session) {
-                        state.remove_frame(&target.frame);
-                    }
+                    state.detach_subtree(session);
                     notification.notify_waiters();
                 }
             }
@@ -406,13 +436,14 @@ impl ConsoleCapture {
                 let contexts = match child_session {
                     None => &mut state.contexts,
                     Some(session) => {
-                        &mut state
-                            .children
-                            .get_mut(session)
-                            .ok_or_else(|| {
-                                capture_error("context destruction from unknown child target")
-                            })?
-                            .contexts
+                        let Some(target) = state.children.get_mut(session) else {
+                            tracing::debug!(
+                                session,
+                                "context destruction after console target retirement"
+                            );
+                            return Ok(());
+                        };
+                        &mut target.contexts
                     }
                 };
                 contexts.retain(|_, context| context.unique != event.execution_context_unique_id);
@@ -427,12 +458,16 @@ impl ConsoleCapture {
                         state.contexts.clear();
                         state.document = Document::default();
                     }
-                    Some(session) => state
-                        .children
-                        .get_mut(session)
-                        .ok_or_else(|| capture_error("context reset from unknown child target"))?
-                        .contexts
-                        .clear(),
+                    Some(session) => {
+                        if let Some(target) = state.children.get_mut(session) {
+                            target.contexts.clear();
+                        } else {
+                            tracing::debug!(
+                                session,
+                                "context reset after console target retirement"
+                            );
+                        }
+                    }
                 }
             }
             _ => unreachable!("context event selected by observe_from"),
@@ -449,6 +484,23 @@ struct Command {
 struct Drain {
     acknowledged: oneshot::Sender<()>,
     pending: HashSet<u64>,
+}
+
+fn retire_commands(
+    state: &State,
+    root_session: &str,
+    pending: &mut HashMap<u64, Command>,
+    mut drain: Option<&mut Drain>,
+) {
+    pending.retain(|id, command| {
+        let live = command.session == root_session || state.children.contains_key(&command.session);
+        if !live {
+            if let Some(drain) = drain.as_mut() {
+                drain.pending.remove(id);
+            }
+        }
+        live
+    });
 }
 
 struct Listener {
@@ -606,20 +658,17 @@ impl Listener {
             self.enable_target(child).await?;
         }
         if message["method"] == "Target.detachedFromTarget" {
-            if let Some(detached) = message["params"]["sessionId"].as_str() {
-                let removed: Vec<_> = self
-                    .pending
-                    .iter()
-                    .filter(|(_, command)| command.session == detached)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in removed {
-                    self.pending.remove(&id);
-                    if let Some(drain) = self.drain.as_mut() {
-                        drain.pending.remove(&id);
-                    }
-                }
-            }
+            let state = self
+                .capture
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retire_commands(
+                &state,
+                &self.root_session,
+                &mut self.pending,
+                self.drain.as_mut(),
+            );
         }
         self.acknowledge_drain();
         Ok(())
@@ -1011,6 +1060,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_detach_retires_descendants_and_their_pending_barriers() {
+        let capture = Arc::new(ConsoleCapture::default());
+        let logs = Mutex::new(VecDeque::new());
+        let notification = Notify::new();
+        let observe = |message: Value| {
+            let session = message["sessionId"].as_str();
+            capture
+                .observe_from(&message, session, &logs, &notification)
+                .unwrap();
+        };
+        observe(
+            json!({"method":"Target.attachedToTarget","params":{"sessionId":"parent","targetInfo":{"targetId":"parent-frame"}}}),
+        );
+        observe(
+            json!({"sessionId":"parent","method":"Target.attachedToTarget","params":{"sessionId":"nested","targetInfo":{"targetId":"nested-frame"}}}),
+        );
+        observe(
+            json!({"method":"Target.attachedToTarget","params":{"sessionId":"sibling","targetInfo":{"targetId":"nested-frame"}}}),
+        );
+        observe(
+            json!({"sessionId":"nested","method":"Runtime.executionContextCreated","params":{"context":{"id":1,"uniqueId":"nested-context","origin":"","name":""}}}),
+        );
+        capture.accept_from(
+            &event(1, "nested error before detach", "error"),
+            Some("nested"),
+            &logs,
+            &notification,
+        );
+        let mut pending = HashMap::from([
+            (
+                1,
+                Command {
+                    session: "parent".to_owned(),
+                    method: "Runtime.enable",
+                },
+            ),
+            (
+                2,
+                Command {
+                    session: "nested".to_owned(),
+                    method: "Runtime.evaluate",
+                },
+            ),
+            (
+                3,
+                Command {
+                    session: "sibling".to_owned(),
+                    method: "Runtime.evaluate",
+                },
+            ),
+            (
+                4,
+                Command {
+                    session: "root".to_owned(),
+                    method: "Runtime.enable",
+                },
+            ),
+        ]);
+        let (acknowledged, _receiver) = oneshot::channel();
+        let mut drain = Drain {
+            acknowledged,
+            pending: HashSet::from([2, 3]),
+        };
+        observe(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"parent"}}));
+        {
+            let state = capture.state.lock().unwrap();
+            assert_eq!(state.children.len(), 1);
+            assert!(state.children.contains_key("sibling"));
+            assert!(
+                state.frames.contains_key("nested-frame"),
+                "a retained session still owns this frame"
+            );
+            assert!(!state.frames.contains_key("parent-frame"));
+            retire_commands(&state, "root", &mut pending, Some(&mut drain));
+        }
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains_key(&3) && pending.contains_key(&4));
+        assert_eq!(drain.pending, HashSet::from([3]));
+        observe(
+            json!({"sessionId":"nested","method":"Runtime.executionContextDestroyed","params":{"executionContextUniqueId":"nested-context"}}),
+        );
+        observe(
+            json!({"sessionId":"nested","method":"Runtime.executionContextsCleared","params":{}}),
+        );
+        assert!(capture.state.lock().unwrap().failure.is_none());
+        capture.accept_from(
+            &event(1, "uncertain late nested error", "error"),
+            Some("nested"),
+            &logs,
+            &notification,
+        );
+        assert!(
+            capture.state.lock().unwrap().failure.is_some(),
+            "unknown late console ownership must be explicit"
+        );
+        let logs = logs.lock().unwrap();
+        assert_eq!(logs[0].text, "nested error before detach");
+        assert!(logs[0].source_document.is_some());
+        assert_eq!(logs[1].text, "uncertain late nested error");
+    }
+
+    #[tokio::test]
     async fn unknown_context_marks_capture_failed_without_discarding_session_history() {
         let capture = Arc::new(ConsoleCapture::default());
         let logs = Mutex::new(VecDeque::new());
@@ -1319,5 +1470,117 @@ mod tests {
         );
         assert!(!captured.contains(&"old-oopif-error"), "{captured:?}");
         assert!(!captured.contains(&"late-old-oopif-error"), "{captured:?}");
+    }
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One browser lifetime verifies repeated nested-process navigation and retained history"
+    )]
+    async fn native_console_capture_survives_repeated_nested_oopif_navigation() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let serving = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = server.accept().await {
+                tokio::spawn(async move {
+                    let mut request = vec![0; 8192];
+                    let Ok(count) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..count]);
+                    let path = request.split_whitespace().nth(1).unwrap_or("/");
+                    let script = format!("<script>console.error('{path}')</script>");
+                    let body = if path.starts_with("/leaf") {
+                        script
+                    } else if path.starts_with("/child") {
+                        format!(
+                            "{script}<iframe src='http://127.0.0.1:{port}/leaf{path}'></iframe>"
+                        )
+                    } else {
+                        format!(
+                            "{script}<iframe src='http://localhost:{port}/child{path}'></iframe>"
+                        )
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("nested-console-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.unwrap();
+        let mut captures = Vec::new();
+        {
+            let session = session.read().await;
+            for path in ["old", "new", "third"] {
+                let capture = session.begin_console_navigation_capture().await.unwrap();
+                session
+                    .page
+                    .goto(format!("http://127.0.0.1:{port}/{path}"))
+                    .await
+                    .unwrap();
+                assert!(
+                    session
+                        .console_capture
+                        .state
+                        .lock()
+                        .unwrap()
+                        .children
+                        .values()
+                        .any(|child| child.parent.is_some()),
+                    "fixture must attach a nested OOPIF session"
+                );
+                captures.push((
+                    path,
+                    session
+                        .finish_console_navigation_capture(capture)
+                        .await
+                        .unwrap(),
+                ));
+            }
+            assert!(session
+                .console_capture
+                .state
+                .lock()
+                .unwrap()
+                .failure
+                .is_none());
+            for path in ["/old", "/child/old", "/leaf/child/old"] {
+                assert!(
+                    session
+                        .console_logs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.text == path),
+                    "prior document history must survive descendant retirement"
+                );
+            }
+        }
+        manager.shutdown_all().await.unwrap();
+        serving.abort();
+        for (path, captured) in captures {
+            let texts: Vec<_> = captured.iter().map(|entry| entry.text.as_str()).collect();
+            for expected in [
+                format!("/{path}"),
+                format!("/child/{path}"),
+                format!("/leaf/child/{path}"),
+            ] {
+                assert!(
+                    texts.contains(&expected.as_str()),
+                    "expected {expected}, got {texts:?}"
+                );
+            }
+            assert_eq!(texts.len(), 3, "exclude prior nested documents: {texts:?}");
+        }
     }
 }
