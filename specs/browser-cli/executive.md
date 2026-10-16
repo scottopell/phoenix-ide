@@ -50,3 +50,7 @@ Nested cross-site target teardown retires descendant sessions and their pending 
 Open revalidates its snapshot document/generation after later observations and reports invalidation as a partial snapshot failure. Native-input paths share the guard cleanup lease; ordinary rejection awaits disarming. Heap-diff failure retains the completed post capture. Daemon readiness receives its own startup budget, and failed readiness terminates and reaps the unready child.
 
 Typed evaluation uses one shared value producer and separate Phoenix-text/CLI-data renderers. CLI JSON retains native JSON values, distinguishes undefined and non-JSON scalars, and identifies JSON/text artifacts for outputs above 4 KiB. Evaluation data bypasses generic artifact extraction, preserving user object keys such as `path`, `post`, and `artifact_path`. Human output renders the authoritative value or artifact handle.
+
+Screenshot output paths resolve in the caller's working directory before transport. Native browser coverage checks chosen/default paths, overwrite behavior, saved PNG bytes, and rejection of symlink or non-file destinations.
+
+Repeated `open` reloads the current URL within the same browser lifetime, retaining cookies and origin storage while replacing page state. Fragment navigation follows native CDP semantics without depending on a document-load event for same-document completion. Real HTTP coverage checks document generations, fresh refs, and navigation-local console errors.

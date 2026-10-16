@@ -104,6 +104,13 @@ AND SHALL NOT abandon an initialization future that may own an unregistered Chro
 WHEN `open` successfully navigates
 THE SYSTEM SHALL return the final URL, page title, compact interactive accessibility snapshot with usable references, and relevant console errors observed for that navigation.
 
+WHEN `open` targets the current URL
+THE SYSTEM SHALL reload the document while retaining the browser session, cookies, and origin storage.
+
+WHEN only the URL fragment changes
+THE SYSTEM SHALL preserve native navigation semantics
+AND SHALL NOT wait for a replacement document when the browser completes a same-document navigation.
+
 WHEN navigation succeeds but snapshot collection, console capture, or final URL/title observation fails
 THE SYSTEM SHALL preserve the successful navigation result and report each observation failure separately
 AND SHALL NOT represent the failed snapshot as an empty successful tree.

@@ -51,6 +51,12 @@ As an AI agent optimizing a web app, I need to measure performance under a repro
 
 The `browser_navigate` tool SHALL navigate to a specified URL and wait for the page to be ready for interaction
 
+WHEN the destination equals the current URL
+`browser_navigate` SHALL reload the document, replacing its DOM and JavaScript state while retaining browser-session cookies and origin storage
+
+WHEN only the URL fragment changes
+`browser_navigate` SHALL preserve native navigation semantics and complete without requiring a document load event when the browser performs same-document navigation
+
 WHEN navigation fails (network error, DNS failure, timeout, HTTP error)
 `browser_navigate` SHALL return a clear error message indicating the failure type
 

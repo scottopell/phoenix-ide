@@ -16,7 +16,7 @@ const HELP: &str = "phoenix-browser — persistent browser for coding agents (ma
 
 Usage: phoenix-browser [--session NAME] [--json] [--idle-timeout SECONDS] COMMAND
 
-  open URL                         Navigate; lazily start a browser
+  open URL                         Navigate; same URL reloads; lazily start a browser
   snapshot [--interactive]          Accessibility tree with click/type refs
   click TARGET                     Click @ref or CSS selector
   type TARGET TEXT [--clear]        Type into @ref or CSS selector

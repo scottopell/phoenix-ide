@@ -101,7 +101,7 @@ impl Tool for BrowserNavigateTool {
     }
 
     fn description(&self) -> String {
-        "Navigate the browser to a URL and wait for the page to load. The browser session persists across tool calls — cookies, JS state, and DOM are preserved until the conversation ends. Call this before any other browser interaction with a new URL. Prefer browser tools over bash curl/wget when you need a rendered page or JS-driven content.".to_string()
+        "Navigate the browser to a URL and wait for the page to load. Opening the current URL reloads the document; fragment navigation follows native browser behavior. Cookies and origin storage persist across calls, while full navigation replaces the page DOM and JavaScript state. Call this before interacting with a new URL. Prefer browser tools over bash curl/wget when you need a rendered page or JS-driven content.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -155,12 +155,12 @@ impl BrowserNavigateTool {
         let result = operation_phase(
             BrowserOperationPhase::Navigation,
             timeout,
-            guard.page.goto(&input.url),
+            guard.navigate(&input.url),
         )
         .await;
 
         match result {
-            Ok(Ok(_)) => {
+            Ok(Ok(())) => {
                 // Detect React and enrich the navigate result with __phoenix hints
                 let react_info = match operation_phase(
                     BrowserOperationPhase::Evaluation,
@@ -181,7 +181,7 @@ impl BrowserNavigateTool {
                     ToolOutput::success(format!("done\n\n{react_info}"))
                 }
             }
-            Ok(Err(e)) => ToolOutput::error(format!("Navigation failed: {e}")),
+            Ok(Err(e)) => ToolOutput::error(e.to_string()),
             Err(error) => ToolOutput::error(error),
         }
     }

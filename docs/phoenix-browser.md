@@ -38,6 +38,8 @@ printf '%s\n' 'document.title' | phoenix-browser --json eval --stdin
 
 `open` returns URL, title, an interactive accessibility snapshot, and console errors captured for that navigation. Snapshot failure appears separately from navigation success. Large snapshots spill to a readable artifact; the returned refs work after reading it. Snapshot refs identify exact nodes and expire on a new snapshot attempt, document replacement, or browser replacement. Refresh the snapshot when a ref is stale. CSS selectors also work with click/type.
 
+To reload, run `open` with the current URL again. It loads a fresh document and resets page JavaScript state while retaining the same browser, cookies, and origin storage. Fragment changes follow Chrome's navigation behavior: adding or changing `#fragment` normally preserves the document, while removing it can reload. Every successful `open` collects a fresh snapshot; use its new refs.
+
 Navigation observation failures appear separately in `observation_errors`; console capture failure has its own `console_capture_error`. Reference input fails visibly when the browser cannot verify the native event destination, including a closed shadow root created without the early input guard.
 
 Console capture includes errors from new child frames, including isolated cross-origin targets, even if they detach before `open` returns. Its bounded channel reports capture failure when an incoming message exceeds 8 MiB or source ownership is unavailable; ordinary retained console history remains available.

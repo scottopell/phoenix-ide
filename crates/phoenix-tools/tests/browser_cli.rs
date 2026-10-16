@@ -16,6 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -405,6 +406,138 @@ fn screenshots_save_to_requested_paths_and_reuse_the_saved_artifact() {
     assert!(String::from_utf8(human.stdout)
         .unwrap()
         .contains(absolute.to_str().unwrap()));
+}
+
+fn serve_reload_fixture(listener: &TcpListener, stop: &AtomicBool, requests: &AtomicUsize) {
+    std::thread::scope(|connections| {
+        while !stop.load(Ordering::Relaxed) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("reload fixture accept: {error}"),
+            };
+            let requests = &requests;
+            connections.spawn(move || {
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                match reader.read_line(&mut request) {
+                    Ok(0) => return,
+                    Ok(_) => {},
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return,
+                    Err(error) => panic!("reload fixture request: {error}"),
+                }
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" { break; }
+                }
+                let page = request.starts_with("GET /reload ");
+                let body = if page {
+                    let version = requests.fetch_add(1, Ordering::Relaxed) + 1;
+                    format!("<!doctype html><title>Reload {version}</title><button>Generation {version}</button><script>window.version={version};window.transient='fresh';console.error('reload-marker-{version}');</script>")
+                } else { String::new() };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                });
+        }
+    });
+}
+
+struct StopOnExit<'a>(&'a AtomicBool);
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn repeated_open_reloads_the_document_and_retains_browser_session_state() {
+    if !chrome_enabled() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/reload", listener.local_addr().unwrap());
+    let stop = AtomicBool::new(false);
+    let requests = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let _stop = StopOnExit(&stop);
+        scope.spawn(|| serve_reload_fixture(&listener, &stop, &requests));
+        let cli = BrowserCli::new();
+        let first = cli.ok(&["open", &url]);
+        assert_eq!(first["result"]["title"], "Reload 1");
+        let old_ref = reference(
+            first["result"]["snapshot"]["result"]["text"]
+                .as_str()
+                .unwrap(),
+            "Generation 1",
+        );
+        cli.eval("window.transient='changed';document.cookie='retained=yes; path=/';localStorage.setItem('retained','yes');true");
+        let second = cli.ok(&["open", &url]);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(second["lifetime"], first["lifetime"]);
+        assert_eq!(second["browser_lifetime"], first["browser_lifetime"]);
+        assert_eq!(second["result"]["title"], "Reload 2");
+        assert_eq!(second["result"]["snapshot"]["status"], "success");
+        let fresh = reference(
+            second["result"]["snapshot"]["result"]["text"]
+                .as_str()
+                .unwrap(),
+            "Generation 2",
+        );
+        assert_ne!(old_ref, fresh);
+        let stale = cli.invoke(&["click", &old_ref], None, false);
+        assert!(stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot"));
+        assert_eq!(cli.eval("({version:window.version, transient:window.transient, cookie:document.cookie, storage:localStorage.getItem('retained')})"), json!({"version":2,"transient":"fresh","cookie":"retained=yes","storage":"yes"}));
+        let errors = second["result"]["console_errors"].as_array().unwrap();
+        assert!(errors
+            .iter()
+            .any(|error| error["text"].as_str().unwrap().contains("reload-marker-2")));
+        assert!(!errors
+            .iter()
+            .any(|error| error["text"].as_str().unwrap().contains("reload-marker-1")));
+        cli.eval("window.transient='hash-retained';true");
+        let hash = cli.ok(&["open", &format!("{url}#section")]);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(hash["browser_lifetime"], first["browser_lifetime"]);
+        assert_eq!(cli.eval("window.transient"), "hash-retained");
+        assert!(hash["result"]["console_errors"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let same_hash = cli.ok(&["open", &format!("{url}#section")]);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            3,
+            "same fragment URL must reload if we promise repeated-open reload"
+        );
+        assert_eq!(same_hash["result"]["title"], "Reload 3");
+        assert_eq!(same_hash["result"]["url"], format!("{url}#section"));
+        assert_eq!(cli.eval("window.transient"), "fresh");
+        cli.eval("window.transient='hash-removal-retained';true");
+        cli.ok(&["open", &url]);
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
+        assert_eq!(cli.eval("window.transient"), "fresh");
+        let invalid = cli.invoke(&["open", "http://[invalid"], None, false);
+        assert_eq!(invalid["error"]["code"], "operation_failed");
+        assert_eq!(cli.eval("window.transient"), "fresh");
+        for document_url in [
+            "about:blank",
+            "data:text/html,<title>Same data URL</title><button>Data button</button>",
+        ] {
+            cli.ok(&["open", document_url]);
+            cli.eval("window.transient='must-be-replaced';true");
+            cli.ok(&["open", document_url]);
+            assert_eq!(cli.eval("typeof window.transient"), "undefined");
+        }
+        cli.ok(&["close"]);
+    });
 }
 
 fn live_resources(cli: &BrowserCli) -> (PathBuf, ProcessIdentity) {
