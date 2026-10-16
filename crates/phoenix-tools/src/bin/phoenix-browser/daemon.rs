@@ -340,10 +340,23 @@ struct ReadyOperation {
 enum Admission {
     Reply(Response),
     Ready(ReadyOperation),
+    CleanupFailed(RetainedCleanup),
+}
+
+struct RetainedCleanup {
+    error: String,
+    browser_lifetime: Option<String>,
+}
+
+enum BrowserLookupFailure {
+    Unavailable(String),
+    CleanupFailed(RetainedCleanup),
 }
 
 impl State {
-    async fn live_browser(&self) -> Result<Option<Arc<RwLock<BrowserSession>>>, String> {
+    async fn live_browser(
+        &self,
+    ) -> Result<Option<Arc<RwLock<BrowserSession>>>, BrowserLookupFailure> {
         let Some(browser) = self.manager.get_existing(&self.scope).await else {
             return Ok(None);
         };
@@ -351,14 +364,17 @@ impl State {
             .write()
             .await
             .is_running()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| BrowserLookupFailure::Unavailable(e.to_string()))?;
         if running {
             Ok(Some(browser))
         } else {
-            self.manager
-                .kill_session(&self.scope)
-                .await
-                .map_err(|e| e.to_string())?;
+            let browser_lifetime = browser.read().await.launch_identity().launch_uuid.clone();
+            self.manager.kill_session(&self.scope).await.map_err(|e| {
+                BrowserLookupFailure::CleanupFailed(RetainedCleanup {
+                    error: e.to_string(),
+                    browser_lifetime: Some(browser_lifetime),
+                })
+            })?;
             Ok(None)
         }
     }
@@ -366,7 +382,10 @@ impl State {
     async fn admit(&self, request: &Request) -> Admission {
         let existing = match self.live_browser().await {
             Ok(browser) => browser,
-            Err(error) => {
+            Err(BrowserLookupFailure::CleanupFailed(failure)) => {
+                return Admission::CleanupFailed(failure);
+            }
+            Err(BrowserLookupFailure::Unavailable(error)) => {
                 return Admission::Reply(Response::error(
                     &self.session,
                     Some(&self.lifetime),
@@ -405,12 +424,10 @@ impl State {
             (_, Some(browser)) => browser,
             ("open", None) => {
                 if let Err(error) = self.manager.kill_session(&self.scope).await {
-                    return Admission::Reply(Response::error(
-                        &self.session,
-                        Some(&self.lifetime),
-                        ErrorCode::CleanupFailed,
-                        error.to_string(),
-                    ));
+                    return Admission::CleanupFailed(RetainedCleanup {
+                        error: error.to_string(),
+                        browser_lifetime: None,
+                    });
                 }
                 match self.manager.get_session(&self.scope).await {
                     Ok(browser) => browser,
@@ -595,36 +612,63 @@ fn cancelled(state: &State, browser_lifetime: Option<String>) -> Response {
     Response::error(&state.session, Some(&state.lifetime), ErrorCode::OperationCancelled, "Shutdown interrupted the operation; browser-side effects may have partially executed. The browser is being closed; do not replay the action automatically.").with_browser_lifetime(browser_lifetime)
 }
 
-async fn run_job(state: &State, job: &mut Job, shutdown: &mut watch::Receiver<bool>) -> Response {
+enum JobResult {
+    Reply(Response),
+    CleanupFailed(RetainedCleanup),
+}
+
+enum WorkerEvent {
+    Completed,
+    CleanupFailed,
+}
+
+async fn run_job(state: &State, job: &mut Job, shutdown: &mut watch::Receiver<bool>) -> JobResult {
     if *shutdown.borrow() {
-        return cancelled(state, None);
+        return JobResult::Reply(cancelled(state, None));
     }
     // Startup retains ownership until the manager can authoritatively tear down its session.
     let admission = state.admit(&job.request).await;
     let ready = match admission {
-        Admission::Reply(response) => return response,
+        Admission::Reply(response) => return JobResult::Reply(response),
+        Admission::CleanupFailed(failure) => return JobResult::CleanupFailed(failure),
         Admission::Ready(ready) => ready,
     };
     if *shutdown.borrow() {
-        return cancelled(state, Some(ready.browser_lifetime));
+        return JobResult::Reply(cancelled(state, Some(ready.browser_lifetime)));
     }
-    tokio::select! {
+    JobResult::Reply(tokio::select! {
         response = state.execute(&job.request, &ready) => response,
         _ = shutdown.changed() => cancelled(state, Some(ready.browser_lifetime.clone())),
-    }
+    })
 }
 
 async fn worker(
     state: Arc<State>,
     mut jobs: mpsc::Receiver<Job>,
     mut shutdown: watch::Receiver<bool>,
-    completed: mpsc::UnboundedSender<()>,
-) {
+    completed: mpsc::UnboundedSender<WorkerEvent>,
+) -> Option<RetainedCleanup> {
+    let mut retained: Option<RetainedCleanup> = None;
     while let Some(mut job) = jobs.recv().await {
-        let response = run_job(&state, &mut job, &mut shutdown).await;
+        let response = match &retained {
+            Some(failure) => {
+                cleanup_failure(&state, &failure.error, failure.browser_lifetime.clone())
+            }
+            None => match run_job(&state, &mut job, &mut shutdown).await {
+                JobResult::Reply(response) => response,
+                JobResult::CleanupFailed(failure) => {
+                    let response =
+                        cleanup_failure(&state, &failure.error, failure.browser_lifetime.clone());
+                    retained = Some(failure);
+                    let _ = completed.send(WorkerEvent::CleanupFailed);
+                    response
+                }
+            },
+        };
         send_response(&mut job.stream, &response).await;
-        let _ = completed.send(());
+        let _ = completed.send(WorkerEvent::Completed);
     }
+    retained
 }
 
 async fn read_job(mut stream: UnixStream, state: &State) -> Option<Job> {
@@ -675,6 +719,12 @@ fn reject_busy(clients: &mut JoinSet<Option<Job>>, mut job: Job, state: Arc<Stat
     });
 }
 
+enum StopReason {
+    Close(UnixStream),
+    Signal,
+    Automatic,
+}
+
 async fn serve(
     listener: &UnixListener,
     state: Arc<State>,
@@ -687,15 +737,18 @@ async fn serve(
     let task = tokio::spawn(worker(state.clone(), jobs_rx, shutdown_rx, completed_tx));
     let mut pending = 0_u32;
     let mut deadline = tokio::time::Instant::now() + state.idle;
-    let mut close_stream = None;
     let mut clients = JoinSet::new();
     tokio::pin!(signal);
     let result = loop {
         tokio::select! {
-            () = &mut signal => break Ok(()),
-            () = tokio::time::sleep_until(deadline), if pending == 0 => break Ok(()),
+            () = &mut signal => break Ok(StopReason::Signal),
+            () = tokio::time::sleep_until(deadline), if pending == 0 => break Ok(StopReason::Automatic),
             completion = completed_rx.recv(), if pending > 0 => {
-                if completion.is_none() { break Err("browser worker stopped unexpectedly".into()); }
+                match completion {
+                    Some(WorkerEvent::Completed) => {},
+                    Some(WorkerEvent::CleanupFailed) => break Ok(StopReason::Automatic),
+                    None => break Err("browser worker stopped unexpectedly".into()),
+                }
                 pending -= 1;
                 deadline = tokio::time::Instant::now() + state.idle;
             }
@@ -709,7 +762,7 @@ async fn serve(
                     Ok(None) => continue,
                     Err(error) => break Err(format!("request reader failed: {error}")),
                 };
-                if job.request.command == "close" { close_stream = Some(job.stream); break Ok(()); }
+                if job.request.command == "close" { break Ok(StopReason::Close(job.stream)); }
                 match jobs_tx.try_send(job) {
                     Ok(()) => pending += 1,
                     Err(mpsc::error::TrySendError::Full(returned)) => {
@@ -727,11 +780,33 @@ async fn serve(
     let worker_result = task
         .await
         .map_err(|e| format!("browser worker failed: {e}"));
-    let browser_lifetime = match state.manager.get_existing(&state.scope).await {
+    let mut browser_lifetime = match state.manager.get_existing(&state.scope).await {
         Some(browser) => Some(browser.read().await.launch_identity().launch_uuid.clone()),
         None => None,
     };
-    let cleanup = finish_shutdown(listener, state, socket, close_stream, browser_lifetime).await;
+    let (worker_result, mut retained) = match worker_result {
+        Ok(retained) => (Ok(()), retained),
+        Err(error) => (Err(error), None),
+    };
+    if matches!(&result, Ok(StopReason::Close(_) | StopReason::Signal)) {
+        if let Some(failure) = retained.take() {
+            browser_lifetime = failure.browser_lifetime;
+        }
+    }
+    let (result, close_stream) = match result {
+        Ok(StopReason::Close(stream)) => (Ok(()), Some(stream)),
+        Ok(StopReason::Signal | StopReason::Automatic) => (Ok(()), None),
+        Err(error) => (Err(error), None),
+    };
+    let cleanup = finish_shutdown(
+        listener,
+        state,
+        socket,
+        close_stream,
+        browser_lifetime,
+        retained,
+    )
+    .await;
     result.and(worker_result).and(cleanup)
 }
 
@@ -741,9 +816,21 @@ async fn finish_shutdown(
     socket: &Path,
     mut close_stream: Option<UnixStream>,
     browser_lifetime: Option<String>,
+    initial_failure: Option<RetainedCleanup>,
 ) -> Result<(), String> {
+    let (mut failure, browser_lifetime) = match initial_failure {
+        Some(failure) => (Some(failure.error), failure.browser_lifetime),
+        None => (None, browser_lifetime),
+    };
     loop {
-        let cleanup = state.manager.shutdown_all().await;
+        let cleanup = match failure.take() {
+            Some(error) => Err(error),
+            None => state
+                .manager
+                .shutdown_all()
+                .await
+                .map_err(|error| error.to_string()),
+        };
         if cleanup.is_ok() {
             std::fs::remove_file(socket).map_err(|e| format!("retire endpoint: {e}"))?;
             if let Some(mut stream) = close_stream {
@@ -757,7 +844,7 @@ async fn finish_shutdown(
             }
             return Ok(());
         }
-        let error = cleanup.expect_err("failed cleanup").to_string();
+        let error = cleanup.expect_err("failed cleanup");
         tracing::error!(%error, "browser cleanup failed; retaining session ownership until explicit close retries cleanup");
         if let Some(mut stream) = close_stream.take() {
             send_response(
@@ -1063,6 +1150,55 @@ mod tests {
         })
         .await
         .expect("daemon response")
+    }
+
+    #[tokio::test]
+    async fn retained_retirement_failure_requires_explicit_cleanup_retry() {
+        let directory = tempfile::Builder::new()
+            .prefix("pb-retained-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = directory.path().join("session.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let state = reader_state();
+        let task_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            finish_shutdown(
+                &listener,
+                state,
+                &task_socket,
+                None,
+                None,
+                Some(RetainedCleanup {
+                    error: "original retirement failure".into(),
+                    browser_lifetime: Some("failed-browser".into()),
+                }),
+            )
+            .await
+        });
+        for command in ["status", "open", "status"] {
+            let response = request(&socket, command).await;
+            assert_eq!(response.browser_lifetime.as_deref(), Some("failed-browser"));
+            match response.outcome {
+                Outcome::Success { result } => {
+                    assert_eq!(command, "status");
+                    assert_eq!(result["phase"], "stopping");
+                    assert_eq!(result["cleanup_error"], "original retirement failure");
+                }
+                Outcome::Error { error } => {
+                    assert_eq!(command, "open");
+                    assert_eq!(error.code, ErrorCode::CleanupFailed);
+                    assert!(error.message.contains("original retirement failure"));
+                }
+            }
+            assert!(socket.exists());
+            assert!(!task.is_finished());
+        }
+        let closed = request(&socket, "close").await;
+        assert_eq!(closed.browser_lifetime.as_deref(), Some("failed-browser"));
+        assert!(matches!(closed.outcome, Outcome::Success { result } if result["closed"] == true));
+        task.await.unwrap().unwrap();
+        assert!(!socket.exists());
     }
 
     #[tokio::test]

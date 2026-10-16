@@ -1172,6 +1172,47 @@ fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
 }
 
 #[test]
+fn dead_chrome_cleanup_failure_remains_visible_until_explicit_close() {
+    struct RestoreMarker<'a>(&'a Path, &'a [u8]);
+    impl Drop for RestoreMarker<'_> {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                std::fs::write(self.0, self.1).expect("restore profile ownership marker");
+            }
+        }
+    }
+    // REQ-BCLI-006.
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    let opened = cli.ok(&["open", &fixture()]);
+    let resources = live_resources(&cli);
+    let marker = resources.0.join("phoenix-profile-owner.json");
+    let original = std::fs::read(&marker).unwrap();
+    let _restore = RestoreMarker(&marker, &original);
+    std::fs::write(&marker, b"broken-owner-marker").unwrap();
+    signal_owned(resources.1, libc::SIGKILL);
+    await_process_exit(resources.1);
+    let failed = cli.invoke(&["status"], None, false);
+    assert_eq!(failed["error"]["code"], "cleanup_failed");
+    assert_eq!(failed["browser_lifetime"], opened["browser_lifetime"]);
+    for _ in 0..2 {
+        let status = cli.ok(&["status"]);
+        assert_eq!(status["result"]["phase"], "stopping");
+        assert!(status["result"]["cleanup_error"].as_str().is_some());
+        assert_eq!(status["browser_lifetime"], opened["browser_lifetime"]);
+    }
+    std::fs::write(&marker, &original).unwrap();
+    let rejected = cli.invoke(&["open", &fixture()], None, false);
+    assert_eq!(rejected["error"]["code"], "cleanup_failed");
+    assert!(resources.0.exists());
+    cli.ok(&["close"]);
+    assert_resources_removed(&resources);
+    assert!(!cli.socket().exists());
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "One launch barrier proves shutdown waits for ownership publication"
