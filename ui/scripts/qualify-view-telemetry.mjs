@@ -405,6 +405,7 @@ export function observePendingFiniteRequest(page, request, baseURL, expectedIden
   assert.ok(requestURL.pathname.startsWith('/api/product-conversations/') || requestURL.pathname.startsWith('/api/global/coordinator/history/'));
   assert.equal(request.timing().responseEnd, -1, 'capture must be armed before finite completion');
   const reports = [];
+  const responseStatuses = [];
   const posts = new Map();
   let navigationFailure = null;
   let captureFailure = null;
@@ -445,7 +446,7 @@ export function observePendingFiniteRequest(page, request, baseURL, expectedIden
   };
   const onResponse = response => {
     const report = posts.get(response.request());
-    if (report) accepted({ report, status: response.status() });
+    if (report) { responseStatuses.push(response.status()); accepted({ report, status: response.status() }); }
   };
   page.on('framenavigated', onNavigation);
   page.on('requestfinished', onFinished);
@@ -475,10 +476,12 @@ export function observePendingFiniteRequest(page, request, baseURL, expectedIden
       assert.equal(result.status, 204, 'actual collector acceptance required');
       return result.report;
     },
-    assertFinal() {
+    assertFinal({ reportRequired = true } = {}) {
       if (navigationFailure) throw navigationFailure;
       if (captureFailure) throw captureFailure;
-      assert.equal(reports.length, 1, 'late duplicate report must fail case drain');
+      assert.ok(reports.length <= 1 && (!reportRequired || reports.length === 1), 'late duplicate or missing required report must fail case drain');
+      assert.equal(responseStatuses.length, reports.length, 'observed terminal requires collector response');
+      assert.ok(responseStatuses.every(status => status === 204), 'observed terminal requires collector204');
     },
     close() {
       page.off('framenavigated', onNavigation);
@@ -628,6 +631,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
       const trial = { kind, attempt, reports: [], statuses: [], producer_events: [], status: 'started' };
       let primaryError;
       let capture;
+      let reportRequired = true;
       let page;
       const posts = new Map();
       let ledgerFailure = null;
@@ -673,6 +677,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
           await cdp.send('Network.enable');
           assert.ok(!canceled, 'lifecycle network admission canceled');
           await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 400, downloadThroughput: 1000000, uploadThroughput: 1000000 });
+          assert.ok(!canceled, 'lifecycle emulation admission canceled');
           page.on('request', request => {
             const url = new URL(request.url());
             if (url.origin !== new URL(baseURL).origin) return;
@@ -706,16 +711,19 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
           const admission = samplingDecision(trial.producer_events, new URL(destination).pathname.startsWith('/global/') ? 'global' : 'ordinary');
           trial.admitted_open_id = admission.open_id;
           trial.sampled = admission.sampled;
+          if (admission.sampled && capture) {
+            assert.ok(trial.producer_events.some(event => event.kind === 'request' && event.open_id === admission.open_id && event.request_id === capture.requestId), 'lifecycle request must belong to admitted producer');
+            capture.expectJourney(admission.open_id);
+          }
           if (!admission.sampled) {
             assert.equal(trial.reports.length, 0, 'unsampled lifecycle cannot emit report');
             trial.status = 'inconclusive_explicit_unsampled';
             capture?.close(); capture = null;
           } else if (winner === 'ready') {
+            reportRequired = false;
             trial.status = 'inconclusive_readiness_preceded_finite_request_sampling_unknown';
           } else {
             assert.equal(winner, 'pending', 'actual pending admission required');
-            assert.ok(trial.producer_events.some(event => event.kind === 'request' && event.open_id === admission.open_id && event.request_id === capture.requestId), 'lifecycle request must belong to admitted producer');
-            capture.expectJourney(admission.open_id);
             if (kind === 'pending_background') {
               trial.witness = await runPendingBackgroundRoundTrip({ page, context: owned, capture });
               trial.status = trial.witness.status;
@@ -760,7 +768,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
           assert.equal(trial.statuses.length, trial.reports.length, 'every observed report must have collector response');
           assert.ok(trial.statuses.every(response => response.status === 204));
           if (ledgerFailure) throw ledgerFailure;
-          if (capture && !trial.status.startsWith('unsupported')) capture.assertFinal();
+          if (capture && !trial.status.startsWith('unsupported')) capture.assertFinal({ reportRequired });
         })();
         await boundedObservation(operation, Math.max(1, deadline - Date.now()), 'absolute lifecycle stage');
       } catch (error) {
@@ -777,7 +785,7 @@ export async function runLifecycleQualificationStage({ browser, storageState, ba
             assert.equal(new Set(trial.reports.map(report => report.open_id)).size, trial.reports.length);
             if (trial.status === 'observed_bfcache_fresh_ready_report') assert.equal(trial.reports.length, 2);
           }
-          if (!trial.failure && capture && !trial.status.startsWith('unsupported')) capture.assertFinal();
+          if (!trial.failure && capture && !trial.status.startsWith('unsupported')) capture.assertFinal({ reportRequired });
         } catch (error) { trial.cleanup_failure = error.message; trial.failure ??= error.message; primaryError ??= error; }
         finally {
           capture?.close();
