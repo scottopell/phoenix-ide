@@ -316,4 +316,68 @@ mod tests {
         assert_eq!(logs[0].text, "after fragment navigation");
         assert_eq!(logs[0].capture_generation, Some(generation));
     }
+
+    #[tokio::test]
+    async fn native_console_capture_preserves_new_document_and_iframe_errors() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = crate::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("console-fence-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        let (captured, fragment_captured, ordinary_logs) = {
+            let session = session.read().await;
+            session.page.goto("about:blank").await.unwrap();
+            session.page.evaluate("console.error('old-page-error'); console.debug = () => { throw Error('page console override'); }; true").await.unwrap();
+            let capture = session.begin_console_navigation_capture().await.unwrap();
+            let url = "data:text/html,<script>console.error('new-page-error');console.debug=()=>{throw Error('new-page console override')};</script><iframe srcdoc=\"<script>console.error('new-iframe-error')</script>\"></iframe>";
+            session.page.goto(url).await.unwrap();
+            let captured = session
+                .finish_console_navigation_capture(capture)
+                .await
+                .unwrap();
+
+            session
+                .page
+                .evaluate("console.error('before-fragment-error'); true")
+                .await
+                .unwrap();
+            let fragment_capture = session.begin_console_navigation_capture().await.unwrap();
+            session
+                .page
+                .evaluate("location.hash='fragment'; console.error('after-fragment-error'); true")
+                .await
+                .unwrap();
+            let fragment_captured = session
+                .finish_console_navigation_capture(fragment_capture)
+                .await
+                .unwrap();
+            let ordinary_logs: Vec<_> = session
+                .console_logs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect();
+            (captured, fragment_captured, ordinary_logs)
+        };
+        manager.shutdown_all().await.expect("browser shutdown");
+        let captured: Vec<_> = captured.iter().map(|entry| entry.text.as_str()).collect();
+        assert!(captured.contains(&"new-page-error"), "{captured:?}");
+        assert!(captured.contains(&"new-iframe-error"), "{captured:?}");
+        assert!(!captured.contains(&"old-page-error"), "{captured:?}");
+        let fragment_captured: Vec<_> = fragment_captured
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(fragment_captured, ["after-fragment-error"]);
+        assert_eq!(ordinary_logs, ["after-fragment-error"]);
+    }
 }
