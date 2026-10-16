@@ -9,7 +9,7 @@ pub use console::ConsoleNavigationCapture;
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
-    cdp::js_protocol::runtime::{ConsoleApiCalledType, EventConsoleApiCalled, RemoteObject},
+    cdp::js_protocol::runtime::{ConsoleApiCalledType, RemoteObject},
     fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
     Page,
 };
@@ -525,7 +525,7 @@ pub struct ConsoleEntry {
     pub level: ConsoleLevel,
     pub text: String,
     pub timestamp: Instant,
-    source_context: chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId,
+    source_context: Option<String>,
     capture_generation: Option<console::Generation>,
 }
 
@@ -1156,21 +1156,10 @@ impl BrowserSession {
     /// Returns [`BrowserError`] when the CDP console event listener cannot be
     /// installed.
     pub async fn setup_console_listener(session: Arc<RwLock<Self>>) -> Result<(), BrowserError> {
-        // Get the page event listener and console_logs handle
-        let (mut console_events, console_logs, console_event, console_capture) = {
+        let task = {
             let guard = session.read().await;
-            let events = guard.page.event_listener::<EventConsoleApiCalled>().await?;
-            let logs = guard.console_logs.clone();
-            let event = guard.console_event.clone();
-            (events, logs, event, guard.console_capture.clone())
+            console::listen(&guard).await?
         };
-
-        // Spawn task to capture console events (uses separate lock, no contention)
-        let task = tokio::spawn(async move {
-            while let Some(event) = console_events.next().await {
-                console_capture.accept(&event, &console_logs, &console_event);
-            }
-        });
 
         // Store the task handle
         {

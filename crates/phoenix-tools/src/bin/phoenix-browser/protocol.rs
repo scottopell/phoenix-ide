@@ -48,7 +48,7 @@ pub struct Failure {
     pub code: ErrorCode,
     pub message: String,
     pub details: Option<Value>,
-    pub artifacts: Vec<Value>,
+    pub artifacts: Vec<String>,
 }
 
 impl Response {
@@ -125,15 +125,27 @@ pub async fn read_message<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&line).map_err(|e| format!("invalid protocol message: {e}"))
 }
 
+pub struct EncodedMessage(Vec<u8>);
+
+impl EncodedMessage {
+    pub async fn write_to(&self, stream: &mut (impl AsyncWrite + Unpin)) -> Result<(), String> {
+        stream.write_all(&self.0).await.map_err(|e| e.to_string())?;
+        stream.flush().await.map_err(|e| e.to_string())
+    }
+}
+
+pub fn encode_message(message: &impl Serialize) -> Result<EncodedMessage, String> {
+    let mut bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 >= MAX_MESSAGE {
+        return Err("serialized protocol message exceeds 32 MiB including framing".into());
+    }
+    bytes.push(b'\n');
+    Ok(EncodedMessage(bytes))
+}
+
 pub async fn write_message(
     stream: &mut (impl AsyncWrite + Unpin),
     message: &impl Serialize,
 ) -> Result<(), String> {
-    let mut bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 >= MAX_MESSAGE {
-        return Err("protocol message too large".into());
-    }
-    bytes.push(b'\n');
-    stream.write_all(&bytes).await.map_err(|e| e.to_string())?;
-    stream.flush().await.map_err(|e| e.to_string())
+    encode_message(message)?.write_to(stream).await
 }

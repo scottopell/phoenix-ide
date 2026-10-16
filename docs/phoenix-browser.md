@@ -37,11 +37,15 @@ printf '%s\n' 'document.title' | phoenix-browser --json eval --stdin
 
 Navigation observation failures appear separately in `observation_errors`; console capture failure has its own `console_capture_error`. Reference input fails visibly when the browser cannot verify the native event destination, including a closed shadow root created without the early input guard.
 
+Console capture includes errors from new child frames even if they detach before `open` returns. Its bounded channel reports capture failure when an incoming message exceeds 8 MiB or source ownership is unavailable; ordinary retained console history remains available.
+
 `--json` returns `session`, daemon `lifetime`, browser `browser_lifetime`, and a `status` tag: `success` with `result`, or `error` with `error.code` and `error.message`. Tool results include `text`, structured `data`, and explicit `artifacts`. Tool errors preserve structured failure data in `error.details` and any `error.artifacts`. Failed commands exit 1; invalid input exits 2 before looking up browser state. Human output prints concise operation text; JSON is the harness interface.
 
 Use `schema [COMMAND]` for the full operation parameters. Each command accepts `--input '{...}'`; this is especially useful for profiling. `--timeout 15s` controls operations that accept a timeout.
 
 Use `--` before positional text that matches an option, for example `phoenix-browser type '#field' -- '--json'`.
+
+The complete encoded JSON request, including framing, must fit within 32 MiB. Quotes, backslashes, and the request envelope reduce the usable raw expression budget. Oversized input fails before connecting to a session. Inline images become file artifacts; an existing artifact is reused only after its bytes are verified.
 
 ## Profile
 

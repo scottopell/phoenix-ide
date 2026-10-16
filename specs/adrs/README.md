@@ -125,6 +125,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [106](106_pre-stop-capacity-cleanup-is-cleanup-only-recovery.md) | Pre-stop capacity cleanup is a cleanup-only recovery boundary | Accepted | REQ-LDD-024 |
 | [107](107_standalone-browser-uses-session-daemon.md) | Standalone browser commands share a local session daemon | Accepted | REQ-BCLI-001–012 |
 | [108](108_snapshot-input-and-collection-boundaries.md) | Snapshot interactions enforce identity at native input dispatch | Accepted | REQ-BT-008, REQ-BT-009, REQ-BT-025 |
+| [109](109_console-capture-uses-ordered-context-identities.md) | Navigation console capture uses ordered context identities | Accepted | REQ-BT-004, REQ-BCLI-007 |
 
 ## For agents: which decisions bind your task
 
@@ -132,6 +133,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing navigation console attribution or CDP context ownership | 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |

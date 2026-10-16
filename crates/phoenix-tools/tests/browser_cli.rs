@@ -546,6 +546,51 @@ fn oversized_stdin_is_rejected_before_starting_or_evaluating() {
     assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
 }
 
+#[test]
+fn encoded_request_budget_is_checked_before_session_access() {
+    let cli = BrowserCli::new();
+    for (character, length) in [
+        ('"', 17 * 1024 * 1024),
+        ('\\', 17 * 1024 * 1024),
+        ('a', 32 * 1024 * 1024),
+    ] {
+        let input: String = std::iter::repeat_n(character, length).collect();
+        let mut child = cli
+            .command()
+            .args(["eval", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["session"], "named:integration");
+        assert_eq!(response["error"]["code"], "invalid_input");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("serialized protocol message"));
+        assert!(response["lifetime"].is_null());
+        assert!(response["browser_lifetime"].is_null());
+        assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+    }
+    let accepted = cli.invoke(
+        &["eval", "--stdin"],
+        Some(&"a".repeat(17 * 1024 * 1024)),
+        false,
+    );
+    assert_eq!(accepted["error"]["code"], "state_lost");
+    assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+}
+
 fn assert_semantic_rejections(cli: &BrowserCli) {
     for arguments in [
         vec!["click"],

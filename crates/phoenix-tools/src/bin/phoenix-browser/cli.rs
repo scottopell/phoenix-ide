@@ -509,6 +509,12 @@ async fn execute(options: &Options) -> Response {
     {
         return daemon::offline(&options.session, &options.request).await;
     }
+    let encoded = match protocol::encode_message(&options.request) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            return Response::error(&options.session, None, ErrorCode::InvalidInput, error);
+        }
+    };
     if let Some(operation) = daemon::operation(&options.request.command) {
         if let Err(output) = operation
             .validate_input(options.request.input.clone())
@@ -548,7 +554,7 @@ async fn execute(options: &Options) -> Response {
             return Response::error(&options.session, None, ErrorCode::StartupFailed, error)
         }
     };
-    if let Err(error) = protocol::write_message(&mut stream, &options.request).await {
+    if let Err(error) = encoded.write_to(&mut stream).await {
         return Response::error(
             &options.session,
             None,

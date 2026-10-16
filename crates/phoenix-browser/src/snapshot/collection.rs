@@ -1,5 +1,7 @@
-use async_tungstenite::tokio::{connect_async_with_config, ConnectStream};
-use async_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
+#[cfg(test)]
+use async_tungstenite::tokio::connect_async_with_config;
+use async_tungstenite::tokio::ConnectStream;
+use async_tungstenite::tungstenite::Message;
 use async_tungstenite::WebSocketStream;
 use chromiumoxide::cdp::browser_protocol::{
     accessibility::GetFullAxTreeReturns, page::FrameId, target::TargetId,
@@ -25,22 +27,10 @@ struct ProtocolError {
     message: String,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Attached {
-    session_id: String,
-}
-
 fn collection_error(failure: impl std::fmt::Display) -> BrowserError {
     super::error(format!(
         "Accessibility collection failed (maximum response 8 MiB): {failure}. Narrow the page content and call browser_snapshot again"
     ))
-}
-
-fn config(limit: usize) -> WebSocketConfig {
-    WebSocketConfig::default()
-        .max_message_size(Some(limit))
-        .max_frame_size(Some(limit))
 }
 
 async fn command<T: DeserializeOwned>(
@@ -82,18 +72,12 @@ pub(super) async fn collect(
     target: &TargetId,
     frame: FrameId,
 ) -> Result<GetFullAxTreeReturns, BrowserError> {
-    let (mut socket, _) = connect_async_with_config(address, Some(config(MAX_RESPONSE_BYTES)))
+    let (mut socket, session_id) = crate::cdp::connect_target(address, target, MAX_RESPONSE_BYTES)
         .await
         .map_err(collection_error)?;
-    let attached: Attached = command(
-        &mut socket,
-        json!({"id":1,"method":"Target.attachToTarget","params":{"targetId":target,"flatten":true}}),
-        1,
-    )
-    .await?;
     command(
         &mut socket,
-        json!({"id":2,"sessionId":attached.session_id,"method":"Accessibility.getFullAXTree","params":{"frameId":frame}}),
+        json!({"id":2,"sessionId":session_id,"method":"Accessibility.getFullAXTree","params":{"frameId":frame}}),
         2,
     )
     .await
@@ -137,7 +121,7 @@ mod tests {
             }
         });
         let (mut socket, _) =
-            connect_async_with_config(format!("ws://{address}"), Some(config(1024)))
+            connect_async_with_config(format!("ws://{address}"), Some(crate::cdp::config(1024)))
                 .await
                 .unwrap();
         let result: Result<Value, _> = command(&mut socket, json!({"id":1}), 1).await;

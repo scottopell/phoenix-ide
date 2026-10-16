@@ -790,9 +790,6 @@ async fn test_browser_screenshot_local() {
         result.output()
     );
 
-    // The screenshot must flow to the LLM via the typed `images` channel,
-    // not via `display_data` (which is UI-only and never threaded to the
-    // LLM). Mirrors the read_image.rs regression assertion.
     assert_eq!(
         result.images().len(),
         1,
@@ -804,11 +801,19 @@ async fn test_browser_screenshot_local() {
         result.images()[0].data.starts_with("iVBORw0KGgo"),
         "image data is not a valid PNG (base64 should start with iVBORw0KGgo)"
     );
-    assert!(
-        result.display_data().is_none(),
-        "browser_take_screenshot must not duplicate the image payload into display_data, got {:?}",
-        result.display_data()
+    let metadata = result.display_data().unwrap().as_object().unwrap();
+    assert_eq!(
+        metadata.len(),
+        1,
+        "UI metadata carries only the saved artifact handle"
     );
+    let path = metadata["artifact_path"].as_str().unwrap();
+    let saved = tokio::fs::read(path).await.unwrap();
+    assert_eq!(
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &saved),
+        result.images()[0].data
+    );
+    tokio::fs::remove_file(path).await.unwrap();
 
     shutdown_test(manager, server).await;
 }

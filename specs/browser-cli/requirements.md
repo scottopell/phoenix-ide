@@ -110,6 +110,8 @@ AND SHALL NOT represent the failed snapshot as an empty successful tree.
 
 THE SYSTEM SHALL NOT attribute console entries retained from earlier navigations to the new navigation.
 
+THE SYSTEM SHALL retain navigation errors from child frames that detach before the navigation result is returned.
+
 **Rationale:** One navigation result should supply the evidence and targets needed for the next agent action.
 
 ### REQ-BCLI-008: Complete Browser Operation Surface
@@ -138,6 +140,12 @@ THE SYSTEM SHALL provide concise human-readable output and a consistent `--json`
 THE SYSTEM SHALL expose artifact paths explicitly
 AND SHALL return nonzero exit status for failed commands
 AND SHALL include stable error codes and actionable recovery instructions where recovery is possible.
+
+THE SYSTEM SHALL reject requests exceeding the 32 MiB encoded JSON message budget, including framing, before session lookup or startup
+AND SHALL report invalid input rather than an uncertain delivery outcome for requests that were never sent.
+
+THE SYSTEM SHALL preserve each inline tool image as a verified existing file artifact or a newly written owned artifact
+AND SHALL report image conversion failures visibly while retaining other returned observations and artifacts.
 
 **Rationale:** Agents need parseable outcomes and humans need readable evidence without inferring success from incidental text.
 

@@ -1,19 +1,21 @@
 use super::cli::parse_idle;
 use super::protocol::{self, ErrorCode, Outcome, Request, Response, SessionPaths};
 use async_trait::async_trait;
+use base64::Engine;
 use fs2::FileExt;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_tools::browser::{
     BrowserAccess, BrowserOperation, BrowserSession, BrowserSessionManager,
 };
-use phoenix_tools::ToolOutput;
+use phoenix_tools::{ToolImage, ToolOutput};
 use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tokio::sync::{mpsc, watch};
@@ -135,7 +137,7 @@ pub(super) fn operation(command: &str) -> Option<BrowserOperation> {
     })
 }
 
-fn take_artifacts(value: &mut Value, paths: &mut Vec<Value>) {
+fn take_artifacts(value: &mut Value, paths: &mut Vec<String>) {
     match value {
         Value::Object(object) => {
             let keys: Vec<_> = object.keys().cloned().collect();
@@ -145,7 +147,14 @@ fn take_artifacts(value: &mut Value, paths: &mut Vec<Value>) {
                     "path" | "artifact_path" | "samples_path" | "post"
                 ) && object[&key].is_string()
                 {
-                    paths.push(object.remove(&key).expect("artifact key exists"));
+                    paths.push(
+                        object
+                            .remove(&key)
+                            .expect("artifact key exists")
+                            .as_str()
+                            .expect("artifact path is a string")
+                            .to_owned(),
+                    );
                 } else if let Some(child) = object.get_mut(&key) {
                     take_artifacts(child, paths);
                 }
@@ -160,18 +169,108 @@ fn take_artifacts(value: &mut Value, paths: &mut Vec<Value>) {
     }
 }
 
-fn adapt(session: &str, lifetime: Option<&str>, output: &ToolOutput) -> Response {
+struct CliImageArtifact(std::path::PathBuf);
+
+struct PendingImageArtifact(Option<std::path::PathBuf>);
+
+impl Drop for PendingImageArtifact {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl CliImageArtifact {
+    async fn from_image(
+        image: &ToolImage,
+        existing: &[String],
+        directory: &Path,
+    ) -> Result<Self, String> {
+        let extension = match image.media_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            other => {
+                return Err(format!(
+                    "Unsupported CLI image artifact media type: {other}"
+                ))
+            }
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .map_err(|error| format!("Decode image artifact: {error}"))?;
+        // SAFETY: geteuid has no preconditions.
+        let owner = unsafe { libc::geteuid() };
+        for path in existing {
+            if let Ok(metadata) = tokio::fs::symlink_metadata(path).await {
+                if metadata.is_file()
+                    && metadata.uid() == owner
+                    && metadata.len() == bytes.len() as u64
+                    && tokio::fs::read(path)
+                        .await
+                        .is_ok_and(|saved| saved == bytes)
+                {
+                    return Ok(Self(std::path::PathBuf::from(path)));
+                }
+            }
+        }
+        private_directory(directory)?;
+        let path = directory.join(format!("{}.{}", uuid::Uuid::new_v4(), extension));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("Create image artifact: {error}"))?;
+        let mut pending = PendingImageArtifact(Some(path));
+        let mut file = tokio::fs::File::from_std(file);
+        file.write_all(&bytes)
+            .await
+            .map_err(|error| format!("Write image artifact: {error}"))?;
+        file.flush()
+            .await
+            .map_err(|error| format!("Flush image artifact: {error}"))?;
+        Ok(Self(pending.0.take().expect("pending image artifact")))
+    }
+}
+
+async fn adapt(
+    session: &str,
+    lifetime: Option<&str>,
+    output: &ToolOutput,
+    image_directory: &Path,
+) -> Response {
     let mut artifacts = Vec::new();
     let mut data = output.display_data().cloned();
     if let Some(data) = &mut data {
         take_artifacts(data, &mut artifacts);
     }
-    // The CLI is a file-artifact sink; images already have a saved screenshot path.
-    if !output.images().is_empty() {
-        tracing::debug!(
-            images = output.images().len(),
-            "CLI returns saved image artifacts rather than inline image blocks"
-        );
+    for image in output.images() {
+        let artifact = match CliImageArtifact::from_image(image, &artifacts, image_directory).await
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                let mut response = Response::error(
+                    session,
+                    lifetime,
+                    ErrorCode::OperationFailed,
+                    format!(
+                        "Browser operation returned an image that could not be preserved: {error}"
+                    ),
+                );
+                if let Outcome::Error { error } = &mut response.outcome {
+                    error.details = Some(json!({"tool_text":output.output(),"data":data}));
+                    error.artifacts = artifacts;
+                }
+                return response;
+            }
+        };
+        let path = artifact.0.to_string_lossy().into_owned();
+        if !artifacts.contains(&path) {
+            artifacts.push(path);
+        }
     }
     if output.is_success() {
         Response::success(
@@ -208,13 +307,18 @@ pub async fn offline(session: &str, request: &Request) -> Response {
         }
         return Response::success(session, None, json!({"operations":entries}));
     }
+    let image_directory = PhoenixRuntimeEnvironment::detect()
+        .tmp_root()
+        .join("browser-cli-images");
     adapt(
         session,
         None,
         &BrowserOperation::Profile
             .execute(request.input.clone(), &Unavailable)
             .await,
+        &image_directory,
     )
+    .await
 }
 
 struct State {
@@ -223,6 +327,7 @@ struct State {
     session: String,
     lifetime: String,
     idle: Duration,
+    image_directory: std::path::PathBuf,
 }
 
 struct ReadyOperation {
@@ -347,8 +452,14 @@ impl State {
         };
         let output = operation.execute(request.input.clone(), &access).await;
         if request.command != "open" || !output.is_success() {
-            return adapt(&self.session, Some(&self.lifetime), &output)
-                .with_browser_lifetime(Some(browser_lifetime.clone()));
+            return adapt(
+                &self.session,
+                Some(&self.lifetime),
+                &output,
+                &self.image_directory,
+            )
+            .await
+            .with_browser_lifetime(Some(browser_lifetime.clone()));
         }
         self.open_result(
             &access,
@@ -375,7 +486,9 @@ impl State {
             &BrowserOperation::Snapshot
                 .execute(json!({"interactive":true}), access)
                 .await,
-        );
+            &self.image_directory,
+        )
+        .await;
         let (url, title) = {
             let guard = browser.read().await;
             let url = navigation_observation(guard.page.url()).await;
@@ -706,10 +819,9 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
     };
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())?;
-    let manager = BrowserSessionManager::with_lifecycle_sink_and_runtime_env(
-        None,
-        &PhoenixRuntimeEnvironment::detect(),
-    );
+    let runtime_env = PhoenixRuntimeEnvironment::detect();
+    let image_directory = runtime_env.tmp_root().join("browser-cli-images");
+    let manager = BrowserSessionManager::with_lifecycle_sink_and_runtime_env(None, &runtime_env);
     manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
     let lifetime = uuid::Uuid::new_v4().to_string();
     let state = Arc::new(State {
@@ -718,6 +830,7 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
         session: args[1].clone(),
         lifetime,
         idle: parse_idle(&args[2])?,
+        image_directory,
     });
     serve(&listener, state, &socket, signal).await
 }
@@ -725,6 +838,98 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image(bytes: &[u8]) -> ToolImage {
+        ToolImage {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_images_become_private_artifacts_on_success_and_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nimage-payload";
+        for output in [
+            ToolOutput::success("image result"),
+            ToolOutput::error("operation failed after capture"),
+        ] {
+            let successful = output.is_success();
+            let output = output.with_images(vec![image(bytes)]);
+            let response = adapt(
+                "named:test",
+                Some("daemon"),
+                &output,
+                &directory.path().join("images"),
+            )
+            .await;
+            let paths = match response.outcome {
+                Outcome::Success { result } => {
+                    assert!(successful);
+                    assert!(result.get("images").is_none());
+                    serde_json::from_value::<Vec<String>>(result["artifacts"].clone()).unwrap()
+                }
+                Outcome::Error { error } => {
+                    assert!(!successful);
+                    assert_eq!(error.message, output.output());
+                    error.artifacts
+                }
+            };
+            assert_eq!(paths.len(), 1);
+            assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(&paths[0]).unwrap().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_metadata_is_reused_only_after_verifying_its_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing = directory.path().join("existing.png");
+        let image_directory = directory.path().join("images");
+        let bytes = b"image-bytes";
+        for matches in [true, false] {
+            std::fs::write(
+                &existing,
+                if matches {
+                    bytes.as_slice()
+                } else {
+                    b"other-bytes"
+                },
+            )
+            .unwrap();
+            let output = ToolOutput::success("image")
+                .with_display(json!({"artifact_path":existing}))
+                .with_images(vec![image(bytes)]);
+            let response = adapt("named:test", None, &output, &image_directory).await;
+            let Outcome::Success { result } = response.outcome else {
+                panic!("image conversion failed");
+            };
+            let paths: Vec<String> = serde_json::from_value(result["artifacts"].clone()).unwrap();
+            assert_eq!(paths.len(), if matches { 1 } else { 2 });
+            assert!(paths
+                .iter()
+                .any(|path| std::fs::read(path).unwrap() == bytes));
+        }
+    }
+
+    #[tokio::test]
+    async fn unpreservable_image_reports_failure_and_retains_other_tool_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = ToolOutput::success("operation already executed")
+            .with_display(json!({"artifact_path":"/saved-before-image","measurement":42}))
+            .with_images(vec![ToolImage {
+                media_type: "image/png".into(),
+                data: "invalid base64!".into(),
+            }]);
+        let response = adapt("named:test", None, &output, directory.path()).await;
+        let Outcome::Error { error } = response.outcome else {
+            panic!("lost image was reported successful");
+        };
+        assert!(error.message.contains("could not be preserved"));
+        assert_eq!(error.details.unwrap()["data"]["measurement"], 42);
+        assert_eq!(error.artifacts, ["/saved-before-image"]);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     async fn request(socket: &Path, command: &str) -> Response {
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -770,6 +975,7 @@ mod tests {
             session: "named:cleanup-test".into(),
             lifetime: uuid::Uuid::new_v4().to_string(),
             idle: Duration::from_secs(300),
+            image_directory: directory.path().join("images"),
         });
         let browser = manager.get_session(&state.scope).await.unwrap();
         let browser_lifetime = browser.read().await.launch_identity().launch_uuid.clone();

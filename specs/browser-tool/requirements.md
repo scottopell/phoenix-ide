@@ -108,6 +108,12 @@ The `browser_recent_console_logs` tool SHALL retrieve recent captured log entrie
 
 The `browser_clear_console_logs` tool SHALL discard all captured log entries, resetting the buffer
 
+THE SYSTEM SHALL bound each incoming frame and message on the console-capture CDP connection to 8 MiB before deserialization
+
+WHEN console context ownership cannot be established or the console listener fails
+THE SYSTEM SHALL expose the failure to navigation capture and log the listener or ownership failure
+AND SHALL NOT represent unavailable navigation capture as an empty successful capture.
+
 WHEN output from `browser_recent_console_logs` exceeds 4096 bytes
 `browser_recent_console_logs` SHALL write the full output to a temp file and return the file path
 

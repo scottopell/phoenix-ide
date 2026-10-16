@@ -2,9 +2,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::cdp::Socket;
+use async_tungstenite::tungstenite::Message;
 use chromiumoxide::cdp::js_protocol::runtime::{
-    ConsoleApiCalledType, EvaluateParams, EventConsoleApiCalled, ExecutionContextId,
+    ConsoleApiCalledType, EvaluateParams, EventConsoleApiCalled, EventExecutionContextCreated,
+    EventExecutionContextDestroyed, ExecutionContextId,
 };
+use futures::StreamExt;
+use serde_json::{json, Value};
 use tokio::sync::{oneshot, Notify, OwnedMutexGuard};
 
 use super::{
@@ -22,12 +27,20 @@ enum Boundary {
 struct Pending {
     context: ExecutionContextId,
     boundary: Boundary,
-    acknowledged: oneshot::Sender<()>,
+    acknowledged: oneshot::Sender<ContextBoundary>,
+}
+
+#[derive(Clone, Debug)]
+struct ContextBoundary {
+    marker_context: String,
+    contexts: HashSet<String>,
 }
 
 #[derive(Default)]
 struct State {
+    contexts: HashMap<ExecutionContextId, String>,
     generation: Option<Generation>,
+    failure: Option<String>,
     pending: HashMap<String, Pending>,
 }
 
@@ -41,6 +54,7 @@ pub(super) struct ConsoleCapture {
 pub struct ConsoleNavigationCapture {
     owner: Arc<ConsoleCapture>,
     generation: Generation,
+    boundary: ContextBoundary,
     _lease: OwnedMutexGuard<()>,
 }
 
@@ -65,7 +79,7 @@ impl ConsoleCapture {
         self: &Arc<Self>,
         context: ExecutionContextId,
         boundary: Boundary,
-    ) -> (Registration, oneshot::Receiver<()>) {
+    ) -> (Registration, oneshot::Receiver<ContextBoundary>) {
         let marker = format!("__phoenix_console_fence_{}", uuid::Uuid::new_v4());
         let (acknowledged, receiver) = oneshot::channel();
         self.state
@@ -115,13 +129,34 @@ impl ConsoleCapture {
                     .is_some_and(|pending| pending.context == event.execution_context_id)
             }) {
                 let pending = state.pending.remove(marker).expect("registered marker");
+                if state.failure.is_some() {
+                    return;
+                }
                 if let Boundary::Begin(generation) = pending.boundary {
                     state.generation = Some(generation);
                 }
-                let _ = pending.acknowledged.send(());
+                if let Some(marker_context) = state.contexts.get(&event.execution_context_id) {
+                    let _ = pending.acknowledged.send(ContextBoundary {
+                        marker_context: marker_context.clone(),
+                        contexts: state.contexts.values().cloned().collect(),
+                    });
+                } else {
+                    state.failure =
+                        Some("source marker arrived from an unknown execution context".to_owned());
+                }
                 return;
             }
-            state.generation
+            if !state.contexts.contains_key(&event.execution_context_id) {
+                state.failure = Some(format!(
+                    "console event from unknown execution context {:?}",
+                    event.execution_context_id
+                ));
+                tracing::warn!(failure = ?state.failure, "console capture lost context ownership");
+            }
+            (
+                state.generation,
+                state.contexts.get(&event.execution_context_id).cloned(),
+            )
         };
         let level = event.r#type.clone().into();
         let text = event
@@ -141,8 +176,8 @@ impl ConsoleCapture {
             level,
             text,
             timestamp: Instant::now(),
-            source_context: event.execution_context_id,
-            capture_generation: generation,
+            source_context: generation.1,
+            capture_generation: generation.0,
         });
         notification.notify_one();
     }
@@ -154,8 +189,146 @@ fn capture_error(message: impl std::fmt::Display) -> BrowserError {
     ))
 }
 
+impl ConsoleCapture {
+    fn observe(
+        &self,
+        message: &Value,
+        logs: &Mutex<VecDeque<ConsoleEntry>>,
+        notification: &Notify,
+    ) -> Result<(), BrowserError> {
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        match message.get("method").and_then(Value::as_str) {
+            Some("Runtime.executionContextCreated") => {
+                let event: EventExecutionContextCreated =
+                    serde_json::from_value(params).map_err(capture_error)?;
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contexts
+                    .insert(event.context.id, event.context.unique_id);
+            }
+            Some("Runtime.executionContextDestroyed") => {
+                let event: EventExecutionContextDestroyed =
+                    serde_json::from_value(params).map_err(capture_error)?;
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contexts
+                    .retain(|_, unique| *unique != event.execution_context_unique_id);
+            }
+            Some("Runtime.executionContextsCleared") => {
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contexts
+                    .clear();
+            }
+            Some("Runtime.consoleAPICalled") => {
+                let event: EventConsoleApiCalled =
+                    serde_json::from_value(params).map_err(capture_error)?;
+                self.accept(&event, logs, notification);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn command(
+        &self,
+        socket: &mut Socket,
+        request: Value,
+        logs: &Mutex<VecDeque<ConsoleEntry>>,
+        notification: &Notify,
+    ) -> Result<Value, BrowserError> {
+        socket
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .map_err(capture_error)?;
+        while let Some(message) = socket.next().await {
+            let message = message.map_err(capture_error)?;
+            if let Message::Text(text) = message {
+                let message: Value = serde_json::from_str(&text).map_err(capture_error)?;
+                self.observe(&message, logs, notification)?;
+                if message.get("id") == request.get("id") {
+                    if let Some(error) = message.get("error") {
+                        return Err(capture_error(error));
+                    }
+                    return Ok(message["result"].clone());
+                }
+            } else if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+        Err(capture_error("console connection ended"))
+    }
+}
+
+pub(super) async fn listen(
+    session: &BrowserSession,
+) -> Result<tokio::task::JoinHandle<()>, BrowserError> {
+    let capture = session.console_capture.clone();
+    let logs = session.console_logs.clone();
+    let notification = session.console_event.clone();
+    let mut socket = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut socket, session_id) = crate::cdp::connect_target(
+            session.snapshot_websocket_address(),
+            session.page.target_id(),
+            8 * 1024 * 1024,
+        )
+        .await
+        .map_err(capture_error)?;
+        capture
+            .command(
+                &mut socket,
+                json!({"id":2,"sessionId":session_id,"method":"Runtime.enable"}),
+                &logs,
+                &notification,
+            )
+            .await?;
+        Ok::<_, BrowserError>(socket)
+    })
+    .await
+    .map_err(|_| capture_error("console connection setup timed out"))??;
+    Ok(tokio::spawn(async move {
+        let result = async {
+            while let Some(message) = socket.next().await {
+                let message = message.map_err(capture_error)?;
+                if let Message::Text(text) = message {
+                    let message: Value = serde_json::from_str(&text).map_err(capture_error)?;
+                    capture.observe(&message, &logs, &notification)?;
+                } else if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+            Ok::<_, BrowserError>(())
+        }
+        .await;
+        let failure = result.err().map_or_else(
+            || "console connection ended".to_owned(),
+            |error| error.to_string(),
+        );
+        tracing::warn!(%failure, "console capture stopped");
+        let mut state = capture
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.failure = Some(failure);
+        state.pending.clear();
+    }))
+}
+
 impl BrowserSession {
-    async fn console_boundary(&self, boundary: Boundary) -> Result<(), BrowserError> {
+    async fn console_boundary(&self, boundary: Boundary) -> Result<ContextBoundary, BrowserError> {
+        if let Some(failure) = self
+            .console_capture
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure
+            .clone()
+        {
+            return Err(capture_error(failure));
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             let context = self
                 .page
@@ -169,8 +342,16 @@ impl BrowserSession {
             ));
             expression.context_id = Some(context);
             self.page.evaluate_expression(expression).await?;
-            acknowledged.await.map_err(capture_error)?;
-            Ok(())
+            acknowledged.await.map_err(|error| {
+                let failure = self
+                    .console_capture
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .failure
+                    .clone();
+                capture_error(failure.unwrap_or_else(|| error.to_string()))
+            })
         })
         .await
         .map_err(|_| capture_error("source-event acknowledgement timed out"))?
@@ -185,10 +366,11 @@ impl BrowserSession {
     ) -> Result<ConsoleNavigationCapture, BrowserError> {
         let lease = self.console_capture.navigation.clone().lock_owned().await;
         let generation = Generation(uuid::Uuid::new_v4());
-        self.console_boundary(Boundary::Begin(generation)).await?;
+        let boundary = self.console_boundary(Boundary::Begin(generation)).await?;
         Ok(ConsoleNavigationCapture {
             owner: self.console_capture.clone(),
             generation,
+            boundary,
             _lease: lease,
         })
     }
@@ -204,18 +386,8 @@ impl BrowserSession {
         if !Arc::ptr_eq(&self.console_capture, &capture.owner) {
             return Err(capture_error("capture belongs to another browser"));
         }
-        self.console_boundary(Boundary::Drain).await?;
-        let context = self
-            .page
-            .execution_context()
-            .await?
-            .ok_or_else(|| capture_error("main execution context unavailable"))?;
-        let mut contexts = HashSet::from([context]);
-        for frame in self.page.frames().await? {
-            if let Some(context) = self.page.frame_execution_context(frame).await? {
-                contexts.insert(context);
-            }
-        }
+        let final_boundary = self.console_boundary(Boundary::Drain).await?;
+        let same_document = capture.boundary.marker_context == final_boundary.marker_context;
         let logs = self
             .console_logs
             .lock()
@@ -224,7 +396,9 @@ impl BrowserSession {
             .iter()
             .filter(|entry| {
                 entry.capture_generation == Some(capture.generation)
-                    && contexts.contains(&entry.source_context)
+                    && entry.source_context.as_ref().is_some_and(|context| {
+                        same_document || !capture.boundary.contexts.contains(context)
+                    })
             })
             .cloned()
             .collect())
@@ -236,6 +410,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn context(capture: &ConsoleCapture, id: i64, unique: &str) {
+        capture.observe(&json!({"method":"Runtime.executionContextCreated", "params":{"context":{"id":id,"uniqueId":unique,"origin":"","name":""}}}), &Mutex::new(VecDeque::new()), &Notify::new()).unwrap();
+    }
+
     fn event(context: i64, text: &str, kind: &str) -> EventConsoleApiCalled {
         serde_json::from_value(json!({"type":kind,"args":[{"type":"string","value":text}],"executionContextId":context,"timestamp":1})).unwrap()
     }
@@ -246,6 +424,9 @@ mod tests {
         let logs = Mutex::new(VecDeque::new());
         let notification = Notify::new();
         let generation = Generation(uuid::Uuid::new_v4());
+        for id in [1, 9, 10] {
+            context(&capture, id, &format!("initial-{id}"));
+        }
         let (begin, mut begin_ack) =
             capture.register(ExecutionContextId::new(9), Boundary::Begin(generation));
         capture.accept(
@@ -258,7 +439,7 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
         capture.accept(&event(9, &begin.marker, "debug"), &logs, &notification);
-        begin_ack.await.unwrap();
+        let initial = begin_ack.await.unwrap();
         assert_eq!(
             logs.lock().unwrap().len(),
             1,
@@ -269,6 +450,8 @@ mod tests {
             &logs,
             &notification,
         );
+        context(&capture, 2, "new-main");
+        context(&capture, 3, "new-iframe");
         capture.accept(
             &event(2, "new navigation error", "error"),
             &logs,
@@ -279,12 +462,15 @@ mod tests {
         capture.accept(&event(10, &end.marker, "debug"), &logs, &notification);
         end_ack.await.unwrap();
         let logs = logs.lock().unwrap();
-        let contexts = HashSet::from([ExecutionContextId::new(2), ExecutionContextId::new(3)]);
+        let contexts = &initial.contexts;
         let selected: Vec<_> = logs
             .iter()
             .filter(|entry| {
                 entry.capture_generation == Some(generation)
-                    && contexts.contains(&entry.source_context)
+                    && entry
+                        .source_context
+                        .as_ref()
+                        .is_some_and(|context| !contexts.contains(context))
             })
             .map(|entry| entry.text.as_str())
             .collect();
@@ -293,11 +479,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_order_keeps_detached_contexts_and_distinguishes_reused_numeric_ids() {
+        let capture = Arc::new(ConsoleCapture::default());
+        let logs = Mutex::new(VecDeque::new());
+        let notification = Notify::new();
+        context(&capture, 1, "old-main");
+        context(&capture, 2, "old-iframe");
+        context(&capture, 9, "old-marker-world");
+        let generation = Generation(uuid::Uuid::new_v4());
+        let (begin, ack) =
+            capture.register(ExecutionContextId::new(9), Boundary::Begin(generation));
+        capture.accept(&event(9, &begin.marker, "debug"), &logs, &notification);
+        let initial = ack.await.unwrap();
+        capture.accept(
+            &event(2, "old iframe during navigation", "error"),
+            &logs,
+            &notification,
+        );
+        capture
+            .observe(
+                &json!({"method":"Runtime.executionContextsCleared","params":{}}),
+                &logs,
+                &notification,
+            )
+            .unwrap();
+        context(&capture, 2, "new-iframe-reused-number");
+        capture.accept(
+            &event(2, "removed new iframe error", "error"),
+            &logs,
+            &notification,
+        );
+        capture.observe(&json!({"method":"Runtime.executionContextDestroyed","params":{"executionContextUniqueId":"new-iframe-reused-number"}}), &logs, &notification).unwrap();
+        let logs = logs.lock().unwrap();
+        let selected: Vec<_> = logs
+            .iter()
+            .filter(|entry| {
+                entry.capture_generation == Some(generation)
+                    && entry
+                        .source_context
+                        .as_ref()
+                        .is_some_and(|context| !initial.contexts.contains(context))
+            })
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(selected, ["removed new iframe error"]);
+        assert_eq!(
+            logs.len(),
+            2,
+            "both entries remain in ordinary session history"
+        );
+        assert!(!capture
+            .state
+            .lock()
+            .unwrap()
+            .contexts
+            .contains_key(&ExecutionContextId::new(2)));
+    }
+
+    #[tokio::test]
+    async fn unknown_context_marks_capture_failed_without_discarding_session_history() {
+        let capture = Arc::new(ConsoleCapture::default());
+        let logs = Mutex::new(VecDeque::new());
+        let notification = Notify::new();
+        capture.accept(&event(77, "unowned error", "error"), &logs, &notification);
+        assert!(capture
+            .state
+            .lock()
+            .unwrap()
+            .failure
+            .as_ref()
+            .unwrap()
+            .contains("unknown execution context"));
+        assert_eq!(logs.lock().unwrap()[0].text, "unowned error");
+        context(&capture, 9, "marker");
+        let (registration, acknowledged) =
+            capture.register(ExecutionContextId::new(9), Boundary::Drain);
+        capture.accept(
+            &event(9, &registration.marker, "debug"),
+            &logs,
+            &notification,
+        );
+        assert!(
+            acknowledged.await.is_err(),
+            "a failed capture cannot report a successful fence"
+        );
+    }
+
+    #[tokio::test]
     async fn same_document_navigation_excludes_events_before_its_source_marker() {
         let capture = Arc::new(ConsoleCapture::default());
         let logs = Mutex::new(VecDeque::new());
         let notification = Notify::new();
         let generation = Generation(uuid::Uuid::new_v4());
+        for id in [1, 9, 10] {
+            context(&capture, id, &format!("initial-{id}"));
+        }
         let (begin, acknowledged) =
             capture.register(ExecutionContextId::new(9), Boundary::Begin(generation));
         capture.accept(
@@ -335,12 +611,26 @@ mod tests {
             WorkScopeId::parse(format!("console-fence-{}", uuid::Uuid::new_v4())).unwrap(),
         );
         let session = manager.get_session(&scope).await.expect("Chrome session");
+        {
+            let mut session = session.write().await;
+            session.page.goto("data:text/html,<iframe srcdoc=\"<script>console.error('old-iframe-error')</script>\"></iframe>").await.unwrap();
+            session.page.evaluate("console.error('old-page-error'); console.debug = () => { throw Error('page console override'); }; true").await.unwrap();
+            session.console_task.take().unwrap().abort();
+            session.console_capture = Arc::new(ConsoleCapture::default());
+            session.console_logs.lock().unwrap().clear();
+        }
+        BrowserSession::setup_console_listener(session.clone())
+            .await
+            .unwrap();
         let (captured, fragment_captured, ordinary_logs) = {
             let session = session.read().await;
-            session.page.goto("about:blank").await.unwrap();
-            session.page.evaluate("console.error('old-page-error'); console.debug = () => { throw Error('page console override'); }; true").await.unwrap();
             let capture = session.begin_console_navigation_capture().await.unwrap();
-            let url = "data:text/html,<script>console.error('new-page-error');console.debug=()=>{throw Error('new-page console override')};</script><iframe srcdoc=\"<script>console.error('new-iframe-error')</script>\"></iframe>";
+            session
+                .page
+                .evaluate("frames[0].console.error('late-old-iframe-error'); true")
+                .await
+                .unwrap();
+            let url = "data:text/html,<script>console.error('new-page-error');console.debug=()=>{throw Error('new-page console override')};</script><iframe srcdoc=\"<script>console.error('new-iframe-error')</script>\"></iframe><iframe srcdoc=\"<script>console.error('removed-iframe-error');frameElement.remove()</script>\"></iframe>";
             session.page.goto(url).await.unwrap();
             let captured = session
                 .finish_console_navigation_capture(capture)
@@ -375,7 +665,10 @@ mod tests {
         let captured: Vec<_> = captured.iter().map(|entry| entry.text.as_str()).collect();
         assert!(captured.contains(&"new-page-error"), "{captured:?}");
         assert!(captured.contains(&"new-iframe-error"), "{captured:?}");
+        assert!(captured.contains(&"removed-iframe-error"), "{captured:?}");
         assert!(!captured.contains(&"old-page-error"), "{captured:?}");
+        assert!(!captured.contains(&"old-iframe-error"), "{captured:?}");
+        assert!(!captured.contains(&"late-old-iframe-error"), "{captured:?}");
         let fragment_captured: Vec<_> = fragment_captured
             .iter()
             .map(|entry| entry.text.as_str())
@@ -383,12 +676,15 @@ mod tests {
         assert_eq!(fragment_captured, ["after-fragment-error"]);
         assert_eq!(
             ordinary_logs.len(),
-            5,
+            8,
             "only application entries are retained"
         );
         for expected in [
             "old-page-error",
+            "old-iframe-error",
+            "late-old-iframe-error",
             "new-page-error",
+            "removed-iframe-error",
             "new-iframe-error",
             "before-fragment-error",
             "after-fragment-error",
