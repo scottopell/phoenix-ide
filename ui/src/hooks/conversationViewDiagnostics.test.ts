@@ -92,3 +92,60 @@ it('distinguishes the sole timeout abort from rejected transport without extendi
     expect(send).toHaveBeenCalledTimes(1);
   } finally { vi.useRealTimers(); }
 });
+
+it.each(['sync_throw', 'rejected_promise', 'success'] as const)('clears timer and restores inflight slot after %s without false timeout or altered busy-drop counters', async mode => {
+  vi.useFakeTimers();
+  try {
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+    const signals: AbortSignal[] = [];
+    const send = vi.fn<typeof fetch>().mockImplementation((_url, init) => {
+      signals.push(init!.signal!);
+      if (mode === 'sync_throw') throw new Error('PRIVATE_SYNC');
+      return mode === 'rejected_promise' ? Promise.reject(new Error('PRIVATE_REJECTION')) : Promise.resolve(new Response(null, { status: 204 }));
+    });
+    const reporter = new ViewJourneyReporter({ random: () => 0.1, send });
+    const first = reporter.begin(identity)!;
+    reporter.report(first, 'incomplete');
+    expect(send).toHaveBeenCalledTimes(1);
+    reporter.report(reporter.begin(identity)!, 'canceled');
+    expect(send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+    const firstStates = dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail).filter(e => e.kind === 'submission');
+    expect(firstStates.filter(e => e.open_id === first.openId).map(e => e.state)).toEqual(['attempted', mode === 'success' ? 'response' : 'failed']);
+    expect(firstStates.filter(e => e.state === 'busy_drop')).toHaveLength(1);
+    send.mockImplementation((_url, init) => {
+      signals.push(init!.signal!);
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    reporter.report(reporter.begin(identity)!, 'failed');
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(send.mock.calls[1]![1]!.body as string)).toMatchObject({ transport_dropped_count: 1, transport_failed_count: mode === 'success' ? 0 : 1 });
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(signals.every(signal => !signal.aborted)).toBe(true);
+    const events = dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail);
+    expect(events.some(e => e.state === 'timeout_abort')).toBe(false);
+    expect(JSON.stringify(events)).not.toContain('PRIVATE');
+    expect(send).toHaveBeenCalledTimes(2);
+  } finally { vi.useRealTimers(); }
+});
+
+it('emits timeout_abort immediately before invoking the sole abort signal', async () => {
+  vi.useFakeTimers();
+  try {
+    const order: string[] = [];
+    const listen = (event: Event) => { const detail = (event as CustomEvent).detail; if (detail.kind === 'submission') order.push(detail.state); };
+    window.addEventListener('phoenix:view-diagnostic', listen);
+    try {
+      const send = vi.fn<typeof fetch>().mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+        init!.signal!.addEventListener('abort', () => { order.push('signal_aborted'); reject(new Error('aborted')); });
+      }));
+      const reporter = new ViewJourneyReporter({ random: () => 0.1, send });
+      reporter.report(reporter.begin(identity)!, 'incomplete');
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(order).toEqual(['attempted', 'timeout_abort', 'signal_aborted', 'failed']);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { window.removeEventListener('phoenix:view-diagnostic', listen); }
+  } finally { vi.useRealTimers(); }
+});
