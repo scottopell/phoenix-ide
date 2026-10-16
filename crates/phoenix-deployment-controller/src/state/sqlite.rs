@@ -476,9 +476,6 @@ impl ControllerSqliteStore {
             tx.execute("UPDATE guardian_bindings SET revision=?2,dispatch_floor=?3 WHERE attempt_id=?1 AND revision=?4",
                 params![id, Word(revision.get()), Word(interruption.get()), Word(expected.revision.get())])?;
         } else {
-            if current.state == NativeSessionState::Detached {
-                return Err(ControllerStoreError::RevisionConflict);
-            }
             tx.execute("UPDATE guardian_sessions SET state='detached' WHERE attempt_id=?1 AND generation=?2",
                 params![id, Word(current.generation.get())])?;
             tx.execute(

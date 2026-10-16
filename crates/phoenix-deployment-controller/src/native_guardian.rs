@@ -565,11 +565,26 @@ impl GuardianClient {
 }
 
 /// Verified diagnostic outcome, not a live controller session or execution permit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VerifiedBindingStatus {
     InitialActive,
     Detached,
-    PendingBegin,
+    PendingBegin {
+        observed_slots: Vec<crate::NativeGuardianSlot>,
+    },
+}
+
+fn persist_detached_observation(
+    store: &mut crate::ControllerSqliteStore,
+    binding: &crate::NativeGuardianBinding,
+    slots: &[crate::NativeGuardianSlot],
+) -> Result<VerifiedBindingStatus, String> {
+    if binding.slots() != slots {
+        store
+            .commit_detached_binding(binding, slots)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(VerifiedBindingStatus::Detached)
 }
 
 /// Compare all durable continuity evidence before recording a detached session.
@@ -659,7 +674,9 @@ pub fn verify_native_binding(
                 (WireState::DetachedFenced, NativeSessionState::Reconciling)
                     if live_generation.checked_add(1) == Some(stored_generation) =>
                 {
-                    Ok(VerifiedBindingStatus::PendingBegin)
+                    Ok(VerifiedBindingStatus::PendingBegin {
+                        observed_slots: slots,
+                    })
                 }
                 (
                     WireState::DetachedFenced,
@@ -671,7 +688,7 @@ pub fn verify_native_binding(
                     Ok(VerifiedBindingStatus::Detached)
                 }
                 (WireState::DetachedFenced, NativeSessionState::Detached) => {
-                    Ok(VerifiedBindingStatus::Detached)
+                    persist_detached_observation(store, &binding, &slots)
                 }
                 _ => Err(reject()),
             }

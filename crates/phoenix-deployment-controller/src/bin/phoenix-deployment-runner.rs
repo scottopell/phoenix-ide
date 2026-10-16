@@ -4,7 +4,8 @@
 use phoenix_deployment_controller::{
     guardian_ipc::{WireNativeBinding, WireSnapshot},
     native_guardian::{verify_native_binding, GuardianClient, VerifiedBindingStatus},
-    AttemptId, ControllerSqliteStore, PersistenceRevision, Phase, RecoveryDisposition,
+    AttemptId, ControllerSqliteStore, NativeGuardianSlot, PersistenceRevision, Phase,
+    RecoveryDisposition,
 };
 #[cfg(unix)]
 use std::{
@@ -104,6 +105,7 @@ fn catch_up_pending_begin(
     store: &mut ControllerSqliteStore,
     attempt: AttemptId,
     snapshot: &WireSnapshot,
+    observed_slots: &[NativeGuardianSlot],
 ) -> Result<(), String> {
     let pending = store
         .load_native_binding(attempt)
@@ -119,7 +121,7 @@ fn catch_up_pending_begin(
         .fence(caught_up)
         .map_err(|e| format!("fence pending: {e:?}"))?;
     store
-        .commit_detached_binding(&pending, pending.slots())
+        .commit_detached_binding(&pending, observed_slots)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -238,7 +240,8 @@ fn main() -> Result<(), String> {
         ControllerSqliteStore::open_existing(&config.store).map_err(|e| e.to_string())?;
     let (mut client, snapshot) = connect_consistent(&config.socket_dir)?;
     let status = verify_native_binding(&mut store, config.attempt, &snapshot)?;
-    if status == VerifiedBindingStatus::InitialActive {
+    let initial_active = status == VerifiedBindingStatus::InitialActive;
+    if initial_active {
         let binding = store
             .load_native_binding(config.attempt)
             .map_err(|e| e.to_string())?
@@ -249,10 +252,16 @@ fn main() -> Result<(), String> {
     }
     println!("verified binding: {status:?}");
     std::io::stdout().flush().map_err(|e| e.to_string())?;
-    if status == VerifiedBindingStatus::PendingBegin {
-        catch_up_pending_begin(&mut client, &mut store, config.attempt, &snapshot)?;
+    if let VerifiedBindingStatus::PendingBegin { observed_slots } = &status {
+        catch_up_pending_begin(
+            &mut client,
+            &mut store,
+            config.attempt,
+            &snapshot,
+            observed_slots,
+        )?;
     }
-    if status != VerifiedBindingStatus::InitialActive {
+    if !initial_active {
         begin_reconciliation(&mut client, &mut store, config.attempt, &snapshot)?;
     }
     observe_until(&mut client, &snapshot, config.observe_seconds)

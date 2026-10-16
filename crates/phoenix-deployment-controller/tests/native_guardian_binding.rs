@@ -88,13 +88,24 @@ fn initial_and_detached_reconnect_are_exact_and_idempotent() {
         NativeSessionState::Detached
     );
     assert_eq!(detached.slots()[0].liveness, NativeSlotLiveness::Exited);
+    wire.native_binding.as_mut().unwrap().slots[0].liveness = WireObservation::Unavailable;
+    assert_eq!(
+        verify_native_binding(&mut store, id, &wire).unwrap(),
+        VerifiedBindingStatus::Detached
+    );
+    let refreshed = store.load_native_binding(id).unwrap().unwrap();
+    assert!(refreshed.revision().get() > detached.revision().get());
+    assert_eq!(
+        refreshed.slots()[0].liveness,
+        NativeSlotLiveness::Unavailable
+    );
     assert_eq!(
         verify_native_binding(&mut store, id, &wire).unwrap(),
         VerifiedBindingStatus::Detached
     );
     assert_eq!(
         store.load_native_binding(id).unwrap().unwrap().revision(),
-        detached.revision()
+        refreshed.revision()
     );
 }
 
@@ -187,13 +198,17 @@ fn pending_begin_crash_refreshes_interruption_and_advances_durable_generation() 
     );
     // The runner died after durable session commit but before the guardian Begin.
     wire.session.generation = 1;
-    assert_eq!(
-        verify_native_binding(&mut store, attempt, &wire).unwrap(),
-        VerifiedBindingStatus::PendingBegin
-    );
+    wire.native_binding.as_mut().unwrap().slots[0].liveness = WireObservation::Exited;
+    let VerifiedBindingStatus::PendingBegin { observed_slots } =
+        verify_native_binding(&mut store, attempt, &wire).unwrap()
+    else {
+        panic!("expected pending begin")
+    };
+    assert_eq!(observed_slots[0].liveness, NativeSlotLiveness::Exited);
     let detached = store
-        .commit_detached_binding(&pending, pending.slots())
+        .commit_detached_binding(&pending, &observed_slots)
         .unwrap();
+    assert_eq!(detached.slots()[0].liveness, NativeSlotLiveness::Exited);
     let refreshed = store
         .load_attempt(attempt)
         .unwrap()

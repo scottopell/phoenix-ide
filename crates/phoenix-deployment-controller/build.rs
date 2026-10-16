@@ -59,7 +59,15 @@ fn main() {
         }
         let status = git(
             manifest,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                ".",
+                "../../Cargo.toml",
+                "../../Cargo.lock",
+            ],
         )?;
         if !status.is_empty() {
             return None;
