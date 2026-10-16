@@ -1953,3 +1953,79 @@ and changed-file ESLint passed. Affected Python admission 67 and joint Node 65
 passed at this new pin. The source-backed synchronization change is not claimed
 to prove the cause of the prior hosted failure. Full UI and native qualification
 remain required; no acceptance or overhead clearance follows from these passes.
+
+
+## Immutable natural baseline and separate controlled-functional packet
+
+Run `38921946475` is terminal success at harness
+`42a2d078b7f73ea71f3e850acb3546c2a6cde526` and app
+`1ef9a5773446d62f10c60a71eeef69f235653c8a` (tree
+`49907e8c10205f5675291fe031bcc3170807ebe9`). All ten jobs passed,
+including witness `117043819200` and Rust `117043953760`. The ordinary
+collector/export inventory was 15/15/15; Global was 11/11/11. All reports
+were ready. Independent source/instance/value joins, same-trace HTTP ancestry,
+40 ordinary and 21 Global correlation children, normal app-first/receiver-second
+drain, and physical history ordinary9/Global11 passed. The real capacity test
+measured cap32 attributes32/drop20, Span1489B/semantic1043B/SDK295B, and cap52
+attributes52/drop0, Span2240B/semantic1726B/SDK325B. Those are fixture encoding
+sizes, not whole-wire, memory or timing clearance. Artifact `12056176368`
+remains remote; the retained bounded selection was 802,027 bytes.
+
+This baseline is partial: four actual pagehide attempts were naturally unsampled,
+and both history pages had zero additional-history reports. Native resume is
+unsupported; overhead clearance and full acceptance remain false. Controlled
+positives do not retrospectively change that stock evidence.
+
+The separate source packet pins app `d760aad0573f949e61a04fd95bd905257fec4721`,
+tree `9477fd6afb59a333ac6590a6e3b324886dc6fbda`, integrating the reviewed
+factory/graph guard and additive actual-config/output-directory verification.
+The governing controlled exception is the app's ADR-109 and REQ-CVT-001/005/006;
+no shipping sampler, collector schema, privacy limit or SDK capacity changes are
+introduced by this harness packet. Both stock and controlled artifacts must be
+built separately by the hosted workflow. Exact mode-specific manifest digests
+and output inventories are sealed immediately in the independent build-owner
+receipt, threaded into libtest provenance, and checked before and after capture.
+Git-pinned factory/config/guard/module hashes, lockfile identity, exclusive graph,
+contained non-symlink asset inventory and independently fetched served bytes are
+additional gates, not substitutes for that build attestation. Stock/overhead
+admission structurally rejects a controlled artifact.
+
+The native command selects only `--joint-telemetry --controlled-functional
+--timeout 300`: one original-page retained historical direct-open, one real
+pending-GET cross-document pagehide, and one real pending-GET Sidebar-home SPA
+cancellation per ordinary/Global route. Admission is truthfully sample_rate1.
+Exactly six reports must join six real collector acceptances and six semantic
+exports (ready2/incomplete2/canceled2); one unauthenticated POST must return401
+and add zero acceptance/export. Original-page producer and finite-network
+ownership, actual report/producer/scenario route equality, unique UUIDs, physical
+historical source identity and current writable composer owner are checked.
+Observers survive context closure so late reports/admissions cannot disappear.
+Pagehide waits for the departing transport to settle before destroying its
+context, but that event is not delivery proof: only the final real collector
+and export join after normal drain can seal it. A failed transport cannot be
+promoted by the provisional browser receipt.
+
+The scenario clock is absolute195s, within a browser lifecycle bound205s plus
+bounded4s shutdown and15s asset verification; the Python child cap is230s and
+whole qualification cap300s. Deadline/stalled setup, late completion, primary
+versus cleanup failure, failed auth-negative receipt retention, changed report
+routes, rehashed replacement assets and delayed departure transport are offline
+regression targets. These ceilings are liveness bounds, not performance budgets.
+The original real libtest guards, collector/auth/default-SDK and capacity/privacy
+guards, codegen and full UI source qualification remain mandatory hosted gates.
+No native resume simulation, unchanged sampling rerun, overhead capture or
+numerical overhead tolerance is included. No controlled artifact build or native
+execution is claimed by the source/unit packet. Hosted qualification may proceed
+only after cohesive exact-source contract/artifact/workflow review.
+
+The source-only cached ring passed: artifact8, Python lifecycle68, controlled
+Node16, existing Python16 and Node14/35/65, and pinned-app25 across four focused
+Vitest files. Diff whitespace and workflow YAML parsing passed; actionlint was
+not installed, and no dependency was installed for it. This is not a full check
+or artifact build. Cohesive independent review found an execution blocker at the
+pinned app: `writeBundle` inventories only Rollup bundle entries, omitting Vite's
+copied public files and the stock `closeBundle` `.gitkeep`. Exact asset admission
+correctly rejects that mismatch. The telemetry source owner has the focused
+correction request. Hosted execution and publication remain held until corrected
+source is imported, re-pinned, tested and independently reviewed; the exact
+inventory gate must not be weakened to bypass the defect.

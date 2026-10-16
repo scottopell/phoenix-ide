@@ -28,12 +28,13 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode, quote
 
 import history_browser as shipping
+import history_controlled_artifact as artifact_admission
 
-PIN = "1ef9a5773446d62f10c60a71eeef69f235653c8a"
-TREE_PIN = "49907e8c10205f5675291fe031bcc3170807ebe9"
+PIN = "d760aad0573f949e61a04fd95bd905257fec4721"
+TREE_PIN = "9477fd6afb59a333ac6590a6e3b324886dc6fbda"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
@@ -71,6 +72,7 @@ def identity(app, exe, receipt_path):
     if not exe.is_file() or exe.resolve() != exe or not os.access(exe, os.X_OK):
         raise ValueError("standalone non-symlink executable required")
     receipt = json.loads(receipt_path.read_text())
+    artifact_admission.require_build_owner_binding(app, receipt)
     modules = {relative: shipping.digest(app / relative) for relative in TELEMETRY_MODULES}
     if modules != TELEMETRY_MODULES:
         raise ValueError("telemetry runtime module hash mismatch")
@@ -80,6 +82,7 @@ def identity(app, exe, receipt_path):
         "cargo_lock_sha256": shipping.digest(app / "Cargo.lock"),
         "ui_lock_sha256": shipping.digest(app / "ui/pnpm-lock.yaml"),
         "ui_files": shipping.ui_hashes(app), "telemetry_modules": modules,
+        "ui_artifacts": artifact_admission.build_owner_binding(app),
         "evidence_class": CLASS, "ignored_driver": DRIVER}
     if any(receipt.get(k) != v for k, v in measured.items()):
         raise ValueError("instrumented receipt source/tree/harness/hash/lock/UI mismatch")
@@ -106,7 +109,9 @@ def identity(app, exe, receipt_path):
             raise ValueError("production collector capacity and privacy guards did not execute exactly once")
     return measured | {"rustc": receipt["rustc"], "receipt_sha256": shipping.digest(receipt_path),
         "harness_files": {str(p.relative_to(ROOT)): shipping.digest(p) for p in
-            [Path(__file__), SCRIPT, Path(shipping.__file__),
+            [Path(__file__), SCRIPT, Path(shipping.__file__), Path(artifact_admission.__file__),
+             ROOT/'ui/scripts/history-controlled-functional.mjs',
+             ROOT/'ui/scripts/qualify-history-controlled-functional.mjs',
              ROOT / "ui/scripts/qualify-history-realserver.mjs",
              ROOT / "ui/scripts/history-postfault-baseline.mjs",
              ROOT / "ui/scripts/history-joint-telemetry.mjs"]},
@@ -533,7 +538,64 @@ def collector_acceptances(path, identity):
     return records
 
 
-def seal_collector_export_delivery(path, identity, browser, final, drain, run_id, service_name):
+def validate_controlled_receipt(receipt):
+    if (receipt.get('evidence_class') != 'controlled_functional'
+            or receipt.get('status') != 'passed_assertions'
+            or receipt.get('full_acceptance') is not False
+            or receipt.get('overhead_clearance') is not False
+            or receipt.get('resume', {}).get('status') != 'unsupported'
+            or receipt.get('comparison', {}).get('overhead_clearance') is not False
+            or receipt.get('acceptance') != 'partial_controlled_functional_collector_export_only'
+            or receipt.get('auth_negative') != {'attempts': 1, 'response_status': 401, 'expected_acceptances': 0}):
+        raise ValueError('controlled evidence class or scope mismatch')
+    if any(type(value) is not int for value in receipt['auth_negative'].values()):
+        raise ValueError('controlled auth-negative counts must be integers')
+    trials, journeys = receipt.get('trials'), receipt.get('journeys')
+    if not isinstance(trials, list) or len(trials) != 6 or not isinstance(journeys, list) or len(journeys) != 6:
+        raise ValueError('controlled exact six-scenario inventory required')
+    seen = set()
+    for route in ('ordinary', 'global'):
+        for kind, outcome in (('history', 'ready'), ('pagehide', 'incomplete'), ('cancellation', 'canceled')):
+            entries = [t for t in trials if t.get('route') == route and t.get('kind') == kind]
+            if len(entries) != 1:
+                raise ValueError('controlled missing or duplicate scenario')
+            trial = entries[0]
+            reports = trial.get('reports')
+            if (trial.get('status') != 'passed_assertions' or trial.get('errors') != []
+                    or not isinstance(reports, list) or len(reports) != 1):
+                raise ValueError('controlled report or action failure')
+            report = reports[0]
+            identifier = report.get('open_id')
+            if (not isinstance(identifier, str) or identifier in seen or report.get('outcome') != outcome
+                    or type(report.get('sample_rate')) not in (int, float) or report['sample_rate'] != 1
+                    or trial.get('admission', {}).get('sampled') is not True
+                    or trial['admission'].get('open_id') != identifier
+                    or report.get('route') != route or trial['admission'].get('route') != route):
+                raise ValueError('controlled report ownership, outcome or selection mismatch')
+            if kind == 'history':
+                history = trial.get('additional_history', {})
+                if (history.get('report_count') != 1 or history.get('original_owner') != identifier
+                        or type(history.get('request_count')) is not int or history['request_count'] < 1
+                        or trial.get('physical_history', {}).get('original_page') is not True):
+                    raise ValueError('controlled positive original-owner historical evidence missing')
+            if kind == 'pagehide' and trial.get('transport_settled_before_context_close') is not True:
+                raise ValueError('controlled departing context closed before transport settled')
+            if kind != 'pagehide' and trial.get('statuses') != [204]:
+                raise ValueError('controlled nondeparting response missing')
+            if kind == 'pagehide' and trial.get('delivery_proof') != 'provisional_until_real_collector_and_export_join':
+                raise ValueError('controlled departing proof cannot substitute collector/export')
+            seen.add(identifier)
+    ids = [j.get('open_id') for j in journeys]
+    if len(set(ids)) != 6 or set(ids) != seen:
+        raise ValueError('controlled report/journey exact inventory mismatch')
+    return receipt
+
+
+def seal_collector_export_delivery(path, identity, browser, final, drain, run_id, service_name, evidence_mode='stock_natural'):
+    if evidence_mode == 'controlled_functional':
+        validate_controlled_receipt(browser)
+    elif evidence_mode != 'stock_natural' or browser.get('evidence_class') == 'controlled_functional':
+        raise ValueError('controlled evidence cannot enter stock collector/export seal')
     if drain != {"run_id": run_id, "service_name": service_name, "app_stopped": True,
                  "receiver_stopped": True, "errors": []}:
         raise ValueError("collector/export join requires normal owned drain")
@@ -569,6 +631,8 @@ def seal_collector_export_delivery(path, identity, browser, final, drain, run_id
                 or any(c not in "0123456789abcdef" for c in trace) or set(trace) == {"0"}):
             raise ValueError("actual exported journey mismatch")
     return {"schema_version": 1, "run_id": run_id, "service_name": service_name,
+            "evidence_class": evidence_mode,
+            "full_acceptance": False, "overhead_clearance": False,
             "scope": "real_collector_and_semantic_export_not_full_joint_or_overhead_acceptance",
             "collector_acceptances": accepted, "exported": retrieved,
             "normal_drain": True}
@@ -766,7 +830,13 @@ def normal_server_completion(server, case, startup, control, failures):
     return receipt
 
 
-def qualify(app, exe, output, joint_telemetry=False):
+def qualify(app, exe, output, joint_telemetry=False, controlled=False):
+    if controlled and not joint_telemetry:
+        raise ValueError('controlled functional capture requires real collector/export joining')
+    mode = 'controlled_functional' if controlled else 'stock_natural'
+    manifest_name = 'controlled-functional-build.json' if controlled else 'stock-natural-build.json'
+    artifact = artifact_admission.admit_artifact(app, app/'ui'/manifest_name, PIN, TREE_PIN, mode)
+    (artifact_admission.require_controlled if controlled else artifact_admission.require_stock)(artifact)
     h = shipping.load_app_harness(app)
     telemetry = load_telemetry_modules(app) if joint_telemetry else None
     safe = {"PATH": os.environ["PATH"]}
@@ -774,7 +844,7 @@ def qualify(app, exe, output, joint_telemetry=False):
     with tempfile.TemporaryDirectory(prefix="ho-", dir="/tmp") as short:
         temp = Path(short).resolve()
         os.chmod(temp, 0o700)
-        for kind in ("ordinary", "global"):
+        for kind in (("ordinary",) if controlled else ("ordinary", "global")):
             case = output / kind
             case.mkdir()
             run_id = f"history-{kind}-{shipping.uuid.uuid4().hex[:16]}"
@@ -830,6 +900,8 @@ def qualify(app, exe, output, joint_telemetry=False):
                                         other_cwd = work / f"telemetry-{other_kind}-cwd"
                                         other_cwd.mkdir(mode=0o700)
                                         other = fixture.build(other_kind, other_cwd)
+                                        if controlled:
+                                            other = equal_text_fixture(fixture, other)
                                         other = other | {
                                             "latest_transcript_row_id": other["members"][-1]}
                                         fixtures = joint_fixture(
@@ -854,7 +926,7 @@ def qualify(app, exe, output, joint_telemetry=False):
                                 config = work / "preview.mjs"
                                 options = {
                                     "root": str(app / "ui"),
-                                    "build": {"outDir": str(app / "ui/dist")},
+                                    "build": {"outDir": str(artifact.root)},
                                     "preview": {"host": "127.0.0.1",
                                                 "port": preview_port,
                                                 "strictPort": True}}
@@ -892,22 +964,42 @@ def qualify(app, exe, output, joint_telemetry=False):
                                         "HISTORY_TELEMETRY_MODULE_SHA256":
                                             TELEMETRY_MODULES[
                                                 "ui/scripts/qualify-view-telemetry.mjs"]}
+                                if controlled:
+                                    if artifact_admission.digest(app/'ui'/manifest_name) != artifact.manifest_sha256:
+                                        raise ValueError('controlled manifest changed after admission')
+                                    targets = []
+                                    for owned_aggregate in (aggregate, other):
+                                        source, message = owned_aggregate['members'][0], owned_aggregate['old_message']
+                                        route = owned_aggregate['route'] + '?' + urlencode({'source_transcript': source, 'qualification': 'retained'}) + '#message-' + quote(message, safe='')
+                                        targets.append({'kind': owned_aggregate['kind'], 'route': route,
+                                            'anchor': {'persistedMessageID': message, 'sourceRow': source},
+                                            'composerOwner': owned_aggregate['members'][-1]})
+                                    admission_path = case/'controlled-artifact-admission.json'
+                                    shipping.write_json(admission_path, {'evidence_class': mode, 'sample_rate': 1,
+                                        'source_sha': PIN, 'source_tree': TREE_PIN,
+                                        'manifest_sha256': artifact.manifest_sha256,
+                                        'ui_files': dict(artifact.ui_files), 'history_targets': targets})
+                                    node_env['HISTORY_CONTROLLED_ADMISSION'] = str(admission_path)
                                 with failures.own(shipping.owned_process(
                                         ["node", str(app /
                                             "ui/node_modules/vite/bin/vite.js"),
                                          "preview", "--config", str(config)],
                                         work, node_env, case / "preview.log"), "preview") as preview:
                                     readiness(preview, ui, shipping.digest(
-                                        app / "ui/dist/index.html"))
+                                        artifact.root / "index.html"))
                                     with failures.own(shipping.owned_process(
-                                            ["node", str(SCRIPT)], work, node_env,
+                                            ["node", str(ROOT/'ui/scripts/qualify-history-controlled-functional.mjs' if controlled else SCRIPT)], work, node_env,
                                             case / "browser.log"), "browser") as driver:
-                                        driver.wait(timeout=500 if receiver else 180)
+                                        driver.wait(timeout=230 if controlled else 500 if receiver else 180)
                                         assert driver.returncode == 0, (
                                             "opening browser assertions failed; see case logs")
                                 result = json.loads(
                                     (case / "browser-result.json").read_text())
-                                assert result["status"] == "passed_assertions" and result["checks"]
+                                if controlled:
+                                    validate_controlled_receipt(result)
+                                    shipping.write_json(case/'telemetry/telemetry-browser-result.json', result)
+                                else:
+                                    assert result["status"] == "passed_assertions" and result["checks"]
                                 if receiver:
                                     telemetry_result = case / "telemetry/telemetry-browser-result.json"
                                     telemetry_browser_result(telemetry_result)
@@ -959,11 +1051,12 @@ def qualify(app, exe, output, joint_telemetry=False):
                         receiver.output, receiver.service, run_id,
                         case / "telemetry/telemetry-browser-result.json",
                         drain_receipt=drain)
+                    final['scope']['evidence_class'] = mode
                     shipping.write_json(case / "telemetry-final.json", final)
                     delivery = seal_collector_export_delivery(
                         case / "instrumented-runtime.log", fixtures["identity"],
                         telemetry_browser_result(case / "telemetry/telemetry-browser-result.json"),
-                        final, drain, run_id, receiver.service)
+                        final, drain, run_id, receiver.service, evidence_mode=mode)
                     shipping.write_json(case / "telemetry-delivery.json", delivery)
             except Exception as error:
                 failures.remember_primary("case", error)
@@ -985,6 +1078,10 @@ def qualify(app, exe, output, joint_telemetry=False):
             finally:
                 failures.write_receipt(case / "lifecycle-failures.json")
 
+
+    after_artifact = artifact_admission.admit_artifact(app, app/'ui'/manifest_name, PIN, TREE_PIN, mode)
+    if after_artifact != artifact:
+        raise ValueError('UI artifact identity changed during capture')
 
 def retained_evidence(path, missing_status, errors):
     if not path.is_file():
@@ -1008,14 +1105,19 @@ def main():
     parser.add_argument("--joint-telemetry", action="store_true",
                         help="hosted-only joint history plus telemetry evidence")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument('--controlled-functional', action='store_true', help='separate controlled UI; never stock or overhead evidence')
     parser.add_argument("--timeout", type=int, default=1100)
     args = parser.parse_args()
     if not 120 <= args.timeout <= 1200:
         parser.error("whole-run timeout must be 120..1200 seconds")
+    if args.controlled_functional and (not args.joint_telemetry or args.timeout > 300):
+        parser.error('controlled capture requires --joint-telemetry and --timeout <=300')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     result = {"status": "failed", "evidence_class": CLASS, "runtime_executed": False,
               "joint_telemetry": args.joint_telemetry,
+              "telemetry_evidence_class": 'controlled_functional' if args.controlled_functional else 'stock_natural',
+              "full_acceptance": False, "overhead_clearance": False,
               "uncovered": ["Shipping binary, real providers, production, physical devices.",
                 "Generated authority: pinned manual ContinueConversationRequest cannot select opening_authority."]}
     start = time.monotonic()
@@ -1028,7 +1130,7 @@ def main():
         app, exe = args.app_root.resolve(), args.instrumented_exe.absolute()
         before = identity(app, exe, args.instrumented_receipt)
         shipping.write_json(output / "identity.json", before)
-        qualify(app, exe, output, args.joint_telemetry)
+        qualify(app, exe, output, args.joint_telemetry, args.controlled_functional)
         assert identity(app, exe, args.instrumented_receipt) == before, "artifact identity changed"
         result["status"] = "passed_assertions"
     except Exception as error:
@@ -1050,7 +1152,7 @@ def main():
                                          "not_completed", aggregation_errors),
             "telemetry": retained_evidence(output / kind / "telemetry-final.json",
                                            "not_enabled_or_completed", aggregation_errors)}
-            for kind in ("ordinary", "global")}
+            for kind in (("ordinary",) if args.controlled_functional else ("ordinary", "global"))}
         result["runtime_executed"] = any(case["verified_runtime_startup"] for case in result["cases"].values())
         result["elapsed_seconds"] = time.monotonic() - start
         result["aggregation_errors"] = aggregation_errors

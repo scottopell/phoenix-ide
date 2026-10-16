@@ -4,7 +4,7 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = '1ef9a5773446d62f10c60a71eeef69f235653c8a';
+export const APP_PIN = 'd760aad0573f949e61a04fd95bd905257fec4721';
 export const APP_BASE_PIN = '7af06a4004b97b534d468b6ca2f42c145c8d4fb9';
 export const TELEMETRY_MODULE_SHA256 = '1c702c78bb06f74f3dae4c8f97d1932fc308959596f3602375bc65d7d99fb9e1';
 export const TELEMETRY_DIAGNOSTICS_SHA256 = 'e06232a39200d88e0a98aedb3d9e6183537f97a6e9498f27fe57a7e2a9a4696b';
@@ -139,7 +139,7 @@ export async function installHistoryRequestOwnership(context, config, UNIT) {
       ({ captureDiagnostic } = await import(pathToFileURL(helper).href));
     }
   } catch { throw new Error('history diagnostic parser setup failed'); }
-  const pairs = [], streams = [], admissions = new Set();
+  const pairs = [], streams = [], producerEvents = [], admissions = new Set();
   let events = 0, failure = null, canceled = false, timer, observedPage, phase = 'binding';
   const binding = '__phoenixHistoryDiagnostic';
   const operation = (async () => {
@@ -148,6 +148,7 @@ export async function installHistoryRequestOwnership(context, config, UNIT) {
       try {
         assert.ok(++events <= 2048, 'history producer diagnostic event bound');
         const event = captureDiagnostic(raw);
+        producerEvents.push(event);
         if (event.kind === 'admission' && event.sampled) admissions.add(event.open_id);
         if (event.kind === 'request' || event.kind === 'sse') {
           assert.ok(admissions.has(event.open_id), 'history correlation owner must be admitted');
@@ -177,6 +178,7 @@ export async function installHistoryRequestOwnership(context, config, UNIT) {
   return {
     bindPage(page) { assert.ok(!observedPage, 'history observed page must bind once'); observedPage = page; },
     snapshot: () => structuredClone({ pairs, streams, failure }),
+    diagnostics: () => structuredClone(producerEvents),
   };
 }
 

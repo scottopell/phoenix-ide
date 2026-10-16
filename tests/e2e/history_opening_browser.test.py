@@ -29,6 +29,10 @@ class OpeningQualificationTests(unittest.TestCase):
         self.app.mkdir()
         (self.app / "ui/dist").mkdir(parents=True)
         (self.app / "ui/dist/index.html").write_text("independent built UI")
+        (self.app / 'ui/dist-controlled-functional').mkdir()
+        (self.app / 'ui/dist-controlled-functional/index.html').write_text('UNIT controlled UI')
+        for name in ('stock-natural-build.json', 'controlled-functional-build.json'):
+            (self.app / 'ui' / name).write_text('UNIT manifest binding only')
         (self.app / "Cargo.lock").write_text("lock")
         (self.app / "ui/pnpm-lock.yaml").write_text("ui lock")
         for relative in opening.TELEMETRY_MODULES:
@@ -45,6 +49,7 @@ class OpeningQualificationTests(unittest.TestCase):
             "cargo_lock_sha256": opening.shipping.digest(self.app / "Cargo.lock"),
             "ui_lock_sha256": opening.shipping.digest(self.app / "ui/pnpm-lock.yaml"),
             "ui_files": opening.shipping.ui_hashes(self.app),
+            "ui_artifacts": opening.artifact_admission.build_owner_binding(self.app),
             "telemetry_modules": opening.TELEMETRY_MODULES,
             "rustc": "rustc 1.95.0 (build attestation)",
             "focused_test_exit": 0, "ignored_driver": opening.DRIVER,
@@ -103,6 +108,7 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertEqual(producer, opening.shipping.ui_hashes(self.app))
         self.assertEqual(set(producer), {"index.html", "assets/owned.js"})
         self.value["ui_files"] = producer
+        self.value['ui_artifacts'] = opening.artifact_admission.build_owner_binding(self.app)
         self.write()
         self.identity()
         self.value["ui_files"] = {"ui/dist/" + key: value for key, value in producer.items()}
@@ -533,6 +539,7 @@ class OpeningQualificationTests(unittest.TestCase):
                 raise RuntimeError("process cleanup failed")
 
         with patch.object(opening.shipping, "load_app_harness", return_value=Mock()), \
+                patch.object(opening.artifact_admission, 'admit_artifact', return_value=opening.artifact_admission.StockArtifact(self.root/'ui/dist', 'UNIT-manifest', ())), \
                 patch.object(opening.shipping, "owned_process", side_effect=process), \
                 patch.object(opening, "readiness", side_effect=AssertionError("startup primary")):
             with self.assertRaisesRegex(AssertionError, "startup primary"):
@@ -567,6 +574,7 @@ class OpeningQualificationTests(unittest.TestCase):
                 patch.object(opening.signal, "signal"), patch.object(opening.signal, "alarm"), \
                 patch.object(opening, "identity", return_value={}), \
                 patch.object(opening.shipping, "load_app_harness", return_value=Mock()), \
+                patch.object(opening.artifact_admission, 'admit_artifact', return_value=opening.artifact_admission.StockArtifact(self.root/'ui/dist', 'UNIT-manifest', ())), \
                 patch.object(opening.shipping.subprocess, "Popen", return_value=server), \
                 patch.object(opening.shipping, "stop"), \
                 patch.object(opening, "readiness", side_effect=primary), \
@@ -859,6 +867,46 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("--ignored", source)
         self.assertIn("Fixture(h, base, case)", source)
 
+
+    def test_controlled_six_scenario_receipt_cannot_promote_wrong_mode_or_inventory(self):
+        import copy
+        trials = []
+        for kind, outcome in [('history', 'ready'), ('pagehide', 'incomplete'), ('cancellation', 'canceled')]:
+            for route in ['ordinary', 'global']:
+                identifier = f'UNIT-{route}-{kind}'
+                trials.append({'route': route, 'kind': kind, 'status': 'passed_assertions', 'errors': [],
+                    'reports': [{'open_id': identifier, 'route': route, 'sample_rate': 1, 'outcome': outcome}],
+                    'admission': {'open_id': identifier, 'sampled': True, 'route': route}, 'statuses': [] if kind == 'pagehide' else [204],
+                    'delivery_proof': 'provisional_until_real_collector_and_export_join',
+                    'transport_settled_before_context_close': True,
+                    'physical_history': {'original_page': True},
+                    'additional_history': {'report_count': 1, 'request_count': 1, 'original_owner': identifier}})
+        receipt = {'evidence_class': 'controlled_functional', 'status': 'passed_assertions',
+            'full_acceptance': False, 'overhead_clearance': False, 'resume': {'status': 'unsupported'},
+            'comparison': {'overhead_clearance': False}, 'acceptance': 'partial_controlled_functional_collector_export_only',
+            'auth_negative': {'attempts': 1, 'response_status': 401, 'expected_acceptances': 0},
+            'trials': trials, 'journeys': [{'open_id': t['reports'][0]['open_id']} for t in trials]}
+        opening.validate_controlled_receipt(receipt)
+        changes = [lambda r: r.update(evidence_class='stock_natural'), lambda r: r.update(full_acceptance=True),
+            lambda r: r.update(overhead_clearance=True), lambda r: r['resume'].update(status='passed'),
+            lambda r: r['trials'].pop(), lambda r: r['trials'].append(r['trials'][0]),
+            lambda r: r['trials'][1].update(route='ordinary'), lambda r: r['journeys'].pop(),
+            lambda r: r['trials'][0]['reports'][0].update(sample_rate=.25),
+            lambda r: r['trials'][0]['reports'][0].update(sample_rate=True),
+            lambda r: r['trials'][0]['reports'][0].update(route='global'),
+            lambda r: r['trials'][0]['admission'].update(route='global'),
+            lambda r: r['auth_negative'].update(attempts=True),
+            lambda r: r['trials'][0]['additional_history'].update(request_count=0),
+            lambda r: r['trials'][0]['additional_history'].update(original_owner='foreign'),
+            lambda r: r['trials'][0]['physical_history'].update(original_page=False),
+            lambda r: r['trials'][2].update(transport_settled_before_context_close=False),
+            lambda r: r['trials'][0]['reports'][0].update(outcome='canceled'),
+            lambda r: r['trials'][0].update(statuses=[]), lambda r: r['auth_negative'].update(response_status=204)]
+        for change in changes:
+            altered = copy.deepcopy(receipt); change(altered)
+            with self.assertRaisesRegex(ValueError, 'controlled'): opening.validate_controlled_receipt(altered)
+        with self.assertRaisesRegex(ValueError, 'cannot enter stock'):
+            opening.seal_collector_export_delivery(None, {}, receipt, {}, {}, 'unit', 'service-unit')
 
     def test_production_capacity_and_privacy_units_are_mandatory_and_exact(self):
         original = json.loads(json.dumps(self.value["production_capacity_tests"]))

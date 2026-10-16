@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 1ef9a5773446d62f10c60a71eeef69f235653c8a
+          ref: d760aad0573f949e61a04fd95bd905257fec4721
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -239,17 +239,31 @@ jobs:
           uv run tests/e2e/history_browser.test.py
           node --test ui/scripts/qualify-history-realserver.selftest.mjs
           node --check ui/scripts/qualify-history-realserver.mjs
-      - name: Prepare existing UI artifact for RustEmbed (not runtime qualification)
+      - name: Build separate stock and controlled UI artifacts (not runtime qualification)
         working-directory: pinned-app/ui
         run: |
           pnpm install --frozen-lockfile
-          pnpm run build
+          node node_modules/vite/bin/vite.js build
+          node node_modules/vite/bin/vite.js build --config vite.controlled-functional.config.ts --mode controlled-functional
+          python3 - <<'PY'
+          import importlib.util,json
+          from pathlib import Path
+          root=Path.cwd().parent
+          spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
+          import sys
+          module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
+          source='d760aad0573f949e61a04fd95bd905257fec4721'; tree='9477fd6afb59a333ac6590a6e3b324886dc6fbda'
+          for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
+              module.admit_artifact(root, root/'ui'/name, source, tree, mode)
+          (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
+              'ui_artifacts':module.build_owner_binding(root), 'scope':'hosted exact-source two-build attestation; not runtime acceptance'},indent=2))
+          PY
       - name: Genuine typed-contract codegen through existing dev.py
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 1ef9a5773446d62f10c60a71eeef69f235653c8a
-          test "$(git rev-parse HEAD^{tree})" = 49907e8c10205f5675291fe031bcc3170807ebe9
+          test "$(git rev-parse HEAD)" = d760aad0573f949e61a04fd95bd905257fec4721
+          test "$(git rev-parse HEAD^{tree})" = 9477fd6afb59a333ac6590a6e3b324886dc6fbda
           test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -339,6 +353,9 @@ jobs:
           completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
           (root.parent/'opening-instrumented-unit.log').write_text(completed.stdout+completed.stderr)
           receipt = json.loads((root.parent/'opening-codegen-receipt.json').read_text())
+          ui_owner = json.loads((root.parent/'opening-ui-build-owner.json').read_text())
+          assert ui_owner['app_source'] == receipt['app_source'] and ui_owner['app_tree'] == receipt['app_tree']
+          receipt['ui_artifacts'] = ui_owner['ui_artifacts']
           receipt.update({'evidence_class':'instrumented_cfg_test_library_not_shipping_runtime',
                           'executable_sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),
                           'compiled_executable_path':str(executable.relative_to(root)),
@@ -396,13 +413,16 @@ jobs:
         working-directory: harness
         run: |
           uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.test.py
+          uv run tests/e2e/history_controlled_artifact.test.py
+          node --test ui/scripts/history-controlled-functional.selftest.mjs
+          node --check ui/scripts/qualify-history-controlled-functional.mjs
           node --test ui/scripts/qualify-history-opening-realserver.selftest.mjs
           node --test ui/scripts/history-joint-telemetry.selftest.mjs
           test -f ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
           node --check ../pinned-app/ui/scripts/qualify-view-telemetry.mjs
           node --check ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
           cd ../pinned-app/ui
-          pnpm exec vitest run scripts/qualify-view-telemetry.test.mjs scripts/view-telemetry-diagnostics.test.mjs src/hooks/conversationViewDiagnostics.test.ts src/hooks/conversationViewJourney.test.ts src/hooks/conversationViewTelemetry.test.ts src/hooks/conversationViewLifecycle.test.ts src/hooks/useConversationViewJourney.test.tsx --maxWorkers=2
+          pnpm exec vitest run scripts/qualify-view-telemetry.test.mjs scripts/view-telemetry-diagnostics.test.mjs src/hooks/conversationViewDiagnostics.test.ts src/hooks/conversationViewJourney.test.ts src/hooks/conversationViewTelemetry.test.ts src/hooks/conversationViewLifecycle.test.ts src/hooks/useConversationViewJourney.test.tsx qualification/viewReporterBuild.test.ts qualification/viewReporterManifest.test.ts --maxWorkers=2
           cd ../../harness
           node --check ui/scripts/qualify-history-opening-realserver.mjs
       - name: Full UI source qualification at exact pinned app (no filtered retry)
@@ -441,16 +461,16 @@ jobs:
       - name: Prepare owned Chromium for instrumented actual-server witness
         working-directory: pinned-app/ui
         run: pnpm exec playwright install --with-deps chromium
-      - name: Joint instrumented history and telemetry witness (not shipping)
+      - name: Controlled-functional six-report witness (separate from immutable stock baseline)
         working-directory: harness
         run: |
           chmod 700 ../opening-instrumented-libtest
           uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.py \
-            --joint-telemetry \
+            --joint-telemetry --controlled-functional \
             --app-root "$GITHUB_WORKSPACE/pinned-app" \
             --instrumented-exe "$GITHUB_WORKSPACE/opening-instrumented-libtest" \
             --instrumented-receipt "$GITHUB_WORKSPACE/opening-instrumented-receipt.json" \
-            --output "$GITHUB_WORKSPACE/opening-browser-evidence" --timeout 1100
+            --output "$GITHUB_WORKSPACE/opening-browser-evidence" --timeout 300
       - name: Retain receipts on success or failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -466,6 +486,10 @@ jobs:
             pinned-app/ui/src/generated/
             opening-instrumented-libtest
             opening-instrumented-receipt.json
+            opening-ui-build-owner.json
+            pinned-app/ui/stock-natural-build.json
+            pinned-app/ui/controlled-functional-build.json
+            pinned-app/ui/dist-controlled-functional/
             opening-instrumented-unit.log
             opening-collector-witness-unit.log
             opening-sdk-metadata-unit.log
