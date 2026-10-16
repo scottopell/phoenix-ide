@@ -1689,3 +1689,44 @@ Python 16 and Node 99 pass with refreshed exact source/tree pins. This is a
 source-supported synchronization repair, not a claim that local testing
 reproduced or conclusively explained the external hosted scheduling stall.
 The strict full UI and native collector/export gates remain mandatory.
+
+
+## Receiver rejection predicate after run 38901479005
+
+Harness `5963ba82` / app `a7b39c09` completed run `38901479005` with witness
+`116974533255` failure; standard Rust `116974658821` and all other standard
+jobs succeeded. The repaired full UI gate passed. The actual browser stage
+completed nine history checks and 49 stock trials, 14 sampled. Both pagehide
+trials were explicitly unsampled; lifecycle admissions likewise retained
+inconclusive/unsupported distinctions, with one BFCache primary ready report.
+The independent browser inventory had 15 journeys, not final acceptance.
+
+The first failure occurred at receiver.assert_receipt/final_index: retained
+capture.errors was `['ValueError']`, so export qualification correctly failed.
+The successful prefix had 1,257,499 wire bytes, ten batches and 2,362 spans;
+its retained index contained no browser view spans. The failed batch was never
+written. Those facts cannot recover the erased predicate or justify claiming
+an overflow/unknown attribute cause. Actual logged view fields matched the
+receiver's existing allowlist. Artifact `12046602577` (89,651,261 bytes) remains
+remote; selected bounded receipts used 302,117 range bytes. No final semantic
+collector/export join, normal-drain proof, outer Global or overhead acceptance
+was obtained.
+
+Reviewed donor `5f227d0778d34fe422d142d2f4ce300326346d4b` integrates as app
+`ea2d362b33a2558564d61911e156f7a6562e3b07`, tree
+`04d2ff2c2c99f336fe43f969b072c61a46841051`. It is diagnostic-only: each existing
+rejection predicate records its finite fixed code instead of the generic
+exception class. Bounds, allowlists, predicate comparisons, raw retention,
+fail-closed final retrieval and first-error preservation remain unchanged.
+Unknown internal exceptions map to a fixed internal-failure code without raw
+exception text, rejected payload, unknown key names or values. It cannot
+repair or retroactively explain the prior failed export. A new exact-source
+run is needed specifically to identify the rejection boundary; this is not an
+unchanged retry or a claim that the error was fixed.
+
+Actual cached validation: 16 no-network receiver semantic/reconciliation/
+rejection/privacy controls, 65 opening Python, 16 shipping Python and 99 Node
+selftests passed. No listeners, browser, install or heavy local build were run.
+Review confirmed unchanged predicates and finite literals; tests are not claimed
+exhaustive over every code. Acceptance still requires zero receiver errors,
+actual semantic exports, exact real collector inventory and normal owned drain.

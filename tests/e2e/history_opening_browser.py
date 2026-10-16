@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent a7b39c0 checkout, independently built ignored
+Inputs are a clean independent ea2d362 checkout, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports four hash-attested telemetry harness
@@ -32,8 +32,8 @@ from urllib.parse import urlparse
 
 import history_browser as shipping
 
-PIN = "a7b39c0985bbd1419b1f09d599b1d79a5d1fe0fa"
-TREE_PIN = "429a7cf4cd59a76b7cde182d6c7f82b5641c2a9a"
+PIN = "ea2d362b33a2558564d61911e156f7a6562e3b07"
+TREE_PIN = "04d2ff2c2c99f336fe43f969b072c61a46841051"
 BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
@@ -43,7 +43,7 @@ SCRIPT = ROOT / "ui/scripts/qualify-history-opening-realserver.mjs"
 TELEMETRY_MODULES = {
     "ui/scripts/qualify-view-telemetry.mjs": "1c702c78bb06f74f3dae4c8f97d1932fc308959596f3602375bc65d7d99fb9e1",
     "ui/scripts/view-telemetry-diagnostics.mjs": "fa442b6f4ea65c12fc2a05ec1c37c1e565430baa6d3151e6a8c180d21ed110a1",
-    "tests/e2e/view_telemetry_sink.py": "aa3e704f4cf1ac356f130e8e64ed2733c7b253b9d927dd6544b301065b5790fd",
+    "tests/e2e/view_telemetry_sink.py": "db4ccebab3b97e09291171f827901167d0c36d31a3959073f454802c2263a3e3",
     "tests/e2e/assert_view_telemetry.py": "18bb8465f046d7473b95a49157df5824019ae62e068d34fa98d24c1af656ecdb",
 }
 TELEMETRY_KEYS = frozenset({"PHOENIX_TRACE_EXPORTER", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
