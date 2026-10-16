@@ -138,14 +138,21 @@ export class ViewJourneyReporter {
     };
     this.#busy = true;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    void Promise.resolve().then(() => {
+    const timeout = setTimeout(() => {
+      emitViewDiagnostic({ kind: 'submission', open_id: journey.openId, state: 'timeout_abort', status: null });
+      controller.abort();
+    }, 3000);
+    let submission: Promise<Response>;
+    try {
       emitViewDiagnostic({ kind: 'submission', open_id: journey.openId, state: 'attempted', status: null });
-      return this.#send('/api/telemetry/conversation-view', {
+      submission = this.#send('/api/telemetry/conversation-view', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload), keepalive: true, signal: controller.signal,
       });
-    }).then(response => {
+    } catch {
+      submission = Promise.reject(new Error('view report submission failed'));
+    }
+    void submission.then(response => {
       emitViewDiagnostic({ kind: 'submission', open_id: journey.openId, state: 'response', status: response.status });
       if (!response.ok) this.#failed = increment(this.#failed);
     }).catch(() => {

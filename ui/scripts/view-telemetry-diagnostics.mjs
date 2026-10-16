@@ -11,7 +11,7 @@ export function captureDiagnostic(event) {
   if (event.kind === 'request') assert.ok(uuid.test(event.request_id ?? ''));
   if (event.kind === 'anchor') assert.ok(['applied', 'tail_pinned', 'empty', 'target_missing', 'superseded'].includes(event.result));
   if (event.kind === 'terminal') assert.ok(['ready', 'failed', 'canceled', 'incomplete'].includes(event.outcome));
-  if (event.kind === 'submission') assert.ok(['attempted', 'busy_drop', 'response', 'failed'].includes(event.state) && (event.state === 'response' ? Number.isInteger(event.status) && event.status >= 100 && event.status <= 599 : event.status === null));
+  if (event.kind === 'submission') assert.ok(['attempted', 'timeout_abort', 'busy_drop', 'response', 'failed'].includes(event.state) && (event.state === 'response' ? Number.isInteger(event.status) && event.status >= 100 && event.status <= 599 : event.status === null));
   return { ...event };
 }
 export function samplingDecision(events, route) {
