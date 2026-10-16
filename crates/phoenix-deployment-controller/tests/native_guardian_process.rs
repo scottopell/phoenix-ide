@@ -436,6 +436,7 @@ fn sampling_rows(path: &Path) -> (i64, i64, i64, u64, u64) {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn sample_death_and_recover(lost_response: bool) {
     use std::{io::Read, net::Shutdown, os::unix::net::UnixStream};
     let parent = tempfile::Builder::new()
@@ -524,7 +525,10 @@ fn sample_death_and_recover(lost_response: bool) {
     let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
     let binding = observed.load_native_binding(attempt).unwrap().unwrap();
     assert_eq!(binding.identity().process.pid().get(), guardian.id());
-    assert_eq!(binding.slots()[0].process.pid().get(), child_pid as u32);
+    assert_eq!(
+        binding.slots()[0].process.pid().get(),
+        u32::try_from(child_pid).expect("child PID is positive")
+    );
     assert_eq!(binding.slots()[0].process.birth(), child_birth);
     assert_eq!(binding.deadline(), deadline);
     let mut os = MacOsControllerOs::new(&dir).unwrap();
