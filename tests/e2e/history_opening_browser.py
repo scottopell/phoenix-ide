@@ -324,6 +324,56 @@ def actual_server_identity(startup, fixture):
             "serverInstanceId": rows[0][1]}
 
 
+class OwnedFixtureCompletion:
+    def __init__(self, startup, fixture):
+        self.fixture = fixture
+        self.identity = actual_server_identity(startup, fixture)
+        self.db = Path(startup["db"]).resolve(strict=True)
+        self.file_identity = (self.db.stat().st_dev, self.db.stat().st_ino)
+
+    def __call__(self, row, exhausted, message_id, data):
+        correlation = message_id or next((m["message_id"] for m in reversed(data["messages"])
+                                         if m["message_type"] == "user"), None)
+        if correlation is None:
+            return False
+        stat = self.db.stat()
+        if (stat.st_dev, stat.st_ino) != self.file_identity:
+            raise ValueError("owned fixture database identity changed")
+        with contextlib.closing(sqlite3.connect(
+                self.db.as_uri() + "?mode=ro", uri=True, timeout=2)) as connection:
+            connection.execute("BEGIN")
+            identity = connection.execute(
+                "SELECT singleton_key, instance_id FROM instance_identity").fetchall()
+            if identity != [(1, self.identity["serverInstanceId"])]:
+                raise ValueError("owned fixture server identity changed")
+            active = connection.execute(
+                "SELECT count(*) FROM durable_turns WHERE conversation_id = ? "
+                "AND disposition = 'Runtime' AND terminal_kind IS NULL AND owns_conversation = 1",
+                (row,)).fetchone()[0]
+            queued = connection.execute(
+                "SELECT count(*) FROM steering_messages WHERE conversation_id = ?", (row,)).fetchone()[0]
+            terminal = connection.execute(
+                "SELECT terminal_kind, owns_conversation FROM durable_turns "
+                "WHERE conversation_id = ? AND canonical_message_id = ? AND disposition = 'Runtime'",
+                (row, correlation)).fetchall()
+        if queued:
+            raise AssertionError("unexpected steering backlog during isolated fixture completion")
+        if active or terminal != [("Failed" if exhausted else "Completed", 0)]:
+            return False
+        if exhausted:
+            return True
+        result = self.fixture.request("POST", f"/api/conversations/{row}/messages/reconcile",
+                                      {"message_ids": [correlation]})
+        entries = result.get("entries")
+        if (not isinstance(entries, list) or len(entries) != 1
+                or entries[0].get("message_id") != correlation
+                or entries[0].get("status") != "persisted"):
+            raise ValueError("fixture completion reconciliation identity mismatch")
+        if not isinstance(result.get("conversation_idle"), bool):
+            raise ValueError("fixture completion requires authoritative runtime idle status")
+        return result["conversation_idle"]
+
+
 def validate_joint_aggregates(aggregates):
     if not isinstance(aggregates, list) or len(aggregates) != 2:
         raise ValueError("two telemetry aggregates required")
@@ -616,6 +666,7 @@ def qualify(app, exe, output, joint_telemetry=False):
                                     authenticate_fixture(fixture.client, owned_qualification_password(
                                         startup, case / "credential-identity.json"))
                                     fixture.h = AuthenticatedHarness(h, fixture.client)
+                                    fixture.completion = OwnedFixtureCompletion(startup, fixture)
                                     shipping.write_json(case / "authentication.json", {
                                         "auth_required": True, "parent_authenticated": True,
                                         "credential_source": "owned_cfg_test_home", "session": "existing_login_cookie"})

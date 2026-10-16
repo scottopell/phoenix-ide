@@ -190,9 +190,10 @@ def complete_occurrences(pages, members):
 
 
 class Fixture:
-    def __init__(self, harness, base, output):
+    def __init__(self, harness, base, output, *, completion=None):
         import httpx
         self.h, self.base, self.out = harness, base, output
+        self.completion = completion
         self.client = httpx.Client(base_url=base, timeout=10, trust_env=False)
 
     def request(self, method, path, body=None):
@@ -217,7 +218,8 @@ class Fixture:
             current = self.h._state_str(data["conversation"]["state"])
             evidence = message_id is None or (any(m["message_id"] == message_id for m in data["messages"])
                 and (exhausted or self.h._has_agent_after_message(data["messages"], message_id)))
-            if current == expected and evidence:
+            if (current == expected and evidence
+                    and (self.completion is None or self.completion(row, exhausted, message_id, data))):
                 return data
             assert current != "error", data["conversation"]
             if time.monotonic() >= deadline:

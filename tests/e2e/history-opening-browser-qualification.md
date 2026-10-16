@@ -1336,3 +1336,64 @@ passed. No local compile, install, application server, browser capture, cache
 cleanup or large artifact copy was performed. Full new-source hosted codegen,
 UI/Rust, ordinary and outer Global history, export inventory, normal drain and
 overhead qualification remain owed; no joint acceptance is claimed.
+
+
+## Fixture settlement successor after run 38832404299
+
+Exact published harness `e4e9166303914b8b025f88c757920512d8d9ecac` / app
+`f9355ade31138f06229808d8d5ca5a0d0f1df74b` completed run `38832404299`
+with witness `116753898790` failure; standard Rust `116753978935` and all
+other standard jobs succeeded. Browser/pagehide qualification was not reached.
+Artifact `12018217312` (89,009,915 bytes) remains remote and preserved. Two
+bounded ZIP reads fetched 20,241 then 343,715 bytes; selected final-five API/SSE
+records, runtime log, lifecycle and completion receipts were retained, not the
+DB, binary, credential file or complete artifact. The completed job log was
+also retained. Python failed at `other = fixture.build(other_kind, other_cwd)`:
+Global chapter-one turn 20 returned `{queued: true, steering: true}` and the
+strict non-steering assertion failed. The preceding persisted GET was Idle
+with the prior canonical user and agent. Runtime's fatal-authority warning
+followed the failed POST and forced-cleanup request, so is not evidence of an
+earlier application failure causing steering. Forced cleanup is not normal
+shutdown evidence.
+
+Source identifies a missing fixture completion boundary, without uniquely
+attributing the actual steering OR-branch: direct send admission checks live
+effective state, queued steering and active Runtime ownership. GET persisted
+Idle plus agent evidence does not establish those predicates. This failure
+supplies no new native evidence about synchronous keepalive delivery.
+
+The successor strengthens the existing bounded condition wait with an optional
+qualification-owned completion predicate; shipping's default wait behavior and
+strict non-steering assertion remain unchanged. It adds no fixed delay, elapsed
+sleep, resend attempt or second wait loop. The existing wait's polling/backoff
+and deadline remain unchanged. Before returning successful completion, the
+opening qualifier requires a read-only transaction on the verified isolated DB:
+matching instance identity, the exact persisted canonical user's Runtime turn
+terminal and ownership released, no active Runtime owner and no queued steering.
+Normal completion additionally requires the existing authenticated message
+reconciliation endpoint to confirm that exact message is persisted and live
+`conversation_idle` is true. This public boolean shares chat's effective-state
+source but is not alone sufficient; the DB checks cover the other admission
+fences. Context-exhausted completion requires the existing persisted exhausted
+state and exact Failed terminal/released ownership, not live Idle. Exact app
+`ExecutorRuntime::terminal_obligation_for_state` and continuation settlement
+classify ContextExhausted as Failed even when summary generation succeeds.
+Opening/continuation waits without a caller-supplied chat ID resolve the actual
+persisted user ID and require the same exact terminal lookup; missing user,
+foreign row or non-completed opening cannot pass. This is an isolated single
+fixture writer's quiescence observer, not an atomic public admission guarantee
+under unrelated concurrent producers. No product endpoint, producer, cfg-test
+control signal or production database change is introduced.
+
+Deterministic mocked-runtime/owned-DB regressions hold durable ownership after
+persisted Idle/agent evidence, then independently release ownership and live
+state. Corrected wait returns only after both; original e4e wait fails the same
+test with one read instead of three. Mutation evidence is retained, using the
+original wait in memory without editing source; elapsed sleeps are mocked out.
+Other controls cover absent/foreign exact canonical identity, terminal failure,
+a new active owner, backlog, missing/schema-error/changed-identity DB, and
+opening/exhausted paths. Actual offline ring: shipping Python 16, opening Python
+52, base Node 14, opening Node 30, joint Node 50 passed. An initial bypassed-
+constructor shipping test failed on the new member; its test fixture now sets
+the constructor-owned default explicitly. Failed intermediate logs remain
+retained. These are bounded readiness tests, not hosted or joint acceptance.

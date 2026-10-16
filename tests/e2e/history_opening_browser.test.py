@@ -854,4 +854,121 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("Fixture(h, base, case)", source)
 
 
+class FixtureSettlementTests(unittest.TestCase):
+    def setUp(self):
+        import sqlite3
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.db = self.root / "owned.db"
+        self.instance = str(opening.shipping.uuid.uuid4())
+        with opening.contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.executescript("CREATE TABLE instance_identity(singleton_key INTEGER, instance_id TEXT);"
+                             "CREATE TABLE durable_turns(conversation_id TEXT, canonical_message_id TEXT,"
+                             "disposition TEXT, terminal_kind TEXT, owns_conversation INTEGER);"
+                             "CREATE TABLE steering_messages(conversation_id TEXT);")
+            db.execute("INSERT INTO instance_identity VALUES(1, ?)", (self.instance,))
+            db.execute("INSERT INTO durable_turns VALUES('row', 'row:key', 'Runtime', NULL, 1)")
+        self.idle = True
+        self.correlation = "row:key"
+        self.calls = []
+        self.fixture = types.SimpleNamespace(request=self.request)
+        self.observer = opening.OwnedFixtureCompletion(
+            {"db": str(self.db), "git_sha": opening.PIN}, self.fixture)
+        self.data = {"conversation": {"state": {"type": "idle"}},
+                     "messages": [{"message_id": "row:key", "message_type": "user"}]}
+
+    def request(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        if path == "/api/deployment":
+            return {"build": {"git_sha": opening.PIN}}
+        return {"conversation_idle": self.idle, "entries": [
+            {"message_id": self.correlation, "status": "persisted"}]}
+
+    def sql(self, statement, args=()):
+        import sqlite3
+        with opening.contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(statement, args)
+
+    def test_correlated_terminal_release_and_live_idle_are_both_required(self):
+        self.assertFalse(self.observer("row", False, "row:key", self.data))
+        self.sql("UPDATE durable_turns SET terminal_kind='Completed', owns_conversation=0")
+        self.idle = False
+        self.assertFalse(self.observer("row", False, "row:key", self.data))
+        self.idle = True
+        self.assertTrue(self.observer("row", False, "row:key", self.data))
+        self.assertFalse(self.observer("row", False, "row:foreign", self.data))
+        self.sql("INSERT INTO durable_turns VALUES('row', 'row:next', 'Runtime', NULL, 1)")
+        self.assertFalse(self.observer("row", False, "row:key", self.data))
+
+    def test_empty_owner_set_does_not_hide_backlog_or_foreign_message(self):
+        self.sql("UPDATE durable_turns SET terminal_kind='Completed', owns_conversation=0")
+        self.sql("INSERT INTO steering_messages VALUES('row')")
+        with self.assertRaisesRegex(AssertionError, "steering backlog"):
+            self.observer("row", False, "row:key", self.data)
+        self.sql("DELETE FROM steering_messages")
+        self.correlation = "row:foreign"
+        with self.assertRaisesRegex(ValueError, "reconciliation identity"):
+            self.observer("row", False, "row:key", self.data)
+
+    def test_opening_wait_resolves_persisted_canonical_identity_and_requires_terminal(self):
+        self.assertFalse(self.observer("row", False, None, self.data))
+        self.sql("UPDATE durable_turns SET terminal_kind='Completed', owns_conversation=0")
+        self.assertTrue(self.observer("row", False, None, self.data))
+        self.sql("UPDATE durable_turns SET terminal_kind='Failed'")
+        self.assertFalse(self.observer("row", False, None, self.data))
+        self.sql("UPDATE durable_turns SET terminal_kind='Completed', conversation_id='foreign'")
+        self.assertFalse(self.observer("row", False, None, self.data))
+        self.assertFalse(self.observer("row", False, None, {"messages": []}))
+
+    def test_exhausted_requires_failed_exact_turn_and_released_owner(self):
+        self.assertFalse(self.observer("row", True, "row:key", self.data))
+        self.sql("UPDATE durable_turns SET terminal_kind='Completed', owns_conversation=0")
+        self.assertFalse(self.observer("row", True, "row:key", self.data))
+        self.sql("UPDATE durable_turns SET terminal_kind='Failed'")
+        self.assertTrue(self.observer("row", True, "row:key", self.data))
+
+    def test_database_errors_and_identity_changes_fail_closed(self):
+        import sqlite3
+        self.sql("UPDATE instance_identity SET instance_id='foreign'")
+        with self.assertRaisesRegex(ValueError, "server identity"):
+            self.observer("row", False, "row:key", self.data)
+        self.sql("UPDATE instance_identity SET instance_id=?", (self.instance,))
+        self.sql("DROP TABLE durable_turns")
+        with self.assertRaises(sqlite3.OperationalError):
+            self.observer("row", False, "row:key", self.data)
+        self.db.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.observer("row", False, "row:key", self.data)
+        self.assertFalse(self.db.exists())
+
+    def test_existing_wait_cannot_return_from_idle_and_agent_before_real_completion(self):
+        reads = []
+        harness = types.SimpleNamespace(_terminal_event=lambda *a: True,
+            _context_exhausted_event=lambda *a: True,
+            _wait_for_sse_signal=lambda *a: None,
+            _state_str=lambda state: state["type"], _has_agent_after_message=lambda *a: True)
+        fixture = opening.shipping.Fixture(harness, "http://127.0.0.1:1", self.root,
+                                          completion=self.observer)
+        self.addCleanup(fixture.client.close)
+        def request(method, path, body=None):
+            if method == "POST":
+                self.assertEqual(path, "/api/conversations/row/chat")
+                self.assertEqual(body["message_id"], "key")
+                return {"queued": True, "steering": False}
+            reads.append(path)
+            if len(reads) == 2:
+                self.sql("UPDATE durable_turns SET terminal_kind='Completed', owns_conversation=0")
+            self.idle = len(reads) >= 3
+            return self.data
+        fixture.request = request
+        with patch.object(opening.shipping.uuid, "uuid4", return_value="key"), \
+                patch.object(opening.shipping.time, "sleep") as no_elapsed_delay:
+            result = fixture.send("row", "fixture turn")
+        self.assertIs(result, self.data)
+        self.assertEqual(len(reads), 3)
+        self.assertEqual(no_elapsed_delay.call_count, 2)
+        self.assertEqual(len([c for c in self.calls if c[1].endswith("/messages/reconcile")]), 2)
+
+
 if __name__ == "__main__": unittest.main()

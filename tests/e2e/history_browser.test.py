@@ -193,6 +193,7 @@ class QualificationTests(unittest.TestCase):
         h._wait_for_sse_signal = lambda base, row, predicate, timeout: self.assertTrue(predicate("agent_done", "{}"))
         fixture = object.__new__(hb.Fixture)
         fixture.h, fixture.base, fixture.out = h, "http://127.0.0.1:1", Path(self.temp.name)
+        fixture.completion = None
         old = {"conversation": {"state": "idle"}, "messages": [{"message_id": "old", "message_type": "agent"}]}
         durable = {"conversation": {"state": "idle"}, "messages": [
             {"message_id": "new", "message_type": "user"}, {"message_id": "reply", "message_type": "agent"}]}
