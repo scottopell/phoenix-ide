@@ -2029,3 +2029,20 @@ correctly rejects that mismatch. The telemetry source owner has the focused
 correction request. Hosted execution and publication remain held until corrected
 source is imported, re-pinned, tested and independently reviewed; the exact
 inventory gate must not be weakened to bypass the defect.
+
+The focused correction donor `c060d77989d9bcad0e0491f471fe6595697671b1`
+integrates as app `c2344bc1387e073de83e164b086a7260e713d4af`, tree
+`f3c8a59de1daf4860c418ebc73d6126bbb867bb6`. Manifest sealing now runs in
+post-order `closeBundle`, after the normal `.gitkeep` hook. Emitted-byte equality
+remains mandatory; the final exact inventory additionally proves recursive public
+source bytes and an empty output-local `.gitkeep`, rejecting extra/missing/changed
+files and symlinks. The `.gitkeep` writer resolves the selected output rather
+than modifying stock output during a controlled build. Shared exact admission
+is unchanged. Read-only independent review checked the cached Vite8/Rolldown
+close ordering and approved source import/progression to hosted validation,
+not artifact or runtime acceptance. Cached parent tests at this pin passed
+artifact8, lifecycle68, controlled Node16, joint Node65 and app29 across four
+focused files. All executable workflow/Python/Node app pins now select this exact
+integrated SHA/tree; the earlier blocked pin above is retained as history.
+The next gate is the actual hosted two-build inventory and controlled six-report
+collector/export/drain witness. No local heavy build or native run was performed.
