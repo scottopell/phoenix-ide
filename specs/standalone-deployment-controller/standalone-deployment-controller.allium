@@ -683,6 +683,7 @@ contract ControllerSqliteBoundary {
     persist_checkpoint: (attempt: DeploymentAttempt) -> CommittedTransition
     load_attempt: (attempt_id: String) -> LoadedAttempt?
     prepare_recovery: (loaded: LoadedAttempt) -> PersistableRecoveryCheckpoint?
+    refresh_interruption: (loaded: LoadedAttempt) -> PersistableInterruptionCheckpoint?
 
     @invariant IndependentNormalizedAuthority
         -- Controller persistence is a distinct SQLite lifecycle. Attempts,
@@ -704,6 +705,18 @@ contract ControllerSqliteBoundary {
         -- A crash-loaded active checkpoint is affine recovery evidence, not a live
         -- DeploymentAttempt. Interruption and fresh reconciliation are committed
         -- before any process-mutation effect can become accessible.
+
+    @invariant CrashSeamInterruptionRefresh
+        -- If the runner dies after interruption commits but before the guardian
+        -- accepts BeginReconciliation, a successor may consume fresh affine
+        -- crash-loaded Interrupted evidence to commit another Interrupted
+        -- checkpoint with zero effects. It preserves the original deadline,
+        -- resume phase, owned and acquired identities, compatibility fence,
+        -- and interruption kind. Non-Interrupted evidence cannot refresh.
+        -- Each refresh requires a new crash load of committed evidence and
+        -- advances the SQLite CAS revision; historical plans and transitions
+        -- are not reusable. The refresh alone grants no recovery preparation,
+        -- reconciliation, mutation, or acknowledgement authority.
 
     @invariant FailedAuthorityPoisonsHandle
         -- Persistence or loading that cannot classify durable authority invalidates

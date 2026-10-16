@@ -453,6 +453,13 @@ commit fresh reconciliation of every acquired identity before any new mutation.
 Retained results SHALL remain evidence, not a substitute for that observation barrier;
 dispatch floors SHALL NOT regress and the original deadline SHALL NOT be extended.
 
+WHEN a runner crashes after committing interruption but before the guardian accepts that
+interruption for a new reconciliation session
+THE recovering runner SHALL consume freshly crash-loaded Interrupted evidence to commit a
+zero-effect interruption refresh at a strictly newer revision, preserving the original
+interruption state and deadline without granting recovery, reconciliation, mutation, or
+acknowledgement authority. Non-Interrupted evidence SHALL NOT authorize this refresh.
+
 WHEN a retained completion is received
 THE runner SHALL correlate its instance, session of issuance, key, full effect, and
 typed outcome, and durably record its policy application or explicit round settlement

@@ -2781,6 +2781,154 @@ fn historical_sampling_recovery_cannot_reactivate_a_later_interruption() {
 }
 
 #[test]
+fn crash_loaded_interruption_refresh_requires_interrupted_phase() {
+    let mut store = TestStore::in_memory().unwrap();
+    let active = start(126, 1, root()).persist(&mut store).unwrap();
+    assert_eq!(
+        store
+            .load_attempt(AttemptId::new(126))
+            .unwrap()
+            .unwrap()
+            .refresh_interruption()
+            .unwrap_err(),
+        TransitionError::WrongPhase
+    );
+    let interrupted = active.checkpoint().clone().interrupt().unwrap();
+    interrupted.persist(&mut store).unwrap();
+    let loaded = store.load_attempt(AttemptId::new(126)).unwrap().unwrap();
+    assert_eq!(loaded.phase(), Phase::Interrupted);
+    let refreshed = loaded.refresh_interruption().unwrap();
+    assert!(refreshed
+        .persist(&mut store)
+        .unwrap()
+        .after_persist()
+        .is_empty());
+
+    let mut terminal_store = TestStore::in_memory().unwrap();
+    let stable = ready(&mut terminal_store, 127);
+    assert_eq!(stable.phase(), Phase::ReadyForDisruption);
+    assert_eq!(
+        terminal_store
+            .load_attempt(AttemptId::new(127))
+            .unwrap()
+            .unwrap()
+            .refresh_interruption()
+            .unwrap_err(),
+        TransitionError::WrongPhase
+    );
+}
+
+#[test]
+fn fresh_interruption_refresh_preserves_evidence_and_outpaces_unfinished_reconciliation() {
+    let mut store = TestStore::in_memory().unwrap();
+    let cleaning = cleaning_transition(&mut store, 128, &[43]);
+    let active = commit(&mut store, cleaning);
+    let interrupted = commit(&mut store, active.interrupt().unwrap());
+    let original = interrupted.clone();
+    let original_revision = original.persistence_revision().unwrap();
+    let (mut guardian, old, audit) = audited_guardian_fixture(128, FakeOs::default());
+    guardian.controller_lost(old).unwrap();
+    let first = begin_loaded_reconciliation(&mut store, &mut guardian, old);
+    assert_eq!(guardian.reconciliation_floor(), Some(original_revision));
+    guardian.controller_lost(first).unwrap();
+
+    let loaded = store.load_attempt(AttemptId::new(128)).unwrap().unwrap();
+    let stale = loaded.refresh_interruption().unwrap();
+    let stale_copy = stale.clone();
+    let refreshed = stale.persist(&mut store).unwrap();
+    let next = refreshed.checkpoint();
+    assert!(refreshed.after_persist().is_empty());
+    assert_eq!(next.phase(), Phase::Interrupted);
+    assert_eq!(next.deadline(), original.deadline());
+    assert_eq!(
+        next.compatibility_boundary(),
+        original.compatibility_boundary()
+    );
+    assert_eq!(next.cleanup_outcome(), original.cleanup_outcome());
+    assert_eq!(next.ownership_tree(), original.ownership_tree());
+    assert_eq!(
+        next.persistence_revision(),
+        original_revision.checked_next()
+    );
+    let refreshed_revision = next.persistence_revision().unwrap();
+    let current = begin_loaded_reconciliation(&mut store, &mut guardian, first);
+    assert_eq!(guardian.reconciliation_floor(), Some(refreshed_revision));
+    assert_eq!(guardian.state(), GuardianState::Reconciling);
+    assert!(audit.borrow().is_empty());
+
+    let loaded = store.load_attempt(AttemptId::new(128)).unwrap().unwrap();
+    assert!(matches!(
+        PolicyLoop::from_committed_recovery_for_guardian(refreshed, &guardian, current),
+        Err(GuardianLoopError::Policy(LoopFailure::RecoveryNotAdmitted))
+    ));
+
+    let recovery = checkpoint_recovery(loaded).persist(&mut store).unwrap();
+    assert_eq!(recovery.checkpoint().phase(), Phase::Recovering);
+    assert!(matches!(
+        recovery.after_persist().first(),
+        Some(OsEffect::ObserveIdentity { .. })
+    ));
+    assert!(PolicyLoop::from_committed_recovery_for_guardian(recovery, &guardian, current).is_ok());
+    assert!(matches!(
+        stale_copy.persist(&mut store),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+}
+
+#[test]
+fn repeated_refresh_requires_fresh_loaded_revision() {
+    let mut store = TestStore::in_memory().unwrap();
+    let initial = start(129, 1, root()).persist(&mut store).unwrap();
+    let original = commit(
+        &mut store,
+        initial.checkpoint().clone().interrupt().unwrap(),
+    );
+    let historical_recovery =
+        checkpoint_recovery(store.load_attempt(AttemptId::new(129)).unwrap().unwrap());
+    let first = store
+        .load_attempt(AttemptId::new(129))
+        .unwrap()
+        .unwrap()
+        .refresh_interruption()
+        .unwrap()
+        .persist(&mut store)
+        .unwrap();
+    let second = store
+        .load_attempt(AttemptId::new(129))
+        .unwrap()
+        .unwrap()
+        .refresh_interruption()
+        .unwrap()
+        .persist(&mut store)
+        .unwrap();
+    assert_eq!(
+        first.checkpoint().persistence_revision(),
+        original.persistence_revision().unwrap().checked_next()
+    );
+    assert_eq!(
+        second.checkpoint().persistence_revision(),
+        first
+            .checkpoint()
+            .persistence_revision()
+            .unwrap()
+            .checked_next()
+    );
+    assert_eq!(second.checkpoint().deadline(), original.deadline());
+    assert!(first.after_persist().is_empty() && second.after_persist().is_empty());
+    assert!(matches!(
+        checkpoint_recovery(store.load_attempt(AttemptId::new(129)).unwrap().unwrap())
+            .persist(&mut store)
+            .unwrap()
+            .after_persist(),
+        [OsEffect::SampleResources { sequence: 0 }]
+    ));
+    assert!(matches!(
+        historical_recovery.persist(&mut store),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+}
+
+#[test]
 fn historical_ownership_recovery_origin_cannot_bind_a_new_interruption_floor() {
     let mut store = TestStore::in_memory().unwrap();
     let committed = discovery(&mut store, 125, root());

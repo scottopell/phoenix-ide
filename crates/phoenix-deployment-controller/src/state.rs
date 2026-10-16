@@ -247,6 +247,37 @@ impl LoadedAttempt {
         })
     }
 
+    /// Re-checkpoints crash-loaded interruption without recovery preparation or effects.
+    /// The original deadline and all interruption evidence remain unchanged; only a
+    /// successful store compare-and-swap advances its revision. This does not grant
+    /// reconciliation, mutation, or acknowledgement authority.
+    ///
+    /// ```compile_fail
+    /// use phoenix_deployment_controller::LoadedAttempt;
+    /// fn twice(loaded: LoadedAttempt) {
+    ///     let _ = loaded.refresh_interruption();
+    ///     let _ = loaded.refresh_interruption();
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`TransitionError::WrongPhase`] unless the loaded attempt is Interrupted.
+    pub fn refresh_interruption(self) -> Result<Transition, TransitionError> {
+        match self.checkpoint {
+            DeploymentAttempt::Interrupted(interrupted) => Ok(Transition {
+                checkpoint: DeploymentAttempt::Interrupted(interrupted),
+                after_persist: Vec::new(),
+                dispatch_purpose: DispatchPurpose::Ordinary,
+            }),
+            DeploymentAttempt::Active(_)
+            | DeploymentAttempt::Ready(_)
+            | DeploymentAttempt::ResourceBlocked(_)
+            | DeploymentAttempt::ForwardRecovery(_)
+            | DeploymentAttempt::AdministrativeCloseoutRequired(_)
+            | DeploymentAttempt::AdministrativelyClosed(_) => Err(TransitionError::WrongPhase),
+        }
+    }
+
     /// Active work first checkpoints interruption without OS effects. A further
     /// committed recovery transition restarts the fresh-observation barrier.
     ///
