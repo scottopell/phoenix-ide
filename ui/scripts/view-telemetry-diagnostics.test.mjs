@@ -32,3 +32,8 @@ test('dual errors retain primary identity and independent cleanup failure', () =
   assert.deepEqual(trial, { failure: primary.message, cleanup_failure: cleanup.message });
   assert.equal(initialFailure({}, undefined, cleanup), cleanup);
 });
+test('explicit timeout abort is a bounded diagnostic distinct from failed submission', () => {
+  assert.deepEqual(captureDiagnostic({ version: 1, kind: 'submission', open_id: id, state: 'timeout_abort', status: null }),
+    { version: 1, kind: 'submission', open_id: id, state: 'timeout_abort', status: null });
+  assert.throws(() => captureDiagnostic({ version: 1, kind: 'submission', open_id: id, state: 'timeout_abort', status: 204 }));
+});
