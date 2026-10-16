@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 use phoenix_deployment_controller::{
-    guardian_ipc::{BuildIdentity, WireSnapshot, WireState},
+    guardian_ipc::{WireSnapshot, WireState},
     native_guardian::GuardianClient,
     AttemptId, BirthToken, ControllerOs, ControllerSqliteStore, CpuContentionBasisPoints,
     DeploymentAttempt, IdentityObservation, MacOsControllerOs, MemoryPressure, MonotonicTick,
@@ -190,43 +190,7 @@ fn wait_for_detached(dir: &Path) -> WireSnapshot {
 }
 
 #[test]
-fn unidentified_native_guardian_rejects_before_binding_a_socket_or_child() {
-    if BuildIdentity::compiled().is_some() {
-        return;
-    }
-    let parent = tempfile::Builder::new()
-        .prefix("sdc-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let directory = parent.path().join("sdc-disposable-noidentity");
-    let output = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"))
-        .args([
-            "--socket-dir",
-            directory.to_str().unwrap(),
-            "--child-seconds",
-            "2",
-            "--serve-seconds",
-            "2",
-            "--attempt",
-            "64",
-            "--deadline-nanoseconds",
-            "1",
-            "--store",
-            parent.path().join("missing.sqlite").to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(!directory.exists());
-}
-
-#[test]
 fn runner_death_does_not_kill_guardian_or_its_original_child() {
-    if BuildIdentity::compiled().is_none() {
-        // Rsynced source has no admissible identity for native child execution.
-        return;
-    }
     let NativeProcessFixture {
         _parent,
         dir,

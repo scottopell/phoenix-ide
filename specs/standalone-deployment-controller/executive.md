@@ -66,7 +66,7 @@ bound to the exact live instance, session, key, and full effect. The safe
 
 The disposable native transport uses separate guardian and runner executables over an
 owner-only, same-UID, bounded protocol-v2 Unix socket whose Hello exchange requires the
-same clean full-commit build identity. Initial workload execution remains
+same exact SHA-256 source-input build identity. Initial workload execution remains
 blocked behind a process-local one-use gate until the runner commits a normalized exact
 binding for a fresh resource-sampling checkpoint and the guardian independently rereads
 the attempt, revision, nonce, guardian PID/birth identity, original nanosecond monotonic
@@ -106,11 +106,11 @@ integration, and production adoption remain outside this pre-adoption qualificat
 | REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor, CLI, completion-to-checkpoint, guardian integration, replay, and capacity-reservation coverage pass full CI/macOS at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The guardian is the harmless child's original parent and survives forced runner death; launchd ownership and a durable runnable policy loop remain gaps. |
-| REQ-SDC-016 | Owner-only path checks, same-UID peer admission, exact clean full-commit Hello identity, protocol-v2 four-byte big-endian bounded typed JSON framing, strict request fields, version/malformed/oversized-frame fencing, and replacement connections pass Unix/macOS hosted tests. |
+| REQ-SDC-016 | Owner-only path checks, same-UID peer admission, exact source-input digest Hello identity, protocol-v2 four-byte big-endian bounded typed JSON framing, strict request fields, version/malformed/oversized-frame fencing, and replacement connections pass Unix/macOS hosted tests. |
 | REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The native server independently validates durable evidence before consuming its process-local initial gate or entering reconciliation; generic transport, finish, mutation, application, and ACK remain refused. |
 | REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated observation-only reconciliation begin are implemented. Reconciliation completion and retained-result application/ACK custody are not. |
-| REQ-SDC-019 | Exact schema compatibility, clean full-commit build identity, protocol-v2 rejection, and platform capability checks exist. The transport remains pre-adoption and same-build-only; no v1 upgrade, downgrade, rolling/replacement/cross-boot promise is made. |
-| REQ-SDC-020 | Linux policy/IPC/SQLite tests and hosted macOS exact-build handshake, gated-start, exact binding, original parenthood, runner-death, reconnect-begin, Clippy, and formatting qualification exist. Real guardian replacement, native mutation/ACK crash windows, launchd, updater, and rollback scenarios remain required. |
+| REQ-SDC-019 | Exact schema compatibility, source-input build identity, protocol-v2 rejection, and platform capability checks exist. The transport remains pre-adoption and same-build-only; no v1 upgrade, downgrade, rolling/replacement/cross-boot promise is made. |
+| REQ-SDC-020 | Linux policy/IPC/SQLite tests and hosted macOS exact source-input handshake, gated-start, exact binding, original parenthood, runner-death, reconnect-begin, Clippy, and formatting qualification exist. Real guardian replacement, native mutation/ACK crash windows, launchd, updater, and rollback scenarios remain required. |
 
 ## Next work
 

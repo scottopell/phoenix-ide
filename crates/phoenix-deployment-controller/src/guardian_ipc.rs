@@ -73,15 +73,15 @@ pub fn initial_release_request(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidBuildIdentity;
 
-/// A clean, exact source revision; arbitrary strings cannot enter the native protocol.
+/// Exact SHA-256 of the controller artifact's source inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildIdentity(String);
 
 impl BuildIdentity {
     /// # Errors
-    /// Rejects abbreviated, uppercase, and non-hexadecimal revisions.
+    /// Rejects abbreviated, uppercase, and non-hexadecimal digests.
     pub fn parse(value: &str) -> Result<Self, InvalidBuildIdentity> {
-        if value.len() == 40
+        if value.len() == 64
             && value
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -92,10 +92,13 @@ impl BuildIdentity {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics only when this crate's build script emits an invalid digest.
     #[must_use]
-    /// No native identity exists for a dirty or unidentifiable build.
-    pub fn compiled() -> Option<Self> {
-        Self::parse(env!("PHOENIX_SDC_BUILD_ID")).ok()
+    pub fn compiled() -> Self {
+        Self::parse(env!("PHOENIX_SDC_BUILD_ID"))
+            .expect("build script emits a validated source digest")
     }
 }
 
@@ -1503,7 +1506,8 @@ impl From<&EffectCompletion> for WireCompletion {
 
 #[cfg(test)]
 fn test_build() -> BuildIdentity {
-    BuildIdentity::parse("0123456789abcdef0123456789abcdef01234567").unwrap()
+    BuildIdentity::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -1667,7 +1671,10 @@ mod tests {
             server.handle(Request::Snapshot),
             Response::Refused(WireError::BuildMismatch)
         );
-        let other = BuildIdentity::parse("abcdef0123456789abcdef0123456789abcdef01").unwrap();
+        let other = BuildIdentity::parse(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        )
+        .unwrap();
         assert_eq!(
             server.handle(Request::Hello { build: other }),
             Response::Refused(WireError::BuildMismatch)
@@ -1692,8 +1699,8 @@ mod tests {
         for invalid in [
             "",
             "01234567",
-            "ABCDEF0123456789abcdef0123456789abcdef01",
-            "g123456789abcdef0123456789abcdef01234567",
+            "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ] {
             assert!(BuildIdentity::parse(invalid).is_err());
             assert!(serde_json::from_value::<BuildIdentity>(serde_json::json!(invalid)).is_err());

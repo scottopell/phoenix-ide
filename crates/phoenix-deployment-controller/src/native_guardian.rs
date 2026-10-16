@@ -327,7 +327,6 @@ pub enum ClientError {
     Codec(CodecError),
     Refused(WireError),
     UnexpectedResponse,
-    MissingBuildIdentity,
 }
 impl From<io::Error> for ClientError {
     fn from(value: io::Error) -> Self {
@@ -349,11 +348,10 @@ impl GuardianClient {
     /// # Errors
     /// Rejects insecure socket paths or peer identities.
     pub fn connect(dir: &Path) -> Result<Self, ClientError> {
-        let build = BuildIdentity::compiled().ok_or(ClientError::MissingBuildIdentity)?;
-        Self::connect_with_build(dir, build)
+        Self::connect_with_build(dir, BuildIdentity::compiled())
     }
 
-    /// Explicit identity injection for isolated transport fixtures without Git metadata.
+    /// Explicit identity injection for isolated transport fixtures.
     /// # Errors
     /// Rejects insecure socket paths or peer identities.
     pub fn connect_with_build(dir: &Path, build: BuildIdentity) -> Result<Self, ClientError> {
@@ -717,8 +715,7 @@ pub fn run_disposable_guardian(
     if !(1..=120).contains(&child_seconds) || !(1..=120).contains(&serve_seconds) {
         return Err(Box::new(permission_denied()));
     }
-    let build = BuildIdentity::compiled()
-        .ok_or_else(|| io::Error::other("clean native build identity required"))?;
+    let build = BuildIdentity::compiled();
     let reader = SqliteNativeEvidenceReader::open(store_path, attempt)?;
     let mut nonce_bytes = [0; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;

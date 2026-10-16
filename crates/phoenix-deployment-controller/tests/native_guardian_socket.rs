@@ -17,7 +17,8 @@ use std::{
 };
 
 fn test_build() -> BuildIdentity {
-    BuildIdentity::parse("0123456789abcdef0123456789abcdef01234567").unwrap()
+    BuildIdentity::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        .unwrap()
 }
 
 fn readable_within(stream: &UnixStream, millis: i32) -> bool {
