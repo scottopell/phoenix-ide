@@ -2273,3 +2273,48 @@ collector/export/full/native acceptance is not claimed. Frozen stock evidence,
 controlled class, resumeunsupported, overheadfalse and fullacceptancefalse remain
 separate. Further execution is held pending an admitted same-artifact bounded
 geometry observation, not an unchanged rerun.
+
+### Fractional start regression and narrow product correction
+
+The approved five-minute artifact-reuse reproduction ran as `38973904057`, job
+`117218596370`, terminal diagnostic SUCCESS in about100s, source
+`d1a18b983ab37ac269964ab1fca759a2a5b82d7d`. Exact old executable/UI hashes
+were verified; no Cargo/Vite/codegen/full-suite build occurred. Recreated ordinary
+fixture recipe is not the originalDB. All five actual observations at1360x900,
+DPR1, Chromium148.0.7778.96 show cliptop93, row/message top92.5, sole top-edge
+violation0.5CSSpx; horizontal/bottom edges fit. Row75px/message67px, scrollTop43.
+Exact identity unique1, alias/sourcepin/originalroute true throughout. Strict
+containment remains false across four following rAF. Screenshot viewed; normal
+app exit0/HOME+socket removed/receiver closed. Artifact `12078106197` is56,986B;
+only bounded private-safe diagnostic evidence retained. This proves actual
+fractional displacement, not the historical setter argument or acceptance.
+https://github.com/scottopell/phoenix-ide/pull/908#issuecomment-6225670473
+
+Donor test-only `6f992c42f6f547982cda6ade977688a806c37b34` integrates as
+`e434785fb5fc61182ef9d48a2010324f551eddef`. Parent independently reproduced
+57pass/2expectedred: real immediate and hidden/reveal start paths request42.5,
+modeled native nearest-integer setter applies43 and physical edges are-0.5.
+Integer/end/tail/restore controls pass. This reproduces the modeled mechanism,
+not the exact earlier browser setter trace.
+
+Authorized correction donor `dd7f7ef5205cc1772b12b09e909fe10dfc3fadee`
+integrates as app `c115db652817815e3e3d3c13fa9dcdd91355404b`, tree
+`9454eccd3d0e7884f50ea393bf5e9b1519aa2998`. Shared immediate/deferred
+start execution reads native actual position; only directional start overshoot
+above the clamped ceiling by<=1CSSpx triggers one conservative ceiling-1 request.
+Final readback updates viewport/anchor and own-write bookkeeping only when a write
+actually occurred. No generic rounding/tolerance/quantizer guarantee is added.
+Restore explicitly selects continuity; end/tail and readiness/oracle stay intact.
+Hidden semantic targets retain intent until visible and existing authorization/
+supersession gates remain enforced. Minimal REQ-VT-006/executive coverage is in
+the app source; reducer Allium is unchanged. Independent exact donor review
+approved import and one actual-browser qualification, not release acceptance.
+Parent genuine TypeScript passed and235focused tests across8files passed, including
+both red→green cases and existing/integer/accepted-fraction/own-write/clamp/resize/
+continuity controls. Harness lifecycle68/controlled22/joint65 also passed. The
+existing MessageList test fixture setState-in-render warning remains recorded,
+not silently treated as a new product defect or removed. No local bundle/native
+work occurred. Actual newly-built strict containment and exact-six collector/
+export/drain remain required; old artifact geometry is not promoted to fixed
+artifact evidence. The dedicated geometry workflow is not triggered by this PR
+branch publication, so no duplicate diagnostic runner is created.
