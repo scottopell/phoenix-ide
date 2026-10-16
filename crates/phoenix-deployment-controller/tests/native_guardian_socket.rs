@@ -10,9 +10,25 @@ use phoenix_deployment_controller::{
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::{fs::PermissionsExt, io::AsRawFd, net::UnixStream},
     time::{Duration, Instant},
 };
+
+fn readable_within(stream: &UnixStream, millis: i32) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: descriptor is a valid stack value and stream owns the live fd.
+    let result = unsafe { libc::poll(&raw mut descriptor, 1, millis) };
+    assert!(
+        result >= 0,
+        "poll failed: {}",
+        std::io::Error::last_os_error()
+    );
+    result > 0
+}
 
 struct NoEffects;
 impl GuardianExecutor for NoEffects {
@@ -85,11 +101,15 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
             )
         ));
         drop(client);
-        // test-timing-allow: bounded delay lets the single-threaded fixture observe EOF.
-        std::thread::sleep(Duration::from_millis(80));
         let mut raw = UnixStream::connect(directory.join("guardian.sock")).unwrap();
         same_uid(&raw).unwrap();
-        write_frame(&mut raw, &Request::Hello).unwrap();
+        let mut hello_frame = Vec::new();
+        write_frame(&mut hello_frame, &Request::Hello).unwrap();
+        raw.write_all(&hello_frame[..2]).unwrap();
+        assert!(!readable_within(&raw, 20));
+        raw.write_all(&hello_frame[2..5]).unwrap();
+        assert!(!readable_within(&raw, 20));
+        raw.write_all(&hello_frame[5..]).unwrap();
         let Response::Hello { snapshot } = read_frame(&mut raw).unwrap() else {
             panic!("hello")
         };
@@ -110,8 +130,11 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
         );
         raw.write_all(&0_u32.to_be_bytes()).unwrap();
         drop(raw);
-        // test-timing-allow: bounded delay lets the fixture fence the malformed frame.
-        std::thread::sleep(Duration::from_millis(80));
+        let mut stalled = UnixStream::connect(directory.join("guardian.sock")).unwrap();
+        stalled.write_all(&hello_frame[..2]).unwrap();
+        assert!(readable_within(&stalled, 1000));
+        assert_eq!(std::io::Read::read(&mut stalled, &mut [0; 1]).unwrap(), 0);
+        drop(stalled);
         let mut oversized = UnixStream::connect(directory.join("guardian.sock")).unwrap();
         oversized
             .write_all(
@@ -121,8 +144,6 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
             )
             .unwrap();
         drop(oversized);
-        // test-timing-allow: bounded delay lets the fixture fence the oversized frame.
-        std::thread::sleep(Duration::from_millis(80));
         let mut replacement = GuardianClient::connect(&directory).unwrap();
         assert_eq!(
             replacement.hello().unwrap().state,

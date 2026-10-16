@@ -1,27 +1,23 @@
 //! Disposable same-UID Unix transport; no durable binding or policy mutation authority.
 use crate::guardian_ipc::{
-    read_frame, serve_once, write_frame, CodecError, GuardianServer, Request, Response, WireError,
+    read_frame, write_frame, CodecError, GuardianServer, Request, Response, WireError,
     WireObservation, WireSlot, WireSnapshot,
 };
 use crate::GuardianExecutor;
-#[cfg(target_os = "macos")]
-use std::io::Write;
 use std::{
     fs::{self, DirBuilder, Metadata, Permissions},
-    io,
+    io::{self, Read, Write},
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-        io::AsRawFd,
+        io::{AsRawFd, RawFd},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    thread,
     time::{Duration, Instant},
 };
 
 const SOCKET_NAME: &str = "guardian.sock";
 const IO_SLICE: Duration = Duration::from_millis(250);
-const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
 fn permission_denied() -> io::Error {
     io::Error::new(
@@ -155,16 +151,24 @@ pub fn same_uid(stream: &UnixStream) -> io::Result<()> {
     }
 }
 
-fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<bool> {
-    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+fn wait_ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<bool> {
     let mut descriptor = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
+        fd,
+        events,
         revents: 0,
     };
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let millis = i32::try_from(remaining.as_millis().saturating_add(1)).unwrap_or(i32::MAX);
+        // SAFETY: descriptor is a live stack value and fd is owned by the caller.
         let ready = unsafe { libc::poll(&raw mut descriptor, 1, millis) };
         if ready > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
             return Ok(true);
         }
         if ready == 0 {
@@ -175,6 +179,77 @@ fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<bool> {
             return Err(error);
         }
     }
+}
+
+struct DeadlineStream<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if !wait_ready(self.stream.as_raw_fd(), libc::POLLIN, self.deadline)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "guardian frame timed out",
+                ));
+            }
+            match self.stream.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            if !wait_ready(self.stream.as_raw_fd(), libc::POLLOUT, self.deadline)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "guardian frame timed out",
+                ));
+            }
+            match self.stream.write(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn serve_frame<E: GuardianExecutor>(
+    stream: &mut DeadlineStream<'_>,
+    server: &mut GuardianServer<E>,
+) -> Result<(), CodecError> {
+    let result = (|| {
+        let request: Request = read_frame(stream)?;
+        write_frame(stream, &server.handle(request))
+    })();
+    if result.is_err() {
+        server.fence_connection();
+    }
+    result
 }
 
 /// Retain the same `GuardianServer` across disconnected connections until the
@@ -196,10 +271,14 @@ pub fn serve_until<E: GuardianExecutor>(
                 }
                 stream.set_nonblocking(true)?;
                 while Instant::now() < until {
-                    if !wait_readable(&stream, IO_SLICE)? {
-                        continue;
+                    if !wait_ready(stream.as_raw_fd(), libc::POLLIN, until)? {
+                        break;
                     }
-                    if serve_once(&mut stream, server).is_err() {
+                    let mut frame = DeadlineStream {
+                        stream: &mut stream,
+                        deadline: (Instant::now() + IO_SLICE).min(until),
+                    };
+                    if serve_frame(&mut frame, server).is_err() {
                         break;
                     }
                 }
@@ -207,7 +286,9 @@ pub fn serve_until<E: GuardianExecutor>(
                 server.fence_connection();
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL.min(until.saturating_duration_since(Instant::now())));
+                if !wait_ready(listener.as_raw_fd(), libc::POLLIN, until)? {
+                    break;
+                }
             }
             Err(error) => return Err(error),
         }
@@ -243,13 +324,16 @@ impl GuardianClient {
     pub fn connect(dir: &Path) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(socket_path(dir)?)?;
         same_uid(&stream)?;
-        stream.set_read_timeout(Some(IO_SLICE))?;
-        stream.set_write_timeout(Some(IO_SLICE))?;
+        stream.set_nonblocking(true)?;
         Ok(Self { stream })
     }
     fn exchange(&mut self, request: &Request) -> Result<Response, ClientError> {
-        write_frame(&mut self.stream, request)?;
-        match read_frame(&mut self.stream)? {
+        let mut frame = DeadlineStream {
+            stream: &mut self.stream,
+            deadline: Instant::now() + IO_SLICE,
+        };
+        write_frame(&mut frame, request)?;
+        match read_frame(&mut frame)? {
             Response::Refused(error) => Err(ClientError::Refused(error)),
             response @ (Response::Hello { .. }
             | Response::Snapshot(_)
