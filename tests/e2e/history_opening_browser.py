@@ -440,6 +440,117 @@ def telemetry_browser_result(path):
     return result
 
 
+COLLECTOR_TARGET = "phoenix_ide::view_journey_acceptance"
+COLLECTOR_MESSAGE = "conversation_view_accepted"
+COLLECTOR_MAX_BYTES = 16 * 1024 * 1024
+COLLECTOR_MAX_LINE = 64 * 1024
+COLLECTOR_MAX_EVENTS = 64
+
+
+def canonical_uuid(value):
+    try:
+        return isinstance(value, str) and str(shipping.uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def collector_acceptances(path, identity):
+    """Project only validated handler-completion facts from the owned app log."""
+    expected_keys = {"message", "schema_version", "open_id", "server_instance_id", "backend_source", "status"}
+    records, seen, size = [], set(), 0
+    with Path(path).open("rb") as source:
+        while line := source.readline(COLLECTOR_MAX_LINE + 1):
+            size += len(line)
+            if size > COLLECTOR_MAX_BYTES or len(line) > COLLECTOR_MAX_LINE:
+                raise ValueError("collector log input bound exceeded")
+            claimed = COLLECTOR_TARGET.encode() in line or COLLECTOR_MESSAGE.encode() in line
+            try:
+                def unique_keys(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError("duplicate collector JSON key")
+                        result[key] = value
+                    return result
+                event = json.loads(line, object_pairs_hook=unique_keys)
+            except (ValueError, UnicodeDecodeError):
+                if claimed:
+                    raise ValueError("malformed collector success record") from None
+                continue
+            if not isinstance(event, dict):
+                if claimed:
+                    raise ValueError("invalid collector success envelope")
+                continue
+            fields = event.get("fields")
+            matches = event.get("target") == COLLECTOR_TARGET or (
+                isinstance(fields, dict) and fields.get("message") == COLLECTOR_MESSAGE)
+            if not matches:
+                continue
+            if (event.get("target") != COLLECTOR_TARGET or event.get("level") != "INFO"
+                    or not isinstance(fields, dict) or set(fields) != expected_keys
+                    or fields["message"] != COLLECTOR_MESSAGE):
+                raise ValueError("invalid collector success schema")
+            if (type(fields["schema_version"]) is not int or fields["schema_version"] != 1
+                    or type(fields["status"]) is not int or fields["status"] != 204
+                    or not canonical_uuid(fields["open_id"])
+                    or not canonical_uuid(fields["server_instance_id"])
+                    or not isinstance(fields["backend_source"], str)
+                    or len(fields["backend_source"]) != 40
+                    or any(c not in "0123456789abcdef" for c in fields["backend_source"])):
+                raise ValueError("invalid collector success values")
+            if (fields["backend_source"] != identity["appSource"]
+                    or fields["server_instance_id"] != identity["serverInstanceId"]):
+                raise ValueError("foreign collector success identity")
+            if fields["open_id"] in seen:
+                raise ValueError("duplicate collector acceptance")
+            seen.add(fields["open_id"])
+            if len(records) >= COLLECTOR_MAX_EVENTS:
+                raise ValueError("collector acceptance count bound exceeded")
+            records.append({key: value for key, value in fields.items() if key != "message"})
+    return records
+
+
+def seal_collector_export_delivery(path, identity, browser, final, drain, run_id, service_name):
+    if drain != {"run_id": run_id, "service_name": service_name, "app_stopped": True,
+                 "receiver_stopped": True, "errors": []}:
+        raise ValueError("collector/export join requires normal owned drain")
+    if (final.get("run_id") != run_id or final.get("service_name") != service_name
+            or not service_name.endswith(run_id)):
+        raise ValueError("collector/export run identity mismatch")
+    if (browser.get("runId") != run_id or browser.get("serviceName") != service_name
+            or browser.get("identity") != identity):
+        raise ValueError("collector/browser identity mismatch")
+    trials = list(browser.get("trials", []))
+    for stage in ("terminal", "lifecycle"):
+        trials.extend(browser.get(stage, {}).get("trials", []))
+    if "failure" in browser or any("failure" in trial for trial in trials):
+        raise ValueError("collector/export join cannot accept browser failure")
+    reports = [report for trial in trials for report in trial.get("reports", [])]
+    ids = [report["open_id"] for report in reports]
+    journeys = browser.get("journeys", [])
+    if (not 0 < len(ids) <= COLLECTOR_MAX_EVENTS or len(set(ids)) != len(ids)
+            or any(not canonical_uuid(value) for value in ids)
+            or len(journeys) != len(ids) or {case["open_id"] for case in journeys} != set(ids)):
+        raise ValueError("collector/browser report inventory mismatch")
+    accepted = collector_acceptances(path, identity)
+    if len(accepted) != len(ids) or {entry["open_id"] for entry in accepted} != set(ids):
+        raise ValueError("real collector acceptance inventory mismatch")
+    retrieved = final.get("retrieved", [])
+    if (len(retrieved) != len(ids) or {entry["open_id"] for entry in retrieved} != set(ids)):
+        raise ValueError("actual exported inventory mismatch")
+    outcomes = {report["open_id"]: report["outcome"] for report in reports}
+    for entry in retrieved:
+        trace = entry.get("trace_id")
+        if (entry.get("outcome") != outcomes[entry["open_id"]]
+                or not isinstance(trace, str) or len(trace) != 32
+                or any(c not in "0123456789abcdef" for c in trace) or set(trace) == {"0"}):
+            raise ValueError("actual exported journey mismatch")
+    return {"schema_version": 1, "run_id": run_id, "service_name": service_name,
+            "scope": "real_collector_and_semantic_export_not_full_joint_or_overhead_acceptance",
+            "collector_acceptances": accepted, "exported": retrieved,
+            "normal_drain": True}
+
+
 def exhausted_summary(state):
     """ConvState is internally tagged by type; ContextExhausted carries summary: String."""
     if (not isinstance(state, dict) or state.get("type") != "context_exhausted"
@@ -826,6 +937,11 @@ def qualify(app, exe, output, joint_telemetry=False):
                         case / "telemetry/telemetry-browser-result.json",
                         drain_receipt=drain)
                     shipping.write_json(case / "telemetry-final.json", final)
+                    delivery = seal_collector_export_delivery(
+                        case / "instrumented-runtime.log", fixtures["identity"],
+                        telemetry_browser_result(case / "telemetry/telemetry-browser-result.json"),
+                        final, drain, run_id, receiver.service)
+                    shipping.write_json(case / "telemetry-delivery.json", delivery)
             except Exception as error:
                 failures.remember_primary("case", error)
                 lifecycle_errors.append(f"{type(error).__name__}: {error}")

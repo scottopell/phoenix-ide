@@ -854,6 +854,174 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("Fixture(h, base, case)", source)
 
 
+class CollectorDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "instrumented-runtime.log"
+        self.open_id = str(opening.shipping.uuid.uuid4())
+        self.identity = {"appSource": "a" * 40, "frontendSource": "a" * 40,
+                         "serverInstanceId": str(opening.shipping.uuid.uuid4())}
+        self.event = {"target": opening.COLLECTOR_TARGET, "level": "INFO", "timestamp": "synthetic",
+                      "fields": {"message": opening.COLLECTOR_MESSAGE, "schema_version": 1,
+                                 "open_id": self.open_id, "status": 204, "backend_source": "a" * 40,
+                                 "server_instance_id": self.identity["serverInstanceId"]},
+                      "span": {"name": "not retained"}}
+        self.browser = {"runId": "run", "serviceName": "service-run", "identity": self.identity,
+            "journeys": [{"open_id": self.open_id}], "trials": [],
+            "terminal": {"status": "provisional_incomplete_collector_export_pending", "trials": [
+                {"sampled": True, "statuses": [], "reports": [
+                    {"open_id": self.open_id, "outcome": "incomplete"}]}]}}
+        self.final = {"run_id": "run", "service_name": "service-run", "retrieved": [
+            {"open_id": self.open_id, "trace_id": "1" * 32, "outcome": "incomplete"}]}
+        self.drain = {"run_id": "run", "service_name": "service-run", "app_stopped": True,
+                      "receiver_stopped": True, "errors": []}
+        self.write()
+
+    def write(self, event=None):
+        self.path.write_text("running 1 test\n" + json.dumps(event or self.event) + "\n")
+
+    def seal(self):
+        return opening.seal_collector_export_delivery(
+            self.path, self.identity, self.browser, self.final, self.drain, "run", "service-run")
+
+    def test_real_collector_and_actual_export_join_not_browser_response(self):
+        result = self.seal()
+        self.assertEqual(len(result["collector_acceptances"]), 1)
+        self.assertEqual(result["collector_acceptances"][0]["open_id"], self.open_id)
+        self.assertNotIn("message", result["collector_acceptances"][0])
+        self.assertNotIn("span", result["collector_acceptances"][0])
+        self.assertIs(result["normal_drain"], True)
+        self.assertEqual(self.browser["terminal"]["trials"][0]["statuses"], [])
+
+    def test_missing_collector_and_missing_export_fail_independently(self):
+        self.path.write_text("running 1 test\n")
+        with self.assertRaisesRegex(ValueError, "collector acceptance inventory"):
+            self.seal()
+        self.write()
+        self.final["retrieved"] = []
+        with self.assertRaisesRegex(ValueError, "exported inventory"):
+            self.seal()
+
+    def test_duplicate_unknown_and_negative_acceptance_never_deduplicate(self):
+        self.path.write_text((json.dumps(self.event) + "\n") * 2)
+        with self.assertRaisesRegex(ValueError, "duplicate collector"):
+            self.seal()
+        event = json.loads(json.dumps(self.event))
+        event["fields"]["open_id"] = str(opening.shipping.uuid.uuid4())
+        self.write(event)
+        with self.assertRaisesRegex(ValueError, "collector acceptance inventory"):
+            self.seal()
+        self.browser["terminal"]["trials"].append({"sampled": False, "reports": [], "statuses": []})
+        with self.assertRaisesRegex(ValueError, "collector acceptance inventory"):
+            self.seal()
+
+    def test_foreign_source_instance_and_invalid_values_fail_closed(self):
+        for field, value in [("backend_source", "b" * 40),
+                             ("server_instance_id", str(opening.shipping.uuid.uuid4())),
+                             ("schema_version", True), ("status", True), ("status", 400),
+                             ("backend_source", "A" * 40), ("open_id", "not-a-uuid")]:
+            with self.subTest(field=field, value=value):
+                event = json.loads(json.dumps(self.event)); event["fields"][field] = value
+                self.write(event)
+                with self.assertRaises(ValueError):
+                    self.seal()
+
+    def test_private_unknown_fields_wrong_target_level_and_truncation_fail(self):
+        for mutate in [lambda e: e["fields"].update(body="private"),
+                       lambda e: e.update(target="proxy"), lambda e: e.update(level="DEBUG"),
+                       lambda e: e["fields"].update(message="other")]:
+            event = json.loads(json.dumps(self.event)); mutate(event); self.write(event)
+            with self.assertRaises(ValueError):
+                self.seal()
+        self.path.write_text(json.dumps(self.event)[:-3])
+        with self.assertRaisesRegex(ValueError, "malformed collector"):
+            self.seal()
+        self.path.write_text(json.dumps(self.event).replace('"status": 204', '"status": 204, "status": 204'))
+        with self.assertRaisesRegex(ValueError, "malformed collector"):
+            self.seal()
+
+    def test_log_and_event_budgets_fail_without_truncation(self):
+        with patch.object(opening, "COLLECTOR_MAX_BYTES", 10):
+            with self.assertRaisesRegex(ValueError, "input bound"):
+                self.seal()
+        with patch.object(opening, "COLLECTOR_MAX_LINE", 10):
+            with self.assertRaisesRegex(ValueError, "input bound"):
+                self.seal()
+        with patch.object(opening, "COLLECTOR_MAX_EVENTS", 0):
+            with self.assertRaises(ValueError):
+                opening.collector_acceptances(self.path, self.identity)
+
+    def test_failed_browser_drain_foreign_run_and_duplicate_export_cannot_seal(self):
+        for field, value in [("app_stopped", False), ("receiver_stopped", False), ("errors", ["forced"])]:
+            old = self.drain[field]; self.drain[field] = value
+            with self.assertRaisesRegex(ValueError, "normal owned drain"):
+                self.seal()
+            self.drain[field] = old
+        self.final["service_name"] = "foreign-run"
+        with self.assertRaisesRegex(ValueError, "run identity"):
+            self.seal()
+        self.final["service_name"] = "service-run"
+        self.final["retrieved"] *= 2
+        with self.assertRaisesRegex(ValueError, "exported inventory"):
+            self.seal()
+        self.final["retrieved"] = self.final["retrieved"][:1]
+        self.browser["failure"] = "browser error"
+        with self.assertRaisesRegex(ValueError, "browser failure"):
+            self.seal()
+
+    def test_export_trace_outcome_and_browser_report_inventory_are_independent(self):
+        for field, value in [("trace_id", "0" * 32), ("outcome", "ready")]:
+            old = self.final["retrieved"][0][field]; self.final["retrieved"][0][field] = value
+            with self.assertRaisesRegex(ValueError, "exported journey"):
+                self.seal()
+            self.final["retrieved"][0][field] = old
+        self.browser["terminal"]["trials"][0]["reports"] *= 2
+        with self.assertRaisesRegex(ValueError, "browser report inventory"):
+            self.seal()
+
+    def test_real_protobuf_inventory_must_reconcile_before_collector_join(self):
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+        sink, assertions = opening.load_telemetry_modules(Path(os.environ.get(
+            "APP_ROOT", str(opening.ROOT / "target/history-hidden-geometry-repair"))))
+        capture = sink.Capture(self.path.parent / "otlp")
+        request = ExportTraceServiceRequest()
+        resource = request.resource_spans.add()
+        resource.resource.attributes.add(key="service.name").value.string_value = "service-run"
+        view = resource.scope_spans.add().spans.add(name="browser.conversation_view",
+            trace_id=b"t" * 16, span_id=b"v" * 8)
+        expected = {"server.backend_source": "a" * 40,
+            "server.instance_id": self.identity["serverInstanceId"],
+            "browser.frontend_source": "a" * 40, "browser.route": "ordinary",
+            "browser.trigger": "navigation", "browser.outcome": "incomplete"}
+        for key, value in {**expected, "open.id": self.open_id,
+                           "browser.presentation_evidence": "commit_frame_estimate"}.items():
+            view.attributes.add(key=key).value.string_value = value
+        self.browser["journeys"] = [{"open_id": self.open_id, "expected": expected, "correlations": []}]
+        self.browser["acceptance"] = "partial_initial_terminal_and_lifecycle_export_raw_overhead_only"
+        self.browser["capabilities"] = {"pagehide_incomplete": "provisional_incomplete_collector_export_pending"}
+        self.browser["comparison"] = {"overhead_clearance": False}
+        browser_path = self.path.parent / "browser.json"
+        browser_path.write_text(json.dumps(self.browser))
+        capture.accept(request.SerializeToString())
+        self.final = assertions.assertPhoenixTelemetry(capture.output, "service-run", "run",
+                                                       browser_path, drain_receipt=self.drain)
+        self.assertEqual(len(self.seal()["exported"]), 1)
+        batch = capture.output / "batch-000.pb"
+        self.assertTrue(batch.exists())
+        batch.write_bytes(b"invalid protobuf")
+        with self.assertRaises(ValueError):
+            assertions.assertPhoenixTelemetry(capture.output, "service-run", "run", browser_path,
+                                             drain_receipt=self.drain)
+
+    def test_final_join_occurs_after_raw_export_and_normal_drain(self):
+        import inspect
+        source = inspect.getsource(opening.qualify)
+        self.assertLess(source.index("normal_server_completion("), source.index("receiver_is_stopped(receiver)"))
+        self.assertLess(source.index("assertPhoenixTelemetry("), source.index("seal_collector_export_delivery("))
+        self.assertIn('case / "instrumented-runtime.log", fixtures["identity"]', source)
+
+
 class FixtureSettlementTests(unittest.TestCase):
     def setUp(self):
         import sqlite3
