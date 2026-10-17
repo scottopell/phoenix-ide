@@ -714,3 +714,88 @@ async fn invalid_fixture_or_target_never_falls_back_to_live_startup() {
         fixture.assert_isolated(&sentinel);
     }
 }
+
+#[cfg(feature = "portable-ui")]
+#[tokio::test]
+async fn portable_ui_serves_exact_built_entry_assets_from_private_cwd() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::new().await;
+    assert!(!fixture.dir.path().join("ui/dist").exists());
+    let sentinel = listener();
+    let mut server = Server(
+        fixture
+            .command(&sentinel)
+            .arg("--observe-fixture")
+            .arg(&fixture.path)
+            .args(["--target", &fixture.product, "--port", "0"])
+            .spawn()
+            .unwrap(),
+    );
+    let address = server.ready();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let response = client
+        .get(format!("http://{address}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    let html = response.bytes().await.unwrap();
+    let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/dist");
+    let expected_html = std::fs::read(dist.join("index.html")).unwrap();
+    assert_eq!(Sha256::digest(&html), Sha256::digest(&expected_html));
+    let html = std::str::from_utf8(&html).unwrap();
+    let entries: Vec<_> = html
+        .split("<script")
+        .skip(1)
+        .filter_map(|tag| {
+            let tag = tag.split('>').next()?;
+            if !tag.contains("type=\"module\"") {
+                return None;
+            }
+            let asset = tag.split("src=\"").nth(1)?.split('"').next()?;
+            (asset.starts_with("/assets/") && asset.ends_with(".js")).then_some(asset)
+        })
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "built HTML must reference a module entry"
+    );
+    let mut manifest = serde_json::json!({
+        "index.html": format!("{:x}", Sha256::digest(&expected_html)),
+    });
+    for entry in entries {
+        let filename = entry.strip_prefix("/assets/").unwrap();
+        assert!(!filename.contains('/'));
+        assert!(
+            filename.strip_suffix(".js").unwrap().contains('-'),
+            "entry must be content-hashed"
+        );
+        let response = client
+            .get(format!("http://{address}{entry}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let mime = response.headers()["content-type"].to_str().unwrap();
+        assert!(mime.contains("javascript"), "entry MIME: {mime}");
+        let bytes = response.bytes().await.unwrap();
+        assert!(!bytes.is_empty());
+        let expected = std::fs::read(dist.join(entry.trim_start_matches('/'))).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(digest, format!("{:x}", Sha256::digest(&expected)));
+        manifest[entry] = serde_json::Value::String(digest);
+    }
+    println!("portable_ui_asset_manifest={manifest}");
+    terminate(&server.0);
+    server.wait(true);
+    fixture.assert_isolated(&sentinel);
+}
