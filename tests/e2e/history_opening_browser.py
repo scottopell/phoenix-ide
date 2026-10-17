@@ -33,8 +33,8 @@ from urllib.parse import urlparse, urlencode, quote
 import history_browser as shipping
 import history_controlled_artifact as artifact_admission
 
-PIN = "353a1b98cbb566d25c9f84ba415bcec683db4d63"
-TREE_PIN = "4efd49a3b7746a3093ce9dce3dac37c1175b5d54"
+PIN = "b778a86cfc32ff32f68965433829af0dd46d53a4"
+TREE_PIN = "2fc5a8ea32f3ea0b11d4e3fc37249734a9f84983"
 BASE_PIN = "1f9529c634a074c6ab6ea36eb15ca284770df1a5"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
@@ -43,6 +43,7 @@ PRODUCTION_CAPACITY_TESTS = [
     "api::view_journey::tests::production_attribute_capacity_preserves_complete_ready_collector_schema",
     "logging::tests::otel_limits_are_conservative_and_event_free",
     "logging::tests::otel_filter_is_a_spans_only_allowlist",
+    "api::product_conversations::tests::routed_history_reads_export_initial_cursor_and_recovery_identity",
 ]
 CLASS = "instrumented_cfg_test_library_not_shipping_runtime"
 ROOT = shipping.ROOT
