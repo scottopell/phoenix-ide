@@ -418,8 +418,19 @@ impl State {
     async fn live_browser(
         &self,
     ) -> Result<Option<Arc<RwLock<BrowserSession>>>, BrowserLookupFailure> {
-        let Some(browser) = self.manager.get_existing(&self.scope).await else {
-            return Ok(None);
+        let browser = match self.manager.lookup_existing(&self.scope).await {
+            phoenix_browser::session::BrowserSessionLookup::Absent => return Ok(None),
+            phoenix_browser::session::BrowserSessionLookup::Ready(browser) => browser,
+            phoenix_browser::session::BrowserSessionLookup::Retained(retained) => {
+                return Err(BrowserLookupFailure::CleanupFailed(RetainedCleanup {
+                    error: format!(
+                        "retained browser initialization at {}: {}",
+                        retained.profile_path.display(),
+                        retained.reason
+                    ),
+                    browser_lifetime: Some(retained.browser_lifetime),
+                }))
+            }
         };
         let running = browser
             .write()
@@ -1143,7 +1154,7 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let runtime_env = PhoenixRuntimeEnvironment::detect();
     let image_directory = runtime_env.tmp_root().join("browser-cli-images");
-    let manager = BrowserSessionManager::with_lifecycle_sink_and_runtime_env(None, &runtime_env);
+    let manager = BrowserSessionManager::for_cli(&runtime_env);
     manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
     let lifetime = uuid::Uuid::new_v4().to_string();
     let state = Arc::new(State {

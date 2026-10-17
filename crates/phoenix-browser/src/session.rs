@@ -5,7 +5,9 @@
 //! REQ-BROWSER-WS-001: Sessions keyed by `ResourceScopeKey` so continuations share Chrome.
 
 mod console;
+mod launch_slot;
 pub use console::ConsoleNavigationCapture;
+use launch_slot::{LaunchSlot, ProfilePolicy};
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
@@ -315,12 +317,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// Cleanup check interval (60 seconds)
 const CLEANUP_INTERVAL: Duration = Duration::from_mins(1);
 
-// Per-phase ceiling on the individual cold-start CDP steps — browser launch,
-// first-page open, helper inject, and each listener setup. chromiumoxide's
-// awaits are otherwise unbounded, so a stalled subprocess or wedged CDP socket
-// hangs the caller forever. Applied per step (not around the whole of
-// BrowserSession::new) so the legitimate first-run chromium DOWNLOAD via
-// BrowserFetcher::fetch() is NOT bounded by it. Task 45001.
+// Per-operation CDP/launch ceiling; executable fetching is outside this budget.
 const SESSION_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -986,18 +983,8 @@ impl BrowserSession {
     }
 
     async fn launch_browser(
-        user_data_dir: &Path,
-        executable: Option<&Path>,
+        config: BrowserConfig,
     ) -> Result<(Browser, chromiumoxide::Handler), BrowserError> {
-        let config = match Self::browser_config(user_data_dir, executable) {
-            Ok(config) => config,
-            Err(error) => {
-                if !profile_marker_path(user_data_dir).exists() {
-                    let _ = std::fs::remove_dir_all(user_data_dir);
-                }
-                return Err(error);
-            }
-        };
         match init_phase(
             SessionInitPhase::Launch,
             SESSION_INIT_TIMEOUT,
@@ -1008,213 +995,6 @@ impl BrowserSession {
             Ok(pair) => Ok(pair),
             Err(error) => Err(BrowserError::LaunchFailed(error.to_string())),
         }
-    }
-
-    async fn reject_unadopted_browser(browser: &mut Browser, reason: &str) -> BrowserError {
-        let cleanup = match tokio::time::timeout(SESSION_INIT_TIMEOUT, browser.kill()).await {
-            Ok(Some(Ok(()))) => "owned root stopped; descendant closure unproven".to_string(),
-            Ok(Some(Err(error))) => format!("owned root stop failed: {error}"),
-            Ok(None) => "owned root handle missing".to_string(),
-            Err(_) => "owned root stop deadline expired".to_string(),
-        };
-        BrowserError::LaunchFailed(format!("{reason}; {cleanup}; unmarked profile retained"))
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn adopt_launch_group(
-        browser: &mut Browser,
-        identity: ProcessIdentity,
-    ) -> Result<Option<crate::process_group::OwnedChromeGroup>, BrowserError> {
-        if crate::process_group::ChromeExecShim::registered().is_none() {
-            return Ok(None);
-        }
-        let child = browser.get_mut_child().ok_or_else(|| {
-            BrowserError::LaunchFailed("owned Chrome child missing before adoption".into())
-        })?;
-        match crate::process_group::OwnedChromeGroup::adopt(identity, child.as_mut_inner()) {
-            Ok(group) => Ok(Some(group)),
-            Err(error) => Err(Self::reject_unadopted_browser(browser, &error.to_string()).await),
-        }
-    }
-
-    /// Launch browser and create a session
-    async fn launch_and_init(
-        tmp_root: &Path,
-        scope_key: &str,
-        launch_uuid: &str,
-        executable: Option<&Path>,
-    ) -> Result<Self, BrowserError> {
-        let user_data_dir = prepare_profile_dir_for_launch(tmp_root, scope_key)?;
-        let (mut browser, mut handler) = Self::launch_browser(&user_data_dir, executable).await?;
-        let chrome_pid = browser
-            .get_mut_child()
-            .and_then(|child| child.as_mut_inner().id());
-        let Some(chrome_process) = chrome_pid.and_then(current_process_identity) else {
-            return Err(Self::reject_unadopted_browser(
-                &mut browser,
-                "could not capture Chrome process identity",
-            )
-            .await);
-        };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let mut owned_group = Self::adopt_launch_group(&mut browser, chrome_process).await?;
-        let launch_identity = BrowserLaunchIdentity {
-            launch_uuid: launch_uuid.to_string(),
-            chrome_process: Some(chrome_process),
-        };
-        let marker = BrowserProfileMarker::from_launch(scope_key, &launch_identity)
-            .expect("launch identity contains a proven Chrome process");
-        if let Err(error) = write_profile_marker_atomic(&user_data_dir, &marker) {
-            Self::stop_initial_browser(
-                &mut browser,
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                owned_group.as_mut(),
-            )
-            .await?;
-            if !profile_marker_path(&user_data_dir).exists() {
-                let _ = std::fs::remove_dir_all(&user_data_dir);
-            }
-            return Err(error);
-        }
-
-        let handler_task = tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if let Err(e) = event {
-                    tracing::warn!("CDP handler error: {e}");
-                }
-            }
-        });
-
-        let page = match Self::first_page(&mut browser, &handler_task).await {
-            Ok(page) => page,
-            Err(error) => {
-                let proof = Self::stop_initial_browser(
-                    &mut browser,
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    owned_group.as_mut(),
-                )
-                .await?;
-                delete_profile_if_owned_and_stopped(
-                    &user_data_dir,
-                    scope_key,
-                    &launch_identity,
-                    proof,
-                )?;
-                return Err(error);
-            }
-        };
-
-        Self::inject_react_helper(&page).await;
-
-        let reference_guard_available = Self::install_reference_guard(&page).await;
-
-        Ok(Self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            owned_group,
-            browser,
-            chrome_pid,
-            chrome_process: Some(chrome_process),
-            launch_identity,
-            handler_task,
-            console_task: None,
-            profiling_tasks: Vec::new(),
-            snapshot: crate::snapshot::SnapshotState::default(),
-            reference_guard_available,
-            reference_input_lock: Arc::new(tokio::sync::Mutex::new(())),
-            page,
-            profiling: Arc::new(StdMutex::new(ProfilingState::default())),
-            trace_complete: Arc::new(tokio::sync::Notify::new()),
-            console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
-            console_capture: Arc::new(console::ConsoleCapture::default()),
-            console_event: Arc::new(tokio::sync::Notify::new()),
-            last_activity: Instant::now(),
-            screencast: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
-            screencast_lifecycle: Arc::new(crate::screencast::ScreencastLifecycle::default()),
-        })
-    }
-
-    /// Create a new browser session.
-    ///
-    /// Order of attempts:
-    ///   1. `PHOENIX_CHROME_EXECUTABLE` env var — explicit override. Set by
-    ///      `./dev.py check` when it finds a Chromium binary in a cache
-    ///      directory (Playwright `/opt/pw-browsers/`, Puppeteer `~/.cache/`,
-    ///      etc.) so the tests don't have to download. Production users
-    ///      can set this manually to point at any Chrome they trust.
-    ///   2. System Chrome via chromiumoxide's lookup (PATH + standard
-    ///      install paths).
-    ///   3. `BrowserFetcher` downloads a compatible Chromium and caches it.
-    async fn new(tmp_root: &Path, scope_key: &str) -> Result<Self, BrowserError> {
-        let launch_uuid = uuid::Uuid::new_v4().to_string();
-
-        // 1. Explicit env-var override — used by the test harness in
-        //    sandboxes where Chrome lives at a non-standard path that
-        //    chromiumoxide's lookup doesn't probe.
-        if let Ok(explicit) = std::env::var("PHOENIX_CHROME_EXECUTABLE") {
-            let explicit_path = PathBuf::from(&explicit);
-            if explicit_path.exists() {
-                tracing::info!(
-                    "Using PHOENIX_CHROME_EXECUTABLE={}",
-                    explicit_path.display()
-                );
-                match Self::launch_and_init(tmp_root, scope_key, &launch_uuid, Some(&explicit_path))
-                    .await
-                {
-                    Ok(session) => return Ok(session),
-                    Err(e) => {
-                        tracing::warn!(
-                            "PHOENIX_CHROME_EXECUTABLE set but launch failed ({e}); falling through"
-                        );
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "PHOENIX_CHROME_EXECUTABLE={} does not exist; falling through",
-                    explicit_path.display()
-                );
-            }
-        }
-
-        // 2. System Chrome (no explicit executable — chromiumoxide finds it)
-        match Self::launch_and_init(tmp_root, scope_key, &launch_uuid, None).await {
-            Ok(session) => return Ok(session),
-            Err(e) => {
-                tracing::info!("System Chrome not available ({e}), trying fetcher...");
-            }
-        }
-
-        // 2. Download / use cached Chrome via fetcher
-        let cache_dir = Self::fetcher_cache_dir();
-        tracing::info!("Downloading Chrome to {cache_dir:?} (first run only)...");
-
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            BrowserError::LaunchFailed(format!(
-                "Failed to create cache dir {}: {e}",
-                cache_dir.display()
-            ))
-        })?;
-
-        let fetcher_opts = BrowserFetcherOptions::builder()
-            .with_path(&cache_dir)
-            .with_kind(BrowserKind::ChromeHeadlessShell)
-            .build()
-            .map_err(|e| BrowserError::LaunchFailed(format!("Fetcher config error: {e}")))?;
-
-        let fetcher = BrowserFetcher::new(fetcher_opts);
-        let info = fetcher
-            .fetch()
-            .await
-            .map_err(|e| BrowserError::LaunchFailed(format!("Chrome download failed: {e:#}")))?;
-
-        tracing::info!("Using Chrome at {:?}", info.executable_path);
-
-        Self::launch_and_init(
-            tmp_root,
-            scope_key,
-            &launch_uuid,
-            Some(&info.executable_path),
-        )
-        .await
     }
 
     #[must_use]
@@ -1271,7 +1051,7 @@ impl BrowserSession {
 
     #[must_use]
     pub fn exact_instance_matches(&self, identity: &BrowserSessionInstanceIdentity) -> bool {
-        self.launch_identity == identity.durable
+        self.launch_identity.launch_uuid == identity.durable.launch_uuid
     }
 
     /// Attach a new live-view viewer (REQ-BT-018).
@@ -1685,7 +1465,7 @@ pub struct BrowserSessionInstanceIdentity {
     pub audience: BrowserSessionAudience,
     pub chrome_pid: Option<u32>,
     durable: BrowserLaunchIdentity,
-    session_addr: usize,
+    slot_addr: usize,
     user_data_key: String,
 }
 
@@ -1708,20 +1488,14 @@ impl BrowserSessionInstanceIdentity {
 
     #[must_use]
     pub fn matches_session(&self, session: &Arc<RwLock<BrowserSession>>) -> bool {
-        self.session_addr == Arc::as_ptr(session) as usize
-            && session
-                .try_read()
-                .is_ok_and(|guard| guard.exact_instance_matches(self))
+        session
+            .try_read()
+            .is_ok_and(|guard| guard.launch_identity.launch_uuid == self.durable.launch_uuid)
     }
 }
 
-type BrowserRetirementSession = (
-    String,
-    Arc<RwLock<BrowserSession>>,
-    String,
-    BrowserSessionAudience,
-);
-type BrowserActorRetirementSession = (Arc<RwLock<BrowserSession>>, String, BrowserSessionAudience);
+type BrowserRetirementSession = (String, Arc<LaunchSlot>, String, BrowserSessionAudience);
+type BrowserActorRetirementSession = (Arc<LaunchSlot>, String, BrowserSessionAudience);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BrowserRetirementPermit {
@@ -1821,7 +1595,7 @@ struct ScopedSession {
     scope: ResourceScopeKey,
     creator_conversation_id: String,
     authority: ResourceAuthority,
-    session: Arc<RwLock<BrowserSession>>,
+    session: Arc<LaunchSlot>,
     user_data_key: String,
     destination_retirement_generation: u64,
     current_kill: std::sync::Mutex<Option<Arc<KillAttempt>>>,
@@ -1865,12 +1639,24 @@ struct ReopenPermitTestHook {
     release: Arc<tokio::sync::Notify>,
 }
 
-/// Global manager for all browser sessions
+pub struct BrowserRetainedLaunch {
+    pub reason: String,
+    pub browser_lifetime: String,
+    pub profile_path: PathBuf,
+}
+
+pub enum BrowserSessionLookup {
+    Absent,
+    Ready(Arc<RwLock<BrowserSession>>),
+    Retained(BrowserRetainedLaunch),
+}
+
+/// Global manager for all browser launch reservations and ready sessions.
 pub struct BrowserSessionManager {
     /// Keyed by browser session identity, with per-scope / per-actor retirement
     /// fences in the same lock so exact retirement can close admission without a
     /// check-then-insert race.
-    state: RwLock<BrowserSessionRegistryState>,
+    state: Arc<RwLock<BrowserSessionRegistryState>>,
     /// Optional lifecycle event sink. Populated by [`RuntimeManager::new`]
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
@@ -1884,6 +1670,9 @@ pub struct BrowserSessionManager {
     #[cfg(test)]
     reopen_permit_test_hook: Option<Arc<ReopenPermitTestHook>>,
     tmp_root: PathBuf,
+    profile_policy: ProfilePolicy,
+    #[cfg(test)]
+    launch_fault: Option<Arc<launch_slot::tests::LaunchFault>>,
 }
 
 impl BrowserSessionManager {
@@ -1909,14 +1698,31 @@ impl BrowserSessionManager {
         sink: Option<BrowserSessionLifecycleSink>,
         runtime_env: &PhoenixRuntimeEnvironment,
     ) -> Arc<Self> {
+        Self::with_profile_policy(sink, runtime_env, ProfilePolicy::StableScope)
+    }
+
+    /// Construct the standalone CLI manager with fresh profiles after proven retirement.
+    #[must_use]
+    pub fn for_cli(runtime_env: &PhoenixRuntimeEnvironment) -> Arc<Self> {
+        Self::with_profile_policy(None, runtime_env, ProfilePolicy::CliTransient)
+    }
+
+    fn with_profile_policy(
+        sink: Option<BrowserSessionLifecycleSink>,
+        runtime_env: &PhoenixRuntimeEnvironment,
+        profile_policy: ProfilePolicy,
+    ) -> Arc<Self> {
         let manager = Arc::new(Self {
-            state: RwLock::new(BrowserSessionRegistryState::default()),
+            state: Arc::new(RwLock::new(BrowserSessionRegistryState::default())),
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
             #[cfg(test)]
             reopen_permit_test_hook: None,
             tmp_root: runtime_env.tmp_root().to_path_buf(),
+            profile_policy,
+            #[cfg(test)]
+            launch_fault: None,
         });
 
         // Start background cleanup task with weak reference to avoid reference cycle
@@ -1964,11 +1770,13 @@ impl BrowserSessionManager {
         let Some(entry) = state.sessions.get(&old_key) else {
             return false;
         };
-        if !Self::destination_generation_is_current(
-            &state,
-            &new_key,
-            entry.destination_retirement_generation,
-        ) {
+        if entry.session.ready().is_none()
+            || !Self::destination_generation_is_current(
+                &state,
+                &new_key,
+                entry.destination_retirement_generation,
+            )
+        {
             return false;
         }
         if entry
@@ -1998,6 +1806,22 @@ impl BrowserSessionManager {
         let old_key = work_scope.stable_key();
         let new_key = session_key(work_scope, &restricted);
         let mut state = self.state.write().await;
+        if Self::scope_is_fenced(&state, work_scope).is_some()
+            || Self::actor_is_fenced(&state, work_scope, &restricted).is_some()
+            || state
+                .retirements
+                .get(&BrowserRetirementFenceKey::Session(old_key.clone()))
+                .is_some_and(|retirement| retirement.fenced)
+            || state.sessions.get(&old_key).is_some_and(|entry| {
+                entry.session.ready().is_none()
+                    || !entry
+                        .current_kill
+                        .lock()
+                        .is_ok_and(|attempt| attempt.is_none())
+            })
+        {
+            return false;
+        }
         if state.sessions.contains_key(&new_key) {
             return false;
         }
@@ -2166,7 +1990,9 @@ impl BrowserSessionManager {
         entry: &ScopedSession,
         expected: &BrowserSessionInstanceIdentity,
     ) -> bool {
-        entry.user_data_key == expected.user_data_key && expected.matches_session(&entry.session)
+        entry.user_data_key == expected.user_data_key
+            && expected.slot_addr == Arc::as_ptr(&entry.session) as usize
+            && entry.session.identity.launch_uuid == expected.durable.launch_uuid
     }
 
     #[cfg(test)]
@@ -2311,44 +2137,8 @@ impl BrowserSessionManager {
         actor: &EffectiveResourceAccess,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let key = session_key(work_scope, actor);
-        self.ensure_accepting_sessions()?;
-
-        let mut state = loop {
-            {
-                let state = self.state.read().await;
-                if Self::scope_is_fenced(&state, work_scope).is_some()
-                    || Self::actor_is_fenced(&state, work_scope, actor).is_some()
-                {
-                    return Err(BrowserError::RetirementFenced {
-                        work_scope: work_scope.clone(),
-                    });
-                }
-                if let Some(entry) = state.sessions.get(&key) {
-                    if entry.teardown_failed.load(Ordering::SeqCst) {
-                        return Err(BrowserError::OperationFailed(
-                            "browser session teardown failed; retry cleanup before reuse"
-                                .to_string(),
-                        ));
-                    }
-                    let pending_kill = entry
-                        .current_kill
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone()
-                        .filter(|attempt| attempt.result().is_none());
-                    if let Some(attempt) = pending_kill {
-                        drop(state);
-                        self.wait_for_kill_completion(attempt).await?;
-                        continue;
-                    }
-                    if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
-                        return Err(BrowserError::AccessDenied);
-                    }
-                    return Ok(entry.session.clone());
-                }
-            }
-
-            let state = self.state.write().await;
+        let slot = loop {
+            let mut state = self.state.write().await;
             self.ensure_accepting_sessions()?;
             if Self::scope_is_fenced(&state, work_scope).is_some()
                 || Self::actor_is_fenced(&state, work_scope, actor).is_some()
@@ -2358,60 +2148,64 @@ impl BrowserSessionManager {
                 });
             }
             if let Some(entry) = state.sessions.get(&key) {
+                if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+                    return Err(BrowserError::AccessDenied);
+                }
                 if entry.teardown_failed.load(Ordering::SeqCst) {
                     return Err(BrowserError::OperationFailed(
-                        "browser session teardown failed; retry cleanup before reuse".to_string(),
+                        "browser session teardown failed; retry cleanup before reuse".into(),
                     ));
                 }
-                let pending_kill = entry
+                let pending = entry
                     .current_kill
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
                     .filter(|attempt| attempt.result().is_none());
-                if let Some(attempt) = pending_kill {
+                if let Some(attempt) = pending {
                     drop(state);
                     self.wait_for_kill_completion(attempt).await?;
                     continue;
                 }
-                if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
-                    return Err(BrowserError::AccessDenied);
-                }
-                return Ok(entry.session.clone());
+                break entry.session.clone();
             }
-            break state;
+            let slot = LaunchSlot::reserve(&self.tmp_root, &key, self.profile_policy);
+            let destination_retirement_generation =
+                Self::destination_generation(&state, work_scope);
+            state.sessions.insert(
+                key.clone(),
+                ScopedSession {
+                    scope: work_scope.clone(),
+                    creator_conversation_id: actor.conversation_id().to_owned(),
+                    authority: actor.authority(),
+                    session: slot.clone(),
+                    user_data_key: key.clone(),
+                    destination_retirement_generation,
+                    current_kill: StdMutex::new(None),
+                    teardown_failed: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            #[cfg(test)]
+            slot.inject(self.launch_fault.clone());
+            slot.start(self.state.clone(), self.lifecycle_sink.clone());
+            break slot;
         };
-
-        tracing::info!(work_scope = %work_scope, "Creating new browser session");
-        let session = BrowserSession::new(&self.tmp_root, &key).await?;
-        let session_arc = Arc::new(RwLock::new(session));
-
-        Self::setup_session_listeners(session_arc.clone()).await;
-
-        let destination_retirement_generation = Self::destination_generation(&state, work_scope);
-        state.sessions.insert(
-            key.clone(),
-            ScopedSession {
-                scope: work_scope.clone(),
-                creator_conversation_id: actor.conversation_id().to_string(),
-                authority: actor.authority(),
-                session: session_arc.clone(),
-                user_data_key: key.clone(),
-                destination_retirement_generation,
-                current_kill: std::sync::Mutex::new(None),
-                teardown_failed: Arc::new(AtomicBool::new(false)),
-            },
-        );
+        let session = slot.wait_ready().await?;
+        let state = self.state.read().await;
+        if Self::scope_is_fenced(&state, work_scope).is_some()
+            || Self::actor_is_fenced(&state, work_scope, actor).is_some()
+            || !state.sessions.get(&key).is_some_and(|entry| {
+                Arc::ptr_eq(&entry.session, &slot)
+                    && !entry.teardown_failed.load(Ordering::SeqCst)
+                    && entry.current_kill.lock().is_ok_and(|kill| kill.is_none())
+            })
+        {
+            return Err(BrowserError::RetirementFenced {
+                work_scope: work_scope.clone(),
+            });
+        }
         drop(state);
-        let audience = match actor.authority() {
-            ResourceAuthority::Work => BrowserSessionAudience::Scope,
-            ResourceAuthority::Restricted => {
-                BrowserSessionAudience::Conversation(actor.conversation_id().to_string())
-            }
-        };
-        self.emit_lifecycle(work_scope, audience, BrowserSessionLifecycleKind::Active);
-
-        Ok(session_arc)
+        Ok(session)
     }
 
     pub async fn cleanup_identifiers(
@@ -2428,12 +2222,13 @@ impl BrowserSessionManager {
             .map(|entry| (entry.session.clone(), entry.user_data_key.clone()))
             .collect();
         let mut identifiers = Vec::with_capacity(sessions.len());
-        for (session, user_data_key) in sessions {
+        for (session, _) in sessions {
             identifiers.push(BrowserCleanupIdentifiers {
-                chrome_pid: session.read().await.chrome_pid,
-                profile_path: user_data_dir_for_key(&self.tmp_root, &user_data_key)
-                    .to_string_lossy()
-                    .into_owned(),
+                chrome_pid: session
+                    .observed_identity()
+                    .chrome_process
+                    .map(|process| process.pid),
+                profile_path: session.profile.to_string_lossy().into_owned(),
             });
         }
         identifiers
@@ -2469,6 +2264,12 @@ impl BrowserSessionManager {
         if state != BrowserInventoryState::Live {
             return Some(BrowserInventoryMetadata { state, idle: None });
         }
+        let Some(session) = session.ready() else {
+            return Some(BrowserInventoryMetadata {
+                state: BrowserInventoryState::TeardownFailed,
+                idle: None,
+            });
+        };
         let idle = session.read().await.last_activity.elapsed();
         Some(BrowserInventoryMetadata {
             state,
@@ -2513,6 +2314,12 @@ impl BrowserSessionManager {
         if state != BrowserInventoryState::Live {
             return Ok(Some(BrowserInventoryMetadata { state, idle: None }));
         }
+        let Some(session) = session.ready() else {
+            return Ok(Some(BrowserInventoryMetadata {
+                state: BrowserInventoryState::TeardownFailed,
+                idle: None,
+            }));
+        };
         let idle = session.read().await.last_activity.elapsed();
         Ok(Some(BrowserInventoryMetadata {
             state,
@@ -2552,7 +2359,27 @@ impl BrowserSessionManager {
                 "browser session teardown failed; retry cleanup before reuse".to_string(),
             ));
         }
-        Ok(Some(entry.session.clone()))
+        entry.session.ready().map(Some).ok_or_else(|| {
+            BrowserError::OperationFailed(
+                "browser initialization is retained; close before reuse".into(),
+            )
+        })
+    }
+
+    /// Inspect an existing reservation without creating another launch.
+    pub async fn lookup_existing(&self, work_scope: &ResourceScopeKey) -> BrowserSessionLookup {
+        let slot = self
+            .state
+            .read()
+            .await
+            .sessions
+            .values()
+            .find(|entry| entry.scope == *work_scope)
+            .map(|entry| entry.session.clone());
+        match slot {
+            Some(slot) => slot.lookup().await,
+            None => BrowserSessionLookup::Absent,
+        }
     }
 
     /// Get the session for a `work_scope` **without creating one**.
@@ -2575,7 +2402,7 @@ impl BrowserSessionManager {
             .find(|entry| {
                 entry.scope == *work_scope && !entry.teardown_failed.load(Ordering::SeqCst)
             })
-            .map(|entry| entry.session.clone());
+            .and_then(|entry| entry.session.ready());
         if hit.is_none() {
             tracing::debug!(
                 work_scope = %work_scope,
@@ -2609,16 +2436,14 @@ impl BrowserSessionManager {
         };
         let mut instances = Vec::with_capacity(current.len());
         for (session_key, session, user_data_key, audience) in current {
-            let guard = session.read().await;
-            let chrome_pid = guard.chrome_pid;
-            let durable = guard.launch_identity().clone();
-            drop(guard);
+            let durable = session.observed_identity();
+            let chrome_pid = durable.chrome_process.map(|process| process.pid);
             instances.push(BrowserSessionInstanceIdentity {
                 session_key,
                 audience,
                 chrome_pid,
                 durable,
-                session_addr: Arc::as_ptr(&session) as usize,
+                slot_addr: Arc::as_ptr(&session) as usize,
                 user_data_key,
             });
         }
@@ -2657,16 +2482,14 @@ impl BrowserSessionManager {
         };
         let instances = match current {
             Some((session, user_data_key, audience)) => {
-                let guard = session.read().await;
-                let chrome_pid = guard.chrome_pid;
-                let durable = guard.launch_identity().clone();
-                drop(guard);
+                let durable = session.observed_identity();
+                let chrome_pid = durable.chrome_process.map(|process| process.pid);
                 vec![BrowserSessionInstanceIdentity {
                     session_key: actor_key.clone(),
                     audience,
                     chrome_pid,
                     durable,
-                    session_addr: Arc::as_ptr(&session) as usize,
+                    slot_addr: Arc::as_ptr(&session) as usize,
                     user_data_key,
                 }]
             }
@@ -2737,40 +2560,10 @@ impl BrowserSessionManager {
         BrowserRetirementOutcome::AbsenceVerified
     }
 
-    async fn remove_profile_for_attempt(
-        &self,
-        key: &str,
-        attempt: &Arc<KillAttempt>,
-        user_data_dir: &Path,
-        session_key: &str,
-        expected: &BrowserLaunchIdentity,
-        proof: ProfileDeletionProof,
-    ) -> Result<(), BrowserError> {
-        let user_data_dir = user_data_dir.to_path_buf();
-        let profile_for_delete = user_data_dir.clone();
-        let session_key = session_key.to_string();
-        let expected = expected.clone();
-        let failure = match tokio::task::spawn_blocking(move || {
-            delete_profile_if_owned_and_stopped(&profile_for_delete, &session_key, &expected, proof)
-        })
-        .await
-        {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => error.to_string(),
-            Err(error) => format!(
-                "browser profile deletion task failed for {}: {error}",
-                user_data_dir.display()
-            ),
-        };
-        self.complete_kill_failure(key, attempt, failure.clone())
-            .await;
-        Err(BrowserError::OperationFailed(failure))
-    }
-
     async fn remove_session_if_current(
         &self,
         key: &str,
-        session: &Arc<RwLock<BrowserSession>>,
+        session: &Arc<LaunchSlot>,
     ) -> Option<ScopedSession> {
         let mut state = self.state.write().await;
         state
@@ -2854,52 +2647,12 @@ impl BrowserSessionManager {
             handle: tokio::spawn(async move {
                 tracing::info!(work_scope = %requested_scope, "Killing browser session");
 
-                let termination = {
-                    let mut session_guard = session.write().await;
-                    session_guard
-                        .terminate()
-                        .await
-                        .map_err(|error| BrowserError::OperationFailed(error.to_string()))
-                        .and_then(|()| session_guard.profile_deletion_proof())
-                };
-                let proof = match termination {
-                    Ok(proof) => proof,
-                    Err(error) => {
-                        tracing::warn!(work_scope = %requested_scope, %error, "browser termination failed; retaining tracked session");
-                        manager
-                            .complete_kill_failure(&key, &task_attempt, error.to_string())
-                            .await;
-                        return Err(BrowserError::OperationFailed(error.to_string()));
-                    }
-                };
-
-                let Some((user_data_key, launch_identity)) = ({
-                    let state = manager.state.read().await;
-                    state.sessions.get(&key).and_then(|entry| {
-                        if !Arc::ptr_eq(&entry.session, &session) {
-                            return None;
-                        }
-                        entry.session.try_read().ok().map(|guard| {
-                            (entry.user_data_key.clone(), guard.launch_identity().clone())
-                        })
-                    })
-                }) else {
-                    tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was removed or replaced");
-                    task_attempt.complete(Ok(()));
-                    return Ok(());
-                };
-
-                let user_data_dir = user_data_dir_for_key(&manager.tmp_root, &user_data_key);
-                manager
-                    .remove_profile_for_attempt(
-                        &key,
-                        &task_attempt,
-                        &user_data_dir,
-                        &user_data_key,
-                        &launch_identity,
-                        proof,
-                    )
-                    .await?;
+                if let Err(error) = session.stop_and_delete().await {
+                    manager
+                        .complete_kill_failure(&key, &task_attempt, error.to_string())
+                        .await;
+                    return Err(error);
+                }
 
                 let removed = manager.remove_session_if_current(&key, &session).await;
                 let Some(entry) = removed else {
@@ -3209,7 +2962,10 @@ impl BrowserSessionManager {
         {
             let state = self.state.read().await;
             for (key, entry) in &state.sessions {
-                if let Ok(guard) = entry.session.try_read() {
+                if let Some(session) = entry.session.ready() {
+                    let Ok(guard) = session.try_read() else {
+                        continue;
+                    };
                     if now.duration_since(guard.last_activity) > IDLE_TIMEOUT {
                         let restricted_creator =
                             matches!(entry.authority, ResourceAuthority::Restricted)
@@ -3304,13 +3060,16 @@ impl Drop for BrowserSession {
 impl Default for BrowserSessionManager {
     fn default() -> Self {
         Self {
-            state: RwLock::new(BrowserSessionRegistryState::default()),
+            state: Arc::new(RwLock::new(BrowserSessionRegistryState::default())),
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
             #[cfg(test)]
             reopen_permit_test_hook: None,
             tmp_root: PhoenixRuntimeEnvironment::detect().tmp_root().to_path_buf(),
+            profile_policy: ProfilePolicy::StableScope,
+            #[cfg(test)]
+            launch_fault: None,
         }
     }
 }

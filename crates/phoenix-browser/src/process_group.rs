@@ -31,6 +31,18 @@ impl ChromeExecShim {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_external_qualification_executable(executable: PathBuf) -> io::Result<()> {
+        let executable = executable.canonicalize()?;
+        if executable == std::env::current_exe()?.canonicalize()? {
+            return Err(io::Error::other(
+                "unit-test executable does not implement the native Chrome shim",
+            ));
+        }
+        SHIM.set(Self(executable))
+            .map_err(|_| io::Error::other("Chrome qualification shim already installed"))
+    }
+
     pub(crate) fn registered() -> Option<Self> {
         SHIM.get().cloned()
     }

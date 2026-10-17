@@ -710,6 +710,30 @@ fn wait_for_observation<T>(reason: &str, mut observe: impl FnMut() -> Option<T>)
     }
 }
 
+fn observe_process_exited_or_retained_zombie(process: ProcessIdentity) {
+    wait_for_observation(
+        "killed Chrome is gone or kernel-exited with retained identity",
+        || {
+            if !process_identity_matches(process) {
+                return Some(());
+            }
+            let output = Command::new("ps")
+                .args(["-p", &process.pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            eprintln!(
+                "pre_close_process_observation pid={} identity_retained=true state={}",
+                process.pid,
+                state.trim()
+            );
+            (output.status.success()
+                && matches!(state.trim_start().chars().next(), Some('Z' | 'X')))
+            .then_some(())
+        },
+    );
+}
+
 fn await_process_exit(process: ProcessIdentity) {
     wait_for_observation("owned process exited", || {
         (!process_identity_matches(process)).then_some(())
@@ -1639,6 +1663,262 @@ fn blocked_profile_preserves_structured_measurement_failure() {
     cli.ok(&["close"]);
 }
 
+#[test]
+fn opaque_initial_launch_failure_status_retains_lifetime_and_barrier() {
+    initial_launch_failure_status(true);
+}
+
+#[test]
+fn partial_initial_launch_failure_status_retains_lifetime_and_barrier() {
+    if chrome_enabled() {
+        initial_launch_failure_status(false);
+    }
+}
+
+struct InitialLaunchDaemon<'a> {
+    cli: &'a BrowserCli,
+    child: std::process::Child,
+    opening: Option<std::process::Child>,
+    release: PathBuf,
+    cancel: PathBuf,
+    ready: PathBuf,
+    chrome: Option<ProcessIdentity>,
+    processes: Vec<ProcessIdentity>,
+    profile: Option<PathBuf>,
+}
+
+impl InitialLaunchDaemon<'_> {
+    fn open(&mut self, opaque: bool) -> Value {
+        if opaque {
+            return self.cli.invoke(&["open", &fixture()], None, false);
+        }
+        self.opening = Some(
+            self.cli
+                .command()
+                .args(["open", &fixture()])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let (chrome, profile) = wait_for_observation("partial launch wrapper identity", || {
+            let contents = std::fs::read_to_string(&self.ready).ok()?;
+            let mut lines = contents.lines();
+            let process = current_process_identity(lines.next()?.parse().ok()?)?;
+            let profile = PathBuf::from(lines.next()?);
+            Some((process, profile))
+        });
+        self.chrome = Some(chrome);
+        self.processes.push(chrome);
+        assert!(profile.starts_with(self.cli.directory.path().join("scratch")));
+        self.profile = Some(profile);
+        std::fs::write(&self.release, b"release").unwrap();
+        let output = self.opening.take().unwrap().wait_with_output().unwrap();
+        assert!(!output.status.success());
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn repair_marker(&self) {
+        if let Some(profile) = &self.profile {
+            // This directory is the obstruction injected by failing-chrome, not a marker file.
+            let _ = std::fs::remove_dir(profile.join("phoenix-profile-owner.json"));
+        }
+    }
+
+    fn close_partial(&mut self, profile: &Path) {
+        assert_eq!(self.profile.as_deref(), Some(profile));
+        let chrome = self
+            .chrome
+            .expect("partial launch captured a Chrome identity");
+        self.processes
+            .extend(initial_launch_processes(chrome).expect("observe owned Chrome helpers"));
+        self.repair_marker();
+        self.cli.ok(&["close"]);
+        assert_resources_removed(&(profile.to_path_buf(), chrome));
+        assert!(!self.cli.socket().exists(), "owned daemon socket retained");
+        for process in &self.processes {
+            assert!(
+                !process_identity_matches(*process),
+                "owned helper retained: {process:?}"
+            );
+        }
+        let status = wait_for_observation("owned daemon exited after close", || {
+            self.child.try_wait().unwrap()
+        });
+        assert!(status.success(), "owned daemon close failed: {status}");
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+fn initial_launch_processes(root: ProcessIdentity) -> std::io::Result<Vec<ProcessIdentity>> {
+    let mut processes = vec![root];
+    if !process_identity_matches(root) {
+        return Ok(processes);
+    }
+    let output = Command::new("ps").args(["-axo", "pid=,ppid="]).output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            "owned Chrome helper observation failed",
+        ));
+    }
+    let rows: Vec<(u32, u32)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect();
+    loop {
+        let before = processes.len();
+        for (pid, parent) in &rows {
+            if processes.iter().any(|process| process.pid == *parent)
+                && !processes.iter().any(|process| process.pid == *pid)
+            {
+                if let Some(process) = current_process_identity(*pid) {
+                    processes.push(process);
+                }
+            }
+        }
+        if processes.len() == before {
+            return Ok(processes);
+        }
+    }
+}
+
+impl Drop for InitialLaunchDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.cancel, b"cancel");
+        let _ = std::fs::write(&self.release, b"release");
+        if let Some(mut opening) = self.opening.take() {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while matches!(opening.try_wait(), Ok(None)) && Instant::now() < deadline {
+                // test-timing-allow: await the accepted launch result before repairing its injected obstruction.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = opening.kill();
+            let _ = opening.wait();
+        }
+        if let Some(chrome) = self.chrome {
+            match initial_launch_processes(chrome) {
+                Ok(processes) => self.processes.extend(processes),
+                Err(error) => eprintln!("emergency helper observation failed: {error}"),
+            }
+        }
+        self.repair_marker();
+        // Close gets the retained authority before any emergency process teardown.
+        let _ = self.cli.command().arg("close").output();
+        for process in self.processes.iter().rev() {
+            if process_identity_matches(*process) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &process.pid.to_string()])
+                    .status();
+            }
+        }
+        // The opaque /usr/bin/false fixture cannot yield browser authority.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn initial_launch_failure_status(opaque: bool) {
+    let cli = BrowserCli::new();
+    let key = hex::encode(&Sha256::digest(b"named:integration")[..12]);
+    let wrapper = cli.directory.path().join("failing-chrome");
+    let ready = cli.directory.path().join("partial-ready");
+    let release = cli.directory.path().join("partial-release");
+    let cancel = cli.directory.path().join("partial-cancel");
+    let executable = if opaque {
+        PathBuf::from("/usr/bin/false")
+    } else {
+        let actual = std::env::var_os("PHOENIX_CHROME_EXECUTABLE")
+            .map(PathBuf::from)
+            .expect("hosted dev.py supplies installed Chrome for the partial-initialization test");
+        std::fs::write(&wrapper, b"#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --user-data-dir=*) profile=${arg#--user-data-dir=};; esac; done\nprintf '%s\\n%s\\n' \"$$\" \"$profile\" > \"$PHOENIX_BROWSER_TEST_READY\"\nwhile [ ! -e \"$PHOENIX_BROWSER_TEST_RELEASE\" ]; do sleep 0.02; done\n[ ! -e \"$PHOENIX_BROWSER_TEST_CANCEL\" ] || exit 92\nmkdir \"$profile/phoenix-profile-owner.json\" || exit 91\nexec \"$PHOENIX_BROWSER_TEST_CHROME\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        actual
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"));
+    command
+        .args(["__daemon", &key, "named:integration", "300"])
+        .arg(cli.directory.path())
+        .env("PHOENIX_TMP_DIR", cli.directory.path().join("scratch"))
+        .env(
+            "PHOENIX_CHROME_EXECUTABLE",
+            if opaque { &executable } else { &wrapper },
+        )
+        .env("PHOENIX_BROWSER_TEST_CHROME", &executable)
+        .env("PHOENIX_BROWSER_TEST_READY", &ready)
+        .env("PHOENIX_BROWSER_TEST_RELEASE", &release)
+        .env("PHOENIX_BROWSER_TEST_CANCEL", &cancel)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut daemon = InitialLaunchDaemon {
+        cli: &cli,
+        child: command.spawn().unwrap(),
+        opening: None,
+        release,
+        cancel,
+        ready,
+        chrome: None,
+        processes: Vec::new(),
+        profile: None,
+    };
+    wait_for_observation("explicit owned daemon socket", || {
+        assert!(daemon.child.try_wait().unwrap().is_none());
+        cli.socket().exists().then_some(())
+    });
+    let opened = daemon.open(opaque);
+    assert_eq!(opened["error"]["code"], "browser_start_failed");
+    if !opaque {
+        assert!(
+            opened["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("failed to publish browser profile marker"),
+            "must reach returned-Browser marker publication: {opened}"
+        );
+    }
+    let status = cli.invoke(&["status"], None, false);
+    assert_eq!(status["error"]["code"], "cleanup_failed");
+    assert!(status["browser_lifetime"].as_str().is_some());
+    assert!(status["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("retained browser initialization at"));
+    let profiles: Vec<_> = std::fs::read_dir(cli.directory.path().join("scratch"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("phoenix-browser-cli-")
+        })
+        .collect();
+    assert_eq!(profiles.len(), 1);
+    assert!(status["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(profiles[0].to_str().unwrap()));
+    if !opaque {
+        assert!(profiles[0].join("phoenix-profile-owner.json").is_dir());
+        assert!(status["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to publish browser profile marker"));
+    }
+    let repeated = cli.invoke(&["open", &fixture()], None, false);
+    assert_eq!(repeated["error"]["code"], "cleanup_failed");
+    assert_eq!(repeated["browser_lifetime"], status["browser_lifetime"]);
+    let stopping = cli.ok(&["status"]);
+    assert_eq!(stopping["result"]["phase"], "stopping");
+    assert_eq!(stopping["browser_lifetime"], status["browser_lifetime"]);
+    if !opaque {
+        daemon.close_partial(&profiles[0]);
+    }
+}
+
 fn record_owned_chrome_layout(
     resources: &(PathBuf, ProcessIdentity),
     phase: &str,
@@ -1843,7 +2123,9 @@ fn dead_chrome_cleanup_failure_remains_visible_until_explicit_close() {
             None
         }
     });
-    await_process_exit(resources.1);
+    eprintln!("dead_chrome_cleanup_failure_first_status={failed}");
+    record_owned_chrome_layout(&resources, "cleanup_failed_before_explicit_close", false);
+    observe_process_exited_or_retained_zombie(resources.1);
     assert_eq!(failed["error"]["code"], "cleanup_failed");
     assert_eq!(failed["browser_lifetime"], opened["browser_lifetime"]);
     for _ in 0..2 {
