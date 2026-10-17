@@ -246,7 +246,7 @@ pub(super) fn bounded_text(path: &Path) -> io::Result<String> {
 
 pub(super) fn poll_pause() {
     // test-timing-allow: all callers have explicit hard deadlines for causal OS/file observations.
-    thread::sleep(Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(250));
 }
 
 #[derive(Clone, Copy, Debug)]
