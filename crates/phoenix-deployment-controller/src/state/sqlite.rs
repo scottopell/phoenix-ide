@@ -41,8 +41,9 @@ pub use native_reconciliation::{
 mod native_sampling;
 mod resources;
 pub use native_sampling::{
-    NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingIssue, NativeSamplingStatus,
-    VerifiedNativeSamplingAckConfirmation, VerifiedNativeSamplingCompletion,
+    NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingIssue,
+    NativeSamplingRecoveryCandidate, NativeSamplingStatus, VerifiedNativeSamplingAckConfirmation,
+    VerifiedNativeSamplingCompletion, VerifiedRecoveredNativeSampling,
 };
 mod tree;
 
@@ -523,6 +524,27 @@ impl ControllerSqliteStore {
         application: Option<(&NativeSamplingIssue, &NativeSamplingCompletion)>,
         reconciliation: Option<(&DeploymentAttempt, &NativeGuardianBinding, MonotonicTick)>,
     ) -> Result<PersistenceRevision> {
+        self.persist_checkpoint_with_sample(
+            checkpoint,
+            application,
+            reconciliation,
+            None,
+            &mut native_sampling::native_deadline_now,
+        )
+    }
+
+    fn persist_checkpoint_with_sample(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+        application: Option<(&NativeSamplingIssue, &NativeSamplingCompletion)>,
+        reconciliation: Option<(&DeploymentAttempt, &NativeGuardianBinding, MonotonicTick)>,
+        recovered_sample: Option<(
+            &DeploymentAttempt,
+            &NativeGuardianBinding,
+            &NativeSamplingIssue,
+        )>,
+        clock: &mut impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<PersistenceRevision> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -552,6 +574,22 @@ impl ControllerSqliteStore {
                 binding,
                 now,
             )?;
+        }
+        if let Some((interrupted, binding, issue)) = recovered_sample {
+            native_sampling::validate_recovery_candidate(
+                &transaction,
+                interrupted,
+                binding,
+                *issue,
+                clock()?,
+            )?;
+            if durable.as_ref() != Some(interrupted)
+                || !matches!(application, Some((applied_issue, NativeSamplingCompletion::Sample(sample)))
+                    if applied_issue == issue
+                    && interrupted.clone().fold_interrupted_sampling_sample(*sample).as_ref() == Some(checkpoint))
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
         }
         let mut next = checkpoint.clone();
         next.set_revision(revision);
@@ -586,6 +624,11 @@ impl ControllerSqliteStore {
         }
         if let Some((_, binding, _)) = reconciliation {
             native_reconciliation::insert_completion(&transaction, binding, revision)?;
+        }
+        if let Some((interrupted, _, _)) = recovered_sample {
+            if clock()? >= interrupted.deadline() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
         }
         transaction.commit()?;
         Ok(revision)

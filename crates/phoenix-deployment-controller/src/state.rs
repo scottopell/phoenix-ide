@@ -256,6 +256,22 @@ impl LoadedAttempt {
         self.checkpoint.phase()
     }
 
+    pub(crate) fn interrupted_sampling_sequence(&self) -> Option<u64> {
+        match &self.checkpoint {
+            DeploymentAttempt::Interrupted(InterruptedAttempt {
+                resume: ActiveAttempt::ResourceSampling(attempt),
+                ..
+            }) => Some(attempt.pending_sample_sequence),
+            DeploymentAttempt::Active(_)
+            | DeploymentAttempt::Ready(_)
+            | DeploymentAttempt::ResourceBlocked(_)
+            | DeploymentAttempt::Interrupted(_)
+            | DeploymentAttempt::ForwardRecovery(_)
+            | DeploymentAttempt::AdministrativeCloseoutRequired(_)
+            | DeploymentAttempt::AdministrativelyClosed(_) => None,
+        }
+    }
+
     /// # Panics
     /// Panics if private loaded evidence lacks its store-validated revision.
     #[must_use]
@@ -669,6 +685,38 @@ impl DeploymentAttempt {
             }
             Self::AdministrativelyClosed(_) => CleanupOutcome::AdministrativeRiskAccepted,
         }
+    }
+
+    pub(crate) fn interrupted_sampling_sequence(&self) -> Option<u64> {
+        let Self::Interrupted(InterruptedAttempt {
+            resume: ActiveAttempt::ResourceSampling(sampling),
+            ..
+        }) = self
+        else {
+            return None;
+        };
+        Some(sampling.pending_sample_sequence)
+    }
+
+    pub(crate) fn fold_interrupted_sampling_sample(self, sample: ResourceSample) -> Option<Self> {
+        let Self::Interrupted(mut interrupted) = self else {
+            return None;
+        };
+        let ActiveAttempt::ResourceSampling(ref mut sampling) = interrupted.resume else {
+            return None;
+        };
+        if sample.sequence != sampling.pending_sample_sequence {
+            return None;
+        }
+        let next = sampling.pending_sample_sequence.checked_add(1)?;
+        if !matches!(
+            sampling.window.record(sample).ok()?,
+            ResourceAssessment::NeedMoreSamples { .. }
+        ) {
+            return None;
+        }
+        sampling.pending_sample_sequence = next;
+        Some(Self::Interrupted(interrupted))
     }
 
     /// # Errors

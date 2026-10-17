@@ -165,7 +165,7 @@ impl<'de> Deserialize<'de> for BuildIdentity {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -653,6 +653,12 @@ pub enum Request {
     ObserveRetained {
         key: WireKey,
     },
+    VerifyRecoveredNativeSampling {
+        session: WireSession,
+        key: WireKey,
+        sequence: u64,
+        issuing_session_generation: u64,
+    },
     AckAfterAppliedRevision {
         session: WireSession,
         key: WireKey,
@@ -703,6 +709,11 @@ pub enum Response {
     Inventory(Vec<WireSlot>),
     SlotObserved(WireObservation),
     Retained(Option<WireRetained>),
+    RecoveredNativeSampling {
+        key: WireKey,
+        sequence: u64,
+        sample: WireResourceSample,
+    },
     Acked {
         key: WireKey,
         applied_revision: u64,
@@ -816,6 +827,41 @@ impl NativeSamplingAdmission {
     }
 }
 
+fn recovered_sampling_slots_match(
+    binding: &crate::NativeGuardianBinding,
+    wire: &WireNativeBinding,
+    live: &WireSnapshot,
+    diagnostics: &[(Option<ProcessIdentity>, ChildSlotObservation)],
+) -> bool {
+    let slots = binding.slots();
+    slots.len() == wire.slots.len()
+        && slots.len() == live.slots.len()
+        && slots.len() == diagnostics.len()
+        && slots
+            .iter()
+            .zip(&wire.slots)
+            .zip(&live.slots)
+            .zip(diagnostics)
+            .enumerate()
+            .all(|(index, (((stored, native), slot), diagnostic))| {
+                let observation = match stored.liveness {
+                    crate::NativeSlotLiveness::Running => WireObservation::Running,
+                    crate::NativeSlotLiveness::Exited => WireObservation::Exited,
+                    crate::NativeSlotLiveness::Unavailable => WireObservation::Unavailable,
+                };
+                let observed_slot = match stored.liveness {
+                    crate::NativeSlotLiveness::Running => ChildSlotObservation::Running,
+                    crate::NativeSlotLiveness::Exited => ChildSlotObservation::Exited,
+                    crate::NativeSlotLiveness::Unavailable => ChildSlotObservation::Unavailable,
+                };
+                WireIdentity::from(stored.process) == native.identity
+                    && native.liveness == observation
+                    && slot.instance == live.instance
+                    && slot.ordinal == (index + 1) as u64
+                    && *diagnostic == (Some(stored.process), observed_slot)
+            })
+}
+
 // Affine authority is held server-side; only correlation keys can be decoded.
 pub struct GuardianServer<E: GuardianExecutor> {
     guardian: Guardian<E>,
@@ -838,6 +884,7 @@ pub struct GuardianServer<E: GuardianExecutor> {
     refused: Vec<DispatchTicket>,
     admissions: BTreeMap<u64, (ControllerSession, DispatchTicket)>,
     native_admissions: BTreeMap<u64, NativeSamplingAdmission>,
+    native_retained_origins: Vec<(DispatchKey, u64, NonZeroU64)>,
     next_admission: u64,
     native_unbound: bool,
     native_identity: Option<crate::NativeGuardianIdentity>,
@@ -874,6 +921,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             refused: Vec::new(),
             admissions: BTreeMap::new(),
             native_admissions: BTreeMap::new(),
+            native_retained_origins: Vec::new(),
             next_admission: 1,
             native_unbound: false,
             native_identity: None,
@@ -1139,6 +1187,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::Inventory
                     | Request::ObserveSlot { .. }
                     | Request::ObserveRetained { .. }
+                    | Request::VerifyRecoveredNativeSampling { .. }
                     | Request::Fence { .. }
                     | Request::BeginReconciliation { .. }
                     | Request::FinishReconciliation { .. }
@@ -1447,6 +1496,101 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             }
         })
     }
+    fn verify_recovered_native_sampling(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        sequence: u64,
+        issuing_session_generation: u64,
+    ) -> Result<Response, WireError> {
+        if !self.native_unbound {
+            return Err(WireError::UnsupportedDurableBinding);
+        }
+        self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        let origin = NonZeroU64::new(issuing_session_generation).ok_or(WireError::InvalidValue)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .sampling_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeSamplingStatus::IssuedPendingApplication { issue } = status else {
+            return Err(WireError::MissingProof);
+        };
+        let current = binding.current_session();
+        if live.state != WireState::Reconciling
+            || live.session != session
+            || live.session.instance != live.instance
+            || live.session.generation == 0
+            || live.attempt != key.attempt_id().get()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || binding.attempt_id() != key.attempt_id()
+            || checkpoint.attempt_id() != key.attempt_id()
+            || checkpoint.phase() != crate::Phase::Interrupted
+            || checkpoint.interrupted_sampling_sequence() != Some(sequence)
+            || checkpoint.deadline() != binding.deadline()
+            || checkpoint.persistence_revision() != current.interruption_revision
+            || binding.dispatch_floor() != current.interruption_revision
+            || key.revision() >= current.interruption_revision
+            || current.state != crate::NativeSessionState::Reconciling
+            || current.generation.get() != session.generation
+            || origin >= current.generation
+            || !binding
+                .sessions()
+                .iter()
+                .any(|old| old.generation == origin)
+            || issue.key() != key
+            || issue.sequence() != sequence
+            || issue.session_generation() != origin
+            || issue.guardian_identity() != binding.identity()
+            || !self
+                .native_retained_origins
+                .contains(&(key, sequence, origin))
+            || self.native_identity != Some(binding.identity())
+            || binding.deadline() != self.guardian.original_deadline()
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.guardian != WireIdentity::from(binding.identity().process)
+            || !recovered_sampling_slots_match(
+                &binding,
+                wire,
+                &live,
+                &self.guardian.diagnostic_slots(),
+            )
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        let Some(retained) = self.guardian.retained_result(key) else {
+            return Err(WireError::MissingProof);
+        };
+        let WireCompletion::SampleResources {
+            sequence: returned,
+            result: Ok(sample),
+        } = WireRetained::from(retained).completion
+        else {
+            return Err(WireError::MissingProof);
+        };
+        if returned != sequence
+            || sample.sequence != sequence
+            || crate::CpuContentionBasisPoints::new(sample.cpu_basis_points).is_err()
+        {
+            return Err(WireError::MissingProof);
+        }
+        Ok(Response::RecoveredNativeSampling {
+            key: key.try_into()?,
+            sequence,
+            sample,
+        })
+    }
+
     fn native_sampling_ack(
         &mut self,
         session: ControllerSession,
@@ -1539,6 +1683,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     crate::AppliedResultAck::after_applied(session, key),
                 )
                 .map_err(WireError::from)?;
+            self.native_retained_origins
+                .retain(|(stored, _, _)| *stored != key);
             self.native_ack_receipts.push(receipt);
         }
         Ok(Response::Acked {
@@ -1645,10 +1791,17 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         }
         self.validate_native_sampling_evidence(session, admission.key(), admission.sequence())?;
         let now = native_reconciliation_now()?;
+        let origin = (
+            admission.sequence(),
+            NonZeroU64::new(admission.session().generation()).ok_or(WireError::InvalidValue)?,
+        );
         match self.guardian.submit_native_sampling(admission, now) {
-            Ok(key) => Ok(Response::Submitted {
-                key: key.try_into()?,
-            }),
+            Ok(key) => {
+                self.native_retained_origins.push((key, origin.0, origin.1));
+                Ok(Response::Submitted {
+                    key: key.try_into()?,
+                })
+            }
             Err(crate::guardian::PolicySubmissionError::Refused { error, .. }) => Err(error.into()),
             Err(crate::guardian::PolicySubmissionError::ExecutorCorrelationMismatch) => {
                 Err(GuardianError::ExecutorCorrelationMismatch.into())
@@ -1804,6 +1957,17 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 let key = self.resolve_key(key)?;
                 Response::Retained(self.guardian.retained_result(key).map(WireRetained::from))
             }
+            Request::VerifyRecoveredNativeSampling {
+                session,
+                key,
+                sequence,
+                issuing_session_generation,
+            } => self.verify_recovered_native_sampling(
+                session,
+                key,
+                sequence,
+                issuing_session_generation,
+            )?,
             Request::AckAfterAppliedRevision {
                 session,
                 key,
@@ -2107,9 +2271,9 @@ mod tests {
             read_frame::<Request>(&mut Cursor::new(unknown)),
             Err(CodecError::UnsupportedVersion(version)) if version == unsupported
         ));
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         let old = serde_json::to_vec(&Envelope {
-            version: 3,
+            version: 4,
             body: Request::Snapshot,
         })
         .unwrap();
@@ -2117,7 +2281,7 @@ mod tests {
         old_frame.extend(old);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(old_frame)),
-            Err(CodecError::UnsupportedVersion(3))
+            Err(CodecError::UnsupportedVersion(4))
         ));
         let mut unknown_op = Vec::new();
         let bytes =
@@ -2809,12 +2973,19 @@ mod native_evidence_tests {
     }
 
     fn native_ack_fixture() -> NativeAckFixture {
+        native_ack_fixture_with_options(true, std::time::Duration::from_secs(120))
+    }
+
+    fn native_ack_fixture_with_options(
+        successful: bool,
+        remaining: std::time::Duration,
+    ) -> NativeAckFixture {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("controller.sqlite");
         let attempt = AttemptId::new(921);
         let deadline = MonotonicTick::native_now()
             .unwrap()
-            .checked_add(std::time::Duration::from_secs(120))
+            .checked_add(remaining)
             .unwrap();
         let mut store = ControllerSqliteStore::open(&path).unwrap();
         let policy = ResourcePolicy::new(
@@ -2831,7 +3002,7 @@ mod native_evidence_tests {
         let (guardian, session) = Guardian::new(
             attempt,
             deadline,
-            SamplingExecutor(calls.clone(), true),
+            SamplingExecutor(calls.clone(), successful),
             vec![identity(42)],
         )
         .unwrap();
@@ -3058,6 +3229,217 @@ mod native_evidence_tests {
             .commit_native_sampling_recovery_at(loaded, &binding, crate::MonotonicTick::new(0))
             .unwrap();
         (session, committed)
+    }
+
+    fn dispatch_native_without_application(fixture: &mut NativeAckFixture) {
+        let Response::Admitted { admission } = fixture.server.handle(Request::DispatchAdmit {
+            session: fixture.active_session,
+            key: fixture.key,
+            effect: WireEffect::SampleResources {
+                sequence: fixture.issue.sequence(),
+            },
+        }) else {
+            panic!("admission")
+        };
+        assert_eq!(
+            fixture.server.handle(Request::DispatchSubmit {
+                session: fixture.active_session,
+                admission,
+                now: 0,
+            }),
+            Response::Submitted { key: fixture.key }
+        );
+        assert_eq!(
+            fixture.server.native_retained_origins,
+            vec![(
+                fixture.issue.key(),
+                fixture.issue.sequence(),
+                fixture.issue.session_generation()
+            )]
+        );
+    }
+
+    fn recovery_request(fixture: &NativeAckFixture, session: WireSession) -> Request {
+        Request::VerifyRecoveredNativeSampling {
+            session,
+            key: fixture.key,
+            sequence: fixture.issue.sequence(),
+            issuing_session_generation: fixture.issue.session_generation().get(),
+        }
+    }
+
+    #[test]
+    fn native_recovery_reads_only_exact_pending_sample_after_fence() {
+        let mut fixture = native_ack_fixture();
+        dispatch_native_without_application(&mut fixture);
+        assert!(matches!(
+            fixture
+                .server
+                .handle(recovery_request(&fixture, fixture.active_session)),
+            Response::Refused(WireError::MissingProof)
+        ));
+        let session = reconnect_ack_session(&mut fixture);
+        assert_eq!(fixture.server.native_retained_origins.len(), 1);
+        let request = recovery_request(&fixture, session);
+        let expected = Response::RecoveredNativeSampling {
+            key: fixture.key,
+            sequence: fixture.issue.sequence(),
+            sample: WireResourceSample {
+                sequence: fixture.issue.sequence(),
+                memory_bytes: 11,
+                storage_bytes: 12,
+                cpu_basis_points: 42,
+                memory_pressure: WireMemoryPressure::Normal,
+            },
+        };
+        assert_eq!(fixture.server.handle(request.clone()), expected);
+        assert_eq!(fixture.server.handle(request), expected);
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .store
+                .load_native_sampling_status(fixture.issue.key())
+                .unwrap(),
+            Some(crate::NativeSamplingStatus::IssuedPendingApplication {
+                issue: fixture.issue
+            })
+        );
+        let loaded = fixture
+            .store
+            .load_attempt(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let candidate = fixture
+            .store
+            .prepare_native_sampling_recovery(loaded)
+            .unwrap();
+        let sample = crate::ResourceSample {
+            sequence: fixture.issue.sequence(),
+            capacity: crate::ResourceCapacity {
+                available_memory_bytes: 11,
+                available_storage_bytes: 12,
+            },
+            contention: crate::ResourceContention {
+                cpu: CpuContentionBasisPoints::new(42).unwrap(),
+                memory_pressure: MemoryPressure::Nominal,
+            },
+        };
+        let status = fixture
+            .store
+            .apply_recovered_native_sampling(
+                crate::VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+            )
+            .unwrap();
+        let crate::NativeSamplingStatus::AppliedPendingAck {
+            applying_revision, ..
+        } = status
+        else {
+            panic!("applied")
+        };
+        assert_eq!(
+            fixture.server.handle(recovery_request(&fixture, session)),
+            Response::Refused(WireError::MissingProof)
+        );
+        assert_eq!(
+            fixture.server.handle(Request::AckAfterAppliedRevision {
+                session,
+                key: fixture.key,
+                applied_revision: applying_revision.get(),
+            }),
+            Response::Acked {
+                key: fixture.key,
+                applied_revision: applying_revision.get()
+            }
+        );
+        assert!(fixture.server.native_retained_origins.is_empty());
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_recovery_refuses_failed_completion_and_expired_deadline() {
+        let mut failed =
+            native_ack_fixture_with_options(false, std::time::Duration::from_secs(120));
+        dispatch_native_without_application(&mut failed);
+        let session = reconnect_ack_session(&mut failed);
+        assert_eq!(
+            failed.server.handle(recovery_request(&failed, session)),
+            Response::Refused(WireError::MissingProof)
+        );
+        assert_eq!(failed.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut expired = native_ack_fixture_with_options(true, std::time::Duration::from_secs(2));
+        dispatch_native_without_application(&mut expired);
+        let session = reconnect_ack_session(&mut expired);
+        let now = MonotonicTick::native_now().unwrap();
+        if now < expired.deadline {
+            std::thread::sleep(std::time::Duration::from_nanos(
+                expired.deadline.get() - now.get(),
+            ));
+        }
+        assert_eq!(
+            expired.server.handle(recovery_request(&expired, session)),
+            Response::Refused(WireError::MissingProof)
+        );
+        assert_eq!(expired.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_recovery_refuses_wrong_origin_key_sequence_session_and_state() {
+        for case in 0..8 {
+            let mut fixture = native_ack_fixture();
+            dispatch_native_without_application(&mut fixture);
+            let session = reconnect_ack_session(&mut fixture);
+            let mut request = recovery_request(&fixture, session);
+            match case {
+                0 => {
+                    if let Request::VerifyRecoveredNativeSampling {
+                        issuing_session_generation,
+                        ..
+                    } = &mut request
+                    {
+                        *issuing_session_generation = session.generation;
+                    }
+                }
+                1 => {
+                    if let Request::VerifyRecoveredNativeSampling { key, .. } = &mut request {
+                        key.ordinal += 1;
+                    }
+                }
+                2 => {
+                    if let Request::VerifyRecoveredNativeSampling { sequence, .. } = &mut request {
+                        *sequence += 1;
+                    }
+                }
+                3 => {
+                    if let Request::VerifyRecoveredNativeSampling { session, .. } = &mut request {
+                        session.generation -= 1;
+                    }
+                }
+                4 => {
+                    fixture.server.native_retained_origins[0].2 =
+                        NonZeroU64::new(session.generation).unwrap();
+                }
+                5 => {
+                    fixture
+                        .server
+                        .guardian
+                        .controller_lost(fixture.server.session)
+                        .unwrap();
+                }
+                6 => {
+                    fixture.server.native_identity = None;
+                }
+                7 => {
+                    fixture.server.native_reader = None;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(fixture.server.handle(request), Response::Refused(_)),
+                "case {case}"
+            );
+            assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
@@ -4314,6 +4696,7 @@ mod native_evidence_tests {
                 | Request::Inventory
                 | Request::ObserveSlot { .. }
                 | Request::ObserveRetained { .. }
+                | Request::VerifyRecoveredNativeSampling { .. }
                 | Request::ReserveSignalRound { .. } => WireError::UnsupportedDurableBinding,
             };
             assert_eq!(server.handle(request), Response::Refused(expected));

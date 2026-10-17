@@ -37,15 +37,24 @@ enum RunnerMode {
     InitialSample {
         deadline: MonotonicTick,
         root: ProcessIdentity,
-        pause_after_apply: bool,
+        fixture: InitialFixture,
     },
     RecoverAppliedAck,
+    RecoverUnappliedSample,
     RecoverAndFinish {
         fixture: FinishFixture,
     },
     RecoverFinishAndSample {
         fixture: SampleFixture,
     },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum InitialFixture {
+    Run,
+    PauseAfterObservation,
+    PauseAfterApplication,
 }
 
 #[cfg(unix)]
@@ -85,7 +94,7 @@ impl RecoveryRun {
 
 #[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-apply] | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply] | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -112,6 +121,7 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
             }
         }
         "recover-applied-ack" if args.len() == 8 => RunnerMode::RecoverAppliedAck,
+        "recover-unapplied-sample" if args.len() == 8 => RunnerMode::RecoverUnappliedSample,
         "recover-and-finish" if args.len() == 8 => RunnerMode::RecoverAndFinish {
             fixture: FinishFixture::Run,
         },
@@ -141,7 +151,9 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
                 && args[10] == "--root-pid"
                 && args[12] == "--root-birth-seconds"
                 && args[14] == "--root-birth-nanos"
-                && (args.len() == 16 || args[16] == "--fixture-pause-after-apply") =>
+                && (args.len() == 16
+                    || args[16] == "--fixture-pause-after-apply"
+                    || args[16] == "--fixture-pause-after-observation") =>
         {
             let pid = u32::try_from(number(11)?)
                 .ok()
@@ -154,7 +166,14 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
                     ProcessId::new(pid),
                     BirthToken::new(number(13)?, nanos).map_err(|_| usage)?,
                 ),
-                pause_after_apply: args.len() == 17,
+                fixture: match args.get(16).and_then(|flag| flag.to_str()) {
+                    None => InitialFixture::Run,
+                    Some("--fixture-pause-after-observation") => {
+                        InitialFixture::PauseAfterObservation
+                    }
+                    Some("--fixture-pause-after-apply") => InitialFixture::PauseAfterApplication,
+                    _ => return Err(usage.into()),
+                },
             }
         }
         _ => return Err(usage.into()),
@@ -626,6 +645,50 @@ fn run_recover_and_finish(
     std::io::stdout().flush().map_err(|e| e.to_string())
 }
 
+fn run_recover_unapplied_sample(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    attempt: AttemptId,
+    session: phoenix_deployment_controller::guardian_ipc::WireSession,
+) -> Result<(), String> {
+    let loaded = store
+        .load_attempt(attempt)
+        .map_err(|error| error.to_string())?
+        .ok_or("missing interrupted attempt")?;
+    let candidate = store
+        .prepare_native_sampling_recovery(loaded)
+        .map_err(|error| format!("prepare recovered sample: {error}"))?;
+    let issue = candidate.issue();
+    let verified = client
+        .verify_recovered_native_sampling(candidate)
+        .map_err(|error| format!("verify recovered sample: {error:?}"))?;
+    let applied = store
+        .apply_recovered_native_sampling(verified)
+        .map_err(|error| format!("apply recovered sample: {error}"))?;
+    if !matches!(applied, NativeSamplingStatus::AppliedPendingAck { issue: stored, sample, .. }
+        if stored == issue && sample.sequence == issue.sequence())
+    {
+        return Err("recovered sample did not produce exact pending ACK".into());
+    }
+    let confirmed = recover_native_sampling_ack(store, client, issue.key())
+        .map_err(|error| format!("recovered sample ACK: {error:?}"))?;
+    if !matches!(confirmed, NativeSamplingStatus::SampleAckConfirmed {
+        issue: stored, sample, confirming_session_generation, ..
+    } if stored == issue && sample.sequence == issue.sequence()
+        && confirming_session_generation.get() == session.generation)
+    {
+        return Err("recovered sample ACK confirmation mismatch".into());
+    }
+    println!(
+        "recovered_sample_applied_ack attempt={} revision={} ordinal={} sequence={}",
+        issue.key().attempt_id().get(),
+        issue.key().revision().get(),
+        issue.key().ordinal(),
+        issue.sequence()
+    );
+    std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
 fn dispatch_sampling(
     store: &mut ControllerSqliteStore,
     client: &mut GuardianClient,
@@ -651,12 +714,23 @@ fn dispatch_sampling(
     }
 }
 
+fn initial_fixture_gate() -> Result<(), String> {
+    let mut byte = [0];
+    std::io::stdin()
+        .read_exact(&mut byte)
+        .map_err(|error| format!("fixture gate EOF: {error}"))?;
+    if byte != [b'R'] {
+        return Err("invalid fixture gate release".into());
+    }
+    Ok(())
+}
+
 fn run_initial_sample(
     config: &RunnerConfig,
     store: &mut ControllerSqliteStore,
     client: &mut GuardianClient,
     committed: CommittedTransition,
-    pause_after_apply: bool,
+    fixture: InitialFixture,
 ) -> Result<(), String> {
     let binding = store
         .load_native_binding(config.attempt)
@@ -671,6 +745,30 @@ fn run_initial_sample(
     let verified = client
         .observe_native_sampling(dispatched)
         .map_err(|error| format!("observe sample: {error:?}"))?;
+    if matches!(fixture, InitialFixture::PauseAfterObservation) {
+        let snapshot = client
+            .snapshot()
+            .map_err(|error| format!("observed snapshot: {error:?}"))?;
+        if snapshot.state != WireState::Active
+            || snapshot.retained.len() != 1
+            || snapshot.retained[0].key
+                != phoenix_deployment_controller::guardian_ipc::WireKey::try_from(issue.key())
+                    .map_err(|error| format!("issue key: {error:?}"))?
+            || !matches!(snapshot.retained[0].completion, phoenix_deployment_controller::guardian_ipc::WireCompletion::SampleResources { sequence, result: Ok(_), } if sequence == issue.sequence())
+        {
+            return Err("observation fixture lacks exact active retained sample".into());
+        }
+        println!(
+            "sample_observed_pending_application revision={} sequence={} snapshot={}",
+            issue.key().revision().get(),
+            issue.sequence(),
+            serde_json::to_string(&snapshot).map_err(|error| error.to_string())?
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        initial_fixture_gate()?;
+    }
     let progress = policy
         .apply_native_sampling(verified, store)
         .map_err(|error| format!("apply sample: {error:?}"))?;
@@ -691,7 +789,7 @@ fn run_initial_sample(
     if key != issue.key() {
         return Err("wrong pending ACK".into());
     }
-    if pause_after_apply {
+    if matches!(fixture, InitialFixture::PauseAfterApplication) {
         println!(
             "application_committed_pending_ack revision={}",
             key.revision().get()
@@ -699,13 +797,7 @@ fn run_initial_sample(
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
-        let mut byte = [0];
-        std::io::stdin()
-            .read_exact(&mut byte)
-            .map_err(|error| format!("fixture gate EOF: {error}"))?;
-        if byte != [b'R'] {
-            return Err("invalid fixture gate release".into());
-        }
+        initial_fixture_gate()?;
     }
     let confirmed = recover_native_sampling_ack(store, client, key)
         .map_err(|error| format!("ACK: {error:?}"))?;
@@ -759,6 +851,7 @@ fn main() -> Result<(), String> {
     if matches!(
         config.mode,
         RunnerMode::RecoverAppliedAck
+            | RunnerMode::RecoverUnappliedSample
             | RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
     ) && status == VerifiedBindingStatus::InitialActive
@@ -799,7 +892,8 @@ fn main() -> Result<(), String> {
                 RunnerMode::RecoverFinishAndSample { .. }
                 | RunnerMode::ObserveOnly { .. }
                 | RunnerMode::InitialSample { .. }
-                | RunnerMode::RecoverAppliedAck => FinishFixture::Run,
+                | RunnerMode::RecoverAppliedAck
+                | RunnerMode::RecoverUnappliedSample => FinishFixture::Run,
             },
         )?)
     };
@@ -823,19 +917,23 @@ fn main() -> Result<(), String> {
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
             RecoveryRun::FinishAndSample(fixture),
         ),
+        RunnerMode::RecoverUnappliedSample => run_recover_unapplied_sample(
+            &mut store,
+            &mut client,
+            config.attempt,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
+        ),
         RunnerMode::RecoverAppliedAck => run_recover_applied_ack(
             &mut store,
             &mut client,
             pending_recovery_key.ok_or("missing preflight pending ACK")?,
         ),
-        RunnerMode::InitialSample {
-            pause_after_apply, ..
-        } => run_initial_sample(
+        RunnerMode::InitialSample { fixture, .. } => run_initial_sample(
             &config,
             &mut store,
             &mut client,
             committed.ok_or("missing committed transition")?,
-            pause_after_apply,
+            fixture,
         ),
     }
 }
@@ -913,12 +1011,110 @@ mod tests {
             parse_args(&initial),
             Ok(RunnerConfig {
                 mode: RunnerMode::InitialSample {
-                    pause_after_apply: true,
+                    fixture: InitialFixture::PauseAfterApplication,
                     ..
                 },
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn unapplied_recovery_and_initial_fixtures_are_mode_specific() {
+        assert!(matches!(
+            parse_args(&args("recover-unapplied-sample")),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverUnappliedSample,
+                ..
+            })
+        ));
+        let mut initial = args("initial-sample");
+        initial.extend(
+            [
+                "--deadline-nanoseconds",
+                "100",
+                "--root-pid",
+                "42",
+                "--root-birth-seconds",
+                "1",
+                "--root-birth-nanos",
+                "0",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        assert!(matches!(
+            parse_args(&initial),
+            Ok(RunnerConfig {
+                mode: RunnerMode::InitialSample {
+                    fixture: InitialFixture::Run,
+                    ..
+                },
+                ..
+            })
+        ));
+        for (flag, fixture) in [
+            (
+                "--fixture-pause-after-observation",
+                InitialFixture::PauseAfterObservation,
+            ),
+            (
+                "--fixture-pause-after-apply",
+                InitialFixture::PauseAfterApplication,
+            ),
+        ] {
+            let mut selected = initial.clone();
+            selected.push(flag.into());
+            assert!(matches!(
+                (parse_args(&selected), fixture),
+                (
+                    Ok(RunnerConfig {
+                        mode: RunnerMode::InitialSample {
+                            fixture: InitialFixture::PauseAfterObservation,
+                            ..
+                        },
+                        ..
+                    }),
+                    InitialFixture::PauseAfterObservation
+                ) | (
+                    Ok(RunnerConfig {
+                        mode: RunnerMode::InitialSample {
+                            fixture: InitialFixture::PauseAfterApplication,
+                            ..
+                        },
+                        ..
+                    }),
+                    InitialFixture::PauseAfterApplication
+                )
+            ));
+            for second in [
+                "--fixture-pause-after-observation",
+                "--fixture-pause-after-apply",
+            ] {
+                let mut duplicate = selected.clone();
+                duplicate.push(second.into());
+                assert!(parse_args(&duplicate).is_err(), "{flag} + {second}");
+            }
+            for mode in [
+                "recover-applied-ack",
+                "recover-unapplied-sample",
+                "recover-and-finish",
+                "recover-finish-and-sample",
+            ] {
+                let mut invalid = args(mode);
+                invalid.push(flag.into());
+                assert!(parse_args(&invalid).is_err(), "{mode} + {flag}");
+            }
+        }
+        for flag in [
+            "--fixture-pause-before-begin",
+            "--fixture-activation-barriers",
+            "--fixture-activation-and-sample-barriers",
+        ] {
+            let mut invalid = args("recover-unapplied-sample");
+            invalid.push(flag.into());
+            assert!(parse_args(&invalid).is_err(), "unapplied + {flag}");
+        }
     }
 
     #[test]
@@ -938,7 +1134,7 @@ mod tests {
                     ProcessId::new(NonZeroU32::new(42).unwrap()),
                     BirthToken::new(1, 0).unwrap(),
                 ),
-                pause_after_apply: false,
+                fixture: InitialFixture::Run,
             },
         };
         let snapshot = WireSnapshot {
@@ -1045,7 +1241,7 @@ mod tests {
                 mode: RunnerMode::InitialSample {
                     deadline,
                     root,
-                    pause_after_apply: false,
+                    fixture: InitialFixture::Run,
                 },
             };
             std::thread::scope(|scope| {
@@ -1088,8 +1284,14 @@ mod tests {
                 });
                 let mut client = GuardianClient::connect(&socket_dir).unwrap();
                 client.hello().unwrap();
-                let error = run_initial_sample(&config, &mut store, &mut client, committed, false)
-                    .unwrap_err();
+                let error = run_initial_sample(
+                    &config,
+                    &mut store,
+                    &mut client,
+                    committed,
+                    InitialFixture::Run,
+                )
+                .unwrap_err();
                 assert!(
                     error.starts_with("dispatch known unsubmitted (issue cancelled):"),
                     "{error}"
@@ -1294,6 +1496,7 @@ mod tests {
             "observe-only",
             "initial-sample",
             "recover-applied-ack",
+            "recover-unapplied-sample",
             "recover-and-finish",
             "recover-finish-and-sample",
         ] {
@@ -1315,6 +1518,7 @@ mod tests {
             baseline.extend(options.iter().map(OsString::from));
             assert!(parse_args(&baseline).is_ok());
             for (flag, owner) in [
+                ("--fixture-pause-after-observation", "initial-sample"),
                 ("--fixture-pause-after-apply", "initial-sample"),
                 ("--fixture-pause-before-begin", "recover-and-finish"),
                 ("--fixture-activation-barriers", "recover-and-finish"),

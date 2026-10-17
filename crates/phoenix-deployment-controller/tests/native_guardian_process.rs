@@ -91,6 +91,14 @@ impl GuardedRunner {
         self.child.wait().ok();
         self.armed = false;
     }
+
+    fn kill_checked(&mut self) {
+        assert!(self.child.try_wait().unwrap().is_none());
+        self.child.kill().unwrap();
+        let status = self.child.wait().unwrap();
+        assert!(!status.success());
+        self.armed = false;
+    }
 }
 
 impl std::ops::Deref for GuardedRunner {
@@ -867,6 +875,293 @@ fn sample_death_and_recover(lost_response: bool, finish_reconciliation: bool) {
     }
     guardian.finish();
     wait_process_gone(child_pid, Duration::from_secs(5));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn observed_first_sample_survives_runner_death_before_application() {
+    use phoenix_deployment_controller::guardian_ipc::WireCompletion;
+    let parent = tempfile::Builder::new()
+        .prefix("sdc-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = parent.path().join("sdc-disposable-unapplied-sample");
+    let path = parent.path().join("controller.sqlite");
+    let attempt = AttemptId::new(64);
+    let deadline = MonotonicTick::native_now()
+        .unwrap()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
+    drop(ControllerSqliteStore::open(&path).unwrap());
+    let mut guardian = GuardedGuardian::new(
+        Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"))
+            .args([
+                "--socket-dir",
+                dir.to_str().unwrap(),
+                "--child-seconds",
+                "25",
+                "--serve-seconds",
+                "30",
+                "--attempt",
+                "64",
+                "--deadline-nanoseconds",
+                &deadline.get().to_string(),
+                "--store",
+                path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut guardian_output = BufReader::new(guardian.stdout.take().unwrap());
+    assert!(line(&mut guardian_output).starts_with("disposable child pid="));
+    let mut initial = GuardedRunner::new(
+        sampling_runner_command(&dir, &path, deadline, false)
+            .arg("--fixture-pause-after-observation")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = BufReader::new(initial.stdout.take().unwrap());
+    assert_eq!(line(&mut output), "verified binding: InitialActive");
+    let marker = line(&mut output);
+    let (prefix, json) = marker.split_once(" snapshot=").expect("observation marker");
+    let active: WireSnapshot = serde_json::from_str(json).unwrap();
+    assert_eq!(active.state, WireState::Active);
+    assert_eq!(active.session.generation, 1);
+    assert_eq!(active.retained.len(), 1);
+    assert_eq!(active.attempt, attempt.get());
+    assert_eq!(active.deadline, deadline.get());
+    let retained = &active.retained[0];
+    assert_eq!(retained.key.attempt, attempt.get());
+    assert_eq!(retained.key.ordinal, 0);
+    let WireCompletion::SampleResources {
+        sequence: 0,
+        result: Ok(wire_sample),
+    } = retained.completion
+    else {
+        panic!("expected exactly one successful seq0 completion: {retained:?}");
+    };
+    assert_eq!(wire_sample.sequence, 0);
+    assert_eq!(
+        prefix,
+        format!(
+            "sample_observed_pending_application revision={} sequence=0",
+            retained.key.revision
+        )
+    );
+    assert!(
+        initial.try_wait().unwrap().is_none(),
+        "runner remains at observation gate"
+    );
+    let db =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let counts = || {
+        [
+            "native_sampling_issues",
+            "native_sampling_applications",
+            "native_sampling_ack_confirmations",
+            "native_reconciliation_completions",
+            "native_reconciliation_activations",
+        ]
+        .map(|table| {
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    assert_eq!(counts(), [1, 0, 0, 0, 0]);
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    let child = binding.slots()[0].process;
+    let child_pid = i32::try_from(child.pid().get()).unwrap();
+    assert_eq!(binding.identity().process.pid().get(), guardian.id());
+    assert_eq!(binding.deadline(), deadline);
+    assert_eq!(
+        active.native_binding.as_ref().unwrap().nonce,
+        binding.identity().nonce.bytes()
+    );
+    assert_eq!(
+        active.native_binding.as_ref().unwrap().guardian,
+        binding.identity().process.into()
+    );
+    assert_eq!(
+        active.native_binding.as_ref().unwrap().slots[0].identity,
+        child.into()
+    );
+    let issue_revision = phoenix_deployment_controller::PersistenceRevision::new(
+        std::num::NonZeroU64::new(retained.key.revision).unwrap(),
+    );
+    let issued: (Vec<u8>, i64, Vec<u8>, Vec<u8>) = db.query_row(
+        "SELECT dispatch_revision, ordinal, sequence, session_generation FROM native_sampling_issues",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(
+        u64::from_be_bytes(issued.0.try_into().unwrap()),
+        issue_revision.get()
+    );
+    assert_eq!(issued.1, 0);
+    assert_eq!(u64::from_be_bytes(issued.2.try_into().unwrap()), 0);
+    assert_eq!(u64::from_be_bytes(issued.3.try_into().unwrap()), 1);
+    assert!(observed
+        .pending_native_sampling_ack(attempt)
+        .unwrap()
+        .is_none());
+    let checkpoint = observed.load_attempt(attempt).unwrap().unwrap();
+    assert_eq!(checkpoint.phase(), Phase::ResourceSampling);
+    assert_eq!(checkpoint.persistence_revision(), issue_revision);
+    assert_eq!(checkpoint.deadline(), deadline);
+    let mut os = MacOsControllerOs::new(&dir).unwrap();
+    assert!(matches!(
+        os.observe_identity(binding.identity().process),
+        IdentityObservation::SameIdentity { .. }
+    ));
+    assert!(matches!(
+        os.observe_identity(child),
+        IdentityObservation::SameIdentity { .. }
+    ));
+    assert_guardian_is_parent(child_pid, guardian.id());
+
+    initial.kill_checked();
+    let detached = wait_for_detached(&dir);
+    assert_eq!(detached.state, WireState::DetachedFenced);
+    assert_eq!(detached.instance, active.instance);
+    assert_eq!(detached.attempt, active.attempt);
+    assert_eq!(detached.deadline, active.deadline);
+    assert_eq!(detached.slots, active.slots);
+    assert_eq!(detached.native_binding, active.native_binding);
+    assert_eq!(detached.retained, active.retained);
+    assert!(guardian.try_wait().unwrap().is_none());
+    assert_guardian_is_parent(child_pid, guardian.id());
+    assert_eq!(counts(), [1, 0, 0, 0, 0]);
+
+    let mut replacement = GuardedRunner::new(
+        Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
+            .args([
+                "--mode",
+                "recover-unapplied-sample",
+                "--socket-dir",
+                dir.to_str().unwrap(),
+                "--store",
+                path.to_str().unwrap(),
+                "--attempt",
+                "64",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert_ne!(initial.id(), replacement.id());
+    let mut replacement_output = BufReader::new(replacement.stdout.take().unwrap());
+    assert!(line(&mut replacement_output).starts_with("verified binding: Detached"));
+    let reconciling = line(&mut replacement_output);
+    let interruption = issue_revision.checked_next().unwrap();
+    assert_eq!(
+        reconciling,
+        format!(
+            "reconciling generation=2 interruption={}",
+            interruption.get()
+        )
+    );
+    assert_eq!(
+        line(&mut replacement_output),
+        format!(
+            "recovered_sample_applied_ack attempt=64 revision={} ordinal=0 sequence=0",
+            issue_revision.get()
+        )
+    );
+    success(&mut replacement);
+    let mut remaining = String::new();
+    std::io::Read::read_to_string(&mut replacement_output, &mut remaining).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "no follow-up output/effect: {remaining}"
+    );
+    assert_eq!(counts(), [1, 1, 1, 0, 0]);
+    assert_eq!(
+        settled_sampling_keys(&path),
+        vec![(issue_revision.get(), 0, 0, 1, 2)]
+    );
+    assert!(observed
+        .pending_native_sampling_ack(attempt)
+        .unwrap()
+        .is_none());
+    let applied_revision = interruption.checked_next().unwrap();
+    let application: (Vec<u8>, Vec<u8>, Vec<u8>, i64, String) = db.query_row(
+        "SELECT applying_revision, available_memory, available_storage, cpu, pressure FROM native_sampling_applications",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).unwrap();
+    assert_eq!(
+        u64::from_be_bytes(application.0.try_into().unwrap()),
+        applied_revision.get()
+    );
+    assert_eq!(
+        u64::from_be_bytes(application.1.try_into().unwrap()),
+        wire_sample.memory_bytes
+    );
+    assert_eq!(
+        u64::from_be_bytes(application.2.try_into().unwrap()),
+        wire_sample.storage_bytes
+    );
+    assert_eq!(application.3, i64::from(wire_sample.cpu_basis_points));
+    assert_eq!(
+        application.4,
+        match wire_sample.memory_pressure {
+            phoenix_deployment_controller::guardian_ipc::WireMemoryPressure::Normal => "nominal",
+            phoenix_deployment_controller::guardian_ipc::WireMemoryPressure::Elevated => "warning",
+            phoenix_deployment_controller::guardian_ipc::WireMemoryPressure::Critical => "critical",
+        }
+    );
+    let generation: Vec<u8> = db
+        .query_row(
+            "SELECT confirming_session_generation FROM native_sampling_ack_confirmations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(u64::from_be_bytes(generation.try_into().unwrap()), 2);
+    let checkpoint = observed.load_attempt(attempt).unwrap().unwrap();
+    assert_eq!(checkpoint.phase(), Phase::Interrupted);
+    assert_eq!(checkpoint.persistence_revision(), applied_revision);
+    assert_eq!(checkpoint.deadline(), deadline);
+    let binding_after = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(binding_after.identity(), binding.identity());
+    assert_eq!(binding_after.slots(), binding.slots());
+    assert_eq!(binding_after.deadline(), deadline);
+    assert_eq!(
+        binding_after.current_session().state,
+        NativeSessionState::Reconciling
+    );
+    assert_eq!(binding_after.current_session().generation.get(), 2);
+    assert_eq!(
+        binding_after.current_session().interruption_revision,
+        interruption
+    );
+    let after = wait_for_detached(&dir);
+    assert_eq!(after.state, WireState::DetachedFenced);
+    assert_eq!(after.retained.len(), 0);
+    assert_eq!(after.native_binding, active.native_binding);
+    assert_eq!(after.deadline, active.deadline);
+    assert_eq!(after.slots, active.slots);
+    assert_eq!(after.instance, active.instance);
+    assert_guardian_is_parent(child_pid, guardian.id());
+    assert!(matches!(
+        os.observe_identity(binding.identity().process),
+        IdentityObservation::SameIdentity { .. }
+    ));
+    assert!(matches!(
+        os.observe_identity(child),
+        IdentityObservation::SameIdentity { .. }
+    ));
+    assert!(MonotonicTick::native_now().unwrap() < deadline);
+    let guardian_pid = i32::try_from(guardian.id()).unwrap();
+    guardian.finish();
+    wait_process_gone(child_pid, Duration::from_secs(5));
+    wait_process_gone(guardian_pid, Duration::from_secs(5));
 }
 
 #[test]

@@ -8,8 +8,9 @@ use super::{
 };
 use crate::{
     CpuContentionBasisPoints, DeploymentAttempt, DispatchKey, DispatchTicket, LoadedAttempt,
-    MemoryPressure, NativeGuardianBinding, NativeSessionState, OsEffect, PersistenceRevision,
-    ResourceCapacity, ResourceContention, ResourceObservationFailure, ResourceSample,
+    MemoryPressure, MonotonicTick, NativeGuardianBinding, NativeSessionState, OsEffect,
+    PersistenceRevision, ResourceCapacity, ResourceContention, ResourceObservationFailure,
+    ResourceSample,
 };
 
 /// A committed native sampling identity, not dispatch or result authority.
@@ -162,6 +163,60 @@ impl VerifiedNativeSamplingAckConfirmation {
     }
 }
 
+/// Store-validated, one-use interrupted sampling evidence. It grants no dispatch or ACK.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::NativeSamplingRecoveryCandidate;
+/// fn duplicate(candidate: NativeSamplingRecoveryCandidate) { let _ = candidate.clone(); }
+/// ```
+/// ```compile_fail
+/// use phoenix_deployment_controller::{DispatchTicket, NativeSamplingRecoveryCandidate};
+/// fn dispatch(candidate: NativeSamplingRecoveryCandidate) -> DispatchTicket { candidate.into() }
+/// ```
+#[derive(Debug)]
+pub struct NativeSamplingRecoveryCandidate {
+    loaded: LoadedAttempt,
+    binding: NativeGuardianBinding,
+    issue: NativeSamplingIssue,
+}
+
+impl NativeSamplingRecoveryCandidate {
+    #[must_use]
+    pub const fn issue(&self) -> NativeSamplingIssue {
+        self.issue
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &NativeGuardianBinding {
+        &self.binding
+    }
+}
+
+/// Positive same-guardian live observation; no executable or ACK authority.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::VerifiedRecoveredNativeSampling;
+/// fn duplicate(verified: VerifiedRecoveredNativeSampling) { let _ = verified.clone(); }
+/// ```
+/// ```compile_fail
+/// use phoenix_deployment_controller::{DispatchTicket, VerifiedRecoveredNativeSampling};
+/// fn dispatch(verified: VerifiedRecoveredNativeSampling) -> DispatchTicket { verified.into() }
+/// ```
+#[derive(Debug)]
+pub struct VerifiedRecoveredNativeSampling {
+    candidate: NativeSamplingRecoveryCandidate,
+    sample: ResourceSample,
+}
+
+impl VerifiedRecoveredNativeSampling {
+    pub(crate) const fn after_live_verification(
+        candidate: NativeSamplingRecoveryCandidate,
+        sample: ResourceSample,
+    ) -> Self {
+        Self { candidate, sample }
+    }
+}
+
 /// Durable diagnostic classification; loading it never reconstructs authority.
 ///
 /// ```compile_fail
@@ -197,6 +252,82 @@ fn issue_params(issue: NativeSamplingIssue) -> (Vec<u8>, Word, i64) {
         Word(issue.key.revision().get()),
         i64::try_from(issue.key.ordinal()).expect("validated ordinal"),
     )
+}
+
+fn unique_recovery_issue(
+    tx: &rusqlite::Transaction<'_>,
+    attempt: crate::AttemptId,
+) -> Result<NativeSamplingIssue> {
+    let mut statement = tx.prepare(
+        "SELECT dispatch_revision, ordinal FROM native_sampling_issues WHERE attempt_id=?1",
+    )?;
+    let rows = statement.query_map([key(attempt)], |row| {
+        Ok((row.get::<_, Word>(0)?.0, row.get::<_, i64>(1)?))
+    })?;
+    let mut candidate = None;
+    for row in rows {
+        let (revision, ordinal) = row?;
+        let dispatch = DispatchKey::from_committed_parts(
+            attempt,
+            binding_revision(revision)?,
+            usize::try_from(ordinal)
+                .map_err(|_| ControllerStoreError::Malformed("invalid native ordinal"))?,
+        );
+        match read_status(tx, dispatch)? {
+            Some(NativeSamplingStatus::IssuedPendingApplication { issue }) => {
+                if candidate.replace(issue).is_some() {
+                    return Err(ControllerStoreError::RevisionConflict);
+                }
+            }
+            Some(NativeSamplingStatus::SampleAckConfirmed { .. }) => {}
+            _ => return Err(ControllerStoreError::RevisionConflict),
+        }
+    }
+    candidate.ok_or(ControllerStoreError::RevisionConflict)
+}
+
+pub(super) fn validate_recovery_candidate(
+    tx: &rusqlite::Transaction<'_>,
+    interrupted: &DeploymentAttempt,
+    expected: &NativeGuardianBinding,
+    issue: NativeSamplingIssue,
+    now: MonotonicTick,
+) -> Result<()> {
+    let session = expected.current_session();
+    if now >= interrupted.deadline()
+        || unique_recovery_issue(tx, interrupted.attempt_id())? != issue
+        || interrupted.attempt_id() != issue.key().attempt_id()
+        || interrupted.persistence_revision() != Some(session.interruption_revision)
+        || interrupted.interrupted_sampling_sequence() != Some(issue.sequence())
+        || interrupted.deadline() != expected.deadline()
+        || expected.attempt_id() != issue.key().attempt_id()
+        || expected.identity() != issue.guardian_identity()
+        || session.state != NativeSessionState::Reconciling
+        || issue.session_generation() >= session.generation
+        || issue.key().revision() >= session.interruption_revision
+        || expected.dispatch_floor() != session.interruption_revision
+        || read_attempt(tx, issue.key().attempt_id())?.as_ref() != Some(interrupted)
+        || read_binding(tx, issue.key().attempt_id())?.as_ref() != Some(expected)
+        || read_status(tx, issue.key())?
+            != Some(NativeSamplingStatus::IssuedPendingApplication { issue })
+    {
+        return Err(ControllerStoreError::RevisionConflict);
+    }
+    Ok(())
+}
+
+pub(super) fn native_deadline_now() -> Result<MonotonicTick> {
+    #[cfg(unix)]
+    {
+        MonotonicTick::native_now()
+            .map_err(|_| ControllerStoreError::Malformed("native monotonic clock unavailable"))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(ControllerStoreError::Malformed(
+            "native monotonic clock unavailable",
+        ))
+    }
 }
 
 impl ControllerSqliteStore {
@@ -403,6 +534,115 @@ impl ControllerSqliteStore {
             };
             tx.commit()?;
             Ok(evidence)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Consumes crash-loaded evidence only when the exact pending issue, interrupted
+    /// checkpoint, binding, and reconciling session are still durable.
+    /// # Errors
+    /// Any mismatch or storage failure poisons this handle.
+    pub fn prepare_native_sampling_recovery(
+        &mut self,
+        loaded: LoadedAttempt,
+    ) -> Result<NativeSamplingRecoveryCandidate> {
+        self.prepare_native_sampling_recovery_with_clock(loaded, native_deadline_now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_native_sampling_recovery_at(
+        &mut self,
+        loaded: LoadedAttempt,
+        now: MonotonicTick,
+    ) -> Result<NativeSamplingRecoveryCandidate> {
+        self.prepare_native_sampling_recovery_with_clock(loaded, || Ok(now))
+    }
+
+    fn prepare_native_sampling_recovery_with_clock(
+        &mut self,
+        loaded: LoadedAttempt,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeSamplingRecoveryCandidate> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            let id = loaded.checkpoint.attempt_id();
+            let binding = required(read_binding(&tx, id)?, "missing native binding")?;
+            let issue = unique_recovery_issue(&tx, id)?;
+            validate_recovery_candidate(&tx, &loaded.checkpoint, &binding, issue, clock()?)?;
+            if clock()? >= loaded.checkpoint.deadline() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.commit()?;
+            Ok(NativeSamplingRecoveryCandidate {
+                loaded,
+                binding,
+                issue,
+            })
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Applies only a live-verified successful nonterminal sample; returns diagnostics,
+    /// never a dispatch or ACK permit.
+    /// # Errors
+    /// Terminal outcomes, duplicate applications, mismatches, and storage failures
+    /// roll back and poison this handle.
+    pub fn apply_recovered_native_sampling(
+        &mut self,
+        verified: VerifiedRecoveredNativeSampling,
+    ) -> Result<NativeSamplingStatus> {
+        self.apply_recovered_native_sampling_with_clock(verified, native_deadline_now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_recovered_native_sampling_at(
+        &mut self,
+        verified: VerifiedRecoveredNativeSampling,
+        now: MonotonicTick,
+    ) -> Result<NativeSamplingStatus> {
+        self.apply_recovered_native_sampling_with_clock(verified, || Ok(now))
+    }
+
+    fn apply_recovered_native_sampling_with_clock(
+        &mut self,
+        verified: VerifiedRecoveredNativeSampling,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeSamplingStatus> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let VerifiedRecoveredNativeSampling { candidate, sample } = verified;
+            let NativeSamplingRecoveryCandidate {
+                loaded,
+                binding,
+                issue,
+            } = candidate;
+            let checkpoint = loaded
+                .checkpoint
+                .clone()
+                .fold_interrupted_sampling_sample(sample)
+                .ok_or(ControllerStoreError::RevisionConflict)?;
+            let revision = self.persist_checkpoint_with_sample(
+                &checkpoint,
+                Some((&issue, &NativeSamplingCompletion::Sample(sample))),
+                None,
+                Some((&loaded.checkpoint, &binding, &issue)),
+                &mut clock,
+            )?;
+            Ok(NativeSamplingStatus::AppliedPendingAck {
+                issue,
+                sample,
+                applying_revision: revision,
+            })
         })();
         if result.is_err() {
             self.poisoned = true;
@@ -786,6 +1026,508 @@ mod pending_lookup_tests {
         ));
         assert!(matches!(
             store.pending_native_sampling_ack(attempt),
+            Err(ControllerStoreError::Poisoned)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::{
+        AttemptStore, BirthToken, GuardianLifetimeNonce, MemoryPressure, MonotonicTick,
+        NativeGuardianIdentity, Phase, PolicyLoop, ProcessId, ProcessIdentity, ResourcePolicy,
+    };
+    use std::num::{NonZeroU32, NonZeroUsize};
+
+    fn fixture(
+        required: usize,
+    ) -> (
+        ControllerSqliteStore,
+        LoadedAttempt,
+        NativeGuardianBinding,
+        NativeSamplingIssue,
+        ResourceSample,
+    ) {
+        let mut store = ControllerSqliteStore::in_memory().unwrap();
+        let id = crate::AttemptId::new(721);
+        let process = ProcessIdentity::new(
+            ProcessId::new(NonZeroU32::new(42).unwrap()),
+            BirthToken::new(1, 0).unwrap(),
+        );
+        let committed = DeploymentAttempt::start(
+            id,
+            MonotonicTick::new(500),
+            ResourcePolicy::new(
+                NonZeroUsize::new(required).unwrap(),
+                10,
+                10,
+                CpuContentionBasisPoints::new(100).unwrap(),
+                MemoryPressure::Critical,
+            ),
+            process,
+        )
+        .persist(&mut store)
+        .unwrap();
+        let binding = store
+            .commit_initial_binding(
+                id,
+                MonotonicTick::new(500),
+                PersistenceRevision::first(),
+                NativeGuardianIdentity {
+                    nonce: GuardianLifetimeNonce::new([7; 16]).unwrap(),
+                    process,
+                },
+                &[],
+            )
+            .unwrap();
+        let checkpoint = committed.checkpoint().clone();
+        let mut policy = PolicyLoop::from_committed(committed);
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let binding = store.commit_detached_binding(&binding, &[]).unwrap();
+        let interrupted = checkpoint.interrupt().unwrap().persist(&mut store).unwrap();
+        let binding = store
+            .commit_fresh_interruption_binding(
+                &binding,
+                interrupted.checkpoint().persistence_revision().unwrap(),
+            )
+            .unwrap();
+        let loaded = store.load_attempt(id).unwrap().unwrap();
+        let sample = ResourceSample {
+            sequence: issue.sequence(),
+            capacity: ResourceCapacity {
+                available_memory_bytes: 100,
+                available_storage_bytes: 100,
+            },
+            contention: ResourceContention {
+                cpu: CpuContentionBasisPoints::new(0).unwrap(),
+                memory_pressure: MemoryPressure::Nominal,
+            },
+        };
+        (store, loaded, binding, issue, sample)
+    }
+
+    fn assert_unchanged_and_poisoned(
+        store: &mut ControllerSqliteStore,
+        original: &DeploymentAttempt,
+    ) {
+        assert_eq!(
+            read_attempt(&store.connection, original.attempt_id()).unwrap(),
+            Some(original.clone())
+        );
+        let applications: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_sampling_applications WHERE attempt_id=?1",
+                [key(original.attempt_id())],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applications, 0);
+        assert!(matches!(
+            store.load_attempt(original.attempt_id()),
+            Err(ControllerStoreError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn preparation_requires_exactly_one_pending_issue() {
+        let (mut store, loaded, _, issue, _) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        store
+            .connection
+            .execute(
+                "DELETE FROM native_sampling_issues WHERE attempt_id=?1",
+                [key(issue.key().attempt_id())],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499)),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_unchanged_and_poisoned(&mut store, &original);
+
+        let (mut store, loaded, binding, issue, _) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        insert_extra_pending_issue(&store, &binding, issue);
+        assert!(matches!(
+            store.prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499)),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_unchanged_and_poisoned(&mut store, &original);
+    }
+
+    fn insert_extra_pending_issue(
+        store: &ControllerSqliteStore,
+        binding: &NativeGuardianBinding,
+        issue: NativeSamplingIssue,
+    ) {
+        store.connection.execute(
+            "INSERT INTO native_sampling_issues (attempt_id,dispatch_revision,ordinal,session_generation,sequence) VALUES (?1,?2,0,?3,?4)",
+            params![
+                key(issue.key().attempt_id()),
+                Word(binding.current_session().interruption_revision.get()),
+                Word(binding.current_session().generation.get()),
+                Word(issue.sequence())
+            ],
+        ).unwrap();
+    }
+
+    #[test]
+    fn application_rejects_new_unsettled_issue_after_preparation() {
+        let (mut store, loaded, binding, issue, sample) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        insert_extra_pending_issue(&store, &binding, issue);
+        assert!(matches!(
+            store.apply_recovered_native_sampling_at(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                MonotonicTick::new(499)
+            ),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_unchanged_and_poisoned(&mut store, &original);
+    }
+
+    #[test]
+    fn preparation_refuses_original_deadline_without_writes() {
+        for now in [500, 501] {
+            let (mut store, loaded, _, _, _) = fixture(2);
+            let original = loaded.checkpoint.clone();
+            assert!(matches!(
+                store.prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(now)),
+                Err(ControllerStoreError::RevisionConflict)
+            ));
+            assert_unchanged_and_poisoned(&mut store, &original);
+        }
+    }
+
+    #[test]
+    fn application_refuses_original_deadline_without_writes() {
+        for now in [500, 501] {
+            let (mut store, loaded, _, _, sample) = fixture(2);
+            let original = loaded.checkpoint.clone();
+            let candidate = store
+                .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+                .unwrap();
+            assert!(matches!(
+                store.apply_recovered_native_sampling_at(
+                    VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                    MonotonicTick::new(now)
+                ),
+                Err(ControllerStoreError::RevisionConflict)
+            ));
+            assert_unchanged_and_poisoned(&mut store, &original);
+        }
+    }
+
+    #[test]
+    fn preparation_refuses_deadline_reached_after_validation() {
+        let (mut store, loaded, _, _, _) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        let mut ticks = [499, 500].into_iter();
+        assert!(matches!(
+            store.prepare_native_sampling_recovery_with_clock(loaded, || {
+                Ok(MonotonicTick::new(
+                    ticks.next().expect("unexpected clock read"),
+                ))
+            }),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_eq!(ticks.next(), None);
+        assert_unchanged_and_poisoned(&mut store, &original);
+    }
+
+    #[test]
+    fn application_rolls_back_when_deadline_reached_before_commit() {
+        let (mut store, loaded, _, _, sample) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        let mut ticks = [499, 500].into_iter();
+        assert!(matches!(
+            store.apply_recovered_native_sampling_with_clock(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                || Ok(MonotonicTick::new(
+                    ticks.next().expect("unexpected clock read")
+                )),
+            ),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_eq!(ticks.next(), None);
+        assert_unchanged_and_poisoned(&mut store, &original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_recovery_entries_use_native_deadline() {
+        let (mut store, loaded, _, _, _) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        assert!(matches!(
+            store.prepare_native_sampling_recovery(loaded),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_unchanged_and_poisoned(&mut store, &original);
+
+        let (mut store, loaded, _, _, sample) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        assert!(matches!(
+            store.apply_recovered_native_sampling(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample)
+            ),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_unchanged_and_poisoned(&mut store, &original);
+    }
+
+    #[test]
+    fn recovered_sample_is_atomic_interrupted_and_not_reapplied() {
+        let (mut store, loaded, binding, issue, sample) = fixture(2);
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        assert_eq!(candidate.issue(), issue);
+        assert_eq!(candidate.binding(), &binding);
+        let status = store
+            .apply_recovered_native_sampling_at(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                MonotonicTick::new(499),
+            )
+            .unwrap();
+        assert_eq!(
+            status,
+            NativeSamplingStatus::AppliedPendingAck {
+                issue,
+                sample,
+                applying_revision: binding
+                    .current_session()
+                    .interruption_revision
+                    .checked_next()
+                    .unwrap(),
+            }
+        );
+        let checkpoint = store
+            .load_attempt(issue.key().attempt_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.phase(), Phase::Interrupted);
+        assert_eq!(
+            checkpoint.checkpoint.interrupted_sampling_sequence(),
+            Some(1)
+        );
+        assert_eq!(
+            store.load_native_sampling_status(issue.key()).unwrap(),
+            Some(status)
+        );
+        let applications: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_sampling_applications",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let acks: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_sampling_ack_confirmations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((applications, acks), (1, 0));
+        assert!(matches!(
+            store.prepare_native_sampling_recovery_at(checkpoint, MonotonicTick::new(499)),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert!(matches!(
+            store.load_native_sampling_status(issue.key()),
+            Err(ControllerStoreError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn preparation_rejects_wrong_sequence_stale_checkpoint_and_session() {
+        let (mut store, loaded, _, issue, _) = fixture(2);
+        store
+            .connection
+            .execute(
+                "UPDATE native_sampling_issues SET sequence=?2 WHERE attempt_id=?1",
+                params![key(issue.key().attempt_id()), Word(issue.sequence() + 1)],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499)),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert!(matches!(
+            store.load_attempt(issue.key().attempt_id()),
+            Err(ControllerStoreError::Poisoned)
+        ));
+
+        let (mut store, loaded, _, _, _) = fixture(2);
+        store.persist(&loaded.checkpoint).unwrap();
+        assert!(matches!(
+            store.prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499)),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+
+        let (mut store, loaded, binding, issue, _) = fixture(2);
+        store.connection.execute(
+            "UPDATE guardian_sessions SET state='detached' WHERE attempt_id=?1 AND generation=?2",
+            params![key(issue.key().attempt_id()), Word(binding.current_session().generation.get())],
+        ).unwrap();
+        assert!(matches!(
+            store.prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499)),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+    }
+
+    #[test]
+    fn wrong_sequence_and_stale_binding_do_not_apply() {
+        let (mut store, loaded, _, _, mut sample) = fixture(2);
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        sample.sequence += 1;
+        assert!(matches!(
+            store.apply_recovered_native_sampling_at(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                MonotonicTick::new(499)
+            ),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        let (mut store, loaded, binding, issue, sample) = fixture(2);
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE guardian_bindings SET revision=?2 WHERE attempt_id=?1",
+                params![
+                    key(issue.key().attempt_id()),
+                    Word(binding.revision.checked_next().unwrap().get())
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.apply_recovered_native_sampling_at(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                MonotonicTick::new(499)
+            ),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_sampling_applications",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn terminal_and_stale_session_samples_fail_without_writes() {
+        let (mut store, loaded, _, issue, sample) = fixture(1);
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        let original = candidate.loaded.checkpoint.clone();
+        assert!(matches!(
+            store.apply_recovered_native_sampling_at(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                MonotonicTick::new(499)
+            ),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_eq!(
+            read_attempt(&store.connection, issue.key().attempt_id()).unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_sampling_applications",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+
+        let (mut store, loaded, binding, issue, sample) = fixture(2);
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        store.connection.execute("UPDATE guardian_sessions SET state='detached' WHERE attempt_id=?1 AND generation=?2",
+            params![key(issue.key().attempt_id()), Word(binding.current_session().generation.get())]).unwrap();
+        assert!(matches!(
+            store.apply_recovered_native_sampling_at(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                MonotonicTick::new(499)
+            ),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_sampling_applications",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_application_insert_rolls_back_checkpoint_and_poisons() {
+        let (mut store, loaded, _, issue, sample) = fixture(2);
+        let original = loaded.checkpoint.clone();
+        let candidate = store
+            .prepare_native_sampling_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        store.connection.execute_batch("CREATE TRIGGER fail_sample BEFORE INSERT ON native_sampling_applications BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(matches!(
+            store.apply_recovered_native_sampling_at(
+                VerifiedRecoveredNativeSampling::after_live_verification(candidate, sample),
+                MonotonicTick::new(499)
+            ),
+            Err(ControllerStoreError::Sqlite(_))
+        ));
+        assert_eq!(
+            read_attempt(&store.connection, issue.key().attempt_id()).unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_sampling_applications",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            store.load_attempt(issue.key().attempt_id()),
             Err(ControllerStoreError::Poisoned)
         ));
     }

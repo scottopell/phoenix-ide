@@ -71,9 +71,9 @@ pub use runtime::{
 pub use state::sqlite::{
     CommittedNativeReconciliationActivation, ControllerSqliteStore, ControllerStoreError,
     NativeReconciliationActivation, NativeReconciliationCompletion, NativeSamplingCompletion,
-    NativeSamplingDispatch, NativeSamplingIssue, NativeSamplingStatus,
-    PreparedNativeReconciliation, VerifiedNativeSamplingAckConfirmation,
-    VerifiedNativeSamplingCompletion,
+    NativeSamplingDispatch, NativeSamplingIssue, NativeSamplingRecoveryCandidate,
+    NativeSamplingStatus, PreparedNativeReconciliation, VerifiedNativeSamplingAckConfirmation,
+    VerifiedNativeSamplingCompletion, VerifiedRecoveredNativeSampling,
 };
 pub use state::{
     ActiveAttempt, AdministrativeRiskAcceptance, AttemptId, AttemptStore, CleanupOutcome,
