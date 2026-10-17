@@ -17,7 +17,8 @@ use phoenix_deployment_controller::{
     },
     native_guardian::{verify_native_binding, GuardianClient, VerifiedBindingStatus},
     CleanupOutcome, ControllerOs, ControllerSqliteStore, IdentityObservation, MacOsControllerOs,
-    MonotonicTick, NativeChildListStatus, NativeSamplingStatus, NativeSessionState, Phase,
+    MonotonicTick, NativeChildListStatus, NativeSamplingStatus, NativeSessionState,
+    NativeSlotLiveness, Phase,
 };
 use std::{
     io::Write,
