@@ -295,9 +295,7 @@ fn recovered_identity_folds_only_the_root_without_activating_cleanup() {
             .unwrap();
         assert_eq!(saved.phase(), Phase::Interrupted);
         assert_ne!(saved.checkpoint, original);
-        let super::super::super::AttemptPhase::Interrupted(interrupted) =
-            &saved.checkpoint.phase_state
-        else {
+        let DeploymentAttempt::Interrupted(interrupted) = &saved.checkpoint else {
             panic!("recovered identity application must remain interrupted")
         };
         assert_eq!(
