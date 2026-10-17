@@ -8,7 +8,7 @@ use std::process::Command;
 fn server_chrome_exec_precedes_argument_parsing_and_preserves_native_arguments() {
     let target = std::fs::canonicalize("/bin/sh").unwrap();
     let encoded = base64::engine::general_purpose::STANDARD.encode(target.as_os_str().as_bytes());
-    let output = Command::new(env!("CARGO_BIN_EXE_phoenix-ide"))
+    let output = Command::new(env!("CARGO_BIN_EXE_phoenix_ide"))
         .env("PHOENIX_INTERNAL_CHROME_EXEC", encoded)
         .args(["-c", r#"printf '%s\n' "$$"; ps -o pgid= -p "$$"; printf '%s\000' "${PHOENIX_INTERNAL_CHROME_EXEC-unset}" "$@""#, "shim", "space value", "--chrome-argument"])
         .arg(std::ffi::OsString::from_vec(vec![b'x', 0xff, b'y']))
@@ -30,7 +30,7 @@ fn server_chrome_exec_precedes_argument_parsing_and_preserves_native_arguments()
 
 #[test]
 fn server_malformed_chrome_exec_cannot_start_the_application() {
-    let output = Command::new(env!("CARGO_BIN_EXE_phoenix-ide"))
+    let output = Command::new(env!("CARGO_BIN_EXE_phoenix_ide"))
         .env("PHOENIX_INTERNAL_CHROME_EXEC", "%%%")
         .arg("--help")
         .output()

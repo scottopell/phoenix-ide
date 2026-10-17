@@ -910,9 +910,17 @@ impl BrowserSession {
     ) -> Result<ProfileDeletionProof, BrowserError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(group) = group {
-            group.drain(SESSION_INIT_TIMEOUT).await.map_err(|error| {
-                BrowserError::LaunchFailed(format!("initial Chrome group drain failed: {error}"))
+            let child = browser.get_mut_child().ok_or_else(|| {
+                BrowserError::LaunchFailed("owned Chrome child missing before drain".into())
             })?;
+            group
+                .drain(child.as_mut_inner(), SESSION_INIT_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    BrowserError::LaunchFailed(format!(
+                        "initial Chrome group drain failed: {error}"
+                    ))
+                })?;
             browser
                 .wait()
                 .await
@@ -1020,7 +1028,10 @@ impl BrowserSession {
         if crate::process_group::ChromeExecShim::registered().is_none() {
             return Ok(None);
         }
-        match crate::process_group::OwnedChromeGroup::adopt(identity) {
+        let child = browser.get_mut_child().ok_or_else(|| {
+            BrowserError::LaunchFailed("owned Chrome child missing before adoption".into())
+        })?;
+        match crate::process_group::OwnedChromeGroup::adopt(identity, child.as_mut_inner()) {
             Ok(group) => Ok(Some(group)),
             Err(error) => Err(Self::reject_unadopted_browser(browser, &error.to_string()).await),
         }
@@ -1238,8 +1249,11 @@ impl BrowserSession {
     pub fn is_running(&mut self) -> Result<bool, BrowserError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(group) = &self.owned_group {
+            let child = self.browser.get_mut_child().ok_or_else(|| {
+                BrowserError::OperationFailed("owned Chrome child missing before status".into())
+            })?;
             return group
-                .root_exited()
+                .root_exited(child.as_mut_inner())
                 .map(|exited| !exited)
                 .map_err(|error| BrowserError::OperationFailed(error.to_string()));
         }
@@ -1424,11 +1438,19 @@ impl BrowserSession {
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(group) = self.owned_group.as_mut() {
-            group.drain(SESSION_INIT_TIMEOUT).await.map_err(|error| {
-                BrowserTerminationError::KillFailed(format!(
-                    "owned Chrome group drain failed: {error}"
-                ))
+            let child = self.browser.get_mut_child().ok_or_else(|| {
+                BrowserTerminationError::KillFailed(
+                    "owned Chrome child missing before drain".into(),
+                )
             })?;
+            group
+                .drain(child.as_mut_inner(), SESSION_INIT_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    BrowserTerminationError::KillFailed(format!(
+                        "owned Chrome group drain failed: {error}"
+                    ))
+                })?;
             self.browser.wait().await.map_err(|error| {
                 BrowserTerminationError::KillFailed(format!("owned Chrome reap failed: {error}"))
             })?;
