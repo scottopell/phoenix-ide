@@ -214,7 +214,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 52ec18b65bcf757ff40d8e5c0ed74982b2512afb
+          ref: 7906d436de340ea12e5e57bfb0b7459ec77d866d
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -256,7 +256,7 @@ jobs:
           spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
           import sys
           module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
-          source='52ec18b65bcf757ff40d8e5c0ed74982b2512afb'; tree='cdd9297ef0f5ed0577014b0b8c2f9a09b409ee51'
+          source='7906d436de340ea12e5e57bfb0b7459ec77d866d'; tree='8ef968e711c2d0730de19dd588f6efc8128c0b81'
           for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
               module.admit_artifact(root, root/'ui'/name, source, tree, mode)
           (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
@@ -267,9 +267,9 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 52ec18b65bcf757ff40d8e5c0ed74982b2512afb
-          test "$(git rev-parse HEAD^{tree})" = cdd9297ef0f5ed0577014b0b8c2f9a09b409ee51
-          test "$(git merge-base HEAD d07417325246d1ad1787af468b168bdae397c067)" = d07417325246d1ad1787af468b168bdae397c067
+          test "$(git rev-parse HEAD)" = 7906d436de340ea12e5e57bfb0b7459ec77d866d
+          test "$(git rev-parse HEAD^{tree})" = 8ef968e711c2d0730de19dd588f6efc8128c0b81
+          test "$(git merge-base HEAD 0f054466b68fdb77c8aeb4490aee12470dd6c24f)" = 0f054466b68fdb77c8aeb4490aee12470dd6c24f
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
@@ -287,7 +287,7 @@ jobs:
           pathlib.Path('../opening-codegen-receipt.json').write_text(json.dumps({
               'app_source': subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
               'app_tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),
-              'app_base': subprocess.check_output(['git','merge-base','HEAD','d07417325246d1ad1787af468b168bdae397c067'],text=True).strip(),
+              'app_base': subprocess.check_output(['git','merge-base','HEAD','0f054466b68fdb77c8aeb4490aee12470dd6c24f'],text=True).strip(),
               'telemetry_modules': telemetry,
               'harness_source': '${{ github.event.pull_request.head.sha }}',
               'rustc': subprocess.check_output(['rustc','--version'],text=True).strip(),
@@ -311,14 +311,14 @@ jobs:
               (out/'opening-coordinator-home-fixture.log').write_text(text(error.stdout)+text(error.stderr))
               (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
                   'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
-                  'app_base':'d07417325246d1ad1787af468b168bdae397c067',
+                  'app_base':'0f054466b68fdb77c8aeb4490aee12470dd6c24f',
                   'command':command,'exit_status':None,'timed_out':True,'timeout_seconds':900,
                   'scope':'failed actual DB fixture timeout, not qualification'},indent=2))
               raise
           (out/'opening-coordinator-home-fixture.log').write_text(completed.stdout+completed.stderr)
           (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
               'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
-              'app_base':'d07417325246d1ad1787af468b168bdae397c067',
+              'app_base':'0f054466b68fdb77c8aeb4490aee12470dd6c24f',
               'command':command,'exit_status':completed.returncode,
               'scope':'actual DB owned-home continuation admission test, not app/browser qualification'},indent=2))
           assert completed.returncode == 0, 'owned Coordinator fixture failed; see retained log'
@@ -447,7 +447,7 @@ jobs:
           sha=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
           git=lambda *args:subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
           receipt={'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
-                   'app_base':'d07417325246d1ad1787af468b168bdae397c067',
+                   'app_base':'0f054466b68fdb77c8aeb4490aee12470dd6c24f',
                    'harness_source':subprocess.check_output(['git','-C',str(out/'harness'),'rev-parse','HEAD'],text=True).strip(),
                    'command':'PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest',
                    'vitest_config_sha256':sha(root/'ui/vitest.config.ts'),
@@ -471,6 +471,14 @@ jobs:
       - name: Prepare owned Chromium for instrumented actual-server witness
         working-directory: pinned-app/ui
         run: pnpm exec playwright install --with-deps chromium
+      - name: Exact Linux owned Chrome group, executable shim and real layout qualification
+        working-directory: pinned-app
+        timeout-minutes: 15
+        env:
+          CHROME_QUALIFICATION_OUTPUT: ${{ github.workspace }}/owned-chrome-linux
+        run: |
+          export PHOENIX_CHROME_EXECUTABLE="$(cd ui && node -e 'console.log(require("playwright").chromium.executablePath())')"
+          bash "$GITHUB_WORKSPACE/harness/scripts/qualify-owned-chrome-teardown.sh"
       - name: Controlled-functional six-report witness (separate from immutable stock baseline)
         working-directory: harness
         run: |
@@ -508,6 +516,7 @@ jobs:
             opening-browser-evidence/
             pinned-app-full-ui.log
             pinned-app-full-ui-receipt.json
+            owned-chrome-linux/
 
   check-ui:
     name: check (ui/specs)

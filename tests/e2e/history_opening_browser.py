@@ -33,9 +33,9 @@ from urllib.parse import urlparse, urlencode, quote
 import history_browser as shipping
 import history_controlled_artifact as artifact_admission
 
-PIN = "52ec18b65bcf757ff40d8e5c0ed74982b2512afb"
-TREE_PIN = "cdd9297ef0f5ed0577014b0b8c2f9a09b409ee51"
-BASE_PIN = "d07417325246d1ad1787af468b168bdae397c067"
+PIN = "7906d436de340ea12e5e57bfb0b7459ec77d866d"
+TREE_PIN = "8ef968e711c2d0730de19dd588f6efc8128c0b81"
+BASE_PIN = "0f054466b68fdb77c8aeb4490aee12470dd6c24f"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
 SDK_METADATA_TEST = "api::view_journey::tests::pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields"

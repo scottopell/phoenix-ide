@@ -142,3 +142,52 @@ jobs:
           set -e
           test "$status" -ne 0
           grep -F "Release builds require PHOENIX_SIDECAR_PATH" "$RUNNER_TEMP/release-without-sidecar.log"
+
+  owned-chrome-teardown:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'integration/v013-history-current-main'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RAYON_NUM_THREADS: '2'
+      RUST_TEST_THREADS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CHROME_QUALIFICATION_OUTPUT: ${{ github.workspace }}/owned-chrome-macos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: owned-chrome-macos
+      - name: Admit exact app sources, build existing UI embed and install owned Chromium
+        run: |
+          git diff --exit-code 7906d436de340ea12e5e57bfb0b7459ec77d866d HEAD -- crates
+          cd ui
+          npm install -g corepack@latest
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm run build
+          pnpm exec playwright install chromium
+      - name: Exact macOS owned group, executable shim and actual Chrome layout
+        run: |
+          export PHOENIX_CHROME_EXECUTABLE="$(cd ui && node -e 'console.log(require("playwright").chromium.executablePath())')"
+          bash scripts/qualify-owned-chrome-teardown.sh
+      - name: Retain actual native test/layout evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owned-chrome-macos-${{ github.event.pull_request.head.sha }}
+          path: owned-chrome-macos/
+          if-no-files-found: warn
+          retention-days: 7

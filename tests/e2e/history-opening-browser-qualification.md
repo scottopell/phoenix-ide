@@ -3274,3 +3274,38 @@ source-reference guard failed on both missing files before retirement; the full
 81-test Python lifecycle suite passes after retirement. A future optional probe
 workflow must ship its real sources together. This is a shared workflow/test
 change only, not a product runtime or telemetry-acceptance change.
+
+## Current-main owned Chrome teardown qualification candidate
+
+App7906d436de340ea12e5e57bfb0b7459ec77d866d,
+tree8ef968e711c2d0730de19dd588f6efc8128c0b81, composes main0f054466
+with the preserved52ec chapter-owner/shared-stream repairs and a separately
+reviewed native launch-group teardown candidate. Chromiumoxide's public API
+is reused via native existing-executable reexec, not a dependency fork or
+argument reconstruction. The root remains unreaped while exact owned group
+signals/drain are authorized; group-marker deletion requires retained group
+proof, and failed/unadopted launch profiles remain fail-closed. Escaped-writer
+coverage explicitly demonstrates that group drain is not arbitrary descendant
+closure. Actual supported Chrome layout is a qualification dependency, not a
+claim inferred from that negative test or libtest RootOnly behavior.
+
+The shared atomic source/tree/base pins and all emitted receipt bases move to
+7906/8ef968/main0f054. Both existing Linux pinned-app qualification and existing
+macOS workflow schedule exact group/marker/actual CLI+server shim tests plus
+the real lost-Chrome test with required before/after native layout receipts.
+Every exact test requires an actual one-pass result, server shim requires two,
+and skipped Chrome cannot pass the layout-receipt guard. Full Rust/Clippy/UI
+and rebuilt six-context history witness remain mandatory. No unchanged full-suite
+retry, deletion retry, sleep-based cleanup assertion or threshold relaxation.
+
+Parent compiler-free checks pass81 Python lifecycle tests,69 joint-pin guards,
+YAML parse, shell syntax and diff checks; independent exact-source reviews
+found no established native blocker and corrected stale auxiliary receipt-base
+values before publication. No local Rust/Chrome candidate execution is claimed.
+The earlier supplementary retained-binary macOS topology observed one group,
+but is not exact Linux failure reproduction or candidate proof. Native compile,
+Linux/macOS process behavior and all complete hosted gates remain owed at this
+new shared head; prior1e04/26d,713c/52ec and PR908 evidence are not relabeled.
+The orphaned optional keepalive workflow retirement is published in this
+cohesive failure response rather than left indefinitely local. Separate reusable
+observation benchmark development is not imported into the history packet.
