@@ -219,11 +219,17 @@ export function installObservedHistoryTelemetry(page, baseURL, ownership) {
         assert.ok(Buffer.byteLength(raw) <= 8192 && reports.length < 7, 'history report capture bound');
         const report = JSON.parse(raw); assert.equal(typeof report.open_id, 'string');
         postReports.set(request, report); reports.push(report);
-      } else if (url.pathname.startsWith('/api/') && url.searchParams.has('open_id')) {
+      } else if (url.pathname.startsWith('/api/') && (url.searchParams.has('open_id') || url.searchParams.has('request_id'))) {
         assert.ok(requests.length < 128, 'history correlated request capture bound');
-        assert.equal(url.searchParams.getAll('open_id').length, 1);
-        const record = { method: request.method(), pathname: url.pathname, has_before: url.searchParams.has('before'), open_id: url.searchParams.get('open_id'),
-          kind: /\/api\/conversations\/[^/]+\/stream$/.test(url.pathname) ? 'sse' : 'request', trace_id: null };
+        const keys = ['open_id', 'request_id'].filter(key => url.searchParams.has(key));
+        assert.equal(keys.length, 1, 'one network correlation purpose per request');
+        const key = keys[0];
+        assert.equal(url.searchParams.getAll(key).length, 1);
+        assert.ok(url.searchParams.get(key));
+        const kind = /\/api\/conversations\/[^/]+\/stream$/.test(url.pathname) ? 'sse' : 'request';
+        if (kind === 'sse') assert.equal(key, 'open_id');
+        const record = { method: request.method(), pathname: url.pathname, has_before: url.searchParams.has('before'), open_id: url.searchParams.get(key),
+          kind, trace_id: null };
         requests.push(record); requestRecords.set(request, record);
       }
     } catch { if (errors.length === 0) errors.push('invalid_or_overflow_history_network_observation'); }

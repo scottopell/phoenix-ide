@@ -277,6 +277,21 @@ test('UNIT pagination diagnostic distinguishes actual uncorrelated GETs without 
   assert.ok(diagnostic.snapshot().errors > 0);
 });
 
+test('UNIT recovery request correlation is finite and exclusive without initial-open stage attribution', () => {
+  const base = 'http://127.0.0.1:12345', path = '/api/product-conversations/unit';
+  const page = new EventEmitter(), capture = installObservedHistoryTelemetry(page, base);
+  page.emit('request', { method: () => 'GET', url: () => base + path + '?request_id=UNIT-recovery&unknown=SECRET' });
+  assert.deepEqual(capture.snapshot().requestRecords, [{ method: 'GET', pathname: path, has_before: false, open_id: 'UNIT-recovery', kind: 'request', trace_id: null }]);
+  assert.deepEqual(capture.snapshot().errors, []);
+  assert.doesNotMatch(JSON.stringify(capture.snapshot()), /SECRET|request_id=/);
+  for (const query of ['open_id=a&request_id=b', 'request_id=a&request_id=b', 'request_id=', 'open_id=']) {
+    const invalidPage = new EventEmitter(), invalid = installObservedHistoryTelemetry(invalidPage, base);
+    invalidPage.emit('request', { method: () => 'GET', url: () => base + path + '?' + query });
+    assert.equal(invalid.snapshot().requestRecords.length, 0);
+    assert.deepEqual(invalid.snapshot().errors, ['invalid_or_overflow_history_network_observation']);
+  }
+});
+
 test('UNIT ONLY late report capture retains raw body/response and independent header trace provenance', () => {
   const page = new EventEmitter(), capture = installObservedHistoryTelemetry(page, 'http://127.0.0.1:12345', {
     bindPage: () => {},

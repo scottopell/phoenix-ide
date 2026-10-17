@@ -2589,3 +2589,19 @@ cursors, arbitrary query values and origin are not retained in controlled
 ownership receipts. A regression includes sentinel cursor/unknown query values
 and proves neither enters the snapshot. This does not rewrite immutable stock
 baseline evidence. All130 shared cached Node regressions still pass.
+
+### Recovery request identity versus initial-open stage attribution
+
+The app-source owner identified an attribution constraint during repair: a
+fresh-tail recovery GET has no `before`, so sending `open_id` would qualify it
+for an existing initial-open backend stage. The source repair therefore needs
+an exclusive finite `request_id` query identity for that recovery request, not
+an expanded backend stage. Initial and actual older-page GETs retain their
+explicit admitted `open_id` contract. The shared network observer recognizes
+one nonempty single-valued correlation key (`open_id` or finite `request_id`),
+rejects mixed/duplicate keys, and normalizes it into its existing opaque network
+request-identity slot for producer/network/report joins. Neither query string
+nor arbitrary values are retained. SSE still requires its existing `open_id`.
+Cached shared131 Node tests pass, including exclusive recovery-key and query
+privacy regressions. This is shared integration preparation; the app repair
+packet has not yet been imported or qualified at this entry.
