@@ -147,7 +147,7 @@ jobs:
   readonly-projection-contract:
     if: github.ref == 'refs/heads/qualification/history-observation-projection'
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       CARGO_BUILD_JOBS: '2'
       RAYON_NUM_THREADS: '2'
@@ -175,20 +175,57 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
           pnpm run build
-      - name: Admit exact causal source and preserved runtime qualification
+      - name: Build matched candidate then measurement-only baseline artifacts
         run: |
-          set -o pipefail
-          git diff --exit-code f3893088b3cb224be9403f600173d5216e3a2f6b HEAD -- crates ui dev.py docs specs tests
+          set -euo pipefail
+          candidate=f3893088b3cb224be9403f600173d5216e3a2f6b
+          baseline=6a43908b87b7b0ff72d987a56e80e5795accbfe7
+          git fetch origin "$baseline"
+          test "$(git diff --name-only "$candidate" "$baseline")" = ui/src/components/ConversationNavStack.tsx
           mkdir -p "$RUNNER_TEMP/observation-qualification"
-          printf '%s\n' 'Scoped successor to39045775405: runtime contracts, codegen136, UI and binary passed there; only unused db accessor failed Clippy.' 'Prior scoped39048649141 passed accessor Clippy and generated consumers. Portable runtime/build39050189155 passed and receiving-machine browser admission passed on that exact artifact. This successor checks only the test extension-comparison Clippy fix; no new artifact/runtime claim.' > "$RUNNER_TEMP/observation-qualification/scope.txt"
-          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/observation-qualification/source.txt"
-      - name: Check actual generated type consumers
-        working-directory: ui
-        run: |
-          pnpm exec tsc -b --noEmit
-          pnpm exec vitest run src/pages/PersistedObservation.test.tsx --maxWorkers=1
-      - name: Check portable feature with Clippy
-        run: cargo clippy -p phoenix_ide --features portable-ui --lib --tests -- -D warnings
+          git diff "$candidate" "$baseline" > "$RUNNER_TEMP/observation-qualification/baseline-only.diff"
+          printf '%s\n' 'Build order candidate then baseline; identical backend/locks/features; only two P1 UI hunks differ.' 'Scope initial common-correct render only; excludes known incorrect baseline chapter navigation, whole-history neutrality, and telemetry overhead.' > "$RUNNER_TEMP/observation-qualification/scope.txt"
+          for variant in candidate baseline; do
+            if [ "$variant" = candidate ]; then source="$candidate"; else source="$baseline"; fi
+            git checkout --detach "$source"
+            output="$RUNNER_TEMP/observation-qualification/$variant"
+            mkdir -p "$output/bin"
+            git rev-parse HEAD HEAD^{tree} > "$output/source.txt"
+            (cd ui && pnpm run build)
+            set +e
+            (cd ui && pnpm exec vitest run src/components/ConversationNavStack.test.tsx --maxWorkers=1 --reporter=json --outputFile="$output/nav-tests.json") > "$output/nav-tests.log" 2>&1
+            test_exit=$?
+            set -e
+            export VARIANT="$variant" REPORT="$output/nav-tests.json" TEST_EXIT="$test_exit"
+            python3 - <<'PY'
+          import collections,json,os
+          d=json.load(open(os.environ['REPORT']))
+          expected={'selects the owning member from a hashless Global route: Other member chapter','selects the owning member from a hashless Global route: Unloaded member boundary'}
+          suites=d['testResults'];assert len(suites)==1 and suites[0]['name'].endswith('ConversationNavStack.test.tsx'),suites
+          tests=suites[0]['assertionResults'];assert len(tests)==6 and d['numTotalTests']==6
+          assert not d.get('numPendingTests',0) and not d.get('numTodoTests',0) and not d.get('numRuntimeErrorTestSuites',0)
+          assert not d.get('unhandledErrors') and not d.get('testExecError')
+          failed=[t for t in tests if t['status']=='failed']
+          if os.environ['VARIANT']=='baseline':
+            assert os.environ['TEST_EXIT']=='1' and d['numFailedTests']==2 and d['numPassedTests']==4
+            assert collections.Counter(t['title'] for t in failed)==collections.Counter(expected)
+            assert all(t['ancestorTitles']==['source locator decoding'] for t in failed)
+          else:
+            assert os.environ['TEST_EXIT']=='0' and d['numFailedTests']==0 and d['numPassedTests']==6
+          assert all(t['status']=='passed' or t in failed for t in tests)
+          PY
+            # Force the existing embedding owner to recompile after each UI build; bytes remain source-identical.
+            touch crates/phoenix-ide/src/api/assets.rs
+            git diff --exit-code
+            cargo test -p phoenix_ide --features portable-ui --test observation_startup portable_ui_serves_exact_built_entry_assets_from_private_cwd -- --exact --test-threads=1 --nocapture 2>&1 | tee "$output/portable-ui.log"
+            grep -F 'test result: ok. 1 passed; 0 failed;' "$output/portable-ui.log"
+            grep -F 'portable_ui_asset_manifest=' "$output/portable-ui.log" > "$output/served-manifest.txt"
+            cargo build -p phoenix_ide --bin phoenix_ide --features portable-ui
+            cp target/debug/phoenix_ide "$output/bin/"
+            shasum -a 256 "$output/bin/phoenix_ide" > "$output/binary-sha256.txt"
+            (cd ui/dist && find . -type f -exec shasum -a 256 {} \; | sort) > "$output/ui-dist-sha256.txt"
+            printf '%s\n' 'portable-ui=rust-embed/debug-embed; same source backend and immutable current wire/capabilities' > "$output/features.txt"
+          done
       - name: Retain source-only qualification logs, never fixture data
         if: always()
         uses: actions/upload-artifact@v4
