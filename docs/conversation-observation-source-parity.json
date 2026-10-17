@@ -5300,5 +5300,18 @@
       "product_blob": "28b02e8249ea38c3f54c651960532aca3fe67581",
       "actual_blob": "28b02e8249ea38c3f54c651960532aca3fe67581"
     }
+  ],
+  "diff_args": [
+    "diff",
+    "--diff-algorithm=myers",
+    "--no-indent-heuristic",
+    "--unified=3",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--full-index",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--no-index"
   ]
 }

@@ -7,8 +7,11 @@ This source-only contract change is atop `dfcd8b477468b4d94c9ec2830a1e92bf5bcdb6
 on `bench/current-task-observation-attribution`. The exact exception blobs,
 diffs and production-function inventory are in
 [`conversation-observation-attribution.json`](conversation-observation-attribution.json).
-This supplements, not rewrites, the earlier composition packet. All 2702 UI
-bytes remain exact except the explicitly manifested source-parity guard.
+This supplements the earlier composition packet. The deterministic-diff portability
+follow-up preserves checkpoint `d5700c84f` and all its Rust/runtime sources. All
+2702 UI bytes remain exact except the explicitly manifested source-parity guard;
+its composition documentation and UI exception manifest are separately enumerated
+attribution exceptions, not renderer changes.
 
 **This source is UNCOMPILED. Its Rust tests are authored, UNRUN.** No Cargo,
 build, codegen, installation, child/server executable, fixture/SQL operation,
@@ -151,6 +154,46 @@ serialization cost, latency percentiles or a bottleneck verdict.
   diagnostics only, not samples of the event contract. No new runtime sample
   has been generated or qualified.
 
+The fourth qualification attempt, per parent report, stopped at the UI source
+proof: **416 passed, 1 failed**. No Rust qualification ran in that attempt; it
+was not a runtime/event failure. The exact-patch mismatch is consistent with
+unpinned Git diff defaults. The runner's defaults/configuration were inferred,
+not measured; this source-only follow-up does not assert a measured runner setting
+or qualify a new runtime sample.
+
+## Deterministic patch producer and consumers
+
+Python `EXACT_DIFF_ARGS` is shared by `exact_diff` and the named
+`regenerate_manifests` producer in `tests/devpy/test_observation_attribution_source.py`.
+TypeScript `exactDiffArgs` pins the same explicit arguments for `exactDiff`:
+
+```text
+git diff --diff-algorithm=myers --no-indent-heuristic --unified=3 --no-ext-diff --no-textconv --no-color --full-index --src-prefix=a/ --dst-prefix=b/ --no-index -- BEFORE AFTER
+```
+
+Both manifests are regenerated with these arguments, including **every** UI
+exception (not just the reported failure) and all attribution exceptions. Both
+manifests record `diff_args`, which both guards check against their explicit
+constant. Only temporary operand paths are replaced with the manifest path; patch bodies are
+never normalized or waived. Git blob hashes still pin exact bytes independently.
+No user/repository Git configuration is written.
+
+The finite order is: finish producer/guard/docs source, regenerate the UI exception
+manifest, then regenerate the attribution manifest. The Python producer file is
+hashed/diffed as an ordinary completed source entry. The attribution manifest does
+not contain itself; its finite path inventory is enforced by both guards. The UI
+manifest does not include either guard or itself; the attribution manifest pins
+those files. No recursive hash fixed point is sought. A producer regression
+compares both serialized outputs byte-for-byte without writing them.
+
+Both helpers have an eight-case cross-product regression using subprocess-local
+`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`: histogram/myers,
+indent heuristic true/false, compaction heuristic true/false, plus hostile context
+17 in every case. Every case requires the same canonical patches for every UI
+exception and every attribution exception. An SQL-literal whitespace mutation
+still differs in exact blob and exact patch; Python additionally rejects it through
+the unchanged SQL-preserving token proof. Tests do not edit any SQL or product file.
+
 ## Static proof and authored regressions
 
 The Python guard unwraps only the enumerated finite calls and original exact
@@ -203,3 +246,31 @@ Rustfmt is syntax/formatting, **not compilation**. All new Rust tests remain
 **UNRUN**. Full Rust/router/runtime qualification remains a parent-owned gate
 requiring separate authorization; no retry or dispatch is implicitly authorized
 by this packet.
+
+## Portability follow-up reproduction (source-only)
+
+From the repository root, using only cached Python/Node dependencies:
+
+```sh
+python3 tests/devpy/test_observation_attribution_source.py --regenerate-manifests
+python3 -m unittest discover -s tests/devpy -p test_observation_attribution_source.py -v
+python3 -m unittest discover -s tests/devpy -p test_observe.py -v
+(cd ui && ./node_modules/.bin/vitest run tests/observationSourceParity.test.ts src/pages/PersistedObservation.test.tsx --maxWorkers=1)
+(cd ui && ./node_modules/.bin/eslint tests/observationSourceParity.test.ts --report-unused-disable-directives --max-warnings 0)
+git diff --exit-code d5700c84f -- crates ui/src
+git diff --check
+```
+
+Executed follow-up results: **17 Python tests passed** (all **9** attribution
+source guards, including producer idempotence and the eight-configuration matrix,
+plus all **8** mocked observation launcher/source guards); **26 UI tests passed**
+(the previous **18** plus **8** hostile-config cases); strict ESLint **passed**
+with zero warnings; both diff checks **passed**. These are cached, source-only
+checks, not a new Rust/event/runtime qualification. The UI exception manifest was
+fully regenerated; its 859 source identities and 34 patch bodies remain identical
+to the checkpoint, with explicit diff-argument metadata added.
+
+The Rust tree has no delta from d570; no rustfmt or Rust validation is needed for
+this follow-up. These commands are not authorization for build, Cargo, install,
+network, services, browser, SQL or hosted dispatch. Roadmap #806 remains unverified
+under the no-network constraint. The working changes are intentionally uncommitted.

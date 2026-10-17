@@ -9,11 +9,13 @@ const root = resolve(import.meta.dirname, '../..');
 const manifest = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observation-source-parity.json'), 'utf8')) as {
   base: string;
   product: string;
+  diff_args: string[];
   files: Array<{ path: string; base_blob: string | null; product_blob: string | null; actual_blob: string | null; exception?: { reason: string; diff: string } }>;
 };
 const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 const attribution = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observation-attribution.json'), 'utf8')) as {
   base: string;
+  diff_args: string[];
   files: Array<{ path: string; base_blob: string | null; actual_blob: string; diff: string; changed_functions: string[] }>;
 };
 const attributionPaths = [
@@ -24,6 +26,8 @@ const attributionPaths = [
   'crates/phoenix-ide/src/observation_startup.rs',
   'crates/phoenix-ide/src/observation_startup/attribution_tests.rs',
   'docs/conversation-observation-attribution.md',
+  'docs/conversation-observation-composition.md',
+  'docs/conversation-observation-source-parity.json',
   'tests/devpy/test_observation_attribution_source.py',
   'ui/tests/observationSourceParity.test.ts',
 ];
@@ -39,14 +43,19 @@ function actualBlob(path: string): string | null {
   const bytes = readFileSync(absolute);
   return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
 }
-function exactDiff(path: string, productBlob: string | null): string {
+const exactDiffArgs = [
+  'diff', '--diff-algorithm=myers', '--no-indent-heuristic', '--unified=3',
+  '--no-ext-diff', '--no-textconv', '--no-color', '--full-index',
+  '--src-prefix=a/', '--dst-prefix=b/', '--no-index',
+];
+function exactDiff(path: string, productBlob: string | null, env = process.env, body = readFileSync(resolve(root, path))): string {
   const scratch = mkdtempSync(resolve(tmpdir(), 'observation-source-diff-'));
   try {
     const product = `${scratch}/product`;
     const actual = `${scratch}/actual`;
     writeFileSync(product, productBlob ? execFileSync('git', ['cat-file', 'blob', productBlob], { cwd: root }) : '');
-    writeFileSync(actual, readFileSync(resolve(root, path)));
-    const diff = spawnSync('git', ['diff', '--no-index', '--no-color', '--no-ext-diff', '--full-index', '--src-prefix=a/', '--dst-prefix=b/', '--', product, actual], { cwd: root, encoding: 'utf8' });
+    writeFileSync(actual, body);
+    const diff = spawnSync('git', [...exactDiffArgs, '--', product, actual], { cwd: root, env, encoding: 'utf8' });
     if (diff.status !== 1) throw new Error(`Expected an exception diff for ${path}: ${diff.stderr}`);
     return diff.stdout.replaceAll(product.slice(1), path).replaceAll(actual.slice(1), path);
   } finally {
@@ -66,6 +75,7 @@ describe('observation composition source identity', () => {
   it('pins both authorities and inventories every product/base UI source blob', () => {
     expect(manifest.base).toBe('f3893088b3cb224be9403f600173d5216e3a2f6b');
     expect(manifest.product).toBe('9ee218d4a33ebd4b94ea547d60caa62134edb960');
+    expect(manifest.diff_args).toEqual(exactDiffArgs);
     const base = tree(manifest.base);
     const product = tree(manifest.product);
     const paths = new Set([...base.keys(), ...product.keys(), ...sourcePaths('ui/src')]);
@@ -83,6 +93,33 @@ describe('observation composition source identity', () => {
     }
   });
 
+  for (const algorithm of ['histogram', 'myers']) {
+    for (const indent of ['true', 'false']) {
+      for (const compact of ['true', 'false']) {
+        it(`pins exact patches under algorithm=${algorithm}, indent=${indent}, compaction=${compact} and rejects body mutation`, () => {
+          const env = {
+            ...process.env, GIT_CONFIG_COUNT: '4',
+            GIT_CONFIG_KEY_0: 'diff.algorithm', GIT_CONFIG_VALUE_0: algorithm,
+            GIT_CONFIG_KEY_1: 'diff.indentHeuristic', GIT_CONFIG_VALUE_1: indent,
+            GIT_CONFIG_KEY_2: 'diff.compactionHeuristic', GIT_CONFIG_VALUE_2: compact,
+            GIT_CONFIG_KEY_3: 'diff.context', GIT_CONFIG_VALUE_3: '17',
+          };
+          for (const file of manifest.files.filter(file => file.exception)) {
+            expect(exactDiff(file.path, file.product_blob, env), file.path).toBe(file.exception!.diff);
+          }
+          for (const file of attribution.files) {
+            expect(exactDiff(file.path, file.base_blob, env), file.path).toBe(file.diff);
+          }
+          const file = attribution.files.find(file => file.path === 'crates/phoenix-db/src/product_conversation_read.rs')!;
+          const body = Buffer.from(readFileSync(resolve(root, file.path), 'utf8').replace('SELECT kind, ordinary_lifecycle', 'SELECT  kind, ordinary_lifecycle'));
+          const changedBlob = createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
+          expect(changedBlob).not.toBe(file.actual_blob);
+          expect(exactDiff(file.path, file.base_blob, env, body)).not.toBe(file.diff);
+        });
+      }
+    }
+  }
+
   it('preserves the backend outside exact attribution diffs, generated types and rig support', () => {
     expect(git('diff', '--name-only', manifest.base, '--', '.', ':(exclude)ui/src', ':(exclude)ui/tests/observationSourceParity.test.ts', ':(exclude)docs/conversation-observation-source-parity.json', ':(exclude)docs/conversation-observation-composition.md', ':(exclude)docs/conversation-observation-attribution.json', ...attributionPaths.map(path => `:(exclude)${path}`)).trim()).toBe('');
     for (const file of manifest.files.filter(file => file.path.startsWith('ui/src/generated/') || file.path.startsWith('ui/scripts/'))) {
@@ -92,6 +129,7 @@ describe('observation composition source identity', () => {
 
   it('bounds attribution to exact reviewed diffs and preserves all other 2702 UI bytes', () => {
     expect(attribution.base).toBe('2702d8389c2fc78ac2e528c876c35a1a7040d692');
+    expect(attribution.diff_args).toEqual(exactDiffArgs);
     expect(attribution.files.map(file => file.path)).toEqual([...attributionPaths].sort());
     for (const file of attribution.files) {
       const entry = git('ls-tree', attribution.base, '--', file.path).trim();

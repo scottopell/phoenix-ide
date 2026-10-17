@@ -1,15 +1,25 @@
 """Source-only attribution proof: no SQLite, executables, services or network."""
 import hashlib
 import json
+import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
+from itertools import product
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = "2702d8389c2fc78ac2e528c876c35a1a7040d692"
 PACKET = "docs/conversation-observation-attribution.json"
+UI_PACKET = "docs/conversation-observation-source-parity.json"
+EXACT_DIFF_ARGS = (
+    "diff", "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=3",
+    "--no-ext-diff", "--no-textconv", "--no-color", "--full-index",
+    "--src-prefix=a/", "--dst-prefix=b/", "--no-index",
+)
 DB = "crates/phoenix-db/src/product_conversation_read.rs"
 ROUTES = "crates/phoenix-ide/src/api/observation.rs"
 AUTH = "crates/phoenix-ide/src/api/auth.rs"
@@ -22,6 +32,8 @@ FUNCTIONS = {
     STARTUP: ["Stage::name", "StageCompletion::new", "StageCompletion::complete", "StageCompletion::emit", "StageCompletion::drop", "complete_stage", "RequestCompletion::new", "RequestCompletion::response_ready", "RequestCompletion::emit", "RequestCompletion::drop", "attribution_subscriber", "AttributionRequest::poll", "AttributionRequest::drop", "with_attribution_dispatch", "run", "run_with_attribution", "serve"],
     "crates/phoenix-ide/src/observation_startup/attribution_tests.rs": [],
     "docs/conversation-observation-attribution.md": [],
+    "docs/conversation-observation-composition.md": [],
+    UI_PACKET: [],
     "tests/devpy/test_observation_attribution_source.py": [],
     "ui/tests/observationSourceParity.test.ts": [],
 }
@@ -161,24 +173,51 @@ def without_auth_branch_instrumentation(source):
     }''')
 
 
-def exact_diff(path, blob):
+def exact_diff(path, blob, *, env=None):
     with tempfile.TemporaryDirectory(prefix="observation-attribution-source-") as directory:
         before, after = Path(directory) / "product", Path(directory) / "actual"
         before.write_bytes(subprocess.check_output(["git", "cat-file", "blob", blob], cwd=ROOT) if blob else b"")
         after.write_bytes((ROOT / path).read_bytes())
         diff = subprocess.run([
-            "git", "diff", "--no-index", "--no-color", "--no-ext-diff", "--full-index",
-            "--src-prefix=a/", "--dst-prefix=b/", "--", str(before), str(after),
-        ], cwd=ROOT, text=True, capture_output=True, check=False)
+            "git", *EXACT_DIFF_ARGS, "--", str(before), str(after),
+        ], cwd=ROOT, env=env, text=True, capture_output=True, check=False)
         if diff.returncode != 1:
             raise AssertionError(f"expected an exact exception diff: {path}: {diff.stderr}")
         return diff.stdout.replace(str(before)[1:], path).replace(str(after)[1:], path)
+
+
+def blob_hash(body):
+    return hashlib.sha1(f"blob {len(body)}\0".encode() + body).hexdigest()
+
+
+def regenerate_manifests():
+    ui = json.loads((ROOT / UI_PACKET).read_text())
+    ui["diff_args"] = list(EXACT_DIFF_ARGS)
+    for entry in ui["files"]:
+        body = ROOT / entry["path"]
+        entry["actual_blob"] = blob_hash(body.read_bytes()) if body.exists() else None
+        if "exception" in entry:
+            entry["exception"]["diff"] = exact_diff(entry["path"], entry["product_blob"])
+    (ROOT / UI_PACKET).write_text(json.dumps(ui, indent=2, ensure_ascii=False) + "\n")
+    # The packet excludes itself; its producer's completed source is an ordinary entry.
+    packet = {"base": BASE, "diff_args": list(EXACT_DIFF_ARGS), "files": []}
+    for path in sorted(FUNCTIONS):
+        tree = git("ls-tree", BASE, "--", path).strip()
+        base_blob = tree.split()[2] if tree else None
+        packet["files"].append({
+            "path": path, "base_blob": base_blob,
+            "actual_blob": blob_hash((ROOT / path).read_bytes()),
+            "changed_functions": FUNCTIONS[path], "diff": exact_diff(path, base_blob),
+        })
+    (ROOT / PACKET).write_text(json.dumps(packet, indent=2) + "\n")
 
 
 class AttributionSourceTests(unittest.TestCase):
     def test_bounded_exact_diffs_and_changed_function_inventory(self):
         packet = json.loads((ROOT / PACKET).read_text())
         self.assertEqual(packet["base"], BASE)
+        self.assertEqual(packet["diff_args"], list(EXACT_DIFF_ARGS))
+        self.assertEqual(json.loads((ROOT / UI_PACKET).read_text())["diff_args"], list(EXACT_DIFF_ARGS))
         self.assertEqual([entry["path"] for entry in packet["files"]], sorted(FUNCTIONS))
         for entry in packet["files"]:
             path = entry["path"]
@@ -187,12 +226,42 @@ class AttributionSourceTests(unittest.TestCase):
                 tree = git("ls-tree", BASE, "--", path).strip()
                 self.assertEqual(entry["base_blob"], tree.split()[2] if tree else None)
                 body = (ROOT / path).read_bytes()
-                blob = hashlib.sha1(f"blob {len(body)}\0".encode() + body).hexdigest()
+                blob = blob_hash(body)
                 self.assertEqual(entry["actual_blob"], blob)
                 self.assertEqual(entry["diff"], exact_diff(path, entry["base_blob"]))
         changed = set(git("diff", "--name-only", BASE).splitlines())
         changed.update(git("ls-files", "--others", "--exclude-standard").splitlines())
         self.assertEqual(changed, set(FUNCTIONS) | {PACKET})
+
+    def test_manifest_producer_is_finite_and_byte_idempotent(self):
+        writes = {}
+        with mock.patch.object(Path, "write_text", lambda path, text: writes.__setitem__(path, text)):
+            regenerate_manifests()
+        self.assertEqual(set(writes), {ROOT / UI_PACKET, ROOT / PACKET})
+        for path, text in writes.items():
+            self.assertEqual(text, path.read_text(), str(path))
+
+    def test_exact_diff_ignores_hostile_git_config_and_rejects_body_mutation(self):
+        packet = json.loads((ROOT / PACKET).read_text())
+        ui = json.loads((ROOT / UI_PACKET).read_text())
+        entries = [(entry, entry["base_blob"], entry["diff"]) for entry in packet["files"]]
+        entries += [(entry, entry["product_blob"], entry["exception"]["diff"])
+                    for entry in ui["files"] if "exception" in entry]
+        for algorithm, indent, compact in product(["histogram", "myers"], ["true", "false"], ["true", "false"]):
+            env = {**os.environ, "GIT_CONFIG_COUNT": "4",
+                   "GIT_CONFIG_KEY_0": "diff.algorithm", "GIT_CONFIG_VALUE_0": algorithm,
+                   "GIT_CONFIG_KEY_1": "diff.indentHeuristic", "GIT_CONFIG_VALUE_1": indent,
+                   "GIT_CONFIG_KEY_2": "diff.compactionHeuristic", "GIT_CONFIG_VALUE_2": compact,
+                   "GIT_CONFIG_KEY_3": "diff.context", "GIT_CONFIG_VALUE_3": "17"}
+            for entry, base_blob, canonical in entries:
+                with self.subTest(algorithm=algorithm, indent=indent, compact=compact, path=entry["path"]):
+                    self.assertEqual(exact_diff(entry["path"], base_blob, env=env), canonical)
+            entry = next(entry for entry in packet["files"] if entry["path"] == DB)
+            changed = (ROOT / DB).read_bytes().replace(b"SELECT kind, ordinary_lifecycle", b"SELECT  kind, ordinary_lifecycle", 1)
+            self.assertNotEqual(blob_hash(changed), entry["actual_blob"])
+            with mock.patch.object(Path, "read_bytes", return_value=changed):
+                self.assertNotEqual(exact_diff(DB, entry["base_blob"], env=env), entry["diff"])
+            self.assertNotEqual(tokens(pinned(DB)), without_wrappers(changed.decode(), DB))
 
     def test_only_exact_instrument_wrappers_change_db_and_admission_tokens(self):
         for path in [DB, ROUTES, "crates/phoenix-ide/src/api/product_conversations.rs"]:
@@ -294,4 +363,7 @@ class AttributionSourceTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if sys.argv[1:] == ["--regenerate-manifests"]:
+        regenerate_manifests()
+    else:
+        unittest.main()

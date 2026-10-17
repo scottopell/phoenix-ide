@@ -12,7 +12,9 @@
 This is a source composition, not a complete UI-tree identity claim, built artifact,
 fixture, browser capture, deployment or authorization to run a server. Backend,
 API, immutable admission, capabilities, launch/root/shell, existing rig-support
-scripts and generated observation types remain the actual f389 source. No old
+scripts and generated observation types remain the actual f389 source except the
+separately bounded [attribution exceptions](conversation-observation-attribution.md).
+The portability follow-up preserves all d570 Rust and product UI bytes. No old
 branch, fixture or captured packet was imported. No fake init or schema-default
 fields were added. No dependencies, migrations, lower hooks or runners were added.
 
@@ -26,8 +28,9 @@ renderers, CSS, hooks, tool bodies, tests, assets/configuration and rig support:
   null means absent in that authority, never an inferred identity.
 - **825 files byte-identical to final product**. Of **789 `ui/src` paths**,
   **775 are byte-identical** and **14 are explicit observation/test/type adapters**.
-- Each of the **34 differences** has its exact normalized final-to-composed unified
-  diff and a reason, not just a filename whitelist. Twenty are unchanged f389
+- Each of the **34 differences** has its exact final-to-composed unified
+  diff and a reason, not just a filename whitelist. Only temporary operand paths
+  are replaced; patch bodies are not normalized. Twenty are unchanged f389
   rig-support scripts absent from the product authority; they are not renderers
   and were neither created nor run by this composition.
 - MessageList, VirtualTranscript, ConversationNavStack and ConversationNav match
@@ -46,8 +49,20 @@ capability gates**, an explicitly authorized exception; it needs no algorithm ed
 The source guard `ui/tests/observationSourceParity.test.ts` checks inventory
 completeness, all three blob identities, every exact exception diff, the bounded
 adapter list, unchanged generated/rig source and an empty non-UI tracked diff
-against the immutable base. A changed file cannot pass merely because its name is
-on the adapter list.
+against the immutable base outside exact attribution exceptions and packet metadata.
+The attribution guard additionally pins the composition documentation and UI
+manifest themselves, as well as its Python producer and TypeScript consumer.
+Only the source-parity guard is an exception inside the 2702 UI tree. A changed
+file cannot pass merely because its name is on the adapter list.
+
+All exception patches use explicit Myers, disabled indent heuristic, three context
+lines, disabled external diff/textconv/color, full index hashes and fixed a/ and b/
+prefixes. The tracked `regenerate_manifests` function in
+`tests/devpy/test_observation_attribution_source.py` shares Python's exact diff
+arguments; TypeScript's `exactDiff` pins identical arguments. See the attribution
+packet for the complete command, finite manifest dependency order, hostile-config
+regressions and exact source-only reproduction commands. Regenerating patch
+metadata does not alter the original UI renderer/product source.
 
 ## Explicit existing capability exceptions
 
