@@ -24,8 +24,8 @@ use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use super::application_state::{ApplicationState, LiveState, UnavailableLiveCapability};
 use super::assets::public_root_asset;
-use super::AppState;
 use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,10 +451,19 @@ fn is_exempt_path(path: &str) -> bool {
 
 /// Axum middleware that enforces password auth when `PHOENIX_PASSWORD` is set.
 pub async fn auth_middleware(
-    State(state): State<AppState>,
+    State(application): State<ApplicationState>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    let state = match &application {
+        ApplicationState::Live(state) => state,
+        ApplicationState::Observation(application) => {
+            if let Err(error) = application.admit_peer(peer_from_extensions(&req), req.headers()) {
+                return error.into_response();
+            }
+            return next.run(req).await;
+        }
+    };
     // No password configured — pass through as the owner channel.
     let Some(password) = &state.password else {
         req.extensions_mut().insert(OwnerAuthenticated);
@@ -462,7 +471,9 @@ pub async fn auth_middleware(
     };
 
     // Exempt paths don't require auth
-    if is_exempt_path(req.uri().path()) {
+    if is_exempt_path(req.uri().path())
+        || (req.method() == axum::http::Method::GET && req.uri().path() == "/api/capabilities")
+    {
         return next.run(req).await;
     }
 
@@ -497,10 +508,13 @@ pub async fn auth_middleware(
 }
 
 pub async fn peer_auth_middleware(
-    State(state): State<AppState>,
+    State(application): State<ApplicationState>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    let ApplicationState::Live(state) = &application else {
+        return UnavailableLiveCapability.into_response();
+    };
     let authenticated = bearer_token(&req)
         .filter(|token| token.starts_with("phx_peer_"))
         .map(|token| FederationCredentialVerifier::from_bearer(token.as_bytes()));
@@ -546,7 +560,7 @@ pub struct LoginRequest {
 /// `GET /api/auth/status` — report whether auth is required and whether the
 /// caller is currently authenticated.
 pub async fn auth_status(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     req: Request<Body>,
 ) -> Json<AuthStatusResponse> {
     match &state.password {
@@ -581,7 +595,7 @@ pub async fn auth_status(
 /// set it in an auth cookie on success. Rate-limited per client (see
 /// [`LoginThrottle`]).
 pub async fn auth_login(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req_headers: header::HeaderMap,
     Json(body): Json<LoginRequest>,

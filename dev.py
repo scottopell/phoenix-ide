@@ -12219,6 +12219,78 @@ def cmd_prod_override_unset(_name: str):
     _reject_prod_override_command()
 
 
+def _observe_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be in 0..65535") from error
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be in 0..65535")
+    return port
+
+
+def _observe_fixture(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("fixture must be an absolute database path")
+    return path
+
+
+def _observe_target(value: str) -> str:
+    if not value.strip() or value.startswith("--"):
+        raise argparse.ArgumentTypeError("target must be a nonempty conversation reference")
+    return value
+
+
+def _observe_environment(directory: Path) -> dict[str, str]:
+    paths = {
+        "HOME": directory / "home",
+        "XDG_CONFIG_HOME": directory / "config",
+        "XDG_DATA_HOME": directory / "data",
+        "XDG_CACHE_HOME": directory / "cache",
+        "XDG_STATE_HOME": directory / "state",
+        "TMPDIR": directory / "tmp",
+    }
+    for path in paths.values():
+        path.mkdir(mode=0o700)
+    return {**{key: str(path) for key, path in paths.items()},
+            "TMP": str(paths["TMPDIR"]), "TEMP": str(paths["TMPDIR"]),
+            "LANG": "C", "LC_ALL": "C"}
+
+
+def cmd_observe(*, fixture: Path, target: str, binary: Path, port: int = 0) -> int:
+    """Launch an explicitly selected observation binary without development setup."""
+    binary = binary.resolve(strict=True)
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise ValueError("--binary must name an existing executable; observe never builds")
+    with tempfile.TemporaryDirectory(prefix="phoenix-observe-") as temporary:
+        directory = Path(temporary)
+        env = _observe_environment(directory)
+        command = [str(binary), "--observe-fixture", str(fixture), "--target", target,
+                   "--port", str(port)]
+        child = subprocess.Popen(command, cwd=directory, env=env)
+        previous = {}
+
+        def forward(signum, _frame):
+            child.send_signal(signum)
+
+        try:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous[signum] = signal.signal(signum, forward)
+            code = child.wait()
+            return code if code >= 0 else 128 - code
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+
+
 def cmd_conversation_search(args: list[str]) -> None:
     """Run the private, opt-in production conversation-search benchmark helper."""
     helper = ROOT / "scripts" / "conversation_search_benchmark.py"
@@ -12275,6 +12347,17 @@ def main():
         help="Render long-running commands (check, prod deploy) as a live lane table",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    observe_parser = sub.add_parser(
+        "observe", help="Observe a private read-only fixture using an already-built binary")
+    observe_parser.add_argument("--fixture", required=True, type=_observe_fixture,
+                                help="Absolute standalone, read-only SQLite fixture (server validates)")
+    observe_parser.add_argument("--target", required=True, type=_observe_target,
+                                help="Conversation reference admitted by the observation server")
+    observe_parser.add_argument("--binary", required=True, type=Path,
+                                help="Existing trusted phoenix_ide executable; never built implicitly")
+    observe_parser.add_argument("--port", type=_observe_port, default=0,
+                                help="Loopback port (default: 0, OS-selected; server prints URL)")
 
     # up
     up_parser = sub.add_parser("up", help="Build and start servers")
@@ -12533,6 +12616,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.command == "observe":
+        try:
+            code = cmd_observe(fixture=args.fixture, target=args.target,
+                               binary=args.binary, port=args.port)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        raise SystemExit(code)
 
     if args.command == "check":
         _check_cpu_budget()  # Reject invalid input before optional dependency bootstrap.

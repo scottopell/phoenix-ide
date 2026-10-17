@@ -94,6 +94,7 @@ fn host_addresses() -> Vec<IpAddr> {
 /// `POST /api/files/reveal` — open a path's containing folder in the server
 /// host's file manager. Refuses non-local callers (403).
 pub async fn reveal_path(
+    _live: super::application_state::LiveState,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<RevealRequest>,

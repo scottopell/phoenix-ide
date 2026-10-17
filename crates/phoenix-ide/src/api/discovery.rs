@@ -1,9 +1,9 @@
-use axum::{extract::State, Json};
+use super::application_state::LiveState;
+use axum::Json;
 
-use super::AppState;
 use crate::discovery::DiscoveryServicesResponse;
 
-pub async fn list_services(State(state): State<AppState>) -> Json<DiscoveryServicesResponse> {
+pub async fn list_services(LiveState(state): LiveState) -> Json<DiscoveryServicesResponse> {
     Json(DiscoveryServicesResponse {
         services: state.discovery.snapshot(),
     })

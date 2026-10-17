@@ -3,6 +3,7 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+use super::application_state::{ApplicationState, ConversationRouteObservations, LiveState};
 use super::assets::{
     get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
     PUBLIC_ROOT_ASSETS,
@@ -24,6 +25,7 @@ use super::lifecycle_handlers::{
     list_fork_proposals, mark_merged, reject_task, request_changes_on_fork_proposal,
     retry_close_retirement, task_feedback,
 };
+use super::observation::CoordinatorRouteResponse;
 use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
     list_product_conversations, rename_product_conversation,
@@ -63,7 +65,7 @@ use crate::state_machine::{ConvState, Event};
 use super::browser_view::browser_view_ws_handler;
 
 use axum::{
-    extract::{DefaultBodyLimit, MatchedPath, Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, MatchedPath, Multipart, Path, Query},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -87,7 +89,7 @@ use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 
 async fn trajectory_export_handler(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match crate::analytics::trajectory_export(&state.db, &id).await {
@@ -118,12 +120,14 @@ const STREAMING_ROUTES: &[&str] = &[
 const MAX_REMOTE_QUERY_REQUEST_BODY_BYTES: usize = 100 * 1024;
 
 /// Create the API router
-pub fn create_router(state: AppState) -> Router {
+pub fn create_router(state: impl Into<ApplicationState>) -> Router {
+    let state = state.into();
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
     // from `spa_routes::SPA_ROUTES` — the single source of truth shared with the
     // auth exemption (`auth::is_exempt_path`) so the two cannot drift. Adding a
     // React route means adding one entry there, not here.
     let mut router = Router::new()
+        .route("/api/capabilities", get(get_capabilities))
         .route("/service-worker.js", get(serve_service_worker))
         .route("/phoenix.svg", get(serve_favicon));
     for asset in PUBLIC_ROOT_ASSETS {
@@ -1001,7 +1005,7 @@ async fn cached_pr_summaries_for_conversations(
 }
 
 async fn get_existing_coordinator(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let conversation_id = state
         .db
@@ -1019,52 +1023,18 @@ async fn get_existing_coordinator(
     }))
 }
 
-#[derive(Serialize)]
-struct CoordinatorRouteResponse {
-    coordinator_id: Option<String>,
-}
-
 async fn resolve_coordinator_route(
-    State(state): State<AppState>,
+    observations: ConversationRouteObservations,
     Path(conversation): Path<String>,
 ) -> Result<Json<CoordinatorRouteResponse>, AppError> {
-    let Some(coordinator_id) = state
-        .db
-        .coordinator_conversation_id()
+    observations
+        .resolve_coordinator_route(&conversation)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    else {
-        return Ok(Json(CoordinatorRouteResponse {
-            coordinator_id: None,
-        }));
-    };
-    let root_id = state
-        .db
-        .chain_root_of(&coordinator_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .unwrap_or_else(|| coordinator_id.clone());
-    let members = state
-        .db
-        .chain_members_forward(&root_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let matched = if members.iter().any(|id| id == &conversation) {
-        true
-    } else {
-        match state.db.get_conversation_by_slug(&conversation).await {
-            Ok(candidate) => members.iter().any(|id| id == &candidate.id),
-            Err(DbError::ConversationNotFound(_)) => false,
-            Err(error) => return Err(AppError::Internal(error.to_string())),
-        }
-    };
-    Ok(Json(CoordinatorRouteResponse {
-        coordinator_id: matched.then_some(root_id),
-    }))
+        .map(Json)
 }
 
 async fn ensure_coordinator(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let llm_language = state
         .db
@@ -1260,7 +1230,7 @@ async fn serve_spa() -> impl IntoResponse {
 // ============================================================
 
 async fn list_conversations(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<ConversationListResponse>, AppError> {
     let conversations = state
         .runtime
@@ -1284,7 +1254,7 @@ async fn list_conversations(
 }
 
 async fn list_archived_conversations(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<ConversationListResponse>, AppError> {
     let conversations = state
         .runtime
@@ -1317,7 +1287,7 @@ fn clamp_conversation_search_limit(limit: Option<usize>) -> usize {
 }
 
 async fn retrieval_status(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Json<phoenix_db::retrieval::ReconciliationStatus> {
     Json(state.message_retriever.reconciliation_status())
 }
@@ -1343,7 +1313,7 @@ fn require_retrieval_ready(
 }
 
 async fn search_conversations(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<ConversationSearchQuery>,
 ) -> Result<Json<ConversationSearchResponse>, AppError> {
     let q = query.q.trim();
@@ -1441,7 +1411,7 @@ async fn search_conversations(
 // ============================================================
 
 async fn get_notification_settings(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<NotificationSettings>, AppError> {
     let settings = state
         .db
@@ -1452,7 +1422,7 @@ async fn get_notification_settings(
 }
 
 async fn update_notification_settings(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(req): Json<NotificationSettingsRequest>,
 ) -> Result<Json<NotificationSettings>, AppError> {
     let settings: NotificationSettings = req.into();
@@ -1493,7 +1463,7 @@ fn llm_language_setting_response(
 }
 
 async fn get_llm_language_setting(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<LlmLanguageSettingResponse>, AppError> {
     let lang = state
         .db
@@ -1504,7 +1474,7 @@ async fn get_llm_language_setting(
 }
 
 async fn update_llm_language_setting(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(req): Json<LlmLanguageSettingRequest>,
 ) -> Result<Json<LlmLanguageSettingResponse>, AppError> {
     let lang = crate::llm_language::LlmLanguage::parse(&req.language).ok_or_else(|| {
@@ -1530,7 +1500,7 @@ async fn update_llm_language_setting(
 // Projects (REQ-PROJ-014)
 // ============================================================
 
-async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn list_projects(LiveState(state): LiveState) -> Result<Json<Value>, AppError> {
     let projects = state
         .db
         .list_projects()
@@ -2016,7 +1986,7 @@ async fn read_multipart_attachments(
 // ============================================================
 
 async fn cancel_product_conversation_creation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(request_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let _authority = state
@@ -2038,7 +2008,7 @@ async fn cancel_product_conversation_creation(
 }
 
 async fn retry_product_conversation_delivery(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(request_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let _authority = state
@@ -2061,7 +2031,7 @@ async fn retry_product_conversation_delivery(
 }
 
 async fn get_product_conversation_creation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(request_id): Path<String>,
 ) -> Result<Json<super::types::ProductConversationCreationStatusResponse>, AppError> {
     let job = state
@@ -2171,7 +2141,7 @@ fn product_creation_status_response(
 }
 
 async fn delete_product_conversation_creation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(request_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let _authority = state
@@ -2194,7 +2164,7 @@ async fn delete_product_conversation_creation(
 
 #[allow(clippy::too_many_lines)]
 async fn create_product_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(req): Json<CreateProductConversationRequest>,
 ) -> Result<(StatusCode, Json<ProductConversationCreateAcceptedResponse>), AppError> {
     let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
@@ -2608,7 +2578,7 @@ mod product_creation_acceptance_tests {
 }
 
 async fn list_recent_management_roots(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<RecentManagementRootSuggestionsResponse>, AppError> {
     let suggestions = state
         .db
@@ -2626,7 +2596,7 @@ async fn list_recent_management_roots(
 }
 
 async fn create_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(req): Json<CreateConversationRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     create_conversation_with_id(state, req, Vec::new()).await
@@ -2970,7 +2940,7 @@ async fn create_conversation_with_id(
 
 #[allow(clippy::too_many_lines)]
 async fn create_conversation_with_attachments(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     multipart: Multipart,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let (req, raw_files) = read_multipart_create_parts(multipart).await?;
@@ -3489,6 +3459,7 @@ impl ProductConversationOpenTelemetry {
 }
 
 async fn report_product_conversation_open(
+    _live: LiveState,
     Json(report): Json<ProductConversationOpenTelemetry>,
 ) -> StatusCode {
     if !report.has_valid_bounds() {
@@ -3511,7 +3482,10 @@ async fn report_product_conversation_open(
     StatusCode::NO_CONTENT
 }
 
-async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>) -> StatusCode {
+async fn report_conversation_open(
+    _live: LiveState,
+    Json(report): Json<ConversationOpenTelemetry>,
+) -> StatusCode {
     if !report.has_valid_bounds() {
         return StatusCode::BAD_REQUEST;
     }
@@ -3594,7 +3568,7 @@ const MAX_MESSAGE_HISTORY_LIMIT: i64 = 500;
 const MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES: usize = 2_048;
 
 async fn get_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<GetConversationQuery>,
 ) -> Result<Json<ConversationWithMessagesResponse>, AppError> {
@@ -4000,7 +3974,7 @@ async fn get_server_message_tail(
 }
 
 async fn reconcile_accepted_messages(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(req): Json<ReconcileAcceptedMessagesRequest>,
 ) -> Result<Json<ReconcileAcceptedMessagesResponse>, AppError> {
@@ -4065,7 +4039,7 @@ async fn reconcile_accepted_messages(
 }
 
 async fn get_conversation_messages_latest(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<LatestMessagesQuery>,
 ) -> Result<Json<ConversationMessageSliceResponse>, AppError> {
@@ -4096,7 +4070,7 @@ async fn get_conversation_messages_latest(
 }
 
 async fn get_conversation_messages(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<MessageHistoryQuery>,
 ) -> Result<Json<ConversationMessageSliceResponse>, AppError> {
@@ -4162,7 +4136,7 @@ async fn get_conversation_messages(
 }
 
 async fn get_conversation_message_range(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<MessageRangeQuery>,
 ) -> Result<Json<ConversationMessageRangeResponse>, AppError> {
@@ -4211,7 +4185,7 @@ async fn get_conversation_message_range(
 }
 
 async fn get_conversation_messages_around(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((id, sequence)): Path<(String, i64)>,
     Query(query): Query<AroundMessagesQuery>,
 ) -> Result<Json<ConversationMessagesAroundResponse>, AppError> {
@@ -4245,7 +4219,7 @@ async fn get_conversation_messages_around(
 /// `GET /api/conversations/:id/slug` — compatibility lookup used by links that
 /// already have a conversation id and only need its current slug.
 async fn get_conversation_slug(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let conversation = state
@@ -4260,47 +4234,20 @@ async fn get_conversation_slug(
 
 /// `GET /api/conversations/:id/route` — minimal bootstrap route lookup.
 async fn get_conversation_route(
-    State(state): State<AppState>,
+    observations: ConversationRouteObservations,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationRouteResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(product_route_db_to_app)?;
-
-    Ok(Json(ConversationRouteResponse {
-        id: conversation.id,
-        slug: conversation.slug,
-    }))
-}
-
-fn product_route_db_to_app(error: DbError) -> AppError {
-    match error {
-        DbError::ConversationNotFound(id) => AppError::NotFound(id),
-        error => AppError::Internal(error.to_string()),
-    }
+    observations.get_conversation_route(&id).await.map(Json)
 }
 
 async fn get_product_conversation_route(
-    State(state): State<AppState>,
+    observations: ConversationRouteObservations,
     Path(reference): Path<String>,
 ) -> Result<Json<ProductConversationRouteResponse>, AppError> {
-    let db = state.runtime.db();
-    let resolved = db
-        .resolve_ordinary_product_conversation(&reference)
+    observations
+        .get_product_conversation_route(&reference)
         .await
-        .map_err(product_route_db_to_app)?;
-    let conversation = db
-        .get_ordinary_product_conversation(&resolved.product_conversation_id)
-        .await
-        .map_err(product_route_db_to_app)?
-        .root
-        .conversation;
-    Ok(Json(ProductConversationRouteResponse {
-        transcript_row_id: conversation.id,
-    }))
+        .map(Json)
 }
 
 /// `GET /api/work-scope/:scope_key/inventory` — read-projection over the
@@ -4373,7 +4320,7 @@ async fn load_request_scope(
 }
 
 async fn get_work_scope_load(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(scope_key): Path<String>,
     Query(query): Query<WorkScopeActorQuery>,
 ) -> Result<Json<super::work_scope_load::WorkScopeLoadSummary>, AppError> {
@@ -4396,7 +4343,7 @@ async fn get_work_scope_load(
 }
 
 async fn get_all_work_scope_load(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<WorkScopeActorQuery>,
 ) -> Result<Json<Vec<super::work_scope_load::WorkScopeLoadSummary>>, AppError> {
     load_request_scope(&state, &query.conversation_id, None).await?;
@@ -4410,7 +4357,7 @@ async fn get_all_work_scope_load(
 }
 
 async fn get_work_scope_inventory(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(scope_key): Path<String>,
     Query(query): Query<WorkScopeActorQuery>,
 ) -> Result<Json<phoenix_core::domain::work_scope_inventory::WorkScopeInventory>, AppError> {
@@ -4462,7 +4409,7 @@ async fn get_work_scope_inventory(
 }
 
 async fn stop_conversation_browser_session(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let conversation = state
@@ -4505,7 +4452,7 @@ async fn stop_conversation_browser_session(
 /// manager path used by delete cascades and idle cleanup, so normal browser and
 /// work-scope lifecycle events drive the UI back to not-live.
 async fn stop_work_scope_browser_session(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(scope_key): Path<String>,
     Query(query): Query<WorkScopeActorQuery>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -4558,7 +4505,7 @@ struct ActiveCoordinatorWatchResponse {
 }
 
 async fn list_active_coordinator_watches(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<Vec<ActiveCoordinatorWatchResponse>>, AppError> {
     let snapshots = state.db.list_coordinator_watches().await.map_err(|error| {
         AppError::Internal(format!("failed to list Coordinator watches: {error}"))
@@ -4587,7 +4534,7 @@ async fn list_active_coordinator_watches(
 }
 
 async fn list_live_coordinator_bash_handles(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Json<Vec<LiveCoordinatorBashHandle>> {
     let handles = state
         .runtime
@@ -4613,7 +4560,7 @@ async fn list_live_coordinator_bash_handles(
 }
 
 async fn stop_live_coordinator_bash_handle(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(handle_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     match phoenix_tools::bash::stop_exact_handle_for_scope(
@@ -4640,7 +4587,7 @@ fn coordinator_stop_error(handle_id: &str, error: phoenix_tools::bash::BashError
 }
 
 async fn inspect_bash_handle(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(handle_id): Path<String>,
     Query(query): Query<InspectQuery>,
 ) -> Result<Json<phoenix_core::domain::process_inspection::BashHandleInspection>, AppError> {
@@ -4689,7 +4636,7 @@ async fn inspect_bash_handle(
 }
 
 async fn get_system_prompt(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SystemPromptResponse>, AppError> {
     let conversation = state
@@ -4930,13 +4877,13 @@ async fn read_stream_init_messages_with_tail(
     ))
 }
 
-async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
+async fn stream_aggregate_events(LiveState(state): LiveState) -> impl IntoResponse {
     super::sse::aggregate_event_stream(state.db.clone(), state.runtime.subscribe_aggregate_events())
 }
 
 #[allow(clippy::too_many_lines)]
 async fn stream_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<StreamConversationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -5203,7 +5150,7 @@ async fn stream_conversation(
 // ============================================================
 
 async fn upload_conversation_attachments(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     multipart: Multipart,
 ) -> Result<Json<AttachmentUploadResponse>, AppError> {
@@ -5223,7 +5170,7 @@ async fn upload_conversation_attachments(
 }
 
 async fn send_chat(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
@@ -5390,7 +5337,7 @@ fn record_cancel_outcome(
 
 #[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<CancelResponse>, AppError> {
     let span = crate::logging::conversation_cancel_span(&id);
@@ -5727,7 +5674,7 @@ async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> 
 /// upgrade while an LLM request, tool execution, or other operation is in flight (see
 /// `ConvState::allows_model_change`).
 async fn upgrade_conversation_model(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(req): Json<UpgradeModelRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -5853,7 +5800,7 @@ fn continuation_operation_id(state: ConvState) -> String {
 
 /// Manually trigger context continuation (REQ-BED-023)
 async fn trigger_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state
@@ -5914,7 +5861,7 @@ mod continuation_operation_id_tests {
 /// message is not found. Returns 200 (success: true) if the message was removed
 /// or was already absent (idempotent).
 async fn cancel_steering_message(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path((id, message_id)): Path<(String, String)>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     // 404 if the conversation does not exist; the removal itself is idempotent.
@@ -6102,7 +6049,7 @@ fn automatic_retry_phase_for_turn_state(
 
 #[allow(clippy::too_many_lines)]
 async fn continue_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(req): Json<ContinueConversationRequest>,
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
@@ -6428,7 +6375,7 @@ mod question_request_identity_tests {
 }
 
 async fn respond_to_question(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(req): Json<RespondToQuestionPayload>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -6476,7 +6423,7 @@ async fn respond_to_question(
 }
 
 async fn dismiss_question(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     payload: Option<Json<DismissQuestionPayload>>,
 ) -> Result<Json<SuccessResponse>, AppError> {
@@ -6533,7 +6480,7 @@ async fn dismiss_question(
 /// end the policy says to abandon for a new conversation, and returning it to
 /// Idle would reopen the resume path the policy denies.
 async fn dismiss_error(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state
@@ -6633,7 +6580,7 @@ pub(super) async fn refuse_if_coordinator(
 }
 
 async fn archive_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
@@ -7013,7 +6960,7 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
 /// attempt automatic recovery on subsequent startup — see REQ-BED-032
 /// rationale.
 async fn delete_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state
@@ -7654,7 +7601,7 @@ async fn cleanup_pending_fork_orphans_on_delete(
 }
 
 async fn rename_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
@@ -7674,7 +7621,7 @@ async fn rename_conversation(
 }
 
 async fn regenerate_conversation_name(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let opening = state
@@ -7768,7 +7715,7 @@ pub(crate) fn title_from_text(text: &str) -> String {
 /// query. Stateless and tool-less: a single LLM completion, nothing executed or
 /// persisted server-side.
 async fn suggest_handler(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     headers: axum::http::HeaderMap,
     Json(req): Json<SuggestRequest>,
 ) -> Result<Json<SuggestResponse>, AppError> {
@@ -7821,24 +7768,14 @@ async fn suggest_handler(
 // ============================================================
 
 async fn get_by_slug_route(
-    State(state): State<AppState>,
+    observations: ConversationRouteObservations,
     Path(slug): Path<String>,
 ) -> Result<Json<ConversationRouteResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation_by_slug(&slug)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    Ok(Json(ConversationRouteResponse {
-        id: conversation.id,
-        slug: conversation.slug,
-    }))
+    observations.get_by_slug_route(&slug).await.map(Json)
 }
 
 async fn get_by_slug(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(slug): Path<String>,
 ) -> Result<Json<ConversationWithMessagesResponse>, AppError> {
     let conversation = match state.runtime.db().get_conversation_by_slug(&slug).await {
@@ -7914,7 +7851,7 @@ struct PreviewQuery {
 // the picker exists to expose. Content-reading handlers (`read_file`,
 // `list_files`) ARE confined via `canonicalize_within_roots`.
 async fn validate_cwd(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<PathQuery>,
 ) -> Json<ValidateCwdResponse> {
     // Normalize path: remove trailing slashes (except for root)
@@ -7948,6 +7885,7 @@ async fn validate_cwd(
 }
 
 async fn list_directory(
+    _live: LiveState,
     Query(query): Query<PathQuery>,
 ) -> Result<Json<ListDirectoryResponse>, AppError> {
     // Normalize path: remove trailing slashes (except for root)
@@ -8164,7 +8102,7 @@ async fn read_root_allowlist(state: &AppState, cwd: Option<&str>) -> Vec<PathBuf
 
 /// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
 async fn list_files(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<PathQuery>,
 ) -> Result<Json<ListFilesResponse>, AppError> {
     let path_str = query.path.trim_end_matches('/');
@@ -8257,7 +8195,7 @@ async fn list_files(
 
 /// Read file contents with an explicit text/image contract (REQ-PF-005).
 async fn read_file(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<PathQuery>,
 ) -> Result<Json<ReadFileResponse>, AppError> {
     let requested = PathBuf::from(&query.path);
@@ -8354,7 +8292,7 @@ fn is_browser_screenshot_preview(requested: &FsPath, canonical: &FsPath) -> bool
 /// URL: `/preview/Users/scott/dev/site/index.html`
 /// A `<link href="style.css">` resolves to `/preview/Users/scott/dev/site/style.css`
 async fn serve_preview_file(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(filepath): Path<String>,
     Query(query): Query<PreviewQuery>,
 ) -> Result<axum::response::Response, AppError> {
@@ -8427,7 +8365,7 @@ async fn serve_preview_file(
 /// Uses the `ignore` crate to respect `.gitignore`, `.ignore`, and other standard
 /// exclusion files. Results are fuzzy-matched against the query when provided.
 async fn search_conversation_files(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<FileSearchQuery>,
 ) -> Result<Json<FileSearchResponse>, AppError> {
@@ -8466,6 +8404,7 @@ async fn search_conversation_files(
 /// so the composer on the `/new` page — which has no conversation yet — can
 /// offer the same `@file` / `./path` autocomplete as an in-conversation composer.
 async fn search_project_files(
+    _live: LiveState,
     Query(query): Query<ProjectFileSearchQuery>,
 ) -> Result<Json<FileSearchResponse>, AppError> {
     let cwd = std::path::PathBuf::from(&query.cwd);
@@ -8621,7 +8560,7 @@ const CODE_SEARCH_MAX_SCANNED_BYTES: u64 = 32_000_000;
 
 /// Gitignore-aware literal content search within the conversation's file root.
 async fn search_conversation_code(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<CodeSearchQuery>,
 ) -> Result<Json<CodeSearchResponse>, AppError> {
@@ -8764,7 +8703,7 @@ fn find_literal_match(line: &str, query: &str, case_sensitive: bool) -> Option<(
 /// Calls `discover_skills()` from `system_prompt.rs` and returns each skill's
 /// name, description, and optional `argument_hint` for frontend autocomplete.
 async fn list_conversation_skills(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<SkillsResponse>, AppError> {
     let conversation = state
@@ -8792,6 +8731,7 @@ async fn list_conversation_skills(
 /// conversation's `cwd`, so the composer on the `/new` page — which has no
 /// conversation yet — can offer the same `/skill` autocomplete.
 async fn list_project_skills(
+    _live: LiveState,
     Query(query): Query<ProjectSkillsQuery>,
 ) -> Result<Json<SkillsResponse>, AppError> {
     let cwd = std::path::PathBuf::from(&query.cwd);
@@ -8914,7 +8854,7 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
 
 /// List task files from a project's tasks/ directory before a conversation exists.
 async fn list_project_tasks(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<ProjectTasksQuery>,
 ) -> Result<Json<TasksResponse>, AppError> {
     let cwd = std::path::PathBuf::from(&query.cwd);
@@ -8928,7 +8868,7 @@ async fn list_project_tasks(
 
 /// List task files from the conversation's project tasks/ directory.
 async fn list_conversation_tasks(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<TasksResponse>, AppError> {
     let conversation = state
@@ -8988,7 +8928,7 @@ fn task_counts_for_cwd(cwd: &std::path::Path, current_task_id: Option<&str>) -> 
 /// Lightweight task status counts for the conversation's project, for the Tasks
 /// panel's collapsed header (full list fetched only on expand).
 async fn get_conversation_task_count(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Query(query): Query<TaskCountQuery>,
 ) -> Result<Json<TaskCountResponse>, AppError> {
@@ -9013,7 +8953,7 @@ async fn get_conversation_task_count(
 
 /// Token usage totals for a conversation (own turns + root rollup including sub-agents).
 async fn get_conversation_usage_handler(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationUsage>, AppError> {
     let usage = state
@@ -9028,7 +8968,7 @@ async fn get_conversation_usage_handler(
 // Model Info (REQ-API-009)
 // ============================================================
 
-async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
+async fn list_models(LiveState(state): LiveState) -> Json<ModelsResponse> {
     // Get model metadata from registry
     let models = state.llm_registry.available_model_info();
 
@@ -9060,7 +9000,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 // Credential Helper
 // ============================================================
 
-async fn run_credential_helper(State(state): State<AppState>) -> impl IntoResponse {
+async fn run_credential_helper(LiveState(state): LiveState) -> impl IntoResponse {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::StreamExt;
     use std::convert::Infallible;
@@ -9103,7 +9043,7 @@ async fn run_credential_helper(State(state): State<AppState>) -> impl IntoRespon
         .into_response()
 }
 
-async fn invalidate_credential(State(state): State<AppState>) -> impl IntoResponse {
+async fn invalidate_credential(LiveState(state): LiveState) -> impl IntoResponse {
     use phoenix_llm::CredentialSource;
 
     let Some(ref hs) = state.credential_helper else {
@@ -9128,7 +9068,7 @@ async fn invalidate_credential(State(state): State<AppState>) -> impl IntoRespon
 // Environment Info
 // ============================================================
 
-async fn get_env(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn get_env(LiveState(state): LiveState) -> Json<serde_json::Value> {
     let home = state.runtime_env.home().to_string_lossy().into_owned();
     Json(serde_json::json!({ "home_dir": home }))
 }
@@ -9166,13 +9106,13 @@ fn version_json_reports_runtime_socket_activation() {
 }
 
 /// Return status of all connected MCP servers.
-async fn mcp_status(State(state): State<AppState>) -> impl IntoResponse {
+async fn mcp_status(LiveState(state): LiveState) -> impl IntoResponse {
     Json(state.mcp_manager.status().await)
 }
 
 /// Reload MCP server configurations: disconnect removed servers,
 /// connect newly added ones, leave existing ones untouched.
-async fn reload_mcp(State(state): State<AppState>) -> impl IntoResponse {
+async fn reload_mcp(LiveState(state): LiveState) -> impl IntoResponse {
     let result = state.mcp_manager.reload().await;
     tracing::info!(
         added = ?result.added,
@@ -9188,7 +9128,7 @@ async fn reload_mcp(State(state): State<AppState>) -> impl IntoResponse {
 /// Disable an MCP server: its tools are excluded from conversations.
 /// The server stays connected for instant re-enable.
 async fn disable_mcp_server(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = state.db.disable_mcp_server(&name).await {
@@ -9241,7 +9181,7 @@ fn html_escape(text: &str) -> String {
 /// the callback against the pending flow (state nonce + iss), exchanges the
 /// code, and reconnects the server in the background.
 async fn mcp_oauth_callback(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(params): Query<McpOAuthCallbackParams>,
 ) -> Response {
     // An error redirect (operator denied, server rejected) fails the flow it
@@ -9295,7 +9235,7 @@ async fn mcp_oauth_callback(
 
 /// Re-enable a previously disabled MCP server.
 async fn enable_mcp_server(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = state.db.enable_mcp_server(&name).await {
@@ -9414,7 +9354,7 @@ pub(crate) fn generate_slug() -> String {
 ///
 /// REQ-AUTH-004: If a token already exists, reuses it. Always redirects to `/s/{token}`.
 async fn create_or_redirect_share(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(slug): Path<String>,
 ) -> Result<Redirect, AppError> {
     let conversation = state
@@ -9437,7 +9377,7 @@ async fn create_or_redirect_share(
 ///
 /// REQ-AUTH-005: Validates that the token exists before serving the page.
 async fn serve_share_page(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(token): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     // Validate token exists
@@ -9467,7 +9407,7 @@ async fn serve_share_page(
 ///
 /// REQ-AUTH-006: Validates share token instead of password.
 async fn get_shared_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(token): Path<String>,
 ) -> Result<Json<ConversationWithMessagesResponse>, AppError> {
     let (conversation_id, _) = state
@@ -9517,7 +9457,7 @@ async fn get_shared_conversation(
 /// REQ-AUTH-006 + REQ-AUTH-007: Token-validated, supports multiple simultaneous viewers.
 #[allow(clippy::too_many_lines)]
 async fn shared_sse_stream(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(token): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let (conversation_id, _) = state
@@ -9718,7 +9658,7 @@ mod shared_stream_snapshot_tests {
 
     async fn shared_init(state: AppState, token: String) -> serde_json::Value {
         use futures::StreamExt as _;
-        let response = shared_sse_stream(State(state), Path(token))
+        let response = shared_sse_stream(LiveState(state), Path(token))
             .await
             .expect("shared stable init")
             .into_response();
@@ -9840,7 +9780,7 @@ mod shared_stream_snapshot_tests {
                 STABLE_TRANSCRIPT_READ_MAX_ATTEMPTS,
             ));
         });
-        let result = shared_sse_stream(State(state.clone()), Path(token)).await;
+        let result = shared_sse_stream(LiveState(state.clone()), Path(token)).await;
         assert!(matches!(result, Err(AppError::Internal(_))));
         assert!(CHANGE.with(|hook| hook.borrow().is_none()));
         let after = state
@@ -10396,7 +10336,7 @@ mod conversation_cwd_validation_tests {
     async fn validate_cwd_rejects_filesystem_root() {
         let state = hard_delete_cascade_tests::make_test_state().await;
         let Json(response) = validate_cwd(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: "/".to_string(),
                 cwd: None,
@@ -10452,7 +10392,7 @@ mod conversation_cwd_validation_tests {
         drop(tmp);
 
         let response = stream_conversation(
-            State(state),
+            LiveState(state),
             Path("stale-cwd".to_string()),
             Query(StreamConversationQuery::default()),
         )
@@ -10640,7 +10580,7 @@ pub(crate) mod hard_delete_cascade_tests {
         );
 
         let Json(response) = super::stop_work_scope_browser_session(
-            State(state),
+            LiveState(state),
             Path(scope.stable_key()),
             Query(super::WorkScopeActorQuery {
                 conversation_id: id.to_string(),
@@ -10725,7 +10665,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("persist steering queue");
 
         let Json(response) = reconcile_accepted_messages(
-            State(state),
+            LiveState(state),
             Path("conv-reconcile".to_string()),
             Json(ReconcileAcceptedMessagesRequest {
                 message_ids: vec![
@@ -10776,7 +10716,7 @@ pub(crate) mod hard_delete_cascade_tests {
         }
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history".to_string()),
             Query(LatestMessagesQuery { limit: Some(2) }),
         )
@@ -10795,7 +10735,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert_eq!(latest.transcript_generation, Some(1));
 
         let Json(range) = get_conversation_message_range(
-            State(state),
+            LiveState(state),
             Path("conv-history".to_string()),
             Query(MessageRangeQuery {
                 start_message_sequence: 2,
@@ -10885,7 +10825,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("add tool");
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-history-latest-turn".to_string()),
             Query(LatestMessagesQuery { limit: Some(2) }),
         )
@@ -10948,7 +10888,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("tool");
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-complete-owner".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11024,7 +10964,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("agent 2");
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-agent-run-backfill".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11111,7 +11051,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("agent 2");
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-agent-run-system".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11161,7 +11101,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("user");
 
         let Json(full) = get_conversation(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-system-user".to_string()),
             Query(GetConversationQuery {
                 after_sequence: None,
@@ -11178,7 +11118,7 @@ pub(crate) mod hard_delete_cascade_tests {
         );
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-system-user".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11195,7 +11135,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(latest.has_older_messages);
 
         let Json(before) = get_conversation_messages(
-            State(state),
+            LiveState(state),
             Path("conv-system-user".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(2),
@@ -11302,7 +11242,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("agent 2");
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-boundary-stops-backfill".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11319,7 +11259,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(latest.has_older_messages);
 
         let Json(before) = get_conversation_messages(
-            State(state),
+            LiveState(state),
             Path("conv-boundary-stops-backfill".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(5),
@@ -11499,7 +11439,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("user");
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-whitespace-system-non-boundary".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11516,7 +11456,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(latest.has_older_messages);
 
         let Json(before) = get_conversation_messages(
-            State(state),
+            LiveState(state),
             Path("conv-whitespace-system-non-boundary".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(4),
@@ -11576,7 +11516,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("tool");
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-standalone-prefix".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11679,7 +11619,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let state = latest_message_ceiling_fixture(CeilingFixture::Exact).await;
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-history-exact-ceiling-prefix".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -11763,7 +11703,7 @@ pub(crate) mod hard_delete_cascade_tests {
         }
 
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-history-latest-long-turn".to_string()),
             Query(LatestMessagesQuery { limit: Some(50) }),
         )
@@ -11858,7 +11798,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("add user 3");
 
         let Json(before) = get_conversation_messages(
-            State(state),
+            LiveState(state),
             Path("conv-history-before-turn".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(5),
@@ -11885,7 +11825,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let state = latest_message_ceiling_fixture(CeilingFixture::Over).await;
 
         let err = get_conversation_messages_latest(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history-over-ceiling-turn".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -12032,7 +11972,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let mut pages = Vec::new();
         let Json(latest) = get_conversation_messages_latest(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history-page-each-once".to_string()),
             Query(LatestMessagesQuery { limit: Some(20) }),
         )
@@ -12047,7 +11987,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .map(|message| message.sequence_id)
                 .expect("non-empty page");
             let Json(older) = get_conversation_messages(
-                State(state.clone()),
+                LiveState(state.clone()),
                 Path("conv-history-page-each-once".to_string()),
                 Query(MessageHistoryQuery {
                     before_message_sequence: Some(before_sequence),
@@ -12097,7 +12037,7 @@ pub(crate) mod hard_delete_cascade_tests {
         }
 
         let Json(before) = get_conversation_messages(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history-2".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(5),
@@ -12118,7 +12058,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert_eq!(before.server_message_tail, Some(6));
 
         let Json(after) = get_conversation_messages(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history-2".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: None,
@@ -12139,7 +12079,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert_eq!(after.server_message_tail, Some(6));
 
         let Json(around) = get_conversation_messages_around(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path(("conv-history-2".to_string(), 4)),
             Query(AroundMessagesQuery {
                 before: Some(2),
@@ -12168,7 +12108,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert_eq!(around.server_message_tail, Some(6));
 
         let err = get_conversation_messages(
-            State(state),
+            LiveState(state),
             Path("conv-history-2".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(5),
@@ -12209,7 +12149,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("add message");
 
         let latest_err = get_conversation_messages_latest(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history-zero-limit".to_string()),
             Query(LatestMessagesQuery { limit: Some(0) }),
         )
@@ -12218,7 +12158,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(matches!(latest_err, AppError::BadRequest(_)));
 
         let before_err = get_conversation_messages(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history-zero-limit".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(1),
@@ -12231,7 +12171,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(matches!(before_err, AppError::BadRequest(_)));
 
         let after_err = get_conversation_messages(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-history-zero-limit".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: None,
@@ -12244,7 +12184,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(matches!(after_err, AppError::BadRequest(_)));
 
         let around_before_err = get_conversation_messages_around(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path(("conv-history-zero-limit".to_string(), 1)),
             Query(AroundMessagesQuery {
                 before: Some(0),
@@ -12256,7 +12196,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(matches!(around_before_err, AppError::BadRequest(_)));
 
         let around_after_err = get_conversation_messages_around(
-            State(state),
+            LiveState(state),
             Path(("conv-history-zero-limit".to_string(), 1)),
             Query(AroundMessagesQuery {
                 before: Some(1),
@@ -12300,7 +12240,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         bump_generation_after_next_stable_read_value("conv-history-latest-race");
         let Json(latest) = get_conversation_messages_latest(
-            State(state),
+            LiveState(state),
             Path("conv-history-latest-race".to_string()),
             Query(LatestMessagesQuery { limit: Some(2) }),
         )
@@ -12351,7 +12291,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         bump_generation_after_next_stable_read_value("conv-history-before-race");
         let Json(before) = get_conversation_messages(
-            State(state),
+            LiveState(state),
             Path("conv-history-before-race".to_string()),
             Query(MessageHistoryQuery {
                 before_message_sequence: Some(4),
@@ -12391,7 +12331,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("create conversation");
 
         let err = get_conversation_message_range(
-            State(state),
+            LiveState(state),
             Path("conv-history-range-invalid".to_string()),
             Query(MessageRangeQuery {
                 start_message_sequence: 4,
@@ -12655,7 +12595,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         bump_generation_after_next_stable_read_value("range-read-race");
         let Json(response) = get_conversation_message_range(
-            State(state),
+            LiveState(state),
             Path("range-read-race".to_string()),
             Query(MessageRangeQuery {
                 start_message_sequence: 1,
@@ -12684,7 +12624,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         bump_generation_after_next_stable_read_value("around-read-race");
         let Json(response) = get_conversation_messages_around(
-            State(state),
+            LiveState(state),
             Path(("around-read-race".to_string(), 2)),
             Query(AroundMessagesQuery {
                 before: Some(1),
@@ -12722,7 +12662,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         bump_generation_after_next_stable_read_value("full-read-race");
         let Json(response) = get_conversation(
-            State(state),
+            LiveState(state),
             Path("full-read-race".to_string()),
             Query(GetConversationQuery {
                 after_sequence: None,
@@ -12756,7 +12696,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("add message");
 
         bump_generation_after_next_stable_read_value("slug-read-race");
-        let Json(response) = get_by_slug(State(state), Path("slug-read-race".to_string()))
+        let Json(response) = get_by_slug(LiveState(state), Path("slug-read-race".to_string()))
             .await
             .expect("stable slug conversation read");
 
@@ -13047,7 +12987,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .create_share_token("c-cached-pr")
             .await
             .expect("share token");
-        let Json(shared_response) = get_shared_conversation(State(state.clone()), Path(token))
+        let Json(shared_response) = get_shared_conversation(LiveState(state.clone()), Path(token))
             .await
             .expect("shared conversation");
         assert!(
@@ -13056,7 +12996,7 @@ pub(crate) mod hard_delete_cascade_tests {
         );
 
         let Json(response) = get_conversation(
-            State(state),
+            LiveState(state),
             Path("c-cached-pr".to_string()),
             Query(GetConversationQuery {
                 after_sequence: None,
@@ -13085,7 +13025,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         // A callback matching no pending flow is rejected (REQ-MCP-011).
         let response = super::mcp_oauth_callback(
-            State(state.clone()),
+            LiveState(state.clone()),
             Query(super::McpOAuthCallbackParams {
                 code: Some("code-1".to_string()),
                 state: Some("nonexistent".to_string()),
@@ -13099,7 +13039,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         // A missing code/state pair is rejected.
         let response = super::mcp_oauth_callback(
-            State(state.clone()),
+            LiveState(state.clone()),
             Query(super::McpOAuthCallbackParams {
                 code: None,
                 state: None,
@@ -13113,7 +13053,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         // An error redirect reports the denial.
         let response = super::mcp_oauth_callback(
-            State(state),
+            LiveState(state),
             Query(super::McpOAuthCallbackParams {
                 code: None,
                 state: Some("nonexistent".to_string()),
@@ -13187,7 +13127,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let scope =
             crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id.expect("scope"));
         let Json(inv) = super::get_work_scope_inventory(
-            State(state),
+            LiveState(state),
             Path(scope.stable_key()),
             Query(super::WorkScopeActorQuery {
                 conversation_id: "conv-empty".into(),
@@ -13230,7 +13170,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .unwrap();
         assert!(matches!(
             super::get_work_scope_load(
-                State(state.clone()),
+                LiveState(state.clone()),
                 Path("work:does-not-exist".into()),
                 Query(super::WorkScopeActorQuery {
                     conversation_id: global.id.clone()
@@ -13240,7 +13180,7 @@ pub(crate) mod hard_delete_cascade_tests {
             Err(super::AppError::NotFound(_))
         ));
         let Json(empty) = super::get_work_scope_load(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path(first.stable_key()),
             Query(super::WorkScopeActorQuery {
                 conversation_id: "load-first".into(),
@@ -13257,7 +13197,7 @@ pub(crate) mod hard_delete_cascade_tests {
             "live_tracked_bash_groups"
         );
         let Json(all) = super::get_all_work_scope_load(
-            State(state),
+            LiveState(state),
             Query(super::WorkScopeActorQuery {
                 conversation_id: global.id,
             }),
@@ -13362,7 +13302,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await;
 
         let Json(inv) = super::get_work_scope_inventory(
-            State(state),
+            LiveState(state),
             Path(scope.stable_key()),
             Query(super::WorkScopeActorQuery {
                 conversation_id: actor_id.into(),
@@ -13385,7 +13325,7 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn work_scope_inventory_rejects_malformed_key() {
         let state = make_test_state().await;
         let err = super::get_work_scope_inventory(
-            State(state),
+            LiveState(state),
             Path("bogus-no-namespace".into()),
             Query(super::WorkScopeActorQuery {
                 conversation_id: "unused".into(),
@@ -13400,7 +13340,7 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn stop_conversation_browser_session_rejects_missing_conversation() {
         let state = make_test_state().await;
         let err = super::stop_conversation_browser_session(
-            State(state),
+            LiveState(state),
             Path("missing-conversation".into()),
         )
         .await
@@ -13412,7 +13352,7 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn stop_work_scope_browser_session_rejects_malformed_key() {
         let state = make_test_state().await;
         let err = super::stop_work_scope_browser_session(
-            State(state),
+            LiveState(state),
             Path("bogus-no-namespace".into()),
             Query(super::WorkScopeActorQuery {
                 conversation_id: "unused".into(),
@@ -13440,7 +13380,7 @@ pub(crate) mod hard_delete_cascade_tests {
             crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id.expect("scope"));
 
         let Json(resp) = super::stop_work_scope_browser_session(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path(scope.stable_key()),
             Query(super::WorkScopeActorQuery {
                 conversation_id: "conv-no-browser".into(),
@@ -13553,7 +13493,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await;
 
         let Json(inspection) = super::inspect_bash_handle(
-            State(state),
+            LiveState(state),
             Path("b-1".to_string()),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
@@ -13646,7 +13586,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await;
 
         let Json(inspection) = super::inspect_bash_handle(
-            State(state),
+            LiveState(state),
             Path("b-1".to_string()),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
@@ -13735,7 +13675,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await;
 
         let Json(inspection) = super::inspect_bash_handle(
-            State(state),
+            LiveState(state),
             Path("b-coordinator".to_string()),
             Query(super::InspectQuery {
                 conversation_id: coordinator.id,
@@ -13755,7 +13695,7 @@ pub(crate) mod hard_delete_cascade_tests {
         // Scope with a table but no such handle.
         let _ = state.runtime.bash_handles().get_or_create(&scope).await;
         let err = super::inspect_bash_handle(
-            State(state),
+            LiveState(state),
             Path("b-404".to_string()),
             Query(super::InspectQuery {
                 conversation_id: "conv-inspect".into(),
@@ -13946,7 +13886,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let state = make_test_state().await;
 
         let cancel_error = cancel_conversation(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("missing-cancel-target".to_string()),
         )
         .await
@@ -13954,7 +13894,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(matches!(cancel_error, AppError::NotFound(_)));
 
         let delete_error =
-            delete_conversation(State(state), Path("missing-delete-target".to_string()))
+            delete_conversation(LiveState(state), Path("missing-delete-target".to_string()))
                 .await
                 .expect_err("missing delete target");
         assert!(matches!(delete_error, AppError::NotFound(_)));
@@ -13976,11 +13916,11 @@ pub(crate) mod hard_delete_cascade_tests {
                 .expect("break admission storage");
 
             let error = if operation == "cancel" {
-                cancel_conversation(State(state), Path(id))
+                cancel_conversation(LiveState(state), Path(id))
                     .await
                     .expect_err("cancellation storage failure")
             } else {
-                delete_conversation(State(state), Path(id))
+                delete_conversation(LiveState(state), Path(id))
                     .await
                     .expect_err("delete storage failure")
             };
@@ -14077,7 +14017,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("install stale database projection");
 
         let Json(response) =
-            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+            cancel_conversation(LiveState(state.clone()), Path(conversation_id.to_string()))
                 .await
                 .expect("cancel against live idle runtime");
 
@@ -14120,7 +14060,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .expect("mark history");
             }
 
-            let error = cancel_conversation(State(state.clone()), Path(id.to_string()))
+            let error = cancel_conversation(LiveState(state.clone()), Path(id.to_string()))
                 .await
                 .expect_err("lifecycle admission rejects cancellation");
             assert!(matches!(
@@ -14150,7 +14090,7 @@ pub(crate) mod hard_delete_cascade_tests {
         accept_unmaterialized_direct_turn(&state, "c-pending-turn").await;
 
         let Json(response) =
-            cancel_conversation(State(state.clone()), Path("c-pending-turn".to_string()))
+            cancel_conversation(LiveState(state.clone()), Path("c-pending-turn".to_string()))
                 .await
                 .expect("cancel pending direct turn");
 
@@ -14241,7 +14181,7 @@ pub(crate) mod hard_delete_cascade_tests {
         );
 
         let Json(response) =
-            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+            cancel_conversation(LiveState(state.clone()), Path(conversation_id.to_string()))
                 .await
                 .expect("cancel pending direct turn");
 
@@ -14315,7 +14255,7 @@ pub(crate) mod hard_delete_cascade_tests {
         );
 
         let Json(response) =
-            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+            cancel_conversation(LiveState(state.clone()), Path(conversation_id.to_string()))
                 .await
                 .expect("later idle cancellation wakes deferred steering");
 
@@ -14392,7 +14332,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("update state");
 
-        let err = cancel_conversation(State(state.clone()), Path("c-continuation".to_string()))
+        let err = cancel_conversation(LiveState(state.clone()), Path("c-continuation".to_string()))
             .await
             .expect_err("awaiting continuation cancel should be rejected");
 
@@ -14433,7 +14373,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("update state");
 
-        let err = cancel_conversation(State(state.clone()), Path("c-question".to_string()))
+        let err = cancel_conversation(LiveState(state.clone()), Path("c-question".to_string()))
             .await
             .expect_err("question response prompt is dismissed through its dedicated endpoint");
 
@@ -14496,7 +14436,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         // Unfiltered search returns the cwd file and not the worktree-only file.
         let Json(response) = search_conversation_files(
-            State(state),
+            LiveState(state),
             Path("c-file-root".to_string()),
             Query(FileSearchQuery {
                 q: String::new(),
@@ -14538,7 +14478,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("create");
 
         let Json(response) = search_conversation_files(
-            State(state),
+            LiveState(state),
             Path("c-direct-root".to_string()),
             Query(FileSearchQuery {
                 q: "direct".to_string(),
@@ -14561,13 +14501,16 @@ pub(crate) mod hard_delete_cascade_tests {
         std::fs::create_dir_all(cwd.join("src")).expect("dirs");
         std::fs::write(cwd.join("src/project.rs"), "fn project() {}\n").expect("file");
 
-        let Json(response) = search_project_files(Query(ProjectFileSearchQuery {
-            cwd: cwd.to_string_lossy().to_string(),
-            q: "project".to_string(),
-            limit: Some(10),
-            mode: None,
-            base_branch: None,
-        }))
+        let Json(response) = search_project_files(
+            LiveState(make_test_state().await),
+            Query(ProjectFileSearchQuery {
+                cwd: cwd.to_string_lossy().to_string(),
+                q: "project".to_string(),
+                limit: Some(10),
+                mode: None,
+                base_branch: None,
+            }),
+        )
         .await
         .expect("search");
 
@@ -14577,13 +14520,16 @@ pub(crate) mod hard_delete_cascade_tests {
 
     #[tokio::test]
     async fn search_project_files_rejects_missing_directory() {
-        let err = search_project_files(Query(ProjectFileSearchQuery {
-            cwd: "/nonexistent/phoenix/test/dir".to_string(),
-            q: String::new(),
-            limit: None,
-            mode: None,
-            base_branch: None,
-        }))
+        let err = search_project_files(
+            LiveState(make_test_state().await),
+            Query(ProjectFileSearchQuery {
+                cwd: "/nonexistent/phoenix/test/dir".to_string(),
+                q: String::new(),
+                limit: None,
+                mode: None,
+                base_branch: None,
+            }),
+        )
         .await
         .expect_err("missing dir rejected");
         assert!(matches!(err, AppError::BadRequest(_)));
@@ -14621,7 +14567,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("create");
 
         let Json(lower) = search_conversation_code(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("c-code-case".to_string()),
             Query(CodeSearchQuery {
                 q: "metricsource".to_string(),
@@ -14637,7 +14583,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert_eq!(lower.items[0].match_end, 16);
 
         let Json(mixed) = search_conversation_code(
-            State(state),
+            LiveState(state),
             Path("c-code-case".to_string()),
             Query(CodeSearchQuery {
                 q: "metricSource".to_string(),
@@ -14689,7 +14635,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("create");
 
         let Json(response) = search_conversation_code(
-            State(state),
+            LiveState(state),
             Path("c-code-ignore".to_string()),
             Query(CodeSearchQuery {
                 q: "needle".to_string(),
@@ -14749,7 +14695,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("create");
 
         let Json(response) = search_conversation_code(
-            State(state),
+            LiveState(state),
             Path("c-code-root".to_string()),
             Query(CodeSearchQuery {
                 q: "needle".to_string(),
@@ -14888,7 +14834,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .await
                 .expect("set creation state");
 
-            let _ = delete_conversation(State(state.clone()), Path(id.clone()))
+            let _ = delete_conversation(LiveState(state.clone()), Path(id.clone()))
                 .await
                 .expect("non-ready creation cleanup remains available");
             let shell = state.db.get_conversation(&id).await.expect("reload shell");
@@ -14912,7 +14858,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("create");
 
-        let error = delete_conversation(State(state.clone()), Path("delete-open".to_string()))
+        let error = delete_conversation(LiveState(state.clone()), Path("delete-open".to_string()))
             .await
             .expect_err("Open aggregate cannot be permanently deleted");
         assert!(matches!(
@@ -14933,7 +14879,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .execute(state.db.pool())
         .await
         .expect("mark history");
-        let _ = delete_conversation(State(state.clone()), Path("delete-open".to_string()))
+        let _ = delete_conversation(LiveState(state.clone()), Path("delete-open".to_string()))
             .await
             .expect("History aggregate can be permanently deleted");
         assert!(state.db.get_conversation("delete-open").await.is_err());
@@ -15310,7 +15256,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let mut events = state.runtime.subscribe_aggregate_events();
 
         let response = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state.clone()),
+            axum::extract::LiveState(state.clone()),
             axum::extract::Path("cd-a".to_string()),
         )
         .await
@@ -15360,13 +15306,13 @@ pub(crate) mod hard_delete_cascade_tests {
         mark_chain_history(&state, "retry-a").await;
 
         let _ = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state.clone()),
+            axum::extract::LiveState(state.clone()),
             axum::extract::Path("retry-a".to_string()),
         )
         .await
         .expect("first delete");
         let retry = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state),
+            axum::extract::LiveState(state),
             axum::extract::Path("retry-a".to_string()),
         )
         .await
@@ -15394,7 +15340,7 @@ pub(crate) mod hard_delete_cascade_tests {
             let state = state.clone();
             tokio::spawn(async move {
                 crate::api::chains::delete_chain_handler(
-                    axum::extract::State(state),
+                    axum::extract::LiveState(state),
                     axum::extract::Path("overlap-a".to_string()),
                 )
                 .await
@@ -15405,7 +15351,7 @@ pub(crate) mod hard_delete_cascade_tests {
             let state = state.clone();
             tokio::spawn(async move {
                 crate::api::chains::delete_chain_handler(
-                    axum::extract::State(state),
+                    axum::extract::LiveState(state),
                     axum::extract::Path("overlap-a".to_string()),
                 )
                 .await
@@ -15440,7 +15386,7 @@ pub(crate) mod hard_delete_cascade_tests {
         state.db.pool().close().await;
 
         let error = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state),
+            axum::extract::LiveState(state),
             axum::extract::Path("unreadable-root".to_string()),
         )
         .await
@@ -15459,7 +15405,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("corrupt persisted state");
 
         let error = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state),
+            axum::extract::LiveState(state),
             axum::extract::Path("decode-a".to_string()),
         )
         .await
@@ -15506,7 +15452,7 @@ pub(crate) mod hard_delete_cascade_tests {
             }
 
             let error = crate::api::chains::delete_chain_handler(
-                axum::extract::State(state.clone()),
+                axum::extract::LiveState(state.clone()),
                 axum::extract::Path(root_id.clone()),
             )
             .await
@@ -15571,7 +15517,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("set busy");
 
         let err = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state.clone()),
+            axum::extract::LiveState(state.clone()),
             axum::extract::Path("cb-a".to_string()),
         )
         .await
@@ -15773,7 +15719,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .unwrap();
 
-        let first = archive_conversation(State(state.clone()), Path(root.id.clone())).await;
+        let first = archive_conversation(LiveState(state.clone()), Path(root.id.clone())).await;
         assert!(
             matches!(first, Err(AppError::Conflict(detail)) if detail.error_type == "close_settlement_in_progress")
         );
@@ -15814,7 +15760,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .execute(state.db.pool())
         .await
         .unwrap();
-        let _response = archive_conversation(State(state.clone()), Path(root.id.clone()))
+        let _response = archive_conversation(LiveState(state.clone()), Path(root.id.clone()))
             .await
             .expect("retry completes durable Close");
 
@@ -15874,7 +15820,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .unwrap();
 
-        let result = archive_conversation(State(state.clone()), Path(root.id)).await;
+        let result = archive_conversation(LiveState(state.clone()), Path(root.id)).await;
         assert!(
             matches!(result, Err(AppError::Conflict(detail)) if detail.error_type == "close_already_history")
         );
@@ -15897,7 +15843,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .unwrap();
 
-        let result = archive_conversation(State(state), Path(coordinator.id)).await;
+        let result = archive_conversation(LiveState(state), Path(coordinator.id)).await;
         assert!(
             matches!(result, Err(AppError::Conflict(detail)) if detail.error_type == "coordinator_lifecycle")
         );
@@ -15934,7 +15880,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .unwrap();
 
-        let first = archive_conversation(State(state.clone()), Path(root.id.clone())).await;
+        let first = archive_conversation(LiveState(state.clone()), Path(root.id.clone())).await;
         assert!(
             matches!(first, Err(AppError::Conflict(detail)) if detail.error_type == "close_settlement_in_progress")
         );
@@ -15959,7 +15905,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .unwrap();
 
-        let retry = archive_conversation(State(state.clone()), Path(root.id.clone()))
+        let retry = archive_conversation(LiveState(state.clone()), Path(root.id.clone()))
             .await
             .expect_err("cancelled Close is not archive success");
         assert!(
@@ -16061,7 +16007,7 @@ pub(crate) mod hard_delete_cascade_tests {
         }
 
         let _ = crate::api::chains::archive_chain_handler(
-            axum::extract::State(state.clone()),
+            axum::extract::LiveState(state.clone()),
             axum::extract::Path("ca-a".to_string()),
         )
         .await
@@ -16125,7 +16071,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("set busy");
 
         let err = crate::api::chains::archive_chain_handler(
-            axum::extract::State(state.clone()),
+            axum::extract::LiveState(state.clone()),
             axum::extract::Path("cab-a".to_string()),
         )
         .await
@@ -16319,7 +16265,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .expect("mark chain history");
 
         let _ = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state.clone()),
+            axum::extract::LiveState(state.clone()),
             axum::extract::Path("dc-a".to_string()),
         )
         .await
@@ -17111,7 +17057,7 @@ mod regenerate_conversation_name_tests {
         state: &AppState,
         id: &str,
     ) -> Result<Json<ConversationResponse>, AppError> {
-        regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
+        regenerate_conversation_name(LiveState(state.clone()), Path(id.to_string())).await
     }
 
     #[tokio::test]
@@ -17123,7 +17069,7 @@ mod regenerate_conversation_name_tests {
         seed_conversation(&state, "conv-rename", "before-rename").await;
 
         let Json(response) = rename_conversation(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("conv-rename".to_string()),
             Json(RenameRequest {
                 name: "After Rename".to_string(),
@@ -17325,7 +17271,7 @@ mod upgrade_model_state_guard_tests {
 
     async fn upgrade(state: &AppState, id: &str, model: &str) -> Result<(), AppError> {
         upgrade_conversation_model(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path(id.to_string()),
             Json(UpgradeModelRequest {
                 model: model.to_string(),
@@ -17695,7 +17641,7 @@ mod file_read_tests {
     async fn preview_dir(state: AppState, dir: &std::path::Path) -> Result<Response, AppError> {
         let filepath = dir.to_string_lossy().trim_start_matches('/').to_string();
         serve_preview_file(
-            State(state),
+            LiveState(state),
             Path(filepath),
             Query(PreviewQuery { cwd: None }),
         )
@@ -17710,7 +17656,12 @@ mod file_read_tests {
         cwd: Option<String>,
     ) -> Result<Response, AppError> {
         let filepath = file.to_string_lossy().trim_start_matches('/').to_string();
-        serve_preview_file(State(state), Path(filepath), Query(PreviewQuery { cwd })).await
+        serve_preview_file(
+            LiveState(state),
+            Path(filepath),
+            Query(PreviewQuery { cwd }),
+        )
+        .await
     }
 
     /// A file admitted only by the cwd-widened allowlist (a fresh project's
@@ -17794,7 +17745,7 @@ mod file_read_tests {
         let state = state_with_root(tmp.path()).await;
 
         let Json(response) = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: path.to_string_lossy().to_string(),
                 cwd: None,
@@ -17826,7 +17777,7 @@ mod file_read_tests {
         let state = state_with_root(tmp.path()).await;
 
         let Json(response) = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: path.to_string_lossy().to_string(),
                 cwd: None,
@@ -17880,7 +17831,7 @@ mod file_read_tests {
             .trim_start_matches('/')
             .to_string();
         let resp = serve_preview_file(
-            State(state),
+            LiveState(state),
             Path(filepath),
             Query(PreviewQuery { cwd: None }),
         )
@@ -17900,7 +17851,7 @@ mod file_read_tests {
         let state = state_with_root(root.path()).await;
 
         let err = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: secret.to_string_lossy().to_string(),
                 cwd: None,
@@ -17931,7 +17882,7 @@ mod file_read_tests {
 
         // Without cwd: rejected (not under any base root).
         let err = read_file(
-            State(state.clone()),
+            LiveState(state.clone()),
             Query(PathQuery {
                 path: task.to_string_lossy().to_string(),
                 cwd: None,
@@ -17943,7 +17894,7 @@ mod file_read_tests {
 
         // With cwd: admitted.
         let Json(response) = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: task.to_string_lossy().to_string(),
                 cwd: Some(project.path().to_string_lossy().to_string()),
@@ -17973,7 +17924,7 @@ mod file_read_tests {
 
         let state = state_with_root(conv_root.path()).await;
         let err = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: secret.to_string_lossy().to_string(),
                 cwd: Some(project.path().to_string_lossy().to_string()),
@@ -18002,7 +17953,7 @@ mod file_read_tests {
         let state = state_with_root(conv_root.path()).await;
 
         let err = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: secret.to_string_lossy().to_string(),
                 cwd: Some(project.path().to_string_lossy().to_string()),
@@ -18032,7 +17983,7 @@ mod file_read_tests {
         let state = state_with_root(conv_root.path()).await;
 
         let err = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: secret.to_string_lossy().to_string(),
                 cwd: Some(project.path().to_string_lossy().to_string()),
@@ -18066,7 +18017,7 @@ mod file_read_tests {
             Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
 
         let Json(response) = read_file(
-            State(state),
+            LiveState(state),
             Query(PathQuery {
                 path: skill.to_string_lossy().to_string(),
                 cwd: None,
@@ -18459,9 +18410,13 @@ mod chat_authority_tests {
             files: vec![],
             user_agent: None,
         };
-        let result = send_chat(State(state.clone()), Path("c-fm7".to_string()), Json(req))
-            .await
-            .expect("must not return Err — steering should succeed");
+        let result = send_chat(
+            LiveState(state.clone()),
+            Path("c-fm7".to_string()),
+            Json(req),
+        )
+        .await
+        .expect("must not return Err — steering should succeed");
 
         assert!(result.0.queued, "message must be queued");
         assert!(
@@ -18510,7 +18465,7 @@ mod chat_authority_tests {
         let message_id = uuid::Uuid::new_v4().to_string();
 
         let result = send_chat(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path("c-cancel".to_string()),
             Json(ChatRequest {
                 text: "cancel me".to_string(),
@@ -18531,7 +18486,7 @@ mod chat_authority_tests {
         }
 
         let _ = cancel_steering_message(
-            State(state.clone()),
+            LiveState(state.clone()),
             Path(("c-cancel".to_string(), message_id.clone())),
         )
         .await
@@ -18551,9 +18506,10 @@ mod chat_authority_tests {
             ));
         }
 
-        let _ = cancel_steering_message(State(state), Path(("c-cancel".to_string(), message_id)))
-            .await
-            .expect("idempotent retry");
+        let _ =
+            cancel_steering_message(LiveState(state), Path(("c-cancel".to_string(), message_id)))
+                .await
+                .expect("idempotent retry");
         if let Ok(Ok(event)) =
             tokio::time::timeout(std::time::Duration::from_millis(25), first.recv()).await
         {
@@ -18577,7 +18533,7 @@ mod chat_authority_tests {
 
         let send = |message_id: &'static str, text: &'static str| {
             send_chat(
-                State(state.clone()),
+                LiveState(state.clone()),
                 Path("c-order".to_string()),
                 Json(ChatRequest {
                     text: text.to_string(),
@@ -18656,7 +18612,7 @@ mod chat_authority_tests {
             .expect("client");
 
         let _ = cancel_steering_message(
-            State(state),
+            LiveState(state),
             Path(("c-cancel-retry".to_string(), "already-removed".to_string())),
         )
         .await
@@ -20311,4 +20267,10 @@ mod detached_task_worktree_tests {
             moved_oid
         );
     }
+}
+
+async fn get_capabilities(
+    capabilities: super::application_state::ApplicationCapabilities,
+) -> Json<super::application_state::ApplicationCapabilities> {
+    Json(capabilities)
 }

@@ -28,8 +28,14 @@ the agent work in real-time.
 ### REQ-AUTH-001: Password-Gated Access
 
 WHERE the `PHOENIX_PASSWORD` environment variable is set
-THE SYSTEM SHALL require a matching password for all API endpoints
-AND reject requests without a valid password with HTTP 401
+THE SYSTEM SHALL require authenticated owner access for protected API endpoints
+AND reject requests without valid owner authentication with HTTP 401.
+
+THE SYSTEM SHALL permit anonymous `GET /api/capabilities` to expose only mode and
+capability availability needed to reach login and public views. This bootstrap
+response SHALL NOT grant owner authority or expose persisted content. Observation
+composition SHALL still enforce its direct-loopback peer and forwarding policy
+before serving that bootstrap response.
 
 WHERE `PHOENIX_PASSWORD` is not set
 THE SYSTEM SHALL allow all requests without authentication (current behavior)

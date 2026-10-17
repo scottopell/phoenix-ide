@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod alloc_guard;
+pub mod application_state;
 mod assets;
 pub mod auth;
 mod browser_view;
@@ -19,6 +20,7 @@ pub(crate) mod handlers;
 mod installation_ownership;
 mod lifecycle_handlers;
 mod local_reveal;
+pub(crate) mod observation;
 pub(crate) mod pr_monitoring;
 mod process_sample;
 mod product_conversations;

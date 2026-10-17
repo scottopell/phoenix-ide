@@ -21,11 +21,12 @@
 //! `chain_root_of(id) == Some(id)` AND `chain_members_forward(id).len() >= 2`.
 //! Single-member roots and non-root members are not chains.
 
+use super::application_state::LiveState;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -176,7 +177,7 @@ pub struct SetChainNameRequest {
 
 /// `GET /api/chains/:rootId`
 pub async fn get_chain(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(root_id): Path<String>,
 ) -> Result<Json<ChainView>, AppError> {
     let view = build_chain_view(&state, &root_id).await?;
@@ -185,7 +186,7 @@ pub async fn get_chain(
 
 /// `POST /api/chains/:rootId/qa`
 pub async fn submit_chain_question(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(root_id): Path<String>,
     Json(req): Json<SubmitChainQaRequest>,
 ) -> Result<Json<SubmitChainQaResponse>, AppError> {
@@ -222,7 +223,7 @@ pub async fn submit_chain_question(
 /// Non-empty names set the compatibility override without replacing the root title. A null or
 /// whitespace-only name clears that override so the original title fallback applies.
 pub async fn set_chain_name(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(root_id): Path<String>,
     Json(req): Json<SetChainNameRequest>,
 ) -> Result<Json<ChainView>, AppError> {
@@ -269,7 +270,7 @@ pub async fn set_chain_name(
 ///   502/503 variant would be a one-off in `AppError` that nothing else uses.
 /// - Success: 200 with the rebuilt [`ChainView`], identical to the PATCH shape.
 pub async fn regenerate_chain_name(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(root_id): Path<String>,
 ) -> Result<Json<ChainView>, AppError> {
     validate_chain_root(&state, &root_id).await?;
@@ -389,7 +390,7 @@ fn chain_member_blocks_cascade(state: &ConvState) -> bool {
 /// resolves to its latest aggregate transcript and enters the same durable Close
 /// obligation, settlement, retirement, outcome, and History finalization path.
 pub async fn archive_chain_handler(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(root_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     validate_chain_root(&state, &root_id).await?;
@@ -488,7 +489,7 @@ fn chain_delete_response(outcome: ChainDeleteOutcome) -> Json<ChainDeleteRespons
 }
 
 pub async fn delete_chain_handler(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(root_id): Path<String>,
 ) -> Result<Json<ChainDeleteResponse>, AppError> {
     let Some(root) = validate_aggregate_delete_root(&state, &root_id).await? else {
@@ -583,7 +584,7 @@ pub async fn delete_chain_handler(
 
 /// `GET /api/chains/:rootId/stream`
 pub async fn stream_chain(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(root_id): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
     validate_chain_root(&state, &root_id).await?;

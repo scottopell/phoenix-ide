@@ -8,11 +8,11 @@
 //! `run_relay`.  This module handles only the axum/WebSocket wiring: auth, 409
 //! guard, PTY spawn, frame type filtering, and process lifecycle.
 
-use crate::api::AppState;
+use super::application_state::LiveState;
 use crate::runtime::{RuntimeManager, SseEvent};
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{Path, WebSocketUpgrade},
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
@@ -41,7 +41,7 @@ const ATTACH_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn terminal_ws_handler(
     ws: WebSocketUpgrade,
     Path(conversation_id): Path<String>,
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let db = state.db.clone();
@@ -105,7 +105,7 @@ pub async fn terminal_ws_handler(
 /// that wants a terminal unbound from a single transcript).
 pub async fn terminal_ws_global_handler(
     ws: WebSocketUpgrade,
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let runtime = Arc::clone(&state.runtime);
