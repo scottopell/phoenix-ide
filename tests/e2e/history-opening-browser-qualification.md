@@ -3005,3 +3005,32 @@ Red-first failures and green25 tests (18 pass,7 explicit retained-input skips)
 are preserved. Explicit invalid paths still fail rather than silently skipping.
 Positive private-artifact groups were not requalified and are not represented as
 runtime proof. The portable replay/cache suites are scheduled in successor CI.
+
+### Qualified-source preservation closed; exact landing candidate prepared
+
+Product merge0f6b75cfc059d11e273532c5eeb2222e6b99f6e6, tree
+47d229c27705c4d216d3bd55f6bf31bdda474567, has exact parents1adc and qualified35f.
+All10 donor-vs-qualified source paths were audited, not just the caught auth
+helper. The cfg(test) opening helper is byte-identical to35f, including random
+password/private home/create-new0600 credential. Existing main close-retirement,
+bash and e2e hardening are byte-preserved. Exactly the two obsolete
+probe-view-keepalive source/test paths (absent in both main and35f) are removed;
+this is explicit qualified-source reconciliation, not silently deleted coverage.
+The qualified Mermaid/reaction fixture timing corrections are retained. ADR
+remaps/main byte-preservation and all15 main semantic resolutions remain intact.
+
+The shared successor now merges this exact product ancestry and pins its clean
+independent source branch qualification/history-joint-source-0f6b75cfc. Fresh
+remote main remainsd074. Parent independently passed genuine composite tsc-b,
+837 focused tests19 app files,79 Python lifecycle tests, and337 shared Node tests
+(328 pass,9 explicitly optional retained-input skips), YAML and diff checks.
+Independent final source-preservation review found no blockers; Rust compilation,
+codegen, both actual UI builds and stronger actual native/browser qualification
+remain hosted obligations, not inherited from greenedac/35f.
+
+The successor PR targets main and the witness is explicitly scheduled for its
+integration branch. No merge/deploy/production/device action is authorized by
+preparing it. Overhead tolerance/capture and native/device resume remain distinct
+unadopted decisions; full_acceptance/overhead_clearance remain false. The next
+hosted run is one new exact-source causal integration qualification, not a blind
+retry of the immutable baseline or a second concurrent runner.
