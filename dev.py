@@ -11310,7 +11310,9 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
 
 def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = None) -> tuple[dict[str, str], Path | None]:
     env: dict[str, str] = {}
-    if controller is not None and (controller.enabled or controller.prepared_artifact is not None):
+    if controller is not None and (
+        controller.enabled or controller.prepared_artifact is not None or controller.current_schema_upgrade
+    ):
         try:
             installed = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
             installed.pop("PHOENIX_VERSION", None)

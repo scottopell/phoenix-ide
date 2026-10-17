@@ -5223,6 +5223,62 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
     def test_public_release_current_schema_preserves_distinct_helper_and_release_provenance(self):
         self.test_release_current_schema_fetches_distinct_pinned_helper_and_release_registry(public=True)
 
+    def test_public_protected_release_uses_installed_environment_without_checkout_env(self):
+        read_env = self.dev._launchd_candidate_env
+        with self.deployment(paired=False, current=True, release=True, public=True) as (staging, controller, events):
+            self.assertFalse(controller.enabled)
+            self.assertIsNone(controller.prepared_artifact)
+            database = self.dev.PROD_DB_PATH.with_name("installed-custom.db")
+            database.touch()
+            installed_env = {
+                "PATH": "/installed/bin:/usr/bin",
+                "PHOENIX_PASSWORD": "installed-test-credential",
+                "PHOENIX_DB_PATH": str(database),
+                "PHOENIX_VERSION": "1.0.0",
+            }
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": installed_env}))
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 mock.patch.object(self.dev, "_launchd_candidate_env", side_effect=read_env), \
+                 mock.patch.object(self.dev, "_load_env_file", side_effect=AssertionError("checkout environment must not load")) as load_env, \
+                 mock.patch.object(self.dev, "capture_login_shell_path", side_effect=AssertionError("installed PATH required")) as login_path:
+                self.dev.launchd_prod_deploy("v2.0.0", controller=controller)
+                load_env.assert_not_called()
+                login_path.assert_not_called()
+                expected_env = installed_env | {"PHOENIX_VERSION": "2.0.0"}
+                candidate = plistlib.loads((staging / "candidate.plist").read_bytes())
+                self.assertEqual(candidate["EnvironmentVariables"], expected_env)
+                preflight_env = {key: value for key, value in installed_env.items() if key != "PHOENIX_VERSION"}
+                self.assertEqual(self.dev._preflight_prod_bind_auth.call_args_list, [
+                    mock.call(preflight_env, socket_activated=True),
+                    mock.call(preflight_env, socket_activated=True),
+                ])
+                self.assertEqual(self.dev.generate_launchd_plist.call_args.kwargs["path_override"], installed_env["PATH"])
+            manifest = json.loads((staging / "manifest.json").read_text())
+            self.assertEqual(manifest["current_schema_upgrade"]["database_path"], str(database))
+            self.assertIn(("status", "prepared"), events)
+            self.assertTrue(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_public_protected_release_unreadable_installed_plist_fails_before_claim_or_handoff(self):
+        read_env = self.dev._launchd_candidate_env
+        for missing in (False, True):
+            with self.subTest(missing=missing), self.deployment(paired=False, current=True, release=True, public=True) as (staging, controller, events):
+                if missing:
+                    self.dev.LAUNCHD_PLIST_PATH.unlink()
+                else:
+                    self.dev.LAUNCHD_PLIST_PATH.write_bytes(b"not a plist")
+                with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_launchd_candidate_env", side_effect=read_env), \
+                     mock.patch.object(self.dev, "_load_env_file", side_effect=AssertionError("checkout environment must not load")) as load_env, \
+                     mock.patch.object(self.dev, "_claim_launchd_deploy") as claim:
+                    with self.assertRaisesRegex(SystemExit, "installed launchd configuration is unreadable"):
+                        self.dev.launchd_prod_deploy("v2.0.0", controller=controller)
+                    load_env.assert_not_called()
+                    claim.assert_not_called()
+                    self.dev._prepare_release_candidate.assert_not_called()
+                self.assertFalse(staging.exists())
+                self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                self.assertFalse(any(event[0] == "command" for event in events))
+
     def test_ordinary_controller_preflight_failure_prevents_handoff_for_all_sources(self):
         for release in (False, True):
             with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events), \
