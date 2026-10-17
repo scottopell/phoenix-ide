@@ -13,6 +13,7 @@ const {chromium}=createRequire(resolve(process.env.APP_ROOT,'ui/package.json'))(
 const result={scope:'separate_full_chromium_desktop_native_bfcache_probe_controlled_artifact_not_PWA_or_physical_suspend',
   environment_change:'full_chromium_channel_not_headless_shell_after_delegate_rejection',
   full_acceptance:false,overhead_clearance:false,status:'failed',reports:[],rejections:[],sockets:[],
+  protocol_transports:[],protocol_scope:'main_page_CDP_target_not_browser_wide_or_worker_inventory',
   launch:{headless:true,channel:'chromium',ignoreDefaultArgs:['--disable-back-forward-cache']}};
 let browser,context,page,parseErrors=0;
 result.stage='launch';
@@ -38,9 +39,41 @@ try {
     socket.on('close',()=>{entry.closed=true;entry.closed_stage=result.stage;});
   });
   const diagnostics=await context.newCDPSession(page);
+  const protocolTransports=new Map();
+  const safePath=raw=>{
+    try {
+      const url=new URL(raw);
+      return {path:/^\/api\/(?:terminal|conversations|browser)[A-Za-z0-9_\/-]*$/.test(url.pathname)?url.pathname:'unclassified_path_redacted',query_present:!!url.search,same_origin:url.host===new URL(base).host};
+    } catch {return {path:'invalid_url_redacted'};}
+  };
+  const recordTransport=(id,kind,url,extra={})=>{
+    if(protocolTransports.has(id))return protocolTransports.get(id);
+    if(result.protocol_transports.length>=16){result.protocol_inventory_overflow=true;return null;}
+    const entry={kind,...safePath(url),opened_stage:result.stage,...extra};
+    protocolTransports.set(id,entry);result.protocol_transports.push(entry);return entry;
+  };
+  diagnostics.on('Network.webSocketCreated',event=>{
+    recordTransport(event.requestId,'WebSocket',event.url,{initiator_type:event.initiator?.type??null});
+  });
+  diagnostics.on('Network.webSocketClosed',event=>{
+    const entry=protocolTransports.get(event.requestId);
+    if(entry){entry.closed=true;entry.closed_stage=result.stage;}
+  });
+  diagnostics.on('Network.requestWillBeSent',event=>{
+    if(event.type==='EventSource')recordTransport(event.requestId,'EventSource',event.request.url,{initiator_type:event.initiator?.type??null});
+  });
+  diagnostics.on('Network.responseReceived',event=>{
+    const entry=protocolTransports.get(event.requestId);
+    if(entry)entry.response_status=event.response.status;
+  });
+  diagnostics.on('Network.loadingFailed',event=>{
+    const entry=protocolTransports.get(event.requestId);
+    if(entry){entry.failed=true;entry.canceled=event.canceled===true;entry.finished_stage=result.stage;}
+  });
+  await diagnostics.send('Network.enable');
   await diagnostics.send('Page.enable');
   diagnostics.on('Page.backForwardCacheNotUsed',event=>{
-    result.rejections.push({reasons:event.notRestoredExplanations?.slice(0,32).map(e=>({type:e.type,reason:e.reason}))??[]});
+    result.rejections.push({stage:result.stage,reasons:event.notRestoredExplanations?.slice(0,32).map(e=>({type:e.type,reason:e.reason}))??[],protocol_transport_count:result.protocol_transports.length,playwright_socket_count:result.sockets.length});
     if(result.rejections.length>4) result.rejections.shift();
   });
   const accepted=new Set();
