@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { Link, Route, Routes, useParams } from 'react-router-dom';
 import * as v from 'valibot';
 import type { ProductConversationListRow } from '../api';
+import type { CoordinatorObservationTarget } from '../generated/CoordinatorObservationTarget';
+import type { ObservationTargetResponse } from '../generated/ObservationTargetResponse';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
 import { ProductConversationPage } from './ProductConversationPage';
@@ -29,11 +31,11 @@ const ordinaryTargetSchema = v.strictObject({
     v.strictObject({ kind: v.literal('state'), display_name: v.string(), presentation_mode: v.string() }),
   ]),
 }) satisfies v.GenericSchema<unknown, ProductConversationListRow>;
+const coordinatorTargetSchema = v.strictObject(targetConversationFields) satisfies v.GenericSchema<unknown, CoordinatorObservationTarget>;
 const observationTargetSchema = v.variant('kind', [
   v.strictObject({ kind: v.literal('ordinary'), conversation: ordinaryTargetSchema }),
-  v.strictObject({ kind: v.literal('coordinator'), conversation: v.strictObject(targetConversationFields) }),
-]);
-type ObservationTarget = v.InferOutput<typeof observationTargetSchema>;
+  v.strictObject({ kind: v.literal('coordinator'), conversation: coordinatorTargetSchema }),
+]) satisfies v.GenericSchema<unknown, ObservationTargetResponse>;
 
 function PersistedConversation({ global = false }: { global?: boolean }) {
   const { slug } = useParams<{ slug: string }>();
@@ -43,7 +45,7 @@ function PersistedConversation({ global = false }: { global?: boolean }) {
 }
 
 function PersistedConversationList() {
-  const [target, setTarget] = useState<ObservationTarget | null>(null);
+  const [target, setTarget] = useState<ObservationTargetResponse | null>(null);
   const [error, setError] = useState(false);
   useEffect(() => {
     const controller = new AbortController();

@@ -340,10 +340,6 @@ impl ConversationRouteObservations {
         })
     }
 
-    pub(crate) fn db(&self) -> &Database {
-        &self.db
-    }
-
     pub(crate) fn new(db: Database) -> Self {
         Self {
             db,
