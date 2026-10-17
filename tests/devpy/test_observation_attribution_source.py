@@ -72,6 +72,34 @@ def without_wrappers(source, path):
     return items
 
 
+def without_auth_branch_instrumentation(source):
+    expected = '''ApplicationState::Observation(application) => {
+        use tracing::Instrument;
+        let span = observation_request_span(&req);
+        return async {
+            let admitted = tracing::info_span!("observation.authorization")
+                .in_scope(|| application.admit_peer(peer_from_extensions(&req), req.headers()));
+            let response = match admitted {
+                Ok(()) => next.run(req).await,
+                Err(error) => error.into_response(),
+            };
+            tracing::Span::current().record("status", response.status().as_u16());
+            tracing::Span::current().record("response_ready", true);
+            response
+        }
+        .instrument(span)
+        .await;
+    }'''
+    if tokens(source) != tokens(expected):
+        raise AssertionError("auth branch differs from exact synchronous admission/root future wrapper")
+    return tokens('''ApplicationState::Observation(application) => {
+        if let Err(error) = application.admit_peer(peer_from_extensions(&req), req.headers()) {
+            return error.into_response();
+        }
+        return next.run(req).await;
+    }''')
+
+
 def exact_diff(path, blob):
     with tempfile.TemporaryDirectory(prefix="observation-attribution-source-") as directory:
         before, after = Path(directory) / "product", Path(directory) / "actual"
@@ -129,6 +157,21 @@ class AttributionSourceTests(unittest.TestCase):
         end = "    };\n    // No password configured"
         old_start, new_start = baseline.index(branch), actual.index(branch)
         old_end, new_end = baseline.index(end, old_start), actual.index(end, new_start)
+        observation_branch = actual[new_start:new_end]
+        self.assertEqual(tokens(baseline[old_start:old_end]),
+                         without_auth_branch_instrumentation(observation_branch))
+        synchronous_admission = '''tracing::info_span!("observation.authorization")
+                    .in_scope(|| application.admit_peer(peer_from_extensions(&req), req.headers()))'''
+        borrowed_async_admission = '''async { application.admit_peer(peer_from_extensions(&req), req.headers()) }
+                    .instrument(tracing::info_span!("observation.authorization")).await'''
+        self.assertIn(synchronous_admission, observation_branch)
+        for changed in [observation_branch.replace(synchronous_admission, borrowed_async_admission, 1),
+                        observation_branch.replace("peer_from_extensions(&req)", "None", 1),
+                        observation_branch.replace("req.headers()", "&Default::default()", 1),
+                        observation_branch.replace("Err(error) => error.into_response()",
+                                                   "Err(error) => next.run(req).await", 1)]:
+            with self.assertRaises(AssertionError):
+                without_auth_branch_instrumentation(changed)
         actual = actual[:new_start] + baseline[old_start:old_end] + actual[new_end:]
         self.assertEqual(actual, baseline)
 
@@ -169,7 +212,17 @@ class AttributionSourceTests(unittest.TestCase):
     def test_authored_actual_router_case_uses_startup_helper_and_another_dispatch(self):
         source = (ROOT / "crates/phoenix-ide/src/observation_startup/attribution_tests.rs").read_text()
         self.assertIn("async fn startup_dispatch_captures_actual_product_detail_without_inheriting_default()", source)
-        self.assertIn("for outer in [tracing::Dispatch::none(), existing.dispatch()]", source)
+        self.assertIn('''for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
+        .into_iter()
+        .enumerate()''', source)
+        self.assertIn("let emit_sample = index == 0;", source)
+        self.assertNotIn("outer.is_none()", source)
+        self.assertIn("fn assert_send<T: Send>(_: &T) {}", source)
+        self.assertIn('''|state: State<ApplicationState>, req: Request<Body>, next: Next| async move {
+                let future = auth_middleware(state, req, next);
+                assert_send(&future);
+                future.await
+            }''', source)
         self.assertIn("let app = with_attribution_dispatch(", source)
         self.assertIn("crate::api::create_router(", source)
         self.assertIn("crate::api::application_state::ApplicationState::Observation(application.clone())", source)

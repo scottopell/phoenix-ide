@@ -1,9 +1,13 @@
 use super::{attribution_subscriber, with_attribution_dispatch};
-use crate::api::{application_state::ObservationApplication, auth::auth_middleware};
+use crate::api::{
+    application_state::{ApplicationState, ObservationApplication},
+    auth::auth_middleware,
+};
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Path},
+    extract::{ConnectInfo, Path, State},
     http::{Request, StatusCode},
+    middleware::Next,
     routing::get,
     Json, Router,
 };
@@ -113,13 +117,19 @@ fn assert_private(records: &[Value]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closes_associated_success_error_and_denial_before_body_drain() {
+    fn assert_send<T: Send>(_: &T) {}
+
     let capture = Capture::default();
     let dispatch = capture.dispatch();
     let app = Router::new()
         .route("/attribution/:reference", get(handler))
         .layer(axum::middleware::from_fn_with_state(
             application().await,
-            auth_middleware,
+            |state: State<ApplicationState>, req: Request<Body>, next: Next| async move {
+                let future = auth_middleware(state, req, next);
+                assert_send(&future);
+                future.await
+            },
         ));
     let app = with_attribution_dispatch(app, dispatch);
     let mut previous_id = 0;
@@ -225,8 +235,11 @@ async fn startup_dispatch_captures_actual_product_detail_without_inheriting_defa
         .await
         .unwrap();
     let existing = Capture::default();
-    for outer in [tracing::Dispatch::none(), existing.dispatch()] {
-        let emit_sample = outer.is_none();
+    for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
+        .into_iter()
+        .enumerate()
+    {
+        let emit_sample = index == 0;
         let capture = Capture::default();
         let app = with_attribution_dispatch(
             crate::api::create_router(

@@ -478,10 +478,8 @@ pub async fn auth_middleware(
             use tracing::Instrument;
             let span = observation_request_span(&req);
             return async {
-                let admitted =
-                    async { application.admit_peer(peer_from_extensions(&req), req.headers()) }
-                        .instrument(tracing::info_span!("observation.authorization"))
-                        .await;
+                let admitted = tracing::info_span!("observation.authorization")
+                    .in_scope(|| application.admit_peer(peer_from_extensions(&req), req.headers()));
                 let response = match admitted {
                     Ok(()) => next.run(req).await,
                     Err(error) => error.into_response(),
