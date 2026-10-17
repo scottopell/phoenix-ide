@@ -2887,3 +2887,9 @@ and pathlib imports, corrected to import ast and use already-imported Path.
 Existing138 shared Node tests apply to the unchanged browser driver. No local
 native/browser/build or hosted diagnostic rerun was used. Rust `117285608206`
 was still running at this entry; next normal push waits for the whole terminal.
+
+Run `38995018348` is fully terminal **failure**: witness failed at the redundant
+controlled receipt write, Rust and all standard lanes succeeded. The single-
+receipt correction receives one causal normal qualification after this complete
+result; app35f and the six-scenario driver are unchanged. No fabricated drain or
+unchanged full run is used to promote the preceding partial evidence.
