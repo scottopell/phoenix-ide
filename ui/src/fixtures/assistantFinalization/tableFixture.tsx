@@ -12,7 +12,13 @@ const toolResults = new Map<string, Message>();
 const tableStart = reply.indexOf('| Path |');
 const tableEnd = reply.indexOf('\n\n', tableStart);
 const prefixes = [
+  { name: 'partial-header', end: tableStart + '| Path | Required'.length },
   { name: 'table-header', end: reply.indexOf('\n', tableStart) },
+  { name: 'partial-separator', end: reply.indexOf('|---|') + '|---|--'.length },
+  { name: 'complete-separator', end: reply.indexOf('|---|') + '|---|---|---|'.length },
+  { name: 'opening-backtick', end: reply.indexOf('| `/Users') + 3 },
+  { name: 'partial-path', end: reply.indexOf('| `/Users') + '| `/Users/scott'.length },
+  { name: 'partial-right-cell', end: reply.indexOf('| `/Users') + '| `/Users/scottopell` | Traverse/'.length },
   { name: 'table-partial-row', end: reply.indexOf('**Blocked**') + 5 },
   { name: 'completed-table-incomplete-tail', end: tableEnd + '\n\nSo the missing permission is '.length },
   { name: 'full-text', end: reply.length },

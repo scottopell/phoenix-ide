@@ -12,3 +12,6 @@ FullRetry.storyName = 'full-retry';
 
 export const CompactRetry = () => <AssistantFinalizationTranscriptFixture density="compact" retry />;
 CompactRetry.storyName = 'compact-retry';
+
+export const FullTable = () => <AssistantFinalizationTranscriptFixture density="full" table />;
+FullTable.storyName = 'full-table';

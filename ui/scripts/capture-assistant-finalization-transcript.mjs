@@ -10,7 +10,7 @@ const browser = await chromium.launch();
 const results = [];
 function snapshot(marker) {
   const scroller = document.querySelector('#messages');
-  const paragraphs = [...scroller.querySelectorAll('p')].filter(p => p.textContent.startsWith('Reading marker'));
+  const paragraphs = [...scroller.querySelectorAll('.message.agent p')];
   const box = scroller.getBoundingClientRect();
   const paragraph = marker ? paragraphs.find(p => p.textContent === marker)
     : paragraphs.find(p => p.getBoundingClientRect().top >= box.top && p.getBoundingClientRect().bottom <= box.bottom);
@@ -21,19 +21,20 @@ function snapshot(marker) {
 }
 try {
   for (const width of [375, 1280]) for (const density of ['full', 'compact']) {
-    for (const retry of [false, true]) for (const mode of ['reader', 'pinned']) {
+    for (const variant of [{ retry: false, table: false }, { retry: true, table: false }, ...(density === 'full' ? [{ retry: false, table: true }] : [])]) for (const mode of ['reader', 'pinned']) {
+      const { retry, table } = variant;
       const context = await browser.newContext({ viewport: { width, height: 900 } });
-      const result = { width, density, retry, mode, errors: [], samples: [] };
+      const result = { width, density, retry, table, mode, errors: [], samples: [] };
       results.push(result);
       try {
         const page = await context.newPage();
         page.on('pageerror', e => result.errors.push(e.message));
         const url = new URL(process.env.LADLE_URL);
-        url.searchParams.set('story', `assistant-finalization-transcript--${density}${retry ? '-retry' : ''}`);
+        url.searchParams.set('story', `assistant-finalization-transcript--${density}${table ? '-table' : retry ? '-retry' : ''}`);
         url.searchParams.set('mode', 'preview');
         await page.goto(url.href);
         await page.waitForSelector('[data-transcript-ready="true"]');
-        await page.waitForFunction(() => document.querySelectorAll('#messages p').length >= 24);
+        await page.waitForFunction(count => document.querySelectorAll('#messages .message.agent p').length >= count, table ? 10 : 24);
         await page.waitForFunction(() => {
           const e = document.querySelector('#messages');
           return e.scrollHeight > e.clientHeight && e.scrollHeight - e.clientHeight - e.scrollTop < 2;

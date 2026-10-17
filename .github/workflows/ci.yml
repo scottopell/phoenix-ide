@@ -287,22 +287,36 @@ jobs:
         run: |
           mkdir -p ui/qa-artifacts/assistant-finalization
           git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt
-          python3 -c 'import runpy,subprocess; d=runpy.run_path("dev.py"); raise SystemExit(subprocess.call(["node","node_modules/@ladle/react/lib/cli/cli.js","serve","--host","127.0.0.1","--port","61129"],cwd="ui",env=d["node_env"]()))' > ui/qa-artifacts/assistant-finalization/ladle.log 2>&1 &
-          server=$!
-          trap 'kill "$server" 2>/dev/null || true; git -C "$GITHUB_WORKSPACE" restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx ui/src/index.css' EXIT
-          for attempt in $(seq 1 60); do
-            if curl -fsS "$LADLE_URL" >/dev/null; then break; fi
-            sleep 1
-          done
+          server=''
+          stop_server() {
+            if [ -n "$server" ]; then kill -- -"$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; server=''; fi
+          }
+          start_server() {
+            setsid python3 -c 'import runpy,os; d=runpy.run_path("dev.py"); env=d["node_env"](); os.chdir("ui"); os.execvpe("node",["node","node_modules/@ladle/react/lib/cli/cli.js","serve","--host","127.0.0.1","--port","61129"],env)' >> ui/qa-artifacts/assistant-finalization/ladle.log 2>&1 &
+            server=$!
+            for attempt in $(seq 1 60); do
+              if curl -fsS "$LADLE_URL" >/dev/null; then return; fi
+              sleep 1
+            done
+            return 1
+          }
+          trap 'stop_server; git -C "$GITHUB_WORKSPACE" restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx ui/src/index.css' EXIT
           # Causal controls restore only the named pre-fix seams, not a shipped build.
           baseline=4894426888d175d4fd65095647bede65bb09718e
           git restore --source="$baseline" -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx
           echo "$baseline (renderer control)" > ui/qa-artifacts/assistant-finalization/baseline-source.txt
+          start_server
           (cd ui && FINALIZATION_QA_BASELINE=1 node scripts/capture-assistant-finalization.mjs)
+          stop_server
           git restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx
           git restore --source="$baseline" -- ui/src/index.css
+          start_server
           (cd ui && STREAMING_TABLE_QA_BASELINE=1 node scripts/capture-streaming-table.mjs)
+          stop_server
           git restore --source=HEAD -- ui/src/index.css
+          git diff --exit-code -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx ui/src/index.css
+          sha256sum ui/src/index.css ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx > ui/qa-artifacts/assistant-finalization/source-files.sha256
+          start_server
           cd ui
           node scripts/capture-assistant-finalization.mjs
           node scripts/capture-streaming-table.mjs
