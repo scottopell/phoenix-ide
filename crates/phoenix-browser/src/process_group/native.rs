@@ -255,7 +255,7 @@ impl GroupQueryOutcome {
         }
         let returned = usize::try_from(self.returned_bytes).map_err(io::Error::other)?;
         let pid_size = std::mem::size_of::<libc::pid_t>();
-        if capacity_bytes == 0 || returned >= capacity_bytes || returned % pid_size != 0 {
+        if capacity_bytes == 0 || returned >= capacity_bytes || !returned.is_multiple_of(pid_size) {
             return Err(io::Error::other(format!(
                 "incomplete Chrome process group query: returned_bytes={returned} capacity_bytes={capacity_bytes} pid_size={pid_size}",
             )));
