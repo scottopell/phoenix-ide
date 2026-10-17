@@ -421,6 +421,16 @@ class BareDeployCommandTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "prod deploy"):
                     self.dev.prod_daemon_restart()
 
+    def test_protected_systemd_mode_is_never_a_bare_deploy(self):
+        options = self.dev.ProdDeployControllerOptions(enabled=True, backend="systemd",
+                                                      systemd_current_schema_upgrade=True)
+        with mock.patch.object(self.dev, "_bare_layout") as layout, \
+             mock.patch.object(self.dev, "_prepare_release_candidate") as prepare:
+            with self.assertRaisesRegex(SystemExit, "cannot use this backend"):
+                self.dev.prod_daemon_deploy("v2.0.0", controller=options)
+        layout.assert_not_called()
+        prepare.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
