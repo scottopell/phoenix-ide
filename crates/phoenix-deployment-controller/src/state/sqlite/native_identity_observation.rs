@@ -12,6 +12,12 @@ use crate::{
     ObservationFailure, OsEffect, PersistenceRevision, Phase, ProcessId, ProcessIdentity,
 };
 
+impl LoadedAttempt {
+    pub(crate) fn native_root_identity_observation(&self, target: ProcessIdentity) -> bool {
+        self.checkpoint.native_root_identity_observation(target)
+    }
+}
+
 /// Diagnostic identity; it cannot reconstruct a policy-issued ticket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeIdentityObservationIssue {
@@ -39,7 +45,7 @@ impl NativeIdentityObservationIssue {
     }
 }
 
-/// Affine custody of the original PolicyLoop-issued ObserveIdentity ticket.
+/// Affine custody of the original `PolicyLoop`-issued `ObserveIdentity` ticket.
 #[derive(Debug)]
 pub struct NativeIdentityObservationDispatch {
     ticket: DispatchTicket,
@@ -50,6 +56,11 @@ impl NativeIdentityObservationDispatch {
     pub(crate) fn new(ticket: DispatchTicket, issue: NativeIdentityObservationIssue) -> Self {
         Self { ticket, issue }
     }
+    #[must_use]
+    pub(crate) const fn issue(&self) -> NativeIdentityObservationIssue {
+        self.issue
+    }
+
     pub(crate) fn into_parts(self) -> (DispatchTicket, NativeIdentityObservationIssue) {
         (self.ticket, self.issue)
     }
@@ -374,6 +385,7 @@ impl ControllerSqliteStore {
     /// Confirms the exact applied observation in an active or reconciling same-guardian session.
     /// # Errors
     /// Mismatch or replay poisons the handle.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn confirm_native_identity_observation_ack(
         &mut self,
         proof: VerifiedNativeIdentityObservationAckConfirmation,

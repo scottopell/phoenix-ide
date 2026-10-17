@@ -1443,28 +1443,34 @@ impl DeploymentAttempt {
                 tree,
                 ..
             })) => tree.identities().contains_key(&root),
-            _ => false,
+            Self::Active(_)
+            | Self::Ready(_)
+            | Self::ResourceBlocked(_)
+            | Self::Interrupted(_)
+            | Self::ForwardRecovery(_)
+            | Self::AdministrativeCloseoutRequired(_)
+            | Self::AdministrativelyClosed(_) => false,
         }
     }
 
     /// The initial root is identifiable only while discovery has exactly one owned identity.
     pub(crate) fn native_root_scan(&self, parent: ProcessIdentity) -> bool {
-        let tree = match self {
-            Self::Active(ActiveAttempt::Ownership(OwnershipAttempt {
-                phase: OwnershipPhase::Discovery,
-                tree,
-                ..
-            }))
-            | Self::Interrupted(InterruptedAttempt {
-                resume:
-                    ActiveAttempt::Ownership(OwnershipAttempt {
-                        phase: OwnershipPhase::Discovery,
-                        tree,
-                        ..
-                    }),
-                ..
-            }) => tree,
-            _ => return false,
+        let (Self::Active(ActiveAttempt::Ownership(OwnershipAttempt {
+            phase: OwnershipPhase::Discovery,
+            tree,
+            ..
+        }))
+        | Self::Interrupted(InterruptedAttempt {
+            resume:
+                ActiveAttempt::Ownership(OwnershipAttempt {
+                    phase: OwnershipPhase::Discovery,
+                    tree,
+                    ..
+                }),
+            ..
+        })) = self
+        else {
+            return false;
         };
         tree.identities().len() == 1
             && tree.identities().contains_key(&parent)

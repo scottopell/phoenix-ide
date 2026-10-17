@@ -80,6 +80,21 @@ pub(crate) trait NativeEvidenceReader: Send {
     > {
         Err(NativeEvidenceReadError)
     }
+    /// # Errors
+    /// Refuses absent or malformed exact root identity issue/application evidence.
+    fn identity_observation_evidence(
+        &mut self,
+        _key: DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeIdentityObservationStatus,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        Err(NativeEvidenceReadError)
+    }
 }
 
 /// Process-local, one-use release handle. Durable rows and wire values cannot create one.
@@ -180,7 +195,7 @@ impl<'de> Deserialize<'de> for BuildIdentity {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum number of child PIDs accepted in one native root scan.
 pub const MAX_NATIVE_CHILDREN: usize = 4096;
@@ -718,6 +733,24 @@ pub enum Request {
         admission: u64,
         now: u64,
     },
+    NativeIdentityObservationAdmit {
+        session: WireSession,
+        key: WireKey,
+    },
+    NativeIdentityObservationSubmit {
+        session: WireSession,
+        admission: u64,
+        now: u64,
+    },
+    ObserveNativeIdentityObservation {
+        session: WireSession,
+        key: WireKey,
+    },
+    AckNativeIdentityObservationAfterApplied {
+        session: WireSession,
+        key: WireKey,
+        applied_revision: u64,
+    },
     NativeChildListAdmit {
         session: WireSession,
         key: WireKey,
@@ -871,6 +904,12 @@ pub(crate) struct NativeChildListAdmission {
     parent: ProcessIdentity,
 }
 
+#[derive(Debug)]
+struct NativeIdentityObservationAdmission {
+    session: ControllerSession,
+    key: DispatchKey,
+}
+
 impl NativeChildListAdmission {
     const fn key(&self) -> DispatchKey {
         self.key
@@ -980,6 +1019,10 @@ pub struct GuardianServer<E: GuardianExecutor> {
     refused: Vec<DispatchTicket>,
     admissions: BTreeMap<u64, (ControllerSession, DispatchTicket)>,
     native_admissions: BTreeMap<u64, NativeSamplingAdmission>,
+    native_identity_observation_admissions: BTreeMap<u64, NativeIdentityObservationAdmission>,
+    native_identity_observation_retained_origins: Vec<(DispatchKey, ProcessIdentity, NonZeroU64)>,
+    native_identity_observation_ack_receipts:
+        Vec<(DispatchKey, crate::IdentityObservation, PersistenceRevision)>,
     native_child_list_admissions: BTreeMap<u64, NativeChildListAdmission>,
     native_retained_origins: Vec<(DispatchKey, u64, NonZeroU64)>,
     native_child_list_retained_origins: Vec<(DispatchKey, ProcessIdentity, NonZeroU64)>,
@@ -1020,6 +1063,9 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             refused: Vec::new(),
             admissions: BTreeMap::new(),
             native_admissions: BTreeMap::new(),
+            native_identity_observation_admissions: BTreeMap::new(),
+            native_identity_observation_retained_origins: Vec::new(),
+            native_identity_observation_ack_receipts: Vec::new(),
             native_child_list_admissions: BTreeMap::new(),
             native_retained_origins: Vec::new(),
             native_child_list_retained_origins: Vec::new(),
@@ -1267,6 +1313,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         self.admissions.clear();
         self.native_admissions.clear();
         self.native_child_list_admissions.clear();
+        self.native_identity_observation_admissions.clear();
         self.interruption = None;
         self.finish_proof = None;
         self.prepared_activation = None;
@@ -1299,6 +1346,10 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ReleaseInitial { .. }
                     | Request::DispatchAdmit { .. }
                     | Request::DispatchSubmit { .. }
+                    | Request::NativeIdentityObservationAdmit { .. }
+                    | Request::NativeIdentityObservationSubmit { .. }
+                    | Request::ObserveNativeIdentityObservation { .. }
+                    | Request::AckNativeIdentityObservationAfterApplied { .. }
                     | Request::NativeChildListAdmit { .. }
                     | Request::NativeChildListSubmit { .. }
                     | Request::ObserveNativeChildList { .. }
@@ -1787,7 +1838,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         };
         if returned != WireIdentity::from(parent)
             || children.len() > MAX_NATIVE_CHILDREN
-            || children.iter().any(|pid| *pid == 0)
+            || children.contains(&0)
         {
             return Err(WireError::MissingProof);
         }
@@ -1945,6 +1996,262 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             return Err(WireError::MissingProof);
         }
         Ok(())
+    }
+
+    fn native_identity_issue(
+        &mut self,
+        session: ControllerSession,
+        key: DispatchKey,
+    ) -> Result<crate::NativeIdentityObservationIssue, WireError> {
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .identity_observation_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeIdentityObservationStatus::IssuedPendingApplication { issue } = status
+        else {
+            return Err(WireError::MissingProof);
+        };
+        let target = issue.target();
+        let diagnostics = self.guardian.diagnostic_slots();
+        if live.state != WireState::Active
+            || live.session != session.into()
+            || live.attempt != key.attempt_id().get()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.guardian != WireIdentity::from(binding.identity().process)
+            || self.native_identity != Some(binding.identity())
+            || binding.attempt_id() != key.attempt_id()
+            || binding.deadline() != self.guardian.original_deadline()
+            || checkpoint.attempt_id() != key.attempt_id()
+            || checkpoint.deadline() != binding.deadline()
+            || !matches!(
+                checkpoint.phase(),
+                crate::Phase::CleaningOwnedTree | crate::Phase::VerifyingCleanup
+            )
+            || checkpoint.persistence_revision() != key.revision()
+            || binding.current_session().state != crate::NativeSessionState::Active
+            || !checkpoint.native_root_identity_observation(target)
+            || binding.current_session().generation.get() != session.generation()
+            || issue.session_generation() != binding.current_session().generation
+            || issue.guardian_identity() != binding.identity()
+            || issue.key() != key
+            || binding.dispatch_floor() > key.revision()
+            || binding.slots().len() != 1
+            || binding.slots()[0].process != target
+            || wire.slots.len() != 1
+            || wire.slots[0].identity != WireIdentity::from(target)
+            || diagnostics.len() != 1
+            || diagnostics[0].0 != Some(target)
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        Ok(issue)
+    }
+
+    fn native_identity_observation_admit(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+    ) -> Result<Response, WireError> {
+        let session = self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        self.native_identity_issue(session, key)?;
+        if self
+            .native_identity_observation_admissions
+            .values()
+            .any(|admission| admission.key == key)
+            || self.guardian.retained_result(key).is_some()
+        {
+            return Err(WireError::AdmissionReplayed);
+        }
+        self.guardian
+            .authenticate_policy_session(
+                session,
+                self.guardian.attempt_id(),
+                self.guardian.original_deadline(),
+            )
+            .map_err(WireError::from)?;
+        let handle = self.next_admission;
+        self.next_admission = handle.checked_add(1).ok_or(WireError::InvalidValue)?;
+        self.native_identity_observation_admissions
+            .insert(handle, NativeIdentityObservationAdmission { session, key });
+        Ok(Response::Admitted { admission: handle })
+    }
+
+    fn native_identity_observation_submit(
+        &mut self,
+        session: WireSession,
+        handle: u64,
+        _now: u64,
+    ) -> Result<Response, WireError> {
+        let admission = self
+            .native_identity_observation_admissions
+            .remove(&handle)
+            .ok_or(WireError::UnknownAdmission)?;
+        let session = self.resolve_session(session)?;
+        if admission.session != session {
+            return Err(WireError::AdmissionMismatch);
+        }
+        let issue = self.native_identity_issue(session, admission.key)?;
+        let origin = issue.session_generation();
+        let ticket = DispatchTicket::from_committed_parts(
+            admission.key,
+            OsEffect::ObserveIdentity {
+                identity: issue.target(),
+            },
+        );
+        let now = native_reconciliation_now()?;
+        match self.guardian.submit_policy_ticket(session, ticket, now) {
+            Ok(key) => {
+                self.native_identity_observation_retained_origins.push((
+                    key,
+                    issue.target(),
+                    origin,
+                ));
+                Ok(Response::Submitted {
+                    key: key.try_into()?,
+                })
+            }
+            Err(crate::guardian::PolicySubmissionError::Refused { error, .. }) => Err(error.into()),
+            Err(crate::guardian::PolicySubmissionError::ExecutorCorrelationMismatch) => {
+                Err(GuardianError::ExecutorCorrelationMismatch.into())
+            }
+        }
+    }
+
+    fn observe_native_identity_observation(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+    ) -> Result<Response, WireError> {
+        let session = self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        let issue = self.native_identity_issue(session, key)?;
+        if !self
+            .native_identity_observation_retained_origins
+            .contains(&(key, issue.target(), issue.session_generation()))
+        {
+            return Err(WireError::MissingProof);
+        }
+        let retained = self
+            .guardian
+            .retained_result(key)
+            .ok_or(WireError::MissingProof)?;
+        if !matches!(WireRetained::from(retained).completion, WireCompletion::ObserveIdentity { identity, .. } if identity == issue.target().into())
+        {
+            return Err(WireError::MissingProof);
+        }
+        Ok(Response::Retained(Some(WireRetained::from(retained))))
+    }
+
+    fn ack_native_identity_observation(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        applied_revision: u64,
+    ) -> Result<Response, WireError> {
+        let session = self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        let applied_revision = revision(applied_revision)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .identity_observation_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeIdentityObservationStatus::AppliedPendingAck {
+            issue,
+            observation,
+            applying_revision,
+        } = status
+        else {
+            return Err(WireError::MissingProof);
+        };
+        let receipt = (key, observation, applying_revision);
+        if issue.key() != key
+            || applying_revision != applied_revision
+            || checkpoint.attempt_id() != key.attempt_id()
+            || checkpoint.persistence_revision() < applying_revision
+            || checkpoint.deadline() != binding.deadline()
+            || binding.attempt_id() != key.attempt_id()
+            || binding.deadline() != self.guardian.original_deadline()
+            || issue.guardian_identity() != binding.identity()
+            || self.native_identity != Some(binding.identity())
+            || binding.slots().len() != 1
+            || binding.slots()[0].process != issue.target()
+            || wire.slots.len() != 1
+            || wire.slots[0].identity != issue.target().into()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || wire.guardian != binding.identity().process.into()
+            || wire.nonce != binding.identity().nonce.bytes()
+            || live.session != session.into()
+            || !matches!(live.state, WireState::Active | WireState::Reconciling)
+            || binding.current_session().generation.get() != session.generation()
+            || binding.current_session().generation < issue.session_generation()
+            || !matches!(
+                binding.current_session().state,
+                crate::NativeSessionState::Active | crate::NativeSessionState::Reconciling
+            )
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        if self
+            .native_identity_observation_ack_receipts
+            .contains(&receipt)
+        {
+            if self.guardian.retained_result(key).is_some() {
+                return Err(WireError::MissingProof);
+            }
+        } else {
+            if !self
+                .native_identity_observation_retained_origins
+                .contains(&(key, issue.target(), issue.session_generation()))
+            {
+                return Err(WireError::MissingProof);
+            }
+            let expected = WireCompletion::from(&EffectCompletion::ObserveIdentity {
+                identity: issue.target(),
+                observation,
+            });
+            if self
+                .guardian
+                .retained_result(key)
+                .is_none_or(|retained| WireRetained::from(retained).completion != expected)
+            {
+                return Err(WireError::MissingProof);
+            }
+            self.guardian
+                .ack_result(
+                    session,
+                    crate::AppliedResultAck::after_applied(session, key),
+                )
+                .map_err(WireError::from)?;
+            self.native_identity_observation_ack_receipts.push(receipt);
+            self.native_identity_observation_retained_origins
+                .retain(|(stored, _, _)| *stored != key);
+        }
+        Ok(Response::Acked {
+            key: key.try_into()?,
+            applied_revision: applied_revision.get(),
+        })
     }
 
     fn validate_native_child_list_evidence(
@@ -2405,6 +2712,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 self.refused.clear();
                 self.admissions.clear();
                 self.native_admissions.clear();
+                self.native_child_list_admissions.clear();
+                self.native_identity_observation_admissions.clear();
                 self.interruption = None;
                 self.finish_proof = None;
                 self.prepared_activation = None;
@@ -2504,6 +2813,38 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 } else {
                     self.dispatch_submit(session, admission, now)?
                 }
+            }
+            Request::NativeIdentityObservationAdmit { session, key } => {
+                if !self.native_unbound {
+                    return Err(WireError::UnsupportedDurableBinding);
+                }
+                self.native_identity_observation_admit(session, key)?
+            }
+            Request::NativeIdentityObservationSubmit {
+                session,
+                admission,
+                now,
+            } => {
+                if !self.native_unbound {
+                    return Err(WireError::UnsupportedDurableBinding);
+                }
+                self.native_identity_observation_submit(session, admission, now)?
+            }
+            Request::ObserveNativeIdentityObservation { session, key } => {
+                if !self.native_unbound {
+                    return Err(WireError::UnsupportedDurableBinding);
+                }
+                self.observe_native_identity_observation(session, key)?
+            }
+            Request::AckNativeIdentityObservationAfterApplied {
+                session,
+                key,
+                applied_revision,
+            } => {
+                if !self.native_unbound {
+                    return Err(WireError::UnsupportedDurableBinding);
+                }
+                self.ack_native_identity_observation(session, key, applied_revision)?
             }
             Request::NativeChildListAdmit {
                 session,
@@ -2760,6 +3101,31 @@ mod tests {
     }
 
     #[test]
+    fn native_identity_admission_wire_has_no_caller_identity() {
+        let request = Request::NativeIdentityObservationAdmit {
+            session: WireSession {
+                instance: 1,
+                generation: 2,
+            },
+            key: WireKey {
+                attempt: 3,
+                revision: 4,
+                ordinal: 5,
+            },
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["data"].as_object().unwrap().len(), 2);
+        assert!(value["data"].get("identity").is_none());
+        assert!(serde_json::from_value::<Request>(serde_json::json!({
+            "op": "native_identity_observation_admit",
+            "data": { "session": { "instance": 1, "generation": 2 },
+                      "key": { "attempt": 3, "revision": 4, "ordinal": 5 },
+                      "identity": { "pid": 123, "birth_seconds": 1, "birth_nanos": 0 } }
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn native_child_vector_is_bounded_during_deserialization() {
         let completion = |count| WireCompletion::ListChildren {
             parent: WireIdentity {
@@ -2837,9 +3203,9 @@ mod tests {
             read_frame::<Request>(&mut Cursor::new(unknown)),
             Err(CodecError::UnsupportedVersion(version)) if version == unsupported
         ));
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
         let old = serde_json::to_vec(&Envelope {
-            version: 6,
+            version: 7,
             body: Request::Snapshot,
         })
         .unwrap();
@@ -2847,7 +3213,7 @@ mod tests {
         old_frame.extend(old);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(old_frame)),
-            Err(CodecError::UnsupportedVersion(6))
+            Err(CodecError::UnsupportedVersion(7))
         ));
         let mut unknown_op = Vec::new();
         let bytes =
@@ -3392,6 +3758,440 @@ mod native_evidence_tests {
         }
         fn diagnostic_slot_identity(&self, slot: &ProcessIdentity) -> Option<ProcessIdentity> {
             Some(*slot)
+        }
+    }
+
+    struct IdentityReader(std::sync::Arc<std::sync::Mutex<ControllerSqliteStore>>);
+
+    impl NativeEvidenceReader for IdentityReader {
+        fn read(
+            &mut self,
+            _: AttemptId,
+        ) -> Result<Option<(crate::LoadedAttempt, NativeGuardianBinding)>, NativeEvidenceReadError>
+        {
+            Err(NativeEvidenceReadError)
+        }
+
+        fn reconciliation_evidence(
+            &mut self,
+            _: AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeReconciliationCompletion,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+
+        fn activation_evidence(
+            &mut self,
+            _: AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeReconciliationActivation,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+
+        fn sampling_evidence(
+            &mut self,
+            _: DispatchKey,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeSamplingStatus,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+
+        fn identity_observation_evidence(
+            &mut self,
+            key: DispatchKey,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeIdentityObservationStatus,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            self.0
+                .lock()
+                .unwrap()
+                .read_native_identity_observation_evidence(key)
+                .map_err(|_| NativeEvidenceReadError)
+        }
+    }
+
+    struct IdentityExecutor(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl GuardianExecutor for IdentityExecutor {
+        type ChildSlot = ProcessIdentity;
+
+        fn execute(
+            &mut self,
+            ticket: DispatchTicket,
+            _: &mut BTreeMap<crate::ChildSlotId, ProcessIdentity>,
+        ) -> ExecutedEffect {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let OsEffect::ObserveIdentity { identity } = ticket.effect() else {
+                panic!("only exact identity observation is expected")
+            };
+            ExecutedEffect::from_parts(
+                ticket.key(),
+                EffectCompletion::ObserveIdentity {
+                    identity: *identity,
+                    observation: crate::IdentityObservation::ExactIdentityAbsent,
+                },
+            )
+        }
+
+        fn poll_observation_only(&self, _: &ProcessIdentity) -> ChildSlotObservation {
+            ChildSlotObservation::Running
+        }
+
+        fn diagnostic_slot_identity(&self, slot: &ProcessIdentity) -> Option<ProcessIdentity> {
+            Some(*slot)
+        }
+    }
+
+    struct IdentityFixture {
+        server: GuardianServer<IdentityExecutor>,
+        store: std::sync::Arc<std::sync::Mutex<ControllerSqliteStore>>,
+        policy: crate::PolicyLoop,
+        ticket: DispatchTicket,
+        issue: crate::NativeIdentityObservationIssue,
+        session: WireSession,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn identity_fixture(slots: Vec<ProcessIdentity>) -> IdentityFixture {
+        let attempt = AttemptId::new(923);
+        let deadline = MonotonicTick::native_now()
+            .unwrap()
+            .checked_add(std::time::Duration::from_secs(120))
+            .unwrap();
+        let root = identity(42);
+        let mut store = ControllerSqliteStore::in_memory().unwrap();
+        let committed = DeploymentAttempt::start(
+            attempt,
+            deadline,
+            ResourcePolicy::new(
+                NonZeroUsize::new(1).unwrap(),
+                0,
+                0,
+                CpuContentionBasisPoints::new(10_000).unwrap(),
+                MemoryPressure::Critical,
+            ),
+            root,
+        )
+        .persist(&mut store)
+        .unwrap();
+        let native = NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([9; 16]).unwrap(),
+            process: identity(100),
+        };
+        let binding = store
+            .commit_initial_binding(
+                attempt,
+                deadline,
+                PersistenceRevision::first(),
+                native,
+                &[crate::NativeGuardianSlot {
+                    process: root,
+                    liveness: crate::NativeSlotLiveness::Running,
+                }],
+            )
+            .unwrap();
+        let mut policy = crate::PolicyLoop::from_committed(committed);
+        let sample = policy.issue_next().unwrap();
+        policy
+            .apply(
+                ExecutedEffect::from_parts(
+                    sample.key(),
+                    EffectCompletion::SampleResources {
+                        sequence: 0,
+                        result: Ok(crate::ResourceSample {
+                            sequence: 0,
+                            capacity: crate::ResourceCapacity {
+                                available_memory_bytes: 10,
+                                available_storage_bytes: 10,
+                            },
+                            contention: crate::ResourceContention {
+                                cpu: CpuContentionBasisPoints::new(0).unwrap(),
+                                memory_pressure: MemoryPressure::Nominal,
+                            },
+                        }),
+                    },
+                ),
+                &mut store,
+            )
+            .unwrap();
+        let child_ticket = policy.issue_next().unwrap();
+        let child_issue = store
+            .commit_native_child_list_issue_at(
+                &child_ticket,
+                &binding,
+                MonotonicTick::new(deadline.get() - 1),
+            )
+            .unwrap();
+        let child_verified = crate::VerifiedNativeChildListCompletion::new(
+            crate::NativeChildListDispatch::new(child_ticket, child_issue),
+            crate::NativeChildListCompletion::Children(Vec::new()),
+        );
+        let mut ticks = [MonotonicTick::new(deadline.get() - 1); 2].into_iter();
+        policy
+            .apply_native_child_list_at(child_verified, &mut store, &mut || {
+                Ok(ticks.next().unwrap())
+            })
+            .unwrap();
+        policy.finish_ownership_scan(&mut store).unwrap();
+        assert_eq!(
+            store.load_attempt(attempt).unwrap().unwrap().phase(),
+            Phase::CleaningOwnedTree
+        );
+        let ticket = policy.issue_next().unwrap();
+        assert!(
+            matches!(ticket.effect(), OsEffect::ObserveIdentity { identity } if *identity == root)
+        );
+        let issue = store
+            .commit_native_identity_observation_issue_at(
+                &ticket,
+                &binding,
+                MonotonicTick::new(deadline.get() - 1),
+            )
+            .unwrap();
+        let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (guardian, guardian_session) =
+            Guardian::new(attempt, deadline, IdentityExecutor(calls.clone()), slots).unwrap();
+        let mut server = GuardianServer::new(guardian, guardian_session, test_build()).unwrap();
+        server.stage_native_identity(native);
+        let Response::Hello { snapshot, .. } = server.handle(Request::Hello {
+            build: test_build(),
+        }) else {
+            panic!("hello")
+        };
+        server.stage_native_reader(Box::new(IdentityReader(store.clone())));
+        IdentityFixture {
+            server,
+            store,
+            policy,
+            ticket,
+            issue,
+            session: snapshot.session,
+            calls,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_identity_observation_executes_once_and_acks_only_durable_application() {
+        let root = identity(42);
+        let mut fixture = identity_fixture(vec![root]);
+        let key = WireKey::try_from(fixture.issue.key()).unwrap();
+        let session = fixture.session;
+        let admit = || Request::NativeIdentityObservationAdmit { session, key };
+        assert_eq!(
+            serde_json::to_value(admit()).unwrap()["data"],
+            serde_json::json!({ "session": session, "key": key }),
+        );
+        assert_eq!(
+            fixture.server.handle(Request::DispatchAdmit {
+                session,
+                key,
+                effect: WireEffect::ObserveIdentity {
+                    identity: root.into()
+                },
+            }),
+            Response::Refused(WireError::UnsupportedDurableBinding),
+        );
+        let Response::Admitted { admission } = fixture.server.handle(admit()) else {
+            panic!("admit")
+        };
+        assert_eq!(
+            fixture.server.handle(admit()),
+            Response::Refused(WireError::AdmissionReplayed)
+        );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .server
+                .handle(Request::NativeIdentityObservationSubmit {
+                    session,
+                    admission,
+                    now: 0,
+                }),
+            Response::Submitted { key },
+        );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .server
+                .handle(Request::NativeIdentityObservationSubmit {
+                    session,
+                    admission,
+                    now: 0,
+                }),
+            Response::Refused(WireError::UnknownAdmission),
+        );
+        let retained = Response::Retained(Some(WireRetained {
+            key,
+            completion: WireCompletion::ObserveIdentity {
+                identity: root.into(),
+                observation: WireIdentityObservation::ExactIdentityAbsent,
+            },
+        }));
+        let observe = || Request::ObserveNativeIdentityObservation { session, key };
+        assert_eq!(fixture.server.handle(observe()), retained);
+        assert_eq!(
+            fixture.server.handle(admit()),
+            Response::Refused(WireError::AdmissionReplayed)
+        );
+        assert_eq!(
+            fixture
+                .server
+                .handle(Request::AckNativeIdentityObservationAfterApplied {
+                    session,
+                    key,
+                    applied_revision: key.revision,
+                }),
+            Response::Refused(WireError::MissingProof),
+        );
+        assert_eq!(fixture.server.handle(observe()), retained);
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .store
+                .lock()
+                .unwrap()
+                .load_native_identity_observation_status(fixture.issue.key())
+                .unwrap(),
+            Some(
+                crate::NativeIdentityObservationStatus::IssuedPendingApplication {
+                    issue: fixture.issue
+                }
+            ),
+        );
+        let verified = crate::VerifiedNativeIdentityObservationCompletion::new(
+            crate::NativeIdentityObservationDispatch::new(fixture.ticket, fixture.issue),
+            crate::IdentityObservation::ExactIdentityAbsent,
+        );
+        let now = MonotonicTick::native_now().unwrap();
+        let mut ticks = [now; 2].into_iter();
+        let progress = fixture
+            .policy
+            .apply_native_identity_observation_at(
+                verified,
+                &mut fixture.store.lock().unwrap(),
+                &mut || Ok(ticks.next().unwrap()),
+            )
+            .unwrap();
+        let crate::LoopProgress::Applied { revision, .. } = progress else {
+            panic!("identity application")
+        };
+        assert_eq!(
+            fixture
+                .store
+                .lock()
+                .unwrap()
+                .load_native_identity_observation_status(fixture.issue.key())
+                .unwrap(),
+            Some(crate::NativeIdentityObservationStatus::AppliedPendingAck {
+                issue: fixture.issue,
+                observation: crate::IdentityObservation::ExactIdentityAbsent,
+                applying_revision: revision,
+            }),
+        );
+        assert_eq!(
+            fixture
+                .server
+                .handle(Request::AckNativeIdentityObservationAfterApplied {
+                    session,
+                    key,
+                    applied_revision: revision.get() + 1,
+                }),
+            Response::Refused(WireError::MissingProof),
+        );
+        let ack = Request::AckNativeIdentityObservationAfterApplied {
+            session,
+            key,
+            applied_revision: revision.get(),
+        };
+        let expected = Response::Acked {
+            key,
+            applied_revision: revision.get(),
+        };
+        assert_eq!(fixture.server.handle(ack.clone()), expected);
+        assert_eq!(fixture.server.handle(ack), expected);
+        assert_eq!(
+            fixture.server.handle(Request::ObserveRetained { key }),
+            Response::Retained(None)
+        );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_identity_admission_rejects_wrong_key_session_and_slot() {
+        let root = identity(42);
+        let mut fixture = identity_fixture(vec![root]);
+        let key = WireKey::try_from(fixture.issue.key()).unwrap();
+        let session = fixture.session;
+        for request in [
+            Request::NativeIdentityObservationAdmit {
+                session,
+                key: WireKey {
+                    ordinal: key.ordinal + 1,
+                    ..key
+                },
+            },
+            Request::NativeIdentityObservationAdmit {
+                session: WireSession {
+                    generation: session.generation + 1,
+                    ..session
+                },
+                key,
+            },
+            Request::NativeIdentityObservationAdmit {
+                session: WireSession {
+                    instance: session.instance + 1,
+                    ..session
+                },
+                key,
+            },
+        ] {
+            assert!(matches!(
+                fixture.server.handle(request),
+                Response::Refused(_)
+            ));
+        }
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for slots in [vec![identity(43)], vec![root, identity(43)]] {
+            let mut fixture = identity_fixture(slots);
+            let key = WireKey::try_from(fixture.issue.key()).unwrap();
+            assert_eq!(
+                fixture
+                    .server
+                    .handle(Request::NativeIdentityObservationAdmit {
+                        session: fixture.session,
+                        key,
+                    }),
+                Response::Refused(WireError::MissingProof),
+            );
+            assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 
@@ -5907,6 +6707,10 @@ mod native_evidence_tests {
                 | Request::NativeChildListSubmit { .. }
                 | Request::ObserveNativeChildList { .. }
                 | Request::AckNativeChildListAfterApplied { .. }
+                | Request::NativeIdentityObservationAdmit { .. }
+                | Request::NativeIdentityObservationSubmit { .. }
+                | Request::ObserveNativeIdentityObservation { .. }
+                | Request::AckNativeIdentityObservationAfterApplied { .. }
                 | Request::ReserveSignalRound { .. } => WireError::UnsupportedDurableBinding,
             };
             assert_eq!(server.handle(request), Response::Refused(expected));

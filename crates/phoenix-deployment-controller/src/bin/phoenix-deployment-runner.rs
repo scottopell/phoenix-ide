@@ -2,16 +2,17 @@
 
 #[cfg(unix)]
 use phoenix_deployment_controller::{
-    guardian_ipc::{WireNativeBinding, WireSnapshot, WireState},
+    guardian_ipc::{WireNativeBinding, WireObservation, WireSnapshot, WireState},
     native_guardian::{
-        recover_native_child_list_ack, recover_native_sampling_ack, verify_native_binding,
-        GuardianClient, VerifiedBindingStatus,
+        recover_native_child_list_ack, recover_native_identity_observation_ack,
+        recover_native_sampling_ack, verify_native_binding, GuardianClient, VerifiedBindingStatus,
     },
-    AckDisposition, AttemptId, BirthToken, CommittedTransition, ControllerSqliteStore,
-    CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce, LoopProgress,
-    MemoryPressure, MonotonicTick, NativeChildListStatus, NativeGuardianSlot, NativeSamplingStatus,
-    OsEffect, PersistenceRevision, Phase, PolicyLoop, ProcessId, ProcessIdentity,
-    RecoveryDisposition, ResourcePolicy,
+    AckDisposition, AttemptId, BirthToken, CleanupOutcome, CommittedTransition,
+    ControllerSqliteStore, CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce,
+    IdentityObservation, LoopFenceReason, LoopProgress, MemoryPressure, MonotonicTick,
+    NativeChildListStatus, NativeGuardianSlot, NativeIdentityObservationStatus,
+    NativeSamplingStatus, OsEffect, PersistenceRevision, Phase, PolicyLoop, ProcessId,
+    ProcessIdentity, RecoveryDisposition, ResourcePolicy, Signal,
 };
 #[cfg(unix)]
 use std::{
@@ -63,7 +64,11 @@ enum RunnerMode {
     RecoverFinishAndChildList {
         fixture: ChildListFixture,
     },
+    RecoverFinishAndReady {
+        fixture: ReadyFixture,
+    },
     RecoverChildListAck(ChildListAckFixture),
+    RecoverIdentityAck(IdentityAckFixture),
 }
 
 #[cfg(unix)]
@@ -125,10 +130,25 @@ enum ChildListAckFixture {
 
 #[cfg(unix)]
 #[derive(Clone)]
+enum ReadyFixture {
+    Run,
+    PauseAfterIdentityApplication(ReleaseSource),
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+enum IdentityAckFixture {
+    Run,
+    PauseAfterConfirmation(ReleaseSource),
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
 enum RecoveryRun {
     Finish(FinishFixture),
     FinishAndSample(SampleFixture),
     FinishAndChildList(ChildListFixture),
+    FinishAndReady(ReadyFixture),
 }
 
 #[cfg(unix)]
@@ -136,9 +156,9 @@ impl RecoveryRun {
     fn activation_fixture(&self) -> FinishFixture {
         match self {
             Self::Finish(fixture) => *fixture,
-            Self::FinishAndSample(SampleFixture::Run) | Self::FinishAndChildList(_) => {
-                FinishFixture::Run
-            }
+            Self::FinishAndSample(SampleFixture::Run)
+            | Self::FinishAndChildList(_)
+            | Self::FinishAndReady(_) => FinishFixture::Run,
             Self::FinishAndSample(SampleFixture::ActivationAndSampleBarriers) => {
                 FinishFixture::ActivationBarriers
             }
@@ -266,6 +286,43 @@ fn parse_recover_child_list_ack(args: &[OsString], usage: &str) -> Result<Runner
 }
 
 #[cfg(unix)]
+fn parse_recover_finish_and_ready(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
+    let fixture = match args {
+        [_, _, _, _, _, _, _, _] => ReadyFixture::Run,
+        [_, _, _, _, _, _, _, _, pause] if pause == "--fixture-pause-after-identity-apply" => {
+            ReadyFixture::PauseAfterIdentityApplication(ReleaseSource::Stdin)
+        }
+        [_, _, _, _, _, _, _, _, pause, release, path]
+            if pause == "--fixture-pause-after-identity-apply"
+                && release == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(path);
+            validate_release_path(&path)?;
+            ReadyFixture::PauseAfterIdentityApplication(ReleaseSource::DisposableFile(path))
+        }
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::RecoverFinishAndReady { fixture })
+}
+
+#[cfg(unix)]
+fn parse_recover_identity_ack(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
+    let fixture = match args {
+        [_, _, _, _, _, _, _, _] => IdentityAckFixture::Run,
+        [_, _, _, _, _, _, _, _, pause, release, path]
+            if pause == "--fixture-pause-after-identity-ack"
+                && release == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(path);
+            validate_release_path(&path)?;
+            IdentityAckFixture::PauseAfterConfirmation(ReleaseSource::DisposableFile(path))
+        }
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::RecoverIdentityAck(fixture))
+}
+
+#[cfg(unix)]
 fn parse_recover_unapplied_child_list(
     args: &[OsString],
     usage: &str,
@@ -294,7 +351,7 @@ fn parse_recover_unapplied_child_list(
 
 #[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-unapplied-child-list|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-child-list-ack> --socket-dir <private fixture> --store <existing schema-v6 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample or recover-unapplied-child-list only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-observation|--fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-unapplied-child-list|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-finish-and-ready|recover-child-list-ack|recover-identity-ack> --socket-dir <private fixture> --store <existing schema-v7 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample or recover-unapplied-child-list only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-observation|--fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only) | --fixture-pause-after-identity-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-ready only) | --fixture-pause-after-identity-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-identity-ack only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -362,7 +419,9 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
             }
         }
         "recover-finish-and-child-list" => parse_recover_child_list(args, usage)?,
+        "recover-finish-and-ready" => parse_recover_finish_and_ready(args, usage)?,
         "recover-child-list-ack" => parse_recover_child_list_ack(args, usage)?,
+        "recover-identity-ack" => parse_recover_identity_ack(args, usage)?,
         "initial-sample" => parse_initial_sample(args, usage)?,
         _ => return Err(usage.into()),
     };
@@ -803,9 +862,10 @@ fn run_recover_and_finish(
         serde_json::to_string(&active).map_err(|e| e.to_string())?
     );
     std::io::stdout().flush().map_err(|e| e.to_string())?;
-    let (sample_fixture, child_list_fixture) = match run {
-        RecoveryRun::FinishAndSample(fixture) => (Some(fixture), None),
-        RecoveryRun::FinishAndChildList(fixture) => (None, Some(fixture)),
+    let (sample_fixture, child_list_fixture, ready_fixture) = match run {
+        RecoveryRun::FinishAndSample(fixture) => (Some(fixture), None, None),
+        RecoveryRun::FinishAndChildList(fixture) => (None, Some(fixture), None),
+        RecoveryRun::FinishAndReady(fixture) => (None, Some(ChildListFixture::Run), Some(fixture)),
         RecoveryRun::Finish(_) => return Ok(()),
     };
     if matches!(
@@ -847,7 +907,7 @@ fn run_recover_and_finish(
         issue.sequence()
     );
     std::io::stdout().flush().map_err(|e| e.to_string())?;
-    match child_list_fixture {
+    match child_list_fixture.as_ref() {
         Some(fixture) => run_recovered_child_list(
             store,
             client,
@@ -855,7 +915,9 @@ fn run_recover_and_finish(
             session,
             policy,
             &active_binding,
+            &active,
             fixture,
+            ready_fixture.as_ref(),
         ),
         None => Ok(()),
     }
@@ -869,7 +931,9 @@ fn run_recovered_child_list(
     session: phoenix_deployment_controller::guardian_ipc::WireSession,
     mut policy: PolicyLoop,
     binding: &phoenix_deployment_controller::NativeGuardianBinding,
-    fixture: ChildListFixture,
+    active: &WireSnapshot,
+    fixture: &ChildListFixture,
+    ready_fixture: Option<&ReadyFixture>,
 ) -> Result<(), String> {
     let child_ticket = policy
         .issue_next()
@@ -892,7 +956,7 @@ fn run_recovered_child_list(
     let verified = client
         .observe_native_child_list(dispatched)
         .map_err(|error| format!("child-list observe: {error:?}"))?;
-    if let ChildListFixture::PauseAfterObservation(release) = &fixture {
+    if let ChildListFixture::PauseAfterObservation(release) = fixture {
         let gate = release.prepare()?;
         println!(
             "child_list_observed_pending_application revision={}",
@@ -920,7 +984,7 @@ fn run_recovered_child_list(
     {
         return Err("child-list completion was not successful and empty".into());
     }
-    if let ChildListFixture::PauseAfterApplication(release) = &fixture {
+    if let ChildListFixture::PauseAfterApplication(release) = fixture {
         let gate = release.prepare()?;
         println!(
             "child_list_application_committed_pending_ack revision={}",
@@ -950,6 +1014,11 @@ fn run_recovered_child_list(
             final_attempt.phase()
         ));
     }
+    if let Some(fixture) = ready_fixture {
+        return run_recovered_identity_to_ready(
+            store, client, attempt, session, policy, binding, active, fixture,
+        );
+    }
     println!(
         "child_list_ack_confirmed attempt={} revision={} generation={} phase=CleaningOwnedTree; observe_identity_not_issued",
         child_issue.key().attempt_id().get(),
@@ -957,6 +1026,189 @@ fn run_recovered_child_list(
         session.generation,
     );
     std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn wait_for_exited_root(
+    client: &mut GuardianClient,
+    active: &WireSnapshot,
+    root: ProcessIdentity,
+) -> Result<(), String> {
+    let [slot] = active.slots.as_slice() else {
+        return Err("ready continuation requires one guardian slot".into());
+    };
+    let native = active
+        .native_binding
+        .as_ref()
+        .ok_or("missing native binding")?;
+    if native.slots.len() != 1 || native.slots[0].identity != root.into() {
+        return Err("ready continuation root does not match guardian identity".into());
+    }
+    loop {
+        let now = MonotonicTick::native_now().map_err(|error| error.to_string())?;
+        if now.get() >= active.deadline {
+            return Err("root did not exit before original deadline".into());
+        }
+        let inventory = client
+            .inventory()
+            .map_err(|error| format!("inventory: {error:?}"))?;
+        if inventory.as_slice() != active.slots.as_slice() {
+            return Err("guardian slot inventory changed".into());
+        }
+        match client
+            .observe_slot(*slot)
+            .map_err(|error| format!("observe slot: {error:?}"))?
+        {
+            WireObservation::Exited => return Ok(()),
+            WireObservation::Running | WireObservation::Unavailable => {}
+        }
+        let now = MonotonicTick::native_now().map_err(|error| error.to_string())?;
+        let remaining = active.deadline.saturating_sub(now.get());
+        if remaining == 0 {
+            return Err("root did not exit before original deadline".into());
+        }
+        // test-timing-allow: bounded liveness polling until the original monotonic deadline.
+        thread::sleep(Duration::from_nanos(remaining.min(100_000_000)));
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_recovered_identity_to_ready(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    attempt: AttemptId,
+    session: phoenix_deployment_controller::guardian_ipc::WireSession,
+    mut policy: PolicyLoop,
+    binding: &phoenix_deployment_controller::NativeGuardianBinding,
+    active: &WireSnapshot,
+    fixture: &ReadyFixture,
+) -> Result<(), String> {
+    let root = binding
+        .slots()
+        .first()
+        .ok_or("missing harmless root slot")?
+        .process;
+    wait_for_exited_root(client, active, root)?;
+    let ticket = policy
+        .issue_next()
+        .ok_or("missing ObserveIdentity successor")?;
+    if !matches!(ticket.effect(), OsEffect::ObserveIdentity { identity } if *identity == root) {
+        return Err("cleanup successor was not exact root identity observation".into());
+    }
+    let issue = store
+        .commit_native_identity_observation_issue(&ticket, binding)
+        .map_err(|error| format!("identity issue: {error}"))?;
+    let dispatched = client
+        .dispatch_native_identity_observation(ticket, issue)
+        .map_err(|error| format!("identity dispatch (issue retained): {error:?}"))?;
+    let verified = client
+        .observe_native_identity_observation(dispatched)
+        .map_err(|error| format!("identity observe: {error:?}"))?;
+    let progress = policy
+        .apply_native_identity_observation(verified, store)
+        .map_err(|error| format!("identity apply: {error:?}"))?;
+    if !matches!(progress, LoopProgress::Applied {
+        key,
+        ack: AckDisposition::AcknowledgeNow,
+        ..
+    } if key == issue.key())
+    {
+        return Err(format!(
+            "identity observation did not produce immediate ACK: {progress:?}"
+        ));
+    }
+    let pending = store
+        .load_native_identity_observation_status(issue.key())
+        .map_err(|error| error.to_string())?
+        .ok_or("identity application not durable")?;
+    if !matches!(&pending, NativeIdentityObservationStatus::AppliedPendingAck { issue: stored, observation, .. }
+        if *stored == issue && clean_identity_observation(*observation, root))
+    {
+        return Err("identity result was not proven absent or valid PID reuse".into());
+    }
+    if let ReadyFixture::PauseAfterIdentityApplication(release) = fixture {
+        let gate = release.prepare()?;
+        println!(
+            "identity_application_committed_pending_ack revision={}",
+            issue.key().revision().get()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        gate.wait()?;
+    }
+    let confirmed = recover_native_identity_observation_ack(store, client, issue.key())
+        .map_err(|error| format!("identity ACK: {error:?}"))?;
+    if !matches!(confirmed, NativeIdentityObservationStatus::AckConfirmed {
+        issue: stored, observation, confirming_session_generation, ..
+    } if stored == issue && clean_identity_observation(observation, root)
+        && confirming_session_generation.get() == session.generation)
+    {
+        return Err("identity ACK confirmation mismatch".into());
+    }
+    loop {
+        let now = MonotonicTick::native_now().map_err(|error| error.to_string())?;
+        let remaining = binding.deadline().get().saturating_sub(now.get());
+        if remaining == 0 {
+            break;
+        }
+        // test-timing-allow: wait for the unchanged original monotonic deadline without signaling.
+        thread::sleep(Duration::from_nanos(remaining.min(100_000_000)));
+    }
+    let progress = policy
+        .request_owned_signals(
+            Signal::Terminate,
+            MonotonicTick::native_now().map_err(|error| error.to_string())?,
+            store,
+        )
+        .map_err(|error| format!("clean deadline transition: {error:?}"))?;
+    if !matches!(
+        progress,
+        LoopProgress::GuardianMustFence {
+            phase: Phase::ReadyForDisruption,
+            reason: LoopFenceReason::DeadlineReached,
+            ..
+        }
+    ) {
+        return Err(format!("deadline transition was not clean: {progress:?}"));
+    }
+    let final_attempt = store
+        .load_attempt(attempt)
+        .map_err(|error| error.to_string())?
+        .ok_or("missing ready attempt")?;
+    if final_attempt.phase() != Phase::ReadyForDisruption
+        || final_attempt.cleanup_outcome() != CleanupOutcome::VerifiedClean
+        || final_attempt.deadline() != binding.deadline()
+        || store
+            .pending_native_sampling_ack(attempt)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        || store
+            .pending_native_child_list_ack(attempt)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        || store
+            .pending_native_identity_observation_ack(attempt)
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Err("ready checkpoint was not verified clean with no pending effects".into());
+    }
+    println!("recover_finish_and_ready attempt={} identity_revision={} generation={} phase=ReadyForDisruption cleanup=VerifiedClean effects=0 signal_exact_identity=0",
+        attempt.get(), issue.key().revision().get(), session.generation);
+    std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn clean_identity_observation(observation: IdentityObservation, target: ProcessIdentity) -> bool {
+    match observation {
+        IdentityObservation::ExactIdentityAbsent => true,
+        IdentityObservation::PidReused(replacement) => {
+            replacement.pid() == target.pid() && replacement != target
+        }
+        IdentityObservation::SameIdentity { .. } | IdentityObservation::Unresolved(_) => false,
+    }
 }
 
 #[cfg(unix)]
@@ -986,6 +1238,55 @@ fn run_recover_child_list_ack(
         ChildListAckFixture::PauseAfterConfirmation(release) => Some(release.prepare()?),
         ChildListAckFixture::Run => None,
     };
+    std::io::stdout()
+        .flush()
+        .map_err(|error| error.to_string())?;
+    if let Some(gate) = gate {
+        gate.wait()?;
+    }
+    Ok(())
+}
+
+fn run_recover_identity_ack(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    key: phoenix_deployment_controller::DispatchKey,
+    session: phoenix_deployment_controller::guardian_ipc::WireSession,
+    fixture: &IdentityAckFixture,
+) -> Result<(), String> {
+    let interrupted = store
+        .load_attempt(key.attempt_id())
+        .map_err(|error| error.to_string())?
+        .ok_or("missing attempt before identity ACK")?;
+    if interrupted.phase() != Phase::Interrupted {
+        return Err("identity ACK recovery requires Interrupted checkpoint".into());
+    }
+    let confirmed = recover_native_identity_observation_ack(store, client, key)
+        .map_err(|error| format!("identity ACK recovery: {error:?}"))?;
+    if !matches!(confirmed, NativeIdentityObservationStatus::AckConfirmed {
+        issue, confirming_session_generation, ..
+    } if issue.key() == key && confirming_session_generation.get() == session.generation)
+    {
+        return Err("recovered identity ACK did not confirm exact key and session".into());
+    }
+    let interrupted = store
+        .load_attempt(key.attempt_id())
+        .map_err(|error| error.to_string())?
+        .ok_or("missing attempt after identity ACK")?;
+    if interrupted.phase() != Phase::Interrupted {
+        return Err("identity ACK recovery changed Interrupted checkpoint".into());
+    }
+    let gate = match fixture {
+        IdentityAckFixture::PauseAfterConfirmation(release) => Some(release.prepare()?),
+        IdentityAckFixture::Run => None,
+    };
+    println!(
+        "identity_ack_confirmed attempt={} revision={} ordinal={} generation={} phase=Interrupted; recovery_gap=PolicyLoop authority is intentionally not reconstructed, so cleanup cannot safely continue",
+        key.attempt_id().get(),
+        key.revision().get(),
+        key.ordinal(),
+        session.generation,
+    );
     std::io::stdout()
         .flush()
         .map_err(|error| error.to_string())?;
@@ -1461,6 +1762,7 @@ fn main() -> Result<(), String> {
         RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
             | RunnerMode::RecoverFinishAndChildList { .. }
+            | RunnerMode::RecoverFinishAndReady { .. }
     ) {
         preflight_recover_and_finish(&mut store, config.attempt)?;
     }
@@ -1478,6 +1780,14 @@ fn main() -> Result<(), String> {
                 .pending_native_child_list_ack(config.attempt)
                 .map_err(|e| e.to_string())?
                 .ok_or("no unique successful pending child-list ACK")?
+                .0,
+        )
+    } else if matches!(config.mode, RunnerMode::RecoverIdentityAck(_)) {
+        Some(
+            store
+                .pending_native_identity_observation_ack(config.attempt)
+                .map_err(|e| e.to_string())?
+                .ok_or("no unique pending identity observation ACK")?
                 .0,
         )
     } else {
@@ -1507,7 +1817,9 @@ fn main() -> Result<(), String> {
             | RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
             | RunnerMode::RecoverFinishAndChildList { .. }
+            | RunnerMode::RecoverFinishAndReady { .. }
             | RunnerMode::RecoverChildListAck(_)
+            | RunnerMode::RecoverIdentityAck(_)
     ) && status == VerifiedBindingStatus::InitialActive
     {
         return Err("recovery requires detached guardian".into());
@@ -1545,12 +1857,14 @@ fn main() -> Result<(), String> {
                 RunnerMode::RecoverAndFinish { fixture } => fixture,
                 RunnerMode::RecoverFinishAndSample { .. }
                 | RunnerMode::RecoverFinishAndChildList { .. }
+                | RunnerMode::RecoverFinishAndReady { .. }
                 | RunnerMode::ObserveOnly { .. }
                 | RunnerMode::InitialSample { .. }
                 | RunnerMode::RecoverAppliedAck(_)
                 | RunnerMode::RecoverUnappliedSample { .. }
                 | RunnerMode::RecoverUnappliedChildList { .. }
-                | RunnerMode::RecoverChildListAck(_) => FinishFixture::Run,
+                | RunnerMode::RecoverChildListAck(_)
+                | RunnerMode::RecoverIdentityAck(_) => FinishFixture::Run,
             },
         )?)
     };
@@ -1582,6 +1896,14 @@ fn main() -> Result<(), String> {
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
             RecoveryRun::FinishAndChildList(fixture.clone()),
         ),
+        RunnerMode::RecoverFinishAndReady { fixture } => run_recover_and_finish(
+            &mut store,
+            &mut client,
+            config.attempt,
+            &snapshot,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
+            RecoveryRun::FinishAndReady(fixture.clone()),
+        ),
         RunnerMode::RecoverUnappliedSample { fixture } => run_recover_unapplied_sample(
             &mut store,
             &mut client,
@@ -1606,6 +1928,13 @@ fn main() -> Result<(), String> {
             &mut store,
             &mut client,
             pending_recovery_key.ok_or("missing preflight pending child-list ACK")?,
+            fixture,
+        ),
+        RunnerMode::RecoverIdentityAck(fixture) => run_recover_identity_ack(
+            &mut store,
+            &mut client,
+            pending_recovery_key.ok_or("missing preflight pending identity ACK")?,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
             fixture,
         ),
         RunnerMode::InitialSample { fixture, .. } => run_initial_sample(
@@ -2501,6 +2830,185 @@ mod tests {
     }
 
     #[test]
+    fn ready_mode_accepts_only_its_private_identity_application_gate() {
+        assert!(matches!(
+            parse_args(&args("recover-finish-and-ready")),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndReady {
+                    fixture: ReadyFixture::Run
+                },
+                ..
+            })
+        ));
+        let mut paused = args("recover-finish-and-ready");
+        paused.push("--fixture-pause-after-identity-apply".into());
+        assert!(matches!(
+            parse_args(&paused),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndReady {
+                    fixture: ReadyFixture::PauseAfterIdentityApplication(ReleaseSource::Stdin)
+                },
+                ..
+            })
+        ));
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut file_pause = paused.clone();
+        file_pause.extend([
+            OsString::from("--fixture-release-file"),
+            root.path().join("runner-release.signal").into_os_string(),
+        ]);
+        assert!(matches!(
+            parse_args(&file_pause),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndReady {
+                    fixture: ReadyFixture::PauseAfterIdentityApplication(
+                        ReleaseSource::DisposableFile(_)
+                    )
+                },
+                ..
+            })
+        ));
+        let mut incomplete_file = paused.clone();
+        incomplete_file.push("--fixture-release-file".into());
+        assert!(parse_args(&incomplete_file).is_err());
+        let mut invalid_path = file_pause.clone();
+        invalid_path[10] = root.path().join("other.signal").into_os_string();
+        assert!(parse_args(&invalid_path).is_err());
+        let mut duplicate = file_pause.clone();
+        duplicate.extend(file_pause[8..].iter().cloned());
+        assert!(parse_args(&duplicate).is_err());
+        for mode in ["recover-finish-and-child-list", "recover-identity-ack"] {
+            let mut other = args(mode);
+            other.extend(file_pause[8..].iter().cloned());
+            assert!(parse_args(&other).is_err(), "fixture leaked to {mode}");
+        }
+        for suffix in [
+            vec!["--root-pid", "42"],
+            vec!["--observe-seconds", "5"],
+            vec!["--fixture-pause-after-child-list-apply"],
+            vec!["--fixture-activation-and-sample-barriers"],
+            vec!["--identity-pid", "42"],
+        ] {
+            let mut invalid = args("recover-finish-and-ready");
+            invalid.extend(suffix.into_iter().map(OsString::from));
+            let error = parse_args(&invalid)
+                .err()
+                .expect("ready mode rejects extra authority");
+            assert!(error.contains("schema-v7 store"));
+            assert!(error.contains("recover-finish-and-ready"));
+        }
+        let mut old = args("recover-finish-and-child-list");
+        old.push("--fixture-pause-after-child-list-apply".into());
+        assert!(matches!(
+            parse_args(&old),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndChildList {
+                    fixture: ChildListFixture::PauseAfterApplication(_)
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ready_mode_accepts_only_proven_absence_or_distinct_same_pid_birth() {
+        let target = ProcessIdentity::new(
+            ProcessId::new(NonZeroU32::new(42).unwrap()),
+            BirthToken::new(1, 0).unwrap(),
+        );
+        let replacement = ProcessIdentity::new(
+            ProcessId::new(NonZeroU32::new(42).unwrap()),
+            BirthToken::new(2, 0).unwrap(),
+        );
+        let other_pid = ProcessIdentity::new(
+            ProcessId::new(NonZeroU32::new(43).unwrap()),
+            BirthToken::new(2, 0).unwrap(),
+        );
+        assert!(clean_identity_observation(
+            IdentityObservation::ExactIdentityAbsent,
+            target
+        ));
+        assert!(clean_identity_observation(
+            IdentityObservation::PidReused(replacement),
+            target
+        ));
+        assert!(!clean_identity_observation(
+            IdentityObservation::PidReused(target),
+            target
+        ));
+        assert!(!clean_identity_observation(
+            IdentityObservation::PidReused(other_pid),
+            target
+        ));
+        assert!(!clean_identity_observation(
+            IdentityObservation::SameIdentity {
+                current_parent: None
+            },
+            target
+        ));
+        assert!(!clean_identity_observation(
+            IdentityObservation::Unresolved(
+                phoenix_deployment_controller::ObservationFailure::TemporarilyUnavailable
+            ),
+            target
+        ));
+    }
+
+    #[test]
+    fn identity_ack_mode_accepts_only_its_private_confirmation_gate() {
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("runner-release.signal");
+        assert!(matches!(
+            parse_args(&args("recover-identity-ack")),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverIdentityAck(IdentityAckFixture::Run),
+                ..
+            })
+        ));
+        let mut paused = args("recover-identity-ack");
+        paused.extend([
+            OsString::from("--fixture-pause-after-identity-ack"),
+            OsString::from("--fixture-release-file"),
+            path.into_os_string(),
+        ]);
+        assert!(matches!(
+            parse_args(&paused),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverIdentityAck(IdentityAckFixture::PauseAfterConfirmation(
+                    ReleaseSource::DisposableFile(_)
+                )),
+                ..
+            })
+        ));
+        for size in [9, 10] {
+            assert!(parse_args(&paused[..size]).is_err());
+        }
+        let mut duplicate = paused.clone();
+        duplicate.extend(paused[8..].iter().cloned());
+        assert!(parse_args(&duplicate).is_err());
+        let mut wrong_path = paused.clone();
+        wrong_path[10] = root.path().join("other.signal").into_os_string();
+        assert!(parse_args(&wrong_path).is_err());
+        for mode in [
+            "recover-child-list-ack",
+            "recover-applied-ack",
+            "recover-finish-and-ready",
+        ] {
+            let mut other = args(mode);
+            other.extend(paused[8..].iter().cloned());
+            assert!(parse_args(&other).is_err(), "fixture leaked to {mode}");
+        }
+    }
+
+    #[test]
     fn sample_barrier_fixtures_are_restricted_to_their_modes() {
         for mode in [
             "observe-only",
@@ -2509,6 +3017,7 @@ mod tests {
             "recover-unapplied-sample",
             "recover-and-finish",
             "recover-finish-and-sample",
+            "recover-finish-and-ready",
         ] {
             let mut baseline = args(mode);
             let options: &[&str] = match mode {

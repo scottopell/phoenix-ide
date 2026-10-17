@@ -33,11 +33,21 @@ struct JobSpec {
     label: String,
     uid: u32,
     deadline: MonotonicTick,
+    child_seconds: u64,
+    serve_seconds: u64,
     guardian_program: GuardianProgram,
 }
 
 impl JobSpec {
     fn new() -> io::Result<Self> {
+        Self::new_with_timing(110, 90, 120)
+    }
+
+    fn new_with_timing(
+        child_seconds: u64,
+        deadline_seconds: u64,
+        serve_seconds: u64,
+    ) -> io::Result<Self> {
         let root = tempfile::Builder::new()
             .prefix("sdc-disposable-")
             .tempdir_in("/tmp")?;
@@ -50,13 +60,15 @@ impl JobSpec {
         let suffix = root.path().file_name().unwrap().to_str().unwrap();
         let label = format!("{LABEL_NAMESPACE}{}.{suffix}", std::process::id());
         let deadline = MonotonicTick::native_now()?
-            .checked_add(Duration::from_secs(90))
+            .checked_add(Duration::from_secs(deadline_seconds))
             .ok_or_else(|| io::Error::other("deadline overflow"))?;
         Ok(Self {
             root,
             label,
             uid,
             deadline,
+            child_seconds,
+            serve_seconds,
             guardian_program: GuardianProgram::SameBuild,
         })
     }
@@ -100,9 +112,9 @@ impl JobSpec {
             "--socket-dir".into(),
             self.socket_dir().to_str().unwrap().into(),
             "--child-seconds".into(),
-            "110".into(),
+            self.child_seconds.to_string(),
             "--serve-seconds".into(),
-            "120".into(),
+            self.serve_seconds.to_string(),
             "--attempt".into(),
             ATTEMPT.get().to_string(),
             "--deadline-nanoseconds".into(),
@@ -496,6 +508,18 @@ impl DisposableLaunchdGuardian {
         }
     }
 
+    pub(super) fn assert_guardian_job(&mut self) -> io::Result<()> {
+        let guardian = self.guardian();
+        if self.job_pid()? != Some(guardian.pid().get()) {
+            return Err(io::Error::other("exact job lost original guardian"));
+        }
+        let live = inspect(guardian.pid().get())?;
+        if live.identity != guardian || live.uid != self.spec.uid || live.parent != 1 {
+            return Err(io::Error::other("launchd guardian identity changed"));
+        }
+        Ok(())
+    }
+
     pub(super) fn assert_original_parent(&mut self) -> io::Result<()> {
         let guardian = self
             .guardian
@@ -720,7 +744,22 @@ pub(super) struct DisposableLaunchdInstallation {
 
 impl DisposableLaunchdInstallation {
     pub(super) fn start() -> io::Result<Self> {
-        let mut spec = JobSpec::new()?;
+        Self::start_spec(JobSpec::new()?)
+    }
+
+    pub(super) fn start_with_timing(
+        child_seconds: u64,
+        deadline_seconds: u64,
+        serve_seconds: u64,
+    ) -> io::Result<Self> {
+        Self::start_spec(JobSpec::new_with_timing(
+            child_seconds,
+            deadline_seconds,
+            serve_seconds,
+        )?)
+    }
+
+    fn start_spec(mut spec: JobSpec) -> io::Result<Self> {
         let bin = spec.root.path().join("bin");
         let artifacts = spec.root.path().join("artifacts");
         let data = spec.root.path().join("data");
@@ -864,7 +903,10 @@ impl Drop for DisposableLaunchdInstallation {
 pub(super) enum InstalledRunnerMode {
     InitialPauseAfterApplication,
     RecoverAppliedAck,
+    RecoverFinishAndReady,
     RecoverFinishAndChildListPauseAfterApplication,
+    RecoverFinishAndChildListPauseAfterObservation,
+    RecoverUnappliedChildListPauseAfterVerification,
     RecoverChildListAckPauseAfterConfirmation,
 }
 
@@ -926,8 +968,15 @@ impl RunnerJobSpec {
             match mode {
                 InstalledRunnerMode::InitialPauseAfterApplication => "initial-sample",
                 InstalledRunnerMode::RecoverAppliedAck => "recover-applied-ack",
+                InstalledRunnerMode::RecoverFinishAndReady => "recover-finish-and-ready",
                 InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication => {
                     "recover-finish-and-child-list"
+                }
+                InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation => {
+                    "recover-finish-and-child-list"
+                }
+                InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification => {
+                    "recover-unapplied-child-list"
                 }
                 InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => {
                     "recover-child-list-ack"
@@ -955,6 +1004,7 @@ impl RunnerJobSpec {
                 "--fixture-release-file".into(),
                 self.release_file().to_str().unwrap().into(),
             ]),
+            InstalledRunnerMode::RecoverFinishAndReady => {}
             InstalledRunnerMode::RecoverAppliedAck => args.extend([
                 "--fixture-pause-after-recovered-ack".into(),
                 "--fixture-release-file".into(),
@@ -962,6 +1012,16 @@ impl RunnerJobSpec {
             ]),
             InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication => args.extend([
                 "--fixture-pause-after-child-list-apply".into(),
+                "--fixture-release-file".into(),
+                self.release_file().to_str().unwrap().into(),
+            ]),
+            InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation => args.extend([
+                "--fixture-pause-after-child-list-observation".into(),
+                "--fixture-release-file".into(),
+                self.release_file().to_str().unwrap().into(),
+            ]),
+            InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification => args.extend([
+                "--fixture-pause-after-recovery-verification".into(),
                 "--fixture-release-file".into(),
                 self.release_file().to_str().unwrap().into(),
             ]),
@@ -1111,6 +1171,10 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
         self.pid.unwrap()
     }
 
+    pub(super) fn label(&self) -> &str {
+        &self.spec.label
+    }
+
     fn launchctl(&mut self, args: &[String]) -> io::Result<(ExitStatus, String, String)> {
         self.ctl_sequence += 1;
         let out = self
@@ -1218,7 +1282,15 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
     }
 
     pub(super) fn marker(&mut self, prefix: &str) -> io::Result<String> {
-        let until = Instant::now() + WAIT;
+        self.marker_with_timeout(prefix, WAIT)
+    }
+
+    pub(super) fn marker_with_timeout(
+        &mut self,
+        prefix: &str,
+        timeout: Duration,
+    ) -> io::Result<String> {
+        let until = Instant::now() + timeout;
         loop {
             let output = bounded_text(&self.spec.stdout())?;
             let tail = output
@@ -1392,10 +1464,28 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
         self.bootstrap(InstalledRunnerMode::RecoverAppliedAck)
     }
 
+    pub(super) fn recover_finish_and_ready(&mut self) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(2)?;
+        self.bootstrap(InstalledRunnerMode::RecoverFinishAndReady)
+    }
+
     pub(super) fn recover_finish_and_child_list(&mut self) -> io::Result<()> {
         self.bootout()?;
         self.archive_generation(2)?;
         self.bootstrap(InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication)
+    }
+
+    pub(super) fn recover_finish_and_child_list_before_application(&mut self) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(2)?;
+        self.bootstrap(InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation)
+    }
+
+    pub(super) fn recover_unapplied_child_list(&mut self) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(3)?;
+        self.bootstrap(InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification)
     }
 
     pub(super) fn recover_child_list_ack(&mut self) -> io::Result<()> {
@@ -1786,6 +1876,23 @@ mod tests {
     }
 
     #[test]
+    fn installed_ready_timing_keeps_default_and_private_job_shape() {
+        let defaults = JobSpec::new().unwrap();
+        assert_eq!(defaults.child_seconds, 110);
+        assert_eq!(defaults.serve_seconds, 120);
+        assert_eq!(defaults.arguments()[4], "110");
+        assert_eq!(defaults.arguments()[6], "120");
+        let ready = JobSpec::new_with_timing(12, 30, 40).unwrap();
+        assert_eq!(ready.arguments()[4], "12");
+        assert_eq!(ready.arguments()[6], "40");
+        let now = MonotonicTick::native_now().unwrap();
+        assert!(ready.deadline > now);
+        assert!(ready.deadline.get().saturating_sub(now.get()) <= 30_000_000_000);
+        assert_eq!(ready.root.path().parent(), Some(Path::new("/tmp")));
+        assert!(ready.label.starts_with(LABEL_NAMESPACE));
+    }
+
+    #[test]
     fn installed_runner_namespace_and_paths_are_private() {
         let mut guardian = JobSpec::new().unwrap();
         guardian.guardian_program = GuardianProgram::StagedInRoot;
@@ -1836,7 +1943,10 @@ mod tests {
         for mode in [
             InstalledRunnerMode::InitialPauseAfterApplication,
             InstalledRunnerMode::RecoverAppliedAck,
+            InstalledRunnerMode::RecoverFinishAndReady,
             InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication,
+            InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation,
+            InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification,
             InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation,
         ] {
             let args = runner.arguments(mode);
@@ -1880,6 +1990,10 @@ mod tests {
                         ]
                     );
                 }
+                InstalledRunnerMode::RecoverFinishAndReady => {
+                    assert_eq!(args.len(), 9);
+                    assert_eq!(args[2], "recover-finish-and-ready");
+                }
                 InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication => {
                     assert_eq!(args.len(), 12);
                     assert_eq!(args[2], "recover-finish-and-child-list");
@@ -1887,6 +2001,30 @@ mod tests {
                         &args[9..],
                         [
                             "--fixture-pause-after-child-list-apply",
+                            "--fixture-release-file",
+                            runner.release_file().to_str().unwrap()
+                        ]
+                    );
+                }
+                InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation => {
+                    assert_eq!(args.len(), 12);
+                    assert_eq!(args[2], "recover-finish-and-child-list");
+                    assert_eq!(
+                        &args[9..],
+                        [
+                            "--fixture-pause-after-child-list-observation",
+                            "--fixture-release-file",
+                            runner.release_file().to_str().unwrap()
+                        ]
+                    );
+                }
+                InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification => {
+                    assert_eq!(args.len(), 12);
+                    assert_eq!(args[2], "recover-unapplied-child-list");
+                    assert_eq!(
+                        &args[9..],
+                        [
+                            "--fixture-pause-after-recovery-verification",
                             "--fixture-release-file",
                             runner.release_file().to_str().unwrap()
                         ]

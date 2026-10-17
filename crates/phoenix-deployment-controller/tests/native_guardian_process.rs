@@ -6,11 +6,12 @@ use native_sampling::{
     settled_sampling_keys,
 };
 use phoenix_deployment_controller::{
-    guardian_ipc::{WireCompletion, WireSnapshot, WireState},
+    guardian_ipc::{WireCompletion, WireIdentityObservation, WireSnapshot, WireState},
     native_guardian::GuardianClient,
-    AttemptId, BirthToken, ControllerOs, ControllerSqliteStore, CpuContentionBasisPoints,
-    DeploymentAttempt, IdentityObservation, MacOsControllerOs, MemoryPressure, MonotonicTick,
-    NativeSessionState, Phase, ProcessId, ProcessIdentity, ResourcePolicy,
+    AttemptId, BirthToken, CleanupOutcome, ControllerOs, ControllerSqliteStore,
+    CpuContentionBasisPoints, DeploymentAttempt, IdentityObservation, MacOsControllerOs,
+    MemoryPressure, MonotonicTick, NativeSessionState, Phase, ProcessId, ProcessIdentity,
+    ResourcePolicy,
 };
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::{
@@ -325,6 +326,14 @@ struct ChildListProcessFixture {
 }
 
 fn start_child_list_fixture() -> ChildListProcessFixture {
+    start_child_list_fixture_with_timing(25, 30, 60)
+}
+
+fn start_child_list_fixture_with_timing(
+    child_seconds: u64,
+    serve_seconds: u64,
+    deadline_seconds: u64,
+) -> ChildListProcessFixture {
     let parent = tempfile::Builder::new()
         .prefix("sdc-")
         .tempdir_in("/tmp")
@@ -335,7 +344,7 @@ fn start_child_list_fixture() -> ChildListProcessFixture {
     let attempt = AttemptId::new(64);
     let deadline = MonotonicTick::native_now()
         .unwrap()
-        .checked_add(Duration::from_secs(60))
+        .checked_add(Duration::from_secs(deadline_seconds))
         .unwrap();
     drop(ControllerSqliteStore::open(&path).unwrap());
     let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"));
@@ -344,9 +353,9 @@ fn start_child_list_fixture() -> ChildListProcessFixture {
             "--socket-dir",
             dir.to_str().unwrap(),
             "--child-seconds",
-            "25",
+            &child_seconds.to_string(),
             "--serve-seconds",
-            "30",
+            &serve_seconds.to_string(),
             "--attempt",
             "64",
             "--deadline-nanoseconds",
@@ -416,6 +425,48 @@ fn child_list_rows(path: &Path) -> (i64, i64, i64, i64) {
         count("native_child_list_ack_confirmations"),
         count("native_child_list_result_children"),
     )
+}
+
+fn native_identity_observation_rows(path: &Path) -> (i64, i64, i64, String) {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let count = |table: &str| -> i64 {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    (
+        count("native_identity_observation_issues"),
+        count("native_identity_observation_applications"),
+        count("native_identity_observation_ack_confirmations"),
+        db.query_row(
+            "SELECT outcome FROM native_identity_observation_applications",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap(),
+    )
+}
+
+fn assert_native_identity_issue_target(path: &Path, root: ProcessIdentity) {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (pid, seconds, nanos): (i64, Vec<u8>, i64) = db
+        .query_row(
+            "SELECT target_pid,target_birth_seconds,target_birth_nanos FROM native_identity_observation_issues",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(pid, i64::from(root.pid().get()));
+    assert_eq!(
+        u64::from_be_bytes(seconds.try_into().unwrap()),
+        root.birth().seconds()
+    );
+    assert_eq!(nanos, i64::from(root.birth().nanos()));
 }
 
 fn assert_child_list_issue_parent(path: &Path, root: ProcessIdentity) {
@@ -573,6 +624,253 @@ fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
         i32::try_from(root.pid().get()).unwrap(),
         Duration::from_secs(5),
     );
+}
+
+#[test]
+fn naturally_exited_exact_root_reaches_ready_without_signals() {
+    let ChildListProcessFixture {
+        _parent,
+        dir,
+        path,
+        attempt,
+        deadline,
+        root,
+        mut guardian,
+    } = start_child_list_fixture_with_timing(12, 35, 25);
+    let initial_snapshot = settle_initial_sample_with_replacement_ack(&dir, &path, deadline, root);
+    let runner = child_list_runner_command(&dir, &path, "recover-finish-and-ready")
+        .output()
+        .unwrap();
+    assert!(
+        runner.status.success(),
+        "ready runner failed: {}",
+        String::from_utf8_lossy(&runner.stderr)
+    );
+    let output = String::from_utf8_lossy(&runner.stdout);
+    assert!(
+        output.contains(
+            "phase=ReadyForDisruption cleanup=VerifiedClean effects=0 signal_exact_identity=0"
+        ),
+        "{output}"
+    );
+    assert_runner_output_ends_at(&output, "recover_finish_and_ready attempt=64");
+    assert_eq!(child_list_rows(&path), (1, 1, 1, 0));
+    assert_child_list_issue_parent(&path, root);
+    assert_eq!(
+        native_identity_observation_rows(&path),
+        (1, 1, 1, "exact_identity_absent".into())
+    );
+    assert_native_identity_issue_target(&path, root);
+    let mut store = ControllerSqliteStore::open_existing(&path).unwrap();
+    let final_attempt = store.load_attempt(attempt).unwrap().unwrap();
+    assert_eq!(final_attempt.phase(), Phase::ReadyForDisruption);
+    assert_eq!(
+        final_attempt.cleanup_outcome(),
+        CleanupOutcome::VerifiedClean
+    );
+    let final_binding = store.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(final_binding.deadline(), deadline);
+    assert_eq!(final_binding.slots().len(), 1);
+    assert_eq!(final_binding.slots()[0].process, root);
+    assert_eq!(
+        final_binding.identity().nonce.bytes(),
+        initial_snapshot.native_binding.unwrap().nonce
+    );
+    assert_eq!(
+        MacOsControllerOs::new("/tmp")
+            .unwrap()
+            .observe_identity(root),
+        IdentityObservation::ExactIdentityAbsent
+    );
+    let detached = wait_for_detached(&dir);
+    assert_eq!(detached.state, WireState::DetachedFenced);
+    assert!(detached.retained.is_empty());
+    assert_eq!(detached.slots.len(), 1);
+    guardian.finish();
+}
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn identity_application_commit_survives_runner_death_before_ack_without_cleanup_continuation() {
+    let ChildListProcessFixture {
+        _parent,
+        dir,
+        path,
+        attempt,
+        deadline,
+        root,
+        mut guardian,
+    } = start_child_list_fixture_with_timing(12, 40, 30);
+    let original = settle_initial_sample_with_replacement_ack(&dir, &path, deadline, root);
+    assert_eq!(sampling_rows(&path).0, 1);
+    let mut runner = GuardedRunner::new(
+        child_list_runner_command(&dir, &path, "recover-finish-and-ready")
+            .arg("--fixture-pause-after-identity-apply")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = BufReader::new(runner.stdout.take().unwrap());
+    assert_eq!(line(&mut output), "verified binding: Detached");
+    assert!(line(&mut output).starts_with("reconciling generation=3 interruption="));
+    assert!(line(&mut output).starts_with("prepared_snapshot="));
+    assert!(line(&mut output).starts_with("durable_activation_snapshot="));
+    assert!(line(&mut output).starts_with("reconciliation_active generation=3 interruption="));
+    assert!(line(&mut output).starts_with("active_snapshot="));
+    assert!(line(&mut output).starts_with("recovered_sample_applied_ack attempt=64"));
+    let marker = line_with_timeout(&mut output, Duration::from_secs(20));
+    let revision = marker
+        .strip_prefix("identity_application_committed_pending_ack revision=")
+        .unwrap_or_else(|| panic!("unexpected application marker: {marker}"))
+        .parse::<u64>()
+        .unwrap();
+    assert!(runner.try_wait().unwrap().is_none());
+    assert_eq!(child_list_rows(&path), (1, 1, 1, 0));
+    assert_child_list_issue_parent(&path, root);
+    assert_eq!(
+        native_identity_observation_rows(&path),
+        (1, 1, 0, "exact_identity_absent".into())
+    );
+    let continued_sampling = sampling_rows(&path);
+    assert_eq!(
+        (
+            continued_sampling.0,
+            continued_sampling.1,
+            continued_sampling.2
+        ),
+        (2, 2, 2)
+    );
+    assert_native_identity_issue_target(&path, root);
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let (key, pending) = observed
+        .pending_native_identity_observation_ack(attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(key.revision().get(), revision);
+    assert!(
+        matches!(pending, phoenix_deployment_controller::NativeIdentityObservationStatus::AppliedPendingAck {
+        issue, observation: IdentityObservation::ExactIdentityAbsent, ..
+    } if issue.key() == key && issue.target() == root
+        && issue.guardian_identity().process.pid().get() == guardian.id())
+    );
+    assert_eq!(
+        MacOsControllerOs::new("/tmp")
+            .unwrap()
+            .observe_identity(root),
+        IdentityObservation::ExactIdentityAbsent
+    );
+
+    runner.kill_checked();
+    let mut remaining = String::new();
+    std::io::Read::read_to_string(&mut output, &mut remaining).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "runner continued past pre-ACK marker: {remaining}"
+    );
+    let crashed = wait_for_detached(&dir);
+    assert_eq!(crashed.retained.len(), 1);
+    assert_eq!(crashed.retained[0].key.attempt, attempt.get());
+    assert_eq!(crashed.retained[0].key.revision, revision);
+    assert_eq!(crashed.retained[0].key.ordinal, key.ordinal() as u64);
+    assert!(matches!(
+        &crashed.retained[0].completion,
+        WireCompletion::ObserveIdentity {
+            identity,
+            observation: WireIdentityObservation::ExactIdentityAbsent,
+        } if *identity == root.into()
+    ));
+    assert_eq!(crashed.instance, original.instance);
+    assert_eq!(crashed.deadline, original.deadline);
+    assert_eq!(crashed.slots, original.slots);
+    let original_native = original.native_binding.as_ref().unwrap();
+    let crashed_native = crashed.native_binding.as_ref().unwrap();
+    assert_eq!(crashed_native.guardian, original_native.guardian);
+    assert_eq!(crashed_native.nonce, original_native.nonce);
+    assert_eq!(crashed_native.deadline, original_native.deadline);
+    assert_eq!(crashed_native.slots.len(), 1);
+    assert_eq!(crashed_native.slots[0].identity, root.into());
+    assert_eq!(crashed.slots.len(), 1);
+    assert_eq!(
+        crashed_native.guardian,
+        observed
+            .load_native_binding(attempt)
+            .unwrap()
+            .unwrap()
+            .identity()
+            .process
+            .into()
+    );
+    assert_eq!(
+        observed.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::CleaningOwnedTree
+    );
+    assert_eq!(
+        native_identity_observation_rows(&path),
+        (1, 1, 0, "exact_identity_absent".into())
+    );
+
+    let mut replacement = GuardedRunner::new(
+        child_list_runner_command(&dir, &path, "recover-identity-ack")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut replacement_output = BufReader::new(replacement.stdout.take().unwrap());
+    assert_eq!(line(&mut replacement_output), "verified binding: Detached");
+    assert!(line(&mut replacement_output).starts_with("reconciling generation=4 interruption="));
+    let ack = line(&mut replacement_output);
+    assert!(
+        ack.starts_with(&format!(
+            "identity_ack_confirmed attempt=64 revision={revision} ordinal={}",
+            key.ordinal()
+        )),
+        "{ack}"
+    );
+    assert!(
+        ack.contains("generation=4 phase=Interrupted; recovery_gap="),
+        "{ack}"
+    );
+    success(&mut replacement);
+    let mut remaining = String::new();
+    std::io::Read::read_to_string(&mut replacement_output, &mut remaining).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "ACK recovery continued cleanup or readiness: {remaining}"
+    );
+
+    let final_snapshot = wait_for_detached(&dir);
+    assert!(final_snapshot.retained.is_empty());
+    assert_eq!(final_snapshot.instance, crashed.instance);
+    assert_eq!(final_snapshot.deadline, crashed.deadline);
+    assert_eq!(final_snapshot.slots, crashed.slots);
+    let final_native = final_snapshot.native_binding.as_ref().unwrap();
+    assert_eq!(final_native.guardian, crashed_native.guardian);
+    assert_eq!(final_native.nonce, crashed_native.nonce);
+    assert_eq!(final_native.deadline, crashed_native.deadline);
+    assert_eq!(final_native.slots, crashed_native.slots);
+    assert_eq!(child_list_rows(&path), (1, 1, 1, 0));
+    assert_eq!(sampling_rows(&path), continued_sampling);
+    assert_eq!(
+        native_identity_observation_rows(&path),
+        (1, 1, 1, "exact_identity_absent".into())
+    );
+    assert_native_identity_issue_target(&path, root);
+    assert!(observed
+        .pending_native_identity_observation_ack(attempt)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        observed.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::Interrupted
+    );
+    let final_binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(final_binding.deadline(), deadline);
+    assert_eq!(final_binding.slots().len(), 1);
+    assert_eq!(final_binding.slots()[0].process, root);
+    assert_eq!(final_binding.identity().process.pid().get(), guardian.id());
+    assert!(MonotonicTick::native_now().unwrap() < deadline);
+    guardian.finish();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1825,6 +2123,13 @@ fn fresh_runner_finishes_reconciliation_after_death_and_ack_recovery() {
 }
 
 fn line(output: &mut BufReader<std::process::ChildStdout>) -> String {
+    line_with_timeout(output, Duration::from_secs(5))
+}
+
+fn line_with_timeout(
+    output: &mut BufReader<std::process::ChildStdout>,
+    timeout: Duration,
+) -> String {
     if output.buffer().is_empty() {
         let mut fd = libc::pollfd {
             fd: std::os::fd::AsRawFd::as_raw_fd(output.get_ref()),
@@ -1832,7 +2137,7 @@ fn line(output: &mut BufReader<std::process::ChildStdout>) -> String {
             revents: 0,
         };
         assert_eq!(
-            unsafe { libc::poll(&raw mut fd, 1, 5000) },
+            unsafe { libc::poll(&raw mut fd, 1, i32::try_from(timeout.as_millis()).unwrap()) },
             1,
             "runner marker timeout"
         );

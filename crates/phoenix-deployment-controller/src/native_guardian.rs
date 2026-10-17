@@ -126,6 +126,28 @@ impl SqliteNativeEvidenceReader {
             .map_err(|_| NativeEvidenceReadError)
     }
 
+    /// Reads exact durable native identity-observation evidence without granting authority.
+    /// # Errors
+    /// Refuses another attempt or malformed issue/application evidence.
+    pub fn identity_observation_evidence(
+        &mut self,
+        key: crate::DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeIdentityObservationStatus,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        if key.attempt_id() != self.attempt {
+            return Err(NativeEvidenceReadError);
+        }
+        self.store
+            .read_native_identity_observation_evidence(key)
+            .map_err(|_| NativeEvidenceReadError)
+    }
+
     /// Reads exact root child-list evidence without constructing executable authority.
     /// # Errors
     /// Refuses another attempt or invalid durable evidence.
@@ -184,6 +206,20 @@ impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
     > {
         Self::sampling_evidence(self, key)
     }
+    fn identity_observation_evidence(
+        &mut self,
+        key: crate::DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeIdentityObservationStatus,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        Self::identity_observation_evidence(self, key)
+    }
+
     fn child_list_evidence(
         &mut self,
         key: crate::DispatchKey,
@@ -464,7 +500,9 @@ fn serve_frame<E: GuardianExecutor>(
         let request: Request = read_frame(stream)?;
         if matches!(
             request,
-            Request::DispatchSubmit { .. } | Request::NativeChildListSubmit { .. }
+            Request::DispatchSubmit { .. }
+                | Request::NativeChildListSubmit { .. }
+                | Request::NativeIdentityObservationSubmit { .. }
         ) {
             stream.deadline = (Instant::now() + EFFECT_RESPONSE_SLICE).min(until);
         }
@@ -472,6 +510,7 @@ fn serve_frame<E: GuardianExecutor>(
             request,
             Request::AckAfterAppliedRevision { .. }
                 | Request::AckNativeChildListAfterApplied { .. }
+                | Request::AckNativeIdentityObservationAfterApplied { .. }
         );
         let response = server.handle(request);
         if ack_request && matches!(response, Response::Acked { .. }) {
@@ -734,6 +773,115 @@ fn child_list_submit_refusal_is_unsubmitted(error: &ClientError) -> bool {
                 )
         )
     )
+}
+
+#[derive(Debug)]
+pub struct UnsubmittedNativeIdentityObservation {
+    ticket: crate::DispatchTicket,
+    issue: crate::NativeIdentityObservationIssue,
+}
+impl UnsubmittedNativeIdentityObservation {
+    #[must_use]
+    pub fn into_retry_parts(
+        self,
+    ) -> (crate::DispatchTicket, crate::NativeIdentityObservationIssue) {
+        (self.ticket, self.issue)
+    }
+}
+
+#[derive(Debug)]
+pub enum NativeIdentityObservationDispatchError {
+    KnownUnsubmitted {
+        error: ClientError,
+        unsubmitted: Box<UnsubmittedNativeIdentityObservation>,
+    },
+    SubmissionUnknown(ClientError),
+}
+
+fn identity_observation_snapshot_matches(
+    snapshot: &WireSnapshot,
+    issue: crate::NativeIdentityObservationIssue,
+) -> bool {
+    let Some(native) = snapshot.native_binding.as_ref() else {
+        return false;
+    };
+    let guardian = issue.guardian_identity();
+    snapshot.state == crate::guardian_ipc::WireState::Active
+        && snapshot.attempt == issue.key().attempt_id().get()
+        && snapshot.session.instance == snapshot.instance
+        && snapshot.session.generation == issue.session_generation().get()
+        && native.attempt == snapshot.attempt
+        && native.deadline == snapshot.deadline
+        && native.nonce == guardian.nonce.bytes()
+        && native.guardian == guardian.process.into()
+        && native.slots.len() == 1
+        && native.slots[0].identity == issue.target().into()
+}
+
+fn identity_observation_ack_snapshot_matches(
+    snapshot: &WireSnapshot,
+    issue: crate::NativeIdentityObservationIssue,
+) -> bool {
+    let Some(native) = snapshot.native_binding.as_ref() else {
+        return false;
+    };
+    let guardian = issue.guardian_identity();
+    matches!(
+        snapshot.state,
+        crate::guardian_ipc::WireState::Active | crate::guardian_ipc::WireState::Reconciling
+    ) && snapshot.attempt == issue.key().attempt_id().get()
+        && snapshot.session.instance == snapshot.instance
+        && snapshot.session.generation >= issue.session_generation().get()
+        && native.attempt == snapshot.attempt
+        && native.deadline == snapshot.deadline
+        && native.nonce == guardian.nonce.bytes()
+        && native.guardian == guardian.process.into()
+        && native.slots.len() == 1
+        && native.slots[0].identity == issue.target().into()
+}
+
+fn identity_observation_completion(
+    completion: crate::guardian_ipc::WireCompletion,
+    target: crate::ProcessIdentity,
+) -> Result<crate::IdentityObservation, ClientError> {
+    use crate::guardian_ipc::{
+        WireCompletion, WireIdentityObservation as W, WireObservationFailure as F,
+    };
+    let WireCompletion::ObserveIdentity {
+        identity,
+        observation,
+    } = completion
+    else {
+        return Err(ClientError::UnexpectedResponse);
+    };
+    if identity != target.into() {
+        return Err(ClientError::UnexpectedResponse);
+    }
+    let decoded = match observation {
+        W::SameIdentity { current_parent } => crate::IdentityObservation::SameIdentity {
+            current_parent: current_parent
+                .map(std::convert::TryInto::try_into)
+                .transpose()
+                .map_err(|_| ClientError::UnexpectedResponse)?,
+        },
+        W::ExactIdentityAbsent => crate::IdentityObservation::ExactIdentityAbsent,
+        W::PidReused(replacement) => {
+            let replacement: crate::ProcessIdentity = replacement
+                .try_into()
+                .map_err(|_| ClientError::UnexpectedResponse)?;
+            if replacement.pid() != target.pid() || replacement == target {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            crate::IdentityObservation::PidReused(replacement)
+        }
+        W::Unresolved(failure) => crate::IdentityObservation::Unresolved(match failure {
+            F::NoSuchProcess => crate::ObservationFailure::NoSuchProcess,
+            F::PermissionDenied => crate::ObservationFailure::PermissionDenied,
+            F::TemporarilyUnavailable => crate::ObservationFailure::TemporarilyUnavailable,
+            F::Malformed => crate::ObservationFailure::Malformed,
+        }),
+    };
+    Ok(decoded)
 }
 
 fn child_list_snapshot_matches(
@@ -1059,6 +1207,176 @@ impl GuardianClient {
                 }
             }
         }
+    }
+
+    /// Submit a policy-issued exact-root identity observation, retaining the ticket only on known nonexecution.
+    /// # Errors
+    /// Ambiguous post-submit outcomes consume the dispatch and require reconciliation.
+    pub fn dispatch_native_identity_observation(
+        &mut self,
+        ticket: crate::DispatchTicket,
+        issue: crate::NativeIdentityObservationIssue,
+    ) -> Result<crate::NativeIdentityObservationDispatch, NativeIdentityObservationDispatchError>
+    {
+        let prepared = (|| {
+            if ticket.key() != issue.key()
+                || !matches!(ticket.effect(), crate::OsEffect::ObserveIdentity { identity } if *identity == issue.target())
+                || self.verified_snapshot.is_none()
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let snapshot = self.snapshot()?;
+            if !identity_observation_snapshot_matches(&snapshot, issue)
+                || !crate::MonotonicTick::native_now()
+                    .is_ok_and(|now| now.get() < snapshot.deadline)
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let key = crate::guardian_ipc::WireKey::try_from(issue.key())
+                .map_err(ClientError::Refused)?;
+            let Response::Admitted { admission } =
+                self.exchange(&Request::NativeIdentityObservationAdmit {
+                    session: snapshot.session,
+                    key,
+                })?
+            else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+            let now = crate::MonotonicTick::native_now().map_err(ClientError::Io)?;
+            if now.get() >= snapshot.deadline {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            Ok((snapshot.session, key, admission, now))
+        })();
+        let (session, key, admission, now) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.stream.take();
+                self.verified_snapshot = None;
+                return Err(NativeIdentityObservationDispatchError::KnownUnsubmitted {
+                    error,
+                    unsubmitted: Box::new(UnsubmittedNativeIdentityObservation { ticket, issue }),
+                });
+            }
+        };
+        let result = self.exchange_with_slice(
+            &Request::NativeIdentityObservationSubmit {
+                session,
+                admission,
+                now: now.get(),
+            },
+            EFFECT_RESPONSE_SLICE,
+        );
+        match result {
+            Ok(Response::Submitted { key: returned }) if returned == key => {
+                Ok(crate::NativeIdentityObservationDispatch::new(ticket, issue))
+            }
+            result => {
+                let error = result.err().unwrap_or(ClientError::UnexpectedResponse);
+                self.stream.take();
+                self.verified_snapshot = None;
+                if child_list_submit_refusal_is_unsubmitted(&error) {
+                    Err(NativeIdentityObservationDispatchError::KnownUnsubmitted {
+                        error,
+                        unsubmitted: Box::new(UnsubmittedNativeIdentityObservation {
+                            ticket,
+                            issue,
+                        }),
+                    })
+                } else {
+                    Err(NativeIdentityObservationDispatchError::SubmissionUnknown(
+                        error,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Verify the retained completion against exact key, target identity and outcome shape.
+    /// # Errors
+    /// Refuses stale or mismatched guardian evidence or an unrelated retained completion.
+    pub fn observe_native_identity_observation(
+        &mut self,
+        dispatch: crate::NativeIdentityObservationDispatch,
+    ) -> Result<crate::VerifiedNativeIdentityObservationCompletion, ClientError> {
+        let issue = dispatch.issue();
+        if self.verified_snapshot.is_none() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        if !identity_observation_snapshot_matches(&snapshot, issue) {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let Response::Retained(Some(retained)) =
+            self.exchange(&Request::ObserveNativeIdentityObservation {
+                session: snapshot.session,
+                key,
+            })?
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if retained.key != key {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let observation = identity_observation_completion(retained.completion, issue.target())?;
+        Ok(crate::VerifiedNativeIdentityObservationCompletion::new(
+            dispatch,
+            observation,
+        ))
+    }
+
+    /// Confirm an ACK only after the exact durable application and correlated guardian receipt.
+    /// # Errors
+    /// Rejects stale evidence, an unmatched ACK receipt, or transport failure.
+    pub fn ack_native_identity_observation(
+        &mut self,
+        status: &crate::NativeIdentityObservationStatus,
+    ) -> Result<crate::VerifiedNativeIdentityObservationAckConfirmation, ClientError> {
+        let &crate::NativeIdentityObservationStatus::AppliedPendingAck {
+            issue,
+            observation,
+            applying_revision,
+        } = status
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if self.verified_snapshot.is_none() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        if !identity_observation_ack_snapshot_matches(&snapshot, issue)
+            || !crate::MonotonicTick::native_now().is_ok_and(|now| now.get() < snapshot.deadline)
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let Response::Acked {
+            key: returned,
+            applied_revision: returned_revision,
+        } = self.exchange(&Request::AckNativeIdentityObservationAfterApplied {
+            session: snapshot.session,
+            key,
+            applied_revision: applying_revision.get(),
+        })?
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if returned != key || returned_revision != applying_revision.get() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let generation = std::num::NonZeroU64::new(snapshot.session.generation)
+            .ok_or(ClientError::UnexpectedResponse)?;
+        Ok(
+            crate::VerifiedNativeIdentityObservationAckConfirmation::new(
+                issue,
+                observation,
+                applying_revision,
+                generation,
+            ),
+        )
     }
 
     /// Consumes and submits an exact durable root child-list issue.
@@ -1784,6 +2102,45 @@ pub fn recover_native_sampling_ack(
         .map_err(NativeSamplingAckRecoveryError::Store)
 }
 
+/// Applied native identity-observation ACK recovery; no dispatch authority is recreated.
+#[derive(Debug)]
+pub enum NativeIdentityObservationAckRecoveryError {
+    Store(crate::ControllerStoreError),
+    Guardian(ClientError),
+    NoPendingApplication,
+}
+
+/// # Errors
+/// Refuses absent or unapplied evidence, guardian mismatch or store failure.
+pub fn recover_native_identity_observation_ack(
+    store: &mut crate::ControllerSqliteStore,
+    client: &mut GuardianClient,
+    key: crate::DispatchKey,
+) -> Result<crate::NativeIdentityObservationStatus, NativeIdentityObservationAckRecoveryError> {
+    let (_, _, status) = store
+        .read_native_identity_observation_evidence(key)
+        .map_err(NativeIdentityObservationAckRecoveryError::Store)?
+        .ok_or(NativeIdentityObservationAckRecoveryError::NoPendingApplication)?;
+    if matches!(
+        status,
+        crate::NativeIdentityObservationStatus::AckConfirmed { .. }
+    ) {
+        return Ok(status);
+    }
+    if !matches!(
+        status,
+        crate::NativeIdentityObservationStatus::AppliedPendingAck { .. }
+    ) {
+        return Err(NativeIdentityObservationAckRecoveryError::NoPendingApplication);
+    }
+    let proof = client
+        .ack_native_identity_observation(&status)
+        .map_err(NativeIdentityObservationAckRecoveryError::Guardian)?;
+    store
+        .confirm_native_identity_observation_ack(proof)
+        .map_err(NativeIdentityObservationAckRecoveryError::Store)
+}
+
 /// Diagnostic child-list recovery ACK; it never recreates a ticket or policy loop.
 #[derive(Debug)]
 pub enum NativeChildListAckRecoveryError {
@@ -2054,6 +2411,54 @@ mod native_sampling_snapshot_tests {
             ProcessId::new(NonZeroU32::new(pid).unwrap()),
             BirthToken::new(12, 3).unwrap(),
         )
+    }
+
+    #[test]
+    fn identity_completion_rejects_wrong_target_and_reused_birth() {
+        use crate::guardian_ipc::{WireCompletion, WireIdentityObservation};
+        let target = process(80);
+        let wrong = process(81);
+        assert!(matches!(
+            identity_observation_completion(
+                WireCompletion::ObserveIdentity {
+                    identity: wrong.into(),
+                    observation: WireIdentityObservation::ExactIdentityAbsent,
+                },
+                target,
+            ),
+            Err(ClientError::UnexpectedResponse)
+        ));
+        assert!(matches!(
+            identity_observation_completion(
+                WireCompletion::ObserveIdentity {
+                    identity: target.into(),
+                    observation: WireIdentityObservation::PidReused(target.into()),
+                },
+                target,
+            ),
+            Err(ClientError::UnexpectedResponse)
+        ));
+        assert!(matches!(
+            identity_observation_completion(
+                WireCompletion::ListChildren {
+                    parent: target.into(),
+                    result: Ok(vec![])
+                },
+                target,
+            ),
+            Err(ClientError::UnexpectedResponse)
+        ));
+        assert_eq!(
+            identity_observation_completion(
+                WireCompletion::ObserveIdentity {
+                    identity: target.into(),
+                    observation: WireIdentityObservation::ExactIdentityAbsent,
+                },
+                target,
+            )
+            .unwrap(),
+            crate::IdentityObservation::ExactIdentityAbsent
+        );
     }
 
     fn issue_and_snapshot() -> (crate::NativeSamplingIssue, WireSnapshot) {

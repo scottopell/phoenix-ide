@@ -352,22 +352,73 @@ impl crate::GuardianExecutor for MacOsGuardianExecutor {
         ticket: crate::DispatchTicket,
         slots: &mut std::collections::BTreeMap<crate::ChildSlotId, SupervisedChild>,
     ) -> crate::ExecutedEffect {
-        if let crate::OsEffect::SignalExactIdentity { identity, signal } = ticket.effect() {
-            let (identity, signal) = (*identity, *signal);
-            let outcome = match slots.values_mut().find(|slot| slot.identity() == identity) {
-                Some(slot) => slot.signal_group(signal),
-                None => SignalOutcome::TemporarilyUnavailable,
-            };
-            crate::ExecutedEffect::from_parts(
-                ticket.key(),
-                crate::EffectCompletion::SignalExactIdentity {
-                    identity,
-                    signal,
-                    outcome,
-                },
-            )
-        } else {
-            crate::EffectExecutor::new(&mut self.os).execute(ticket)
+        match ticket.effect() {
+            crate::OsEffect::SignalExactIdentity { identity, signal } => {
+                let (identity, signal) = (*identity, *signal);
+                let outcome = match slots.values_mut().find(|slot| slot.identity() == identity) {
+                    Some(slot) => slot.signal_group(signal),
+                    None => SignalOutcome::TemporarilyUnavailable,
+                };
+                crate::ExecutedEffect::from_parts(
+                    ticket.key(),
+                    crate::EffectCompletion::SignalExactIdentity {
+                        identity,
+                        signal,
+                        outcome,
+                    },
+                )
+            }
+            crate::OsEffect::ObserveIdentity { identity } => {
+                let identity = *identity;
+                let observation = match slots.values_mut().find(|slot| slot.identity() == identity)
+                {
+                    Some(slot) => {
+                        let liveness = MacOsControllerOs::observe_supervised_slot(identity);
+                        let observed = self.os.observe_identity(identity);
+                        match (&observed, liveness) {
+                            (
+                                IdentityObservation::SameIdentity { .. },
+                                crate::ChildSlotObservation::Running,
+                            ) => observed,
+                            (IdentityObservation::Unresolved(_), _) => observed,
+                            (_, crate::ChildSlotObservation::Unavailable) => {
+                                IdentityObservation::Unresolved(
+                                    ObservationFailure::TemporarilyUnavailable,
+                                )
+                            }
+                            (
+                                IdentityObservation::SameIdentity { .. }
+                                | IdentityObservation::ExactIdentityAbsent
+                                | IdentityObservation::PidReused(_),
+                                crate::ChildSlotObservation::Running
+                                | crate::ChildSlotObservation::Exited,
+                            ) => match slot.try_finalize() {
+                                Ok(Some(_)) => self.os.observe_identity(identity),
+                                Ok(None) => IdentityObservation::Unresolved(
+                                    ObservationFailure::TemporarilyUnavailable,
+                                ),
+                                Err(error) => {
+                                    IdentityObservation::Unresolved(observation_error(error))
+                                }
+                            },
+                        }
+                    }
+                    None => self.os.observe_identity(identity),
+                };
+                crate::ExecutedEffect::from_parts(
+                    ticket.key(),
+                    crate::EffectCompletion::ObserveIdentity {
+                        identity,
+                        observation,
+                    },
+                )
+            }
+            crate::OsEffect::SampleResources { .. }
+            | crate::OsEffect::ListChildren { .. }
+            | crate::OsEffect::AcquireChildIdentity { .. }
+            | crate::OsEffect::ReverifyRetainedCandidate { .. } => {
+                crate::EffectExecutor::new(&mut self.os).execute(ticket)
+            }
         }
     }
 
