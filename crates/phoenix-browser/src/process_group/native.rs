@@ -165,9 +165,15 @@ impl OwnedChromeGroup {
         let mut killed = false;
         loop {
             let observation = self.observe_root(child)?;
-            if observation.permits_completion() && !group_has_live_members(self.root.pid)? {
-                self.drained = true;
-                return Ok(());
+            if observation.permits_completion() {
+                let live_members = group_has_live_members(self.root.pid).inspect_err(|_error| {
+                    #[cfg(target_os = "macos")]
+                    eprintln!("owned_chrome_group_enumeration child={:?} root={:?} observation={observation:?} error={_error} {}", child.id(), self.root, self.darwin_wait_diagnostic());
+                })?;
+                if !live_members {
+                    self.drained = true;
+                    return Ok(());
+                }
             }
             let now = Instant::now();
             if now >= deadline {
@@ -239,7 +245,10 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
     // PROC_PGRP_ONLY = 2, as defined by libproc.h.
     let size = unsafe { libc::proc_listpids(2, group, std::ptr::null_mut(), 0) };
     if size <= 0 {
-        return Err(io::Error::other("could not size Chrome process group"));
+        return Err(io::Error::other(format!(
+            "could not size Chrome process group: group={group} size={size} errno={:?}",
+            io::Error::last_os_error()
+        )));
     }
     let mut pids = vec![
         0 as libc::pid_t;
@@ -251,9 +260,9 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
         .map_err(io::Error::other)?;
     let count = unsafe { libc::proc_listpids(2, group, pids.as_mut_ptr().cast(), bytes) };
     if count <= 0 || count >= bytes {
-        return Err(io::Error::other(
-            "could not enumerate complete Chrome process group",
-        ));
+        return Err(io::Error::other(format!(
+            "could not enumerate complete Chrome process group: group={group} size={size} capacity_bytes={bytes} returned_bytes={count} errno={:?}", io::Error::last_os_error(),
+        )));
     }
     for pid in pids.into_iter().take(
         usize::try_from(count).map_err(io::Error::other)? / std::mem::size_of::<libc::pid_t>(),
@@ -373,7 +382,7 @@ exit 0
                 match group.observe_root(&mut root) {
                     Ok(RootObservation::Exited) => break,
                     Ok(RootObservation::Live | RootObservation::ExitPending) => {
-                        tokio::task::yield_now().await
+                        tokio::task::yield_now().await;
                     }
                     Err(error) => {
                         #[cfg(target_os = "macos")]

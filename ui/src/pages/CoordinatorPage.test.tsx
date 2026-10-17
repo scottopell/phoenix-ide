@@ -282,7 +282,7 @@ describe('CoordinatorPage', () => {
     </Routes></MemoryRouter>);
     await screen.findByText('Shared conversation runtime /global');
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
-    expect(screen.getByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+    expect(await screen.findByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
   });
 
   it('retains the same acquired-history owner while a different valid source pin is validated', async () => {
