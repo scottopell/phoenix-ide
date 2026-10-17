@@ -234,7 +234,7 @@ const StreamingCode = memo(function StreamingCode({ content, lang, complete }: {
 }) {
   const { theme } = useTheme();
   if (!complete) return <pre className="streaming-code-pre"><code className="streaming-code">{content}</code></pre>;
-  if (lang?.toLowerCase() === 'mermaid') return <pre><MemoMermaid code={content} /></pre>;
+  if (lang?.toLowerCase() === 'mermaid') return <MemoMermaid code={content} />;
   if (!lang) {
     const children = content ? `${content}\n` : '';
     return <pre><code data-token-kind={inlineCodeTokenKind(children)}>{children}</code></pre>;

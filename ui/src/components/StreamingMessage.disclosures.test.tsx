@@ -132,10 +132,10 @@ it('keeps code and Mermaid memoized within the coupled suffix while footnote pro
   expect(renders.code).toHaveBeenCalledTimes(1);
   expect(renders.mermaid).toHaveBeenCalledTimes(1);
   view.rerender(stream(prefix + 'note grows')); frame();
-  expect(view.container.querySelectorAll('pre')).toHaveLength(2);
+  expect(view.container.querySelectorAll('pre')).toHaveLength(1);
   expect(view.container.querySelector('pre pre')).toBeNull();
   expect(view.container.querySelector('[data-highlighted]')?.parentElement?.tagName).toBe('PRE');
-  expect(view.container.querySelector('[data-mermaid]')?.parentElement?.tagName).toBe('PRE');
+  expect(view.container.querySelector('[data-mermaid]')?.closest('pre')).toBeNull();
   expect(renders.code).toHaveBeenCalledTimes(1);
   expect(renders.mermaid).toHaveBeenCalledTimes(1);
 });
@@ -171,7 +171,7 @@ it('does not rehighlight completed standalone code while the prose tail grows', 
   expect(renders.code).toHaveBeenCalledExactlyOnceWith('stable');
 });
 
-it.each(['text', 'mermaid', ''])('owns one shell for standalone and coupled completed %j fences', (lang) => {
+it.each(['text', 'mermaid', ''])('keeps ordinary code shells separate from diagram ownership for %j fences', (lang) => {
   const value = lang === 'mermaid' ? 'graph TD; A-->B' : 'plain text';
   for (const prefix of ['', 'Ref[^n]\n\n[^n]: Note\n\n']) {
     const open = `${prefix}\`\`\`${lang}\n${value}`;
@@ -179,12 +179,21 @@ it.each(['text', 'mermaid', ''])('owns one shell for standalone and coupled comp
     expect(view.container.querySelectorAll('pre')).toHaveLength(1);
     expect(view.container.querySelector('pre > code.streaming-code')?.textContent).toBe(value);
     view.rerender(stream(`${open}\n\`\`\``)); frame();
-    expect(view.container.querySelectorAll('pre')).toHaveLength(1);
+    expect(view.container.querySelectorAll('pre')).toHaveLength(lang === 'mermaid' ? 0 : 1);
     expect(view.container.querySelector('pre pre')).toBeNull();
     expect(view.container.querySelector('.streaming-code')).toBeNull();
-    expect(view.container.querySelector('pre > code')?.textContent).toBe(value + (lang ? '' : '\n'));
+    expect(view.container.querySelector(lang === 'mermaid' ? '[data-mermaid]' : 'pre > code')?.textContent).toBe(value + (lang ? '' : '\n'));
     view.unmount();
   }
+});
+
+it.each([
+  { body: '', rendered: '' },
+  { body: 'one\n\n', rendered: 'one\n\n' },
+])('preserves native unlabelled fence whitespace: $body', ({ body, rendered }) => {
+  const view = render(stream(`\`\`\`\n${body}\`\`\``)); frame();
+  expect(view.container.querySelector('pre > code')?.textContent).toBe(rendered);
+  expect(renders.code).not.toHaveBeenCalled();
 });
 
 const nestedFences = [
@@ -210,12 +219,12 @@ for (const { name, prefix, before, after } of nestedFences) {
     const closed = `${code}\n${prefix}\`\`\`${after}`;
     view.rerender(stream(closed)); frame();
     expect(view.container.querySelector('.streaming-code')).toBeNull();
-    expect(view.container.querySelectorAll('pre')).toHaveLength(1);
+    expect(view.container.querySelectorAll('pre')).toHaveLength(lang === 'mermaid' ? 0 : 1);
     expect(view.container.querySelector('pre pre')).toBeNull();
     const expensive = lang === 'mermaid' ? renders.mermaid : renders.code;
     if (lang) {
       expect(expensive).toHaveBeenCalledExactlyOnceWith(value);
-      expect(view.container.querySelector('pre > code')).not.toBeNull();
+      expect(view.container.querySelector(lang === 'mermaid' ? '[data-mermaid]' : 'pre > code')).not.toBeNull();
     } else {
       expect(expensive).not.toHaveBeenCalled();
       expect(view.container.querySelector('pre > code')?.textContent).toBe(value + '\n');

@@ -280,7 +280,7 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
           pnpm exec playwright install --with-deps chromium
-      - name: Qualify exact source and reproduce pre-fix geometry
+      - name: Qualify exact-source geometry and reader ownership
         env:
           LADLE_URL: http://127.0.0.1:61129
           PHOENIX_LADLE: '1'
@@ -300,21 +300,7 @@ jobs:
             done
             return 1
           }
-          trap 'stop_server; git -C "$GITHUB_WORKSPACE" restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx ui/src/index.css' EXIT
-          # Causal controls restore only the named pre-fix seams, not a shipped build.
-          baseline=4894426888d175d4fd65095647bede65bb09718e
-          git restore --source="$baseline" -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx
-          echo "$baseline (renderer control)" > ui/qa-artifacts/assistant-finalization/baseline-source.txt
-          start_server
-          (cd ui && FINALIZATION_QA_BASELINE=1 node scripts/capture-assistant-finalization.mjs)
-          stop_server
-          git restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx
-          git restore --source="$baseline" -- ui/src/index.css
-          start_server
-          (cd ui && STREAMING_TABLE_QA_BASELINE=1 node scripts/capture-streaming-table.mjs)
-          stop_server
-          git restore --source=HEAD -- ui/src/index.css
-          git diff --exit-code -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx ui/src/index.css
+          trap stop_server EXIT
           sha256sum ui/src/index.css ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx > ui/qa-artifacts/assistant-finalization/source-files.sha256
           start_server
           cd ui
