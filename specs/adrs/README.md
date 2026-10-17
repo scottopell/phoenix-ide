@@ -132,6 +132,8 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [113](113_coordinator-api-recipes-are-non-exhaustive.md) | Coordinator API recipes are non-exhaustive | Accepted | REQ-GR-007, REQ-AUQ-009; Phoenix API guidance |
 | [114](114_admit-exact-target-ledger-for-prepared-current-schema-activation.md) | Admit the exact target ledger for prepared current-schema activation | Accepted; partially supersedes ADR-105's prepared-source restriction | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
 | [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
+| [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
+| [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
 
 ## For agents: which decisions bind your task
 
@@ -186,6 +188,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying post-tool direct-turn restart recovery or bounded owed-baton settlement | 074, then 024, 020, 014 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
+| Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -219,6 +222,8 @@ ADR-000 (adopt spEARS v2 for new work)
       │   └── ADR-092 (Federation pins imported private-CA trust per peer)
       │       └── ADR-093 (Federation validates CA capability and types IPv6 persistence)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
+      │   ├── ADR-116 (Protect exact 65-to-128 systemd published-release activation; independent exact-release exception)
+      │   │   └── ADR-117 (Recover interrupted pre-marker systemd activation; retained predecessor only, no launchd impact)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
       │   ├── ADR-102 (Current-schema prepared activation commits at the database-write boundary)
       │   │   └── ADR-103 (Ordinary forward candidate launch is the downgrade boundary)
