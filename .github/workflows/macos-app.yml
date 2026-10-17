@@ -165,14 +165,21 @@ jobs:
           output="$RUNNER_TEMP/observation-qualification/candidate"
           mkdir -p "$output/bin"
           git rev-parse HEAD HEAD^{tree} > "$output/qualifier-source.txt"
-          candidate=f9477018529420b462c896d83c115dbc318d8ef9
+          candidate=90c99a371df41f91fb67e3b1db459d91d9d99698
+          observer_base=f9477018529420b462c896d83c115dbc318d8ef9
+          sql_product_base=250f3d56b13875caa3c927d453ecb70db406803f
+          sql_upstream=f16afb227d9336a863c0b0345960ea9a6d62b7c7
+          ui_backport=e34ff8b85148bdb79f8c4164c5a7b067c930421a
+          ui_backport_base=963307eb834fee0568fb8f991164d842d0ec68c2
+          git fetch origin "$observer_base" "$sql_product_base" "$sql_upstream" "$ui_backport" "$ui_backport_base"
           attribution_base=2702d8389c2fc78ac2e528c876c35a1a7040d692
           base=f3893088b3cb224be9403f600173d5216e3a2f6b
           product=9ee218d4a33ebd4b94ea547d60caa62134edb960
           git fetch origin "$candidate" "$attribution_base" "$base" "$product"
           git checkout --detach "$candidate"
           test "$(git rev-parse HEAD)" = "$candidate"
-          test "$(git rev-parse HEAD^{tree})" = 3d8fd0d023adf90f51efd26e91e6e28d755fb5d7
+          test "$(git rev-parse HEAD^{tree})" = 83a81780e32498f907d492ec1d13b11085d3e626
+          git rev-parse "$observer_base" "$observer_base^{tree}" "$sql_product_base" "$sql_product_base^{tree}" "$sql_upstream" "$sql_upstream^{tree}" "$ui_backport" "$ui_backport_base" > "$output/sql-parity-authorities.txt"
           git rev-parse HEAD HEAD^{tree} > "$output/source.txt"
           git rev-parse "$base" "$base^{tree}" "$product" "$product^{tree}" "$attribution_base" "$attribution_base^{tree}" > "$output/parity-authorities.txt"
           cp docs/conversation-observation-source-parity.json docs/conversation-observation-composition.md docs/conversation-observation-attribution.md docs/conversation-observation-attribution.json "$output/"
@@ -296,6 +303,21 @@ jobs:
                   assert set(span)<={'name','request_id','route','status','response_ready','open.id','product.reference'}
           print('synthetic attribution event receipt: privacy, exact completion inventory and request ancestry passed',json.dumps(counts,sort_keys=True))
           PY
+      - name: Require three exact SQLx ceiling plan and full-row parity contracts
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/observation-qualification/candidate"
+          tests=(
+            product_conversation_read::tests::message_page_materializes_bound_snapshot_ceiling_once_with_result_parity
+            product_conversation_read::tests::message_page_query_enforces_transcript_first_indexed_join
+            product_conversation_read::tests::late_hydration_matches_full_row_oracle_matrix
+          )
+          for selector in "${tests[@]}"; do
+            log="$output/${selector##*::}.log"
+            cargo test -p phoenix-db --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
+          grep -E '^bound_snapshot_ceiling_sqlite_version=[0-9]+\.[0-9]+\.[0-9]+$' "$output/message_page_materializes_bound_snapshot_ceiling_once_with_result_parity.log" > "$output/sqlite-engine-version.txt"
       - name: Require focused current UI contracts and exact source parity
         working-directory: ui
         run: |
@@ -352,7 +374,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: current-task-observation-attribution-events-f947-portable
+          name: current-task-observation-attribution-f16-ceiling-90c99a37-portable
           path: ${{ runner.temp }}/observation-qualification/
           if-no-files-found: warn
           retention-days: 7
