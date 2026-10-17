@@ -178,7 +178,7 @@ jobs:
       - name: Admit exact causal source and preserved runtime qualification
         run: |
           set -o pipefail
-          git diff --exit-code 631d924fdc37e8a6162651f612a3452fa96f6c6e HEAD -- crates ui dev.py docs specs tests
+          git diff --exit-code f4d0f6c8c5a1f79332a25f4a82bc50e77435a612 HEAD -- crates ui dev.py docs specs tests
           mkdir -p "$RUNNER_TEMP/observation-qualification"
           printf '%s\n' 'Scoped successor to39045775405: runtime contracts, codegen136, UI and binary passed there; only unused db accessor failed Clippy.' 'Prior scoped39048649141 passed accessor Clippy and generated consumers. This successor proves portable-ui embedded HTML/entry JS and packages same-feature binary; no fixture/export qualification is claimed.' > "$RUNNER_TEMP/observation-qualification/scope.txt"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/observation-qualification/source.txt"
