@@ -1,4 +1,4 @@
-# ADR-115: Successful positioning settles geometry without retaining command capability
+# ADR-120: Successful positioning settles geometry without retaining command capability
 
 - **Status:** Accepted
 - **Date:** 2026-10-16

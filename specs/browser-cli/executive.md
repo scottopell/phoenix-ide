@@ -153,9 +153,11 @@ or full-acceptance guarantee is added.
 
 The source freshness check found main advanced from `489442688` to
 `ea5df4b473ebd62ee8edd59daad9e43a119e9630` (published schema-114 launchd activation).
-That deployment/harness/spec delta is not included in this scoped browser source
-packet; the integration owner must compose it and refresh base/source/tree pins
-before claiming current-main qualification.
+That deployment/harness/spec delta is composed in this source packet, with no
+Rust, Cargo, or UI byte changes from the scoped `06c7512b1` proof. The published
+activation ADR retains main's ID 115; the donor geometry ADR is remapped to 120.
+Integration must refresh base/source/tree pins before whole-head qualification;
+the scoped native proof is not relabelled as qualification of the merged main.
 
 ## Verification
 
