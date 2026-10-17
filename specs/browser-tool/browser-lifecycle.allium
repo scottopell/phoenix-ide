@@ -222,7 +222,7 @@ rule SessionCreatedOnFirstGet {
 }
 
 rule InitializationBecomesReady {
-    when: BrowserInitializationSucceeded(session, chrome: ChromeProcess)
+    when: BrowserInitializationSucceeded(session, chrome)
     requires: session.status = uninitialized
     ensures: session.status = live
     ensures: session.chrome = chrome
@@ -239,7 +239,7 @@ rule InitializationFailsBeforeSpawn {
 }
 
 rule InitializationFailsWithRetainedBrowser {
-    when: BrowserPartialInitializationFailed(session, chrome: ChromeProcess)
+    when: BrowserPartialInitializationFailed(session, chrome)
     requires: session.status = uninitialized
     ensures: session.status = teardown_failed
     ensures: session.chrome = chrome

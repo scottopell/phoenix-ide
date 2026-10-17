@@ -12,7 +12,6 @@ use launch_slot::{LaunchSlot, ProfilePolicy};
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
     cdp::js_protocol::runtime::{ConsoleApiCalledType, RemoteObject},
-    fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
     Page,
 };
 use futures::StreamExt;
@@ -662,7 +661,6 @@ pub struct BrowserSession {
     pub(crate) reference_input_lock: Arc<tokio::sync::Mutex<()>>,
     #[allow(dead_code)] // Browser must stay alive
     browser: Browser,
-    chrome_pid: Option<u32>,
     chrome_process: Option<ProcessIdentity>,
     launch_identity: BrowserLaunchIdentity,
     #[allow(dead_code)] // Task must stay alive
