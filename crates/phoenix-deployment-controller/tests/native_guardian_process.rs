@@ -450,19 +450,18 @@ fn assert_runner_output_ends_at(output: &str, marker: &str) {
 fn settle_initial_sample_with_replacement_ack(
     socket_dir: &Path,
     path: &Path,
+    deadline: MonotonicTick,
     root: ProcessIdentity,
 ) -> WireSnapshot {
-    let mut initial = GuardedRunner::spawn(sampling_runner_command_with_root(
-        socket_dir, path, root, true,
-    ));
-    assert!(initial
-        .line()
-        .starts_with("verified binding: InitialActive"));
-    assert!(initial.line().starts_with("released child "));
-    assert!(initial.line().starts_with("native_sample_retained key="));
-    assert!(initial
-        .line()
-        .starts_with("application_committed_pending_ack revision="));
+    let mut command = sampling_runner_command_with_root(socket_dir, path, deadline, root, true);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut initial = GuardedRunner::new(child);
+    assert!(line(&mut output).starts_with("verified binding: InitialActive"));
+    assert!(line(&mut output).starts_with("released child "));
+    assert!(line(&mut output).starts_with("native_sample_retained key="));
+    assert!(line(&mut output).starts_with("application_committed_pending_ack revision="));
     wait_for_process_name(i32::try_from(root.pid().get()).unwrap(), "sleep");
     initial.finish();
     assert_eq!(wait_for_detached(socket_dir).retained.len(), 1);
@@ -506,11 +505,11 @@ fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
         dir,
         path,
         attempt,
-        deadline: _,
+        deadline,
         root,
         mut guardian,
     } = start_child_list_fixture();
-    let initial_detached = settle_initial_sample_with_replacement_ack(&dir, &path, root);
+    let initial_detached = settle_initial_sample_with_replacement_ack(&dir, &path, deadline, root);
     let initial_sampling = sampling_rows(&path);
     assert_eq!(
         (initial_sampling.0, initial_sampling.1, initial_sampling.2),
@@ -582,11 +581,11 @@ fn child_list_ack_recovery_does_not_reenumerate_or_reapply_after_runner_crash() 
         dir,
         path,
         attempt,
-        deadline: _,
+        deadline,
         root,
         mut guardian,
     } = start_child_list_fixture();
-    let initial_detached = settle_initial_sample_with_replacement_ack(&dir, &path, root);
+    let _initial_detached = settle_initial_sample_with_replacement_ack(&dir, &path, deadline, root);
     let initial_sampling = sampling_rows(&path);
     assert_eq!(
         (initial_sampling.0, initial_sampling.1, initial_sampling.2),
