@@ -2455,3 +2455,23 @@ The observed f542 continuity writer remains actual failed-artifact evidence; the
 new lifecycle regression is source evidence, not direct observation of the old
 parent authority. Actual newly pinned strict containment and exact-six collector/
 export/drain remain required before any controlled acceptance claim.
+
+The first success-settlement artifact ran as `38982699457` at harnessd97c,
+terminal FAIL: witness `117246983254` passed ordinary strict physical acquisition,
+four-frame stability, exact persisted identity/fixture binding and source-pin
+checks, then failed NEXT at composer_owner. The retained physical diagnostics
+show observation=true, fixture_identity=true, sourcepin=true and exact target
+fully visible. This execution clears the prior ordinary physical gate only;
+zero scenarios complete and Global/departure/collector/export/final-drain claims
+remain unproved. Rust `117247051296` and all standard jobs succeeded. Artifact
+`12082485923` is96,385,215B; selected bounded reads74,610B retained failure/log.
+
+The next failure is a source-proven harness selector mismatch: controlled capture
+hardcodes textarea placeholder Message..., while actual InputArea uses dynamic
+mode/state/hint placeholder text and stable textarea#message-input. The narrow
+shared correction imports existing COMPOSER_SELECTOR from the realserver qualifier,
+retaining exactly-one and editable assertions. The imported module has a guarded
+CLI and no browser startup on import. Controlled23 tests pass including placeholder
+rejection and missing/readonly negatives; independent narrow review approved one
+causal harness successor. No app pin/product/oracle/physical/timing rule changed.
+Unit selector correction is not actual successor acceptance.

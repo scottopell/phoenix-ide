@@ -94,7 +94,10 @@ function fakeRuntime(options={}){
       return {observation:missing?null:{...arg.known[0],key:'UNIT-virtual',offset:0,messageOffset:0,currentURL:this.location,
         sourcepin:options.wrongSourcepin?'UNIT-foreign':arg.known[0].sourceRow},predicates:missing?{known_target_row_clipped:1}:{}};
     }
-    locator(selector){return {count:async()=>1,isEditable:async()=>true,waitFor:async()=>{},isEnabled:async()=>true,evaluate:async()=> 'BUTTON',click:async()=>{this.location='http://127.0.0.1:12345/';this.report('canceled');}};}
+    locator(selector){
+      assert.ok(!selector.includes('placeholder'), 'composer identity cannot depend on dynamic presentation text');
+      if(selector.startsWith('textarea'))assert.equal(selector,'textarea#message-input');
+      return {count:async()=>options.missingComposer?0:1,isEditable:async()=>!options.readonlyComposer,waitFor:async()=>{},isEnabled:async()=>true,evaluate:async()=> 'BUTTON',click:async()=>{this.location='http://127.0.0.1:12345/';this.report('canceled');}};}
     async waitForURL(){}
   }
   const contextOptions=[];
@@ -252,5 +255,14 @@ test('UNIT physical settlement is bounded and cannot accept permanent clipping o
     let reads=0;
     await assert.rejects(settleControlledHistoricalTarget({read:async()=>++reads===1?first:{...first,...change},nextFrame:async()=>{},check:()=>{}}),/four frames/);
     assert.equal(reads,2);
+  }
+});
+
+test('UNIT dynamic-placeholder-independent composer still requires exactly one editable canonical input',async()=>{
+  for(const options of [{missingComposer:true},{readonlyComposer:true}]){
+    const runtime=fakeRuntime(options);let error;
+    try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(e){error=e;}
+    assert.ok(error);assert.equal(error.controlledReceipt.failure_location.phase,'composer_owner');
+    assert.equal(runtime.getClosed(),1);
   }
 });

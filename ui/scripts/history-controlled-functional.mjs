@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { observePhysicalHistoricalRow, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
+import { COMPOSER_SELECTOR } from './qualify-history-realserver.mjs';
 import { installHistoryRequestOwnership, installObservedHistoryTelemetry, authenticateOwnedContext } from './history-joint-telemetry.mjs';
 
 export const CONTROLLED_CLASS = 'controlled_functional';
@@ -218,8 +219,8 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
               },
             }), 5000);
             phase = 'composer_owner';
-            assert.equal(await page.locator('textarea[placeholder="Message..."]').count(), 1, 'exactly one current composer');
-            assert.equal(await page.locator('textarea[placeholder="Message..."]').isEditable(), true, 'current composer is writable');
+            assert.equal(await page.locator(COMPOSER_SELECTOR).count(), 1, 'exactly one current composer');
+            assert.equal(await page.locator(COMPOSER_SELECTOR).isEditable(), true, 'current composer is writable');
             assert.equal(page.url(), new URL(target.route, baseURL).href, 'original retained route cannot be replaced');
             phase = 'report_collect';
             const trial = await collect();
