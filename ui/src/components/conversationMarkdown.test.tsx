@@ -26,6 +26,26 @@ function renderAnchor(href: string, onFileClick?: (path: string) => void) {
 }
 
 describe('ConversationMarkdownAnchor', () => {
+  it.each(['@conv:javascript:alert(1)', '@conv:../private', '@conv:58cff20d-81c3-4655-b9d8-61fe615bda28/extra', 'javascript:alert(1)'])('does not promote unsafe or malformed typed href %s', (href) => {
+    render(<MemoryRouter><ReactMarkdown components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{`[unsafe](${href})`}</ReactMarkdown></MemoryRouter>);
+    expect(document.querySelector('a[href^="/c/"]')).toBeNull();
+  });
+
+  it('routes the actual typed conversation citation through the Markdown sanitizer and router', () => {
+    render(<MemoryRouter initialEntries={['/global/coordinator']}>
+      <ReactMarkdown components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+        {'[UI testing conversation](@conv:58cff20d-81c3-4655-b9d8-61fe615bda28)'}
+      </ReactMarkdown>
+      <CurrentLocation />
+    </MemoryRouter>);
+    const link = screen.getByRole('link', { name: 'UI testing conversation' });
+    expect(link).toHaveAttribute('href', '/c/58cff20d-81c3-4655-b9d8-61fe615bda28');
+    expect(link).not.toHaveAttribute('target');
+    fireEvent.click(link);
+    expect(screen.getByTestId('location')).toHaveTextContent('/c/58cff20d-81c3-4655-b9d8-61fe615bda28');
+    expect(screen.getByTestId('location-state')).toHaveTextContent('/global/coordinator');
+  });
+
   it.each(['/c/source#message-id', 'https://example.com/source'])('adds inline affordance without replacing caller props for %s', (href) => {
     const onClick = vi.fn((event: React.MouseEvent<HTMLAnchorElement>) => event.preventDefault());
     render(
