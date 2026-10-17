@@ -180,7 +180,7 @@ impl<'de> Deserialize<'de> for BuildIdentity {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum number of child PIDs accepted in one native root scan.
 pub const MAX_NATIVE_CHILDREN: usize = 4096;
@@ -692,6 +692,12 @@ pub enum Request {
         sequence: u64,
         issuing_session_generation: u64,
     },
+    VerifyRecoveredNativeChildList {
+        session: WireSession,
+        key: WireKey,
+        parent: WireIdentity,
+        issuing_session_generation: u64,
+    },
     AckAfterAppliedRevision {
         session: WireSession,
         key: WireKey,
@@ -765,6 +771,11 @@ pub enum Response {
         key: WireKey,
         sequence: u64,
         sample: WireResourceSample,
+    },
+    RecoveredNativeChildList {
+        key: WireKey,
+        parent: WireIdentity,
+        children: Vec<u32>,
     },
     Acked {
         key: WireKey,
@@ -971,6 +982,7 @@ pub struct GuardianServer<E: GuardianExecutor> {
     native_admissions: BTreeMap<u64, NativeSamplingAdmission>,
     native_child_list_admissions: BTreeMap<u64, NativeChildListAdmission>,
     native_retained_origins: Vec<(DispatchKey, u64, NonZeroU64)>,
+    native_child_list_retained_origins: Vec<(DispatchKey, ProcessIdentity, NonZeroU64)>,
     native_child_list_ack_receipts: Vec<(DispatchKey, Vec<ProcessId>, PersistenceRevision)>,
     next_admission: u64,
     native_unbound: bool,
@@ -1010,6 +1022,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             native_admissions: BTreeMap::new(),
             native_child_list_admissions: BTreeMap::new(),
             native_retained_origins: Vec::new(),
+            native_child_list_retained_origins: Vec::new(),
             native_child_list_ack_receipts: Vec::new(),
             next_admission: 1,
             native_unbound: false,
@@ -1278,6 +1291,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ObserveSlot { .. }
                     | Request::ObserveRetained { .. }
                     | Request::VerifyRecoveredNativeSampling { .. }
+                    | Request::VerifyRecoveredNativeChildList { .. }
                     | Request::Fence { .. }
                     | Request::BeginReconciliation { .. }
                     | Request::FinishReconciliation { .. }
@@ -1685,6 +1699,105 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         })
     }
 
+    fn verify_recovered_native_child_list(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        parent: WireIdentity,
+        issuing_session_generation: u64,
+    ) -> Result<Response, WireError> {
+        if !self.native_unbound {
+            return Err(WireError::UnsupportedDurableBinding);
+        }
+        self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        let parent: ProcessIdentity = parent.try_into()?;
+        let origin = NonZeroU64::new(issuing_session_generation).ok_or(WireError::InvalidValue)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .child_list_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeChildListStatus::IssuedPendingApplication { issue } = status else {
+            return Err(WireError::MissingProof);
+        };
+        let current = binding.current_session();
+        if live.state != WireState::Reconciling
+            || live.session != session
+            || live.session.instance != live.instance
+            || live.session.generation == 0
+            || live.attempt != key.attempt_id().get()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || checkpoint.attempt_id() != key.attempt_id()
+            || checkpoint.phase() != crate::Phase::Interrupted
+            || !checkpoint.interrupted_native_root_scan(parent)
+            || checkpoint.persistence_revision() != current.interruption_revision
+            || checkpoint.deadline() != binding.deadline()
+            || binding.attempt_id() != key.attempt_id()
+            || binding.dispatch_floor() != current.interruption_revision
+            || key.revision() >= current.interruption_revision
+            || current.state != crate::NativeSessionState::Reconciling
+            || current.generation.get() != session.generation
+            || origin >= current.generation
+            || !binding
+                .sessions()
+                .iter()
+                .any(|old| old.generation == origin)
+            || issue.key() != key
+            || issue.parent() != parent
+            || issue.session_generation() != origin
+            || issue.guardian_identity() != binding.identity()
+            || !self
+                .native_child_list_retained_origins
+                .contains(&(key, parent, origin))
+            || self.native_identity != Some(binding.identity())
+            || binding.deadline() != self.guardian.original_deadline()
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.guardian != WireIdentity::from(binding.identity().process)
+            || binding.slots().len() != 1
+            || binding.slots()[0].process != parent
+            || !recovered_sampling_slots_match(
+                &binding,
+                wire,
+                &live,
+                &self.guardian.diagnostic_slots(),
+            )
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        let retained = self
+            .guardian
+            .retained_result(key)
+            .ok_or(WireError::MissingProof)?;
+        let WireCompletion::ListChildren {
+            parent: returned,
+            result: Ok(children),
+        } = WireRetained::from(retained).completion
+        else {
+            return Err(WireError::MissingProof);
+        };
+        if returned != WireIdentity::from(parent)
+            || children.len() > MAX_NATIVE_CHILDREN
+            || children.iter().any(|pid| *pid == 0)
+        {
+            return Err(WireError::MissingProof);
+        }
+        Ok(Response::RecoveredNativeChildList {
+            key: key.try_into()?,
+            parent: returned,
+            children,
+        })
+    }
+
     fn native_sampling_ack(
         &mut self,
         session: ControllerSession,
@@ -1940,11 +2053,17 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             return Err(WireError::AdmissionMismatch);
         }
         self.validate_native_child_list_evidence(session, admission.key(), admission.parent())?;
+        let parent = admission.parent();
+        let origin = NonZeroU64::new(session.generation()).ok_or(WireError::InvalidValue)?;
         let now = native_reconciliation_now()?;
         match self.guardian.submit_native_child_list(admission, now) {
-            Ok(key) => Ok(Response::Submitted {
-                key: key.try_into()?,
-            }),
+            Ok(key) => {
+                self.native_child_list_retained_origins
+                    .push((key, parent, origin));
+                Ok(Response::Submitted {
+                    key: key.try_into()?,
+                })
+            }
             Err(crate::guardian::PolicySubmissionError::Refused { error, .. }) => Err(error.into()),
             Err(crate::guardian::PolicySubmissionError::ExecutorCorrelationMismatch) => {
                 Err(GuardianError::ExecutorCorrelationMismatch.into())
@@ -2100,6 +2219,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 )
                 .map_err(WireError::from)?;
             self.native_child_list_ack_receipts.push(receipt);
+            self.native_child_list_retained_origins
+                .retain(|(stored_key, _, _)| *stored_key != key);
         }
         Ok(Response::Acked {
             key: key.try_into()?,
@@ -2333,6 +2454,17 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 session,
                 key,
                 sequence,
+                issuing_session_generation,
+            )?,
+            Request::VerifyRecoveredNativeChildList {
+                session,
+                key,
+                parent,
+                issuing_session_generation,
+            } => self.verify_recovered_native_child_list(
+                session,
+                key,
+                parent,
                 issuing_session_generation,
             )?,
             Request::AckAfterAppliedRevision {
@@ -2613,9 +2745,9 @@ mod tests {
         }
     }
     #[test]
-    fn protocol_v5_is_rejected_explicitly() {
+    fn protocol_v6_is_rejected_explicitly() {
         let body = serde_json::to_vec(&Envelope {
-            version: 5,
+            version: 6,
             body: Request::Snapshot,
         })
         .unwrap();
@@ -2623,7 +2755,7 @@ mod tests {
         frame.extend(body);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(frame)),
-            Err(CodecError::UnsupportedVersion(5))
+            Err(CodecError::UnsupportedVersion(6))
         ));
     }
 
@@ -2705,9 +2837,9 @@ mod tests {
             read_frame::<Request>(&mut Cursor::new(unknown)),
             Err(CodecError::UnsupportedVersion(version)) if version == unsupported
         ));
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
         let old = serde_json::to_vec(&Envelope {
-            version: 5,
+            version: 6,
             body: Request::Snapshot,
         })
         .unwrap();
@@ -2715,7 +2847,7 @@ mod tests {
         old_frame.extend(old);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(old_frame)),
-            Err(CodecError::UnsupportedVersion(5))
+            Err(CodecError::UnsupportedVersion(6))
         ));
         let mut unknown_op = Vec::new();
         let bytes =
@@ -3308,10 +3440,10 @@ mod native_evidence_tests {
     impl NativeEvidenceReader for ChildListReader {
         fn read(
             &mut self,
-            _: AttemptId,
+            attempt: AttemptId,
         ) -> Result<Option<(crate::LoadedAttempt, NativeGuardianBinding)>, NativeEvidenceReadError>
         {
-            Err(NativeEvidenceReadError)
+            self.inner.read(attempt)
         }
 
         fn reconciliation_evidence(
@@ -3734,6 +3866,170 @@ mod native_evidence_tests {
                 applied_revision: fixture.key.revision,
             }
         );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn dispatch_child_list_without_application(fixture: &mut ChildListFixture) {
+        let Response::Admitted { admission } =
+            fixture.server.handle(Request::NativeChildListAdmit {
+                session: fixture.session,
+                key: fixture.key,
+                parent: fixture.parent.into(),
+            })
+        else {
+            panic!("admit")
+        };
+        assert_eq!(
+            fixture.server.handle(Request::NativeChildListSubmit {
+                session: fixture.session,
+                admission,
+                now: 0,
+            }),
+            Response::Submitted { key: fixture.key }
+        );
+        assert_eq!(
+            fixture.server.native_child_list_retained_origins,
+            vec![(
+                fixture.issue.key(),
+                fixture.parent,
+                fixture.issue.session_generation(),
+            )]
+        );
+    }
+
+    fn reconnect_child_list_session(fixture: &mut ChildListFixture) -> WireSession {
+        fixture.server.fence_connection();
+        let Response::Hello {
+            snapshot: detached, ..
+        } = fixture.server.handle(Request::Hello {
+            build: test_build(),
+        })
+        else {
+            panic!("detached hello")
+        };
+        assert_eq!(detached.state, WireState::DetachedFenced);
+        crate::native_guardian::verify_native_binding(
+            &mut fixture.store,
+            fixture.attempt,
+            &detached,
+        )
+        .unwrap();
+        let loaded = fixture
+            .store
+            .load_attempt(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let crate::RecoveryDisposition::Checkpoint(interruption) =
+            loaded.prepare_recovery().unwrap()
+        else {
+            panic!("ownership attempt must checkpoint interruption")
+        };
+        let interruption_revision = (*interruption)
+            .persist(&mut fixture.store)
+            .unwrap()
+            .checkpoint()
+            .persistence_revision()
+            .unwrap();
+        let detached_binding = fixture
+            .store
+            .load_native_binding(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let reconciling = fixture
+            .store
+            .commit_fresh_interruption_binding(&detached_binding, interruption_revision)
+            .unwrap();
+        let response = fixture.server.handle(Request::BeginReconciliation {
+            instance: detached.instance,
+            inventory: detached.slots,
+            interruption_revision: interruption_revision.get(),
+        });
+        let Response::ReconciliationBegun { session } = response else {
+            panic!("begin reconciliation: {response:?}")
+        };
+        assert_eq!(
+            session.generation,
+            reconciling.current_session().generation.get()
+        );
+        session
+    }
+
+    fn recovered_child_list_request(fixture: &ChildListFixture, session: WireSession) -> Request {
+        Request::VerifyRecoveredNativeChildList {
+            session,
+            key: fixture.key,
+            parent: fixture.parent.into(),
+            issuing_session_generation: fixture.issue.session_generation().get(),
+        }
+    }
+
+    #[test]
+    fn native_child_list_recovery_reads_retained_result_without_reexecution() {
+        let mut fixture = child_list_fixture();
+        dispatch_child_list_without_application(&mut fixture);
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            fixture
+                .server
+                .handle(recovered_child_list_request(&fixture, fixture.session)),
+            Response::Refused(WireError::MissingProof)
+        ));
+        let session = reconnect_child_list_session(&mut fixture);
+        let request = recovered_child_list_request(&fixture, session);
+        let expected = Response::RecoveredNativeChildList {
+            key: fixture.key,
+            parent: fixture.parent.into(),
+            children: vec![31, 32],
+        };
+        assert_eq!(fixture.server.handle(request.clone()), expected);
+        assert_eq!(fixture.server.handle(request.clone()), expected);
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let loaded = fixture
+            .store
+            .load_attempt(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let candidate = fixture
+            .store
+            .prepare_native_child_list_recovery(loaded)
+            .unwrap();
+        let children = vec![
+            ProcessId::new(NonZeroU32::new(31).unwrap()),
+            ProcessId::new(NonZeroU32::new(32).unwrap()),
+        ];
+        let status = fixture
+            .store
+            .apply_recovered_native_child_list(
+                crate::VerifiedRecoveredNativeChildList::after_live_verification(
+                    candidate, children,
+                ),
+            )
+            .unwrap();
+        let crate::NativeChildListStatus::AppliedPendingAck {
+            applying_revision, ..
+        } = status
+        else {
+            panic!("recovered application")
+        };
+        assert_eq!(
+            fixture.server.handle(request),
+            Response::Refused(WireError::MissingProof)
+        );
+        assert_eq!(
+            fixture
+                .server
+                .handle(Request::AckNativeChildListAfterApplied {
+                    session,
+                    key: fixture.key,
+                    applied_revision: applying_revision.get(),
+                }),
+            Response::Acked {
+                key: fixture.key,
+                applied_revision: applying_revision.get(),
+            }
+        );
+        assert!(fixture.server.native_child_list_retained_origins.is_empty());
         assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -5606,6 +5902,7 @@ mod native_evidence_tests {
                 | Request::ObserveSlot { .. }
                 | Request::ObserveRetained { .. }
                 | Request::VerifyRecoveredNativeSampling { .. }
+                | Request::VerifyRecoveredNativeChildList { .. }
                 | Request::NativeChildListAdmit { .. }
                 | Request::NativeChildListSubmit { .. }
                 | Request::ObserveNativeChildList { .. }

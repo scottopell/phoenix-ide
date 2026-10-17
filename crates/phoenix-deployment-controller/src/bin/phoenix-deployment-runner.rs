@@ -51,6 +51,9 @@ enum RunnerMode {
     RecoverUnappliedSample {
         fixture: UnappliedRecoveryFixture,
     },
+    RecoverUnappliedChildList {
+        fixture: UnappliedRecoveryFixture,
+    },
     RecoverAndFinish {
         fixture: FinishFixture,
     },
@@ -109,6 +112,7 @@ enum SampleFixture {
 #[derive(Clone)]
 enum ChildListFixture {
     Run,
+    PauseAfterObservation(ReleaseSource),
     PauseAfterApplication(ReleaseSource),
 }
 
@@ -217,16 +221,27 @@ fn parse_recover_applied_ack(args: &[OsString], usage: &str) -> Result<RunnerMod
 fn parse_recover_child_list(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
     let fixture = match args {
         [_, _, _, _, _, _, _, _] => ChildListFixture::Run,
+        [_, _, _, _, _, _, _, _, pause]
+            if pause == "--fixture-pause-after-child-list-observation" =>
+        {
+            ChildListFixture::PauseAfterObservation(ReleaseSource::Stdin)
+        }
         [_, _, _, _, _, _, _, _, pause] if pause == "--fixture-pause-after-child-list-apply" => {
             ChildListFixture::PauseAfterApplication(ReleaseSource::Stdin)
         }
         [_, _, _, _, _, _, _, _, pause, release, path]
-            if pause == "--fixture-pause-after-child-list-apply"
+            if (pause == "--fixture-pause-after-child-list-observation"
+                || pause == "--fixture-pause-after-child-list-apply")
                 && release == "--fixture-release-file" =>
         {
             let path = PathBuf::from(path);
             validate_release_path(&path)?;
-            ChildListFixture::PauseAfterApplication(ReleaseSource::DisposableFile(path))
+            let release = ReleaseSource::DisposableFile(path);
+            if pause == "--fixture-pause-after-child-list-observation" {
+                ChildListFixture::PauseAfterObservation(release)
+            } else {
+                ChildListFixture::PauseAfterApplication(release)
+            }
         }
         _ => return Err(usage.into()),
     };
@@ -251,8 +266,35 @@ fn parse_recover_child_list_ack(args: &[OsString], usage: &str) -> Result<Runner
 }
 
 #[cfg(unix)]
+fn parse_recover_unapplied_child_list(
+    args: &[OsString],
+    usage: &str,
+) -> Result<RunnerMode, String> {
+    let fixture = match args {
+        [_, _, _, _, _, _, _, _] => UnappliedRecoveryFixture::Run,
+        [_, _, _, _, _, _, _, _, pause]
+            if pause == "--fixture-pause-after-recovery-verification" =>
+        {
+            UnappliedRecoveryFixture::PauseAfterVerification
+        }
+        [_, _, _, _, _, _, _, _, pause, release, path]
+            if pause == "--fixture-pause-after-recovery-verification"
+                && release == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(path);
+            validate_release_path(&path)?;
+            UnappliedRecoveryFixture::PauseAfterVerificationFile(ReleaseSource::DisposableFile(
+                path,
+            ))
+        }
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::RecoverUnappliedChildList { fixture })
+}
+
+#[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-child-list-ack> --socket-dir <private fixture> --store <existing schema-v6 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-unapplied-child-list|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-child-list-ack> --socket-dir <private fixture> --store <existing schema-v6 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample or recover-unapplied-child-list only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-observation|--fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -272,6 +314,7 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
             }
         }
         "recover-applied-ack" => parse_recover_applied_ack(args, usage)?,
+        "recover-unapplied-child-list" => parse_recover_unapplied_child_list(args, usage)?,
         "recover-unapplied-sample" if args.len() == 8 => RunnerMode::RecoverUnappliedSample {
             fixture: UnappliedRecoveryFixture::Run,
         },
@@ -849,6 +892,17 @@ fn run_recovered_child_list(
     let verified = client
         .observe_native_child_list(dispatched)
         .map_err(|error| format!("child-list observe: {error:?}"))?;
+    if let ChildListFixture::PauseAfterObservation(release) = &fixture {
+        let gate = release.prepare()?;
+        println!(
+            "child_list_observed_pending_application revision={}",
+            child_issue.key().revision().get()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        gate.wait()?;
+    }
     let progress = policy
         .apply_native_child_list(verified, store)
         .map_err(|error| format!("child-list apply: {error:?}"))?;
@@ -866,7 +920,7 @@ fn run_recovered_child_list(
     {
         return Err("child-list completion was not successful and empty".into());
     }
-    if let ChildListFixture::PauseAfterApplication(release) = fixture {
+    if let ChildListFixture::PauseAfterApplication(release) = &fixture {
         let gate = release.prepare()?;
         println!(
             "child_list_application_committed_pending_ack revision={}",
@@ -1005,6 +1059,72 @@ fn run_recover_unapplied_sample(
         issue.key().revision().get(),
         issue.key().ordinal(),
         issue.sequence()
+    );
+    std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
+fn run_recover_unapplied_child_list(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    attempt: AttemptId,
+    session: phoenix_deployment_controller::guardian_ipc::WireSession,
+    fixture: &UnappliedRecoveryFixture,
+) -> Result<(), String> {
+    let loaded = store
+        .load_attempt(attempt)
+        .map_err(|error| error.to_string())?
+        .ok_or("missing interrupted attempt")?;
+    let candidate = store
+        .prepare_native_child_list_recovery(loaded)
+        .map_err(|error| format!("prepare recovered child list: {error}"))?;
+    let issue = candidate.issue();
+    let verified = client
+        .verify_recovered_native_child_list(candidate)
+        .map_err(|error| format!("verify recovered child list: {error:?}"))?;
+    if !matches!(fixture, UnappliedRecoveryFixture::Run) {
+        let gate = match fixture {
+            UnappliedRecoveryFixture::PauseAfterVerificationFile(release) => {
+                Some(release.prepare()?)
+            }
+            UnappliedRecoveryFixture::Run | UnappliedRecoveryFixture::PauseAfterVerification => {
+                None
+            }
+        };
+        println!(
+            "recovered_child_list_verified_pending_application revision={} parent={}",
+            issue.key().revision().get(),
+            issue.parent().pid().get()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        if let Some(gate) = gate {
+            gate.wait()?;
+        } else {
+            activation_barrier(FinishFixture::ActivationBarriers)?;
+        }
+    }
+    let applied = store
+        .apply_recovered_native_child_list(verified)
+        .map_err(|error| format!("apply recovered child list: {error}"))?;
+    if !matches!(applied, NativeChildListStatus::AppliedPendingAck { issue: stored, .. }
+        if stored == issue)
+    {
+        return Err("recovered child list did not produce exact pending ACK".into());
+    }
+    let confirmed = recover_native_child_list_ack(store, client, issue.key())
+        .map_err(|error| format!("recovered child list ACK: {error:?}"))?;
+    if !matches!(confirmed, NativeChildListStatus::ChildrenAckConfirmed {
+        issue: stored, confirming_session_generation, ..
+    } if stored == issue && confirming_session_generation.get() == session.generation)
+    {
+        return Err("recovered child list ACK confirmation mismatch".into());
+    }
+    println!(
+        "recovered_child_list_applied_ack attempt={} revision={} ordinal={}",
+        issue.key().attempt_id().get(),
+        issue.key().revision().get(),
+        issue.key().ordinal()
     );
     std::io::stdout().flush().map_err(|error| error.to_string())
 }
@@ -1383,6 +1503,7 @@ fn main() -> Result<(), String> {
         config.mode,
         RunnerMode::RecoverAppliedAck(_)
             | RunnerMode::RecoverUnappliedSample { .. }
+            | RunnerMode::RecoverUnappliedChildList { .. }
             | RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
             | RunnerMode::RecoverFinishAndChildList { .. }
@@ -1428,6 +1549,7 @@ fn main() -> Result<(), String> {
                 | RunnerMode::InitialSample { .. }
                 | RunnerMode::RecoverAppliedAck(_)
                 | RunnerMode::RecoverUnappliedSample { .. }
+                | RunnerMode::RecoverUnappliedChildList { .. }
                 | RunnerMode::RecoverChildListAck(_) => FinishFixture::Run,
             },
         )?)
@@ -1461,6 +1583,13 @@ fn main() -> Result<(), String> {
             RecoveryRun::FinishAndChildList(fixture.clone()),
         ),
         RunnerMode::RecoverUnappliedSample { fixture } => run_recover_unapplied_sample(
+            &mut store,
+            &mut client,
+            config.attempt,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
+            fixture,
+        ),
+        RunnerMode::RecoverUnappliedChildList { fixture } => run_recover_unapplied_child_list(
             &mut store,
             &mut client,
             config.attempt,
@@ -1824,6 +1953,15 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            parse_args(&args("recover-unapplied-child-list")),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverUnappliedChildList {
+                    fixture: UnappliedRecoveryFixture::Run
+                },
+                ..
+            })
+        ));
         let mut initial = args("initial-sample");
         initial.extend(
             [
@@ -1877,6 +2015,7 @@ mod tests {
             for mode in [
                 "recover-applied-ack",
                 "recover-unapplied-sample",
+                "recover-unapplied-child-list",
                 "recover-and-finish",
                 "recover-finish-and-sample",
             ] {
@@ -1890,9 +2029,11 @@ mod tests {
             "--fixture-activation-barriers",
             "--fixture-activation-and-sample-barriers",
         ] {
-            let mut invalid = args("recover-unapplied-sample");
-            invalid.push(flag.into());
-            assert!(parse_args(&invalid).is_err(), "unapplied + {flag}");
+            for mode in ["recover-unapplied-sample", "recover-unapplied-child-list"] {
+                let mut invalid = args(mode);
+                invalid.push(flag.into());
+                assert!(parse_args(&invalid).is_err(), "{mode} + {flag}");
+            }
         }
     }
 

@@ -577,6 +577,167 @@ fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
 
 #[allow(clippy::too_many_lines)]
 #[test]
+fn completed_child_list_recovery_applies_without_reenumerating_after_runner_crash() {
+    let ChildListProcessFixture {
+        _parent,
+        dir,
+        path,
+        attempt,
+        deadline,
+        root,
+        mut guardian,
+    } = start_child_list_fixture();
+    let initial_detached = settle_initial_sample_with_replacement_ack(&dir, &path, deadline, root);
+    let initial_sampling = sampling_rows(&path);
+    assert_eq!(child_list_rows(&path), (0, 0, 0, 0));
+
+    let mut runner = GuardedRunner::new(
+        child_list_runner_command(&dir, &path, "recover-finish-and-child-list")
+            .arg("--fixture-pause-after-child-list-observation")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = BufReader::new(runner.stdout.take().unwrap());
+    assert_eq!(line(&mut output), "verified binding: Detached");
+    assert!(line(&mut output).starts_with("reconciling generation=3 interruption="));
+    let second_sample = line(&mut output);
+    assert!(
+        second_sample.starts_with("recovered_sample_applied_ack attempt=64")
+            && second_sample.ends_with("sequence=1"),
+        "{second_sample}"
+    );
+    let marker = line(&mut output);
+    let issue_revision = marker
+        .strip_prefix("child_list_observed_pending_application revision=")
+        .unwrap_or_else(|| panic!("unexpected observation marker: {marker}"))
+        .parse::<u64>()
+        .unwrap();
+    assert!(runner.try_wait().unwrap().is_none());
+    assert_eq!(child_list_rows(&path), (1, 0, 0, 0));
+    assert_child_list_issue_parent(&path, root);
+    let observed_sampling = sampling_rows(&path);
+    assert_eq!(
+        (
+            initial_sampling.0,
+            initial_sampling.1,
+            initial_sampling.2,
+            initial_sampling.4
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(
+        (
+            observed_sampling.0,
+            observed_sampling.1,
+            observed_sampling.2,
+            observed_sampling.4
+        ),
+        (2, 2, 2, 1)
+    );
+
+    runner.kill_checked();
+    let crashed = wait_for_detached(&dir);
+    assert_eq!(crashed.state, WireState::DetachedFenced);
+    assert_eq!(crashed.retained.len(), 1);
+    let retained = &crashed.retained[0];
+    assert_eq!(retained.key.attempt, attempt.get());
+    assert_eq!(retained.key.ordinal, 0);
+    assert_eq!(retained.key.revision, issue_revision);
+    assert!(matches!(
+        &retained.completion,
+        WireCompletion::ListChildren {
+            parent,
+            result: Ok(children),
+        } if *parent == root.into() && children.is_empty()
+    ));
+    assert_eq!(child_list_rows(&path), (1, 0, 0, 0));
+    assert_guardian_is_parent(i32::try_from(root.pid().get()).unwrap(), guardian.id());
+
+    let mut replacement = GuardedRunner::new(
+        child_list_runner_command(&dir, &path, "recover-unapplied-child-list")
+            .arg("--fixture-pause-after-recovery-verification")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert_ne!(runner.id(), replacement.id());
+    let mut replacement_output = BufReader::new(replacement.stdout.take().unwrap());
+    assert_eq!(line(&mut replacement_output), "verified binding: Detached");
+    assert!(line(&mut replacement_output).starts_with("reconciling generation=4 interruption="));
+    assert_eq!(
+        line(&mut replacement_output),
+        format!(
+            "recovered_child_list_verified_pending_application revision={issue_revision} parent={}",
+            root.pid().get()
+        )
+    );
+    assert!(replacement.try_wait().unwrap().is_none());
+    assert_eq!(child_list_rows(&path), (1, 0, 0, 0));
+    replacement.stdin.as_mut().unwrap().write_all(b"!").unwrap();
+    assert_eq!(
+        line(&mut replacement_output),
+        format!("recovered_child_list_applied_ack attempt=64 revision={issue_revision} ordinal=0")
+    );
+    success(&mut replacement);
+    replacement.finish();
+    let mut remaining = String::new();
+    std::io::Read::read_to_string(&mut replacement_output, &mut remaining).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "no follow-up runner output: {remaining}"
+    );
+
+    let final_snapshot = wait_for_detached(&dir);
+    assert!(final_snapshot.retained.is_empty());
+    assert_eq!(final_snapshot.instance, crashed.instance);
+    assert_eq!(final_snapshot.attempt, crashed.attempt);
+    assert_eq!(final_snapshot.deadline, crashed.deadline);
+    assert_eq!(final_snapshot.slots, crashed.slots);
+    let final_native = final_snapshot.native_binding.as_ref().unwrap();
+    let crashed_native = crashed.native_binding.as_ref().unwrap();
+    let initial_native = initial_detached.native_binding.as_ref().unwrap();
+    assert_eq!(final_native.guardian, crashed_native.guardian);
+    assert_eq!(final_native.guardian, initial_native.guardian);
+    assert_eq!(final_native.nonce, crashed_native.nonce);
+    assert_eq!(final_native.nonce, initial_native.nonce);
+    assert_eq!(final_native.deadline, deadline.get());
+    assert_eq!(final_native.deadline, initial_native.deadline);
+    assert_eq!(final_native.slots, crashed_native.slots);
+    assert_eq!(final_native.slots.len(), 1);
+    assert_eq!(initial_native.slots.len(), 1);
+    assert_eq!(
+        final_native.slots[0].identity,
+        initial_native.slots[0].identity
+    );
+    assert_eq!(final_native.slots[0].identity, root.into());
+    assert_eq!(child_list_rows(&path), (1, 1, 1, 0));
+    assert_child_list_issue_parent(&path, root);
+    assert_eq!(sampling_rows(&path), observed_sampling);
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    assert_eq!(
+        observed.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::Interrupted
+    );
+    let binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(binding.slots()[0].process, root);
+    assert_eq!(binding.deadline(), deadline);
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(root.pid().get()).unwrap(), 0) },
+        0
+    );
+    assert_guardian_is_parent(i32::try_from(root.pid().get()).unwrap(), guardian.id());
+    guardian.finish();
+    wait_process_gone(
+        i32::try_from(root.pid().get()).unwrap(),
+        Duration::from_secs(5),
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+#[test]
 fn child_list_ack_recovery_does_not_reenumerate_or_reapply_after_runner_crash() {
     let ChildListProcessFixture {
         _parent,

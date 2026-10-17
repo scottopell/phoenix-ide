@@ -272,6 +272,11 @@ impl LoadedAttempt {
         }
     }
 
+    pub(crate) fn interrupted_native_root_scan(&self, parent: ProcessIdentity) -> bool {
+        matches!(&self.checkpoint, DeploymentAttempt::Interrupted(_))
+            && self.checkpoint.native_root_scan(parent)
+    }
+
     /// # Panics
     /// Panics if private loaded evidence lacks its store-validated revision.
     #[must_use]

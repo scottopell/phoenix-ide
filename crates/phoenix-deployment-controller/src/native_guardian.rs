@@ -834,6 +834,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -863,6 +864,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -895,6 +897,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -920,6 +923,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -942,6 +946,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -964,6 +969,7 @@ impl GuardianClient {
             | Response::Inventory(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1167,6 +1173,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1292,6 +1299,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1452,6 +1460,92 @@ impl GuardianClient {
         result
     }
 
+    /// Verify a retained successful child list in the fresh same-guardian reconciling session.
+    /// # Errors
+    /// Refuses stale custody or mismatched responses and fences this connection.
+    pub fn verify_recovered_native_child_list(
+        &mut self,
+        candidate: crate::NativeChildListRecoveryCandidate,
+    ) -> Result<crate::VerifiedRecoveredNativeChildList, ClientError> {
+        let result = (|| {
+            if self.verified_snapshot.is_none() {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let snapshot = self.snapshot()?;
+            let binding = candidate.binding();
+            let issue = candidate.issue();
+            let native = snapshot
+                .native_binding
+                .as_ref()
+                .ok_or(ClientError::UnexpectedResponse)?;
+            let current = binding.current_session();
+            if snapshot.state != crate::guardian_ipc::WireState::Reconciling
+                || snapshot.session.instance != snapshot.instance
+                || snapshot.session.generation != current.generation.get()
+                || current.state != crate::NativeSessionState::Reconciling
+                || current.generation <= issue.session_generation()
+                || !binding
+                    .sessions()
+                    .iter()
+                    .any(|s| s.generation == issue.session_generation())
+                || binding.dispatch_floor() != current.interruption_revision
+                || issue.key().revision() >= current.interruption_revision
+                || binding.identity() != issue.guardian_identity()
+                || binding.attempt_id() != issue.key().attempt_id()
+                || snapshot.attempt != binding.attempt_id().get()
+                || snapshot.deadline != binding.deadline().get()
+                || native.attempt != snapshot.attempt
+                || native.deadline != snapshot.deadline
+                || native.nonce != binding.identity().nonce.bytes()
+                || native.guardian != binding.identity().process.into()
+                || binding.slots().len() != 1
+                || binding.slots()[0].process != issue.parent()
+                || !recovered_sampling_slots_match(binding, &snapshot, native)
+                || !crate::MonotonicTick::native_now()
+                    .is_ok_and(|now| now.get() < snapshot.deadline)
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let key = crate::guardian_ipc::WireKey::try_from(issue.key())
+                .map_err(ClientError::Refused)?;
+            let response = self.exchange(&Request::VerifyRecoveredNativeChildList {
+                session: snapshot.session,
+                key,
+                parent: issue.parent().into(),
+                issuing_session_generation: issue.session_generation().get(),
+            })?;
+            let Response::RecoveredNativeChildList {
+                key: returned,
+                parent,
+                children,
+            } = response
+            else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+            if returned != key
+                || parent != issue.parent().into()
+                || children.len() > crate::guardian_ipc::MAX_NATIVE_CHILDREN
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let children = children
+                .into_iter()
+                .map(|pid| std::num::NonZeroU32::new(pid).map(crate::ProcessId::new))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(ClientError::UnexpectedResponse)?;
+            Ok(
+                crate::VerifiedRecoveredNativeChildList::after_live_verification(
+                    candidate, children,
+                ),
+            )
+        })();
+        if result.is_err() {
+            self.stream.take();
+            self.verified_snapshot = None;
+        }
+        result
+    }
+
     /// ACK an exact successful durable application, including one loaded for recovery.
     /// The authenticated live snapshot is refreshed; no dispatch or policy authority is minted.
     /// # Errors
@@ -1536,6 +1630,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1639,6 +1734,7 @@ impl GuardianClient {
             | Response::SlotObserved(_)
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
+            | Response::RecoveredNativeChildList { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
