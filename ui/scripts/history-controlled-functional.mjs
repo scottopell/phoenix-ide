@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { observePhysicalHistoricalRow, holdPostFaultBaseline } from './history-postfault-baseline.mjs';
 import { COMPOSER_SELECTOR } from './qualify-history-realserver.mjs';
-import { installHistoryRequestOwnership, installObservedHistoryTelemetry, authenticateOwnedContext } from './history-joint-telemetry.mjs';
+import { installHistoryRequestOwnership, installObservedHistoryTelemetry, installHistoryPaginationDiagnostic, authenticateOwnedContext } from './history-joint-telemetry.mjs';
 
 export const CONTROLLED_CLASS = 'controlled_functional';
 export const CONTROLLED_VIEWPORT = Object.freeze({ width: 1360, height: 900 });
@@ -158,7 +158,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
       clock.remaining();
       assert.ok(!canceled);
       const route = fixture.kind, context = await bounded(createContext, 10000);
-      let page, observer, scenarioFailure, collectedTrial, physicalDiagnostics = null, phase = 'authenticate';
+      let page, observer, paginationDiagnostic, scenarioFailure, collectedTrial, physicalDiagnostics = null, phase = 'authenticate';
       try {
         const trial = await bounded(async () => {
           await (UNIT?.authenticate ?? authenticateOwnedContext)(context, baseURL);
@@ -169,6 +169,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
           phase = 'page_create';
           page = await context.newPage();
           if (canceled) { await page.close(); throw new Error('controlled late page creation canceled'); }
+          paginationDiagnostic = installHistoryPaginationDiagnostic(page, baseURL, fixture.endpoint);
           const network = installObservedHistoryTelemetry(page, baseURL, ownership);
           observer = controlledObserver(page, network, module, fixtures.identity, fixture, ownership);
           const reports = [], statuses = [];
@@ -225,10 +226,11 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             phase = 'report_collect';
             const trial = await collect();
             assertOwnedReport(trial.reports[0], network.snapshot());
-            phase = 'additional_history_owner';
+            phase = 'additional_history_request_present';
             const historicalRequests = network.snapshot().requestRecords.filter(r => r.kind === 'request'
               && new URL(r.url).pathname === fixture.endpoint && new URL(r.url).searchParams.has('before'));
             assert.ok(historicalRequests.length > 0, 'actual additional history GET required before historical ready');
+            phase = 'additional_history_owner';
             for (const request of historicalRequests) assert.ok(trial.reports[0].correlations.some(c => c.kind === 'request' && c.id === request.open_id), 'additional history request must remain in its original journey');
             trial.additional_history = { report_count: 1, request_count: historicalRequests.length, original_owner: trial.reports[0].open_id };
             phase = 'stream_owner';
@@ -294,7 +296,8 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
         failure.controlledReceipt = { evidence_class: CONTROLLED_CLASS, status: 'failed', trials,
           failure_location: { scope: 'scenario', route, kind, phase,
             error_kind: error instanceof assert.AssertionError ? 'assertion' : 'operation',
-            counts: observer?.failureCounts() ?? null, physical: physicalDiagnostics },
+            counts: observer?.failureCounts() ?? null, physical: physicalDiagnostics,
+            pagination: paginationDiagnostic?.snapshot(observer?.getReports() ?? []) ?? null },
           failed_trial: collectedTrial ? { ...collectedTrial, reports: observer.getReports(), status: 'failed_assertions' } : null,
           overhead_clearance: false, full_acceptance: false, failure: 'controlled_scenario_failed' };
         scenarioFailure = failure;

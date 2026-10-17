@@ -19,7 +19,7 @@ out=Path(os.environ['GEOMETRY_OUTPUT']).resolve();out.mkdir(parents=True,exist_o
 receipt=json.loads((artifact/'opening-instrumented-receipt.json').read_text())
 owner=json.loads((artifact/'opening-ui-build-owner.json').read_text())
 assert receipt['app_source']==opening.PIN and receipt['app_tree']==opening.TREE_PIN
-assert receipt['harness_source']=='b962ee2e23546dbe9618ff359924335014ff2def'
+assert receipt['harness_source']=='98718c5c05b8191a1cfbf418652a1d08ec401c6c'
 exe=artifact/'opening-instrumented-libtest';assert s.digest(exe)==receipt['executable_sha256'];exe.chmod(0o700)
 with exe.open('rb') as stream: assert stream.read(20)[:4]==b'\x7fELF'
 assert s.git(app,'rev-parse','HEAD')==opening.PIN and s.git(app,'rev-parse','HEAD^{tree}')==opening.TREE_PIN
@@ -32,7 +32,7 @@ assert binding['ui_files']['ui/dist-controlled-functional/.gitkeep']==hashlib.sh
 (ui/'.gitkeep').write_bytes(b'')
 assert {str(p.relative_to(artifact/'pinned-app')):s.digest(p) for p in ui.rglob('*') if p.is_file()}==binding['ui_files']
 assert s.digest(app/'ui/pnpm-lock.yaml')==receipt['ui_lock_sha256']
-s.write_json(out/'provenance.json',{'scope':'diagnostic_not_acceptance','artifact':12082193993,'app_source':opening.PIN,'app_tree':opening.TREE_PIN,'executable_sha256':s.digest(exe),'controlled_manifest_sha256':s.digest(manifest),'fixture':'recreated_recipe_not_original_database'})
+s.write_json(out/'provenance.json',{'scope':'diagnostic_not_acceptance','artifact':12084070461,'app_source':opening.PIN,'app_tree':opening.TREE_PIN,'executable_sha256':s.digest(exe),'controlled_manifest_sha256':s.digest(manifest),'fixture':'recreated_recipe_not_original_database'})
 h=s.load_app_harness(app);failures=opening.LifecycleFailures()
 with tempfile.TemporaryDirectory(prefix='geo-',dir='/tmp') as owned:
  work=Path(owned);work.chmod(0o700);control=work/'c.sock';port=h._free_port();base=f'http://127.0.0.1:{port}'
@@ -48,13 +48,13 @@ with tempfile.TemporaryDirectory(prefix='geo-',dir='/tmp') as owned:
     try:
      opening.authenticate_fixture(fixture.client,opening.owned_qualification_password(startup,out/'private-credential-identity.json'))
      fixture.h=opening.AuthenticatedHarness(h,fixture.client);fixture.completion=opening.OwnedFixtureCompletion(startup,fixture)
-     cwd=work/'cwd';cwd.mkdir();aggregate=opening.equal_text_fixture(fixture,fixture.build('ordinary',cwd))
+     cwd=work/'cwd';cwd.mkdir();aggregate=opening.equal_text_fixture(fixture,fixture.build('ordinary',cwd),writable=True)
     finally:fixture.client.close()
     source=aggregate['members'][0];mid=aggregate['old_message']
     with contextlib.closing(sqlite3.connect(Path(startup['db']).as_uri()+'?mode=ro',uri=True)) as db:
      assert db.execute('SELECT count(*) FROM messages WHERE conversation_id=? AND message_id=?',(source,mid)).fetchone()[0]==1
     route=aggregate['route']+'?'+urlencode({'source_transcript':source})+'#message-'+quote(mid,safe='')
-    input_path=work/'input.json';s.write_json(input_path,{'id':mid,'source':source,'route':route})
+    input_path=work/'input.json';s.write_json(input_path,{'id':mid,'source':source,'route':route,'endpoint':aggregate['endpoint']})
     previewport=h._free_port();config=work/'preview.mjs';fault=work/'fault.json';s.write_json(fault,{'aggregatePath':aggregate['endpoint'],'failRoster':False,'streamPath':'','drop':0})
     script=Path(__file__).resolve().parents[2]/'ui/scripts/qualify-history-opening-realserver.mjs'
     config.write_text('import {previewTransport} from '+json.dumps(script.as_uri())+'; const c='+json.dumps({'root':str(app/'ui'),'build':{'outDir':str(ui)},'preview':{'host':'127.0.0.1','port':previewport,'strictPort':True}})+'; c.preview.proxy=previewTransport('+json.dumps(base)+','+json.dumps(str(fault))+','+json.dumps(str(work/'transport.jsonl'))+');export default c;')

@@ -182,6 +182,31 @@ export async function installHistoryRequestOwnership(context, config, UNIT) {
   };
 }
 
+export function installHistoryPaginationDiagnostic(page, baseURL, endpoint) {
+  const origin = new URL(baseURL).origin, requests = new Map(), correlations = new Set();
+  let errors = 0, reportStarted = false;
+  page.on('request', request => {
+    try {
+      const url = new URL(request.url());
+      if (url.origin !== origin) return;
+      if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') reportStarted = true;
+      if (url.pathname !== endpoint || request.method() !== 'GET' || !url.searchParams.has('before')) return;
+      assert.ok(requests.size < 128);
+      const record = { has_open_id: url.searchParams.getAll('open_id').length === 1 && Boolean(url.searchParams.get('open_id')), before_report: !reportStarted, status: null };
+      requests.set(request, { record, id: url.searchParams.get('open_id') });
+    } catch { errors = Math.min(128, errors + 1); }
+  });
+  page.on('response', response => {
+    try { const observed = requests.get(response.request()); if (observed) observed.record.status = response.status(); }
+    catch { errors = Math.min(128, errors + 1); }
+  });
+  return { snapshot(reports = []) {
+    correlations.clear();
+    for (const report of reports) for (const c of report.correlations ?? []) if (c.kind === 'request') correlations.add(c.id);
+    return { errors, requests: [...requests.values()].map(({ record, id }) => ({ ...record, in_report: Boolean(id) && correlations.has(id) })) };
+  } };
+}
+
 export function installObservedHistoryTelemetry(page, baseURL, ownership) {
   ownership?.bindPage(page);
   const origin = new URL(baseURL).origin, requests = [], reports = [], statuses = [], errors = [];

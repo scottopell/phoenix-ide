@@ -205,7 +205,7 @@ test('UNIT outer lifecycle preserves allowlisted scenario failure location inste
     publish:r=>published.push(structuredClone(r)),timeoutMs:1000}));
   const result=published.at(-1);assert.equal(result.failure,'controlled_scenario_failed');
   assert.deepEqual(result.failure_location,{scope:'scenario',route:'ordinary',kind:'history',
-    phase:'additional_history_owner',error_kind:'assertion',counts:{reports:1,responses:[204],admissions:1,requests:2,pending:1,errors:0},physical:{predicates:{},observation_present:true,fixture_identity_matches:true,sourcepin_matches:true}});
+    phase:'additional_history_request_present',error_kind:'assertion',counts:{reports:1,responses:[204],admissions:1,requests:2,pending:1,errors:0},physical:{predicates:{},observation_present:true,fixture_identity_matches:true,sourcepin_matches:true},pagination:{errors:0,requests:[]}});
 });
 test('UNIT phase receipts expose bounded counts, not raw errors or private setup details',async()=>{
   const runtime=fakeRuntime();const published=[];

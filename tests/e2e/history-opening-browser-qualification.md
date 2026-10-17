@@ -2500,3 +2500,40 @@ accepted opening remain exact. No target/oracle/composer/sampler rule is weakene
 Python70 tests pass including stock exhaustion, controlled no-exhaustion and
 nonidle rejection. Independent narrow review approved one causal successor;
 actual six-scenario collector/export/drain remains required. No app pin changed.
+
+### Additional-history ownership diagnosis after writable latest fixture
+
+Shared `98718c5c05b8191a1cfbf418652a1d08ec401c6c`, app
+`302a3733e9013bb09beb1e83c92b29b616ab0706`, run `38986752552`:
+ordinary controlled history cleared strict physical acquisition, four-frame hold,
+fixture/source-pin identity and the canonical editable composer. The witness
+failed at `additional_history_owner`; the retained receipt does not distinguish
+its two assertions. Rust remained in progress at this entry, so this is not a
+whole-run terminal claim. All other standard lanes were successful.
+
+Source inspection found that the shared correlated-request observer excludes
+GETs lacking URL `open_id`, while the app older-snapshot helper supplies only
+limit/cursor for the initial older GET, cursor-refresh GET and retry. The initial
+snapshot path separately registers journey request ownership. Coordinator API
+also suppresses `open_id` on `before` requests. The app owner independently
+confirmed this instrumentation gap; actual pagination and its ordering relative
+to the report still require observation before naming the runtime cause.
+
+The shared diagnostic now observes up to 128 actual older GETs at the exact
+fixture endpoint independently of correlation. Retained data contains only
+`has_open_id`, `before_report` (request event before report POST event), response
+status and `in_report`; no URL, cursor, ID, response body or raw error is retained.
+It cannot grant acceptance. Normal failure phases distinguish missing correlated
+older requests from missing report ownership; the positive checks are unchanged.
+
+A five-minute hosted artifact-reuse diagnostic is pinned to original artifact
+`12084070461` (96,401,945 bytes), run `38986752552`, exact shared source `98718`.
+It uses the same controlled writable-latest fixture recipe in a newly generated
+DB, not the original DB. No rebuild, emulation or full-suite rerun is requested.
+Stock `.25`, unsupported resume, overhead clearance false and full acceptance
+false remain unchanged.
+
+Cached tests: 93 Node tests pass (joint66, controlled23, diagnostic4); Python
+lifecycle70 passes with cached `opentelemetry-proto==1.39.0`. An initial Python
+invocation omitted that dependency and had one import error; the corrected
+cached invocation passes. No local native/browser/build execution occurred.

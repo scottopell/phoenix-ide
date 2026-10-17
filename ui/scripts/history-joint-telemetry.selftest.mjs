@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, UNIT_ONLY,
   prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage, authenticateOwnedContext,
-  installObservedHistoryTelemetry, installHistoryRequestOwnership, appendObservedHistory } from './history-joint-telemetry.mjs';
+  installObservedHistoryTelemetry, installHistoryRequestOwnership, installHistoryPaginationDiagnostic, appendObservedHistory } from './history-joint-telemetry.mjs';
 
 // All positive fake browser/module/fixture values in this file are UNIT ONLY, not runtime proof.
 function input() {
@@ -253,6 +253,30 @@ for (const [name, mutate] of Object.entries({
 })) test(`original history inventory rejects ${name} (UNIT ONLY)`, () => {
   const i = historyInventory(); mutate(i); assert.throws(() => appendObservedHistory(stock(), i, input().fixtures.identity, unitModule));
 });
+test('UNIT pagination diagnostic distinguishes actual uncorrelated GETs without retaining private values', () => {
+  const page = new EventEmitter(), base = 'http://127.0.0.1:12345';
+  const diagnostic = installHistoryPaginationDiagnostic(page, base, '/api/private-product');
+  const emit = (path, method = 'GET') => {
+    const request = { method: () => method, url: () => base + path };
+    page.emit('request', request);
+    page.emit('response', { request: () => request, status: () => 200 });
+  };
+  emit('/api/private-product?before=SECRET-cursor');
+  emit('/api/other?before=SECRET-cursor');
+  emit('/api/private-product?open_id=SECRET-initial');
+  emit('/api/telemetry/conversation-view', 'POST');
+  emit('/api/private-product?before=SECRET-cursor&open_id=SECRET-request');
+  const result = diagnostic.snapshot([{ correlations: [{ kind: 'request', id: 'SECRET-request' }] }]);
+  assert.deepEqual(result, { errors: 0, requests: [
+    { has_open_id: false, before_report: true, status: 200, in_report: false },
+    { has_open_id: true, before_report: false, status: 200, in_report: true },
+  ] });
+  assert.doesNotMatch(JSON.stringify(result), /SECRET|private-product|cursor|http/);
+  for (let n = 0; n < 130; n++) emit('/api/private-product?before=SECRET');
+  assert.equal(diagnostic.snapshot().requests.length, 128);
+  assert.ok(diagnostic.snapshot().errors > 0);
+});
+
 test('UNIT ONLY late report capture retains raw body/response and independent header trace provenance', () => {
   const page = new EventEmitter(), capture = installObservedHistoryTelemetry(page, 'http://127.0.0.1:12345', {
     bindPage: () => {},

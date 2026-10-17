@@ -1,7 +1,7 @@
 import {createRequire} from 'node:module';
 import {resolve} from 'node:path';
 import {readFileSync,writeFileSync} from 'node:fs';
-import {authenticateOwnedContext} from './history-joint-telemetry.mjs';
+import {authenticateOwnedContext,installHistoryPaginationDiagnostic} from './history-joint-telemetry.mjs';
 import {observePhysicalHistoricalRow} from './history-postfault-baseline.mjs';
 export function geometry({id, source, route}) {
   const rect=e=>{if(!e)return null;const b=e.getBoundingClientRect();return Object.fromEntries(['top','bottom','left','right','width','height'].map(k=>[k,Number.isFinite(b[k])?b[k]:null]));};
@@ -70,11 +70,17 @@ async function main(){
     browser=await chromium.launch({headless:true,timeout:10000});receipt.browser_version=browser.version();
     context=await browser.newContext({viewport:{width:1360,height:900}});await authenticateOwnedContext(context,process.env.HISTORY_BASE_URL);
     await context.addInitScript(installWriteCapture,{input,geometrySource:geometry.toString()});
-    page=await context.newPage();let reports=0;page.on('response',r=>{if(new URL(r.url()).pathname==='/api/telemetry/conversation-view'&&r.status()===204)reports++;});
+    page=await context.newPage();let reports=0,reportCaptureErrors=0;const reportBodies=[];
+    const pagination=installHistoryPaginationDiagnostic(page,process.env.HISTORY_BASE_URL,input.endpoint);
+    page.on('request',r=>{if(new URL(r.url()).pathname==='/api/telemetry/conversation-view'&&r.method()==='POST'){
+      try{const body=r.postData()??'';if(Buffer.byteLength(body)>8192||reportBodies.length>=7)throw new Error();reportBodies.push(JSON.parse(body));}
+      catch{reportCaptureErrors=Math.min(128,reportCaptureErrors+1);}
+    }});
+    page.on('response',r=>{if(new URL(r.url()).pathname==='/api/telemetry/conversation-view'&&r.status()===204)reports++;});
     await page.goto(process.env.HISTORY_BASE_URL+input.route,{waitUntil:'domcontentloaded',timeout:20000});
     const deadline=Date.now()+20000;
     while(reports===0&&Date.now()<deadline)await page.evaluate(()=>new Promise(r=>requestAnimationFrame(r)));
-    receipt.report204_count=reports;
+    receipt.report204_count=reports;receipt.report_capture_errors=reportCaptureErrors;receipt.pagination=pagination.snapshot(reportBodies);
     for(let frame=0;frame<5;frame++){
       if(frame)await page.evaluate(()=>new Promise(r=>requestAnimationFrame(r)));
       const observation=await page.evaluate(async ({geometrySource,oracleSource,input})=>{
@@ -84,7 +90,7 @@ async function main(){
       },{geometrySource:geometry.toString(),oracleSource:observePhysicalHistoricalRow.toString(),input});
       receipt.observations.push(observation);receipt.write_capture=await page.evaluate(()=>window.__historyGeometryRead());save();
     }
-    await page.locator('#messages').screenshot({path:resolve(out,'messages.png'),timeout:5000});receipt.status=reports>0&&receipt.observations.length===5&&receipt.observations.every(o=>o.identity.fixture_id_matches)
+    await page.locator('#messages').screenshot({path:resolve(out,'messages.png'),timeout:5000});receipt.status=reports>0&&reportCaptureErrors===0&&receipt.pagination.errors===0&&receipt.observations.length===5&&receipt.observations.every(o=>o.identity.fixture_id_matches)
       &&receipt.write_capture?.installed&&receipt.write_capture.failures===0&&receipt.write_capture.dropped===0
       &&receipt.write_capture.events.some(e=>e.kind==='scrollTop_assignment'&&!e.geometry.instrumentation_geometry_failed)?'captured':'capture_prerequisites_missing';save();
   }catch{receipt.failure='bounded_geometry_operation_failed';try{if(page)receipt.write_capture=await page.evaluate(()=>window.__historyGeometryRead());}catch{}save();}
