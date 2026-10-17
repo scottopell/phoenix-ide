@@ -984,6 +984,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1015,6 +1017,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1049,6 +1053,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1076,6 +1082,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1100,6 +1108,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1124,6 +1134,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1582,6 +1594,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1709,6 +1723,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1773,6 +1789,150 @@ impl GuardianClient {
             dispatch, completion,
         ))
     }
+    /// Correlates a store-validated failed application with same-guardian retained custody.
+    /// # Errors
+    /// Refuses stale binding, session, slots, failure, or transport uncertainty.
+    pub fn verify_native_sampling_failure_settlement(
+        &mut self,
+        candidate: crate::NativeSamplingFailureSettlementCandidate,
+    ) -> Result<crate::VerifiedNativeSamplingFailureSettlement, ClientError> {
+        let result = (|| {
+            if self.verified_snapshot.is_none() {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let snapshot = self.snapshot()?;
+            let binding = candidate.binding();
+            let issue = candidate.issue();
+            let native = snapshot
+                .native_binding
+                .as_ref()
+                .ok_or(ClientError::UnexpectedResponse)?;
+            let current = binding.current_session();
+            if snapshot.state != crate::guardian_ipc::WireState::Reconciling
+                || snapshot.session.instance != snapshot.instance
+                || snapshot.session.generation != current.generation.get()
+                || current.state != crate::NativeSessionState::Reconciling
+                || current.generation <= issue.session_generation()
+                || binding.dispatch_floor() != current.interruption_revision
+                || !binding
+                    .sessions()
+                    .iter()
+                    .any(|s| s.generation == issue.session_generation())
+                || binding.identity() != issue.guardian_identity()
+                || binding.attempt_id() != issue.key().attempt_id()
+                || snapshot.attempt != binding.attempt_id().get()
+                || snapshot.deadline != binding.deadline().get()
+                || native.attempt != snapshot.attempt
+                || native.deadline != snapshot.deadline
+                || native.nonce != binding.identity().nonce.bytes()
+                || native.guardian != binding.identity().process.into()
+                || !recovered_sampling_slots_match(binding, &snapshot, native)
+                || !crate::MonotonicTick::native_now()
+                    .is_ok_and(|now| now.get() < snapshot.deadline)
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let key = crate::guardian_ipc::WireKey::try_from(issue.key())
+                .map_err(ClientError::Refused)?;
+            let response = self.exchange(&Request::VerifyNativeSamplingFailureSettlement {
+                session: snapshot.session,
+                key,
+                issuing_session_generation: issue.session_generation().get(),
+            })?;
+            let Response::VerifiedNativeSamplingFailureSettlement {
+                key: returned,
+                sequence,
+                failure,
+            } = response
+            else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+            let expected = match candidate.failure() {
+                crate::ResourceObservationFailure::TemporarilyUnavailable => {
+                    crate::guardian_ipc::WireResourceError::TemporarilyUnavailable
+                }
+                crate::ResourceObservationFailure::Unsupported => {
+                    crate::guardian_ipc::WireResourceError::Unsupported
+                }
+                crate::ResourceObservationFailure::Malformed => {
+                    crate::guardian_ipc::WireResourceError::Malformed
+                }
+            };
+            if returned != key || sequence != issue.sequence() || failure != expected {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            Ok(crate::VerifiedNativeSamplingFailureSettlement::after_live_verification(candidate))
+        })();
+        if result.is_err() {
+            self.stream.take();
+            self.verified_snapshot = None;
+        }
+        result
+    }
+
+    /// ACK only an exact settled native failure; a lost response may be retried.
+    /// # Errors
+    /// Refuses non-settlements, stale session, guardian mismatch, or uncorrelated response.
+    pub fn ack_native_sampling_failure_settlement(
+        &mut self,
+        status: crate::NativeSamplingStatus,
+    ) -> Result<crate::VerifiedNativeSamplingFailureAckConfirmation, ClientError> {
+        let crate::NativeSamplingStatus::FailureSettledPendingAck {
+            issue,
+            failure,
+            applying_revision,
+            settlement_revision,
+            settling_session_generation,
+        } = status
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if self.verified_snapshot.is_none() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        let native = snapshot
+            .native_binding
+            .as_ref()
+            .ok_or(ClientError::UnexpectedResponse)?;
+        if snapshot.state != crate::guardian_ipc::WireState::Reconciling
+            || snapshot.session.instance != snapshot.instance
+            || snapshot.session.generation < settling_session_generation.get()
+            || snapshot.attempt != issue.key().attempt_id().get()
+            || native.attempt != snapshot.attempt
+            || native.deadline != snapshot.deadline
+            || native.nonce != issue.guardian_identity().nonce.bytes()
+            || native.guardian != issue.guardian_identity().process.into()
+            || !crate::MonotonicTick::native_now().is_ok_and(|now| now.get() < snapshot.deadline)
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let Response::NativeSamplingFailureSettlementAcked {
+            key: returned,
+            settlement_revision: returned_revision,
+        } = self.exchange(&Request::AckNativeSamplingFailureSettlement {
+            session: snapshot.session,
+            key,
+            issuing_session_generation: issue.session_generation().get(),
+        })?
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if returned != key || returned_revision != settlement_revision.get() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        Ok(crate::VerifiedNativeSamplingFailureAckConfirmation::new(
+            issue,
+            failure,
+            applying_revision,
+            settlement_revision,
+            std::num::NonZeroU64::new(snapshot.session.generation)
+                .ok_or(ClientError::UnexpectedResponse)?,
+        ))
+    }
+
     /// Verify application-only recovery against fresh live and pinned durable evidence.
     /// No dispatch, ACK, or transition authority is returned.
     /// # Errors
@@ -2041,6 +2201,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -2146,6 +2308,8 @@ impl GuardianClient {
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
             | Response::RecoveredNativeIdentityObservation { .. }
+            | Response::VerifiedNativeSamplingFailureSettlement { .. }
+            | Response::NativeSamplingFailureSettlementAcked { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -2192,6 +2356,38 @@ pub fn recover_native_sampling_ack(
         .map_err(NativeSamplingAckRecoveryError::Guardian)?;
     store
         .confirm_native_sampling_ack(proof)
+        .map_err(NativeSamplingAckRecoveryError::Store)
+}
+
+/// ACK-only recovery for an already-durable failure settlement. No sample or transition authority.
+/// # Errors
+/// Refuses unsettled/other evidence, mismatched guardian, or storage failure.
+pub fn recover_native_sampling_failure_settlement_ack(
+    store: &mut crate::ControllerSqliteStore,
+    client: &mut GuardianClient,
+    key: crate::DispatchKey,
+) -> Result<crate::NativeSamplingStatus, NativeSamplingAckRecoveryError> {
+    let (_, _, status) = store
+        .read_native_sampling_evidence(key)
+        .map_err(NativeSamplingAckRecoveryError::Store)?
+        .ok_or(NativeSamplingAckRecoveryError::NoPendingApplication)?;
+    if matches!(
+        status,
+        crate::NativeSamplingStatus::FailureSettlementAckConfirmed { .. }
+    ) {
+        return Ok(status);
+    }
+    if !matches!(
+        status,
+        crate::NativeSamplingStatus::FailureSettledPendingAck { .. }
+    ) {
+        return Err(NativeSamplingAckRecoveryError::NoPendingApplication);
+    }
+    let proof = client
+        .ack_native_sampling_failure_settlement(status)
+        .map_err(NativeSamplingAckRecoveryError::Guardian)?;
+    store
+        .confirm_native_sampling_failure_ack(proof)
         .map_err(NativeSamplingAckRecoveryError::Store)
 }
 
@@ -2407,10 +2603,57 @@ pub fn verify_native_binding(
 }
 
 #[cfg(target_os = "macos")]
+struct DisposableSamplingExecutor {
+    native: crate::MacOsGuardianExecutor,
+    fail_sample: bool,
+    sample_executions: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl crate::GuardianExecutor for DisposableSamplingExecutor {
+    type ChildSlot = crate::macos::SupervisedChild;
+
+    fn execute(
+        &mut self,
+        ticket: crate::DispatchTicket,
+        slots: &mut std::collections::BTreeMap<crate::ChildSlotId, Self::ChildSlot>,
+    ) -> crate::ExecutedEffect {
+        if self.fail_sample {
+            if let crate::OsEffect::SampleResources { sequence } = *ticket.effect() {
+                self.sample_executions += 1;
+                assert_eq!(
+                    self.sample_executions, 1,
+                    "disposable failure sampled twice"
+                );
+                println!("fixture_sample_resources_executed=1");
+                io::stdout().flush().expect("fixture marker flush");
+                return crate::ExecutedEffect::from_parts(
+                    ticket.key(),
+                    crate::EffectCompletion::SampleResources {
+                        sequence,
+                        result: Err(crate::ResourceObservationFailure::Unsupported),
+                    },
+                );
+            }
+        }
+        self.native.execute(ticket, slots)
+    }
+
+    fn poll_observation_only(&self, slot: &Self::ChildSlot) -> crate::ChildSlotObservation {
+        self.native.poll_observation_only(slot)
+    }
+
+    fn diagnostic_slot_identity(&self, slot: &Self::ChildSlot) -> Option<crate::ProcessIdentity> {
+        self.native.diagnostic_slot_identity(slot)
+    }
+}
+
+#[cfg(target_os = "macos")]
 /// Spawn one harmless direct child and hold its original parent slot until the
 /// explicitly bounded disposable fixture ends.
 /// # Errors
 /// Refuses any fixture outside the private temporary directory.
+#[allow(clippy::too_many_arguments)]
 pub fn run_disposable_guardian(
     dir: &Path,
     child_seconds: u64,
@@ -2419,6 +2662,7 @@ pub fn run_disposable_guardian(
     deadline: crate::MonotonicTick,
     store_path: &Path,
     ack_response_barrier: bool,
+    fail_sample: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
         Guardian, GuardianLifetimeNonce, MacOsControllerOs, MacOsGuardianExecutor,
@@ -2451,7 +2695,11 @@ pub fn run_disposable_guardian(
     let (guardian, session) = Guardian::new(
         attempt,
         deadline,
-        MacOsGuardianExecutor::new(os),
+        DisposableSamplingExecutor {
+            native: MacOsGuardianExecutor::new(os),
+            fail_sample,
+            sample_executions: 0,
+        },
         vec![child],
     )
     .map_err(|failure| {

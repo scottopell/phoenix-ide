@@ -2548,3 +2548,181 @@ fn fresh_runner_continues_exactly_one_retained_sample_after_two_phase_activation
     wait_process_gone(child_pid, Duration::from_secs(5));
     wait_process_gone(guardian_pid, Duration::from_secs(5));
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn failed_sample_settles_without_a_second_effect_and_survives_postcommit_runner_death() {
+    use phoenix_deployment_controller::{NativeSamplingStatus, ResourceObservationFailure};
+    let parent = tempfile::Builder::new()
+        .prefix("sdc-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = parent.path().join("sdc-disposable-failure-settlement");
+    let path = parent.path().join("controller.sqlite");
+    let attempt = AttemptId::new(64);
+    let deadline = MonotonicTick::native_now()
+        .unwrap()
+        .checked_add(Duration::from_secs(65))
+        .unwrap();
+    drop(ControllerSqliteStore::open(&path).unwrap());
+    let mut guardian = GuardedGuardian::new(
+        Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"))
+            .args([
+                "--socket-dir",
+                dir.to_str().unwrap(),
+                "--child-seconds",
+                "40",
+                "--serve-seconds",
+                "50",
+                "--attempt",
+                "64",
+                "--deadline-nanoseconds",
+                &deadline.get().to_string(),
+                "--store",
+                path.to_str().unwrap(),
+                "--fixture-sample-unsupported",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut guardian_output = BufReader::new(guardian.stdout.take().unwrap());
+    let child_line = line(&mut guardian_output);
+    let child_pid: u32 = child_line
+        .strip_prefix("disposable child pid=")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let birth: Vec<_> = child_line
+        .split("birth=")
+        .nth(1)
+        .unwrap()
+        .split(':')
+        .collect();
+    let root = ProcessIdentity::new(
+        ProcessId::new(NonZeroU32::new(child_pid).unwrap()),
+        BirthToken::new(birth[0].parse().unwrap(), birth[1].parse().unwrap()).unwrap(),
+    );
+    let mut initial = GuardedRunner::new(
+        sampling_runner_command_with_root(&dir, &path, deadline, root, false)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut initial_output = BufReader::new(initial.stdout.take().unwrap());
+    assert_eq!(line(&mut initial_output), "verified binding: InitialActive");
+    assert!(line(&mut initial_output)
+        .starts_with("sampling_failure_parked_pending_settlement revision="));
+    success(&mut initial);
+    initial.finish();
+    assert_eq!(
+        line(&mut guardian_output),
+        "fixture_sample_resources_executed=1"
+    );
+    let detached = wait_for_detached(&dir);
+    assert_eq!(detached.retained.len(), 1);
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let (key, status) = observed
+        .sole_native_sampling_failure(attempt)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(status, NativeSamplingStatus::ParkedRetained { issue, failure: ResourceObservationFailure::Unsupported, .. } if issue.key() == key)
+    );
+    let binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    let original_identity = binding.identity();
+    let original_slots = binding.slots().to_vec();
+    assert_eq!(binding.deadline(), deadline);
+    drop(observed);
+    let spawn_settlement = |pause: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"));
+        command.args([
+            "--mode",
+            "settle-failed-sample",
+            "--socket-dir",
+            dir.to_str().unwrap(),
+            "--store",
+            path.to_str().unwrap(),
+            "--attempt",
+            "64",
+        ]);
+        if pause {
+            command
+                .arg("--fixture-pause-after-settlement")
+                .stdin(Stdio::piped());
+        }
+        GuardedRunner::new(command.stdout(Stdio::piped()).spawn().unwrap())
+    };
+    let mut crash = spawn_settlement(true);
+    let mut crash_output = BufReader::new(crash.stdout.take().unwrap());
+    assert!(line(&mut crash_output).starts_with("verified binding: Detached"));
+    assert!(line(&mut crash_output).starts_with("reconciling generation="));
+    assert!(line(&mut crash_output).starts_with("sampling_failure_settled_pending_ack revision="));
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    assert!(matches!(
+        observed.load_native_sampling_status(key).unwrap(),
+        Some(NativeSamplingStatus::FailureSettledPendingAck { .. })
+    ));
+    assert_eq!(
+        observed.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::Interrupted
+    );
+    drop(observed);
+    crash.kill_checked();
+    let after_crash = wait_for_detached(&dir);
+    assert_eq!(after_crash.retained.len(), 1);
+    let mut recovery = spawn_settlement(false);
+    let mut recovery_output = BufReader::new(recovery.stdout.take().unwrap());
+    assert!(line(&mut recovery_output).starts_with("verified binding: Detached"));
+    assert!(line(&mut recovery_output).starts_with("reconciling generation="));
+    assert_eq!(line(&mut recovery_output), "sampling_failure_settlement_confirmed generation=3 effects=0 sample_resources=0 list_children=0 observe_identity=0 signal=0");
+    success(&mut recovery);
+    recovery.finish();
+    let final_snapshot = wait_for_detached(&dir);
+    assert_eq!(final_snapshot.session.generation, 3);
+    assert!(final_snapshot.retained.is_empty());
+    assert_eq!(final_snapshot.instance, detached.instance);
+    assert_eq!(final_snapshot.deadline, detached.deadline);
+    assert_eq!(
+        final_snapshot.native_binding.as_ref().unwrap().nonce,
+        detached.native_binding.as_ref().unwrap().nonce
+    );
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(binding.identity(), original_identity);
+    assert_eq!(binding.slots(), original_slots.as_slice());
+    assert_eq!(binding.deadline(), deadline);
+    assert_eq!(
+        observed.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::Interrupted
+    );
+    assert!(
+        matches!(observed.load_native_sampling_status(key).unwrap(), Some(NativeSamplingStatus::FailureSettlementAckConfirmed { confirming_session_generation, .. }) if confirming_session_generation.get() == 3)
+    );
+    let db =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    for (table, expected) in [
+        ("native_sampling_issues", 1),
+        ("native_sampling_applications", 1),
+        ("native_sampling_failure_settlements", 1),
+        ("native_sampling_failure_ack_confirmations", 1),
+        ("native_sampling_ack_confirmations", 0),
+        ("native_child_list_issues", 0),
+        ("native_identity_observation_issues", 0),
+        ("native_reconciliation_activations", 0),
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, expected, "{table}");
+    }
+    assert!(guardian.try_wait().unwrap().is_none());
+    guardian.finish();
+}

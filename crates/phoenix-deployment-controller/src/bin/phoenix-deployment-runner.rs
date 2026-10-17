@@ -5,7 +5,8 @@ use phoenix_deployment_controller::{
     guardian_ipc::{WireNativeBinding, WireObservation, WireSnapshot, WireState},
     native_guardian::{
         recover_native_child_list_ack, recover_native_identity_observation_ack,
-        recover_native_sampling_ack, verify_native_binding, GuardianClient, VerifiedBindingStatus,
+        recover_native_sampling_ack, recover_native_sampling_failure_settlement_ack,
+        verify_native_binding, GuardianClient, VerifiedBindingStatus,
     },
     AckDisposition, AttemptId, BirthToken, CleanupOutcome, CommittedTransition,
     ControllerSqliteStore, CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce,
@@ -48,6 +49,7 @@ enum RunnerMode {
         root: ProcessIdentity,
         fixture: InitialFixture,
     },
+    SettleFailedSample(SettleFailureFixture),
     RecoverAppliedAck(AckRecoveryFixture),
     RecoverUnappliedSample {
         fixture: UnappliedRecoveryFixture,
@@ -79,6 +81,13 @@ enum InitialFixture {
     Run,
     PauseAfterObservation(ReleaseSource),
     PauseAfterApplication(ReleaseSource),
+}
+
+#[cfg(unix)]
+enum SettleFailureFixture {
+    Run,
+    PauseAfterVerification(ReleaseSource),
+    PauseAfterSettlement(ReleaseSource),
 }
 
 #[cfg(unix)]
@@ -222,6 +231,36 @@ fn parse_initial_sample(args: &[OsString], usage: &str) -> Result<RunnerMode, St
         root,
         fixture,
     })
+}
+
+#[cfg(unix)]
+fn parse_settle_failed_sample(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
+    let fixture = match args {
+        [_, _, _, _, _, _, _, _] => SettleFailureFixture::Run,
+        [_, _, _, _, _, _, _, _, pause]
+            if pause == "--fixture-pause-after-settlement-verification" =>
+        {
+            SettleFailureFixture::PauseAfterVerification(ReleaseSource::Stdin)
+        }
+        [_, _, _, _, _, _, _, _, pause] if pause == "--fixture-pause-after-settlement" => {
+            SettleFailureFixture::PauseAfterSettlement(ReleaseSource::Stdin)
+        }
+        [_, _, _, _, _, _, _, _, pause, release, path]
+            if (pause == "--fixture-pause-after-settlement-verification"
+                || pause == "--fixture-pause-after-settlement")
+                && release == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(path);
+            validate_release_path(&path)?;
+            if pause == "--fixture-pause-after-settlement-verification" {
+                SettleFailureFixture::PauseAfterVerification(ReleaseSource::DisposableFile(path))
+            } else {
+                SettleFailureFixture::PauseAfterSettlement(ReleaseSource::DisposableFile(path))
+            }
+        }
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::SettleFailedSample(fixture))
 }
 
 #[cfg(unix)]
@@ -369,7 +408,7 @@ fn parse_recover_unapplied_child_list(
 
 #[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-unapplied-child-list|recover-unapplied-identity|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-finish-and-ready|recover-child-list-ack|recover-identity-ack> --socket-dir <private fixture> --store <existing schema-v7 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample, recover-unapplied-child-list or recover-unapplied-identity only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-observation|--fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only) | --fixture-pause-after-identity-observation|--fixture-pause-after-identity-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-ready only) | --fixture-pause-after-identity-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-identity-ack only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|settle-failed-sample|recover-applied-ack|recover-unapplied-sample|recover-unapplied-child-list|recover-unapplied-identity|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-finish-and-ready|recover-child-list-ack|recover-identity-ack> --socket-dir <private fixture> --store <existing schema-v8 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-settlement-verification|--fixture-pause-after-settlement [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (settle-failed-sample only) | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample, recover-unapplied-child-list or recover-unapplied-identity only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-observation|--fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only) | --fixture-pause-after-identity-observation|--fixture-pause-after-identity-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-ready only) | --fixture-pause-after-identity-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-identity-ack only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -388,6 +427,7 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
                 observe_seconds: seconds,
             }
         }
+        "settle-failed-sample" => parse_settle_failed_sample(args, usage)?,
         "recover-applied-ack" => parse_recover_applied_ack(args, usage)?,
         "recover-unapplied-child-list" | "recover-unapplied-identity" => {
             parse_recover_unapplied_child_list(args, usage)?
@@ -702,6 +742,100 @@ fn prepare_initial_attempt(
         .persist(store)
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn run_settle_failed_sample(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    attempt: AttemptId,
+    session: phoenix_deployment_controller::guardian_ipc::WireSession,
+    fixture: &SettleFailureFixture,
+) -> Result<(), String> {
+    let (key, status) = store
+        .sole_native_sampling_failure(attempt)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing sole failed sampling issue")?;
+    if !matches!(
+        status,
+        NativeSamplingStatus::ParkedRetained {
+            failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported,
+            ..
+        } | NativeSamplingStatus::FailureSettledPendingAck {
+            failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported,
+            ..
+        }
+    ) {
+        return Err("settlement fixture requires exact Unsupported failure".into());
+    }
+    let settled = match status {
+        NativeSamplingStatus::ParkedRetained { .. } => {
+            let loaded = store
+                .load_attempt(attempt)
+                .map_err(|e| e.to_string())?
+                .ok_or("missing interrupted attempt")?;
+            let candidate = store
+                .prepare_native_sampling_failure_settlement(loaded, key)
+                .map_err(|e| format!("prepare failure settlement: {e}"))?;
+            let issue = candidate.issue();
+            let verified = client
+                .verify_native_sampling_failure_settlement(candidate)
+                .map_err(|e| format!("verify failure settlement: {e:?}"))?;
+            if let SettleFailureFixture::PauseAfterVerification(release) = fixture {
+                let gate = release.prepare()?;
+                println!(
+                    "sampling_failure_verified_pending_settlement revision={}",
+                    key.revision().get()
+                );
+                std::io::stdout().flush().map_err(|e| e.to_string())?;
+                gate.wait()?;
+            }
+            let settled = store
+                .settle_native_sampling_failure(verified)
+                .map_err(|e| format!("settle failure: {e}"))?;
+            if !matches!(settled, NativeSamplingStatus::FailureSettledPendingAck { issue: stored, failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported, .. } if stored == issue)
+            {
+                return Err("settlement was not exact pending failure ACK".into());
+            }
+            settled
+        }
+        status @ NativeSamplingStatus::FailureSettledPendingAck { .. } => status,
+        _ => return Err("failed sample is neither parked nor pending settlement ACK".into()),
+    };
+    if let SettleFailureFixture::PauseAfterSettlement(release) = fixture {
+        let gate = release.prepare()?;
+        println!(
+            "sampling_failure_settled_pending_ack revision={}",
+            key.revision().get()
+        );
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        gate.wait()?;
+    }
+    let confirmed = recover_native_sampling_failure_settlement_ack(store, client, key)
+        .map_err(|e| format!("failure ACK: {e:?}"))?;
+    if !matches!((settled, confirmed),
+        (NativeSamplingStatus::FailureSettledPendingAck { issue, .. }, NativeSamplingStatus::FailureSettlementAckConfirmed { issue: stored, failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported, confirming_session_generation, .. })
+        if stored == issue && confirming_session_generation.get() == session.generation)
+    {
+        return Err("failure ACK confirmation mismatch".into());
+    }
+    let snapshot = client
+        .snapshot()
+        .map_err(|e| format!("confirmed snapshot: {e:?}"))?;
+    if snapshot.state != WireState::Reconciling
+        || snapshot.session != session
+        || !snapshot.retained.is_empty()
+    {
+        return Err("failure ACK did not release retained result in Reconciling".into());
+    }
+    let loaded = store
+        .load_attempt(attempt)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing settled attempt")?;
+    if loaded.phase() != Phase::Interrupted {
+        return Err("failure settlement changed Interrupted phase".into());
+    }
+    println!("sampling_failure_settlement_confirmed generation={} effects=0 sample_resources=0 list_children=0 observe_identity=0 signal=0", session.generation);
+    std::io::stdout().flush().map_err(|e| e.to_string())
 }
 
 fn run_recover_applied_ack(
@@ -1811,6 +1945,25 @@ fn run_initial_sample(
     let progress = policy
         .apply_native_sampling(verified, store)
         .map_err(|error| format!("apply sample: {error:?}"))?;
+    if matches!(progress, LoopProgress::Parked { key, ack: AckDisposition::RetainParked, .. } if key == issue.key())
+    {
+        let status = store
+            .load_native_sampling_status(issue.key())
+            .map_err(|e| e.to_string())?;
+        if !matches!(status, Some(NativeSamplingStatus::ParkedRetained { issue: stored, failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported, .. }) if stored == issue)
+        {
+            return Err("parked sample not durably Unsupported".into());
+        }
+        println!(
+            "sampling_failure_parked_pending_settlement revision={}",
+            issue.key().revision().get()
+        );
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        if let InitialFixture::PauseAfterApplication(release) = fixture {
+            release.prepare()?.wait()?;
+        }
+        return Ok(());
+    }
     if !matches!(progress, LoopProgress::Applied { key, ack: AckDisposition::AcknowledgeNow, .. } if key == issue.key())
     {
         return Err(format!(
@@ -1909,7 +2062,8 @@ fn main() -> Result<(), String> {
     }
     if matches!(
         config.mode,
-        RunnerMode::RecoverAppliedAck(_)
+        RunnerMode::SettleFailedSample(_)
+            | RunnerMode::RecoverAppliedAck(_)
             | RunnerMode::RecoverUnappliedSample { .. }
             | RunnerMode::RecoverUnappliedChildList { .. }
             | RunnerMode::RecoverUnappliedIdentity { .. }
@@ -1959,6 +2113,7 @@ fn main() -> Result<(), String> {
                 | RunnerMode::RecoverFinishAndReady { .. }
                 | RunnerMode::ObserveOnly { .. }
                 | RunnerMode::InitialSample { .. }
+                | RunnerMode::SettleFailedSample(_)
                 | RunnerMode::RecoverAppliedAck(_)
                 | RunnerMode::RecoverUnappliedSample { .. }
                 | RunnerMode::RecoverUnappliedChildList { .. }
@@ -2025,6 +2180,13 @@ fn main() -> Result<(), String> {
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
             fixture,
         ),
+        RunnerMode::SettleFailedSample(fixture) => run_settle_failed_sample(
+            &mut store,
+            &mut client,
+            config.attempt,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
+            fixture,
+        ),
         RunnerMode::RecoverAppliedAck(fixture) => run_recover_applied_ack(
             &mut store,
             &mut client,
@@ -2079,6 +2241,80 @@ mod tests {
         .into_iter()
         .map(OsString::from)
         .collect()
+    }
+
+    #[test]
+    fn settlement_mode_accepts_only_its_bounded_pause_arguments() {
+        let base = args("settle-failed-sample");
+        assert!(matches!(
+            parse_args(&base).unwrap().mode,
+            RunnerMode::SettleFailedSample(SettleFailureFixture::Run)
+        ));
+        for flag in [
+            "--fixture-pause-after-settlement-verification",
+            "--fixture-pause-after-settlement",
+        ] {
+            let mut command = base.clone();
+            command.push(flag.into());
+            assert!(matches!(
+                parse_args(&command).unwrap().mode,
+                RunnerMode::SettleFailedSample(
+                    SettleFailureFixture::PauseAfterVerification(_)
+                        | SettleFailureFixture::PauseAfterSettlement(_)
+                )
+            ));
+            for invalid in [
+                "--fixture-pause-after-apply",
+                "--fixture-pause-after-observation",
+                "--fixture-activation-barriers",
+                "--fixture-pause-after-identity-ack",
+            ] {
+                let mut wrong = base.clone();
+                wrong.push(invalid.into());
+                assert!(parse_args(&wrong).is_err(), "accepted {invalid}");
+            }
+            let mut missing = command.clone();
+            missing.push("--fixture-release-file".into());
+            assert!(parse_args(&missing).is_err());
+            let mut extra = command.clone();
+            extra.push("--fixture-release-file".into());
+            extra.push("/tmp/other/runner-release.signal".into());
+            assert!(parse_args(&extra).is_err());
+            let mut other_mode = args("recover-applied-ack");
+            other_mode.push(flag.into());
+            assert!(parse_args(&other_mode).is_err());
+        }
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        for flag in [
+            "--fixture-pause-after-settlement-verification",
+            "--fixture-pause-after-settlement",
+        ] {
+            let mut command = base.clone();
+            command.extend([
+                OsString::from(flag),
+                "--fixture-release-file".into(),
+                root.path().join("runner-release.signal").into_os_string(),
+            ]);
+            assert!(matches!(
+                parse_args(&command).unwrap().mode,
+                RunnerMode::SettleFailedSample(
+                    SettleFailureFixture::PauseAfterVerification(ReleaseSource::DisposableFile(_))
+                        | SettleFailureFixture::PauseAfterSettlement(
+                            ReleaseSource::DisposableFile(_)
+                        )
+                )
+            ));
+        }
+        let mut duplicate = base.clone();
+        duplicate.extend([
+            OsString::from("--fixture-pause-after-settlement"),
+            OsString::from("--fixture-pause-after-settlement"),
+        ]);
+        assert!(parse_args(&duplicate).is_err());
     }
 
     #[test]
@@ -3005,7 +3241,7 @@ mod tests {
             let error = parse_args(&invalid)
                 .err()
                 .expect("ready mode rejects extra authority");
-            assert!(error.contains("schema-v7 store"));
+            assert!(error.contains("schema-v8 store"));
             assert!(error.contains("recover-finish-and-ready"));
         }
         let mut old = args("recover-finish-and-child-list");

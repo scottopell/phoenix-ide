@@ -55,17 +55,19 @@ pub use native_reconciliation::{
 mod native_sampling;
 mod resources;
 pub use native_sampling::{
-    NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingIssue,
-    NativeSamplingRecoveryCandidate, NativeSamplingStatus, VerifiedNativeSamplingAckConfirmation,
-    VerifiedNativeSamplingCompletion, VerifiedRecoveredNativeSampling,
+    NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingFailureSettlementCandidate,
+    NativeSamplingIssue, NativeSamplingRecoveryCandidate, NativeSamplingStatus,
+    VerifiedNativeSamplingAckConfirmation, VerifiedNativeSamplingCompletion,
+    VerifiedNativeSamplingFailureAckConfirmation, VerifiedNativeSamplingFailureSettlement,
+    VerifiedRecoveredNativeSampling,
 };
 mod tree;
 
 const SCHEMA: &str = include_str!("sqlite/schema.sql");
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// An independent controller database, never a Phoenix application connection.
-/// Only schema version 7 is supported; there is no upgrade/downgrade policy.
+/// Only schema version 8 is supported; there is no upgrade/downgrade policy.
 #[derive(Debug)]
 pub struct ControllerSqliteStore {
     connection: Connection,
@@ -155,7 +157,7 @@ impl ControllerSqliteStore {
         })
     }
 
-    /// Opens an existing schema-v7 store for guardian read-only evidence.
+    /// Opens an existing schema-v8 store for guardian read-only evidence.
     /// # Errors
     /// Rejects missing or incompatible stores.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
@@ -1640,6 +1642,65 @@ mod tests {
             crate::MemoryPressure::Critical,
         );
         DeploymentAttempt::start(AttemptId::new(1), MonotonicTick::new(100), policy, root)
+    }
+
+    #[test]
+    fn frozen_v7_store_is_rejected_unchanged_and_new_store_is_v8() {
+        let old = include_str!("sqlite/schema_v7.sql");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let connection = rusqlite::Connection::open(file.path()).unwrap();
+        connection.execute_batch(old).unwrap();
+        let before: Vec<(String, String)> = {
+            let mut statement = connection
+                .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(matches!(
+            ControllerSqliteStore::initialize(connection),
+            Err(ControllerStoreError::UnsupportedSchema(7))
+        ));
+        let fresh = ControllerSqliteStore::in_memory().unwrap();
+        assert_eq!(
+            fresh
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        assert_eq!(fresh.connection.query_row("SELECT count(*) FROM sqlite_schema WHERE name='native_sampling_failure_settlements'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let old_again = rusqlite::Connection::open(file.path()).unwrap();
+        assert_eq!(
+            old_again
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        let after: Vec<(String, String)> = {
+            let mut statement = old_again
+                .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn schema_v9_is_rejected_without_mutation() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.pragma_update(None, "user_version", 9).unwrap();
+        assert!(matches!(
+            ControllerSqliteStore::initialize(connection),
+            Err(ControllerStoreError::UnsupportedSchema(9))
+        ));
     }
 
     #[test]

@@ -48,7 +48,7 @@ fn setup(path: &std::path::Path) -> (ControllerSqliteStore, PolicyLoop) {
 }
 
 #[test]
-fn schema_v7_is_empty_and_older_versions_are_rejected_without_mutation() {
+fn schema_v8_is_empty_and_older_versions_are_rejected_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fresh.sqlite");
     let store = ControllerSqliteStore::open(&path).unwrap();
@@ -57,7 +57,7 @@ fn schema_v7_is_empty_and_older_versions_are_rejected_without_mutation() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     for table in [
         "native_reconciliation_activations",
@@ -65,6 +65,8 @@ fn schema_v7_is_empty_and_older_versions_are_rejected_without_mutation() {
         "native_sampling_issues",
         "native_sampling_applications",
         "native_sampling_ack_confirmations",
+        "native_sampling_failure_settlements",
+        "native_sampling_failure_ack_confirmations",
     ] {
         assert_eq!(
             raw.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r

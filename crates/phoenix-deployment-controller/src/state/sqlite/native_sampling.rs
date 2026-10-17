@@ -217,6 +217,73 @@ impl VerifiedRecoveredNativeSampling {
     }
 }
 
+/// Affine store-validated settlement candidate, not a sampling recovery or dispatch ticket.
+#[derive(Debug)]
+pub struct NativeSamplingFailureSettlementCandidate {
+    loaded: LoadedAttempt,
+    binding: NativeGuardianBinding,
+    issue: NativeSamplingIssue,
+    failure: ResourceObservationFailure,
+    applying_revision: PersistenceRevision,
+}
+
+impl NativeSamplingFailureSettlementCandidate {
+    #[must_use]
+    pub const fn issue(&self) -> NativeSamplingIssue {
+        self.issue
+    }
+    #[must_use]
+    pub const fn failure(&self) -> ResourceObservationFailure {
+        self.failure
+    }
+    #[must_use]
+    pub const fn binding(&self) -> &NativeGuardianBinding {
+        &self.binding
+    }
+}
+
+/// Guardian-correlated retained failure; consuming it grants only a checkpoint settlement.
+#[derive(Debug)]
+pub struct VerifiedNativeSamplingFailureSettlement {
+    candidate: NativeSamplingFailureSettlementCandidate,
+}
+
+impl VerifiedNativeSamplingFailureSettlement {
+    pub(crate) const fn after_live_verification(
+        candidate: NativeSamplingFailureSettlementCandidate,
+    ) -> Self {
+        Self { candidate }
+    }
+}
+
+/// An exact positive response to the failure-only ACK request, never a sample ACK.
+#[derive(Debug)]
+pub struct VerifiedNativeSamplingFailureAckConfirmation {
+    issue: NativeSamplingIssue,
+    failure: ResourceObservationFailure,
+    applying_revision: PersistenceRevision,
+    settlement_revision: PersistenceRevision,
+    confirming_session_generation: NonZeroU64,
+}
+
+impl VerifiedNativeSamplingFailureAckConfirmation {
+    pub(crate) const fn new(
+        issue: NativeSamplingIssue,
+        failure: ResourceObservationFailure,
+        applying_revision: PersistenceRevision,
+        settlement_revision: PersistenceRevision,
+        confirming_session_generation: NonZeroU64,
+    ) -> Self {
+        Self {
+            issue,
+            failure,
+            applying_revision,
+            settlement_revision,
+            confirming_session_generation,
+        }
+    }
+}
+
 /// Durable diagnostic classification; loading it never reconstructs authority.
 ///
 /// ```compile_fail
@@ -243,6 +310,21 @@ pub enum NativeSamplingStatus {
         issue: NativeSamplingIssue,
         failure: ResourceObservationFailure,
         applying_revision: PersistenceRevision,
+    },
+    FailureSettledPendingAck {
+        issue: NativeSamplingIssue,
+        failure: ResourceObservationFailure,
+        applying_revision: PersistenceRevision,
+        settlement_revision: PersistenceRevision,
+        settling_session_generation: NonZeroU64,
+    },
+    FailureSettlementAckConfirmed {
+        issue: NativeSamplingIssue,
+        failure: ResourceObservationFailure,
+        applying_revision: PersistenceRevision,
+        settlement_revision: PersistenceRevision,
+        settling_session_generation: NonZeroU64,
+        confirming_session_generation: NonZeroU64,
     },
 }
 
@@ -284,6 +366,343 @@ fn unique_recovery_issue(
         }
     }
     candidate.ok_or(ControllerStoreError::RevisionConflict)
+}
+
+fn validate_failure_settlement(
+    tx: &rusqlite::Transaction<'_>,
+    interrupted: &DeploymentAttempt,
+    binding: &NativeGuardianBinding,
+    issue: NativeSamplingIssue,
+    failure: ResourceObservationFailure,
+    applying_revision: PersistenceRevision,
+    now: MonotonicTick,
+) -> Result<()> {
+    let session = binding.current_session();
+    if now >= interrupted.deadline()
+        || interrupted.phase() != crate::Phase::Interrupted
+        || interrupted.interrupted_sampling_sequence() != Some(issue.sequence())
+        || interrupted.persistence_revision() != Some(session.interruption_revision)
+        || interrupted.deadline() != binding.deadline()
+        || interrupted.attempt_id() != issue.key().attempt_id()
+        || binding.attempt_id() != issue.key().attempt_id()
+        || binding.identity() != issue.guardian_identity()
+        || session.state != NativeSessionState::Reconciling
+        || issue.session_generation() >= session.generation
+        || issue.key().revision() >= applying_revision
+        || applying_revision >= session.interruption_revision
+        || binding.dispatch_floor() != session.interruption_revision
+        || !binding
+            .sessions()
+            .iter()
+            .any(|s| s.generation == issue.session_generation())
+        || read_attempt(tx, issue.key().attempt_id())?.as_ref() != Some(interrupted)
+        || read_binding(tx, issue.key().attempt_id())?.as_ref() != Some(binding)
+        || read_status(tx, issue.key())?
+            != Some(NativeSamplingStatus::ParkedRetained {
+                issue,
+                failure,
+                applying_revision,
+            })
+    {
+        return Err(ControllerStoreError::RevisionConflict);
+    }
+    let mut statement = tx.prepare(
+        "SELECT dispatch_revision,ordinal FROM native_sampling_issues WHERE attempt_id=?1",
+    )?;
+    let rows = statement.query_map([key(issue.key().attempt_id())], |row| {
+        Ok((row.get::<_, Word>(0)?.0, row.get::<_, i64>(1)?))
+    })?;
+    let mut failures = 0;
+    for row in rows {
+        let (revision, ordinal) = row?;
+        let dispatch = DispatchKey::from_committed_parts(
+            issue.key().attempt_id(),
+            binding_revision(revision)?,
+            usize::try_from(ordinal).map_err(|_| ControllerStoreError::RevisionConflict)?,
+        );
+        match read_status(tx, dispatch)? {
+            Some(NativeSamplingStatus::ParkedRetained { .. }) if dispatch == issue.key() => {
+                failures += 1
+            }
+            Some(NativeSamplingStatus::SampleAckConfirmed { .. }) => {}
+            _ => return Err(ControllerStoreError::RevisionConflict),
+        }
+    }
+    if failures != 1 {
+        return Err(ControllerStoreError::RevisionConflict);
+    }
+    Ok(())
+}
+
+impl ControllerSqliteStore {
+    /// Classifies one already-durable failed sample in a fresh Interrupted/Reconciling session.
+    /// # Errors
+    /// Stale, multiple, successful, missing, or expired evidence poisons the handle.
+    pub fn prepare_native_sampling_failure_settlement(
+        &mut self,
+        loaded: LoadedAttempt,
+        dispatch: DispatchKey,
+    ) -> Result<NativeSamplingFailureSettlementCandidate> {
+        self.prepare_native_sampling_failure_settlement_with_clock(
+            loaded,
+            dispatch,
+            native_deadline_now,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_native_sampling_failure_settlement_at(
+        &mut self,
+        loaded: LoadedAttempt,
+        dispatch: DispatchKey,
+        now: MonotonicTick,
+    ) -> Result<NativeSamplingFailureSettlementCandidate> {
+        self.prepare_native_sampling_failure_settlement_with_clock(loaded, dispatch, || Ok(now))
+    }
+
+    fn prepare_native_sampling_failure_settlement_with_clock(
+        &mut self,
+        loaded: LoadedAttempt,
+        dispatch: DispatchKey,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeSamplingFailureSettlementCandidate> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            let binding = required(
+                read_binding(&tx, dispatch.attempt_id())?,
+                "missing native binding",
+            )?;
+            let NativeSamplingStatus::ParkedRetained {
+                issue,
+                failure,
+                applying_revision,
+            } = required(
+                read_status(&tx, dispatch)?,
+                "missing native sampling failure",
+            )?
+            else {
+                return Err(ControllerStoreError::RevisionConflict);
+            };
+            validate_failure_settlement(
+                &tx,
+                &loaded.checkpoint,
+                &binding,
+                issue,
+                failure,
+                applying_revision,
+                clock()?,
+            )?;
+            if clock()? >= loaded.checkpoint.deadline() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.commit()?;
+            Ok(NativeSamplingFailureSettlementCandidate {
+                loaded,
+                binding,
+                issue,
+                failure,
+                applying_revision,
+            })
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Advances only the Interrupted checkpoint revision and records the exact failure settlement.
+    /// Returns diagnostics, never a transition, effect, sample, or ACK capability.
+    /// # Errors
+    /// An expired deadline, replay, or changed evidence rolls back and poisons the handle.
+    pub fn settle_native_sampling_failure(
+        &mut self,
+        verified: VerifiedNativeSamplingFailureSettlement,
+    ) -> Result<NativeSamplingStatus> {
+        self.settle_native_sampling_failure_with_clock(verified, native_deadline_now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settle_native_sampling_failure_at(
+        &mut self,
+        verified: VerifiedNativeSamplingFailureSettlement,
+        now: MonotonicTick,
+    ) -> Result<NativeSamplingStatus> {
+        self.settle_native_sampling_failure_with_clock(verified, || Ok(now))
+    }
+
+    fn settle_native_sampling_failure_with_clock(
+        &mut self,
+        verified: VerifiedNativeSamplingFailureSettlement,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeSamplingStatus> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let NativeSamplingFailureSettlementCandidate {
+                loaded,
+                binding,
+                issue,
+                failure,
+                applying_revision,
+            } = verified.candidate;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            validate_failure_settlement(
+                &tx,
+                &loaded.checkpoint,
+                &binding,
+                issue,
+                failure,
+                applying_revision,
+                clock()?,
+            )?;
+            let current = loaded
+                .checkpoint
+                .persistence_revision()
+                .ok_or(ControllerStoreError::RevisionConflict)?;
+            let revision = current
+                .checked_next()
+                .ok_or(ControllerStoreError::RevisionExhausted)?;
+            let (id, dispatch, ordinal) = issue_params(issue);
+            if tx.execute("UPDATE attempts SET revision=?1 WHERE attempt_id=?2 AND revision=?3 AND phase='interrupted'", params![Word(revision.get()), id, Word(current.get())])? != 1 {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.execute(
+                "INSERT INTO native_sampling_failure_settlements VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    dispatch,
+                    ordinal,
+                    Word(applying_revision.get()),
+                    Word(revision.get()),
+                    Word(binding.current_session().generation.get())
+                ],
+            )?;
+            let expected = NativeSamplingStatus::FailureSettledPendingAck {
+                issue,
+                failure,
+                applying_revision,
+                settlement_revision: revision,
+                settling_session_generation: binding.current_session().generation,
+            };
+            if read_status(&tx, issue.key())? != Some(expected) {
+                return malformed("failure settlement did not round-trip");
+            }
+            let mut checkpoint = loaded.checkpoint;
+            checkpoint.set_revision(revision);
+            if read_attempt(&tx, issue.key().attempt_id())?.as_ref() != Some(&checkpoint) {
+                return malformed("settlement changed Interrupted checkpoint");
+            }
+            if clock()? >= checkpoint.deadline() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.commit()?;
+            Ok(expected)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Records a separately verified failure ACK without changing sampling policy.
+    /// # Errors
+    /// Mismatched or duplicate confirmation poisons the store.
+    pub fn confirm_native_sampling_failure_ack(
+        &mut self,
+        confirmation: VerifiedNativeSamplingFailureAckConfirmation,
+    ) -> Result<NativeSamplingStatus> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let VerifiedNativeSamplingFailureAckConfirmation {
+                issue,
+                failure,
+                applying_revision,
+                settlement_revision,
+                confirming_session_generation,
+            } = confirmation;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            let NativeSamplingStatus::FailureSettledPendingAck {
+                settling_session_generation,
+                ..
+            } = required(read_status(&tx, issue.key())?, "missing failure settlement")?
+            else {
+                return Err(ControllerStoreError::RevisionConflict);
+            };
+            if settling_session_generation > confirming_session_generation
+                || read_status(&tx, issue.key())?
+                    != Some(NativeSamplingStatus::FailureSettledPendingAck {
+                        issue,
+                        failure,
+                        applying_revision,
+                        settlement_revision,
+                        settling_session_generation,
+                    })
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            let binding = required(
+                read_binding(&tx, issue.key().attempt_id())?,
+                "missing failure ACK binding",
+            )?;
+            let checkpoint = required(
+                read_attempt(&tx, issue.key().attempt_id())?,
+                "missing failure ACK checkpoint",
+            )?;
+            let current = binding.current_session();
+            let expected_revision = if confirming_session_generation == settling_session_generation
+            {
+                settlement_revision
+            } else {
+                if current.interruption_revision <= settlement_revision {
+                    return Err(ControllerStoreError::RevisionConflict);
+                }
+                current.interruption_revision
+            };
+            if current.generation != confirming_session_generation
+                || current.state != NativeSessionState::Reconciling
+                || binding.dispatch_floor() != current.interruption_revision
+                || checkpoint.phase() != crate::Phase::Interrupted
+                || checkpoint.interrupted_sampling_sequence() != Some(issue.sequence())
+                || checkpoint.persistence_revision() != Some(expected_revision)
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            let (id, dispatch, ordinal) = issue_params(issue);
+            tx.execute(
+                "INSERT INTO native_sampling_failure_ack_confirmations VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    dispatch,
+                    ordinal,
+                    Word(applying_revision.get()),
+                    Word(settlement_revision.get()),
+                    Word(confirming_session_generation.get())
+                ],
+            )?;
+            let status = required(read_status(&tx, issue.key())?, "missing confirmed failure")?;
+            if !matches!(
+                status,
+                NativeSamplingStatus::FailureSettlementAckConfirmed { .. }
+            ) {
+                return malformed("failure ACK did not round-trip");
+            }
+            tx.commit()?;
+            Ok(status)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
 }
 
 pub(super) fn validate_recovery_candidate(
@@ -504,6 +923,54 @@ impl ControllerSqliteStore {
             drop(statement);
             tx.commit()?;
             Ok(pending)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Selects the sole failure for a runner without recreating a dispatch ticket.
+    /// # Errors
+    /// Ambiguous, missing, or malformed rows poison the handle.
+    pub fn sole_native_sampling_failure(
+        &mut self,
+        attempt: crate::AttemptId,
+    ) -> Result<Option<(DispatchKey, NativeSamplingStatus)>> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self.connection.transaction()?;
+            check_authority(&tx)?;
+            let mut statement = tx.prepare(
+                "SELECT dispatch_revision, ordinal FROM native_sampling_issues WHERE attempt_id=?1",
+            )?;
+            let rows = statement.query_map([key(attempt)], |row| {
+                Ok((row.get::<_, Word>(0)?.0, row.get::<_, i64>(1)?))
+            })?;
+            let mut failure = None;
+            for row in rows {
+                let (revision, ordinal) = row?;
+                let dispatch = DispatchKey::from_committed_parts(
+                    attempt,
+                    binding_revision(revision)?,
+                    usize::try_from(ordinal).map_err(|_| ControllerStoreError::RevisionConflict)?,
+                );
+                match read_status(&tx, dispatch)? {
+                    Some(
+                        status @ (NativeSamplingStatus::ParkedRetained { .. }
+                        | NativeSamplingStatus::FailureSettledPendingAck { .. }),
+                    ) => {
+                        if failure.replace((dispatch, status)).is_some() {
+                            return Err(ControllerStoreError::RevisionConflict);
+                        }
+                    }
+                    Some(NativeSamplingStatus::SampleAckConfirmed { .. }) => {}
+                    _ => return Err(ControllerStoreError::RevisionConflict),
+                }
+            }
+            drop(statement);
+            tx.commit()?;
+            Ok(failure)
         })();
         if result.is_err() {
             self.poisoned = true;
@@ -793,16 +1260,30 @@ pub(super) fn read_status(
     let ordinal =
         i64::try_from(dispatch.ordinal()).map_err(|_| ControllerStoreError::RevisionConflict)?;
     let row = connection.query_row(
-        "SELECT i.session_generation,i.sequence,a.applying_revision,a.outcome,a.available_memory,a.available_storage,a.cpu,a.pressure,c.confirming_session_generation FROM native_sampling_issues i LEFT JOIN native_sampling_applications a ON a.attempt_id=i.attempt_id AND a.dispatch_revision=i.dispatch_revision AND a.ordinal=i.ordinal LEFT JOIN native_sampling_ack_confirmations c ON c.attempt_id=i.attempt_id AND c.dispatch_revision=i.dispatch_revision AND c.ordinal=i.ordinal WHERE i.attempt_id=?1 AND i.dispatch_revision=?2 AND i.ordinal=?3",
+        "SELECT i.session_generation,i.sequence,a.applying_revision,a.outcome,a.available_memory,a.available_storage,a.cpu,a.pressure,c.confirming_session_generation,s.applying_revision,s.settlement_revision,s.settling_session_generation,f.confirming_session_generation FROM native_sampling_issues i LEFT JOIN native_sampling_applications a ON a.attempt_id=i.attempt_id AND a.dispatch_revision=i.dispatch_revision AND a.ordinal=i.ordinal LEFT JOIN native_sampling_ack_confirmations c ON c.attempt_id=i.attempt_id AND c.dispatch_revision=i.dispatch_revision AND c.ordinal=i.ordinal LEFT JOIN native_sampling_failure_settlements s ON s.attempt_id=i.attempt_id AND s.dispatch_revision=i.dispatch_revision AND s.ordinal=i.ordinal LEFT JOIN native_sampling_failure_ack_confirmations f ON f.attempt_id=i.attempt_id AND f.dispatch_revision=i.dispatch_revision AND f.ordinal=i.ordinal WHERE i.attempt_id=?1 AND i.dispatch_revision=?2 AND i.ordinal=?3",
         params![id, Word(dispatch.revision().get()), ordinal], |row| Ok((
             row.get::<_, Word>(0)?.0, row.get::<_, Word>(1)?.0,
             row.get::<_, Option<Word>>(2)?, row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<Word>>(4)?, row.get::<_, Option<Word>>(5)?,
             row.get::<_, Option<i64>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<Word>>(8)?,
+            row.get::<_, Option<Word>>(9)?, row.get::<_, Option<Word>>(10)?, row.get::<_, Option<Word>>(11)?, row.get::<_, Option<Word>>(12)?,
         ))
     ).optional()?;
-    let Some((generation, sequence, applying, outcome, memory, storage, cpu, pressure, confirming)) =
-        row
+    let Some((
+        generation,
+        sequence,
+        applying,
+        outcome,
+        memory,
+        storage,
+        cpu,
+        pressure,
+        confirming,
+        settlement_applying,
+        settlement,
+        settling,
+        failure_confirming,
+    )) = row
     else {
         return Ok(None);
     };
@@ -837,6 +1318,10 @@ pub(super) fn read_status(
     }
     let Some(applying) = applying else {
         if confirming.is_some()
+            || settlement_applying.is_some()
+            || settlement.is_some()
+            || settling.is_some()
+            || failure_confirming.is_some()
             || outcome.is_some()
             || memory.is_some()
             || storage.is_some()
@@ -892,6 +1377,13 @@ pub(super) fn read_status(
     }
     Ok(Some(match completion {
         NativeSamplingCompletion::Sample(sample) => {
+            if settlement_applying.is_some()
+                || settlement.is_some()
+                || settling.is_some()
+                || failure_confirming.is_some()
+            {
+                return malformed("successful sample has failure settlement");
+            }
             if let Some(generation) = confirming {
                 let confirming_session_generation =
                     required(NonZeroU64::new(generation.0), "zero confirming generation")?;
@@ -926,10 +1418,74 @@ pub(super) fn read_status(
             if confirming.is_some() {
                 return malformed("confirmed failed native sample");
             }
-            NativeSamplingStatus::ParkedRetained {
-                issue,
-                failure,
-                applying_revision,
+            match (settlement_applying, settlement, settling) {
+                (None, None, None) if failure_confirming.is_none() => {
+                    NativeSamplingStatus::ParkedRetained {
+                        issue,
+                        failure,
+                        applying_revision,
+                    }
+                }
+                (Some(source), Some(settled), Some(generation))
+                    if source.0 == applying_revision.get() =>
+                {
+                    let settlement_revision = binding_revision(settled.0)?;
+                    let settling_session_generation =
+                        required(NonZeroU64::new(generation.0), "zero settling session")?;
+                    let settling_session = required(
+                        binding
+                            .sessions()
+                            .iter()
+                            .find(|session| session.generation == settling_session_generation),
+                        "missing failure settling session",
+                    )?;
+                    if settling_session_generation <= issue.session_generation()
+                        || applying_revision >= settling_session.interruption_revision
+                        || settlement_revision <= applying_revision
+                        || header.revision < settlement_revision
+                        || settling_session.interruption_revision.checked_next()
+                            != Some(settlement_revision)
+                    {
+                        return malformed("invalid failure settlement");
+                    }
+                    if let Some(confirmed) = failure_confirming {
+                        let confirming_session_generation =
+                            required(NonZeroU64::new(confirmed.0), "zero failure confirmation")?;
+                        if confirming_session_generation < settling_session_generation
+                            || confirming_session_generation > binding.current_session().generation
+                        {
+                            return malformed("invalid failure confirming session");
+                        }
+                        let confirming_session = required(
+                            binding.sessions().iter().find(|session| {
+                                session.generation == confirming_session_generation
+                            }),
+                            "missing failure confirming session",
+                        )?;
+                        if confirming_session_generation > settling_session_generation
+                            && confirming_session.interruption_revision <= settlement_revision
+                        {
+                            return malformed("failure confirmation lacks fresh interruption");
+                        }
+                        NativeSamplingStatus::FailureSettlementAckConfirmed {
+                            issue,
+                            failure,
+                            applying_revision,
+                            settlement_revision,
+                            settling_session_generation,
+                            confirming_session_generation,
+                        }
+                    } else {
+                        NativeSamplingStatus::FailureSettledPendingAck {
+                            issue,
+                            failure,
+                            applying_revision,
+                            settlement_revision,
+                            settling_session_generation,
+                        }
+                    }
+                }
+                _ => return malformed("partial failure settlement"),
             }
         }
     }))
@@ -1533,3 +2089,6 @@ mod recovery_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod failure_settlement_tests;

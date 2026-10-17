@@ -195,7 +195,7 @@ impl<'de> Deserialize<'de> for BuildIdentity {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum number of child PIDs accepted in one native root scan.
 pub const MAX_NATIVE_CHILDREN: usize = 4096;
@@ -607,6 +607,16 @@ pub enum WireResourceError {
     Unsupported,
     Malformed,
 }
+fn wire_resource_failure(failure: crate::ResourceObservationFailure) -> WireResourceError {
+    match failure {
+        crate::ResourceObservationFailure::TemporarilyUnavailable => {
+            WireResourceError::TemporarilyUnavailable
+        }
+        crate::ResourceObservationFailure::Unsupported => WireResourceError::Unsupported,
+        crate::ResourceObservationFailure::Malformed => WireResourceError::Malformed,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireQueryError {
@@ -705,6 +715,16 @@ pub enum Request {
         session: WireSession,
         key: WireKey,
         sequence: u64,
+        issuing_session_generation: u64,
+    },
+    VerifyNativeSamplingFailureSettlement {
+        session: WireSession,
+        key: WireKey,
+        issuing_session_generation: u64,
+    },
+    AckNativeSamplingFailureSettlement {
+        session: WireSession,
+        key: WireKey,
         issuing_session_generation: u64,
     },
     VerifyRecoveredNativeChildList {
@@ -809,6 +829,15 @@ pub enum Response {
         key: WireKey,
         sequence: u64,
         sample: WireResourceSample,
+    },
+    VerifiedNativeSamplingFailureSettlement {
+        key: WireKey,
+        sequence: u64,
+        failure: WireResourceError,
+    },
+    NativeSamplingFailureSettlementAcked {
+        key: WireKey,
+        settlement_revision: u64,
     },
     RecoveredNativeChildList {
         key: WireKey,
@@ -1024,6 +1053,11 @@ pub struct GuardianServer<E: GuardianExecutor> {
         crate::ResourceSample,
         PersistenceRevision,
     )>,
+    native_failure_ack_receipts: Vec<(
+        crate::NativeSamplingIssue,
+        crate::ResourceObservationFailure,
+        PersistenceRevision,
+    )>,
     staged: Vec<DispatchTicket>,
     refused: Vec<DispatchTicket>,
     admissions: BTreeMap<u64, (ControllerSession, DispatchTicket)>,
@@ -1068,6 +1102,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             prepared_activation: None,
             ack_proofs: Vec::new(),
             native_ack_receipts: Vec::new(),
+            native_failure_ack_receipts: Vec::new(),
             staged: Vec::new(),
             refused: Vec::new(),
             admissions: BTreeMap::new(),
@@ -1347,6 +1382,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ObserveSlot { .. }
                     | Request::ObserveRetained { .. }
                     | Request::VerifyRecoveredNativeSampling { .. }
+                    | Request::VerifyNativeSamplingFailureSettlement { .. }
+                    | Request::AckNativeSamplingFailureSettlement { .. }
                     | Request::VerifyRecoveredNativeChildList { .. }
                     | Request::VerifyRecoveredNativeIdentityObservation { .. }
                     | Request::Fence { .. }
@@ -1757,6 +1794,217 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             key: key.try_into()?,
             sequence,
             sample,
+        })
+    }
+
+    fn verify_native_sampling_failure_settlement(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        issuing_session_generation: u64,
+    ) -> Result<Response, WireError> {
+        if !self.native_unbound {
+            return Err(WireError::UnsupportedDurableBinding);
+        }
+        self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        let origin = NonZeroU64::new(issuing_session_generation).ok_or(WireError::InvalidValue)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .sampling_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeSamplingStatus::ParkedRetained {
+            issue,
+            failure,
+            applying_revision,
+        } = status
+        else {
+            return Err(WireError::MissingProof);
+        };
+        let current = binding.current_session();
+        if live.state != WireState::Reconciling
+            || live.session != session
+            || live.session.instance != live.instance
+            || live.attempt != key.attempt_id().get()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || checkpoint.phase() != crate::Phase::Interrupted
+            || checkpoint.attempt_id() != key.attempt_id()
+            || checkpoint.interrupted_sampling_sequence() != Some(issue.sequence())
+            || checkpoint.persistence_revision() != current.interruption_revision
+            || checkpoint.deadline() != binding.deadline()
+            || binding.attempt_id() != key.attempt_id()
+            || binding.deadline() != self.guardian.original_deadline()
+            || binding.dispatch_floor() != current.interruption_revision
+            || current.state != crate::NativeSessionState::Reconciling
+            || current.generation.get() != session.generation
+            || issue.key() != key
+            || issue.session_generation() != origin
+            || issue.guardian_identity() != binding.identity()
+            || origin >= current.generation
+            || applying_revision <= key.revision()
+            || applying_revision >= current.interruption_revision
+            || !binding
+                .sessions()
+                .iter()
+                .any(|old| old.generation == origin)
+            || !self
+                .native_retained_origins
+                .contains(&(key, issue.sequence(), origin))
+            || self.native_identity != Some(binding.identity())
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.guardian != WireIdentity::from(binding.identity().process)
+            || !recovered_sampling_slots_match(
+                &binding,
+                wire,
+                &live,
+                &self.guardian.diagnostic_slots(),
+            )
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        let expected = WireCompletion::SampleResources {
+            sequence: issue.sequence(),
+            result: Err(wire_resource_failure(failure)),
+        };
+        if self
+            .guardian
+            .retained_result(key)
+            .is_none_or(|result| WireRetained::from(result).completion != expected)
+        {
+            return Err(WireError::MissingProof);
+        }
+        Ok(Response::VerifiedNativeSamplingFailureSettlement {
+            key: key.try_into()?,
+            sequence: issue.sequence(),
+            failure: wire_resource_failure(failure),
+        })
+    }
+
+    fn ack_native_sampling_failure_settlement(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        issuing_session_generation: u64,
+    ) -> Result<Response, WireError> {
+        if !self.native_unbound {
+            return Err(WireError::UnsupportedDurableBinding);
+        }
+        let session = self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        let origin = NonZeroU64::new(issuing_session_generation).ok_or(WireError::InvalidValue)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .sampling_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeSamplingStatus::FailureSettledPendingAck {
+            issue,
+            failure,
+            applying_revision,
+            settlement_revision,
+            settling_session_generation,
+        } = status
+        else {
+            return Err(WireError::MissingProof);
+        };
+        let current = binding.current_session();
+        let checkpoint_revision = checkpoint.persistence_revision();
+        let settlement_session_matches = (settling_session_generation == current.generation
+            && current.interruption_revision.checked_next() == Some(settlement_revision)
+            && checkpoint_revision == settlement_revision)
+            || (settling_session_generation < current.generation
+                && current.interruption_revision > settlement_revision
+                && checkpoint_revision == current.interruption_revision);
+        if live.state != WireState::Reconciling
+            || live.session != session.into()
+            || live.session.instance != live.instance
+            || live.attempt != key.attempt_id().get()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || checkpoint.phase() != crate::Phase::Interrupted
+            || checkpoint.attempt_id() != key.attempt_id()
+            || checkpoint.interrupted_sampling_sequence() != Some(issue.sequence())
+            || !settlement_session_matches
+            || checkpoint.deadline() != binding.deadline()
+            || binding.attempt_id() != key.attempt_id()
+            || binding.deadline() != self.guardian.original_deadline()
+            || binding.dispatch_floor() != current.interruption_revision
+            || current.state != crate::NativeSessionState::Reconciling
+            || current.generation.get() != session.generation()
+            || settling_session_generation > current.generation
+            || issue.key() != key
+            || issue.session_generation() != origin
+            || issue.guardian_identity() != binding.identity()
+            || origin >= current.generation
+            || applying_revision <= key.revision()
+            || applying_revision >= current.interruption_revision
+            || !binding
+                .sessions()
+                .iter()
+                .any(|old| old.generation == origin)
+            || self.native_identity != Some(binding.identity())
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.guardian != WireIdentity::from(binding.identity().process)
+            || !recovered_sampling_slots_match(
+                &binding,
+                wire,
+                &live,
+                &self.guardian.diagnostic_slots(),
+            )
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        let receipt = (issue, failure, settlement_revision);
+        if self.native_failure_ack_receipts.contains(&receipt) {
+            if self.guardian.retained_result(key).is_some() {
+                return Err(WireError::MissingProof);
+            }
+        } else {
+            let expected = WireCompletion::SampleResources {
+                sequence: issue.sequence(),
+                result: Err(wire_resource_failure(failure)),
+            };
+            if !self
+                .native_retained_origins
+                .contains(&(key, issue.sequence(), origin))
+                || self
+                    .guardian
+                    .retained_result(key)
+                    .is_none_or(|result| WireRetained::from(result).completion != expected)
+            {
+                return Err(WireError::MissingProof);
+            }
+            self.guardian
+                .ack_result(
+                    session,
+                    crate::AppliedResultAck::after_applied(session, key),
+                )
+                .map_err(WireError::from)?;
+            self.native_retained_origins
+                .retain(|(stored, _, _)| *stored != key);
+            self.native_failure_ack_receipts.push(receipt);
+        }
+        Ok(Response::NativeSamplingFailureSettlementAcked {
+            key: key.try_into()?,
+            settlement_revision: settlement_revision.get(),
         })
     }
 
@@ -2868,6 +3116,24 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 sequence,
                 issuing_session_generation,
             )?,
+            Request::VerifyNativeSamplingFailureSettlement {
+                session,
+                key,
+                issuing_session_generation,
+            } => self.verify_native_sampling_failure_settlement(
+                session,
+                key,
+                issuing_session_generation,
+            )?,
+            Request::AckNativeSamplingFailureSettlement {
+                session,
+                key,
+                issuing_session_generation,
+            } => self.ack_native_sampling_failure_settlement(
+                session,
+                key,
+                issuing_session_generation,
+            )?,
             Request::VerifyRecoveredNativeChildList {
                 session,
                 key,
@@ -3342,9 +3608,9 @@ mod tests {
             read_frame::<Request>(&mut Cursor::new(unknown)),
             Err(CodecError::UnsupportedVersion(version)) if version == unsupported
         ));
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
         let old = serde_json::to_vec(&Envelope {
-            version: 8,
+            version: 9,
             body: Request::Snapshot,
         })
         .unwrap();
@@ -3352,7 +3618,7 @@ mod tests {
         old_frame.extend(old);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(old_frame)),
-            Err(CodecError::UnsupportedVersion(8))
+            Err(CodecError::UnsupportedVersion(9))
         ));
         let mut unknown_op = Vec::new();
         let bytes =
@@ -5508,6 +5774,8 @@ mod native_evidence_tests {
         );
     }
 
+    mod failure_settlement_tests;
+
     fn recovery_request(fixture: &NativeAckFixture, session: WireSession) -> Request {
         Request::VerifyRecoveredNativeSampling {
             session,
@@ -6946,6 +7214,8 @@ mod native_evidence_tests {
                 | Request::Inventory
                 | Request::ObserveSlot { .. }
                 | Request::ObserveRetained { .. }
+                | Request::VerifyNativeSamplingFailureSettlement { .. }
+                | Request::AckNativeSamplingFailureSettlement { .. }
                 | Request::VerifyRecoveredNativeSampling { .. }
                 | Request::VerifyRecoveredNativeChildList { .. }
                 | Request::VerifyRecoveredNativeIdentityObservation { .. }
