@@ -244,8 +244,7 @@ fn linux_process_is_live_member(
     read_stat: impl FnOnce() -> io::Result<String>,
 ) -> io::Result<bool> {
     let mut is_member = || match query_group(pid) {
-        Ok(actual) if actual > 0 => Ok(u32::try_from(actual).map_err(io::Error::other)? == group),
-        Ok(_) => Err(io::Error::other("invalid process group")),
+        Ok(actual) => Ok(u32::try_from(actual).map_err(io::Error::other)? == group),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
         Err(error) => Err(error),
     };
@@ -389,7 +388,11 @@ mod tests {
 
     #[test]
     fn linux_scan_skips_only_kernel_proven_nonmembers_without_reading_stat() {
-        for membership in [Ok(99), Err(io::Error::from_raw_os_error(libc::ESRCH))] {
+        for membership in [
+            Ok(0),
+            Ok(99),
+            Err(io::Error::from_raw_os_error(libc::ESRCH)),
+        ] {
             let mut membership = Some(membership);
             assert!(!linux_process_is_live_member(
                 42,
@@ -399,7 +402,7 @@ mod tests {
             )
             .unwrap());
         }
-        for invalid in [0, -1] {
+        for invalid in [-1, libc::pid_t::MIN] {
             assert!(linux_process_is_live_member(
                 42,
                 42,
@@ -428,7 +431,11 @@ mod tests {
 
     #[test]
     fn linux_scan_reclassifies_missing_candidate_stat_without_assuming_exit() {
-        for after in [Ok(99), Err(io::Error::from_raw_os_error(libc::ESRCH))] {
+        for after in [
+            Ok(0),
+            Ok(99),
+            Err(io::Error::from_raw_os_error(libc::ESRCH)),
+        ] {
             let mut observations = [Ok(42), after].into_iter();
             assert!(!linux_process_is_live_member(
                 42,
