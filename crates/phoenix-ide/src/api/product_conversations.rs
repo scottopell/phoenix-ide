@@ -46,16 +46,38 @@ const DEFAULT_MESSAGE_LIMIT: usize = 50;
 const MAX_MESSAGE_LIMIT: usize = 200;
 const PRODUCT_CONVERSATION_ROUTE_PREFIX: &str = "/c/";
 
+fn encoded_route_component(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
 pub(crate) fn canonical_product_conversation_route(
     id: &phoenix_core::domain::product_conversation::ProductConversationId,
 ) -> String {
-    format!("{PRODUCT_CONVERSATION_ROUTE_PREFIX}{id}")
+    format!(
+        "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
+        encoded_route_component(id.as_str())
+    )
 }
 
 pub(crate) fn exact_transcript_route(
     id: &phoenix_core::domain::close::TranscriptConversationId,
 ) -> String {
-    format!("{PRODUCT_CONVERSATION_ROUTE_PREFIX}{id}?source_transcript={id}")
+    let encoded = encoded_route_component(id.as_str());
+    format!("{PRODUCT_CONVERSATION_ROUTE_PREFIX}{encoded}?source_transcript={encoded}")
+}
+
+pub(crate) fn message_fragment(message_id: &str) -> String {
+    format!("#message-{}", encoded_route_component(message_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2425,6 +2447,16 @@ mod tests {
         assert_eq!(
             super::exact_transcript_route(&transcript_id),
             "/c/transcript-id?source_transcript=transcript-id"
+        );
+        let punctuated_transcript =
+            phoenix_core::domain::close::TranscriptConversationId::parse("transcript?#%").unwrap();
+        assert_eq!(
+            super::exact_transcript_route(&punctuated_transcript),
+            "/c/transcript%3F%23%25?source_transcript=transcript%3F%23%25"
+        );
+        assert_eq!(
+            super::message_fragment("message?#%"),
+            "#message-message%3F%23%25"
         );
     }
 

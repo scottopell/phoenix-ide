@@ -176,6 +176,16 @@ impl FederationSearchConversationsEndpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationReadConversationEndpoint(url::Url);
+
+impl FederationReadConversationEndpoint {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerNavigationUrl(url::Url);
 
 impl PeerNavigationUrl {
@@ -248,6 +258,19 @@ impl PeerBaseUrl {
         FederationSearchConversationsEndpoint(
             self.0
                 .join("/api/federation/peer/search-conversations")
+                .expect("fixed federation route is a valid URL path"),
+        )
+    }
+
+    /// Return the fixed authenticated peer conversation-read endpoint.
+    ///
+    /// # Panics
+    /// Panics only if the compile-time route is not a valid URL path.
+    #[must_use]
+    pub fn read_conversation_endpoint(&self) -> FederationReadConversationEndpoint {
+        FederationReadConversationEndpoint(
+            self.0
+                .join("/api/federation/peer/read-conversation")
                 .expect("fixed federation route is a valid URL path"),
         )
     }

@@ -15,6 +15,7 @@ import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import type { PendingUserMessage } from '../hooks/useMessageQueue';
 import {
   decideRouteFocus,
+  messageIdFromLocationHash,
   reduceRouteFocusState,
   type RouteFocusState,
 } from './conversationRouteFocus';
@@ -324,10 +325,10 @@ function ConversationPageContent({
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
   const location = useLocation();
-  const targetMessageId = useMemo(() => {
-    const hash = location.hash.startsWith('#message-') ? location.hash.slice('#message-'.length) : '';
-    return hash || undefined;
-  }, [location.hash]);
+  const targetMessageId = useMemo(
+    () => messageIdFromLocationHash(location.hash),
+    [location.hash],
+  );
   const createConversationWithStore = useCreateConversationWithStore();
 
   // Atom-backed conversation state (survives navigation via ConversationProvider).

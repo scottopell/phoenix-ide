@@ -80,6 +80,37 @@ pub struct RemoteSearchResponse {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct RemoteReadConversationRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub target: ConversationReferenceTarget,
+    pub cursor: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RemoteReadConversationResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub read: crate::api::global_read::QualifiedConversationRead,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteReadErrorCode {
+    InvalidTarget,
+    DestinationUnavailable,
+    ResponseTooLarge,
+    CallerMismatch,
+    DestinationMismatch,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoteReadErrorResponse {
+    code: RemoteReadErrorCode,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RemoteSearchErrorCode {
     SearchIndexUnavailable,
@@ -115,6 +146,205 @@ pub enum FederationClientError {
     SearchNavigation(#[from] phoenix_core::domain::instance_identity::PeerNavigationUrlError),
     #[error("remote search unavailable: {0}")]
     SearchUnavailable(String),
+    #[error("remote read response provenance mismatch")]
+    ReadProvenanceMismatch,
+    #[error("remote read target rejected: {0}")]
+    ReadInvalidTarget(String),
+    #[error("remote read destination unavailable: {0}")]
+    ReadUnavailable(String),
+    #[error("remote read response exceeds the bounded response budget: {0}")]
+    ReadResponseTooLarge(String),
+}
+
+fn validate_remote_read_provenance(
+    response: &RemoteReadConversationResponse,
+    target: &ConversationReferenceTarget,
+    peer_instance_id: InstanceId,
+    caller_instance_id: InstanceId,
+) -> Result<(), FederationClientError> {
+    if response.destination_instance_id != peer_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller_instance_id {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    let resolved_matches_request = match (target, &response.read.resolved.target) {
+        (
+            ConversationReferenceTarget::ProductConversation { .. },
+            ConversationReferenceTarget::Transcript { .. },
+        ) => true,
+        (
+            ConversationReferenceTarget::Transcript {
+                transcript_id: requested,
+            },
+            ConversationReferenceTarget::Transcript {
+                transcript_id: resolved,
+            },
+        ) => requested == resolved,
+        (
+            ConversationReferenceTarget::Message {
+                transcript_id: requested_transcript,
+                message_id: requested_message,
+            },
+            ConversationReferenceTarget::Message {
+                transcript_id: resolved_transcript,
+                message_id: resolved_message,
+            },
+        ) => requested_transcript == resolved_transcript && requested_message == resolved_message,
+        (
+            ConversationReferenceTarget::ProductConversation { .. },
+            ConversationReferenceTarget::ProductConversation { .. }
+            | ConversationReferenceTarget::Message { .. }
+            | ConversationReferenceTarget::Coordinator,
+        )
+        | (
+            ConversationReferenceTarget::Transcript { .. },
+            ConversationReferenceTarget::ProductConversation { .. }
+            | ConversationReferenceTarget::Message { .. }
+            | ConversationReferenceTarget::Coordinator,
+        )
+        | (
+            ConversationReferenceTarget::Message { .. },
+            ConversationReferenceTarget::ProductConversation { .. }
+            | ConversationReferenceTarget::Transcript { .. }
+            | ConversationReferenceTarget::Coordinator,
+        )
+        | (ConversationReferenceTarget::Coordinator, _) => false,
+    };
+    if response.read.requested.instance_id != peer_instance_id
+        || response.read.requested.target != *target
+        || response.read.resolved.instance_id != peer_instance_id
+        || !resolved_matches_request
+    {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    }
+    Ok(())
+}
+
+pub async fn read_remote_conversation(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    target: ConversationReferenceTarget,
+    cursor: usize,
+) -> Result<crate::api::global_read::QualifiedConversationRead, FederationClientError> {
+    let caller_instance_id = local_db.instance_id().await?;
+    let client = remote_query_client(&peer.tls_trust)?;
+    let response = client
+        .post(peer.base_url.read_conversation_endpoint().as_url().clone())
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&RemoteReadConversationRequest {
+            caller_instance_id,
+            destination_instance_id: peer.peer_instance_id,
+            target: target.clone(),
+            cursor,
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut response = decode_remote_read_response(status, &bytes)?;
+    validate_remote_read_provenance(
+        &response,
+        &target,
+        peer.peer_instance_id,
+        caller_instance_id,
+    )?;
+    let (ConversationReferenceTarget::Transcript {
+        transcript_id: resolved_transcript,
+    }
+    | ConversationReferenceTarget::Message {
+        transcript_id: resolved_transcript,
+        ..
+    }) = &response.read.resolved.target
+    else {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    };
+    if response.read.evidence.iter().any(|reference| {
+        reference.instance_id != peer.peer_instance_id
+            || !matches!(
+                &reference.target,
+                ConversationReferenceTarget::Message { transcript_id, .. }
+                    if transcript_id == resolved_transcript
+            )
+    }) {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    }
+    if let ConversationReferenceTarget::Message {
+        message_id: requested_message,
+        ..
+    } = &target
+    {
+        if response.read.evidence.len() != 1
+            || !matches!(
+                &response.read.evidence[0].target,
+                ConversationReferenceTarget::Message { message_id, .. }
+                    if message_id == requested_message
+            )
+        {
+            return Err(FederationClientError::ReadProvenanceMismatch);
+        }
+    }
+    match (
+        &response.read.stable_conversation,
+        &response.read.stable_navigation,
+    ) {
+        (
+            Some(stable),
+            Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { .. }),
+        ) if stable.instance_id == peer.peer_instance_id
+            && (matches!(
+                (&target, &stable.target),
+                (
+                    ConversationReferenceTarget::ProductConversation {
+                        product_conversation_id: requested,
+                    },
+                    ConversationReferenceTarget::ProductConversation {
+                        product_conversation_id: returned,
+                    },
+                ) if requested == returned
+            ) || (!matches!(
+                target,
+                ConversationReferenceTarget::ProductConversation { .. }
+            ) && matches!(
+                &stable.target,
+                ConversationReferenceTarget::ProductConversation { .. }
+            ))) => {}
+        (None, None) => {}
+        _ => return Err(FederationClientError::ReadProvenanceMismatch),
+    }
+    qualify_remote_read_navigation(&peer.base_url, &mut response.read)?;
+    Ok(response.read)
+}
+
+fn decode_remote_read_response(
+    status: StatusCode,
+    bytes: &[u8],
+) -> Result<RemoteReadConversationResponse, FederationClientError> {
+    if status.is_success() {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    let Some(error) = serde_json::from_slice::<RemoteReadErrorResponse>(bytes).ok() else {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    };
+    Err(match error.code {
+        RemoteReadErrorCode::InvalidTarget => {
+            FederationClientError::ReadInvalidTarget(error.message)
+        }
+        RemoteReadErrorCode::DestinationUnavailable => {
+            FederationClientError::ReadUnavailable(error.message)
+        }
+        RemoteReadErrorCode::ResponseTooLarge => {
+            FederationClientError::ReadResponseTooLarge(error.message)
+        }
+        RemoteReadErrorCode::CallerMismatch => FederationClientError::CallerMismatch,
+        RemoteReadErrorCode::DestinationMismatch => FederationClientError::DestinationMismatch,
+    })
 }
 
 pub async fn search_remote_conversations(
@@ -234,6 +464,27 @@ fn decode_remote_query_response(
     Ok(response)
 }
 
+fn qualify_remote_read_navigation(
+    base_url: &phoenix_core::domain::instance_identity::PeerBaseUrl,
+    read: &mut crate::api::global_read::QualifiedConversationRead,
+) -> Result<(), FederationClientError> {
+    use crate::api::global_read::QualifiedSearchNavigation;
+
+    let QualifiedSearchNavigation::AppLocal { path } = &read.source_navigation else {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    };
+    let url = base_url.navigation_url(path)?.as_url().to_string();
+    read.source_navigation = QualifiedSearchNavigation::Peer { url };
+    if let Some(navigation) = &read.stable_navigation {
+        let QualifiedSearchNavigation::AppLocal { path } = navigation else {
+            return Err(FederationClientError::ReadProvenanceMismatch);
+        };
+        let url = base_url.navigation_url(path)?.as_url().to_string();
+        read.stable_navigation = Some(QualifiedSearchNavigation::Peer { url });
+    }
+    Ok(())
+}
+
 fn qualify_remote_search_navigation(
     base_url: &phoenix_core::domain::instance_identity::PeerBaseUrl,
     hits: &mut [crate::api::global_read::QualifiedSearchHit],
@@ -338,6 +589,106 @@ fn random_peer_token() -> String {
         "phx_peer_{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     )
+}
+
+pub async fn read_conversation(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteReadConversationRequest>,
+) -> Response {
+    let destination = match state.db.instance_id().await {
+        Ok(instance_id) => instance_id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read local instance identity");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if request.destination_instance_id != destination {
+        return (
+            StatusCode::CONFLICT,
+            Json(RemoteReadErrorResponse {
+                code: RemoteReadErrorCode::DestinationMismatch,
+                message: "destination instance identity mismatch".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if request.caller_instance_id != authenticated.caller_instance_id {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(RemoteReadErrorResponse {
+                code: RemoteReadErrorCode::CallerMismatch,
+                message: "caller instance identity mismatch".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if matches!(request.target, ConversationReferenceTarget::Coordinator) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(RemoteReadErrorResponse {
+                code: RemoteReadErrorCode::InvalidTarget,
+                message: "Coordinator is not a readable conversation target".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let service = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match service
+        .read_conversation_target(&request.target, request.cursor)
+        .await
+    {
+        Ok(read) => {
+            let response = RemoteReadConversationResponse {
+                caller_instance_id: authenticated.caller_instance_id,
+                destination_instance_id: destination,
+                read,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(encoded) if encoded.len() <= MAX_REMOTE_RESPONSE_BYTES => {
+                    Json(response).into_response()
+                }
+                Ok(_) => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(RemoteReadErrorResponse {
+                        code: RemoteReadErrorCode::ResponseTooLarge,
+                        message: "remote read response exceeds the bounded response budget"
+                            .to_string(),
+                    }),
+                )
+                    .into_response(),
+                Err(error) => {
+                    tracing::error!(%error, "failed to encode peer conversation read");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        Err(crate::api::global_read::QualifiedReadError::Invalid(error)) => {
+            tracing::debug!(%error, "peer conversation read rejected");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(RemoteReadErrorResponse {
+                    code: RemoteReadErrorCode::InvalidTarget,
+                    message: error,
+                }),
+            )
+                .into_response()
+        }
+        Err(crate::api::global_read::QualifiedReadError::Failed(error)) => {
+            tracing::error!(%error, "peer conversation read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RemoteReadErrorResponse {
+                    code: RemoteReadErrorCode::DestinationUnavailable,
+                    message: "destination conversation read unavailable".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn search_conversations(
