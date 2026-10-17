@@ -960,6 +960,19 @@ class OpeningQualificationTests(unittest.TestCase):
         for name in ('history-postfault-baseline.selftest.mjs', 'history-opening-navigation.selftest.mjs'):
             self.assertIn('node --test ui/scripts/' + name, job)
 
+    def test_rust_lane_contains_full_suite_budget_and_non_test_reserve(self):
+        import re
+        workflow = (Path(opening.__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text()
+        job = workflow.split('  check-rust:', 1)[1].split('\n  check-clippy:', 1)[0]
+        minutes = int(re.search(r'    timeout-minutes: (\d+)', job).group(1))
+        cargo = int(re.search(r'PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "(\d+)"', job).group(1))
+        self.assertGreaterEqual(cargo, 1500)
+        self.assertGreaterEqual(minutes * 60, cargo + 600 + 300)
+        self.assertIn('./dev.py check --lanes rust,cargo-fmt', job)
+        self.assertIn('cargo check --target x86_64-unknown-linux-musl', job)
+        self.assertNotIn('--skip', job)
+        self.assertNotIn('continue-on-error', job)
+
     def test_frozen_geometry_workflow_uses_its_frozen_harness_bundle(self):
         workflow = (Path(opening.__file__).resolve().parents[2] / '.github/workflows/history-geometry-repro.yml').read_text()
         self.assertIn('ref: 191dacb3e7bcd671990298be8896d6cdcdb2015c', workflow)

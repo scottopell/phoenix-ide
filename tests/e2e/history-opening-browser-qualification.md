@@ -3198,3 +3198,39 @@ The source branch qualification/history-joint-source-26d40cb8d is clean/publishe
 The shared candidate receives one causal final normal qualification after the
 entire preceding run, rather than treating the previous near-green as full green
 or skipping Clippy. No duplicate/unchanged runner, local native/build or merge.
+
+### Exact final source passes all functional/lint gates; full Rust process budget exhausted
+
+Run39011013756 at0d34/26d is fully terminal failure only in Rust's outer cargo-test
+1200s process budget. Clippy, UI/specs, E2E/tasks/workers, routine macOS and the
+stronger six-scenario witness all passed. Artifact12093455564 is97,809,322 bytes;
+92,025 range bytes retained the actual native/browser/drain/delivery/final facts.
+Six reports/admissions/semantic exports,2 actual latest-owner POST200s, two older
+GETs per historical route, negative401/no extras and actual normal app-first
+drain all passed. Final raw capture reports16 batches/1,324,543 bytes/2472 spans.
+This remains controlled-functional proof, not overhead/device/full acceptance.
+
+Rust's actual terminal summary was4670/4809 tests run:4667 passed,3 failed by
+SIGTERM from the outer timeout,184 skipped;139 not run due to cancellation. The
+three canceled tests had only0.188s,0.490s,0.882s elapsed when terminated. There
+was no assertion failure/panic or evidence of a stuck test: the expanded suite
+was still making normal progress after1073.450s execution, with compilation
+included in the1200s command budget. The previous exact product ancestry had
+completed Rust successfully. It would be false to call this run wholly green,
+or to treat externally canceled tests as three product assertion defects.
+
+The causal successor changes only Rust CI execution budgeting:1500s cargo-test
+under40min job, with600s non-test work+300s reserve enforced by an offline source
+regression. The same full test selection, musl production check, worker settings,
+assertions and individual test timeouts remain unchanged. No retries/skips/
+continue-on-error or test threshold relaxation were added. This is a bounded
+process-completion budget, not a numerical performance/overhead tolerance.
+All80 lifecycle tests and YAML/diff checks pass. Product26d and its tree remain
+immutable/unchanged. One changed-workflow qualification follows the entire
+prior terminal state; no parallel or unchanged rerun is submitted.
+
+Two isolated bounded final reviews used exact d074..0d34 and returned No
+ actionable findings for selected product/qualification seams, explicitly not
+exhaustive177-file proof and not external runtime confirmation. Their evidence
+is retained separately; the budget-only successor is a different exact target
+and does not silently inherit an identical-target label.
