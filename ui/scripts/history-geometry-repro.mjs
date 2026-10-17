@@ -64,14 +64,20 @@ async function main(){
   const input=JSON.parse(readFileSync(process.env.GEOMETRY_INPUT,'utf8')),out=process.env.GEOMETRY_OUTPUT;
   const {chromium}=createRequire(resolve(process.env.APP_ROOT,'ui/package.json'))('playwright');
   const receipt={scope:'diagnostic_same_artifact_new_fixture_recipe_not_original_db',acceptance:false,observations:[],status:'failed'};
-  let browser,context,page;const save=()=>writeFileSync(resolve(out,'geometry.json'),JSON.stringify(receipt,null,2));
+  let browser,context,page,pagination,reports=0,reportCaptureErrors=0;const reportBodies=[];
+  const save=()=>{
+    receipt.report204_count=reports;receipt.report_capture_errors=reportCaptureErrors;
+    if(pagination)receipt.pagination=pagination.snapshot(reportBodies);
+    if(receipt.status==='captured'&&(reportCaptureErrors!==0||receipt.pagination?.errors!==0||receipt.cleanup_failure))receipt.status='capture_prerequisites_missing';
+    writeFileSync(resolve(out,'geometry.json'),JSON.stringify(receipt,null,2));
+  };
   const watchdog=setTimeout(()=>{save();void browser?.close();},55000);
   try{
     browser=await chromium.launch({headless:true,timeout:10000});receipt.browser_version=browser.version();
     context=await browser.newContext({viewport:{width:1360,height:900}});await authenticateOwnedContext(context,process.env.HISTORY_BASE_URL);
     await context.addInitScript(installWriteCapture,{input,geometrySource:geometry.toString()});
-    page=await context.newPage();let reports=0,reportCaptureErrors=0;const reportBodies=[];
-    const pagination=installHistoryPaginationDiagnostic(page,process.env.HISTORY_BASE_URL,input.endpoint);
+    page=await context.newPage();
+    pagination=installHistoryPaginationDiagnostic(page,process.env.HISTORY_BASE_URL,input.endpoint);
     page.on('request',r=>{if(new URL(r.url()).pathname==='/api/telemetry/conversation-view'&&r.method()==='POST'){
       try{const body=r.postData()??'';if(Buffer.byteLength(body)>8192||reportBodies.length>=7)throw new Error();reportBodies.push(JSON.parse(body));}
       catch{reportCaptureErrors=Math.min(128,reportCaptureErrors+1);}
@@ -80,7 +86,7 @@ async function main(){
     await page.goto(process.env.HISTORY_BASE_URL+input.route,{waitUntil:'domcontentloaded',timeout:20000});
     const deadline=Date.now()+20000;
     while(reports===0&&Date.now()<deadline)await page.evaluate(()=>new Promise(r=>requestAnimationFrame(r)));
-    receipt.report204_count=reports;receipt.report_capture_errors=reportCaptureErrors;receipt.pagination=pagination.snapshot(reportBodies);
+    save();
     for(let frame=0;frame<5;frame++){
       if(frame)await page.evaluate(()=>new Promise(r=>requestAnimationFrame(r)));
       const observation=await page.evaluate(async ({geometrySource,oracleSource,input})=>{
@@ -90,7 +96,7 @@ async function main(){
       },{geometrySource:geometry.toString(),oracleSource:observePhysicalHistoricalRow.toString(),input});
       receipt.observations.push(observation);receipt.write_capture=await page.evaluate(()=>window.__historyGeometryRead());save();
     }
-    await page.locator('#messages').screenshot({path:resolve(out,'messages.png'),timeout:5000});receipt.status=reports>0&&reportCaptureErrors===0&&receipt.pagination.errors===0&&receipt.observations.length===5&&receipt.observations.every(o=>o.identity.fixture_id_matches)
+    await page.locator('#messages').screenshot({path:resolve(out,'messages.png'),timeout:5000});save();receipt.status=reports>0&&reportCaptureErrors===0&&receipt.pagination.errors===0&&receipt.observations.length===5&&receipt.observations.every(o=>o.identity.fixture_id_matches)
       &&receipt.write_capture?.installed&&receipt.write_capture.failures===0&&receipt.write_capture.dropped===0
       &&receipt.write_capture.events.some(e=>e.kind==='scrollTop_assignment'&&!e.geometry.instrumentation_geometry_failed)?'captured':'capture_prerequisites_missing';save();
   }catch{receipt.failure='bounded_geometry_operation_failed';try{if(page)receipt.write_capture=await page.evaluate(()=>window.__historyGeometryRead());}catch{}save();}

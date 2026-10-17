@@ -4,6 +4,12 @@ import { observePhysicalHistoricalRow, holdPostFaultBaseline } from './history-p
 import { COMPOSER_SELECTOR } from './qualify-history-realserver.mjs';
 import { installHistoryRequestOwnership, installObservedHistoryTelemetry, installHistoryPaginationDiagnostic, authenticateOwnedContext } from './history-joint-telemetry.mjs';
 
+function assertActualPaginationOwned(actualPagination, expectedCount) {
+  assert.equal(actualPagination.errors, 0, 'actual pagination diagnostic must be complete');
+  assert.equal(actualPagination.requests.length, expectedCount, 'no actual older GET may disappear from correlated inventory');
+  assert.ok(actualPagination.requests.every(r => r.has_open_id && r.before_report && r.in_report), 'every actual older GET must belong to the original pending report');
+}
+
 export const CONTROLLED_CLASS = 'controlled_functional';
 export const CONTROLLED_VIEWPORT = Object.freeze({ width: 1360, height: 900 });
 
@@ -232,6 +238,8 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             assert.ok(historicalRequests.length > 0, 'actual additional history GET required before historical ready');
             phase = 'additional_history_owner';
             for (const request of historicalRequests) assert.ok(trial.reports[0].correlations.some(c => c.kind === 'request' && c.id === request.open_id), 'additional history request must remain in its original journey');
+            const actualPagination = paginationDiagnostic.snapshot(trial.reports);
+            assertActualPaginationOwned(actualPagination, historicalRequests.length);
             trial.additional_history = { report_count: 1, request_count: historicalRequests.length, original_owner: trial.reports[0].open_id };
             phase = 'stream_owner';
             assert.ok(network.snapshot().requestRecords.some(r => r.kind === 'sse' && new URL(r.url).pathname === `/api/conversations/${target.composerOwner}/stream`), 'stream must belong to independently selected writable owner');
@@ -289,6 +297,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
         assert.equal(observer.getReports().length, 1, 'late report cannot change controlled inventory');
         assert.equal(observer.getAdmissionCount(), 1, 'late or successor admission cannot disappear');
         assert.deepEqual(observer.getErrors(), []);
+        if (kind === 'history') assertActualPaginationOwned(paginationDiagnostic.snapshot(observer.getReports()), trial.additional_history.request_count);
         trials.push(trial);
       } catch (error) {
         canceled = true;

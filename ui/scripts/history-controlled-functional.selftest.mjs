@@ -48,6 +48,7 @@ function fakeRuntime(options={}){
     async close(){if(!this.closed){
       assert.ok(!this.page?.reportInFlight, 'context must not close before departing transport settles');
       this.closed=true;closed++;if(options.lateReport&&this.page)this.page.report('ready');
+      if(options.lateUncorrelatedHistory&&this.page)this.page.request(this.page.fixture.endpoint+'?before=UNIT-late');
       if(options.closeFailure)throw new Error('UNIT private cleanup detail');
     }}
   }
@@ -71,6 +72,7 @@ function fakeRuntime(options={}){
           this.diagnostic({kind:'request',open_id:this.open_id,request_id:this.request_id+'-older'});
           this.request(this.fixture.endpoint+'?before=UNIT-cursor&open_id='+this.request_id+'-older');
         }
+        if(options.extraUncorrelatedHistory)this.request(this.fixture.endpoint+'?before=UNIT-unowned');
         this.diagnostic({kind:'sse',open_id:this.open_id,stream_id:'UNIT-stream'});
         this.request('/api/conversations/UNIT-latest/stream?open_id=UNIT-stream');
         this.report('ready');
@@ -109,6 +111,20 @@ function fakeRuntime(options={}){
 test('UNIT full six-report driver traverses real action interfaces and closes all contexts without stock cohorts',async()=>{
   const runtime=fakeRuntime();const result=await runControlledFunctional(runtime.input,runtime.UNIT);
   assertControlledInventory(result);assert.equal(runtime.getClosed(),6);assert.equal(runtime.pages.length,6);
+});
+test('UNIT one correlated older GET cannot hide another actual uncorrelated older GET',async()=>{
+  const runtime=fakeRuntime({extraUncorrelatedHistory:true});
+  let failure;try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(error){failure=error;}
+  assert.match(failure.message,/no actual older GET may disappear/);
+  assert.equal(failure.controlledReceipt.failure_location.phase,'additional_history_owner');
+  assert.deepEqual(failure.controlledReceipt.failure_location.pagination.requests.map(r=>r.has_open_id),[true,false]);
+});
+test('UNIT actual uncorrelated older GET at context close cannot bypass final pagination inventory',async()=>{
+  const runtime=fakeRuntime({lateUncorrelatedHistory:true});
+  let failure;try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(error){failure=error;}
+  assert.match(failure.message,/no actual older GET may disappear/);
+  assert.equal(failure.controlledReceipt.failure_location.phase,'final_inventory');
+  assert.equal(failure.controlledReceipt.failure_location.pagination.requests.at(-1).before_report,false);
 });
 test('UNIT late context-close report is retained and fails exact inventory',async()=>{
   const runtime=fakeRuntime({lateReport:true});await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT));assert.equal(runtime.getClosed(),1);

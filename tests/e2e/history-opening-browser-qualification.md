@@ -2564,3 +2564,20 @@ separate ownership per actual GET on the captured original journey, no new
 admission, no mutation after terminal, and no expansion of backend initial-open
 stages. One causal qualification will follow source regression and review; no
 unchanged normal qualification was rerun for this diagnosis.
+
+### Complete older-request inventory through final browser drain
+
+Independent read-only source review found that the additional-history check could
+miss an uncorrelated older GET arriving after its first snapshot, and the small
+diagnostic saved pagination before its geometry frames rather than on every
+save. Shared qualification now requires every independently observed older GET
+to match the correlated inventory and original report, and rechecks that same
+bounded inventory after context closure. New negative regressions reject an
+extra uncorrelated older GET both before collection and during context close.
+Diagnostic saves refresh pagination/report counters through frames, error paths
+and final drain. No additional hosted diagnostic was run for these changes.
+The existing `191dac` result above remains limited to its actual report-time
+observation; later source changes do not retrospectively strengthen it.
+Cached shared regressions: **130 pass** (joint66, controlled25, diagnostic4,
+existing opening35); diff check passes. Positive additional-history, original
+journey, strict geometry, stock and acceptance constraints are unchanged.
