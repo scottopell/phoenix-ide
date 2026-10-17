@@ -170,7 +170,7 @@ impl OwnedChromeGroup {
                     #[cfg(target_os = "macos")]
                     eprintln!("owned_chrome_group_enumeration child={:?} root={:?} observation={observation:?} error={_error} {}", child.id(), self.root, self.darwin_wait_diagnostic());
                 })?;
-                if !live_members {
+                if !live_members && self.observe_root(child)? == RootObservation::Exited {
                     self.drained = true;
                     return Ok(());
                 }
@@ -240,11 +240,28 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
     Ok(false)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy)]
 struct GroupQueryOutcome {
     returned_bytes: libc::c_int,
     errno: libc::c_int,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl GroupQueryOutcome {
+    fn complete_pid_count(self, capacity_bytes: usize) -> io::Result<usize> {
+        if self.errno != 0 {
+            return Err(io::Error::from_raw_os_error(self.errno));
+        }
+        let returned = usize::try_from(self.returned_bytes).map_err(io::Error::other)?;
+        let pid_size = std::mem::size_of::<libc::pid_t>();
+        if capacity_bytes == 0 || returned >= capacity_bytes || returned % pid_size != 0 {
+            return Err(io::Error::other(format!(
+                "incomplete Chrome process group query: returned_bytes={returned} capacity_bytes={capacity_bytes} pid_size={pid_size}",
+            )));
+        }
+        Ok(returned / pid_size)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -286,7 +303,7 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
     // PROC_PGRP_ONLY = 2, as defined by libproc.h.
     let sizing = query_group(group, None)?;
     let size = sizing.returned_bytes;
-    if size <= 0 {
+    if size <= 0 || sizing.errno != 0 {
         return Err(io::Error::other(format!(
             "could not size Chrome process group: group={group} size={size} errno={:?}",
             sizing.errno
@@ -298,18 +315,14 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
             / std::mem::size_of::<libc::pid_t>()
             + 32
     ];
-    let bytes = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>())
-        .map_err(io::Error::other)?;
+    let bytes = std::mem::size_of_val(pids.as_slice());
     let listing = query_group(group, Some(&mut pids))?;
-    let count = listing.returned_bytes;
-    if count <= 0 || count >= bytes {
-        return Err(io::Error::other(format!(
-            "could not enumerate complete Chrome process group: group={group} size={size} capacity_bytes={bytes} returned_bytes={count} errno={:?}", listing.errno,
-        )));
-    }
-    for pid in pids.into_iter().take(
-        usize::try_from(count).map_err(io::Error::other)? / std::mem::size_of::<libc::pid_t>(),
-    ) {
+    let count = listing.complete_pid_count(bytes).map_err(|error| {
+        io::Error::other(format!(
+            "could not enumerate complete Chrome process group: group={group} size={size} capacity_bytes={bytes} returned_bytes={} errno={}: {error}", listing.returned_bytes, listing.errno,
+        ))
+    })?;
+    for pid in pids.into_iter().take(count) {
         if pid == 0 {
             continue;
         }
@@ -412,6 +425,67 @@ mod tests {
             group.observe_root(&mut root).is_err(),
             "post-reap enumeration grants no signal authority"
         );
+    }
+
+    #[test]
+    fn group_query_decoder_distinguishes_empty_error_and_truncation() {
+        let pid_bytes = std::mem::size_of::<libc::pid_t>();
+        let capacity = pid_bytes * 8;
+        assert_eq!(
+            GroupQueryOutcome {
+                returned_bytes: 0,
+                errno: 0
+            }
+            .complete_pid_count(capacity)
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            GroupQueryOutcome {
+                returned_bytes: i32::try_from(pid_bytes * 2).unwrap(),
+                errno: 0
+            }
+            .complete_pid_count(capacity)
+            .unwrap(),
+            2
+        );
+        for outcome in [
+            GroupQueryOutcome {
+                returned_bytes: 0,
+                errno: libc::EPERM,
+            },
+            GroupQueryOutcome {
+                returned_bytes: i32::try_from(pid_bytes).unwrap(),
+                errno: libc::ESRCH,
+            },
+            GroupQueryOutcome {
+                returned_bytes: -1,
+                errno: 0,
+            },
+            GroupQueryOutcome {
+                returned_bytes: 1,
+                errno: 0,
+            },
+            GroupQueryOutcome {
+                returned_bytes: i32::try_from(capacity).unwrap(),
+                errno: 0,
+            },
+            GroupQueryOutcome {
+                returned_bytes: i32::try_from(capacity + pid_bytes).unwrap(),
+                errno: 0,
+            },
+        ] {
+            assert!(
+                outcome.complete_pid_count(capacity).is_err(),
+                "invalid query accepted: {outcome:?}"
+            );
+        }
+        assert!(GroupQueryOutcome {
+            returned_bytes: 0,
+            errno: 0
+        }
+        .complete_pid_count(0)
+        .is_err());
     }
 
     fn sentinel() -> tokio::process::Child {
