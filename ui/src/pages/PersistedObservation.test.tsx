@@ -56,10 +56,13 @@ describe('persisted-only application ownership', () => {
     expect(latest.messages.length).toBeGreaterThan(0);
     for (const message of latest.messages) expect(screen.getByText(message.message_id)).toHaveAttribute('data-message-type', message.message_type);
     expect(screen.getByText(/Input is read-only/)).toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /send|activate|close conversation|retry save/i })).not.toBeInTheDocument();
     expect(liveOwner).not.toHaveBeenCalled();
     expect(eventSource).not.toHaveBeenCalled();
     expect(requests[0]).toBe('/api/capabilities');
-    expect(requests.slice(1).every(url => (url.includes('boundary_representation=original_messages') || url.includes('/history')))).toBe(true);
+    expect(requests.slice(1).filter(url => !(url.includes('boundary_representation=original_messages') || url.includes('/history')))).toEqual([]);
     cleanup();
     await Promise.resolve();
     expect(requests.some(url => /auth|models|activate|telemetry|resources|events/.test(url))).toBe(false);
@@ -70,7 +73,7 @@ describe('persisted-only application ownership', () => {
     fireEvent.click(link);
     await screen.findByTestId('persisted-messages');
     expect(requests).toContain('/api/observation/target');
-    expect(requests.every(url => url === '/api/capabilities' || url === '/api/observation/target' || (url.includes('boundary_representation=original_messages') || url.includes('/history')))).toBe(true);
+    expect(requests.filter(url => !(url === '/api/capabilities' || url === '/api/observation/target' || (url.includes('boundary_representation=original_messages') || url.includes('/history'))))).toEqual([]);
   });
   it.each(['/', '/global'])('discovers Global without an ordinary row at %s', async path => {
     const { requests, snapshot, eventSource } = setup(path, observed, 'coordinator');

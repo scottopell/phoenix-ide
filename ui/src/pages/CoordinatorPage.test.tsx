@@ -4,6 +4,7 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-rou
 import { CoordinatorPage } from './CoordinatorPage';
 import { COORDINATOR_BRIEFING_PROMPT } from './coordinatorBriefing';
 import type { Conversation } from '../api';
+import { ViewJourneyLifecycle } from '../hooks/conversationViewLifecycle';
 
 vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
   const actual = await importOriginal<typeof import('../hooks/conversationViewTelemetry')>();
@@ -282,7 +283,7 @@ describe('CoordinatorPage', () => {
     </Routes></MemoryRouter>);
     await screen.findByText('Shared conversation runtime /global');
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
-    expect(screen.getByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+    expect(await screen.findByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
   });
 
   it('retains the same acquired-history owner while a different valid source pin is validated', async () => {
@@ -305,6 +306,28 @@ describe('CoordinatorPage', () => {
     expect(screen.getByTestId('history-reference')).toBe(owner);
     expect(owner).toHaveTextContent('old-member');
     expect(screen.getByText('/global/old-member?source_transcript=conv-coordinator#message-new')).toBeInTheDocument();
+  });
+
+  it('does not fail a replacement journey with the preceding source selection error', async () => {
+    const finish = vi.spyOn(ViewJourneyLifecycle.prototype, 'finish');
+    function SelectValid() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/global/conv-coordinator?source_transcript=conv-coordinator')}>select valid</button>;
+    }
+    render(<MemoryRouter initialEntries={['/global/conv-coordinator?source_transcript=']}><Routes>
+      <Route path="/global/:slug" element={<><CoordinatorPage /><SelectValid /></>} />
+    </Routes></MemoryRouter>);
+    await screen.findByText('Original source conversation unavailable');
+    finish.mockClear();
+    let release!: (value: { conversation: Conversation }) => void;
+    apiMock.ensureGlobalCoordinator.mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    fireEvent.click(screen.getByText('select valid'));
+    expect(finish.mock.calls.filter(([outcome]) => outcome === 'failed')).toHaveLength(0);
+    expect(screen.queryByText('Original source conversation unavailable')).not.toBeInTheDocument();
+    await act(async () => release({ conversation: coordinatorConversation() }));
+    await screen.findByTestId('history-reference');
+    expect(finish.mock.calls.filter(([outcome]) => outcome === 'failed')).toHaveLength(0);
+    finish.mockRestore();
   });
 
   it('rejects a slug pin even when it belongs to the Global domain', async () => {
