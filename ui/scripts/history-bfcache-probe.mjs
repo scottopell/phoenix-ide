@@ -12,7 +12,7 @@ const base=process.env.HISTORY_BASE_URL;
 const {chromium}=createRequire(resolve(process.env.APP_ROOT,'ui/package.json'))('playwright');
 const result={scope:'separate_full_chromium_desktop_native_bfcache_probe_controlled_artifact_not_PWA_or_physical_suspend',
   environment_change:'full_chromium_channel_not_headless_shell_after_delegate_rejection',
-  full_acceptance:false,overhead_clearance:false,status:'failed',reports:[],rejections:[],
+  full_acceptance:false,overhead_clearance:false,status:'failed',reports:[],rejections:[],sockets:[],
   launch:{headless:true,channel:'chromium',ignoreDefaultArgs:['--disable-back-forward-cache']}};
 let browser,context,page,parseErrors=0;
 result.stage='launch';
@@ -29,6 +29,14 @@ try {
   result.stage='owned_authentication';
   await authenticateOwnedContext(context,base);
   page=await context.newPage();
+  page.on('websocket',socket=>{
+    const url=new URL(socket.url());
+    const ownedPath=/^\/api\/(?:terminal|conversations|browser)[A-Za-z0-9_\/-]*$/.test(url.pathname)?url.pathname:'unclassified_path_redacted';
+    const entry={path:ownedPath,query_present:!!url.search,opened_stage:result.stage,closed:false};
+    if(result.sockets.length>=8){result.socket_inventory_overflow=true;return;}
+    result.sockets.push(entry);
+    socket.on('close',()=>{entry.closed=true;entry.closed_stage=result.stage;});
+  });
   const diagnostics=await context.newCDPSession(page);
   await diagnostics.send('Page.enable');
   diagnostics.on('Page.backForwardCacheNotUsed',event=>{
