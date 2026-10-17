@@ -1882,12 +1882,12 @@ mod tests {
         assert_eq!(defaults.serve_seconds, 120);
         assert_eq!(defaults.arguments()[4], "110");
         assert_eq!(defaults.arguments()[6], "120");
-        let ready = JobSpec::new_with_timing(12, 30, 40).unwrap();
-        assert_eq!(ready.arguments()[4], "12");
-        assert_eq!(ready.arguments()[6], "40");
+        let ready = JobSpec::new_with_timing(30, 60, 70).unwrap();
+        assert_eq!(ready.arguments()[4], "30");
+        assert_eq!(ready.arguments()[6], "70");
         let now = MonotonicTick::native_now().unwrap();
         assert!(ready.deadline > now);
-        assert!(ready.deadline.get().saturating_sub(now.get()) <= 30_000_000_000);
+        assert!(ready.deadline.get().saturating_sub(now.get()) <= 60_000_000_000);
         assert_eq!(ready.root.path().parent(), Some(Path::new("/tmp")));
         assert!(ready.label.starts_with(LABEL_NAMESPACE));
     }

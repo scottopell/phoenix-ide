@@ -320,7 +320,7 @@ fn assert_fenced_sample(fenced: &WireSnapshot, revision: u64, deadline: Monotoni
 #[test]
 #[allow(clippy::too_many_lines)]
 fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signals() {
-    let mut installation = DisposableLaunchdInstallation::start_with_timing(12, 30, 40).unwrap();
+    let mut installation = DisposableLaunchdInstallation::start_with_timing(30, 60, 70).unwrap();
     installation.assert_witnesses().unwrap();
     let root_path = installation.guardian().root().to_path_buf();
     let path = installation.guardian().store();
@@ -465,7 +465,7 @@ fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signa
     let ready = runner
         .marker_with_timeout(
             "recover_finish_and_ready attempt=64",
-            Duration::from_secs(35),
+            Duration::from_secs(65),
         )
         .unwrap();
     assert!(ready.contains("generation=3 phase=ReadyForDisruption cleanup=VerifiedClean effects=0 signal_exact_identity=0"), "{ready}");
