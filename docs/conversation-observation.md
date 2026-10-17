@@ -63,8 +63,14 @@ Loopback access is unauthenticated; the server rejects forwarded requests. Keep 
 port private: do not publish a tunnel or proxy. A local browser or process can read
 admitted data. The matching UI discovers capabilities before mounting ownership
 and selects persisted-only history rather than live streams, activation, provider
-catalogs, host-resource polling or telemetry reporting. Capability discovery fails
-closed. Actual nested-widget requests, UI usability and endpoint denial still need
+catalogs, host-resource polling or telemetry reporting. It discovers the admitted
+target through `GET /api/observation/target`, reads ordinary history through
+`GET /api/product-conversations/{reference}?boundary_representation=original_messages`,
+and reads Global history through `GET /api/global/coordinator/history/{reference}`.
+Those history responses include `latest_opening`, `boundaries` and explicit
+`event_presentation` fields (including null) on messages. The live member endpoint
+`GET /api/conversations/{member}/observation` remains unavailable (503); it is not
+required by this persisted-only UI. Capability discovery fails closed. Actual nested-widget requests, UI usability and endpoint denial still need
 separate binary/browser qualification; mocked tests alone do not prove this boundary.
 
 ## Portable fixture manifest, format version 1
