@@ -575,6 +575,7 @@ fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn child_list_ack_recovery_does_not_reenumerate_or_reapply_after_runner_crash() {
     let ChildListProcessFixture {
