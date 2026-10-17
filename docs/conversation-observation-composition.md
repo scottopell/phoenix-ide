@@ -8,6 +8,12 @@
   `e34ff8b85148bdb79f8c4164c5a7b067c930421a` applied as two-page hunks to
   `963307eb834fee0568fb8f991164d842d0ec68c2`. This is a tiny new runtime delta
   from 9ee plus its forced-window regression, not whole-UI product parity.
+- Explicit private SQL child: the exact single-DB-file patch from reviewed product
+  `250f3d56b13875caa3c927d453ecb70db406803f` to
+  `f16afb227d9336a863c0b0345960ea9a6d62b7c7`, applied to attribution checkpoint
+  `f9477018529420b462c896d83c115dbc318d8ef9`. Only `snapshot_ceiling AS MATERIALIZED`
+  and the corrected upstream test/helpers are added. This is a real SQL exception,
+  not observer-only SQL parity or a whole-product-file replacement.
 - Worktree: `.phoenix/current-task-observation`, branch
   `bench/current-task-observation-9ee`. This packet is a source-only qualification composition.
 - Read the [observation requirements](../specs/conversation_observation/requirements.md)
@@ -22,6 +28,9 @@ The e34 private backport preserves all 963 Rust bytes and all UI bytes except it
 two exact approved page patches and the manifested source-parity guard. No old
 branch, fixture or captured packet was imported. No fake init or schema-default
 fields were added. No dependencies, migrations, lower hooks or runners were added.
+The subsequent f16 child changes only the approved DB SQL/test hunks plus packet
+source guards/docs/manifest metadata; observer/events/auth/configuration and all
+other UI bytes are preserved from f947. The original e34 UI exception is unchanged.
 
 ## Exact parity inventory
 
@@ -158,3 +167,23 @@ See [the attribution packet](conversation-observation-attribution.md#private-e34
 for exact cached commands and results. Observation gates, SQL, backend sources,
 completion events and dispatch are unchanged by this backport. No installed
 artifact, service, browser, GET, SQL operation or hosted dispatch is qualified.
+
+## Private f16 SQL child evidence boundary
+
+The attribution manifest retains 2702 as its baseline and separately names the
+immutable f947 child base, reviewed product 250 base and f16 upstream source.
+Python and TypeScript reconstruct the entire approved DB bytes by applying only
+that upstream patch to f947, independently of manifest regeneration. Python also
+retains the original observer token proof and compares current unwrapped tokens
+to the exact upstream-patched 2702 baseline; it does not erase SQL or new tests.
+Negative mutations cover SQL whitespace, helper edits, keyword reversal and test
+changes. An f947-relative finite changed-path proof preserves all other tracked
+bytes. The historical UI manifest is regenerated unchanged by the existing
+producer; no UI capability, renderer, test, generated type, rig or asset changes
+are included except source-parity guard metadata/logic.
+
+See [the f16 source packet](conversation-observation-attribution.md#private-f16-sql-child-source-only)
+for exact identities, real Rust selectors, cached checks and their evidence
+boundary. New/retained Rust selectors are authored but **UNRUN**; no build,
+install, push/network, service, GET, browser, SQL execution, qualifier-worktree
+operation, runtime qualification or measured benchmark benefit is claimed.

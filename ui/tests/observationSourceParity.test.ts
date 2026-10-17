@@ -16,6 +16,7 @@ const manifest = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observ
 const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 const attribution = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observation-attribution.json'), 'utf8')) as {
   base: string;
+  approved_sql_backport: { base: string; product_base: string; upstream: string; paths: string[]; patch_args: string[] };
   diff_args: string[];
   files: Array<{ path: string; base_blob: string | null; actual_blob: string; diff: string; changed_functions: string[] }>;
 };
@@ -85,6 +86,31 @@ function appliedBackport(): Map<string, Buffer> {
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+}
+const sqlPatchArgs = exactDiffArgs.slice(0, -1).map(arg => arg === '--unified=3' ? '--unified=20' : arg);
+const approvedSQLBackport = {
+  base: 'f9477018529420b462c896d83c115dbc318d8ef9',
+  product_base: '250f3d56b13875caa3c927d453ecb70db406803f',
+  upstream: 'f16afb227d9336a863c0b0345960ea9a6d62b7c7',
+  paths: ['crates/phoenix-db/src/product_conversation_read.rs'],
+  patch_args: sqlPatchArgs,
+};
+function appliedSQLBackport(): Buffer {
+  const path = approvedSQLBackport.paths[0]!;
+  const patch = git(...sqlPatchArgs, approvedSQLBackport.product_base, approvedSQLBackport.upstream, '--', path);
+  const scratch = mkdtempSync(resolve(tmpdir(), 'observation-approved-sql-backport-'));
+  try {
+    const destination = resolve(scratch, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, execFileSync('git', ['show', `${approvedSQLBackport.base}:${path}`], { cwd: root }));
+    execFileSync('git', ['apply', '--whitespace=error-all', '-'], { cwd: scratch, input: patch });
+    return readFileSync(destination);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+function requireApprovedSQLBytes(body: Buffer, expected: Buffer): void {
+  if (!body.equals(expected)) throw new Error('DB differs from exact 250-to-f16 patch applied to f947');
 }
 function sourcePaths(dir: string): string[] {
   return readdirSync(resolve(root, dir), { withFileTypes: true }).flatMap(entry => {
@@ -175,6 +201,46 @@ describe('observation composition source identity', () => {
       }
     }
     expect(attribution.base).toBe('2702d8389c2fc78ac2e528c876c35a1a7040d692');
+    expect(attribution.approved_sql_backport).toEqual(approvedSQLBackport);
+    const approvedSQL = appliedSQLBackport();
+    const dbPath = approvedSQLBackport.paths[0]!;
+    requireApprovedSQLBytes(readFileSync(resolve(root, dbPath)), approvedSQL);
+    const dbSource = approvedSQL.toString();
+    const oracle = dbSource.split('const ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL:')[1]!.split('";')[0]!;
+    const page = dbSource.split('const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL:')[1]!.split('";')[0]!;
+    expect(oracle).not.toContain('snapshot_ceiling AS MATERIALIZED (');
+    expect(page).toContain('snapshot_ceiling AS MATERIALIZED (');
+    for (const selector of ['late_hydration_matches_full_row_oracle_matrix', 'message_page_query_enforces_transcript_first_indexed_join', 'message_page_materializes_bound_snapshot_ceiling_once_with_result_parity']) {
+      expect(dbSource.split(`async fn ${selector}(`)).toHaveLength(2);
+    }
+    for (const [before, after] of [
+      ['SELECT kind, ordinary_lifecycle', 'SELECT  kind, ordinary_lifecycle'],
+      ['snapshot_ceiling AS MATERIALIZED (', 'snapshot_ceiling AS MATERIALIZED  ('],
+      ['.get_conversation(&id)', '.get_conversation_by_slug(&id)'],
+      ['snapshot_ceiling AS MATERIALIZED (', 'snapshot_ceiling AS ('],
+      ['SELECT sqlite_version()', "SELECT 'invented-version'"],
+      ['assert_eq!(ceilings.len(), 3)', 'assert_eq!(ceilings.len(), 4)'],
+      ['ceiling fixture continuation', 'unapproved fixture continuation'],
+    ]) {
+      expect(dbSource).toContain(before);
+      expect(() => requireApprovedSQLBytes(Buffer.from(dbSource.replace(before!, after!)), approvedSQL)).toThrow('DB differs');
+    }
+    const wrongOwner = dbSource.replace('snapshot_ceiling AS MATERIALIZED (', 'snapshot_ceiling AS (').replace('snapshot_ceiling AS (', 'snapshot_ceiling AS MATERIALIZED (');
+    expect(() => requireApprovedSQLBytes(Buffer.from(wrongOwner), approvedSQL)).toThrow('DB differs');
+    const sqlBaseline = execFileSync('git', ['show', `${approvedSQLBackport.base}:${dbPath}`], { cwd: root });
+    for (const mutation of [sqlBaseline, Buffer.concat([approvedSQL, Buffer.from('\n')])]) {
+      expect(() => requireApprovedSQLBytes(mutation, approvedSQL)).toThrow('DB differs');
+    }
+    const sqlPacketPaths = [dbPath, 'docs/conversation-observation-attribution.json', 'docs/conversation-observation-source-parity.json', 'docs/conversation-observation-attribution.md', 'docs/conversation-observation-composition.md', 'tests/devpy/test_observation_attribution_source.py', 'ui/tests/observationSourceParity.test.ts'];
+    const sqlChanged = [
+      ...git('diff', '--name-only', approvedSQLBackport.base).trim().split('\n').filter(Boolean),
+      ...git('ls-files', '--others', '--exclude-standard').trim().split('\n').filter(Boolean),
+    ];
+    expect(sqlChanged.filter(path => !sqlPacketPaths.includes(path))).toEqual([]);
+    expect(attribution.files.find(file => file.path === dbPath)!.changed_functions).toEqual([
+      'ReadStage::name', 'ReadCompletion::new', 'ReadCompletion::complete', 'ReadCompletion::emit', 'ReadCompletion::drop', 'complete_read', 'get_ordinary_product_conversation', 'read_ordinary_product_conversation_snapshot', 'get_product_conversation_on',
+      'PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL (snapshot_ceiling CTE)', 'tests::message_page_materializes_bound_snapshot_ceiling_once_with_result_parity', 'tests::bound_ceiling_fixture', 'tests::assert_materialized_ceiling_plan',
+    ]);
     expect(attribution.diff_args).toEqual(exactDiffArgs);
     expect(attribution.files.map(file => file.path)).toEqual([...attributionPaths].sort());
     for (const file of attribution.files) {

@@ -29,11 +29,27 @@ EXACT_DIFF_ARGS = (
     "--src-prefix=a/", "--dst-prefix=b/", "--no-index",
 )
 DB = "crates/phoenix-db/src/product_conversation_read.rs"
+SQL_BACKPORT_BASE = "f9477018529420b462c896d83c115dbc318d8ef9"
+SQL_PRODUCT_BASE = "250f3d56b13875caa3c927d453ecb70db406803f"
+SQL_UPSTREAM = "f16afb227d9336a863c0b0345960ea9a6d62b7c7"
+SQL_PATCH_ARGS = tuple("--unified=20" if arg == "--unified=3" else arg for arg in EXACT_DIFF_ARGS[:-1])
+SQL_BACKPORT = {"base": SQL_BACKPORT_BASE, "product_base": SQL_PRODUCT_BASE,
+                "upstream": SQL_UPSTREAM, "paths": [DB], "patch_args": list(SQL_PATCH_ARGS)}
+SQL_PACKET_PATHS = {DB, PACKET, UI_PACKET, "docs/conversation-observation-attribution.md",
+                    "docs/conversation-observation-composition.md",
+                    "tests/devpy/test_observation_attribution_source.py",
+                    "ui/tests/observationSourceParity.test.ts"}
+SQL_FUNCTIONS = ["PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL (snapshot_ceiling CTE)",
+                 "tests::message_page_materializes_bound_snapshot_ceiling_once_with_result_parity",
+                 "tests::bound_ceiling_fixture", "tests::assert_materialized_ceiling_plan"]
+SELECTORS = ["late_hydration_matches_full_row_oracle_matrix",
+             "message_page_query_enforces_transcript_first_indexed_join",
+             "message_page_materializes_bound_snapshot_ceiling_once_with_result_parity"]
 ROUTES = "crates/phoenix-ide/src/api/observation.rs"
 AUTH = "crates/phoenix-ide/src/api/auth.rs"
 STARTUP = "crates/phoenix-ide/src/observation_startup.rs"
 FUNCTIONS = {
-    DB: ["ReadStage::name", "ReadCompletion::new", "ReadCompletion::complete", "ReadCompletion::emit", "ReadCompletion::drop", "complete_read", "get_ordinary_product_conversation", "read_ordinary_product_conversation_snapshot", "get_product_conversation_on"],
+    DB: ["ReadStage::name", "ReadCompletion::new", "ReadCompletion::complete", "ReadCompletion::emit", "ReadCompletion::drop", "complete_read", "get_ordinary_product_conversation", "read_ordinary_product_conversation_snapshot", "get_product_conversation_on", *SQL_FUNCTIONS],
     AUTH: ["observation_request_span", "auth_middleware"],
     ROUTES: ["resolve_reference", "require_member"],
     "crates/phoenix-ide/src/api/product_conversations.rs": ["read_product_conversation"],
@@ -212,6 +228,24 @@ def approved_backport():
         return {path: (Path(directory) / path).read_bytes() for path in BACKPORT_PATHS}
 
 
+def approved_sql_backport(base=SQL_BACKPORT_BASE):
+    if base not in (SQL_BACKPORT_BASE, BASE):
+        raise AssertionError("unapproved SQL reconstruction base")
+    patch = git(*SQL_PATCH_ARGS, SQL_PRODUCT_BASE, SQL_UPSTREAM, "--", DB)
+    with tempfile.TemporaryDirectory(prefix="observation-approved-sql-backport-") as directory:
+        destination = Path(directory) / DB
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(subprocess.check_output(["git", "show", f"{base}:{DB}"], cwd=ROOT))
+        subprocess.run(["git", "apply", "--whitespace=error-all", "-"], cwd=directory,
+                       input=patch, text=True, capture_output=True, check=True)
+        return destination.read_bytes()
+
+
+def require_approved_sql_bytes(body, expected):
+    if body != expected:
+        raise AssertionError("DB differs from exact 250-to-f16 patch applied to f947")
+
+
 def regenerate_manifests():
     ui = json.loads((ROOT / UI_PACKET).read_text())
     ui["diff_args"] = list(EXACT_DIFF_ARGS)
@@ -222,7 +256,8 @@ def regenerate_manifests():
             entry["exception"]["diff"] = exact_diff(entry["path"], entry["product_blob"])
     (ROOT / UI_PACKET).write_text(json.dumps(ui, indent=2, ensure_ascii=False) + "\n")
     # The packet excludes itself; its producer's completed source is an ordinary entry.
-    packet = {"base": BASE, "diff_args": list(EXACT_DIFF_ARGS), "files": []}
+    packet = {"base": BASE, "approved_sql_backport": SQL_BACKPORT,
+              "diff_args": list(EXACT_DIFF_ARGS), "files": []}
     for path in sorted(FUNCTIONS):
         tree = git("ls-tree", BASE, "--", path).strip()
         base_blob = tree.split()[2] if tree else None
@@ -238,6 +273,7 @@ class AttributionSourceTests(unittest.TestCase):
     def test_bounded_exact_diffs_and_changed_function_inventory(self):
         packet = json.loads((ROOT / PACKET).read_text())
         self.assertEqual(packet["base"], BASE)
+        self.assertEqual(packet["approved_sql_backport"], SQL_BACKPORT)
         self.assertEqual(packet["diff_args"], list(EXACT_DIFF_ARGS))
         self.assertEqual(json.loads((ROOT / UI_PACKET).read_text())["diff_args"], list(EXACT_DIFF_ARGS))
         self.assertEqual([entry["path"] for entry in packet["files"]], sorted(FUNCTIONS))
@@ -277,7 +313,7 @@ class AttributionSourceTests(unittest.TestCase):
         self.assertNotEqual(blob_hash(changed), entry["actual_blob"])
         with mock.patch.object(Path, "read_bytes", return_value=changed):
             self.assertNotEqual(exact_diff(DB, entry["base_blob"], env=env), entry["diff"])
-        self.assertNotEqual(tokens(pinned(DB)), without_wrappers(changed.decode(), DB))
+        self.assertNotEqual(tokens(approved_sql_backport(BASE).decode()), without_wrappers(changed.decode(), DB))
 
     def test_exact_diff_ignores_inter_hunk_context_and_rejects_body_mutation(self):
         self._assert_exact_patches_and_reject_body_mutation({
@@ -301,18 +337,52 @@ class AttributionSourceTests(unittest.TestCase):
             with self.subTest(algorithm=algorithm, indent=indent, compact=compact):
                 self._assert_exact_patches_and_reject_body_mutation(env)
 
-    def test_only_exact_instrument_wrappers_change_db_and_admission_tokens(self):
+    def test_only_exact_instrument_wrappers_and_approved_sql_change_db_and_admission_tokens(self):
+        original = git("show", f"{SQL_BACKPORT_BASE}:{DB}")
+        self.assertEqual(tokens(pinned(DB)), without_wrappers(original, DB))
+        approved = approved_sql_backport()
+        require_approved_sql_bytes((ROOT / DB).read_bytes(), approved)
+        oracle = approved.decode().split("const ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL:", 1)[1].split('";', 1)[0]
+        page = approved.decode().split("const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL:", 1)[1].split('";', 1)[0]
+        self.assertNotIn("snapshot_ceiling AS MATERIALIZED (", oracle)
+        self.assertIn("snapshot_ceiling AS MATERIALIZED (", page)
+        changed = set(git("diff", "--name-only", SQL_BACKPORT_BASE).splitlines())
+        changed.update(git("ls-files", "--others", "--exclude-standard").splitlines())
+        self.assertLessEqual(changed, SQL_PACKET_PATHS)
+        for selector in SELECTORS:
+            self.assertEqual(len(re.findall(r"async fn " + selector + r"\(", approved.decode())), 1)
         for path in [DB, ROUTES, "crates/phoenix-ide/src/api/product_conversations.rs"]:
             with self.subTest(path=path):
-                self.assertEqual(tokens(pinned(path)), without_wrappers((ROOT / path).read_text(), path))
+                expected = approved_sql_backport(BASE).decode() if path == DB else pinned(path)
+                self.assertEqual(tokens(expected), without_wrappers((ROOT / path).read_text(), path))
 
     def test_proof_does_not_erase_sql_whitespace_or_helper_changes(self):
         literal = 'r#"SELECT .instrument(tracing::info_span!("observation.db.product"))"#'
         self.assertEqual(tokens(literal), [literal])
         source = (ROOT / DB).read_text()
-        for changed in [source.replace("SELECT kind, ordinary_lifecycle", "SELECT  kind, ordinary_lifecycle", 1),
-                        source.replace(".get_conversation(&id)", ".get_conversation_by_slug(&id)", 1)]:
-            self.assertNotEqual(tokens(pinned(DB)), without_wrappers(changed, DB))
+        approved = approved_sql_backport()
+        expected_tokens = tokens(approved_sql_backport(BASE).decode())
+        for old, new in [("SELECT kind, ordinary_lifecycle", "SELECT  kind, ordinary_lifecycle"),
+                         ("snapshot_ceiling AS MATERIALIZED (", "snapshot_ceiling AS MATERIALIZED  ("),
+                         (".get_conversation(&id)", ".get_conversation_by_slug(&id)"),
+                         ("snapshot_ceiling AS MATERIALIZED (", "snapshot_ceiling AS ("),
+                         ("SELECT sqlite_version()", "SELECT 'invented-version'"),
+                         ("assert_eq!(ceilings.len(), 3)", "assert_eq!(ceilings.len(), 4)"),
+                         ("ceiling fixture continuation", "unapproved fixture continuation")]:
+            with self.subTest(mutation=old):
+                self.assertIn(old, source)
+                changed = source.replace(old, new, 1)
+                with self.assertRaises(AssertionError):
+                    require_approved_sql_bytes(changed.encode(), approved)
+                self.assertNotEqual(expected_tokens, without_wrappers(changed, DB))
+        wrong_owner = source.replace("snapshot_ceiling AS MATERIALIZED (", "snapshot_ceiling AS (", 1).replace(
+            "snapshot_ceiling AS (", "snapshot_ceiling AS MATERIALIZED (", 1)
+        with self.assertRaises(AssertionError):
+            require_approved_sql_bytes(wrong_owner.encode(), approved)
+        self.assertNotEqual(expected_tokens, without_wrappers(wrong_owner, DB))
+        for mutation in [git("show", f"{SQL_BACKPORT_BASE}:{DB}").encode(), approved + b"\n"]:
+            with self.assertRaises(AssertionError):
+                require_approved_sql_bytes(mutation, approved)
         with self.assertRaises(AssertionError):
             without_wrappers(source.replace('.instrument(tracing::info_span!("observation.db.read_member"))',
                                             '.instrument(tracing::info_span!("unreviewed"))', 1), DB)

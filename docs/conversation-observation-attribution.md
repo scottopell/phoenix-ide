@@ -13,7 +13,9 @@ explicit private e34 backport atop `963307eb834fee0568fb8f991164d842d0ec68c2`
 adds only the two approved ProductConversationPage runtime/test patches. All other
 2702 UI bytes remain exact except the explicitly manifested source-parity guard;
 composition documentation and UI exception metadata are separately enumerated.
-Historical product identity remains 9ee, not e34 whole-UI parity.
+Historical product identity remains 9ee, not e34 whole-UI parity. The private
+f16 SQL child described below adds one separately approved DB exception to f947;
+this is no longer a literal SQL-parity claim against 2702.
 
 **This source is UNCOMPILED. Its Rust tests are authored, UNRUN.** No Cargo,
 build, codegen, installation, child/server executable, fixture/SQL operation,
@@ -90,8 +92,10 @@ Each completion guard additionally owns its dispatch and installs it while
 emitting, with an explicit captured parent entered synchronously for JSON
 ancestry. No entered span or dispatcher guard crosses an await.
 
-No DB runtime API, query, fetch, bind, call order, topology loop, limit,
-transaction boundary, rollback policy, response data, route or GET changes.
+The only DB query change in the f16 child is the exact upstream
+`snapshot_ceiling AS MATERIALIZED` keyword in the bounded message-page SQL.
+No DB runtime API, fetch, bind, call order, topology loop, limit, transaction
+boundary, rollback policy, response data, route or GET changes are introduced.
 Shared DB/API guards and existing spans can be observed by an independently
 enabled subscriber in a future live build; only the new private subscriber's
 installation/output is observation-startup-specific. This is not a production
@@ -212,6 +216,11 @@ the unchanged SQL-preserving token proof. Tests do not edit any SQL or product f
 The Python guard unwraps only the enumerated finite calls and original exact
 instrumentation wrappers, the exact added import/member attribute and the DB
 helper/test block, then compares entire owning-file Rust token streams to 2702.
+For the f16 SQL child, the DB comparison target is exactly the immutable upstream
+250-to-f16 DB patch applied to 2702 in scratch; the SQL keyword and new upstream
+test/helpers are not erased. The original f947-to-2702 observer token proof is
+also retained. Independently, the entire current DB file must equal the exact
+same upstream patch applied to f947 bytes, including every observer byte.
 The one rustfmt-added trailing comma on the unchanged latest-opening call is
 normalized by its exact full call token sequence, not a general comma eraser.
 SQL string tokens retain byte-for-byte whitespace. Query/helper/wrapper changes
@@ -353,3 +362,90 @@ product GET, SQL operation, production action or hosted dispatch was performed.
 No measured runtime/event or installed-artifact success is claimed. Roadmap #806
 was read using `gh` per repository orientation guidance; that external metadata
 read is not a product GET or qualification.
+
+## Private f16 SQL child (source-only)
+
+This child uses the **same** `.phoenix/current-task-attribution` worktree on
+`bench/current-task-attribution-f16-ceiling`, branching from clean
+`f9477018529420b462c896d83c115dbc318d8ef9`. The original
+`bench/current-task-observation-attribution` ref remains at f947. The parent
+service uses its existing binary; no artifact or service was replaced.
+
+Immutable reviewed product ancestry, verified locally from Git objects:
+
+```text
+250f3d56b13875caa3c927d453ecb70db406803f
+  -> 3f8277649fe08ec757e396ebf0e0152471e9779a (materialize ceiling)
+  -> 5572e6b7ac34879b0185555cc7fe61b991902718 (correct fixture continuation)
+  -> f16afb227d9336a863c0b0345960ea9a6d62b7c7 (SELECT sqlite_version())
+```
+
+The complete 250-to-f16 delta touches **only**
+`crates/phoenix-db/src/product_conversation_read.rs`: **176 additions, one
+deletion**, in two hunks. One SQL line adds `MATERIALIZED`; 175 lines add the
+result-parity/plan test and its two corrected helpers. The fixture uses the
+actual `ContextExhausted`/`ContinueOutcome` contract, and the test prints the
+actual SQLite engine queried with `SELECT sqlite_version()`. No whole product
+file, other product changes, or qualifier-worktree content was copied.
+
+Both source guards independently reconstruct the approved DB file by pinned
+`git diff --unified=20 250 f16 -- <DB path>` and
+`git apply --whitespace=error-all` to f947 bytes in scratch directories. Only the
+upstream-reconstruction context increases to 20; all other explicit diff settings
+are shared with the unchanged three-line canonical manifest producer. Twenty
+context lines include the owning constant: a three-line upstream SQL hunk can
+otherwise apply to the adjacent full-row oracle query. The initial local token
+check caught that wrong-owner application; it was reversed and correctly
+reapplied before final source-only validation. Both guards assert the bounded-page constant
+has the new keyword and the full-row oracle does not, and reject a wrong-owner
+mutation. The attribution manifest records these separate reconstruction
+`patch_args`, the immutable `approved_sql_backport` identities, and the SQL
+constant and three new test/helper functions in its changed-function inventory. Regenerating manifests
+cannot authorize any additional DB edit. The Python token guard uses the same
+patch applied to the historical 2702 DB baseline; no generic SQL/token deletion
+or keyword normalization was added. Original observer normalization stays intact.
+Both guards reject SQL whitespace mutations, an existing helper mutation,
+keyword reversal, test assertion/version-query changes, a new fixture-helper
+mutation, the unpatched f947 file, and appended bytes.
+
+Relative to f947, all tracked files outside the exact DB patch, the two source
+guards, two packet docs, and manifest metadata are byte-identical. In particular,
+all other Rust, observer events/dispatch, auth, capabilities/configuration, and
+all UI runtime/test files remain f947; the UI source-parity guard alone changes.
+The DB observer/event additions are preserved by whole-file reconstruction.
+The existing canonical diff configuration, historical 2702 baseline, 9ee UI
+identity, and e34-on-963 proof are unchanged. The UI manifest is regenerated by
+the existing producer but has no byte delta. Failed prior qualification evidence
+is not relabeled, and no runtime improvement is claimed.
+
+Real authored Rust selectors present in the resulting source (all **UNRUN**):
+
+- `product_conversation_read::tests::late_hydration_matches_full_row_oracle_matrix`
+- `product_conversation_read::tests::message_page_query_enforces_transcript_first_indexed_join`
+- `product_conversation_read::tests::message_page_materializes_bound_snapshot_ceiling_once_with_result_parity`
+
+Allowed cached validation commands for this packet only:
+
+```sh
+python3 tests/devpy/test_observation_attribution_source.py --regenerate-manifests
+python3 -m unittest discover -s tests/devpy -p test_observation_attribution_source.py -v
+python3 -m unittest discover -s tests/devpy -p test_observe.py -v
+(cd ui && ./node_modules/.bin/vitest run tests/observationSourceParity.test.ts --maxWorkers=1)
+git diff --check
+```
+
+Executed cached results: **11 Python attribution source guards passed**, including
+manifest byte-idempotence and hostile diff-configuration regressions; **8 mocked
+launcher/source guards passed**; focused Vitest source parity **14 passed** with
+one worker; `git diff --check` **passed**. Independent comparison of the
+250-to-f16 and f947-to-child DB diffs found both hunk bodies and owning-constant
+headers identical (only line offsets and whole-file index hashes differ).
+The regenerated UI manifest has zero byte delta from f947, and the original
+attribution branch ref remains f947. Exactly six tracked paths change: the DB,
+two guards, two docs and the attribution manifest.
+
+No Cargo, heavy build, dependency install, push/network, browser, service, fixture/SQL
+execution, product GET, hosted dispatch or qualifier-worktree action is authorized
+or performed by this packet. Roadmap #806 cannot be refreshed under this
+no-network scope. Source proofs do not establish compilation, SQLite plan/result
+behavior, event/runtime qualification, fixture acceptance, or benchmark benefit.
