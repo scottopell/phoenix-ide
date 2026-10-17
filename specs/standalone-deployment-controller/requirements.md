@@ -473,6 +473,29 @@ NOT authorize ACK.
 A lost ACK SHALL permit re-reading retained evidence and re-acknowledging the same
 durable application, not reapplying it or reexecuting the effect.
 
+WHEN the same live guardian retains a successful resource sample that the issuing
+runner did not durably apply
+THE recovering runner MAY apply that retained sample only after committing a fresh
+interruption and establishing an exact reconciling session before the original
+absolute deadline. The application authority SHALL require the sole durable
+`IssuedPendingApplication` issue, exact issuing-session provenance retained by the
+guardian, the current interrupted resource-sampling obligation, and a correlated
+live response from that guardian; none of those evidence sources alone SHALL mint
+application authority.
+
+THE recovered application SHALL atomically append only a nonterminal sample to the
+interrupted resource-sampling resume state and record the exact native application.
+It SHALL leave the attempt interrupted, return no executable plan, and grant no
+dispatch, reconciliation activation, process mutation, or acknowledgement authority.
+The guardian SHALL retain custody when the sample is failed, terminal, stale,
+ambiguous, mismatched, or admitted at or after the original deadline.
+
+WHEN that recovered application is durable
+THE fresh reconciling session MAY acknowledge the exact earlier-session result under
+the ordinary durable-application proof. A crash or lost response before application
+commit SHALL permit fresh verification of retained custody, not effect reexecution;
+a crash after application commit SHALL use acknowledgement-only recovery.
+
 ---
 
 ### REQ-SDC-019: Pre-Adoption Same-Version Boundary

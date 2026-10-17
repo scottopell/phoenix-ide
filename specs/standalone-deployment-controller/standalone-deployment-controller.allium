@@ -558,6 +558,30 @@ rule RecoverPendingResourceSample {
         ExactPendingResourceSampleRequested(attempt)
 }
 
+rule ApplyRetainedPendingResourceSample {
+    when: RetainedNativeResourceSampleVerified(attempt, sample)
+    requires: attempt.phase = interrupted
+    requires: attempt.resume_phase = resource_sampling
+    requires: attempt.compatibility_boundary = predecessor_eligible
+    requires: now < attempt.operation_deadline
+    requires: sample.sequence_is_after(attempt.resource_samples)
+    requires: attempt.resource_samples.count + 1 < minimum_sustained_samples
+    requires: exact_reconciling_guardian_retains_issuing_provenance(attempt, sample)
+    requires: sole_pending_native_issue_matches(attempt, sample)
+    ensures:
+        attempt.resource_samples.append(sample)
+        attempt.phase = interrupted
+        attempt.resume_phase = resource_sampling
+        DurableRecoveredSampleApplicationWritten(attempt, sample)
+        RetainedResultAckRequestedAfterDurableApplication(attempt, sample)
+        not ExactPendingResourceSampleRequested(attempt)
+        not NativeEffectRequestedForAttempt(attempt)
+    @guidance
+        -- The live response and store candidate combine into one application-only
+        -- capability. Neither source alone constructs a ticket, completion, ACK,
+        -- transition, or runnable loop. Failed or terminal samples remain retained.
+}
+
 rule RecordCandidateMigrationInvocation {
     when: CandidateMigrationInvoked(attempt, candidate)
     requires: attempt.phase = ready_for_disruption
@@ -987,6 +1011,15 @@ contract NativeGuardianPersistenceBoundary {
         -- same-instance reattachment and proof of durable application, even while
         -- fresh reconciliation is incomplete. ACK cannot restore mutation authority.
         -- Lost ACK allows repeat evidence retrieval/ACK, not application/effect replay.
+
+    @invariant RecoveredSampleApplicationIsNotDispatch
+        -- A fresh reconciling session may combine the sole durable pending issue with
+        -- exact same-live retained issuing provenance to obtain one application-only
+        -- capability. Only a successful nonterminal resource sample may atomically
+        -- advance the interrupted sampling resume state and application row. The
+        -- attempt stays interrupted and no ticket, executable plan, activation,
+        -- process mutation, or ACK authority is returned. Failed, terminal, stale,
+        -- mismatched, ambiguous, or expired evidence remains retained and unapplied.
 }
 
 contract NativeGuardianReconnectBoundary {
@@ -1012,6 +1045,10 @@ contract NativeGuardianReconnectBoundary {
         -- freshly reconcile every acquired identity; commit complete reconciliation;
         -- only then admit new mutation. Retained results cannot replace fresh
         -- observation. Dispatch floors never regress; deadlines never extend.
+        -- Application of an already-executed retained nonterminal sample may commit
+        -- while this fresh reconciliation remains incomplete. It is not a new native
+        -- mutation and grants no activation or continuation; the attempt stays
+        -- interrupted and any later progress starts with another fresh barrier.
 }
 
 contract NativeSameBuildBoundary {
@@ -1069,6 +1106,8 @@ contract NativeGuardianQualificationBoundary {
 -- recovery_or_retry_does_not_change(deadline) -> Boolean
 -- resource_decision_uses_only_capacity_and_contention_samples(attempt) -> Boolean
 -- candidate_identity_is_exact(candidate) -> Boolean
+-- exact_reconciling_guardian_retains_issuing_provenance(attempt, sample) -> Boolean
+-- sole_pending_native_issue_matches(attempt, sample) -> Boolean
 --
 -- stable_child_evidence_binds(discovery, identity) is true only when one OS-boundary
 -- observation verifies discovery.verified_parent at its recorded birth, the child
@@ -1087,8 +1126,11 @@ contract NativeGuardianQualificationBoundary {
 -- select awaiting_birth_evidence and pending child scans select ownership_discovery.
 -- With neither outstanding, original discovery/birth-evidence phases advance to
 -- cleaning_owned_tree; original cleaning/verifying phases resume unchanged.
--- Resource-sample recovery is separate and reissues the exact pending sample. Any
--- later owned-mutation pass rechecks the unchanged absolute deadline and either
+-- Resource-sample recovery reissues the exact pending sample unless the same live
+-- guardian retains the exact successful nonterminal completion from the issuing
+-- session. That completion may be applied once to the interrupted resume state under
+-- the application-only rule, but it cannot activate recovery or issue another effect.
+-- Any later owned-mutation pass rechecks the unchanged absolute deadline and either
 -- recognizes already verified cleanup or enters administrative closeout without a
 -- signal; resource recovery cannot establish verified owned-tree cleanup.
 --
@@ -1155,6 +1197,7 @@ surface StandaloneDeploymentController {
         CleanupVerificationCompleted(attempt)
         ControllerInterrupted(attempt)
         RecoveryRequested(attempt)
+        RetainedNativeResourceSampleVerified(attempt, sample)
         CandidateMigrationInvoked(attempt, candidate)
         ForwardRecoveryFailed(attempt)
         AdministrativeRiskAccepted(attempt)
