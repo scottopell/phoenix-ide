@@ -167,11 +167,9 @@ jobs:
         run: |
           set -o pipefail
           mkdir owned-child-diagnostic
-          git diff --exit-code 17a8f5952b742c192d61f437a61f5286863e24ac HEAD -- crates Cargo.toml Cargo.lock
-          cargo test -p phoenix-browser --lib process_group::native::tests::exited_root_drains_stderr_closed_writer_before_profile_removal -- --exact --nocapture --test-threads=1 2>&1 | tee owned-child-diagnostic/native.log
+          git diff --exit-code b8723941a914e20398e01e59c592366e91618fc3 HEAD -- crates Cargo.toml Cargo.lock
+          cargo test -p phoenix-browser --lib process_group::native::tests::group_drain_does_not_claim_an_escaped_writer -- --exact --nocapture --test-threads=1 2>&1 | tee owned-child-diagnostic/native.log
           grep -F 'test result: ok. 1 passed; 0 failed;' owned-child-diagnostic/native.log
-          cargo test -p phoenix-browser --lib process_group::native::tests::pending_exit_authorizes_neither_signal_nor_completion -- --exact --nocapture --test-threads=1 2>&1 | tee owned-child-diagnostic/pending-authority.log
-          grep -F 'test result: ok. 1 passed; 0 failed;' owned-child-diagnostic/pending-authority.log
       - name: Preserve exact success or bounded identity diagnostic
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
