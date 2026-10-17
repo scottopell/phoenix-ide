@@ -4,6 +4,8 @@ import type { BashRunTombstonePayload } from "./BashRunTombstonePayload";
 import type { BashRunningPayload } from "./BashRunningPayload";
 import type { BashStillRunningPayload } from "./BashStillRunningPayload";
 import type { BashTombstonedPayload } from "./BashTombstonedPayload";
+import type { BashUnregisteredTerminalPayload } from "./BashUnregisteredTerminalPayload";
+import type { BashUnregisteredUnknownPayload } from "./BashUnregisteredUnknownPayload";
 import type { BashWaiterPanickedPayload } from "./BashWaiterPanickedPayload";
 
 /**
@@ -28,4 +30,4 @@ import type { BashWaiterPanickedPayload } from "./BashWaiterPanickedPayload";
  * `serde(tag = "status")` produces a flat object with `status` as the
  * discriminator.
  */
-export type BashResponse = { "status": "running" } & BashRunningPayload | { "status": "still_running" } & BashStillRunningPayload | { "status": "kill_pending_kernel" } & BashKillPendingKernelPayload | { "status": "tombstoned" } & BashTombstonedPayload | { "status": "exited" } & BashRunTombstonePayload | { "status": "killed" } & BashRunTombstonePayload | { "status": "waiter_panicked" } & BashWaiterPanickedPayload;
+export type BashResponse = { "status": "running" } & BashRunningPayload | { "status": "still_running" } & BashStillRunningPayload | { "status": "kill_pending_kernel" } & BashKillPendingKernelPayload | { "status": "tombstoned" } & BashTombstonedPayload | { "status": "exited" } & BashRunTombstonePayload | { "status": "killed" } & BashRunTombstonePayload | { "status": "unregistered_exited" } & BashUnregisteredTerminalPayload | { "status": "unregistered_killed" } & BashUnregisteredTerminalPayload | { "status": "outcome_unknown" } & BashUnregisteredUnknownPayload | { "status": "waiter_panicked" } & BashWaiterPanickedPayload;

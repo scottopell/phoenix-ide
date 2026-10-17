@@ -2444,29 +2444,61 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unregistered_capture_stays_open_until_direct_child_terminal() {
+        use tokio::io::AsyncWriteExt;
+
         let ctx = test_context(&scope("capture-until-exit"));
         let dir = tempfile::tempdir().unwrap();
-        let cmd = "sleep 0.22; printf 'late-tail'; exit 4";
-        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let cmd = "printf ready > ready; read -r release; printf 'late-tail'; exit 4";
+        let mut process = tokio::process::Command::new("bash")
+            .args(["-c", cmd])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut release = process.stdin.take().unwrap();
+        let child = UnregisteredChild {
+            child: process,
+            sandbox_scratch_dir: None,
+            started_at: Instant::now(),
+        };
+        // Keep the executor runnable: OS child progress must not auto-advance Tokio time.
+        let watchdog = std::time::Instant::now();
+        while !dir.path().join("ready").exists() {
+            assert!(watchdog.elapsed() < Duration::from_secs(5), "child never ready");
+            tokio::task::yield_now().await;
+        }
         let reservation = ctx
             .bash_handle_registry()
             .reserve_spawn(&ctx.work_scope)
             .await
             .unwrap();
-        let response = response_json(
-            settle_unregistered_run(
-                child,
-                reservation,
-                cmd,
-                None,
-                RING_BUFFER_BYTES,
-                &ReadArgs::default(),
-                BashLaunchError::IdentityUnavailable,
-            )
-            .await,
-        );
+        let settlement = tokio::spawn(settle_unregistered_run(
+            child,
+            reservation,
+            cmd,
+            None,
+            RING_BUFFER_BYTES,
+            &ReadArgs::default(),
+            BashLaunchError::IdentityUnavailable,
+        ));
+        tokio::task::yield_now().await;
+        // Cross the reader-drain budget while the child is deliberately still live.
+        let elapsed = READER_DRAIN_TIMEOUT + Duration::from_millis(1);
+        assert!(elapsed < UNREGISTERED_SETTLEMENT_TIMEOUT);
+        tokio::time::advance(elapsed).await;
+        assert!(!settlement.is_finished());
+        release.write_all(b"release\n").await.unwrap();
+        let watchdog = std::time::Instant::now();
+        while !settlement.is_finished() {
+            assert!(watchdog.elapsed() < Duration::from_secs(5), "settlement stalled");
+            tokio::task::yield_now().await;
+        }
+        let response = response_json(settlement.await.unwrap());
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 4);
         assert_eq!(response["lines"][0]["bytes"], "late-tail");
