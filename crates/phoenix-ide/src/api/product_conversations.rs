@@ -1548,7 +1548,10 @@ mod tests {
                 .build();
             let subscriber = tracing_subscriber::registry().with(
                 tracing_opentelemetry::layer()
-                    .with_tracer(provider.tracer("routed-history-correlation")),
+                    .with_tracer(provider.tracer("routed-history-correlation"))
+                    .with_filter(tracing_subscriber::filter::filter_fn(
+                        crate::logging::otel_metadata_enabled,
+                    )),
             );
             let dispatch = tracing::Dispatch::new(subscriber);
             let mut cursor = None;
