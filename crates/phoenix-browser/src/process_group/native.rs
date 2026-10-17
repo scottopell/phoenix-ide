@@ -166,9 +166,11 @@ impl OwnedChromeGroup {
         loop {
             let observation = self.observe_root(child)?;
             if observation.permits_completion() {
-                let live_members = group_has_live_members(self.root.pid).inspect_err(|_error| {
+                let live_members = group_has_live_members(self.root.pid).inspect_err(|error| {
                     #[cfg(target_os = "macos")]
-                    eprintln!("owned_chrome_group_enumeration child={:?} root={:?} observation={observation:?} error={_error} {}", child.id(), self.root, self.darwin_wait_diagnostic());
+                    eprintln!("owned_chrome_group_enumeration child={:?} root={:?} observation={observation:?} error={error} {}", child.id(), self.root, self.darwin_wait_diagnostic());
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = error;
                 })?;
                 if !live_members && self.observe_root(child)? == RootObservation::Exited {
                     self.drained = true;
@@ -511,9 +513,9 @@ mod tests {
             };
             let read_error = (read != size).then(io::Error::last_os_error);
             // SAFETY: observes the same retained owned child's process group.
-            let pgid = unsafe { libc::getpgid(pid) };
-            let pgid_error = (pgid == -1).then(io::Error::last_os_error);
-            eprintln!("owned_chrome_transition sample={samples} child={:?} proc_rc={read} proc_errno={read_error:?} proc_status={} proc_group={} pgid={pgid} pgid_errno={pgid_error:?} {}", child.id(), info.pbi_status, info.pbi_pgid, group.darwin_wait_diagnostic());
+            let observed_group = unsafe { libc::getpgid(pid) };
+            let group_error = (observed_group == -1).then(io::Error::last_os_error);
+            eprintln!("owned_chrome_transition sample={samples} child={:?} proc_rc={read} proc_errno={read_error:?} proc_status={} proc_group={} pgid={observed_group} pgid_errno={group_error:?} {}", child.id(), info.pbi_status, info.pbi_pgid, group.darwin_wait_diagnostic());
             samples += 1;
             if group.waitable_exit().is_ok_and(|exited| exited)
                 || Instant::now() >= deadline
