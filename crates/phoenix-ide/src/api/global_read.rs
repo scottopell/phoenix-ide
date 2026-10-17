@@ -865,6 +865,14 @@ pub(crate) enum CoordinatorWorkScopeTargetError {
     Read,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QualifiedSearchError {
+    #[error("{0}")]
+    Unavailable(&'static str),
+    #[error("{0}")]
+    Failed(String),
+}
+
 impl GlobalReadService {
     pub(crate) fn new(
         db: crate::db::Database,
@@ -972,37 +980,51 @@ impl GlobalReadService {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn search_hits(
+    async fn search_hits_result(
         &self,
         query: &str,
-    ) -> Result<Vec<crate::db::RetrievedChunk>, String> {
+    ) -> Result<Vec<crate::db::RetrievedChunk>, QualifiedSearchError> {
         let query = query.trim();
         if query.is_empty() {
-            return Err("query is required".to_string());
+            return Err(QualifiedSearchError::Failed(
+                "query is required".to_string(),
+            ));
         }
         if let Some(message) = self
             .message_retriever
             .reconciliation_status()
             .unavailable_message()
         {
-            return Err(message.to_string());
+            return Err(QualifiedSearchError::Unavailable(message));
         }
-        let hits = self
-            .message_retriever
-            .retrieve(self.search_request(query).await?)
+        self.message_retriever
+            .retrieve(
+                self.search_request(query)
+                    .await
+                    .map_err(QualifiedSearchError::Failed)?,
+            )
             .await
-            .map_err(|e| format!("search failed: {e}"))?;
-        Ok(hits)
+            .map_err(|error| QualifiedSearchError::Failed(format!("search failed: {error}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn search_hits(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::db::RetrievedChunk>, String> {
+        self.search_hits_result(query)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn qualified_search(
         &self,
         query: &str,
-    ) -> Result<Vec<QualifiedSearchHit>, String> {
-        let hits = self.search_hits(query).await?;
+    ) -> Result<Vec<QualifiedSearchHit>, QualifiedSearchError> {
+        let hits = self.search_hits_result(query).await?;
         qualify_search_hits(self, &hits)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| QualifiedSearchError::Failed(error.to_string()))
     }
 
     pub(crate) async fn resolve_federation_peer(
@@ -1010,6 +1032,14 @@ impl GlobalReadService {
         selector: &phoenix_core::domain::instance_identity::InstanceSelector,
     ) -> Result<crate::db::FederationPeerConnection, crate::db::FederationPeerSelectionError> {
         self.db.resolve_federation_peer(selector).await
+    }
+
+    pub(crate) async fn remote_search(
+        &self,
+        peer: &crate::db::FederationPeerConnection,
+        query: &str,
+    ) -> Result<Vec<QualifiedSearchHit>, crate::api::federation::FederationClientError> {
+        crate::api::federation::search_remote_conversations(&self.db, peer, query).await
     }
 
     pub(crate) async fn search_request(&self, query: &str) -> Result<RetrievalRequest, String> {
@@ -1190,13 +1220,28 @@ async fn ordinary_product_citation(
         }))
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QualifiedSearchSender {
+    pub stable: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub exact: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QualifiedSearchNavigation {
+    AppLocal { path: String },
+    Peer { url: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QualifiedSearchHit {
     pub source: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub source_navigation: Option<QualifiedSearchNavigation>,
     pub stable_conversation:
         Option<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub stable_navigation: Option<QualifiedSearchNavigation>,
     pub role: String,
-    pub sender: String,
+    pub sender: Option<QualifiedSearchSender>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub snippet: String,
 }
@@ -1216,25 +1261,55 @@ pub(crate) async fn qualify_search_hits(
         let message_id =
             phoenix_core::domain::conversation_reference::MessageId::parse(hit.message_id.clone())
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let stable_conversation = match service.db.get_conversation(&hit.conversation_id).await {
-            Ok(conversation) => ordinary_product_citation(&service.db, &conversation)
-                .await?
-                .map(|(product_id, _)| {
-                    phoenix_core::domain::product_conversation::ProductConversationId::parse(
-                        product_id,
-                    )
-                    .map(|product_conversation_id| {
-                        phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
-                            instance_id,
-                            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
-                                product_conversation_id,
-                            },
+        let (source_navigation, stable_conversation, stable_navigation) = match service
+            .db
+            .get_conversation(&hit.conversation_id)
+            .await
+        {
+            Ok(conversation) => {
+                let citation = ordinary_product_citation(&service.db, &conversation).await?;
+                let stable = citation
+                        .as_ref()
+                        .map(|(product_id, _)| {
+                            phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                                product_id.clone(),
+                            )
+                            .map(|product_conversation_id| {
+                                phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                                    instance_id,
+                                    phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                                        product_conversation_id,
+                                    },
+                                )
+                            })
+                            .map_err(|error| DbError::Serialization(error.to_string()))
+                        })
+                        .transpose()?;
+                let stable_navigation = citation
+                    .map(|(product_id, _)| {
+                        phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                            product_id,
                         )
+                        .map(|product_id| QualifiedSearchNavigation::AppLocal {
+                            path: crate::api::product_conversations::canonical_product_conversation_route(
+                                &product_id,
+                            ),
+                        })
+                        .map_err(|error| DbError::Serialization(error.to_string()))
                     })
-                    .map_err(|error| DbError::Serialization(error.to_string()))
-                })
-                .transpose()?,
-            Err(DbError::ConversationNotFound(_)) => None,
+                    .transpose()?;
+                (
+                    Some(QualifiedSearchNavigation::AppLocal {
+                        path: conversation_message_href(
+                            &conversation,
+                            Some((&hit.message_id, hit.message_type)),
+                        ),
+                    }),
+                    stable,
+                    stable_navigation,
+                )
+            }
+            Err(DbError::ConversationNotFound(_)) => (None, None, None),
             Err(error) => return Err(error),
         };
         qualified.push(QualifiedSearchHit {
@@ -1245,10 +1320,17 @@ pub(crate) async fn qualify_search_hits(
                     message_id,
                 },
             ),
+            source_navigation,
             stable_conversation,
+            stable_navigation,
             role: attributed_role(hit.message_type, &hit.origin).to_string(),
-            sender: attributed_sender_with_cache(&service.db, &hit.origin, &mut sender_kinds)
-                .await?,
+            sender: qualified_search_sender(
+                &service.db,
+                instance_id,
+                &hit.origin,
+                &mut sender_kinds,
+            )
+            .await?,
             created_at: hit.created_at,
             snippet: hit.snippet.clone(),
         });
@@ -1473,7 +1555,9 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
 }
 
 fn conversation_href(conv: &Conversation) -> String {
-    format!("/c/{}?source_transcript={}", conv.id, conv.id)
+    let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(&conv.id)
+        .expect("persisted conversation ids are valid transcript ids");
+    crate::api::product_conversations::exact_transcript_route(&transcript_id)
 }
 
 fn conversation_message_href(conv: &Conversation, message: Option<(&str, MessageType)>) -> String {
@@ -1519,6 +1603,57 @@ pub(crate) fn attributed_role(
             InputOrigin::UnknownHistorical => "Skill · Unknown input",
         },
     }
+}
+
+async fn qualified_search_sender(
+    db: &crate::db::Database,
+    instance_id: phoenix_core::domain::instance_identity::InstanceId,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+    sender_kinds: &mut std::collections::HashMap<
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        Option<phoenix_core::domain::product_conversation::ProductConversationKind>,
+    >,
+) -> Result<Option<QualifiedSearchSender>, DbError> {
+    use phoenix_core::domain::{
+        conversation_reference::{ConversationReferenceTarget, QualifiedConversationReference},
+        db_schema::InputOrigin,
+        product_conversation::ProductConversationKind,
+    };
+
+    let InputOrigin::InternalConversation {
+        product_conversation_id,
+        transcript_id,
+        ..
+    } = origin
+    else {
+        return Ok(None);
+    };
+    let kind = if let Some(kind) = sender_kinds.get(product_conversation_id) {
+        *kind
+    } else {
+        let kind = db
+            .product_conversation_kind(product_conversation_id)
+            .await?;
+        sender_kinds.insert(product_conversation_id.clone(), kind);
+        kind
+    };
+    let stable_target = match kind {
+        Some(ProductConversationKind::Coordinator) => ConversationReferenceTarget::Coordinator,
+        Some(ProductConversationKind::Ordinary) | None => {
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: product_conversation_id.clone(),
+            }
+        }
+    };
+    let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(transcript_id)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    Ok(Some(QualifiedSearchSender {
+        stable: QualifiedConversationReference::new(instance_id, stable_target),
+        exact: QualifiedConversationReference::new(
+            instance_id,
+            ConversationReferenceTarget::Transcript { transcript_id },
+        ),
+    }))
 }
 
 pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
@@ -3368,8 +3503,8 @@ mod tests {
         render_full_message_text, render_global_message_line, resolve_conversation_read_target,
         resolve_reference_impl, resolve_work_scope, split_fragment, ConversationReadTarget,
         CoordinatorWorkScopeTargetError, GlobalMessageTarget, GlobalMessageTargetError,
-        GlobalReadService, ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
-        WorkScopeUnavailableReason,
+        GlobalReadService, QualifiedSearchHit, ResolvedEnvironmentKind, ResolvedWorkScope,
+        ServerPathSemantics, WorkScopeUnavailableReason,
     };
     use std::sync::Arc;
 
@@ -3608,6 +3743,39 @@ mod tests {
         assert!(!rendered.contains(&format!("@conv:{}", coordinator.product_conversation_id)));
     }
 
+    fn assert_qualified_search_sender(
+        search: &QualifiedSearchHit,
+        hit: &crate::db::RetrievedChunk,
+    ) {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget, db_schema::InputOrigin,
+        };
+
+        let InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            ..
+        } = &hit.origin
+        else {
+            assert!(search.sender.is_none());
+            return;
+        };
+        let sender = search.sender.as_ref().unwrap();
+        assert_eq!(sender.stable.instance_id, search.source.instance_id);
+        assert!(matches!(
+            &sender.stable.target,
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: qualified_product_id,
+            } if qualified_product_id == product_conversation_id
+        ));
+        assert!(matches!(
+            &sender.exact.target,
+            ConversationReferenceTarget::Transcript {
+                transcript_id: qualified_transcript_id,
+            } if qualified_transcript_id.as_str() == transcript_id
+        ));
+    }
+
     #[tokio::test]
     async fn search_hit_uses_same_recorded_attribution_as_full_read() {
         use phoenix_core::domain::db_schema::{InputOrigin, MessageContent, MessageType};
@@ -3676,7 +3844,7 @@ mod tests {
                 phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message { transcript_id, message_id }
                     if transcript_id.as_str() == hit.conversation_id && message_id.as_str() == hit.message_id
             ));
-            assert!(format!("{}{}", search.role, search.sender).contains(expected));
+            assert_qualified_search_sender(&search, &hit);
             assert!(full.contains(expected), "{full}");
             if expected != "User API" {
                 assert_ne!(search.role, "User API");
@@ -3691,7 +3859,8 @@ mod tests {
                 .await
                 .unwrap();
             let skill_label = format!("Skill · {expected}");
-            assert!(format!("{}{}", search.role, search.sender).contains(&skill_label));
+            assert!(search.role.starts_with("Skill · "));
+            assert_qualified_search_sender(&search, &hit);
             assert!(full.contains(&skill_label), "{full}");
             message.message_type = MessageType::User;
             hit.message_type = MessageType::User;

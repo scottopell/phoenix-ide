@@ -165,6 +165,34 @@ impl FederationQueryDatabaseEndpoint {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationSearchConversationsEndpoint(url::Url);
+
+impl FederationSearchConversationsEndpoint {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerNavigationUrl(url::Url);
+
+impl PeerNavigationUrl {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PeerNavigationUrlError {
+    #[error("peer navigation locator must be an absolute application path")]
+    NotAbsolutePath,
+    #[error("peer navigation locator changed the selected peer origin")]
+    ChangedOrigin,
+}
+
 impl PeerBaseUrl {
     /// Return the typed normalized host.
     ///
@@ -209,6 +237,45 @@ impl PeerBaseUrl {
                 .join("/api/federation/peer/query-database")
                 .expect("fixed federation route is a valid URL path"),
         )
+    }
+
+    /// Return the closed endpoint for bounded remote conversation search.
+    ///
+    /// # Panics
+    /// Panics only if the fixed compile-time route is not a valid URL path.
+    #[must_use]
+    pub fn search_conversations_endpoint(&self) -> FederationSearchConversationsEndpoint {
+        FederationSearchConversationsEndpoint(
+            self.0
+                .join("/api/federation/peer/search-conversations")
+                .expect("fixed federation route is a valid URL path"),
+        )
+    }
+
+    /// Bind a destination-generated application route to this selected peer origin.
+    ///
+    /// # Errors
+    /// Returns an error if the locator is not an absolute application path or changes origin.
+    pub fn navigation_url(
+        &self,
+        locator: &str,
+    ) -> Result<PeerNavigationUrl, PeerNavigationUrlError> {
+        if !locator.starts_with('/') || locator.starts_with("//") {
+            return Err(PeerNavigationUrlError::NotAbsolutePath);
+        }
+        let joined = self
+            .0
+            .join(locator)
+            .map_err(|_| PeerNavigationUrlError::NotAbsolutePath)?;
+        if joined.scheme() != self.0.scheme()
+            || joined.host() != self.0.host()
+            || joined.port_or_known_default() != self.0.port_or_known_default()
+            || !joined.username().is_empty()
+            || joined.password().is_some()
+        {
+            return Err(PeerNavigationUrlError::ChangedOrigin);
+        }
+        Ok(PeerNavigationUrl(joined))
     }
 
     /// Reconstruct a peer origin from normalized relational columns.
@@ -571,6 +638,25 @@ mod tests {
             "https://peer.example:0",
         ] {
             assert!(PeerBaseUrl::from_str(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn peer_navigation_binds_destination_routes_without_changing_origin() {
+        let base = PeerBaseUrl::from_str("https://peer.example:8443").unwrap();
+        let navigation = base
+            .navigation_url("/c/product-id?source_transcript=transcript-id#message-message-id")
+            .unwrap();
+        assert_eq!(
+            navigation.as_url().as_str(),
+            "https://peer.example:8443/c/product-id?source_transcript=transcript-id#message-message-id"
+        );
+        for locator in [
+            "c/product-id",
+            "//attacker.example/c/product-id",
+            "https://attacker.example/c/product-id",
+        ] {
+            assert!(base.navigation_url(locator).is_err(), "{locator}");
         }
     }
 

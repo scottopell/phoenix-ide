@@ -713,10 +713,15 @@ impl Tool for SearchConversations {
                 Ok(peer) => peer,
                 Err(error) => return ToolOutput::error(error.to_string()),
             };
-            return ToolOutput::error(format!(
-                "remote search transport for peer {} is not available in this source slice",
-                peer.peer_instance_id
-            ));
+            return match self.0.remote_search(&peer, &parsed.query).await {
+                Ok(hits) => match serde_json::to_string(&hits) {
+                    Ok(output) => ToolOutput::success(output),
+                    Err(error) => {
+                        ToolOutput::error(format!("failed to encode search results: {error}"))
+                    }
+                },
+                Err(error) => ToolOutput::error(error.to_string()),
+            };
         }
         match self.0.qualified_search(&parsed.query).await {
             Ok(hits) => match serde_json::to_string(&hits) {
@@ -725,7 +730,7 @@ impl Tool for SearchConversations {
                     ToolOutput::error(format!("failed to encode search results: {error}"))
                 }
             },
-            Err(error) => ToolOutput::error(error),
+            Err(error) => ToolOutput::error(error.to_string()),
         }
     }
 }

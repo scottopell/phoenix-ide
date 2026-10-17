@@ -46,6 +46,18 @@ const DEFAULT_MESSAGE_LIMIT: usize = 50;
 const MAX_MESSAGE_LIMIT: usize = 200;
 const PRODUCT_CONVERSATION_ROUTE_PREFIX: &str = "/c/";
 
+pub(crate) fn canonical_product_conversation_route(
+    id: &phoenix_core::domain::product_conversation::ProductConversationId,
+) -> String {
+    format!("{PRODUCT_CONVERSATION_ROUTE_PREFIX}{id}")
+}
+
+pub(crate) fn exact_transcript_route(
+    id: &phoenix_core::domain::close::TranscriptConversationId,
+) -> String {
+    format!("{PRODUCT_CONVERSATION_ROUTE_PREFIX}{id}?source_transcript={id}")
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SnapshotQuery {
     pub before: Option<String>,
@@ -500,10 +512,7 @@ pub async fn get_product_conversation(
 }
 
 fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
-    format!(
-        "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
-        aggregate.product_conversation.id()
-    )
+    canonical_product_conversation_route(aggregate.product_conversation.id())
 }
 
 fn encode_recovery_cursor(updated_at_micros: i64, request_id: &str) -> String {
@@ -2400,6 +2409,23 @@ mod tests {
             ProductConversationPresentationView::State { presentation_mode, .. }
                 if presentation_mode == "done"
         ));
+    }
+
+    #[test]
+    fn canonical_route_helpers_own_stable_and_exact_navigation() {
+        let product_id =
+            phoenix_core::domain::product_conversation::ProductConversationId::parse("product-id")
+                .unwrap();
+        let transcript_id =
+            phoenix_core::domain::close::TranscriptConversationId::parse("transcript-id").unwrap();
+        assert_eq!(
+            super::canonical_product_conversation_route(&product_id),
+            "/c/product-id"
+        );
+        assert_eq!(
+            super::exact_transcript_route(&transcript_id),
+            "/c/transcript-id?source_transcript=transcript-id"
+        );
     }
 
     #[tokio::test]

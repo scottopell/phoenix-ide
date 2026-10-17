@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use phoenix_core::domain::instance_identity::{PeerBaseUrl, PeerCaCertificatePem, PeerTlsTrust};
+use phoenix_core::domain::instance_identity::{
+    FederationCredentialVerifier, InstanceId, PeerBaseUrl, PeerBearerCredential,
+    PeerCaCertificatePem, PeerTlsTrust,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -15,6 +18,7 @@ struct TestInstance {
     _tempdir: tempfile::TempDir,
     state: super::AppState,
     origin: PeerBaseUrl,
+    trust: PeerTlsTrust,
     client: reqwest::Client,
     shutdown: CancellationToken,
     server: tokio::task::JoinHandle<()>,
@@ -22,6 +26,10 @@ struct TestInstance {
 
 impl TestInstance {
     async fn start() -> Self {
+        Self::start_with_search_ready(true).await
+    }
+
+    async fn start_with_search_ready(search_ready: bool) -> Self {
         let tempdir = tempfile::tempdir().unwrap();
         let mut tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
             dir: tempdir.path().to_path_buf(),
@@ -50,7 +58,17 @@ impl TestInstance {
         let origin: PeerBaseUrl = format!("https://localhost:{}", address.port())
             .parse()
             .unwrap();
-        let state = make_test_state().await;
+        let mut state = make_test_state().await;
+        if search_ready {
+            let retriever = state.db.fts_retriever();
+            retriever.reconcile().await.unwrap();
+            state.message_retriever = Arc::new(retriever);
+        }
+        state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
         let app = create_router(state.clone());
         let shutdown = CancellationToken::new();
         let server = spawn_https(listener, app, tls.server, shutdown.clone()).await;
@@ -59,10 +77,54 @@ impl TestInstance {
             _tempdir: tempdir,
             state,
             origin,
+            trust,
             client,
             shutdown,
             server,
         }
+    }
+
+    async fn enroll(&self, caller_instance_id: InstanceId) -> PeerBearerCredential {
+        let credential =
+            PeerBearerCredential::parse(format!("phx_peer_{}", "t".repeat(43))).unwrap();
+        let verifier = FederationCredentialVerifier::from_bearer(credential.expose().as_bytes());
+        self.state
+            .db
+            .replace_federation_enrollment(caller_instance_id, "isolated test caller", &verifier)
+            .await
+            .unwrap();
+        credential
+    }
+
+    async fn connect_to(&self, receiver: &Self) -> phoenix_db::FederationPeerConnection {
+        let caller_id = self.state.db.instance_id().await.unwrap();
+        let credential = receiver.enroll(caller_id).await;
+        self.save_connection(receiver, &credential).await
+    }
+
+    async fn save_connection(
+        &self,
+        receiver: &Self,
+        credential: &PeerBearerCredential,
+    ) -> phoenix_db::FederationPeerConnection {
+        let destination = receiver.state.db.instance_id().await.unwrap();
+        self.state
+            .db
+            .save_federation_peer_connection(
+                destination,
+                "isolated receiver",
+                &receiver.origin,
+                credential,
+                &receiver.trust,
+            )
+            .await
+            .unwrap();
+        self.state
+            .db
+            .federation_peer_connection(destination)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     fn endpoint(&self, path: &str) -> String {

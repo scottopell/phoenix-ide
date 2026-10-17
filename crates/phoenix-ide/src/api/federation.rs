@@ -6,8 +6,9 @@ use axum::{
 };
 use base64::Engine;
 use futures::StreamExt as _;
-use phoenix_core::domain::instance_identity::{
-    FederationCredentialVerifier, InstanceId, PeerTlsTrust,
+use phoenix_core::domain::{
+    conversation_reference::ConversationReferenceTarget,
+    instance_identity::{FederationCredentialVerifier, InstanceId, PeerTlsTrust},
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,32 @@ pub struct RemoteQueryDatabaseResponse {
     pub result: phoenix_db::CoordinatorQueryResult,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct RemoteSearchRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub query: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RemoteSearchResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub hits: Vec<crate::api::global_read::QualifiedSearchHit>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteSearchErrorCode {
+    SearchIndexUnavailable,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoteSearchErrorResponse {
+    code: RemoteSearchErrorCode,
+    message: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FederationClientError {
     #[error("peer connection not found")]
@@ -82,6 +109,46 @@ pub enum FederationClientError {
     DestinationMismatch,
     #[error("caller identity mismatch")]
     CallerMismatch,
+    #[error("remote search result provenance mismatch")]
+    SearchProvenanceMismatch,
+    #[error("remote search navigation locator is invalid: {0}")]
+    SearchNavigation(#[from] phoenix_core::domain::instance_identity::PeerNavigationUrlError),
+    #[error("remote search unavailable: {0}")]
+    SearchUnavailable(String),
+}
+
+pub async fn search_remote_conversations(
+    db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    query: &str,
+) -> Result<Vec<crate::api::global_read::QualifiedSearchHit>, FederationClientError> {
+    let caller_instance_id = db.instance_id().await?;
+    let client = remote_query_client(&peer.tls_trust)?;
+    let response = client
+        .post(
+            peer.base_url
+                .search_conversations_endpoint()
+                .as_url()
+                .clone(),
+        )
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&RemoteSearchRequest {
+            caller_instance_id,
+            destination_instance_id: peer.peer_instance_id,
+            query: query.to_owned(),
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut hits =
+        decode_remote_search_response(status, &bytes, peer.peer_instance_id, caller_instance_id)?;
+    qualify_remote_search_navigation(&peer.base_url, &mut hits)?;
+    Ok(hits)
 }
 
 pub async fn query_remote_database(
@@ -167,6 +234,103 @@ fn decode_remote_query_response(
     Ok(response)
 }
 
+fn qualify_remote_search_navigation(
+    base_url: &phoenix_core::domain::instance_identity::PeerBaseUrl,
+    hits: &mut [crate::api::global_read::QualifiedSearchHit],
+) -> Result<(), FederationClientError> {
+    use crate::api::global_read::QualifiedSearchNavigation;
+
+    for hit in hits {
+        let Some(QualifiedSearchNavigation::AppLocal { path }) = &hit.source_navigation else {
+            return Err(FederationClientError::SearchProvenanceMismatch);
+        };
+        let url = base_url.navigation_url(path)?.as_url().to_string();
+        hit.source_navigation = Some(QualifiedSearchNavigation::Peer { url });
+
+        match (&hit.stable_conversation, &hit.stable_navigation) {
+            (None, None) => {}
+            (Some(_), Some(QualifiedSearchNavigation::AppLocal { path })) => {
+                let url = base_url.navigation_url(path)?.as_url().to_string();
+                hit.stable_navigation = Some(QualifiedSearchNavigation::Peer { url });
+            }
+            _ => return Err(FederationClientError::SearchProvenanceMismatch),
+        }
+    }
+    Ok(())
+}
+
+fn decode_remote_search_response(
+    status: StatusCode,
+    bytes: &[u8],
+    expected_destination: InstanceId,
+    expected_caller: InstanceId,
+) -> Result<Vec<crate::api::global_read::QualifiedSearchHit>, FederationClientError> {
+    if !status.is_success() {
+        let error = serde_json::from_slice::<RemoteSearchErrorResponse>(bytes).ok();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            if let Some(RemoteSearchErrorResponse {
+                code: RemoteSearchErrorCode::SearchIndexUnavailable,
+                message,
+            }) = &error
+            {
+                return Err(FederationClientError::SearchUnavailable(message.clone()));
+            }
+        }
+        let detail = error
+            .map(|error| error.message)
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(FederationClientError::RemoteRejected(detail));
+    }
+    let response: RemoteSearchResponse = serde_json::from_slice(bytes)?;
+    if response.destination_instance_id != expected_destination {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != expected_caller {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.hits.iter().any(|hit| {
+        hit.source.instance_id != expected_destination
+            || !matches!(
+                &hit.source_navigation,
+                Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { .. })
+            )
+            || !matches!(
+                &hit.source.target,
+                ConversationReferenceTarget::Message { .. }
+            )
+            || match (&hit.stable_conversation, &hit.stable_navigation) {
+                (None, None) => false,
+                (
+                    Some(stable),
+                    Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { .. }),
+                ) => {
+                    stable.instance_id != expected_destination
+                        || !matches!(
+                            &stable.target,
+                            ConversationReferenceTarget::ProductConversation { .. }
+                        )
+                }
+                _ => true,
+            }
+            || hit.sender.as_ref().is_some_and(|sender| {
+                sender.stable.instance_id != expected_destination
+                    || !matches!(
+                        &sender.stable.target,
+                        ConversationReferenceTarget::ProductConversation { .. }
+                            | ConversationReferenceTarget::Coordinator
+                    )
+                    || sender.exact.instance_id != expected_destination
+                    || !matches!(
+                        &sender.exact.target,
+                        ConversationReferenceTarget::Transcript { .. }
+                    )
+            })
+    }) {
+        return Err(FederationClientError::SearchProvenanceMismatch);
+    }
+    Ok(response.hits)
+}
+
 fn random_peer_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -174,6 +338,50 @@ fn random_peer_token() -> String {
         "phx_peer_{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     )
+}
+
+pub async fn search_conversations(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteSearchRequest>,
+) -> Response {
+    let local_id = match state.db.instance_id().await {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read local instance identity for peer search");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if request.destination_instance_id != local_id {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if request.caller_instance_id != peer.caller_instance_id || request.query.trim().is_empty() {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let read = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match read.qualified_search(request.query.trim()).await {
+        Ok(hits) => Json(RemoteSearchResponse {
+            caller_instance_id: peer.caller_instance_id,
+            destination_instance_id: local_id,
+            hits,
+        })
+        .into_response(),
+        Err(crate::api::global_read::QualifiedSearchError::Unavailable(message)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(RemoteSearchErrorResponse {
+                code: RemoteSearchErrorCode::SearchIndexUnavailable,
+                message: message.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(crate::api::global_read::QualifiedSearchError::Failed(error)) => {
+            tracing::error!(%error, "peer search failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 pub async fn query_database(
@@ -562,6 +770,50 @@ mod tests {
         assert!(matches!(
             decode_remote_query_response(StatusCode::OK, &body, destination, expected_caller),
             Err(FederationClientError::CallerMismatch)
+        ));
+    }
+
+    #[test]
+    fn remote_search_rejects_hit_from_wrong_source_instance() {
+        use phoenix_core::domain::{
+            close::TranscriptConversationId,
+            conversation_reference::{MessageId, QualifiedConversationReference},
+        };
+
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let body = serde_json::to_vec(&RemoteSearchResponse {
+            destination_instance_id: destination,
+            caller_instance_id: caller,
+            hits: vec![crate::api::global_read::QualifiedSearchHit {
+                source: QualifiedConversationReference::new(
+                    InstanceId::new(),
+                    ConversationReferenceTarget::Message {
+                        transcript_id: TranscriptConversationId::parse("remote-transcript")
+                            .unwrap(),
+                        message_id: MessageId::parse("remote-message").unwrap(),
+                    },
+                ),
+                source_navigation: Some(
+                    crate::api::global_read::QualifiedSearchNavigation::AppLocal {
+                        path:
+                            "/c/remote?source_transcript=remote-transcript#message-remote-message"
+                                .to_string(),
+                    },
+                ),
+                stable_conversation: None,
+                stable_navigation: None,
+                role: "assistant".to_string(),
+                sender: None,
+                created_at: chrono::Utc::now(),
+                snippet: "evidence".to_string(),
+            }],
+        })
+        .unwrap();
+
+        assert!(matches!(
+            decode_remote_search_response(StatusCode::OK, &body, destination, caller),
+            Err(FederationClientError::SearchProvenanceMismatch)
         ));
     }
 

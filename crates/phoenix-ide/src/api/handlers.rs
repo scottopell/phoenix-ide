@@ -649,6 +649,11 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::query_database)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
+        .route(
+            "/api/federation/peer/search-conversations",
+            post(super::federation::search_conversations)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             super::auth::peer_auth_middleware,
