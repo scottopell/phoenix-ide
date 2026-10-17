@@ -425,6 +425,8 @@ jobs:
           node --test ui/scripts/history-joint-telemetry.selftest.mjs
           node --test ui/scripts/history-postfault-baseline.selftest.mjs
           node --test ui/scripts/history-opening-navigation.selftest.mjs
+          node --test ui/scripts/replay-history-opening-recorder.selftest.mjs
+          node --test ui/scripts/global-chapter-cache.selftest.mjs
           test -f ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
           node --check ../pinned-app/ui/scripts/qualify-view-telemetry.mjs
           node --check ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs

@@ -66,3 +66,72 @@ test('authentic SSE owning request/sequence failures reject; Global messages are
     assert.throws(() => replayAcceptedEvents(wrongSeq, a.product_conversation_id));
   }
 });
+
+// UNIT ONLY inputs exercise replay guards, not retained evidence or qualification.
+const unitEdge = { product_conversation_id: 'unit-product', predecessor_transcript_row_id: 'unit-before',
+  successor_transcript_row_id: 'unit-after', continuation_message_id: 'unit-continuation' };
+const unitEvidence = { ...unitEdge, client_turn_key: 'unit-key' };
+const unitRows = () => [
+  { eventName: 'init', requestId: 'unit-request', data: JSON.stringify({ conversation: { id: 'unit-after' }, sequence_id: 1,
+    stream_incarnation: '00000000-0000-0000-0000-000000000001', opening: { status: 'pending', edge: unitEdge } }) },
+  { eventName: 'message', requestId: 'unit-request', data: JSON.stringify({ sequence_id: 2,
+    message: { message_id: 'unit-after:unit-key' }, opening: { status: 'accepted', edge: unitEdge, accepted_message_id: 'unit-after:unit-key' } }) },
+].map((value, i) => ({ value, source: { line: i + 1, kind: 'unit-only' } }));
+test('UNIT replay ignores non-JSON ping and unrelated event bodies before parsing', () => {
+  const rows = unitRows(), expected = replayAcceptedEvents(rows, unitEdge.product_conversation_id);
+  rows.splice(1, 0, { value: { eventName: 'ping', data: 'ping' }, source: { kind: 'unit-only' } },
+    { value: { eventName: 'state_change', data: '{not-json' }, source: { kind: 'unit-only' } });
+  assert.deepEqual(replayAcceptedEvents(rows, unitEdge.product_conversation_id), expected);
+});
+for (const eventName of ['init', 'message', 'message_updated']) {
+  test(`UNIT replay still rejects malformed recognized ${eventName}`, () => {
+    const rows = unitRows();
+    rows.push({ value: { eventName, data: '{not-json' }, source: { kind: 'unit-only' } });
+    assert.throws(() => replayAcceptedEvents(rows, unitEdge.product_conversation_id), SyntaxError);
+  });
+}
+test('UNIT replay still rejects owning request, sequence and full-edge mutations', () => {
+  for (const mutate of [rows => { rows[1].value.requestId = 'foreign'; }, rows => {
+    const data = JSON.parse(rows[1].value.data); data.sequence_id = -1; rows[1].value.data = JSON.stringify(data);
+  }, rows => {
+    const data = JSON.parse(rows[1].value.data); data.opening.edge.continuation_message_id = 'foreign'; rows[1].value.data = JSON.stringify(data);
+  }]) {
+    const rows = unitRows(); mutate(rows);
+    assert.throws(() => replayAcceptedEvents(rows, unitEdge.product_conversation_id));
+  }
+});
+test('UNIT IPC duplicates require the full edge and client key; conflicts never disclose values', async () => {
+  const { uniqueOpeningEvidence } = await import('./replay-history-opening-recorder.mjs');
+  assert.equal(typeof uniqueOpeningEvidence, 'function');
+  assert.deepEqual(uniqueOpeningEvidence([unitEvidence, { ...unitEvidence }]), [unitEvidence]);
+  assert.deepEqual(uniqueOpeningEvidence([unitEvidence, { ...unitEvidence, successor_transcript_row_id: 'unit-next' }]),
+    [unitEvidence, { ...unitEvidence, successor_transcript_row_id: 'unit-next' }]);
+  for (const field of Object.keys(unitEvidence).filter(field => field !== 'successor_transcript_row_id')) {
+    const privateValue = `PRIVATE-${field}`;
+    assert.throws(() => uniqueOpeningEvidence([unitEvidence, { ...unitEvidence, [field]: privateValue }]), error => {
+      assert.equal(error.message, 'conflicting IPC opening evidence for successor');
+      assert.ok(!error.stack.includes(privateValue));
+      assert.equal(error.actual, undefined); assert.equal(error.expected, undefined);
+      return true;
+    });
+  }
+});
+
+test('UNIT Global suite is portable without opt-in and explicit missing evidence fails closed', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const script = new URL('./global-chapter-cache.selftest.mjs', import.meta.url);
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HISTORY_') && key !== 'NODE_TEST_CONTEXT'));
+  const run = extra => spawnSync(process.execPath, ['--test', '--test-reporter=tap', script.pathname],
+    { env: { ...env, ...extra }, encoding: 'utf8', timeout: 10000 });
+  const portable = run({});
+  assert.equal(portable.status, 0, portable.stdout + portable.stderr);
+  assert.match(portable.stdout, /# fail 0/);
+  assert.match(portable.stdout, /# skipped 4/);
+  assert.match(portable.stdout, /UNIT ONLY DOM/);
+  for (const key of ['HISTORY_GLOBAL_0BAC_EVIDENCE', 'HISTORY_GLOBAL_832_EVIDENCE',
+    'HISTORY_SHIPPING_D4_EVIDENCE', 'HISTORY_PINNED_SOURCE']) {
+    const explicit = run({ [key]: '/dev/null/unit-only-missing-evidence' });
+    assert.equal(explicit.status, 1, `${key} must not silently skip an explicit invalid input`);
+    assert.match(explicit.stdout + explicit.stderr, /ENOTDIR|ENOENT/);
+  }
+});

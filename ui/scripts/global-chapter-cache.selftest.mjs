@@ -6,7 +6,9 @@ import { stripTypeScriptTypes } from 'node:module';
 const sha = raw => createHash('sha256').update(raw).digest('hex');
 const rewriteCache = f => { f.cached.raw = JSON.stringify(f.cached.data); f.cached.body_bytes = Buffer.byteLength(f.cached.raw); f.cached.raw_sha256 = sha(f.cached.raw); };
 import { validateGlobalCacheAuthority, validateGlobalChapterSelection, validateGlobalChapterReference, globalChapterReferencePath, capturePolicy } from './qualify-history-opening-realserver.mjs';
-const dir = process.env.HISTORY_GLOBAL_0BAC_EVIDENCE ?? '.phoenix/evidence/continuous-history/instrumented0bac-artifact/opening-browser-evidence/global';
+const dir = process.env.HISTORY_GLOBAL_0BAC_EVIDENCE;
+if (!dir) test('retained 0bac opening evidence', { skip: 'set HISTORY_GLOBAL_0BAC_EVIDENCE explicitly' }, () => {});
+else {
 const lines = name => readFileSync(`${dir}/${name}`, 'utf8').trim().split('\n').map(JSON.parse);
 const a = JSON.parse(readFileSync(`${dir}/fixture.json`));
 const evidence = lines('ipc.jsonl').find(r => r.reply.evidence).reply.evidence;
@@ -96,8 +98,16 @@ for (const [name, mutate] of Object.entries({
     assert.match(error.message, guard[name], name);
     return true;
   }); });
-const dir832 = process.env.HISTORY_GLOBAL_832_EVIDENCE
-  ?? '.phoenix/evidence/continuous-history/instrumented832-artifact/opening-codegen-832d5ea50f6efba2bd3b926cac4d7229caa12a5f-1/opening-browser-evidence/global';
+test('independent reference requires original projection at the real coordinator endpoint; retained Pending is not Accepted', () => {
+  const url = 'http://127.0.0.1:1' + globalChapterReferencePath(a);
+  assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url));
+  assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url.replace('&boundary_representation=original_messages', '')));
+  assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url.replace(a.endpoint, '/api/product-conversations/' + a.product_conversation_id)));
+});
+}
+const dir832 = process.env.HISTORY_GLOBAL_832_EVIDENCE;
+if (!dir832) test('retained 832 opening evidence', { skip: 'set HISTORY_GLOBAL_832_EVIDENCE explicitly' }, () => {});
+else {
 const lines832 = name => readFileSync(`${dir832}/${name}`, 'utf8').trim().split('\n').map(JSON.parse);
 const a832 = JSON.parse(readFileSync(`${dir832}/fixture.json`));
 const evidence832 = lines832('ipc.jsonl').find(record => record.reply.evidence).reply.evidence;
@@ -231,6 +241,14 @@ for (const [name, [mutate, guard]] of Object.entries(preserveNegatives)) {
   });
 }
 
+}
+
+// UNIT ONLY route/DOM inputs: not retained authority or runtime qualification.
+const a = { product_conversation_id: 'unit-product', members: ['unit-root', 'unit-older'] };
+const evidence = { successor_transcript_row_id: 'unit-latest', client_turn_key: 'unit-key' };
+const latest = evidence.successor_transcript_row_id, id = `${latest}:${evidence.client_turn_key}`;
+const selection = `http://127.0.0.1:1/global/${a.members[0]}?source_transcript=${latest}#message-${encodeURIComponent(id)}`;
+const physical = { count: 1, visible: true, persistedMessageID: id };
 for (const [name, url, box] of [
   ['valid', selection, physical], ['wrong_pin', selection.replace(`source_transcript=${latest}`, 'source_transcript=foreign'), physical],
   ['wrong_hash', selection.replace(encodeURIComponent(id), 'foreign'), physical], ['wrong_route', selection.replace(`/global/${a.members[0]}`, '/global/foreign'), physical],
@@ -294,14 +312,9 @@ test('final receipt uses the actual atomic URL/identity/viewport producer after 
   assert.throws(() => validateGlobalChapterSelection(a, evidence, hidden.url, hidden, new URL(selection).pathname));
 });
 
-test('independent reference requires original projection at the real coordinator endpoint; retained Pending is not Accepted', () => {
-  const url = 'http://127.0.0.1:1' + globalChapterReferencePath(a);
-  assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url));
-  assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url.replace('&boundary_representation=original_messages', '')));
-  assert.throws(() => validateGlobalChapterReference(a, evidence, cached.data, url.replace(a.endpoint, '/api/product-conversations/' + a.product_conversation_id)));
-});
-test('pinned d4 routes and real source selection callback remain unchanged', () => {
-  const root = process.env.HISTORY_PINNED_SOURCE ?? 'target/history-hidden-geometry-repair';
+test('pinned d4 routes and real source selection callback remain unchanged',
+  { skip: process.env.HISTORY_PINNED_SOURCE ? false : 'set HISTORY_PINNED_SOURCE explicitly' }, () => {
+  const root = process.env.HISTORY_PINNED_SOURCE;
   const app = readFileSync(`${root}/ui/src/App.tsx`, 'utf8');
   assert.ok(app.includes('<Route path="/global/:slug" element={<CoordinatorPage />} />'));
   const coordinator = readFileSync(`${root}/ui/src/pages/CoordinatorPage.tsx`, 'utf8');
@@ -330,7 +343,9 @@ test('pinned d4 routes and real source selection callback remain unchanged', () 
   assert.ok(driver.indexOf('updateFault(fault, { failRoster: false });') < driver.indexOf('await chapter.click();'));
 });
 
-const shippingDir = process.env.HISTORY_SHIPPING_D4_EVIDENCE ?? '.phoenix/evidence/continuous-history/shipping-d4-artifact/history-evidence';
+const shippingDir = process.env.HISTORY_SHIPPING_D4_EVIDENCE;
+if (!shippingDir) test('retained shipping d4 evidence', { skip: 'set HISTORY_SHIPPING_D4_EVIDENCE explicitly' }, () => {});
+else {
 const shippingFixture = JSON.parse(readFileSync(`${shippingDir}/fixture.json`)).aggregates.find(a => a.kind === 'global');
 const shippingRows = readFileSync(`${shippingDir}/driver-api.jsonl`, 'utf8').trim().split('\n').map(JSON.parse);
 const receipt = shippingRows[21]; // authentic driver-api line22, not reconstructed from Pending
@@ -359,3 +374,4 @@ for (const [name, mutate] of Object.entries({
   const data = structuredClone(referenceData); mutate(data);
   assert.throws(() => validateGlobalChapterReference(shipping, expectedReceipt, data, referenceURL), error => error.captureReason === 'wrong_aggregate');
 });
+}

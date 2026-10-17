@@ -2992,3 +2992,16 @@ assertion or inheriting green35f qualification for a different tree.
 No successor hosted runner, local native/browser/build, production action or
 merge has occurred at this entry. Overhead and native/device resume remain
 separate unadopted decisions, not blockers to executable source integration.
+
+A further bounded historical review found retained offline replay/source-check
+issues, distinct from product/runtime behavior: normal non-JSON SSE ping parsed
+as JSON before event filtering; contradictory duplicate IPC opening receipts
+silently overwrote earlier authority; Global cache selftests implicitly required
+ignored private artifacts at module evaluation. Successor fixes ignore only
+unrelated event types before parsing, reject conflicting full-edge/client-key
+duplicates with a fixed nondisclosing error, and require explicit opt-in paths
+for artifact/source-backed groups while keeping pure unit tests portable.
+Red-first failures and green25 tests (18 pass,7 explicit retained-input skips)
+are preserved. Explicit invalid paths still fail rather than silently skipping.
+Positive private-artifact groups were not requalified and are not represented as
+runtime proof. The portable replay/cache suites are scheduled in successor CI.

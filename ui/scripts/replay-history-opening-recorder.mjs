@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { installAggregateRecorder, capturePolicy, acceptedWireCursor, ownedWireCursor, REQUIRED_BODY_MAX_BYTES } from './qualify-history-opening-realserver.mjs';
+import { installAggregateRecorder, capturePolicy, acceptedWireCursor, ownedWireCursor, sameEdge, REQUIRED_BODY_MAX_BYTES } from './qualify-history-opening-realserver.mjs';
 const PIN = 'd4c2772a95aa46da608b356c8fe7be074de1b7aa';
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 export function readJsonLines(path) {
@@ -83,10 +83,26 @@ export async function replayReservationRace(a, rows, ipcRows, { record = () => {
   assert.equal(snapshots.length, rows.length);
   return { drain, provenance, snapshots, receipts };
 }
+export function uniqueOpeningEvidence(openings) {
+  const bySuccessor = new Map();
+  for (const evidence of openings) {
+    const successor = evidence.successor_transcript_row_id;
+    if (bySuccessor.has(successor)) {
+      const previous = bySuccessor.get(successor);
+      if (!sameEdge(previous, evidence) || typeof evidence.client_turn_key !== 'string'
+        || evidence.client_turn_key.length === 0 || previous.client_turn_key !== evidence.client_turn_key) {
+        throw new Error('conflicting IPC opening evidence for successor');
+      }
+    } else bySuccessor.set(successor, evidence);
+  }
+  return [...bySuccessor.values()];
+}
 export function replayAcceptedEvents(rows, product) {
   const events = rows.map(r => r.value), cursors = [], inits = [], postAcceptedMessages = [];
   for (let i = 0; i < events.length; i++) {
-    const e = events[i], d = JSON.parse(e.data);
+    const e = events[i];
+    if (!['init', 'message', 'message_updated'].includes(e.eventName)) continue;
+    const d = JSON.parse(e.data);
     if (['message', 'message_updated'].includes(e.eventName) && !d.opening) {
       const initial = events.slice(0, i).findLast(candidate => candidate.eventName === 'init' && candidate.requestId === e.requestId);
       const productInits = events.filter(candidate => candidate.eventName === 'init' && JSON.parse(candidate.data).opening?.edge?.product_conversation_id === product);
@@ -128,7 +144,7 @@ async function main() {
   const all = options.responses.flatMap(readJsonLines);
   const ipcRows = options.ipc ? readJsonLines(options.ipc) : [];
   const openingEvidence = ipcRows.filter(r => r.value.reply?.evidence || r.value.reply?.result?.evidence).map(r => r.value.reply.evidence ?? r.value.reply.result.evidence);
-  const unique = [...new Map(openingEvidence.map(e => [e.successor_transcript_row_id, e])).values()];
+  const unique = uniqueOpeningEvidence(openingEvidence);
   const prefix = a.kind === 'global' ? '/api/global/coordinator/history/' : '/api/product-conversations/';
   // Inspect full responses only in this API family. Foreign owners at owned paths still reach the installed validator.
   const family = all.filter(row => {
