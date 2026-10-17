@@ -3372,6 +3372,7 @@ mod native_evidence_tests {
         let session = reconnect_ack_session(&mut expired);
         let now = MonotonicTick::native_now().unwrap();
         if now < expired.deadline {
+            // test-timing-allow: native monotonic deadline expiry is the behavior under test
             std::thread::sleep(std::time::Duration::from_nanos(
                 expired.deadline.get() - now.get(),
             ));
