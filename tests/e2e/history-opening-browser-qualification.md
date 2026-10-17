@@ -1,8 +1,12 @@
 ## Active qualification checkpoint
 
-Pinned app `6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e`, tree `bcf94dc11e62c459750caa1833abea20b8c1911b`, base `1f9529c634a074c6ab6ea36eb15ca284770df1a5`. Adds older-review correlation, Coordinator return-state and ESRCH re-observation repairs; correlation regression uses the production exporter predicate. Native/backend regressions require this exact successor's hosted execution; prior green does not qualify them. The native qualifier explicitly selects both ESRCH guards without removing earlier assertions.
+The pinned app also includes pre-session retained launch slots, explicit CLI-only transient profile policy, pre-spawn same-IDE-path retry and typed retained-state status. Native tests are authored, not yet executed on this successor. The native qualifier selects seven launch-slot tests, an isolated ignored real-Chrome partial-init test with the matched built CLI shim (Group assertion), both new daemon launch-failure regressions and the cleanup-failure diagnostic; existing ESRCH/process-scan/drain guards remain intact. IDE stable-profile derivation and unknown/unobservable fail-closed barriers are preserved.
 
-Preserved shared `335818b17d8c30e3e5726cb05fd1e3b45e1baf80`: Linux run39061431820 all8required jobs and macOS run39061431725 both jobs succeeded. Witness artifact12112111935 yielded6 collector204 acceptances and6 semantic exports, normal app/receiver drain, no aggregation errors. Full acceptance and overhead clearance remain false. Pre-session launch ownership P1 is a separate active source repair, not included in this pin; opaque launch errors are not safe abandonment. Global owns merge/deploy.
+Predecessor shared `465f034da8391288582825ff954a4695173e36c7` failed Linux run39063741378 only in the pre-Close process-identity wait of `dead_chrome_cleanup_failure_remains_visible_until_explicit_close`:2880 passed,1failed,1965notrun under fail-fast. Other seven required Linux jobs and both macOS39063741373 jobs passed. That failure is preserved, not reclassified as a proven test-only flake: source successor records the cleanup error/layout, allows only kernel-exited Z/X or identitygone before Close, and retains strict post-Close process/profile/socket assertions. Exact successor execution is required.
+
+Pinned app `8e70ef0d17338d898667d1aab0b9ae1a507ff369`, tree `81fe817e70949f65291d41c1f9cd2b0e921e9e57`, base `1f9529c634a074c6ab6ea36eb15ca284770df1a5`. Adds older-review correlation, Coordinator return-state and ESRCH re-observation repairs; correlation regression uses the production exporter predicate. Native/backend regressions require this exact successor's hosted execution; prior green does not qualify them. The native qualifier explicitly selects both ESRCH guards without removing earlier assertions.
+
+Preserved shared `335818b17d8c30e3e5726cb05fd1e3b45e1baf80`: Linux run39061431820 all8required jobs and macOS run39061431725 both jobs succeeded. Witness artifact12112111935 yielded6 collector204 acceptances and6 semantic exports, normal app/receiver drain, no aggregation errors. Full acceptance and overhead clearance remain false. Opaque launch errors are not safe abandonment; this successor's native retention repairs await exact hosted qualification. Global owns merge/deploy.
 
 # Instrumented opening browser qualification
 
@@ -13,7 +17,7 @@ wire identity helpers with this witness; the app source remains pinned unchanged
 ## Inputs and hosted invocation
 
 Supply an independent, tracked-clean app checkout at
-`6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e`, its already-built `ui/dist`, installed
+`8e70ef0d17338d898667d1aab0b9ae1a507ff369`, its already-built `ui/dist`, installed
 app-owned Vite/Playwright dependencies and Chromium, and the independently built
 ignored libtest artifact. This script never compiles, installs, starts production,
 or uses the shipping executable. Use the existing hosted preparation; workflow

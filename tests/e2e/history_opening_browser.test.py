@@ -21,6 +21,28 @@ REAL_DIGEST = opening.shipping.digest
 
 
 class OpeningQualificationTests(unittest.TestCase):
+    def test_retained_launch_native_qualification_cannot_skip_or_use_a_unit_shim(self):
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts/qualify-owned-chrome-teardown.sh").read_text()
+        self.assertIn('test "$PHOENIX_TEST_CHROME" = 1', script)
+        self.assertIn('PHOENIX_TEST_CHROME_SHIM_EXECUTABLE="$PWD/target/debug/phoenix-browser"', script)
+        self.assertEqual(script.count("run_exact session::launch_slot::tests::"), 7)
+        self.assertIn("real_chrome_partial_initialization_retains_child_and_retries_exact_close", script)
+        self.assertIn('"$name" -- --ignored --exact --nocapture --test-threads=1', script)
+        for name in (
+            "opaque_initial_launch_failure_status_retains_lifetime_and_barrier",
+            "partial_initial_launch_failure_status_retains_lifetime_and_barrier",
+            "dead_chrome_cleanup_failure_remains_visible_until_explicit_close",
+        ):
+            self.assertIn(f"run_exact {name} -p phoenix-tools --test browser_cli", script)
+        for relative, invocation in (
+            (".github/workflows/ci.yml", 'bash "$GITHUB_WORKSPACE/harness/scripts/qualify-owned-chrome-teardown.sh"'),
+            (".github/workflows/macos-app.yml", "bash scripts/qualify-owned-chrome-teardown.sh"),
+        ):
+            workflow = (root / relative).read_text()
+            prerequisite = "cargo build -p phoenix-tools --bin phoenix-browser\n          export PHOENIX_TEST_CHROME=1\n          "
+            self.assertIn(prerequisite + invocation, workflow)
+
     def test_optional_keepalive_workflow_has_real_probe_sources(self):
         workflow = opening.ROOT / '.github/workflows/history-keepalive-native-probe.yml'
         if workflow.exists():

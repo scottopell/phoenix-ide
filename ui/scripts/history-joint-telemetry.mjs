@@ -4,7 +4,7 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
-export const APP_PIN = '6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e';
+export const APP_PIN = '8e70ef0d17338d898667d1aab0b9ae1a507ff369';
 export const APP_BASE_PIN = '1f9529c634a074c6ab6ea36eb15ca284770df1a5';
 export const TELEMETRY_MODULE_SHA256 = '1c702c78bb06f74f3dae4c8f97d1932fc308959596f3602375bc65d7d99fb9e1';
 export const TELEMETRY_DIAGNOSTICS_SHA256 = 'e06232a39200d88e0a98aedb3d9e6183537f97a6e9498f27fe57a7e2a9a4696b';

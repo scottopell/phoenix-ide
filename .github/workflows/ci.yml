@@ -214,7 +214,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e
+          ref: 8e70ef0d17338d898667d1aab0b9ae1a507ff369
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -256,7 +256,7 @@ jobs:
           spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
           import sys
           module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
-          source='6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e'; tree='bcf94dc11e62c459750caa1833abea20b8c1911b'
+          source='8e70ef0d17338d898667d1aab0b9ae1a507ff369'; tree='81fe817e70949f65291d41c1f9cd2b0e921e9e57'
           for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
               module.admit_artifact(root, root/'ui'/name, source, tree, mode)
           (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
@@ -267,8 +267,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e
-          test "$(git rev-parse HEAD^{tree})" = bcf94dc11e62c459750caa1833abea20b8c1911b
+          test "$(git rev-parse HEAD)" = 8e70ef0d17338d898667d1aab0b9ae1a507ff369
+          test "$(git rev-parse HEAD^{tree})" = 81fe817e70949f65291d41c1f9cd2b0e921e9e57
           test "$(git merge-base HEAD 1f9529c634a074c6ab6ea36eb15ca284770df1a5)" = 1f9529c634a074c6ab6ea36eb15ca284770df1a5
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -478,6 +478,8 @@ jobs:
           CHROME_QUALIFICATION_OUTPUT: ${{ github.workspace }}/owned-chrome-linux
         run: |
           export PHOENIX_CHROME_EXECUTABLE="$(cd ui && node -e 'console.log(require("playwright").chromium.executablePath())')"
+          cargo build -p phoenix-tools --bin phoenix-browser
+          export PHOENIX_TEST_CHROME=1
           bash "$GITHUB_WORKSPACE/harness/scripts/qualify-owned-chrome-teardown.sh"
       - name: Controlled-functional six-report witness (separate from immutable stock baseline)
         working-directory: harness

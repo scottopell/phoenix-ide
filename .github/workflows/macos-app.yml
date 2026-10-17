@@ -172,7 +172,7 @@ jobs:
           shared-key: owned-chrome-macos
       - name: Admit exact app sources, build existing UI embed and install owned Chromium
         run: |
-          git diff --exit-code 6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e HEAD -- crates
+          git diff --exit-code 8e70ef0d17338d898667d1aab0b9ae1a507ff369 HEAD -- crates
           cd ui
           npm install -g corepack@latest
           corepack enable
@@ -182,6 +182,8 @@ jobs:
       - name: Exact macOS owned group, executable shim and actual Chrome layout
         run: |
           export PHOENIX_CHROME_EXECUTABLE="$(cd ui && node -e 'console.log(require("playwright").chromium.executablePath())')"
+          cargo build -p phoenix-tools --bin phoenix-browser
+          export PHOENIX_TEST_CHROME=1
           bash scripts/qualify-owned-chrome-teardown.sh
       - name: Retain actual native test/layout evidence even on failure
         if: always()
