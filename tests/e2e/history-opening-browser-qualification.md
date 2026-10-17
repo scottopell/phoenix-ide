@@ -3092,3 +3092,30 @@ Artifact12091277117 is96,607,629 bytes; exact failed Rust/clippy/witness logs an
 terminal JSON are preserved. No unchanged or concurrent qualification was
 started. The prior greenedac/35f baseline remains immutable; the two successor
 failures are not retroactively qualified by it.
+
+### Actual SQL/lint gate repair prepared without bypasses
+
+Product aac4d9f05765d4e3c09ccb41bc3dbbb1742920bf, tree
+7ab14388b4f638eb34108e0d6c93dd9c719c1846, is a clean4-file child offc39.
+The isolated SQL matrix now supplies real product kind identity and traverses
+both ordinary/coordinator role cases without changing production SQL or the
+full-row15-column oracle. Parent independently replayed the extracted actual
+SQL: priorfc39 fixture fails no-such-table;3150 current matrix comparisons match
+optimized==full oracle with exact i64/tie/order boundaries. This is SQLite
+execution, not Rust test execution.
+
+Coordinator setup and capacity assertions are factored into bounded helpers;
+52/32 capacity checks,44 fields/1030 key bytes, all8 marks, typed counters,
+correlation/metadata and actual OTLP assertions remain. Message wire boxes its
+large payload at its sole construction, preserving serde JSON and explicit TS
+unknown shape; imports/closure/semicolon corrections address actual lint reports.
+No blanket lint allowance or runtime schema relaxation was added. Independent
+bounded static review found no blockers; immutable helper scope/type corrections
+were included before commit. Parent independently passed tsc-b and79 lifecycle
+regressions at the new pin. Genuine Rust/clippy/codegen remain hosted gates.
+
+The source branch qualification/history-joint-source-aac4d9f05 and all three
+shared pins select this exact clean tree; the composed CLI accepts the workflow's
+420s outer bound under actual parser tests. One changed-candidate hosted run is
+prepared after the previous whole terminal, with no duplicate runner, native
+local build or expansion of overhead/device acceptance.
