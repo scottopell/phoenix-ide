@@ -2,7 +2,8 @@
 -- Native macOS launchd deployment lifecycle
 -- Requirement traceability: REQ-LDD-001 through REQ-LDD-024
 -- REQ-LDD-019–022 admit prepared sources at exact 123 or exact 128 with
--- exact target 128; REQ-LDD-023 admits ordinary activation only at exact 123.
+-- exact target 128; the protected published-release admission is exact 114 -> 128.
+-- REQ-LDD-023 admits ordinary pending migrations only at exact 123 -> 128.
 
 config {
     transition_timeout_seconds: Integer = 30
@@ -162,7 +163,17 @@ variant PreparedArtifactDeployment : DeployTransaction {
     recovery_mode: PairedRecoveryMode?
 }
 
+entity CurrentSchemaSource {
+    kind: PreparedCurrentSchemaSource | PublishedCurrentSchemaSource
+}
+
+variant PreparedCurrentSchemaSource : CurrentSchemaSource {}
+variant PublishedCurrentSchemaSource : CurrentSchemaSource {
+    release_tag: String
+}
+
 variant CurrentSchemaDeployment : DeployTransaction {
+    source: CurrentSchemaSource
     current_lifecycle_observation: CurrentSchemaLifecycleObservation
     database_state: CurrentSchemaDatabaseState
     migration_invocation: CurrentSchemaMigrationInvocation
@@ -278,10 +289,15 @@ external entity TargetService {
 --   A latest selection resolves to stable tag and metadata; an exact RC selection
 --   has matching tag, prerelease metadata, full embedded version, and commit. In
 --   either case the candidate's 40-character lowercase embedded git_sha equals
---   source_commit. Both prepared-artifact modes independently verify the receipt,
---   signing, notarization and exact identity; neither accepts release or runtime-only source.
+--   source_commit. Prepared sources independently verify receipt, signing,
+--   notarization and exact identity. CurrentSchemaDeployment.source is either
+--   PreparedCurrentSchemaSource with those checks or PublishedCurrentSchemaSource
+--   with an exact non-alias release tag, expected full release commit, full embedded
+--   version/SHA, host-target asset and published checksum agreeing. The protected
+--   release retains published_release source kind, not prepared_artifact.
 -- prepared_artifact_source_is_valid(transaction) -> Boolean
---   True for ordinary sources. For both prepared-artifact modes, the protected host-target
+--   True for non-prepared sources, including PublishedCurrentSchemaSource.
+--   For both prepared-artifact modes, the protected host-target
 --   candidate identity and receipt contents are valid; the operator establishes
 --   protected run/source association independently of JSON validation. Clean
 --   controller source/helper hash is independently verified, not receipt-derived.
@@ -295,12 +311,16 @@ external entity TargetService {
 --   upgrade mode. It does not assert that quiesce, offline ownership, or a
 --   snapshot has happened.
 -- current_schema_preflight_is_valid(transaction) -> Boolean
---   True for ordinary and paired legacy. CurrentSchemaDeployment is an explicit
---   prepared_artifact mode with exact canonical DB path shared by predecessor
---   and candidate, retained controller helper path/SHA-256 and candidate migration
---   registry path/SHA-256 bound to the immutable transaction. The source ledger
---   equals either the complete qualified ordered ledger through 123 or the complete
---   target registry through 128; a highest-version comparison is insufficient.
+--   True for ordinary and paired legacy. CurrentSchemaDeployment is explicit
+--   protected mode with exact canonical DB path shared by predecessor and candidate,
+--   captured installed configuration, retained controller helper path/SHA-256 and
+--   candidate migration registry path/SHA-256 bound to the immutable transaction.
+--   PreparedCurrentSchemaSource admits only the complete qualified ordered ledger
+--   through 123 or complete target registry through 128, retaining all receipt checks.
+--   PublishedCurrentSchemaSource admits only the exact complete candidate-registry
+--   prefix through 114 (every version/name, no gaps or extras), with candidate binary
+--   and complete registry from the exact release commit. No other source baseline
+--   or range is admitted; a highest-version comparison is insufficient.
 --   The complete candidate registry ends at 128 and names 126 as
 --   retire_wake_feature_preserving_history, 127 as coordinator_owned_work_scope_home,
 --   and 128 as product_creation_provisioning_stage. The complete registry and
@@ -308,7 +328,11 @@ external entity TargetService {
 --   activation and forward recovery; absent, unknown, mismatched, gapped or newer
 --   entries reject. Required
 --   ProductConversation tables, SQLite integrity and foreign keys pass before
---   disruption. No release or runtime-only source can select this mode.
+--   disruption. Local/runtime-only sources cannot select this mode; published
+--   releases select it only through the exact 114 -> 128 admission. First install,
+--   database path changes, release aliases, and contradictory source/mode evidence
+--   reject before disruption. Status, cleanup, recovery and finalization preserve
+--   the recorded prepared_artifact versus published_release source distinction.
 -- current_schema_snapshot_is_valid(transaction, proof) -> Boolean
 --   Proof matches the retained preflight and transaction. Offline exclusive
 --   DB/WAL/SHM ownership follows service stop; SQLite backup
@@ -347,8 +371,20 @@ external entity TargetService {
 --   registry with the named 126/127/128 entries defined by current_schema_preflight_is_valid.
 --   The complete registry and SHA-256 digest are immutable evidence bound to the
 --   candidate identity/configuration and helper, re-verified before activation
---   and forward recovery. Different, missing or newer registries reject.
+--   and forward recovery. Pre-handoff admission executes the hash/path-bound
+--   staged helper, never an ambient checkout. Different, missing or newer registries reject.
 --   No standalone database backup is required.
+-- ordinary_pending_migrations_admitted(transaction) -> Boolean
+--   True for protected transactions, an absent candidate database path, or no
+--   pending migrations. An absent path includes a switch from a predecessor's
+--   different database: captured predecessor configuration still governs ordinary
+--   artifact rollback. An existing database is guarded even on first install.
+--   Ordinary pending migrations require ordinary_forward_boundary_qualified (exact 123 -> 128).
+--   Protected exact 114 -> 128 admission does not qualify an ordinary interval.
+--   Unknown or unqualified pending intervals reject before runtime disruption.
+-- OrdinaryPendingMigrationsRejected(transaction)
+--   Ordinary pending migrations have no explicitly qualified interval; no stop,
+--   install or candidate startup has occurred.
 -- ordinary_forward_no_start_proven(transaction) -> Boolean
 --   Affirmative durable proof that the candidate has never had a start attempt.
 --   Missing or ambiguous start evidence is not proof; once attempted, this
@@ -381,10 +417,14 @@ external entity TargetService {
 --   and verified SQLite snapshot integrity bound to the immutable controller,
 --   predecessor and shared path. No future rollback result is required.
 -- controller_identity_is_independently_bound(transaction) -> Boolean
---   True for ordinary sources. For both prepared-artifact modes, the controller helper hash
---   is bound to the recorded clean controller source and protocol. The controller
---   and candidate commits may be equal when that independently bound helper is
---   valid.
+--   True for ordinary sources. For prepared sources, the controller helper hash
+--   is bound to the recorded clean controller source and protocol; controller and
+--   candidate commits may be equal when independently verified. For protected
+--   PublishedCurrentSchemaSource, require a separately explicit full controller
+--   commit, not the candidate release commit or ambient checkout. Retain helper
+--   bytes/path/SHA-256 from that controller commit independently of candidate
+--   binary/registry provenance from source_commit. Re-verify these immutable
+--   bindings before migration, activation and recovery; never substitute helpers.
 -- PairedRecoveryVerified(transaction, service, mode)
 --   Separately requested retained-helper recovery verified matched database,
 --   runtime/configuration and predecessor identity before releasing ownership.
@@ -393,7 +433,8 @@ external entity TargetService {
 --   migration reached durably verified target 128; ordinary sources use preparation.
 -- candidate_startup_proof_is_valid(transaction) -> Boolean
 --   True for ordinary sources. Paired legacy requires paired_database_proof_is_valid.
---   Current schema requires a durable matching snapshot proof, exact target 128
+--   Current schema requires re-verified immutable candidate/registry/digest and
+--   controller/helper bindings, a durable matching snapshot proof, exact target 128
 --   ledger and integrity/FK verification after offline migration. In both modes
 --   exclusive offline ownership precedes snapshot and candidate startup.
 -- paired_predecessor_start_order_is_valid(transaction) -> Boolean
@@ -510,6 +551,7 @@ rule PrepareCandidate {
     when: CandidatePreparationCompleted(transaction)
     requires: DeploymentOwnsActivationClaim(transaction)
     requires: selected_source_is_valid(transaction)
+    requires: ordinary_pending_migrations_admitted(transaction)
     requires: prepared_artifact_source_is_valid(transaction)
     requires: paired_database_preflight_is_valid(transaction)
     requires: current_schema_preflight_is_valid(transaction)
@@ -523,6 +565,17 @@ rule PrepareCandidate {
         or transaction.previous != null
     ensures: transaction.state = prepared
     ensures: preparation_complete(transaction)
+}
+
+rule RejectUnqualifiedOrdinaryPendingMigrations {
+    when: OrdinaryPendingMigrationsRejected(transaction)
+    requires: transaction.state = preparing
+    requires: DeploymentOwnsActivationClaim(transaction)
+    requires: not ordinary_pending_migrations_admitted(transaction)
+    ensures: transaction.state = precondition_failed
+    ensures: ProductionArtifactsUnchanged(transaction)
+    ensures: TargetServiceUnchanged(transaction)
+    ensures: DurableStatusWritten(transaction)
 }
 
 rule RejectConcurrentDeployment {
@@ -627,6 +680,8 @@ rule BeginCurrentSchemaMigration {
     requires: transaction.database_state = source_unchanged
     requires: transaction.migration_invocation = not_invoked
     requires: snapshot_proof_durable(transaction)
+    requires: current_schema_preflight_is_valid(transaction)
+    requires: controller_identity_is_independently_bound(transaction)
     ensures: atomic_candidate_install(transaction)
     ensures: transaction.migration_invocation = migration_started
     ensures: transaction.database_state = unknown
@@ -1300,6 +1355,12 @@ invariant OrdinaryRollbackIsRuntimeOnly {
             and not DatabaseRollbackClaimed(transaction)
 }
 
+invariant OrdinaryPendingMigrationsRequireQualification {
+    for transaction in DeployTransactions:
+        transaction.state in { prepared, activating, committed } implies
+            ordinary_pending_migrations_admitted(transaction)
+}
+
 invariant OrdinaryForwardStartupHasDurableBoundary {
     for transaction in DeployTransactions:
         ordinary_forward_boundary_qualified(transaction)
@@ -1343,11 +1404,12 @@ invariant PreStopCleanupPendingKeepsRuntimeAndClaim {
             and not DatabaseRollbackCompleted(transaction)
 }
 
-invariant CurrentSchemaPreparedModeIsDistinct {
+invariant CurrentSchemaProtectedModeIsDistinct {
     for transaction in DeployTransactions:
         transaction.kind = CurrentSchemaDeployment
         and transaction.state not in { preparing, rejected_concurrent, precondition_failed } implies
-            prepared_artifact_source_is_valid(transaction)
+            selected_source_is_valid(transaction)
+            and prepared_artifact_source_is_valid(transaction)
             and current_schema_preflight_is_valid(transaction)
             and controller_identity_is_independently_bound(transaction)
             and transaction.previous != null
