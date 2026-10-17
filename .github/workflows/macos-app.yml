@@ -165,14 +165,14 @@ jobs:
           output="$RUNNER_TEMP/observation-qualification/candidate"
           mkdir -p "$output/bin"
           git rev-parse HEAD HEAD^{tree} > "$output/qualifier-source.txt"
-          candidate=f095d1ad7051c83e4806ab5b66af30336a57c82f
+          candidate=bef36e9e4f482b532ebfd53900f3b3f42448a805
           attribution_base=2702d8389c2fc78ac2e528c876c35a1a7040d692
           base=f3893088b3cb224be9403f600173d5216e3a2f6b
           product=9ee218d4a33ebd4b94ea547d60caa62134edb960
           git fetch origin "$candidate" "$attribution_base" "$base" "$product"
           git checkout --detach "$candidate"
           test "$(git rev-parse HEAD)" = "$candidate"
-          test "$(git rev-parse HEAD^{tree})" = e5457e36afa2e368d844645ea1140b005e4edf39
+          test "$(git rev-parse HEAD^{tree})" = 1f618295fc974725cbf0d9136a934f78a8a4ba6b
           git rev-parse HEAD HEAD^{tree} > "$output/source.txt"
           git rev-parse "$base" "$base^{tree}" "$product" "$product^{tree}" "$attribution_base" "$attribution_base^{tree}" > "$output/parity-authorities.txt"
           cp docs/conversation-observation-source-parity.json docs/conversation-observation-composition.md docs/conversation-observation-attribution.md docs/conversation-observation-attribution.json "$output/"
@@ -325,7 +325,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: current-task-observation-attribution-f095-portable
+          name: current-task-observation-attribution-bef36-portable
           path: ${{ runner.temp }}/observation-qualification/
           if-no-files-found: warn
           retention-days: 7
