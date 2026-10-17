@@ -165,15 +165,17 @@ jobs:
           output="$RUNNER_TEMP/observation-qualification/candidate"
           mkdir -p "$output/bin"
           git rev-parse HEAD HEAD^{tree} > "$output/qualifier-source.txt"
-          candidate=2702d8389c2fc78ac2e528c876c35a1a7040d692
+          candidate=f095d1ad7051c83e4806ab5b66af30336a57c82f
+          attribution_base=2702d8389c2fc78ac2e528c876c35a1a7040d692
           base=f3893088b3cb224be9403f600173d5216e3a2f6b
           product=9ee218d4a33ebd4b94ea547d60caa62134edb960
-          git fetch origin "$candidate" "$base" "$product"
+          git fetch origin "$candidate" "$attribution_base" "$base" "$product"
           git checkout --detach "$candidate"
           test "$(git rev-parse HEAD)" = "$candidate"
+          test "$(git rev-parse HEAD^{tree})" = e5457e36afa2e368d844645ea1140b005e4edf39
           git rev-parse HEAD HEAD^{tree} > "$output/source.txt"
-          git rev-parse "$base" "$base^{tree}" "$product" "$product^{tree}" > "$output/parity-authorities.txt"
-          cp docs/conversation-observation-source-parity.json docs/conversation-observation-composition.md "$output/"
+          git rev-parse "$base" "$base^{tree}" "$product" "$product^{tree}" "$attribution_base" "$attribution_base^{tree}" > "$output/parity-authorities.txt"
+          cp docs/conversation-observation-source-parity.json docs/conversation-observation-composition.md docs/conversation-observation-attribution.md docs/conversation-observation-attribution.json "$output/"
           printf '%s\n' 'Single exact current candidate; no baseline or comparative measurement.' 'Hosted synthetic private-cwd contracts only; no real DB, provider, fixture upload, browser or production acceptance.' > "$output/scope.txt"
       - uses: actions/setup-node@v4
         with:
@@ -238,6 +240,70 @@ jobs:
           assert not d.get('numPendingTests',0) and not d.get('numTodoTests',0) and not d.get('numRuntimeErrorTestSuites',0)
           assert not d.get('unhandledErrors') and not d.get('testExecError')
           PY
+      - name: Require exact attribution source guards and existing mock launcher contracts
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/observation-qualification/candidate"
+          python3 tests/devpy/test_observation_attribution_source.py -v 2>&1 | tee "$output/attribution-source-guards.log"
+          grep -E '^Ran 7 tests in ' "$output/attribution-source-guards.log"
+          grep -Fx 'OK' "$output/attribution-source-guards.log"
+          python3 tests/devpy/test_observe.py -v 2>&1 | tee "$output/observation-mock-contracts.log"
+          grep -E '^Ran 8 tests in ' "$output/observation-mock-contracts.log"
+          grep -Fx 'OK' "$output/observation-mock-contracts.log"
+      - name: Require eight exact attribution and observation authority lib contracts
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/observation-qualification/candidate"
+          tests=(
+            observation_startup::attribution_tests::closes_associated_success_error_and_denial_before_body_drain
+            observation_startup::attribution_tests::cancellation_closes_request_and_child_without_claiming_response_ready
+            observation_startup::attribution_tests::startup_dispatch_captures_actual_product_detail_without_inheriting_default
+            observation_startup::attribution_tests::scoped_subscriber_does_not_replace_existing_default_or_log_unmatched_path
+            api::application_state::tests::observation_requires_direct_loopback_even_for_public_routes
+            api::application_state::tests::observation_cannot_extract_live_authority
+            api::application_state::tests::shared_route_lookup_is_target_scoped
+            api::application_state::tests::normal_routes_reject_live_operations_in_observation_composition
+          )
+          for selector in "${tests[@]}"; do
+            log="$output/${selector##*::}.log"
+            cargo test -p phoenix_ide --lib --features portable-ui "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+            grep -F 'test result: ok. 1 passed; 0 failed;' "$log"
+          done
+          grep -o 'observation_attribution_sample=.*' "$output/startup_dispatch_captures_actual_product_detail_without_inheriting_default.log" > "$output/synthetic-attribution-sample.txt"
+          python3 - "$output/synthetic-attribution-sample.txt" <<'PY'
+          import collections,json,sys
+          from pathlib import Path
+          lines=Path(sys.argv[1]).read_text().splitlines()
+          assert len(lines)==1
+          records=json.loads(lines[0].removeprefix('observation_attribution_sample='))
+          assert isinstance(records,list) and records and 'SECRET' not in json.dumps(records)
+          expected={
+              'observation.request','observation.authorization','replay.admission',
+              'observation.resolve_ordinary','observation.get_aggregate','observation.require_member',
+              'observation.member.resolve_ordinary','observation.member.get_aggregate',
+              'product_conversation.detail_get','product_conversation.post_snapshot_projection',
+              'product_conversation.pool_wait','product_conversation.begin_read',
+              'product_conversation.resolve','product_conversation.aggregate',
+              'product_conversation.close','product_conversation.message_page',
+              'product_conversation.snapshot_read','product_conversation.rollback_read',
+              'observation.db.product','observation.db.topology',
+              'observation.db.read_member','observation.db.source',
+          }
+          counts=collections.Counter(record['span']['name'] for record in records)
+          assert set(counts)==expected and counts['observation.request']==1
+          root=next(record['span'] for record in records if record['span']['name']=='observation.request')
+          assert root['route']=='/api/product-conversations/:reference'
+          assert root['status']==200 and root['response_ready'] is True and type(root['request_id']) is int
+          for record in records:
+              assert record['fields']['message']=='close'
+              assert isinstance(record['timestamp'],str)
+              assert all(isinstance(record['fields'][key],str) for key in ['time.busy','time.idle'])
+              for span in [record['span'],*record.get('spans',[])]:
+                  assert set(span)<={'name','request_id','route','status','response_ready','open.id','product.reference'}
+              if record['span']['name']!='observation.request':
+                  assert any(span.get('name')=='observation.request' and span.get('request_id')==root['request_id'] for span in record['spans'])
+          print('synthetic attribution receipt: privacy, names, counts and request ancestry passed',json.dumps(counts,sort_keys=True))
+          PY
       - name: Require real-binary startup and private-cwd portable asset contracts then retain one binary
         run: |
           set -euo pipefail
@@ -259,7 +325,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: current-task-observation-2702-portable
+          name: current-task-observation-attribution-f095-portable
           path: ${{ runner.temp }}/observation-qualification/
           if-no-files-found: warn
           retention-days: 7
