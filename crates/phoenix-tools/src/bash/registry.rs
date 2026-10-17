@@ -20,8 +20,8 @@
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc,
 };
 use std::time::SystemTime;
 
@@ -2484,12 +2484,10 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            assert!(
-                replacement_child
-                    .try_wait()
-                    .expect("try_wait replacement")
-                    .is_none()
-            );
+            assert!(replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none());
             unsafe {
                 let _ = libc::kill(replacement_pgid, libc::SIGKILL);
             }

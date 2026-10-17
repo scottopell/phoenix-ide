@@ -1,4 +1,4 @@
-# ADR-115: Bound owned-child settlement after Bash launch
+# ADR-116: Bound owned-child settlement after Bash launch
 
 - **Status:** Accepted
 - **Date:** 2026-10-17

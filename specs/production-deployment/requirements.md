@@ -24,7 +24,7 @@ THE release deployment command SHALL require the tag, GitHub prerelease metadata
 
 ### REQ-PD-003 — Complete preparation before disruption
 
-For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to local/published sources.
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to unprotected local/published sources. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path.
 
 Before disrupting a running runtime, the system shall stage and validate the candidate, backend configuration, exact `.phoenix-ide.env` snapshot, rollback inputs, runtime identities and endpoints, destination-space reservations, artifact hashes, backend activation program, immutable handoff, and initial durable transaction status.
 
@@ -54,6 +54,8 @@ A deployment shall commit only after observing a new backend-owned runtime proce
 
 ### REQ-PD-010 — Verified rollback
 
+Protected current-schema launchd transactions SHALL obey the pre-invocation-only predecessor recovery boundary in REQ-LDD-021–022. Qualified ordinary launchd migration activation SHALL obey REQ-LDD-023's candidate-start boundary; the runtime-artifact rollback rules below SHALL NOT override either boundary.
+
 For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. The unconditional artifact-rollback attempt below applies to ordinary sources.
 
 If activation fails after disruption, the activation owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment snapshot, and service state, verify the captured previous runtime identity at its previous endpoint, restore the previous deployed SHA, and durably distinguish successful runtime-artifact rollback from rollback failure.
@@ -68,7 +70,7 @@ After exact verification, the system shall write `deployed.sha` from the selecte
 
 ### REQ-PD-012 — Configuration source of truth
 
-For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to local/published sources.
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to unprotected local/published sources. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path.
 
 Modern deployment shall load `.phoenix-ide.env` once and use that exact snapshot for preflight, installation, and candidate endpoint selection. Runtime status shall inspect installed configuration, rollback shall use the previous installed snapshot, and modern operation shall ignore rather than migrate or consult a legacy launchd override store, systemd drop-in, or inferred detached-daemon environment.
 
@@ -115,14 +117,19 @@ THE shared production deployment contract SHALL treat the macOS launchd prepared
 
 The shared command surface SHALL expose `prod finalize-paired TXN` only for the launchd paired contract under `specs/launchd-deployment/requirements.md` REQ-LDD-018. This operation SHALL be publication/reservation-only and SHALL NOT reuse runtime activation or database rollback. Unknown ownership, helper absence, committed identity or captured configuration SHALL retain the fence and refuse.
 
-### REQ-PD-021: Explicit prepared database mode selection
+### REQ-PD-021: Explicit protected database mode selection
 
 **Condition:** When an operator deploys a prepared artifact through the production interface,
-**System:** the interface SHALL require exactly one of paired legacy upgrade or current-schema upgrade, SHALL reject either mode for release/local sources, SHALL require the expected full candidate commit, and SHALL expose mode-matched finalization and recovery commands without weakening artifact signature, notarization, receipt, architecture, source-commit, or embedded-identity verification.
+**System:** the interface SHALL require exactly one of paired legacy upgrade or current-schema upgrade, SHALL reject local sources and release sources except for the protected current-schema admission below, SHALL require the expected full candidate commit, and SHALL expose mode-matched finalization and recovery commands without weakening prepared-artifact signature, notarization, receipt, architecture, source-commit, or embedded-identity verification.
 
 **Rationale:** Artifact provenance and database compatibility are separate dimensions; selecting a newer database family must not bypass the prepared artifact's existing supply-chain contract.
 
+**Condition:** When an operator explicitly selects a published release for protected current-schema launchd activation,
+**System:** the interface SHALL require the exact immutable release identity and a separately explicit full controller commit for the retained activation helper; SHALL retain the helper's hash and obtain the candidate binary and complete migration registry from the release commit, not the controller commit; SHALL admit only the source ledger exactly equal to that registry's complete prefix through 114 and the exact qualified target 128 under REQ-LDD-019; and SHALL reuse the protected snapshot, capacity, exclusivity, durable `migration_started`, and candidate-only post-invocation recovery/finalization lifecycle. It SHALL reject aliases, other source baselines, target registries, and backends before disruption. Prepared exact-123/exact-target and ordinary exact-123-to-128 admissions SHALL remain unchanged; this exception SHALL NOT establish generic release, range, or rollback compatibility.
+
 ### REQ-PD-022: Ordinary forward-only recovery surface
+
+When ordinary launchd deployment has pending migrations outside an explicitly qualified ordinary interval, the interface SHALL reject deployment before runtime disruption, not fall back to unqualified runtime-artifact rollback. Protected exact-114-to-128 release admission SHALL NOT qualify that interval for ordinary deployment.
 
 **Condition:** When ordinary launchd activation crosses the qualified candidate-start boundary and does not verify candidate health,
 **System:** the production interface SHALL report that predecessor rollback is forbidden, retain the deployment claim and exact candidate evidence, and expose only explicit `prod resume-forward TXN` recovery for that transaction. It SHALL NOT require or imply a standalone backup for the normal in-place route.

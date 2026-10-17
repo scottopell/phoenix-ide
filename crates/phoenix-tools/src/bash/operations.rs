@@ -24,16 +24,16 @@ use tokio::process::Command;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
-use super::ValidatedBashSpawnTarget;
 use super::handle::{
-    BASH_LAUNCH_UUID_ENV_VAR, BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause,
-    Handle, HandleId, HandleState, KillSignal, TOMBSTONE_TAIL_LINES,
+    BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState,
+    KillSignal, BASH_LAUNCH_UUID_ENV_VAR, TOMBSTONE_TAIL_LINES,
 };
 use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary, SpawnReservation};
 use super::ring::RingBuffer;
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
+use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
@@ -72,7 +72,8 @@ const CAP_HINT: &str =
 
 // Hint text for handle_not_found responses (REQ-BASH-008/010): tmux pointer
 // for handles that may predate this Phoenix process.
-const HANDLE_NOT_FOUND_HINT: &str = "if Phoenix restarted since this handle was created, the handle was lost — bash handles do \
+const HANDLE_NOT_FOUND_HINT: &str =
+    "if Phoenix restarted since this handle was created, the handle was lost — bash handles do \
      not survive Phoenix restart. For processes that should survive Phoenix restart, use the \
      tmux tool.";
 
@@ -2417,12 +2418,10 @@ mod tests {
         );
         let response = response_json(&output);
         assert_eq!(response["status"], "outcome_unknown");
-        assert!(
-            response["error_message"]
-                .as_str()
-                .unwrap()
-                .contains("Do not automatically retry")
-        );
+        assert!(response["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("Do not automatically retry"));
         for key in [
             "handle",
             "pid",
@@ -2583,7 +2582,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_birth_probe_never_adopts_reused_pid_observation() {
-        use phoenix_core::process_identity::{ProcessIdentity, process_identity_matches};
+        use phoenix_core::process_identity::{process_identity_matches, ProcessIdentity};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let ctx = test_context(&scope("identity-missing-birth"));
         let dir = tempfile::tempdir().unwrap();
@@ -2776,12 +2775,10 @@ mod tests {
         .expect("spawn");
         // A registry with no owner table deterministically refuses registration.
         let missing_owner_registry = crate::bash::registry::BashHandleRegistry::new();
-        assert!(
-            missing_owner_registry
-                .commit_spawn(&mut reservation, handle)
-                .await
-                .is_err()
-        );
+        assert!(missing_owner_registry
+            .commit_spawn(&mut reservation, handle)
+            .await
+            .is_err());
         let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
         std::fs::write(dir.path().join("release"), "").unwrap();
         let response = response_json(
@@ -3472,11 +3469,9 @@ mod tests {
         )
         .await;
         assert!(!output.is_success());
-        assert!(
-            output
-                .output()
-                .contains("bash processes require a conversation-scoped owner")
-        );
+        assert!(output
+            .output()
+            .contains("bash processes require a conversation-scoped owner"));
     }
 
     #[tokio::test]
