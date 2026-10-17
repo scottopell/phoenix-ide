@@ -905,9 +905,11 @@ mod replay_payload_size_tests {
         let (db, mut messages) = super::super::event_presentation::tests::fixture(1).await;
         let event = SseEvent::Message {
             message: messages.remove(0),
+            opening: None,
         };
         let redacted: SseWireEvent = event.clone().into();
         let redacted_json = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(redacted_json.get("opening"), Some(&Value::Null));
         assert_eq!(
             redacted_json["message"]["event_presentation"]["reason"],
             "redacted"
@@ -918,6 +920,7 @@ mod replay_payload_size_tests {
         let presentations = EventPresentations::load(&db, event_messages(&event)).await;
         let projected = SseWireEvent::with_presentations(event.clone(), &presentations);
         let projected_json = serde_json::to_value(&projected).unwrap();
+        assert_eq!(projected_json.get("opening"), Some(&Value::Null));
         assert_eq!(
             projected_json["message"]["event_presentation"]["status"],
             "available"
