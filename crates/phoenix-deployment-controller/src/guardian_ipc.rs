@@ -4359,14 +4359,21 @@ mod native_evidence_tests {
                 reconciling.current_session().generation.get(),
             )
         };
-        let response = fixture.server.handle(Request::BeginReconciliation {
-            instance: detached.instance,
-            inventory: detached.slots,
-            interruption_revision: interruption_revision.get(),
-        });
-        let Response::ReconciliationBegun { session } = response else {
-            panic!("begin reconciliation: {response:?}")
-        };
+        let slots = detached
+            .slots
+            .iter()
+            .copied()
+            .map(|slot| fixture.server.slot(slot))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let instance = fixture.server.guardian.instance_id();
+        let reconciled = fixture
+            .server
+            .guardian
+            .begin_reconciliation(instance, &slots, interruption_revision)
+            .unwrap();
+        fixture.server.session = reconciled;
+        let session: WireSession = reconciled.into();
         assert_eq!(session.generation, reconciling_generation);
         let request = Request::VerifyRecoveredNativeIdentityObservation {
             session,
