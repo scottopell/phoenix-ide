@@ -2,6 +2,24 @@ use phoenix_core::process_identity::{process_identity_matches, ProcessIdentity};
 use std::io;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootObservation {
+    Live,
+    #[cfg(any(target_os = "macos", test))]
+    ExitPending,
+    Exited,
+}
+
+impl RootObservation {
+    fn permits_signal(self) -> bool {
+        matches!(self, Self::Live | Self::Exited)
+    }
+
+    fn permits_completion(self) -> bool {
+        self == Self::Exited
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct OwnedChromeGroup {
     root: ProcessIdentity,
@@ -27,7 +45,7 @@ impl OwnedChromeGroup {
             root,
             drained: false,
         };
-        owned.root_exited(child)?;
+        owned.observe_root(child)?;
         Ok(owned)
     }
 
@@ -75,7 +93,10 @@ impl OwnedChromeGroup {
         )
     }
 
-    pub(crate) fn root_exited(&self, child: &mut tokio::process::Child) -> io::Result<bool> {
+    pub(crate) fn observe_root(
+        &self,
+        child: &mut tokio::process::Child,
+    ) -> io::Result<RootObservation> {
         if child.id() != Some(self.root.pid) {
             return Err(io::Error::other(
                 "owned Chrome child was reaped or replaced",
@@ -84,7 +105,7 @@ impl OwnedChromeGroup {
         if self.waitable_exit()? {
             // A waitable, unreaped child still reserves its PID even when macOS
             // no longer supplies PROC_PIDTBSDINFO for that zombie.
-            return Ok(true);
+            return Ok(RootObservation::Exited);
         }
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
         let observed_identity =
@@ -94,11 +115,20 @@ impl OwnedChromeGroup {
         let group_error = (observed_group == -1).then(io::Error::last_os_error);
         let live_matches = observed_identity == Some(self.root) && observed_group == pid;
         if live_matches {
-            return Ok(false);
+            return Ok(RootObservation::Live);
         }
         // Exit can occur between waitid's live observation and proc_pidinfo.
         if self.waitable_exit()? {
-            return Ok(true);
+            return Ok(RootObservation::Exited);
+        }
+        #[cfg(target_os = "macos")]
+        if observed_identity.is_none()
+            && observed_group == -1
+            && group_error
+                .as_ref()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+        {
+            return Ok(RootObservation::ExitPending);
         }
         #[cfg(target_os = "macos")]
         eprintln!("owned_chrome_darwin_wait {}", self.darwin_wait_diagnostic());
@@ -108,14 +138,16 @@ impl OwnedChromeGroup {
         )))
     }
 
-    fn signal(&self, child: &mut tokio::process::Child, signal: libc::c_int) -> io::Result<()> {
-        self.root_exited(child)?;
+    fn signal(&self, child: &mut tokio::process::Child, signal: libc::c_int) -> io::Result<bool> {
+        if !self.observe_root(child)?.permits_signal() {
+            return Ok(false);
+        }
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
         // SAFETY: the unreaped owned child anchors this isolated launch group.
         if unsafe { libc::kill(-pid, signal) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) async fn drain(
@@ -129,11 +161,11 @@ impl OwnedChromeGroup {
         let started = Instant::now();
         let deadline = started + budget;
         let escalate = started + budget.min(Duration::from_millis(250));
-        self.signal(child, libc::SIGTERM)?;
+        let mut terminated = false;
         let mut killed = false;
         loop {
-            let exited = self.root_exited(child)?;
-            if exited && !group_has_live_members(self.root.pid)? {
+            let observation = self.observe_root(child)?;
+            if observation.permits_completion() && !group_has_live_members(self.root.pid)? {
                 self.drained = true;
                 return Ok(());
             }
@@ -144,9 +176,10 @@ impl OwnedChromeGroup {
                     "Chrome launch group did not drain",
                 ));
             }
-            if !killed && now >= escalate {
-                self.signal(child, libc::SIGKILL)?;
-                killed = true;
+            if !terminated {
+                terminated = self.signal(child, libc::SIGTERM)?;
+            } else if !killed && now >= escalate {
+                killed = self.signal(child, libc::SIGKILL)?;
             }
             // This observes kernel process completion, never retries deletion.
             tokio::task::yield_now().await;
@@ -254,6 +287,16 @@ mod tests {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
+    #[test]
+    fn pending_exit_authorizes_neither_signal_nor_completion() {
+        assert!(!RootObservation::ExitPending.permits_signal());
+        assert!(!RootObservation::ExitPending.permits_completion());
+        assert!(RootObservation::Live.permits_signal());
+        assert!(!RootObservation::Live.permits_completion());
+        assert!(RootObservation::Exited.permits_signal());
+        assert!(RootObservation::Exited.permits_completion());
+    }
+
     fn sentinel() -> tokio::process::Child {
         tokio::process::Command::new("/bin/sh")
             .args(["-c", "exec cat >/dev/null"])
@@ -327,9 +370,11 @@ exit 0
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match group.root_exited(&mut root) {
-                    Ok(true) => break,
-                    Ok(false) => tokio::task::yield_now().await,
+                match group.observe_root(&mut root) {
+                    Ok(RootObservation::Exited) => break,
+                    Ok(RootObservation::Live | RootObservation::ExitPending) => {
+                        tokio::task::yield_now().await
+                    }
                     Err(error) => {
                         #[cfg(target_os = "macos")]
                         diagnose_exit_transition(&group, &mut root).await;
@@ -340,12 +385,14 @@ exit 0
         })
         .await
         .unwrap();
-        assert!(
-            group.root_exited(&mut root).unwrap(),
+        assert_eq!(
+            group.observe_root(&mut root).unwrap(),
+            RootObservation::Exited,
             "WNOWAIT must retain the same exited-child anchor"
         );
-        assert!(
-            group.root_exited(&mut root).unwrap(),
+        assert_eq!(
+            group.observe_root(&mut root).unwrap(),
+            RootObservation::Exited,
             "observing exit must not reap the root"
         );
         assert!(path.join("writer").exists());
@@ -506,7 +553,7 @@ exit 0
         let identity = current_process_identity(root.id().unwrap()).unwrap();
         let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         assert!(
-            group.root_exited(&mut unrelated).is_err(),
+            group.observe_root(&mut unrelated).is_err(),
             "a different child handle cannot authorize this group"
         );
         assert!(group.signal(&mut unrelated, libc::SIGTERM).is_err());
@@ -519,7 +566,7 @@ exit 0
             .unwrap();
         root.wait().await.unwrap();
         assert!(
-            group.root_exited(&mut root).is_err(),
+            group.observe_root(&mut root).is_err(),
             "reaped root must lose wait authority"
         );
         assert!(group
