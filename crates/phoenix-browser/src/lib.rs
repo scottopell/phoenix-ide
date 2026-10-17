@@ -8,6 +8,7 @@
 //! the behavioural contract.
 
 mod cdp;
+mod navigation;
 pub mod react;
 pub mod screencast;
 pub mod session;

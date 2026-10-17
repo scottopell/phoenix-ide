@@ -7,7 +7,7 @@ use phoenix_core::process_identity::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
@@ -16,6 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -190,12 +191,471 @@ fn chrome_enabled() -> bool {
 }
 
 fn evaluation_value(response: &Value) -> Value {
-    let text = response["result"]["text"].as_str().unwrap();
-    let value = text
-        .strip_prefix("<javascript_result>")
-        .and_then(|text| text.strip_suffix("</javascript_result>"))
-        .unwrap_or(text);
-    serde_json::from_str(value).unwrap()
+    assert_eq!(response["result"]["data"]["kind"], "json", "{response}");
+    response["result"]["data"]["value"].clone()
+}
+
+#[test]
+fn eval_returns_typed_values_without_reinterpreting_user_objects() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    cli.ok(&["open", "data:text/html,<title>Typed evaluation</title>"]);
+    for (expression, expected) in [
+        ("42", json!(42)),
+        ("'hello'", json!("hello")),
+        ("true", json!(true)),
+        ("null", Value::Null),
+        ("[1, false, null, {nested: ['value']}]", json!([1, false, null, {"nested":["value"]}])),
+        ("Promise.resolve({answer:42})", json!({"answer":42})),
+        ("({path:'/user/path', post:'/user/post', artifact_path:'/user/artifact', raw_samples:[{path:'user'}]})", json!({"path":"/user/path", "post":"/user/post", "artifact_path":"/user/artifact", "raw_samples":[{"path":"user"}]})),
+        ("window.evalCount = (window.evalCount || 0) + 1; ({count:window.evalCount})", json!({"count":1})),
+    ] {
+        let response = cli.ok(&["eval", expression]);
+        assert_eq!(evaluation_value(&response), expected);
+        assert_eq!(response["result"]["artifacts"], json!([]));
+        assert_eq!(response["result"]["text"], "JavaScript evaluated");
+    }
+    let human = |expression: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"))
+            .env("PHOENIX_BROWSER_RUNTIME_DIR", cli.directory.path())
+            .env("PHOENIX_TMP_DIR", cli.directory.path().join("scratch"))
+            .args(["--session", "integration", "eval", expression])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(human("({answer:42})"), "{\n  \"answer\": 42\n}\n");
+    assert_eq!(human("undefined"), "undefined\n");
+    assert_eq!(human("123n"), "123n\n");
+    let large_human = human("'x'.repeat(5000)");
+    let human_path = large_human
+        .trim()
+        .strip_prefix("Output written to ")
+        .unwrap()
+        .strip_suffix(" (JSON)")
+        .unwrap();
+    cli.artifacts
+        .lock()
+        .unwrap()
+        .push(PathBuf::from(human_path));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(human_path).unwrap()).unwrap(),
+        json!("x".repeat(5000))
+    );
+    let undefined = cli.ok(&["eval", "undefined"]);
+    assert_eq!(undefined["result"]["data"], json!({"kind":"undefined"}));
+    for expression in ["123n", "NaN", "Infinity", "-Infinity", "-0"] {
+        let response = cli.ok(&["eval", expression]);
+        assert_eq!(
+            response["result"]["data"],
+            json!({"kind":"unserializable", "value":expression})
+        );
+    }
+    let large = cli.ok(&["eval", "({nested: ['x'.repeat(5000)]})"]);
+    assert_eq!(large["result"]["data"], json!({"kind":"json_artifact"}));
+    let paths = large["result"]["artifacts"].as_array().unwrap();
+    assert_eq!(paths.len(), 1);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(paths[0].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(saved, json!({"nested":["x".repeat(5000)]}));
+    let large_scalar = cli.ok(&["eval", "BigInt('9'.repeat(5000))"]);
+    assert_eq!(
+        large_scalar["result"]["data"],
+        json!({"kind":"unserializable_artifact"})
+    );
+    let scalar_path = large_scalar["result"]["artifacts"][0].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(scalar_path).unwrap(),
+        format!("{}n", "9".repeat(5000))
+    );
+    let error = cli.invoke(
+        &["eval", "throw new Error('typed-eval-marker')"],
+        None,
+        false,
+    );
+    assert_eq!(error["error"]["code"], "operation_failed");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("typed-eval-marker"));
+    let function = cli.invoke(&["eval", "() => 42"], None, false);
+    assert!(function["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("function object"));
+}
+
+#[test]
+fn eval_errors_are_concise_with_full_exception_context() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    cli.ok(&[
+        "open",
+        "data:text/html,<title>Evaluation error diagnostics</title>",
+    ]);
+    for (expression, marker) in [
+        (
+            "throw new TypeError('evaluation-marker')",
+            "TypeError: evaluation-marker",
+        ),
+        ("const = syntax-marker", "SyntaxError"),
+        ("throw 'primitive-marker'", "primitive-marker"),
+        ("throw null", "null"),
+        ("throw undefined", "undefined"),
+        ("throw 42", "42"),
+        ("throw false", "false"),
+        ("throw 123n", "123n"),
+        ("throw NaN", "NaN"),
+        (
+            "Promise.reject(new Error('promise-marker'))",
+            "Error: promise-marker",
+        ),
+        (
+            "throw new Error('line-one\\nline-two')",
+            "Error: line-one line-two",
+        ),
+    ] {
+        let response = cli.invoke(&["eval", expression], None, false);
+        assert_eq!(response["error"]["code"], "operation_failed");
+        let summary = response["error"]["message"].as_str().unwrap();
+        assert!(summary.contains(marker), "{expression}: {summary}");
+        assert!(!summary.contains('\n'), "{summary}");
+        assert!(!summary.contains("ExceptionDetails"), "{summary}");
+        assert!(summary.contains("<eval>:"), "{summary}");
+        assert!(summary.len() < 500, "{summary}");
+        assert!(response["error"]["details"]["exceptionId"].is_number());
+        assert!(response["error"]["details"]["exception"].is_object());
+        assert_eq!(response["error"]["artifacts"], json!([]));
+    }
+    let expression = "throw new Error('界'.repeat(3000) + '\\nfull-tail-marker')";
+    let response = cli.invoke(&["eval", expression], None, false);
+    let summary = response["error"]["message"].as_str().unwrap();
+    assert!(summary.len() < 500);
+    assert!(summary.contains('…'));
+    let description = response["error"]["details"]["exception"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains(&"界".repeat(3000)));
+    assert!(description.contains("full-tail-marker"));
+    assert!(response["error"]["details"]["stackTrace"]["callFrames"].is_array());
+    let located = cli.invoke(
+        &[
+            "eval",
+            "throw new Error('located-marker')\n//# sourceURL=phoenix-browser-example.js",
+        ],
+        None,
+        false,
+    );
+    assert!(located["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("phoenix-browser-example.js:1:"));
+    let human = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"))
+        .env("PHOENIX_BROWSER_RUNTIME_DIR", cli.directory.path())
+        .args([
+            "--session",
+            "integration",
+            "eval",
+            "throw new Error('human-marker')",
+        ])
+        .output()
+        .unwrap();
+    assert!(!human.status.success());
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("Error: human-marker"));
+    assert!(stderr.contains("<eval>:"));
+    assert!(!stderr.contains("ExceptionDetails"));
+    assert_eq!(cli.eval("2 + 2"), 4);
+}
+
+#[test]
+fn screenshot_output_paths_are_validated_before_session_access() {
+    let cli = BrowserCli::new();
+    for arguments in [
+        vec!["screenshot", "--output", ""],
+        vec!["screenshot", "--input", r#"{"path":""}"#],
+        vec!["screenshot", "--input", r#"{"path":"/tmp/bad\u0000.png"}"#],
+        vec!["screenshot", "--input", r#"{"path":12}"#],
+        vec!["eval", "42", "--output", "unexpected.png"],
+        vec!["profile", "cpu_summary", "--output", "unexpected.png"],
+    ] {
+        let response = cli.invoke(&arguments, None, false);
+        assert_eq!(response["error"]["code"], "invalid_input");
+        assert!(response["lifetime"].is_null());
+        assert!(response["browser_lifetime"].is_null());
+        assert_eq!(std::fs::read_dir(cli.directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn screenshots_save_to_requested_paths_and_reuse_the_saved_artifact() {
+    if !chrome_enabled() {
+        return;
+    }
+    let cli = BrowserCli::new();
+    cli.ok(&[
+        "open",
+        "data:text/html,<title>Screenshot output</title><body style='background:red'>",
+    ]);
+    let absolute = cli.directory.path().join("chosen screenshot.png");
+    let screenshot = cli.ok(&["screenshot", "--output", absolute.to_str().unwrap()]);
+    assert_eq!(screenshot["result"]["artifacts"], json!([absolute]));
+    assert!(screenshot["result"]["text"]
+        .as_str()
+        .unwrap()
+        .contains(absolute.to_str().unwrap()));
+    let first = std::fs::read(&absolute).unwrap();
+    assert!(first.starts_with(b"\x89PNG\r\n\x1a\n"));
+    cli.ok(&["resize", "640", "480"]);
+    cli.eval("document.body.style.background='blue'; true");
+    let overwritten = cli.ok(&["screenshot", "--output", absolute.to_str().unwrap()]);
+    assert_eq!(overwritten["result"]["artifacts"], json!([absolute]));
+    let second = std::fs::read(&absolute).unwrap();
+    assert_ne!(first, second);
+    assert!(second.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(u32::from_be_bytes(second[16..20].try_into().unwrap()), 640);
+    assert_eq!(u32::from_be_bytes(second[20..24].try_into().unwrap()), 480);
+    let caller = cli.directory.path().join("another caller");
+    std::fs::create_dir(&caller).unwrap();
+    let output = cli
+        .command()
+        .current_dir(&caller)
+        .args(["screenshot", "--output", "relative screenshot.png"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let relative: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let expected = caller
+        .canonicalize()
+        .unwrap()
+        .join("relative screenshot.png");
+    assert_eq!(relative["result"]["artifacts"], json!([expected]));
+    assert_eq!(std::fs::read(expected).unwrap(), second);
+    let missing = caller.join("missing/failed.png");
+    let failed = cli.invoke(
+        &["screenshot", "--output", missing.to_str().unwrap()],
+        None,
+        false,
+    );
+    assert_eq!(failed["error"]["code"], "operation_failed");
+    assert!(failed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to save screenshot"));
+    assert!(!missing.exists());
+    let directory = cli.invoke(
+        &["screenshot", "--output", caller.to_str().unwrap()],
+        None,
+        false,
+    );
+    assert_eq!(directory["error"]["code"], "operation_failed");
+    let symlink = caller.join("linked.png");
+    std::os::unix::fs::symlink(&absolute, &symlink).unwrap();
+    let rejected = cli.invoke(
+        &["screenshot", "--output", symlink.to_str().unwrap()],
+        None,
+        false,
+    );
+    assert_eq!(rejected["error"]["code"], "operation_failed");
+    assert_eq!(std::fs::read(&absolute).unwrap(), second);
+    let default = cli.ok(&["screenshot"]);
+    let default_path = default["result"]["artifacts"][0].as_str().unwrap();
+    assert!(std::fs::read(default_path)
+        .unwrap()
+        .starts_with(b"\x89PNG\r\n\x1a\n"));
+    let human = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"))
+        .env("PHOENIX_BROWSER_RUNTIME_DIR", cli.directory.path())
+        .args([
+            "--session",
+            "integration",
+            "screenshot",
+            "--output",
+            absolute.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(String::from_utf8(human.stdout)
+        .unwrap()
+        .contains(absolute.to_str().unwrap()));
+}
+
+fn serve_reload_fixture(listener: &TcpListener, stop: &AtomicBool, requests: &AtomicUsize) {
+    std::thread::scope(|connections| {
+        while !stop.load(Ordering::Acquire) {
+            let (mut stream, _) = listener.accept().unwrap();
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let requests = &requests;
+            connections.spawn(move || {
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                match reader.read_line(&mut request) {
+                    Ok(0) => return,
+                    Ok(_) => {},
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return,
+                    Err(error) => panic!("reload fixture request: {error}"),
+                }
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" { break; }
+                }
+                let page = request.starts_with("GET /reload ");
+                let body = if page {
+                    let version = requests.fetch_add(1, Ordering::Relaxed) + 1;
+                    format!("<!doctype html><title>Reload {version}</title><button>Generation {version}</button><script>window.version={version};window.transient='fresh';console.error('reload-marker-{version}');</script>")
+                } else { String::new() };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                });
+        }
+    });
+}
+
+struct StopOnExit<'a> {
+    stop: &'a AtomicBool,
+    address: SocketAddr,
+}
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
+    }
+}
+
+#[test]
+fn repeated_open_reloads_the_document_and_retains_browser_session_state() {
+    if !chrome_enabled() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}/reload");
+    let stop = AtomicBool::new(false);
+    let requests = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let _stop = StopOnExit {
+            stop: &stop,
+            address,
+        };
+        scope.spawn(|| serve_reload_fixture(&listener, &stop, &requests));
+        let cli = BrowserCli::new();
+        let first = cli.ok(&["open", &url]);
+        assert_eq!(first["result"]["title"], "Reload 1");
+        let old_ref = reference(
+            first["result"]["snapshot"]["result"]["text"]
+                .as_str()
+                .unwrap(),
+            "Generation 1",
+        );
+        cli.eval("window.transient='changed';document.cookie='retained=yes; path=/';localStorage.setItem('retained','yes');true");
+        let second = cli.ok(&["open", &url]);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(second["lifetime"], first["lifetime"]);
+        assert_eq!(second["browser_lifetime"], first["browser_lifetime"]);
+        assert_eq!(second["result"]["title"], "Reload 2");
+        assert_eq!(second["result"]["snapshot"]["status"], "success");
+        let fresh = reference(
+            second["result"]["snapshot"]["result"]["text"]
+                .as_str()
+                .unwrap(),
+            "Generation 2",
+        );
+        assert_ne!(old_ref, fresh);
+        let stale = cli.invoke(&["click", &old_ref], None, false);
+        assert!(stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot"));
+        assert_eq!(cli.eval("({version:window.version, transient:window.transient, cookie:document.cookie, storage:localStorage.getItem('retained')})"), json!({"version":2,"transient":"fresh","cookie":"retained=yes","storage":"yes"}));
+        let errors = second["result"]["console_errors"].as_array().unwrap();
+        assert!(errors
+            .iter()
+            .any(|error| error["text"].as_str().unwrap().contains("reload-marker-2")));
+        assert!(!errors
+            .iter()
+            .any(|error| error["text"].as_str().unwrap().contains("reload-marker-1")));
+        cli.eval("window.transient='hash-retained';true");
+        let hash = cli.ok(&["open", &format!("{url}#section")]);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(hash["browser_lifetime"], first["browser_lifetime"]);
+        assert_eq!(cli.eval("window.transient"), "hash-retained");
+        assert!(hash["result"]["console_errors"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let same_hash = cli.ok(&["open", &format!("{url}#section")]);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            3,
+            "same fragment URL must reload if we promise repeated-open reload"
+        );
+        assert_eq!(same_hash["result"]["title"], "Reload 3");
+        assert_eq!(same_hash["result"]["url"], format!("{url}#section"));
+        assert_eq!(cli.eval("window.transient"), "fresh");
+        cli.eval("window.transient='hash-removal-retained';true");
+        cli.ok(&["open", &url]);
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
+        assert_eq!(cli.eval("window.transient"), "fresh");
+        let invalid = cli.invoke(&["open", "http://[invalid"], None, false);
+        assert_eq!(invalid["error"]["code"], "operation_failed");
+        assert_eq!(cli.eval("window.transient"), "fresh");
+        for document_url in [
+            "about:blank",
+            "data:text/html,<title>Same data URL</title><button>Data button</button>",
+        ] {
+            cli.ok(&["open", document_url]);
+            cli.eval("window.transient='must-be-replaced';true");
+            cli.ok(&["open", document_url]);
+            assert_eq!(cli.eval("typeof window.transient"), "undefined");
+        }
+        cli.ok(&["close"]);
+    });
+}
+
+#[test]
+fn reload_reports_server_failure_and_keeps_the_session_usable() {
+    if !chrome_enabled() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}/reload");
+    let stop = AtomicBool::new(false);
+    let requests = AtomicUsize::new(0);
+    let cli = BrowserCli::new();
+    let first = std::thread::scope(|scope| {
+        let stop = &stop;
+        let requests = &requests;
+        scope.spawn(move || serve_reload_fixture(&listener, stop, requests));
+        let _stop = StopOnExit { stop, address };
+        cli.ok(&["open", &url])
+    });
+    let failed = cli.invoke(&["open", &url], None, false);
+    assert_eq!(failed["error"]["code"], "operation_failed");
+    assert!(failed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to load"));
+    assert_eq!(failed["browser_lifetime"], first["browser_lifetime"]);
+    let recovered = cli.ok(&["open", "about:blank"]);
+    assert_eq!(recovered["browser_lifetime"], first["browser_lifetime"]);
 }
 
 fn live_resources(cli: &BrowserCli) -> (PathBuf, ProcessIdentity) {
@@ -568,9 +1028,17 @@ fn help_is_an_option_only_at_the_command_help_position() {
         vec!["snapshot", "--help"],
         vec!["snapshot", "--help", "--json"],
     ] {
-        let output = cli.command().args(arguments).output().unwrap();
+        let output = cli
+            .command()
+            .current_dir(cli.directory.path())
+            .args(arguments)
+            .output()
+            .unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: phoenix-browser"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(
+            "https://github.com/scottopell/phoenix-ide/blob/main/docs/phoenix-browser.md"
+        ));
     }
     for payload in ["--help", "-h"] {
         let response = cli.invoke(&["type", "#name", payload], None, false);

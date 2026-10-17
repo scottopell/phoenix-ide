@@ -14,6 +14,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn screenshot_path_preflight_rejects_invalid_destinations_without_a_browser() {
+    for path in ["", "relative.png", "/tmp/invalid\0.png"] {
+        let error = super::BrowserOperation::TakeScreenshot
+            .validate_input(json!({"path":path}))
+            .await
+            .expect_err("invalid output path");
+        assert!(error.output().contains("nonempty absolute path"));
+    }
+    assert!(super::BrowserOperation::TakeScreenshot
+        .validate_input(json!({"path":"/missing-parent/output.png"}))
+        .await
+        .is_ok());
+}
+
 fn scope(id: &str) -> phoenix_core::work_scope::ResourceScopeKey {
     phoenix_core::work_scope::ResourceScopeKey::Work(
         phoenix_core::work_scope::WorkScopeId::parse(id).unwrap(),
@@ -329,6 +344,22 @@ async fn test_browser_eval_local() {
         "Arithmetic wrong: {}",
         result.output()
     );
+
+    for (expression, rendered) in [
+        ("null", "null"),
+        ("undefined", "undefined"),
+        ("123n", "123n"),
+    ] {
+        let result = eval_tool
+            .run(json!({"expression":expression}), ctx.clone())
+            .await;
+        assert!(result.is_success(), "{expression}: {}", result.output());
+        assert_eq!(
+            result.output(),
+            format!("<javascript_result>{rendered}</javascript_result>")
+        );
+        assert!(result.display_data().is_none());
+    }
 
     let resize = BrowserResizeTool
         .run(json!({"width": 1024, "height": 768}), ctx.clone())
@@ -814,6 +845,26 @@ async fn test_browser_screenshot_local() {
         result.images()[0].data
     );
     tokio::fs::remove_file(path).await.unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let chosen = directory.path().join("chosen screenshot.png");
+    let result = screenshot_tool
+        .run(json!({"path":chosen}), ctx.clone())
+        .await;
+    assert!(result.is_success(), "{}", result.output());
+    assert_eq!(
+        result.display_data().unwrap()["artifact_path"],
+        json!(chosen)
+    );
+    assert_eq!(result.images().len(), 1);
+    assert_eq!(
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &result.images()[0].data
+        )
+        .unwrap(),
+        tokio::fs::read(&chosen).await.unwrap()
+    );
 
     shutdown_test(manager, server).await;
 }
