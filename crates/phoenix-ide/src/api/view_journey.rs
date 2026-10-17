@@ -694,16 +694,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing field {key}"));
             match (&attribute.value, expected_value) {
                 (opentelemetry::Value::String(actual), serde_json::Value::String(expected)) => {
-                    assert_eq!(actual.as_str(), expected.as_str())
+                    assert_eq!(actual.as_str(), expected.as_str());
                 }
                 (opentelemetry::Value::Bool(actual), serde_json::Value::Bool(expected)) => {
                     assert_eq!(actual, expected);
                 }
                 (opentelemetry::Value::I64(actual), serde_json::Value::Number(expected)) => {
-                    assert_eq!(Some(*actual), expected.as_i64())
+                    assert_eq!(Some(*actual), expected.as_i64());
                 }
                 (opentelemetry::Value::F64(actual), serde_json::Value::Number(expected)) => {
-                    assert_eq!(Some(*actual), expected.as_f64())
+                    assert_eq!(Some(*actual), expected.as_f64());
                 }
                 _ => panic!("wrong type {key}"),
             }
