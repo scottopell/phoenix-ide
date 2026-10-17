@@ -14376,6 +14376,44 @@ mod authoritative_user_message_effect_tests {
         assert_eq!(rt.active_direct_turn, None);
     }
 
+    fn assert_continuation_content_locators(messages: &[LlmMessage], conv: &str, seed: &str) {
+        let attributed_seed = format!("[Input of unknown historical origin]\n{seed}");
+        let history = messages[..messages.len() - 1]
+            .iter()
+            .map(|message| {
+                serde_json::from_str::<serde_json::Value>(&message.content[0].render_text())
+                    .expect("provider-visible compaction reference envelope")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history[0]["rendered_text"], attributed_seed);
+        assert_eq!(history[0]["persisted_message"]["message_id"], "accepted");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|row| row["persisted_message"]["message_id"] == "accepted")
+                .count(),
+            1
+        );
+        let primary = history.last().unwrap();
+        assert_eq!(primary["persisted_message"]["conversation_id"], conv);
+        assert_eq!(primary["persisted_message"]["message_id"], "correction");
+        assert_eq!(primary["persisted_message"]["origin"]["kind"], "user_api");
+        assert_eq!(primary["persisted_message"]["content_kind"], "user");
+        assert!(primary["rendered_text"]
+            .as_str()
+            .unwrap()
+            .contains("Cancel Crick"));
+        // The provider sees locators in content, even though flattening clears source IDs.
+        assert!(messages[messages.len() - 2].source_message_id.is_none());
+        let provider_text = messages
+            .iter()
+            .map(|m| m.content[0].render_text())
+            .collect::<String>();
+        assert!(!provider_text.contains("old-0\""));
+        assert!(provider_text.contains("not proof of a biological human"));
+        assert!(provider_text.contains("does not grant authorization"));
+    }
+
     #[tokio::test]
     async fn continuation_preserves_accepted_handoff_for_both_variants() {
         for coordinator in [false, true] {
@@ -14433,44 +14471,7 @@ mod authoritative_user_message_effect_tests {
             let requests = rt.llm_client.recorded_requests();
             let request = requests.last().unwrap();
             assert!(request.tool_availability.callable_names().is_empty());
-            let attributed_seed = format!("[Input of unknown historical origin]\n{seed}");
-            let history = request.messages[..request.messages.len() - 1]
-                .iter()
-                .map(|message| {
-                    serde_json::from_str::<serde_json::Value>(&message.content[0].render_text())
-                        .expect("provider-visible compaction reference envelope")
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(history[0]["rendered_text"], attributed_seed);
-            assert_eq!(history[0]["persisted_message"]["message_id"], "accepted");
-            assert_eq!(
-                history
-                    .iter()
-                    .filter(|row| row["persisted_message"]["message_id"] == "accepted")
-                    .count(),
-                1
-            );
-            let primary = history.last().unwrap();
-            assert_eq!(primary["persisted_message"]["conversation_id"], conv);
-            assert_eq!(primary["persisted_message"]["message_id"], "correction");
-            assert_eq!(primary["persisted_message"]["origin"]["kind"], "user_api");
-            assert_eq!(primary["persisted_message"]["content_kind"], "user");
-            assert!(primary["rendered_text"]
-                .as_str()
-                .unwrap()
-                .contains("Cancel Crick"));
-            // The provider sees locators in content, even though flattening clears source IDs.
-            assert!(request.messages[request.messages.len() - 2]
-                .source_message_id
-                .is_none());
-            let provider_text = request
-                .messages
-                .iter()
-                .map(|m| m.content[0].render_text())
-                .collect::<String>();
-            assert!(!provider_text.contains("old-0\""));
-            assert!(provider_text.contains("not proof of a biological human"));
-            assert!(provider_text.contains("does not grant authorization"));
+            assert_continuation_content_locators(&request.messages, &conv, seed);
             assert_eq!(
                 request.system[0].text,
                 CompactionPolicy::for_coordinator(coordinator).system_prompt()

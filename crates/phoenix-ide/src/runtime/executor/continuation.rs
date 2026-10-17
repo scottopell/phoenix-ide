@@ -366,17 +366,18 @@ mod tests {
         assert!(envelope(&unknown[0])["persisted_message"].is_null());
 
         let source = persisted("accepted", "full protected seed");
-        let plain = render_messages([&source], &std::collections::HashSet::new())
+        let unwrapped_seed = render_messages([&source], &std::collections::HashSet::new())
             .pop()
             .unwrap();
-        let window = 5_000 + estimate_message_tokens(&plain) + CONTINUATION_MIN_HEADROOM_TOKENS;
-        assert!(plan_with_handoff(vec![], Some(plain), window, 5_000, None).is_ok());
-        let protected = ContinuationHistory::from_projection(&[source], Some("accepted"))
+        let window =
+            5_000 + estimate_message_tokens(&unwrapped_seed) + CONTINUATION_MIN_HEADROOM_TOKENS;
+        assert!(plan_with_handoff(vec![], Some(unwrapped_seed), window, 5_000, None).is_ok());
+        let accepted_seed = ContinuationHistory::from_projection(&[source], Some("accepted"))
             .unwrap()
             .handoff
             .unwrap()
             .message;
-        assert!(plan_with_handoff(vec![], Some(protected), window, 5_000, None).is_err());
+        assert!(plan_with_handoff(vec![], Some(accepted_seed), window, 5_000, None).is_err());
     }
 
     #[test]
