@@ -12,6 +12,9 @@ run_exact() {
   grep -F 'test result: ok. 1 passed; 0 failed;' "$CHROME_QUALIFICATION_OUTPUT/${name##*::}.log"
 }
 run_exact process_group::native::tests::group_query_decoder_distinguishes_empty_error_and_truncation -p phoenix-browser --lib
+run_exact process_group::native::tests::linux_scan_skips_only_kernel_proven_nonmembers_without_reading_stat -p phoenix-browser --lib
+run_exact process_group::native::tests::linux_scan_reclassifies_missing_candidate_stat_without_assuming_exit -p phoenix-browser --lib
+run_exact process_group::native::tests::linux_scan_requires_readable_candidate_state_and_rechecks_stat_group -p phoenix-browser --lib
 if [[ "$(uname -s)" == Darwin ]]; then
   run_exact process_group::native::tests::owned_empty_group_query_contract_before_and_after_root_reap -p phoenix-browser --lib
 fi
