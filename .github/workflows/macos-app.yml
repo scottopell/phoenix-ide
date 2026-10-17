@@ -175,54 +175,18 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
           pnpm run build
-      - name: Test immutable first-unit projection contract and owning suite
+      - name: Admit exact causal source and preserved runtime qualification
         run: |
           set -o pipefail
-          git diff --exit-code db89824ad0de93c6c933bf7821e1d204458f7896 HEAD -- crates ui dev.py docs specs tests
+          git diff --exit-code c21b87e7e7a5cf4bd95072aad5f149993b2f2f01 HEAD -- crates ui dev.py docs specs tests
           mkdir -p "$RUNNER_TEMP/observation-qualification"
-          cargo test -p phoenix_ide --lib api::product_conversations::tests::db_history_projections_preserve_pending_openings_boundaries_and_null_presentations -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/projection-contract.log"
-          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/projection-contract.log"
-          cargo test -p phoenix_ide --lib api::product_conversations::tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/projection-owning.log"
-          grep -F 'test result: ok.' "$RUNNER_TEMP/projection-owning.log"
-          if grep -F 'test result: ok. 0 passed;' "$RUNNER_TEMP/projection-owning.log"; then exit 1; fi
-      - name: Qualify reusable observation authority, normal auth, startup and CLI
-        run: |
-          set -o pipefail
-          for filter in api::application_state::tests api::auth::tests; do
-            name="$(echo "$filter" | tr ':' '_')"
-            cargo test -p phoenix_ide --lib "$filter" -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/observation-qualification/$name.log"
-            grep -F 'test result: ok.' "$RUNNER_TEMP/observation-qualification/$name.log"
-            if grep -F 'test result: ok. 0 passed;' "$RUNNER_TEMP/observation-qualification/$name.log"; then exit 1; fi
-          done
-          cargo test -p phoenix_ide --bin phoenix_ide -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/observation-qualification/cli.log"
-          grep -F 'test result: ok.' "$RUNNER_TEMP/observation-qualification/cli.log"
-          if grep -F 'test result: ok. 0 passed;' "$RUNNER_TEMP/observation-qualification/cli.log"; then exit 1; fi
-          cargo test -p phoenix_ide --test observation_startup -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/observation-qualification/startup.log"
-          grep -F 'test result: ok.' "$RUNNER_TEMP/observation-qualification/startup.log"
-          if grep -F 'test result: ok. 0 passed;' "$RUNNER_TEMP/observation-qualification/startup.log"; then exit 1; fi
-      - name: Generate actual Rust-authored capability contracts
-        run: |
-          set -o pipefail
-          cargo test -p phoenix_ide --lib export_bindings -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/observation-qualification/codegen.log"
-          grep -F 'test result: ok.' "$RUNNER_TEMP/observation-qualification/codegen.log"
-          if grep -F 'test result: ok. 0 passed;' "$RUNNER_TEMP/observation-qualification/codegen.log"; then exit 1; fi
-          mkdir -p "$RUNNER_TEMP/observation-qualification/generated"
-          for file in ApplicationCapabilities CapabilityAvailability ObservationTargetResponse CoordinatorObservationTarget; do
-            test -s "ui/src/generated/$file.ts"
-            cp "ui/src/generated/$file.ts" "$RUNNER_TEMP/observation-qualification/generated/"
-          done
-      - name: Check current UI ownership and generated contracts
+          printf '%s\n' 'Scoped successor to39045775405: runtime contracts, codegen136, UI and binary passed there; only unused db accessor failed Clippy.' 'This run checks accessor removal plus exact generated-type consumers; no new binary or fixture/export qualification is claimed.' > "$RUNNER_TEMP/observation-qualification/scope.txt"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/observation-qualification/source.txt"
+      - name: Check actual generated type consumers
         working-directory: ui
         run: |
           pnpm exec tsc -b --noEmit
-          pnpm exec vitest run src/pages/PersistedObservation.test.tsx src/pages/ProductConversationPage.test.tsx src/pages/CoordinatorPage.test.tsx src/App.markdownNavigation.test.tsx --maxWorkers=1
-      - name: Build existing executable, never fixture data
-        run: |
-          cargo build -p phoenix_ide --bin phoenix_ide
-          mkdir -p "$RUNNER_TEMP/observation-qualification/bin"
-          cp target/debug/phoenix_ide "$RUNNER_TEMP/observation-qualification/bin/"
-          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/observation-qualification/source.txt"
-          shasum -a 256 "$RUNNER_TEMP/observation-qualification/bin/phoenix_ide" > "$RUNNER_TEMP/observation-qualification/binary-sha256.txt"
+          pnpm exec vitest run src/pages/PersistedObservation.test.tsx --maxWorkers=1
       - name: Check projection lib and tests with Clippy
         run: cargo clippy -p phoenix_ide --lib --tests -- -D warnings
       - name: Retain source-only qualification logs, never fixture data
