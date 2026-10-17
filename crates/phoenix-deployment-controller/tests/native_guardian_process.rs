@@ -374,7 +374,6 @@ fn start_child_list_fixture() -> ChildListProcessFixture {
         ProcessId::new(NonZeroU32::new(child_pid).unwrap()),
         BirthToken::new(birth[0].parse().unwrap(), birth[1].parse().unwrap()).unwrap(),
     );
-    wait_for_process_name(i32::try_from(child_pid).unwrap(), "sleep");
     ChildListProcessFixture {
         _parent: parent,
         dir,
@@ -477,6 +476,7 @@ fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
         ]
     );
     assert_eq!(sampling_rows(&path).0, 1);
+    wait_for_process_name(i32::try_from(root.pid().get()).unwrap(), "sleep");
     let initial_detached = wait_for_detached(&dir);
     assert!(initial_detached.retained.is_empty());
 
@@ -557,6 +557,7 @@ fn child_list_ack_recovery_does_not_reenumerate_or_reapply_after_runner_crash() 
         String::from_utf8_lossy(&initial.stderr)
     );
     assert_eq!(sampling_rows(&path).0, 1);
+    wait_for_process_name(i32::try_from(root.pid().get()).unwrap(), "sleep");
     let initial_detached = wait_for_detached(&dir);
     assert!(initial_detached.retained.is_empty());
 
