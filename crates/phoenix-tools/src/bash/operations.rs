@@ -628,25 +628,22 @@ async fn run_run_with_identity_probe(
         let ctx = &ctx;
         match launched {
             Ok((handle, spawned)) => {
-                let inserted = match tokio::time::timeout(
+                let Ok(Ok(inserted)) = tokio::time::timeout(
                     REGISTRATION_TIMEOUT,
                     registry.commit_spawn(&mut reservation, handle.clone()),
                 )
                 .await
-                {
-                    Ok(Ok(inserted)) => inserted,
-                    _ => {
-                        return settle_unregistered_run(
-                            spawned,
-                            reservation,
-                            cmd,
-                            label,
-                            ring_bytes_cap,
-                            &read_args,
-                            BashLaunchError::RegistrationFailed,
-                        )
-                        .await;
-                    }
+                else {
+                    return settle_unregistered_run(
+                        spawned,
+                        reservation,
+                        cmd,
+                        label,
+                        ring_bytes_cap,
+                        &read_args,
+                        BashLaunchError::RegistrationFailed,
+                    )
+                    .await;
                 };
                 // Spawn edge: a new bash handle exists for this scope. Emit a
                 // work-scope state-transition signal (REQ-WSUI-007). The
@@ -687,7 +684,7 @@ async fn run_run_with_identity_probe(
             }
             Err(SpawnChildError::Unregistered(child)) => {
                 settle_unregistered_run(
-                    child,
+                    *child,
                     reservation,
                     cmd,
                     label,
@@ -721,7 +718,7 @@ async fn run_run_with_identity_probe(
 #[derive(Debug)]
 enum SpawnChildError {
     NotSpawned(String),
-    Unregistered(UnregisteredChild),
+    Unregistered(Box<UnregisteredChild>),
 }
 
 impl From<String> for SpawnChildError {
@@ -889,16 +886,16 @@ fn settle_unregistered_run(
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 window: window_to_typed(&read.view, read.partial),
             },
-            cause,
+            cause.as_ref(),
         )
     }
 }
 
-fn unregistered_tool_output(run: BashUnregisteredRun, cause: Option<FinalCause>) -> ToolOutput {
+fn unregistered_tool_output(run: BashUnregisteredRun, cause: Option<&FinalCause>) -> ToolOutput {
     let is_error = cause.is_none();
     let response = match cause {
-        Some(FinalCause::Exited { exit_code }) => BashResponse::UnregisteredExited(BashUnregisteredTerminalPayload { run, exit_code, signal_number: None }),
-        Some(FinalCause::Killed { exit_code, signal_number }) => BashResponse::UnregisteredKilled(BashUnregisteredTerminalPayload { run, exit_code, signal_number }),
+        Some(FinalCause::Exited { exit_code }) => BashResponse::UnregisteredExited(BashUnregisteredTerminalPayload { run, exit_code: *exit_code, signal_number: None }),
+        Some(FinalCause::Killed { exit_code, signal_number }) => BashResponse::UnregisteredKilled(BashUnregisteredTerminalPayload { run, exit_code: *exit_code, signal_number: *signal_number }),
         None => BashResponse::OutcomeUnknown(BashUnregisteredUnknownPayload {
             run,
             error: "launch_outcome_unknown".to_string(),
@@ -1084,11 +1081,11 @@ fn spawn_child_with_identity_probe(
         .id()
         .and_then(|pid| probe(pid).map(|identity| (pid, identity)))
     else {
-        return Err(SpawnChildError::Unregistered(UnregisteredChild {
+        return Err(SpawnChildError::Unregistered(Box::new(UnregisteredChild {
             child,
             sandbox_scratch_dir,
             started_at,
-        }));
+        })));
     };
     let launch_identity = BashLaunchIdentity {
         process,
@@ -2330,14 +2327,14 @@ mod tests {
             &BashSpawnMode::Direct,
             probe,
         ) {
-            Err(SpawnChildError::Unregistered(child)) => child,
+            Err(SpawnChildError::Unregistered(child)) => *child,
             Err(SpawnChildError::NotSpawned(error)) => panic!("OS spawn failed: {error}"),
             Ok(_) => panic!("an unverified child must not get a handle"),
         }
     }
 
     #[cfg(unix)]
-    fn response_json(output: ToolOutput) -> Value {
+    fn response_json(output: &ToolOutput) -> Value {
         serde_json::from_str(output.output()).expect("response JSON")
     }
 
@@ -2416,7 +2413,7 @@ mod tests {
             },
             None,
         );
-        let response = response_json(output);
+        let response = response_json(&output);
         assert_eq!(response["status"], "outcome_unknown");
         assert!(
             response["error_message"]
@@ -2504,7 +2501,7 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        let response = response_json(settlement.await.unwrap());
+        let response = response_json(&settlement.await.unwrap());
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 4);
         assert_eq!(response["lines"][0]["bytes"], "late-tail");
@@ -2521,7 +2518,7 @@ mod tests {
         let registry = ctx.bash_handle_registry();
         let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
         let response = response_json(
-            settle_unregistered_run(
+            &settle_unregistered_run(
                 child,
                 reservation,
                 cmd,
@@ -2572,7 +2569,7 @@ mod tests {
         let registry = ctx.bash_handle_registry();
         let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
         let response = response_json(
-            settle_unregistered_run(
+            &settle_unregistered_run(
                 child,
                 reservation,
                 "success",
@@ -2617,7 +2614,7 @@ mod tests {
             .await
             .unwrap();
         let response = response_json(
-            settle_unregistered_run(
+            &settle_unregistered_run(
                 child,
                 reservation,
                 "printf tail; exit 7",
@@ -2646,7 +2643,7 @@ mod tests {
         let registry = ctx.bash_handle_registry();
         let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
         let response = response_json(
-            settle_unregistered_run(
+            &settle_unregistered_run(
                 child,
                 reservation,
                 cmd,
@@ -2707,7 +2704,7 @@ mod tests {
         )
         .await
         .expect("descendant held settlement open");
-        let response = response_json(response);
+        let response = response_json(&response);
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 19);
         assert_eq!(response["output_complete"], false);
@@ -2751,7 +2748,7 @@ mod tests {
         let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
         std::fs::write(dir.path().join("release"), "").unwrap();
         let response = response_json(
-            settle_unregistered_run(
+            &settle_unregistered_run(
                 UnregisteredChild {
                     child,
                     sandbox_scratch_dir,
@@ -2831,7 +2828,7 @@ mod tests {
             .await
             .unwrap();
         let response = response_json(
-            settle_unregistered_run(
+            &settle_unregistered_run(
                 child,
                 reservation,
                 "cached",

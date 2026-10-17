@@ -1135,6 +1135,7 @@ pub struct CascadeBashReport {
 }
 
 impl CascadeBashReport {
+    #[must_use]
     pub fn has_failures(&self) -> bool {
         self.scope_uncertainty.is_some() || !self.kill_failures.is_empty()
     }
