@@ -1,4 +1,4 @@
-# ADR-117: Departing-document delivery uses collector acceptance and export evidence
+# ADR-122: Departing-document delivery uses collector acceptance and export evidence
 
 - **Status:** Accepted
 - **Date:** 2026-10-16

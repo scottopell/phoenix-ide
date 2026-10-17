@@ -32,7 +32,8 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     try { sourceCallTarget = { messageId: decodeURIComponent(location.hash.slice(9)), toolUseId: sourceToolId }; } catch { /* Invalid external locator is not a navigation target. */ }
   }
   const listRef = useRef<MessageListHandle>(null);
-  const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [publishedChapters, setChapters] = useState<Chapter[] | null>(null);
+  const chapters = publishedChapters ?? [];
   const [activeUnitIndex, setActiveUnitIndex] = useState<number | null>(null);
 
   // Keep the latest chapters for the range callback without re-binding it.
@@ -41,8 +42,7 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
 
   const handleChaptersChange = useCallback((next: Chapter[]) => {
     setChapters(next);
-    onViewChaptersReady?.(next.length);
-  }, [onViewChaptersReady]);
+  }, []);
 
   const handleVisibleRangeChange = useCallback((range: VirtualTranscriptRange) => {
     const next = resolveActiveUnitIndex(chaptersRef.current, range);
@@ -81,6 +81,7 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
         activeUnitIndex={activeUnitIndex}
         onJump={handleJump}
         historyBoundaries={historyBoundaries}
+        onChaptersReady={publishedChapters === null ? undefined : onViewChaptersReady}
         onJumpBoundary={(messageId) => {
           const loaded = chapters.find((chapter) => chapter.kind === 'boundary' && chapter.messageId === messageId);
           const transcriptId = loaded?.kind === 'boundary' ? loaded.transcriptId : historyBoundaries?.find((candidate) => candidate.message_id === messageId)?.predecessor_transcript_row_id;

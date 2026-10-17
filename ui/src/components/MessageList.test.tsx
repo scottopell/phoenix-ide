@@ -1186,6 +1186,31 @@ describe('MessageList', () => {
 });
 
 describe('history scroll acknowledgement + continuity suppression', () => {
+  it.each(['nonexistent', 'other-member', 'user-message', 'thinking-aside'])('finishes an exact source-tool jump as missing for %s instead of waiting for nonexistent geometry', kind => {
+    const first = { ...makeMessage(1, kind === 'user-message' ? 'user' : 'agent'), content: [{ type: 'tool_use', id: 'own-tool', name: kind === 'thinking-aside' ? 'think' : 'read_file', input: {} }] } as Message;
+    const second = { ...makeMessage(2, 'agent'), content: [{ type: 'tool_use', id: 'other-tool', name: 'search', input: {} }] } as Message;
+    const command = makeJumpToMessageCommand({ targetMessageId: first.message_id });
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[first, second]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      sourceCallTarget={{ messageId: first.message_id, toolUseId: kind === 'other-member' ? 'other-tool' : kind === 'user-message' || kind === 'thinking-aside' ? 'own-tool' : 'gone' }}
+      transcriptPositioning={{ kind: 'positioning', command }} onHistoryScrollCommandHandled={handled} />));
+    expect(handled.mock.calls).toEqual([[{ commandKey: transcriptPositioningCommandKey(command), result: 'target_missing' }]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it('restores a valid reader anchor despite a stale source-tool refinement in the URL', () => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[makeMessage(1), makeMessage(2)]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      sourceCallTarget={{ messageId: 'msg-2', toolUseId: 'stale' }}
+      transcriptPositioning={transcriptPositioningForCommand(command)} onHistoryScrollCommandHandled={handled} />));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
+    expect(handled).not.toHaveBeenCalledWith(expect.objectContaining({ result: 'target_missing' }));
+  });
+
   it('reports the full owning key and truthful missing result when no render unit owns the target', () => {
     const command = makeJumpToMessageCommand({ targetMessageId: 'orphan-message' });
     const handled = vi.fn();
