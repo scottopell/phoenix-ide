@@ -422,16 +422,17 @@ fn assert_child_list_issue_parent(path: &Path, root: ProcessIdentity) {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let (pid, seconds, nanos): (i64, i64, i64) = db
+    let (pid, seconds, nanos): (Vec<u8>, Vec<u8>, Vec<u8>) = db
         .query_row(
             "SELECT parent_pid,parent_birth_seconds,parent_birth_nanos FROM native_child_list_issues",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(pid, i64::from(root.pid().get()));
-    assert_eq!(seconds, i64::try_from(root.birth().seconds()).unwrap());
-    assert_eq!(nanos, i64::from(root.birth().nanos()));
+    let word = |bytes: Vec<u8>| u64::from_be_bytes(bytes.try_into().unwrap());
+    assert_eq!(word(pid), u64::from(root.pid().get()));
+    assert_eq!(word(seconds), root.birth().seconds());
+    assert_eq!(word(nanos), u64::from(root.birth().nanos()));
 }
 
 fn assert_runner_output_ends_at(output: &str, marker: &str) {
