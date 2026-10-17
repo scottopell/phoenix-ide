@@ -254,6 +254,65 @@ jobs:
       - name: ./dev.py check (ui/specs)
         run: ./dev.py check --lanes tsc,ui-lint,vitest,ast-grep,allium,spec-shape,spec-anchors,pkglock
 
+  check-finalization-geometry:
+    name: check (assistant finalization geometry)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.ui == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Install fixture dependencies and browser
+        working-directory: ui
+        run: |
+          npm i -g corepack@latest
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+      - name: Qualify exact-source geometry and reader ownership
+        env:
+          LADLE_URL: http://127.0.0.1:61129
+          PHOENIX_LADLE: '1'
+        run: |
+          mkdir -p ui/qa-artifacts/assistant-finalization
+          git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt
+          server=''
+          stop_server() {
+            if [ -n "$server" ]; then kill -- -"$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; server=''; fi
+          }
+          start_server() {
+            setsid python3 -c 'import runpy,os; d=runpy.run_path("dev.py"); env=d["node_env"](); os.chdir("ui"); os.execvpe("node",["node","node_modules/@ladle/react/lib/cli/cli.js","serve","--host","127.0.0.1","--port","61129"],env)' >> ui/qa-artifacts/assistant-finalization/ladle.log 2>&1 &
+            server=$!
+            for attempt in $(seq 1 60); do
+              if curl -fsS "$LADLE_URL" >/dev/null; then return; fi
+              sleep 1
+            done
+            return 1
+          }
+          trap stop_server EXIT
+          sha256sum ui/src/index.css ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx > ui/qa-artifacts/assistant-finalization/source-files.sha256
+          start_server
+          cd ui
+          node scripts/capture-assistant-finalization.mjs
+          node scripts/capture-streaming-table.mjs
+          node scripts/capture-assistant-finalization-transcript.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: assistant-finalization-geometry-${{ github.sha }}
+          path: ui/qa-artifacts/
+
   check-fast:
     name: check (task validation)
     needs: plan_check

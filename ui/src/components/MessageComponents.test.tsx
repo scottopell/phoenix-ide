@@ -1320,7 +1320,7 @@ describe('message copy affordances', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Copy Phoenix message' })).toBeInTheDocument();
-    expect(container.querySelector('.message-mobile-copy-row')).toBeInTheDocument();
+    expect(container.querySelector('.assistant-message-toolbar--continuation')).toBeInTheDocument();
     expect(container.querySelector('.message-mobile-copy-floating')).not.toBeInTheDocument();
   });
 
