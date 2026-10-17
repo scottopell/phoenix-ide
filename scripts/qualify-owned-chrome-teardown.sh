@@ -11,6 +11,10 @@ run_exact() {
   cargo test "$@" "$name" -- --exact --nocapture --test-threads=1 2>&1 | tee "$CHROME_QUALIFICATION_OUTPUT/${name##*::}.log"
   grep -F 'test result: ok. 1 passed; 0 failed;' "$CHROME_QUALIFICATION_OUTPUT/${name##*::}.log"
 }
+run_exact process_group::native::tests::group_query_decoder_distinguishes_empty_error_and_truncation -p phoenix-browser --lib
+if [[ "$(uname -s)" == Darwin ]]; then
+  run_exact process_group::native::tests::owned_empty_group_query_contract_before_and_after_root_reap -p phoenix-browser --lib
+fi
 run_exact process_group::native::tests::pending_exit_authorizes_neither_signal_nor_completion -p phoenix-browser --lib
 run_exact process_group::native::tests::exited_root_drains_stderr_closed_writer_before_profile_removal -p phoenix-browser --lib
 run_exact process_group::native::tests::reaped_or_mismatched_root_cannot_authorize_old_group_signals -p phoenix-browser --lib

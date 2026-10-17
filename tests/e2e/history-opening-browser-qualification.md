@@ -3377,3 +3377,21 @@ that semicolon and awaits the same exact URL, with no timeout increase or
 production behavior change. Local focused2/owning18/tsc/eslint passed; the
 hosted UI failure did not reproduce locally, so no local red-to-green is claimed.
 One fresh exact-head whole Linux/macOS qualification is required.
+
+
+## Errno-safe Darwin enumeration successor on published deployment base
+
+Appa9c39df65b137371192d45494777c8ee48034a87/tree764641c10140ee029aad3df32d208d0b9cc4d9b9
+composes mainea5df4b473ebd62ee8edd59daad9e43a119e9630. Published deployment
+ADR115 remains byte-identical; unpublished geometry decision and references
+move to free120, preserving both decisions and all main deployment paths.
+The errno-safe query decoder follows pinned AppleXNU contract, distinguishes
+empty success/error/truncation and rechecks retained-root WNOWAIT exit before
+completion. Actual5bcf diagnostic zero/errno0 was POSTREAP ONLY, not proof of
+original35a10 failure cause; that failure's returned bytes remain unknown.
+06c751 exactmacOS native module7/0 and browser Clippy passed39051966895
+(artifact12107518333). New decoder exact guard runs on all platforms; owned
+empty-group contract exact guard runs onlyDarwin. No signal authority arises
+from post-reap enumeration, and escaped-writer limits remain explicit.
+Previous35a10 Linux all8jobsSUCCESS, but macOS native failed enumeration;
+those results do not qualify this successor. Fresh whole Linux/macOS required.
