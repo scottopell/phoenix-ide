@@ -11,10 +11,12 @@ export function geometry({id, source, route}) {
   const clip=sr?{top:Math.max(0,sr.top),bottom:Math.min(innerHeight,sr.bottom),left:Math.max(0,sr.left),right:Math.min(innerWidth,sr.right)}:null;
   const inspect=e=>{if(!e)return null;const b=rect(e),s=getComputedStyle(e);return {rect:b,edges:clip?{top:b.top-clip.top,bottom:clip.bottom-b.bottom,left:b.left-clip.left,right:clip.right-b.right}:null,
     clientRects:e.getClientRects().length,connected:e.isConnected,styles:Object.fromEntries(['display','visibility','overflowX','overflowY','contain','position','transform','boxSizing','borderTopWidth','borderBottomWidth','borderLeftWidth','borderRightWidth','paddingTop','paddingBottom','paddingLeft','paddingRight'].map(k=>[k,s[k]]))};};
+  const composers=[...document.querySelectorAll('textarea#message-input')];
+  const composer={count:composers.length,states:composers.slice(0,4).map(e=>({disabled:e.disabled,readOnly:e.readOnly,connected:e.isConnected,visible:e.getClientRects().length>0,rect:rect(e)}))};
   const ancestors=[];for(let e=child?.parentElement;e&&ancestors.length<8;e=e.parentElement)ancestors.push(inspect(e));
   return {viewport:{innerWidth,innerHeight,devicePixelRatio,visualViewport:visualViewport?{width:visualViewport.width,height:visualViewport.height,offsetTop:visualViewport.offsetTop,offsetLeft:visualViewport.offsetLeft,scale:visualViewport.scale}:null},
     document:rect(document.documentElement),scroller:inspect(scroller),scroll:scroller?Object.fromEntries(['clientTop','clientLeft','clientHeight','clientWidth','scrollTop','scrollLeft','scrollHeight','scrollWidth'].map(k=>[k,scroller[k]])):null,
-    clip,child:inspect(child),row:inspect(row),inner:inspect(row?.querySelector('.virtual-transcript-row')),header:inspect(document.querySelector('.virtual-transcript__header')),ancestors,
+    composer,clip,child:inspect(child),row:inspect(row),inner:inspect(row?.querySelector('.virtual-transcript-row')),header:inspect(document.querySelector('.virtual-transcript__header')),ancestors,
     identity:{physical_matches:matches.length,fixture_id_matches:!!child,alias_agrees:!child?.getAttribute('data-message-id')||child.getAttribute('data-message-id')===id,
       sourcepin_matches:new URL(location.href).searchParams.get('source_transcript')===source,original_route:location.pathname+location.search+location.hash===route}};
 }

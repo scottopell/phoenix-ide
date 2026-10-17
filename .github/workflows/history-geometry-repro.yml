@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: f542a268f795821e00a118cf348bf9584dd1d58d
+          ref: 302a3733e9013bb09beb1e83c92b29b616ab0706
           path: pinned-app
           fetch-depth: 1
           persist-credentials: false
@@ -37,16 +37,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir retained-artifact geometry-evidence
-          gh api repos/scottopell/phoenix-ide/actions/artifacts/12079698600 > geometry-evidence/github-artifact.json
+          gh api repos/scottopell/phoenix-ide/actions/artifacts/12082193993 > geometry-evidence/github-artifact.json
           python3 - <<'PYMETA'
           import json
           from pathlib import Path
           a=json.loads(Path('geometry-evidence/github-artifact.json').read_text())
-          assert a['id']==12079698600 and a['workflow_run']['id']==38978290925
-          assert a['name']=='opening-codegen-e7a03e028908719c610a18863a8aff6c7cd2f5e3-1'
-          assert a['size_in_bytes']==96431157 and a['expired'] is False
+          assert a['id']==12082193993 and a['workflow_run']['id']==38984649048
+          assert a['name']=='opening-codegen-b962ee2e23546dbe9618ff359924335014ff2def-1'
+          assert a['size_in_bytes']==96431697 and a['expired'] is False
           PYMETA
-          gh run download 38978290925 --repo scottopell/phoenix-ide --name opening-codegen-e7a03e028908719c610a18863a8aff6c7cd2f5e3-1 --dir retained-artifact
+          gh run download 38984649048 --repo scottopell/phoenix-ide --name opening-codegen-b962ee2e23546dbe9618ff359924335014ff2def-1 --dir retained-artifact
       - name: Frozen runtime dependencies only
         working-directory: pinned-app/ui
         run: |

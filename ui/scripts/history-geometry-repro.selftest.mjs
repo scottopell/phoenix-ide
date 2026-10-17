@@ -5,7 +5,7 @@ test('one physical observation preserves all four signed deltas without leaking 
  const scroller={...node(box(100,10,200,300)),clientHeight:200,clientWidth:300};
  const row={...node(box(99,9,20,302)),querySelector:()=>null};
  const child={...node(box(99,9,20,302)),id:'message-PRIVATE-ID',getAttribute:k=>k==='data-message-id'?'PRIVATE-ID':null,closest:()=>row,parentElement:row};
- const context={document:{querySelector:()=>scroller,querySelectorAll:()=>[child],documentElement:node(box(0,0,900,1360))},
+ const context={document:{querySelector:()=>scroller,querySelectorAll:selector=>selector==='textarea#message-input'?[]:[child],documentElement:node(box(0,0,900,1360))},
  innerWidth:1360,innerHeight:900,devicePixelRatio:1,visualViewport:null,getComputedStyle:()=>({display:'block',visibility:'visible'}),
  location:{href:'http://127.0.0.1/?source_transcript=PRIVATE-SOURCE',pathname:'/',search:'?source_transcript=PRIVATE-SOURCE',hash:''},URL};
  const result=runInNewContext(`(${geometry.toString()})`,context,{timeout:1000})({id:'PRIVATE-ID',source:'PRIVATE-SOURCE',route:'/?source_transcript=PRIVATE-SOURCE'});
