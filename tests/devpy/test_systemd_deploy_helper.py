@@ -32,6 +32,24 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class InstalledHealthUrlTests(unittest.TestCase):
+    def test_tls_modes_match_controller_and_runtime(self):
+        for value, scheme in (("1", "https"), ("true", "https"), ("on", "https"),
+                              ("auto", "https"), ("manual", "https"), (" TRUE ", "https"),
+                              ("none", "http"), ("disabled", "http"), ("off", "http"),
+                              ("false", "http"), ("0", "http"), ("", "http"),
+                              (" NONE ", "http"), ("unknown", "http")):
+            with self.subTest(value=value):
+                self.assertEqual(f"{scheme}://localhost:8031/api/version",
+                                 helper.installed_health_url({"PHOENIX_TLS": value}))
+        for paths, scheme in (({}, "http"), ({"PHOENIX_TLS_CERT_PATH": "/cert"}, "http"),
+                              ({"PHOENIX_TLS_KEY_PATH": "/key"}, "http"),
+                              ({"PHOENIX_TLS_CERT_PATH": "/cert", "PHOENIX_TLS_KEY_PATH": "/key"}, "https")):
+            with self.subTest(paths=paths):
+                self.assertEqual(f"{scheme}://localhost:8123/api/version",
+                                 helper.installed_health_url({"PHOENIX_TLS": "none", "PHOENIX_PORT": "8123", **paths}))
+
+
 class SystemdManifestValidationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1090,12 +1108,98 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         with mock.patch.object(helper.os, "geteuid", return_value=0), \
              mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
              mock.patch.object(helper, "Systemctl", return_value=ctl), \
+             mock.patch.object(helper, "SystemdUnitControl", return_value=ctl), \
              mock.patch.object(helper.sys, "argv", ["helper.py", "recover-current", "--manifest", str(self.manifest_path)]):
             self.assertEqual(1, helper.main())
         self.assertEqual("stop", ctl.events[0])
         self.assertEqual("stop", ctl.events[-1])
         self.assertIn("candidate binary checksum", json.loads(Path(manifest.status_path).read_text())["failure"])
         self.assertTrue(Path(manifest.active_path).exists())
+
+    def test_recovery_cli_stops_running_candidate_before_malformed_manifest_decode(self):
+        manifest = self.protected()
+        ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        self.assertEqual("current_forward_failed", self.execute(manifest, ctl, "partial"))
+        original_manifest = self.manifest_path.read_bytes()
+        marker = self.transaction / "migration_started"
+        original_marker = marker.read_bytes()
+        load = helper.Manifest.load
+        for marker_kind, contents in (("file", b'{"expected":'), ("file", b'{"expected":null}'),
+                                      ("symlink", b'{'), ("directory", b'{')):
+            marker.unlink()
+            if marker_kind == "symlink":
+                marker.symlink_to(self.transaction / "missing-marker-target")
+            elif marker_kind == "directory":
+                marker.mkdir()
+            else:
+                marker.write_bytes(b"malformed marker")
+            self.manifest_path.write_bytes(contents)
+            running = {"service": True, "socket": True, "pid": 52}
+            commands = []
+            def run(command, **_kwargs):
+                commands.append(command)
+                self.assertEqual("systemctl", command[0])
+                if command[1] == "stop":
+                    self.assertEqual([f"{self.policy.unit_name}.service", f"{self.policy.unit_name}.socket"], command[2:])
+                    running.update(service=False, socket=False, pid=0)
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if command[1] == "is-active":
+                    value = "active" if running["service" if command[2].endswith(".service") else "socket"] else "inactive"
+                elif command[3] == "--property=MainPID":
+                    value = str(running["pid"])
+                else:
+                    self.assertEqual("--property=ActiveState", command[3])
+                    value = "active" if running["service" if command[2].endswith(".service") else "socket"] else "inactive"
+                return subprocess.CompletedProcess(command, 0, value + "\n", "")
+            fixed = helper.SystemdUnitControl(self.policy.unit_name, run=run)
+            def decode(path):
+                self.assertEqual({"service": False, "socket": False, "pid": 0}, running)
+                self.assertTrue(any("--property=ActiveState" in command for command in commands))
+                return load(path)
+            with self.subTest(marker=marker_kind, contents=contents), \
+                 mock.patch.object(helper.os, "geteuid", return_value=0), \
+                 mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
+                 mock.patch.object(helper, "SystemdUnitControl", return_value=fixed), \
+                 mock.patch.object(helper.Manifest, "load", side_effect=decode), \
+                 mock.patch.object(helper, "Systemctl", side_effect=AssertionError("manifest was not decoded")), \
+                 mock.patch.object(helper.sys, "argv", ["helper.py", "recover-current", "--manifest", str(self.manifest_path)]):
+                self.assertEqual(1, helper.main())
+            self.assertFalse(any(running.values()))
+            self.assertEqual(manifest.transaction_id, Path(manifest.active_path).read_text().strip())
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("current_forward_failed", status["state"])
+            self.assertTrue(status["migration_started"])
+            self.assertIn("manifest shape", status["failure"])
+            self.manifest_path.write_bytes(original_manifest)
+            if marker_kind == "directory":
+                marker.rmdir()
+            else:
+                marker.unlink()
+            marker.write_bytes(original_marker)
+
+    def test_recovery_cli_requires_exact_claim_and_marker_before_stop_or_decode(self):
+        manifest = self.protected()
+        marker = self.transaction / "migration_started"
+        for scenario in ("prepared", "foreign-claim", "symlink-claim", "foreign-path"):
+            requested = self.manifest_path
+            Path(manifest.active_path).unlink(missing_ok=True)
+            Path(manifest.active_path).write_text(manifest.transaction_id + "\n")
+            marker.unlink(missing_ok=True)
+            if scenario != "prepared":
+                marker.write_text("invalid")
+            if scenario == "foreign-claim":
+                Path(manifest.active_path).write_text("f" * 32)
+            elif scenario == "symlink-claim":
+                Path(manifest.active_path).unlink()
+                Path(manifest.active_path).symlink_to(self.transaction / "unrelated")
+            elif scenario == "foreign-path":
+                requested = self.transaction / "other.json"
+            with self.subTest(scenario=scenario), \
+                 mock.patch.object(helper.Manifest, "load", side_effect=AssertionError("must not decode")), \
+                 mock.patch.object(helper, "SystemdUnitControl") as control:
+                with self.assertRaises(helper.ValidationError):
+                    helper.recover_current_path(requested, self.policy)
+            control.assert_not_called()
 
     def test_loaded_systemd_inhibit_requires_exact_dropins_reload_and_manual_refusal(self):
         manifest = self.protected()
@@ -1255,7 +1359,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
             proof_path.write_text(json.dumps({**proof, **mutation}))
             with self.subTest(mutation=mutation), mock.patch.object(helper.subprocess, "run") as run:
                 with self.assertRaisesRegex(helper.ActivationError, "rehearsal proof"):
-                    helper.run_current_migration(manifest)
+                    helper.run_current_migration(manifest, ctl)
                 run.assert_not_called()
             self.assertFalse((self.transaction / "migration_started").exists())
         proof_path.write_text(json.dumps(proof))
@@ -1264,7 +1368,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         with rehearsal.open("ab") as stream:
             stream.write(b"tampered")
         with self.assertRaisesRegex(helper.ActivationError, "rehearsal proof"):
-            helper.run_current_migration(manifest)
+            helper.run_current_migration(manifest, ctl)
         self.assertFalse((self.transaction / "migration_started").exists())
 
     def test_protected_registry_rejects_earlier_name_and_sql_byte_changes_by_hash(self):
@@ -1513,6 +1617,42 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.assertFalse(helper.release_claim(manifest))
         self.assert_reboot_inhibited(manifest)
 
+    def test_closed_external_write_during_successful_rehearsal_rejects_live_marker(self):
+        import sqlite3
+        manifest = self.protected()
+        ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        before = helper.database_evidence(self.database)
+        rehearse = helper.rehearse_current_migration
+        def rehearse_then_closed_write(retained):
+            rehearse(retained)
+            self.assertTrue(json.loads((self.transaction / "rehearsal-proof.json").read_text())["success"])
+            with sqlite3.connect(self.database) as db:
+                db.execute("INSERT INTO data VALUES (x'beef')")
+        commands = []
+        runtime = self.runtime(manifest)
+        def run(command, **kwargs):
+            commands.append(command)
+            return runtime(command, **kwargs)
+        with mock.patch.object(helper, "rehearse_current_migration", side_effect=rehearse_then_closed_write), \
+             mock.patch.object(helper.subprocess, "run", side_effect=run), \
+             mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.expected), \
+             mock.patch.object(helper, "restore", side_effect=AssertionError("changed predecessor forbidden")) as restore:
+            self.assertEqual("activation_failed_rollback_failed", helper.activate(manifest, ctl))
+        restore.assert_not_called()
+        self.assertNotIn([manifest.targets.binary, "--migrate-only"], commands)
+        self.assertIn([manifest.candidate.binary.path, "--migrate-only"], commands)
+        self.assertFalse((self.transaction / "migration_started").exists())
+        self.assertEqual(before, helper.database_evidence(self.transaction / "source.sqlite"))
+        self.assertNotEqual(before, helper.database_evidence(self.database))
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertIn("live source differs from stopped snapshot", status["failure"])
+        self.assertFalse(status["migration_started"])
+        self.assertFalse(helper.release_claim(manifest))
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assert_reboot_inhibited(manifest)
+        self.assertTrue(ctl.disruption_started)
+        self.assertFalse(any(isinstance(event, tuple) and event[0] in {"restore_state", "start_candidate"} for event in ctl.events))
+
     def test_pre_marker_restore_requires_unchanged_source(self):
         manifest = self.protected()
         ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
@@ -1609,6 +1749,81 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                 with self.assertRaises(helper.ConcurrentDeploy):
                     helper.acquire_claim("f" * 32, self.policy)
         self.assertTrue(Path(manifest.active_path).exists())
+
+    def test_indented_quoted_environment_override_rejects_noncanonical_database_before_stop(self):
+        manifest = self.protected()
+        original_service = Path(self.targets.service).read_text()
+        other = self.database.parent / "other.db"
+        for whitespace in (" ", "\t", "  \t"):
+            service = original_service + f'{whitespace}Environment="PHOENIX_DB_PATH={other}"  \t\n'
+            for name, content in (("service", service), ("environment", "SECRET=installed\n")):
+                Path(getattr(self.targets, name)).write_text(content)
+                for group in ("candidate", "rollback"):
+                    artifact = self.raw[group][name]
+                    Path(artifact["path"]).write_text(content)
+                    artifact["sha256"] = digest(Path(artifact["path"]))
+            self.write_manifest()
+            manifest = self.manifest()
+            helper.write_status(manifest, "prepared")
+            ctl = ProtectedSystemctl(manifest, helper.UnitState(False, True, False, True, 0))
+            with self.subTest(whitespace=whitespace), mock.patch.object(helper.subprocess, "run") as run:
+                helper.validate_manifest(self.manifest_path, manifest, self.policy)
+                with self.assertRaisesRegex(helper.ActivationError, "effective database path drift"):
+                    helper.verify_preserved_configuration(manifest)
+                with self.assertRaisesRegex(helper.ActivationError, "effective database path drift"):
+                    helper.activate(manifest, ctl)
+                run.assert_not_called()
+            self.assertNotIn("stop", ctl.events)
+            self.assertFalse((self.transaction / "migration_started").exists())
+        # EnvironmentFile values override even a quoted, indented unit assignment.
+        content = f'SECRET=installed\nPHOENIX_DB_PATH={self.database}\n'
+        Path(self.targets.environment).write_text(content)
+        for group in ("candidate", "rollback"):
+            artifact = self.raw[group]["environment"]
+            Path(artifact["path"]).write_text(content)
+            artifact["sha256"] = digest(Path(artifact["path"]))
+        self.write_manifest()
+        manifest = self.manifest()
+        self.assertEqual(self.database, helper.effective_database(manifest))
+        self.assertEqual(self.database, helper.effective_database(manifest, installed=True))
+        helper.verify_preserved_configuration(manifest)
+
+    def test_protected_cli_precondition_failure_releases_only_undisrupted_matching_claim(self):
+        import sqlite3
+        manifest = self.protected()
+        for failure in ("source-drift", "reservation", "foreign-claim", "marker"):
+            Path(manifest.active_path).write_text(manifest.transaction_id + "\n")
+            helper.write_status(manifest, "prepared")
+            if failure == "source-drift":
+                self.advance(66)
+            ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+            def reservation_failed(*_args):
+                if failure == "foreign-claim":
+                    Path(manifest.active_path).write_text("f" * 32 + "\n")
+                elif failure == "marker":
+                    (self.transaction / "migration_started").symlink_to(self.transaction / "missing-marker-target")
+                raise OSError("reservation failed")
+            with self.subTest(failure=failure), \
+                 mock.patch.object(helper.os, "geteuid", return_value=0), \
+                 mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
+                 mock.patch.object(helper, "Systemctl", return_value=ctl), \
+                 mock.patch.object(helper, "prepare_installs", side_effect=reservation_failed), \
+                 mock.patch.object(helper.sys, "argv", ["helper.py", "activate", "--manifest", str(self.manifest_path)]):
+                self.assertEqual(1, helper.main())
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("precondition_failed", status["state"])
+            self.assertEqual(failure == "marker", status["migration_started"])
+            self.assertIn("prefix65" if failure == "source-drift" else "reservation failed", status["failure"])
+            self.assertEqual(failure in {"foreign-claim", "marker"}, Path(manifest.active_path).exists())
+            if failure == "foreign-claim":
+                self.assertEqual("f" * 32, Path(manifest.active_path).read_text().strip())
+            self.assertNotIn("stop", ctl.events)
+            self.assertEqual(failure == "marker", helper.migration_marker_present(self.transaction))
+            (self.transaction / "migration_started").unlink(missing_ok=True)
+            self.assertTrue(self.manifest_path.exists())
+            self.assertTrue(Path(manifest.rollback.binary.path).exists())
+            with sqlite3.connect(self.database) as db:
+                db.execute("DELETE FROM _migrations WHERE version > 65")
 
     def test_configuration_and_database_path_drift_are_refused_before_stop(self):
         manifest = self.protected()

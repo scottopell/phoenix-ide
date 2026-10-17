@@ -486,6 +486,14 @@ def remove_target(path: Path) -> None:
         fsync_dir(path.parent)
 
 
+def migration_marker_present(root: Path) -> bool:
+    try:
+        (root / "migration_started").lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = None, rollback_failure: Optional[str] = None) -> None:
     status = {
         "transaction_id": manifest.transaction_id,
@@ -493,7 +501,7 @@ def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = Non
         "source_kind": manifest.source_kind,
         "mode": manifest.mode,
         "manifest_sha256": transaction_context(manifest)["manifest_sha256"] if manifest.mode == PROTECTED_MODE else None,
-        "migration_started": (Path(manifest.candidate.binary.path).parent / "migration_started").exists(),
+        "migration_started": migration_marker_present(Path(manifest.candidate.binary.path).parent),
         "source_commit": manifest.source_commit,
         "release_tag": manifest.release_tag,
         "release_commit": manifest.release_commit,
@@ -523,7 +531,7 @@ def write_policy_status(
         "source_kind": manifest.source_kind,
         "mode": manifest.mode,
         "manifest_sha256": transaction_context(manifest)["manifest_sha256"] if manifest.mode == PROTECTED_MODE else None,
-        "migration_started": (Path(manifest.candidate.binary.path).parent / "migration_started").exists(),
+        "migration_started": migration_marker_present(Path(manifest.candidate.binary.path).parent),
         "source_commit": manifest.source_commit,
         "release_tag": manifest.release_tag,
         "release_commit": manifest.release_commit,
@@ -564,7 +572,7 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
                 and status.get("expected_version") == manifest.expected.version
                 and status.get("expected_git_sha") == manifest.expected.git_sha
                 and status.get("state") in TERMINAL_STATES
-                and status["migration_started"] == (Path(manifest.candidate.binary.path).parent / "migration_started").exists()
+                and status["migration_started"] == migration_marker_present(Path(manifest.candidate.binary.path).parent)
                 and (manifest.mode == "ordinary" or status.get("manifest_sha256") == transaction_context(manifest)["manifest_sha256"])
                 and (not status["migration_started"] or status["state"] == "committed"))
     except (OSError, json.JSONDecodeError):
@@ -594,12 +602,12 @@ def release_claim(manifest: Manifest) -> bool:
             return False
 
 
-class Systemctl:
-    def __init__(self, manifest: Manifest, run=subprocess.run):
-        self.manifest = manifest
+class SystemdUnitControl:
+    def __init__(self, unit_name: str, transition_timeout_secs: float = 30.0, run=subprocess.run):
         self.run = run
-        self.service = f"{manifest.unit_name}.service"
-        self.socket = f"{manifest.unit_name}.socket"
+        self.service = f"{unit_name}.service"
+        self.socket = f"{unit_name}.socket"
+        self.transition_timeout_secs = transition_timeout_secs
         self.disruption_started = False
 
     def command(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -638,6 +646,22 @@ class Systemctl:
         if self.main_pid():
             raise ActivationError("service still owns a MainPID")
 
+    def stop(self) -> None:
+        self.command("stop", self.service, self.socket, check=False)
+        self.disruption_started = True
+        deadline = time.monotonic() + self.transition_timeout_secs
+        while time.monotonic() < deadline:
+            if not self.is_active(self.service) and not self.is_active(self.socket):
+                return
+            time.sleep(0.1)
+        raise ActivationError("timed out stopping previous systemd units")
+
+
+class Systemctl(SystemdUnitControl):
+    def __init__(self, manifest: Manifest, run=subprocess.run):
+        super().__init__(manifest.unit_name, manifest.transition_timeout_secs, run)
+        self.manifest = manifest
+
     def verify_protected_configuration(self) -> None:
         inhibits = start_inhibit_paths(self.manifest)
         inhibited = any(path.exists() or path.is_symlink() for path in inhibits)
@@ -674,16 +698,6 @@ class Systemctl:
             )
         if result.returncode != 0:
             raise ActivationError(f"systemd unit validation failed: {(result.stderr or result.stdout).strip()}")
-
-    def stop(self) -> None:
-        self.command("stop", self.service, self.socket, check=False)
-        self.disruption_started = True
-        deadline = time.monotonic() + self.manifest.transition_timeout_secs
-        while time.monotonic() < deadline:
-            if not self.is_active(self.service) and not self.is_active(self.socket):
-                return
-            time.sleep(0.1)
-        raise ActivationError("timed out stopping previous systemd units")
 
     def daemon_reload(self) -> None:
         self.command("daemon-reload")
@@ -999,6 +1013,7 @@ def effective_database(manifest: Manifest, *, installed: bool = False) -> Path:
     environment = Path(manifest.targets.environment) if installed else artifact_path(manifest.candidate.environment)
     values = {}
     for raw in service.read_text().splitlines():
+        raw = raw.strip()
         if raw.startswith("Environment="):
             for assignment in shlex.split(raw.partition("=")[2]):
                 key, sep, value = assignment.partition("=")
@@ -1253,7 +1268,7 @@ def verify_rehearsal_proof(manifest: Manifest) -> None:
         raise ActivationError("rehearsal proof mismatch")
 
 
-def run_current_migration(manifest: Manifest) -> None:
+def run_current_migration(manifest: Manifest, controller: Systemctl) -> None:
     verify_rehearsal_proof(manifest)
     if sha256(Path(manifest.targets.binary)) != manifest.candidate.binary.sha256:
         raise ActivationError("installed migration candidate differs from retained candidate")
@@ -1261,6 +1276,7 @@ def run_current_migration(manifest: Manifest) -> None:
         raise ActivationError("migration candidate identity mismatch")
     environment = {}
     for raw in Path(manifest.targets.service).read_text().splitlines():
+        raw = raw.strip()
         if raw.startswith("Environment="):
             environment.update(assignment.split("=", 1) for assignment in shlex.split(raw.partition("=")[2]))
     environment.update(installed_environment(Path(manifest.targets.environment)))
@@ -1269,7 +1285,14 @@ def run_current_migration(manifest: Manifest) -> None:
     environment.update(PATH="/usr/bin:/bin", USER=account.pw_name, LOGNAME=account.pw_name)
     environment.setdefault("HOME", account.pw_dir)
     root = Path(manifest.candidate.binary.path).parent
-    atomic_write(root / "migration_started", (json.dumps(transaction_context(manifest), sort_keys=True) + "\n").encode())
+    marker_data = (json.dumps(transaction_context(manifest), sort_keys=True) + "\n").encode()
+    if not migration_marker_present(root):
+        source = verify_snapshot_proof(manifest)
+        assert_database_exclusive(manifest, controller)
+        ledger, digest = database_evidence(effective_database(manifest, installed=True))
+        if [list(row) for row in ledger] != source["source_ledger"] or digest != source["source_digest"]:
+            raise ActivationError("live source differs from stopped snapshot; migration forbidden")
+    atomic_write(root / "migration_started", marker_data)
     write_status(manifest, "activating")
     subprocess.run([manifest.targets.binary, "--migrate-only"], env=environment, cwd="/",
                    user=account.pw_uid, group=account.pw_gid,
@@ -1289,7 +1312,7 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
         validate_mode(manifest)
         if manifest.mode == PROTECTED_MODE:
             retained = retained_status(manifest)
-            if retained["state"] != "prepared" or retained["migration_started"] or (Path(manifest.candidate.binary.path).parent / "migration_started").exists():
+            if retained["state"] != "prepared" or retained["migration_started"] or migration_marker_present(Path(manifest.candidate.binary.path).parent):
                 raise ValidationError("protected activation is not an untouched prepared transaction")
         prepared = None
         try:
@@ -1316,7 +1339,7 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
                 verify_preserved_configuration(manifest)
                 assert_database_exclusive(manifest, controller)
                 verify_snapshot_proof(manifest)
-                run_current_migration(manifest)
+                run_current_migration(manifest, controller)
                 if database_evidence(effective_database(manifest, installed=True))[0] != candidate_registry(manifest):
                     raise ActivationError("candidate did not reach exact target128")
             if manifest.mode == PROTECTED_MODE:
@@ -1337,7 +1360,7 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
                     return "activation_failed_rollback_failed"
                 write_status(manifest, "precondition_failed", failure=failure)
                 raise
-            if manifest.mode == PROTECTED_MODE and (Path(manifest.candidate.binary.path).parent / "migration_started").exists():
+            if manifest.mode == PROTECTED_MODE and migration_marker_present(Path(manifest.candidate.binary.path).parent):
                 try:
                     retain_failed_start_inhibit(manifest, controller)
                 except Exception:
@@ -1522,7 +1545,7 @@ def installed_environment(path: Path) -> dict[str, str]:
 
 
 def installed_health_url(environment: dict[str, str]) -> str:
-    tls = environment.get("PHOENIX_TLS", "").lower() not in {"", "0", "false", "off", "disabled"}
+    tls = environment.get("PHOENIX_TLS", "").strip().lower() in {"1", "true", "on", "auto", "manual"}
     tls = tls or bool(environment.get("PHOENIX_TLS_CERT_PATH") and environment.get("PHOENIX_TLS_KEY_PATH"))
     scheme = "https" if tls else "http"
     port = environment.get("PHOENIX_PORT", "8031")
@@ -1704,6 +1727,74 @@ def retained_status(manifest: Manifest) -> dict:
     return status
 
 
+def validate_recovery_request(manifest_path: Path, policy: ValidationPolicy) -> str:
+    transaction_id = manifest_path.parent.name
+    if (not TRANSACTION_RE.fullmatch(transaction_id)
+            or manifest_path != policy.transaction_root / transaction_id / "manifest.json"):
+        raise ValidationError("recovery request does not match fixed transaction path")
+    metadata = manifest_path.parent.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValidationError("recovery transaction must be a real directory")
+    validate_root_owned_tree(manifest_path.parent, policy.transaction_root, policy)
+    validate_root_owned_tree(policy.active_path.parent, policy.transaction_root.parent, policy)
+    claim = policy.active_path.lstat()
+    if (not stat.S_ISREG(claim.st_mode) or claim.st_uid != policy.owner_uid
+            or stat.S_IMODE(claim.st_mode) & 0o022
+            or policy.active_path.read_text().strip() != transaction_id):
+        raise ValidationError("recovery requires exact owned active claim")
+    try:
+        (manifest_path.parent / "migration_started").lstat()
+    except FileNotFoundError as exc:
+        raise ValidationError("recover-current requires irreversible marker; predecessor left unchanged") from exc
+    return transaction_id
+
+
+def write_undecoded_recovery_failure(transaction_id: str, policy: ValidationPolicy, failure: str) -> None:
+    with policy.claim_lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if policy.active_path.read_text().strip() != transaction_id:
+            raise ValidationError("recovery claim changed")
+        metadata = policy.status_path.lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != policy.owner_uid
+                or stat.S_IMODE(metadata.st_mode) & 0o022):
+            raise ValidationError("unsafe retained recovery status")
+        status = json.loads(policy.status_path.read_text())
+        if (not isinstance(status, dict) or status.get("transaction_id") != transaction_id
+                or status.get("mode") != PROTECTED_MODE):
+            raise ValidationError("cannot attribute retained recovery status")
+        status.update(state="current_forward_failed", migration_started=True,
+                      failure=failure, updated_at=utc_now())
+        atomic_write(policy.status_path, (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
+
+
+def recover_current_path(manifest_path: Path, policy: ValidationPolicy) -> str:
+    with policy.activation_lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("activation is still running") from exc
+        transaction_id = validate_recovery_request(manifest_path, policy)
+        controller = SystemdUnitControl(policy.unit_name)
+        try:
+            controller.stop()
+            controller.assert_inactive()
+            manifest = Manifest.load(manifest_path)
+            validate_recovery_authority(manifest_path, manifest, policy)
+            return _recover_current_locked(manifest, None, policy)
+        except Exception as exc:
+            print(f"systemd forward recovery failed before detailed activation: {exc}", file=sys.stderr)
+            try:
+                controller.stop()
+                controller.assert_inactive()
+            except Exception:
+                pass
+            try:
+                write_undecoded_recovery_failure(transaction_id, policy, str(exc))
+            except Exception:
+                pass
+            return "current_forward_failed"
+
+
 def recover_current(manifest: Manifest, controller: Optional[Systemctl] = None,
                     validation_policy: Optional[ValidationPolicy] = None) -> str:
     lock_path = Path(manifest.activation_lock_path)
@@ -1712,56 +1803,61 @@ def recover_current(manifest: Manifest, controller: Optional[Systemctl] = None,
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ConcurrentDeploy("activation is still running") from exc
-        root = (validation_policy.transaction_root / manifest.transaction_id if validation_policy
-                else Path(manifest.candidate.binary.path).parent)
-        marker_path = root / "migration_started"
-        if not marker_path.exists() and not marker_path.is_symlink():
-            raise ValidationError("recover-current requires irreversible marker; predecessor left unchanged")
-        ctl = controller or Systemctl(manifest)
+        return _recover_current_locked(manifest, controller, validation_policy)
+
+
+def _recover_current_locked(manifest: Manifest, controller: Optional[Systemctl],
+                            validation_policy: Optional[ValidationPolicy]) -> str:
+    root = (validation_policy.transaction_root / manifest.transaction_id if validation_policy
+            else Path(manifest.candidate.binary.path).parent)
+    marker_path = root / "migration_started"
+    if not marker_path.exists() and not marker_path.is_symlink():
+        raise ValidationError("recover-current requires irreversible marker; predecessor left unchanged")
+    ctl = controller or Systemctl(manifest)
+    try:
+        ctl.stop()
+        ctl.assert_inactive()
+        if validation_policy is not None:
+            validate_manifest(root / "manifest.json", manifest, validation_policy)
+        if manifest.mode != PROTECTED_MODE:
+            raise ValidationError("recover-current requires protected mode")
+        verify_start_inhibit_files(manifest)
+        ctl.verify_protected_configuration()
+        assert_database_exclusive(manifest, ctl)
+        status = retained_status(manifest)
+        if status.get("state") not in {"activating", "current_forward_failed"}:
+            raise ValidationError("retained transaction is not forward-recoverable")
+        if marker_path.is_symlink() or json.loads(marker_path.read_text()) != transaction_context(manifest):
+            raise ValidationError("irreversible marker does not match transaction")
+        registry = candidate_registry(manifest)
+        verify_rehearsal_proof(manifest)
+        verify_preserved_configuration(manifest)
+        if (sha256(Path(manifest.targets.binary)) != manifest.candidate.binary.sha256
+                or installed_runtime_identity(Path(manifest.targets.binary)) != manifest.expected):
+            raise ValidationError("installed candidate changed; recovery cannot replace artifacts")
+        ledger = database_evidence(effective_database(manifest, installed=True))[0]
+        if ledger not in tuple(registry[:n] for n in range(65, len(registry) + 1)):
+            raise ValidationError("stopped database diverges from candidate registry")
+        write_status(manifest, "activating")
+        if ledger != registry:
+            run_current_migration(manifest, ctl)
+        if database_evidence(effective_database(manifest, installed=True))[0] != candidate_registry(manifest):
+            raise ActivationError("recovery did not reach exact target128")
+        if sha256(Path(manifest.targets.binary)) != manifest.candidate.binary.sha256:
+            raise ActivationError("candidate changed before recovery start")
+        authorize_candidate_start(manifest, ctl)
+        ctl.start_candidate(0)
+        wait_for_identity(manifest, manifest.expected, manifest.expected_health_url)
+        atomic_write(Path(manifest.targets.deployed_sha), (manifest.source_commit + "\n").encode())
+        write_status(manifest, "committed")
+        return "committed"
+    except Exception as exc:
         try:
-            ctl.stop()
-            ctl.assert_inactive()
-            if validation_policy is not None:
-                validate_manifest(root / "manifest.json", manifest, validation_policy)
-            if manifest.mode != PROTECTED_MODE:
-                raise ValidationError("recover-current requires protected mode")
-            verify_start_inhibit_files(manifest)
-            ctl.verify_protected_configuration()
-            assert_database_exclusive(manifest, ctl)
-            status = retained_status(manifest)
-            if status.get("state") not in {"activating", "current_forward_failed"}:
-                raise ValidationError("retained transaction is not forward-recoverable")
-            if marker_path.is_symlink() or json.loads(marker_path.read_text()) != transaction_context(manifest):
-                raise ValidationError("irreversible marker does not match transaction")
-            registry = candidate_registry(manifest)
-            verify_rehearsal_proof(manifest)
-            verify_preserved_configuration(manifest)
-            if (sha256(Path(manifest.targets.binary)) != manifest.candidate.binary.sha256
-                    or installed_runtime_identity(Path(manifest.targets.binary)) != manifest.expected):
-                raise ValidationError("installed candidate changed; recovery cannot replace artifacts")
-            ledger = database_evidence(effective_database(manifest, installed=True))[0]
-            if ledger not in tuple(registry[:n] for n in range(65, len(registry) + 1)):
-                raise ValidationError("stopped database diverges from candidate registry")
-            write_status(manifest, "activating")
-            if ledger != registry:
-                run_current_migration(manifest)
-            if database_evidence(effective_database(manifest, installed=True))[0] != candidate_registry(manifest):
-                raise ActivationError("recovery did not reach exact target128")
-            if sha256(Path(manifest.targets.binary)) != manifest.candidate.binary.sha256:
-                raise ActivationError("candidate changed before recovery start")
-            authorize_candidate_start(manifest, ctl)
-            ctl.start_candidate(0)
-            wait_for_identity(manifest, manifest.expected, manifest.expected_health_url)
-            atomic_write(Path(manifest.targets.deployed_sha), (manifest.source_commit + "\n").encode())
-            write_status(manifest, "committed")
-            return "committed"
-        except Exception as exc:
-            try:
-                retain_failed_start_inhibit(manifest, ctl)
-            except Exception:
-                pass
-            write_status(manifest, "current_forward_failed", failure=str(exc))
-            return "current_forward_failed"
+            retain_failed_start_inhibit(manifest, ctl)
+        except Exception:
+            pass
+        write_status(manifest, "current_forward_failed", failure=str(exc))
+        return "current_forward_failed"
 
 
 def abandon(manifest: Manifest) -> None:
@@ -1771,7 +1867,7 @@ def abandon(manifest: Manifest) -> None:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("activation is running; cannot abandon") from exc
         status = retained_status(manifest)
-        if status.get("state") != "prepared" or status["migration_started"] or (Path(manifest.candidate.binary.path).parent / "migration_started").exists():
+        if status.get("state") != "prepared" or status["migration_started"] or migration_marker_present(Path(manifest.candidate.binary.path).parent):
             raise ValidationError("only a pre-disruption prepared transaction may be abandoned")
         write_status(manifest, "precondition_failed", failure="transient activation unit did not start")
         if not release_claim(manifest):
@@ -1818,18 +1914,25 @@ def main() -> int:
     if args.action not in {"activate", "recover-current"} or args.manifest is None:
         parser.error("activation requires activate --manifest PATH")
     manifest = None
+    validated = False
     policy = ValidationPolicy.production()
     try:
-        manifest = Manifest.load(args.manifest)
         if args.action == "recover-current":
-            validate_recovery_authority(args.manifest, manifest, policy)
-        else:
-            validate_manifest(args.manifest, manifest, policy)
+            state = recover_current_path(args.manifest, policy)
+            if state == "committed":
+                manifest = Manifest.load(args.manifest)
+                if status_is_durable_terminal(manifest):
+                    release_claim(manifest)
+            print(state, flush=True)
+            return 0 if state == "committed" else 1
+        manifest = Manifest.load(args.manifest)
+        validate_manifest(args.manifest, manifest, policy)
+        validated = True
         if manifest.mode == PROTECTED_MODE and args.action == "activate":
             status = retained_status(manifest)
-            if status["state"] != "prepared" or status["migration_started"] or (args.manifest.parent / "migration_started").exists():
+            if status["state"] != "prepared" or status["migration_started"] or migration_marker_present(args.manifest.parent):
                 raise ValidationError("protected activation requires untouched prepared status; use recover-current")
-        state = recover_current(manifest, validation_policy=policy) if args.action == "recover-current" else activate(manifest)
+        state = activate(manifest)
         if state in CLAIM_RELEASABLE_STATES and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(state, flush=True)
@@ -1838,6 +1941,15 @@ def main() -> int:
         print(f"systemd activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
+        if validated and manifest is not None and manifest.mode == PROTECTED_MODE and args.action == "activate":
+            try:
+                if (migration_marker_present(args.manifest.parent)
+                        or any(path.exists() or path.is_symlink() for path in start_inhibit_paths(manifest))):
+                    raise ValidationError("disruption evidence forbids precondition claim release")
+                if retained_status(manifest).get("state") == "precondition_failed":
+                    release_claim(manifest)
+            except Exception:
+                pass
         if manifest is not None and manifest.mode == "ordinary" and args.action == "activate":
             try:
                 staged_transaction_id = args.manifest.parent.name
