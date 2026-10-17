@@ -799,7 +799,12 @@ fn run_settle_failed_sample(
             settled
         }
         status @ NativeSamplingStatus::FailureSettledPendingAck { .. } => status,
-        _ => return Err("failed sample is neither parked nor pending settlement ACK".into()),
+        NativeSamplingStatus::IssuedPendingApplication { .. }
+        | NativeSamplingStatus::AppliedPendingAck { .. }
+        | NativeSamplingStatus::SampleAckConfirmed { .. }
+        | NativeSamplingStatus::FailureSettlementAckConfirmed { .. } => {
+            return Err("failed sample is neither parked nor pending settlement ACK".into());
+        }
     };
     if let SettleFailureFixture::PauseAfterSettlement(release) = fixture {
         let gate = release.prepare()?;
