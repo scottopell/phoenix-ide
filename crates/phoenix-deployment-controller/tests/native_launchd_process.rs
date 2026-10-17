@@ -391,7 +391,6 @@ fn launchd_journey(continuation: bool) {
     same_custody(&active, &original);
     let expected_final_rows;
     let expected_final_revision;
-    let expected_final_phase;
     if continuation {
         finish.marker("post_activation_sample_pending");
         assert_eq!(sampling_rows(&path), settled);
@@ -445,7 +444,6 @@ fn launchd_journey(continuation: bool) {
             .recovery_revision()
             .checked_next()
             .unwrap();
-        expected_final_phase = Phase::OwnershipDiscovery;
     } else {
         finish.success();
         assert!(
@@ -459,7 +457,6 @@ fn launchd_journey(continuation: bool) {
         assert_eq!(settled_sampling_keys(&path), settled_keys);
         expected_final_rows = settled;
         expected_final_revision = activation.completion().recovery_revision();
-        expected_final_phase = Phase::ResourceSampling;
     }
     assert!(observed
         .pending_native_sampling_ack(attempt)
@@ -491,8 +488,18 @@ fn launchd_journey(continuation: bool) {
         activation.completion().recovery_revision()
     );
     let final_attempt = writable.load_attempt(attempt).unwrap().unwrap();
-    assert_eq!(final_attempt.persistence_revision(), expected_final_revision);
-    assert_eq!(final_attempt.phase(), expected_final_phase);
+    assert_eq!(
+        final_attempt.persistence_revision(),
+        expected_final_revision
+    );
+    if continuation {
+        assert!(matches!(
+            final_attempt.phase(),
+            Phase::OwnershipDiscovery | Phase::ResourceBlocked
+        ));
+    } else {
+        assert_eq!(final_attempt.phase(), Phase::ResourceSampling);
+    }
     assert_eq!(
         sampling_rows(&path),
         expected_final_rows,

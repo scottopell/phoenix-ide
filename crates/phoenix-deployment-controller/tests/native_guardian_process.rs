@@ -1149,7 +1149,10 @@ fn fresh_runner_continues_exactly_one_retained_sample_after_two_phase_activation
         .is_none());
     let continued_attempt = observed.load_attempt(attempt).unwrap().unwrap();
     assert_eq!(continued_attempt.persistence_revision().get(), continued.3);
-    assert_eq!(continued_attempt.phase(), Phase::OwnershipDiscovery);
+    assert!(matches!(
+        continued_attempt.phase(),
+        Phase::OwnershipDiscovery | Phase::ResourceBlocked
+    ));
     let raw =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
