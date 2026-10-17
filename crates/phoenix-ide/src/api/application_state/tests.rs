@@ -114,6 +114,7 @@ async fn live_capability_bootstrap_requires_no_owner_cookie_but_grants_no_owner_
             Request::builder()
                 .method("POST")
                 .uri("/api/auth/login")
+                .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({ "password": password }).to_string(),
