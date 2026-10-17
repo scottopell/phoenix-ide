@@ -900,6 +900,10 @@ fn completed_child_list_recovery_applies_without_reenumerating_after_runner_cras
     let mut output = BufReader::new(runner.stdout.take().unwrap());
     assert_eq!(line(&mut output), "verified binding: Detached");
     assert!(line(&mut output).starts_with("reconciling generation=3 interruption="));
+    assert!(line(&mut output).starts_with("prepared_snapshot="));
+    assert!(line(&mut output).starts_with("durable_activation_snapshot="));
+    assert!(line(&mut output).starts_with("reconciliation_active generation=3 interruption="));
+    assert!(line(&mut output).starts_with("active_snapshot="));
     let second_sample = line(&mut output);
     assert!(
         second_sample.starts_with("recovered_sample_applied_ack attempt=64")

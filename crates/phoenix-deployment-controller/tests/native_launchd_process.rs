@@ -11,7 +11,7 @@ use launchd::{
 };
 use native_sampling::{sampling_rows, sampling_runner_command, settled_sampling_keys};
 use phoenix_deployment_controller::{
-    guardian_ipc::{WireCompletion, WireMemoryPressure, WireSnapshot, WireState},
+    guardian_ipc::{WireCompletion, WireMemoryPressure, WireObservation, WireSnapshot, WireState},
     native_guardian::{verify_native_binding, GuardianClient, VerifiedBindingStatus},
     CleanupOutcome, ControllerOs, ControllerSqliteStore, IdentityObservation, MacOsControllerOs,
     MonotonicTick, NativeChildListStatus, NativeSamplingStatus, NativeSessionState, Phase,
@@ -548,7 +548,20 @@ fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signa
     assert_eq!(final_snapshot.state, WireState::DetachedFenced);
     assert_eq!(final_snapshot.session.generation, 3);
     assert!(final_snapshot.retained.is_empty());
-    same_custody(&final_snapshot, &fenced);
+    assert_eq!(final_snapshot.instance, fenced.instance);
+    assert_eq!(final_snapshot.attempt, fenced.attempt);
+    assert_eq!(final_snapshot.deadline, fenced.deadline);
+    assert_eq!(final_snapshot.slots, fenced.slots);
+    let final_native = final_snapshot.native_binding.as_ref().unwrap();
+    let fenced_native = fenced.native_binding.as_ref().unwrap();
+    assert_eq!(final_native.guardian, fenced_native.guardian);
+    assert_eq!(final_native.nonce, fenced_native.nonce);
+    assert_eq!(final_native.slots.len(), 1);
+    assert_eq!(
+        final_native.slots[0].identity,
+        fenced_native.slots[0].identity
+    );
+    assert_eq!(final_native.slots[0].liveness, WireObservation::Exited);
     runner.finish().unwrap();
     installation.assert_witnesses().unwrap();
     drop((store, db));
