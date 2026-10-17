@@ -21,6 +21,14 @@ REAL_DIGEST = opening.shipping.digest
 
 
 class OpeningQualificationTests(unittest.TestCase):
+    def test_optional_keepalive_workflow_has_real_probe_sources(self):
+        workflow = opening.ROOT / '.github/workflows/history-keepalive-native-probe.yml'
+        if workflow.exists():
+            for name in ('probe-view-keepalive.mjs', 'probe-view-keepalive.test.mjs'):
+                with self.subTest(source=name):
+                    self.assertTrue((opening.ROOT / 'ui/scripts' / name).is_file(),
+                                    f'keepalive workflow references absent probe source: {name}')
+
     def test_controlled_global_history_target_uses_retained_source_slug_not_latest(self):
         from urllib.parse import parse_qs, urlsplit
         ordinary = {'kind': 'ordinary', 'route': '/c/product-ordinary',

@@ -3261,3 +3261,16 @@ PR908 baselines remain preserved. Separate native-capability artifact reuse and
 read-only performance-fixture investigation do not amend this app packet or
 provide overhead, physical-device or full acceptance. No numeric overhead
 threshold is adopted; improved measurement quality proceeds without one.
+
+## Orphaned synthetic keepalive workflow disposition
+
+A later review found that the optional four-cell synthetic keepalive workflow
+referenced probe sources absent from both current main and the pinned qualified
+app lineage. The obsolete workflow is explicitly retired rather than restoring
+removed legacy scripts or claiming a probe can execute. Its original source is
+preserved in713c and earlier Git history; no baseline evidence, source workspace,
+current native/codegen qualification or regression file is deleted. A focused
+source-reference guard failed on both missing files before retirement; the full
+81-test Python lifecycle suite passes after retirement. A future optional probe
+workflow must ship its real sources together. This is a shared workflow/test
+change only, not a product runtime or telemetry-acceptance change.
