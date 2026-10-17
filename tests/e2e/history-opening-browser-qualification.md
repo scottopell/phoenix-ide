@@ -2793,3 +2793,8 @@ its expectation was corrected to the actual string schema without product or
 oracle change. Existing71 Python/43 actual route tests apply to unchanged target
 factory/production source. No local native/browser/build, no app-source edit,
 no unchanged normal rerun or diagnostic runner was performed.
+
+Run `38992494875` is now fully terminal **failure**: isolated witness failed at
+ordinary pagehide; Rust and every standard lane succeeded. App35f remains clean
+and unchanged. The changed pending-identity/root-reference candidate may now
+receive one causal normal qualification; no unchanged run was retried.
