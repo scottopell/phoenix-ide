@@ -18,6 +18,8 @@ run_exact process_group::native::tests::linux_scan_requires_readable_candidate_s
 if [[ "$(uname -s)" == Darwin ]]; then
   run_exact process_group::native::tests::owned_empty_group_query_contract_before_and_after_root_reap -p phoenix-browser --lib
 fi
+run_exact process_group::native::tests::missing_signal_target_requires_reobservation_not_completion -p phoenix-browser --lib
+run_exact process_group::native::tests::signal_exit_race_reobserves_owned_child_before_draining -p phoenix-browser --lib
 run_exact process_group::native::tests::pending_exit_authorizes_neither_signal_nor_completion -p phoenix-browser --lib
 run_exact process_group::native::tests::exited_root_drains_stderr_closed_writer_before_profile_removal -p phoenix-browser --lib
 run_exact process_group::native::tests::reaped_or_mismatched_root_cannot_authorize_old_group_signals -p phoenix-browser --lib

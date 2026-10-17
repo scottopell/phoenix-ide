@@ -1,3 +1,9 @@
+## Active qualification checkpoint
+
+Pinned app `6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e`, tree `bcf94dc11e62c459750caa1833abea20b8c1911b`, base `1f9529c634a074c6ab6ea36eb15ca284770df1a5`. Adds older-review correlation, Coordinator return-state and ESRCH re-observation repairs; correlation regression uses the production exporter predicate. Native/backend regressions require this exact successor's hosted execution; prior green does not qualify them. The native qualifier explicitly selects both ESRCH guards without removing earlier assertions.
+
+Preserved shared `335818b17d8c30e3e5726cb05fd1e3b45e1baf80`: Linux run39061431820 all8required jobs and macOS run39061431725 both jobs succeeded. Witness artifact12112111935 yielded6 collector204 acceptances and6 semantic exports, normal app/receiver drain, no aggregation errors. Full acceptance and overhead clearance remain false. Pre-session launch ownership P1 is a separate active source repair, not included in this pin; opaque launch errors are not safe abandonment. Global owns merge/deploy.
+
 # Instrumented opening browser qualification
 
 This harness is **instrumented runtime evidence, not shipping-binary proof**.
@@ -7,7 +13,7 @@ wire identity helpers with this witness; the app source remains pinned unchanged
 ## Inputs and hosted invocation
 
 Supply an independent, tracked-clean app checkout at
-`d4c2772a95aa46da608b356c8fe7be074de1b7aa`, its already-built `ui/dist`, installed
+`6bf41ee6aee65b9d4686a6e22dbf483d8cc48c0e`, its already-built `ui/dist`, installed
 app-owned Vite/Playwright dependencies and Chromium, and the independently built
 ignored libtest artifact. This script never compiles, installs, starts production,
 or uses the shipping executable. Use the existing hosted preparation; workflow
