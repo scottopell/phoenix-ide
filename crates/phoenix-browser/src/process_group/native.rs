@@ -66,7 +66,14 @@ impl OwnedChromeGroup {
             )
         };
         if result != 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "owned_chrome_waitid_failed root={:?} error={error} {}",
+                self.root,
+                self.darwin_wait_diagnostic()
+            );
+            return Err(error);
         }
         // SAFETY: waitid initialized the siginfo payload, or left its zero PID.
         Ok(unsafe { status.si_pid() } == pid)
@@ -149,7 +156,17 @@ impl OwnedChromeGroup {
         } else {
             Err(io::Error::last_os_error())
         };
-        signal_delivery(result)
+        signal_delivery(result).inspect_err(|error| {
+            #[cfg(target_os = "macos")]
+            {
+                let observed_identity = phoenix_core::process_identity::current_process_identity(self.root.pid);
+                let observed_group = unsafe { libc::getpgid(pid) };
+                let group_error = (observed_group == -1).then(io::Error::last_os_error);
+                eprintln!("owned_chrome_signal_failed signal={signal} root={:?} child={:?} observed_identity={observed_identity:?} getpgid={observed_group} group_error={group_error:?} error={error} {}", self.root, child.id(), self.darwin_wait_diagnostic());
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = error;
+        })
     }
 
     pub(crate) async fn drain(
@@ -925,6 +942,72 @@ exit 0
         unrelated.kill().await.unwrap();
     }
 
+    struct EscapedWriterChild(std::process::Child);
+
+    impl Drop for EscapedWriterChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < deadline {
+                // test-timing-allow: bounded reap of this fixture's killed direct child.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    struct EscapedLaunchCleanup {
+        root: tokio::process::Child,
+        writer: Option<ProcessIdentity>,
+    }
+
+    impl Drop for EscapedLaunchCleanup {
+        fn drop(&mut self) {
+            if let Some(writer) = self.writer {
+                if process_identity_matches(writer) {
+                    if let Ok(pid) = libc::pid_t::try_from(writer.pid) {
+                        // SAFETY: the fixture supplied this exact owned birth identity.
+                        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+            // EOF lets a not-yet-released root kill and reap its owned writer.
+            drop(self.root.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while matches!(self.root.try_wait(), Ok(None)) && Instant::now() < deadline {
+                // test-timing-allow: await the owned fixture's EOF cleanup before kill fallback.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if matches!(self.root.try_wait(), Ok(None)) {
+                let _ = self.root.start_kill();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while matches!(self.root.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    // test-timing-allow: bounded reap of the fixture's killed direct root child.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            if let Some(writer) = self.writer {
+                observe_escaped_writer_stopped(writer);
+            }
+        }
+    }
+
+    fn observe_escaped_writer_stopped(writer: ProcessIdentity) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_identity_matches(writer) {
+            match group_has_live_members(writer.pid) {
+                Ok(false) => return,
+                observation if Instant::now() >= deadline => {
+                    eprintln!("escaped fixture emergency cleanup unresolved: writer={writer:?} observation={observation:?}");
+                    return;
+                }
+                _ => {
+                    // test-timing-allow: observe termination of the exact escaped fixture, not reap a non-child.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     #[test]
     fn escaped_writer_fixture() {
         use std::io::{BufRead as _, Write as _};
@@ -946,74 +1029,122 @@ exit 0
             }
         }
         assert_eq!(role, "root");
-        let mut writer = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "process_group::native::tests::escaped_writer_fixture",
-                "--nocapture",
-            ])
-            .env("PHOENIX_GROUP_TEST_ROLE", "writer")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = std::io::BufReader::new(writer.stdout.take().unwrap());
-        for line in stdout.lines() {
-            if let Some((_, pid)) = line.unwrap().split_once("writer-ready:") {
-                println!("root-ready:{}", pid.trim());
-                std::io::stdout().flush().unwrap();
-                break;
+        let mut writer = EscapedWriterChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process_group::native::tests::escaped_writer_fixture",
+                    "--nocapture",
+                ])
+                .env("PHOENIX_GROUP_TEST_ROLE", "writer")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        println!("writer-spawned:{}", writer.0.id());
+        std::io::stdout().flush().unwrap();
+        let stdout = std::io::BufReader::new(writer.0.stdout.take().unwrap());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines() {
+                if let Some((_, pid)) = line.unwrap().split_once("writer-ready:") {
+                    let _ = ready_tx.send(pid.trim().to_owned());
+                    return;
+                }
             }
-        }
+        });
+        let writer_pid = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        println!("root-ready:{writer_pid}");
+        std::io::stdout().flush().unwrap();
         let mut release = String::new();
         std::io::stdin().read_line(&mut release).unwrap();
-        std::process::exit(0);
+        if release.trim() == "release" {
+            std::process::exit(0);
+        }
     }
 
-    #[tokio::test]
-    async fn group_drain_does_not_claim_an_escaped_writer() {
-        let profile = tempfile::tempdir().unwrap();
-        let mut root = tokio::process::Command::new(std::env::current_exe().unwrap())
+    async fn escaped_launch(profile: &std::path::Path) -> EscapedLaunchCleanup {
+        let root = tokio::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "process_group::native::tests::escaped_writer_fixture",
                 "--nocapture",
             ])
             .env("PHOENIX_GROUP_TEST_ROLE", "root")
-            .env("PHOENIX_GROUP_TEST_PROFILE", profile.path())
+            .env("PHOENIX_GROUP_TEST_PROFILE", profile)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut stdout = tokio::io::BufReader::new(root.stdout.take().unwrap());
-        let writer_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut cleanup = EscapedLaunchCleanup { root, writer: None };
+        let mut stdout = tokio::io::BufReader::new(cleanup.root.stdout.take().unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let mut line = String::new();
                 assert_ne!(stdout.read_line(&mut line).await.unwrap(), 0);
+                if let Some((_, pid)) = line.split_once("writer-spawned:") {
+                    let pid = pid.trim().parse::<u32>().unwrap();
+                    cleanup.writer = current_process_identity(pid);
+                    assert!(cleanup.writer.is_some(), "spawned writer identity missing");
+                }
                 if let Some((_, pid)) = line.split_once("root-ready:") {
-                    break pid.trim().parse::<u32>().unwrap();
+                    assert_eq!(
+                        cleanup.writer.unwrap().pid,
+                        pid.trim().parse::<u32>().unwrap()
+                    );
+                    break;
                 }
             }
         })
         .await
         .unwrap();
-        let writer_identity = current_process_identity(writer_pid).unwrap();
-        let mut group = OwnedChromeGroup::adopt(
-            current_process_identity(root.id().unwrap()).unwrap(),
-            &mut root,
-        )
+        cleanup
+    }
+
+    #[tokio::test]
+    async fn escaped_writer_unwind_cleans_owned_fixture_before_release() {
+        let profile = tempfile::tempdir().unwrap();
+        let cleanup = escaped_launch(profile.path()).await;
+        let root_identity = current_process_identity(cleanup.root.id().unwrap()).unwrap();
+        let writer_identity = cleanup.writer.unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _cleanup = cleanup;
+            panic!("injected failure before root release");
+        }));
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process_identity_matches(root_identity)
+                || process_identity_matches(writer_identity)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_drain_does_not_claim_an_escaped_writer() {
+        let profile = tempfile::tempdir().unwrap();
+        let mut cleanup = escaped_launch(profile.path()).await;
+        let writer_identity = cleanup.writer.unwrap();
+        let writer_pid = writer_identity.pid;
+        let root = &mut cleanup.root;
+        let mut group =
+            OwnedChromeGroup::adopt(current_process_identity(root.id().unwrap()).unwrap(), root)
+                .unwrap();
         root.stdin
             .take()
             .unwrap()
             .write_all(b"release\n")
             .await
             .unwrap();
-        group
-            .drain(&mut root, Duration::from_secs(5))
-            .await
-            .unwrap();
+        group.drain(root, Duration::from_secs(5)).await.unwrap();
         root.wait().await.unwrap();
         assert!(
             process_identity_matches(writer_identity),
