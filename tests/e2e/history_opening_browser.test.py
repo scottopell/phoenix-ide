@@ -864,6 +864,34 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertNotIn("'app_stopped': True", source)
         self.assertNotIn("'receiver_stopped': True", source)
 
+    def test_joint_consumers_use_one_authoritative_controlled_receipt_without_copy(self):
+        import ast
+        tree = ast.parse(Path(opening.__file__).read_text())
+        qualify = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'qualify')
+        assignments = [node for node in ast.walk(qualify) if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'telemetry_result' for target in node.targets)]
+        self.assertEqual(len(assignments), 1)
+        expression = compile(ast.Expression(assignments[0].value), '<actual qualifier receipt path>', 'eval')
+        case = self.root / 'controlled-case'
+        case.mkdir()
+        receipt = {'runId': 'unit-controlled', 'journeys': []}
+        (case / 'browser-result.json').write_text(json.dumps(receipt))
+        selected = eval(expression, {'case': case, 'controlled': True})
+        self.assertEqual(selected, case / 'browser-result.json')
+        self.assertEqual(opening.telemetry_browser_result(selected), receipt)
+        self.assertFalse((case / 'telemetry').exists())
+        self.assertEqual(eval(expression, {'case': case, 'controlled': False}),
+                         case / 'telemetry/telemetry-browser-result.json')
+        final_join = next(node for node in ast.walk(qualify) if isinstance(node, ast.Call)
+                          and isinstance(node.func, ast.Attribute) and node.func.attr == 'assertPhoenixTelemetry')
+        self.assertEqual(ast.unparse(final_join.args[3]), 'telemetry_result')
+        collector = next(node for node in ast.walk(qualify) if isinstance(node, ast.Call)
+                         and isinstance(node.func, ast.Attribute) and node.func.attr == 'assert_receipt')
+        self.assertEqual(ast.unparse(collector.args[0]), 'telemetry_result')
+        delivery = next(node for node in ast.walk(qualify) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id == 'seal_collector_export_delivery')
+        self.assertEqual(ast.unparse(delivery.args[2]), 'telemetry_browser_result(telemetry_result)')
+
     def test_missing_or_invalid_joint_browser_producer_receipt_fails(self):
         path = self.root / "telemetry" / "telemetry-browser-result.json"
         with self.assertRaisesRegex(RuntimeError, "producer receipt is missing"):

@@ -1014,11 +1014,11 @@ def qualify(app, exe, output, joint_telemetry=False, controlled=False):
                                     (case / "browser-result.json").read_text())
                                 if controlled:
                                     validate_controlled_receipt(result)
-                                    shipping.write_json(case/'telemetry/telemetry-browser-result.json', result)
                                 else:
                                     assert result["status"] == "passed_assertions" and result["checks"]
                                 if receiver:
-                                    telemetry_result = case / "telemetry/telemetry-browser-result.json"
+                                    telemetry_result = (case / "browser-result.json" if controlled
+                                                        else case / "telemetry/telemetry-browser-result.json")
                                     telemetry_browser_result(telemetry_result)
                                     receiver_serving_check(receiver)
                                     receiver.assert_receipt(telemetry_result)
@@ -1066,13 +1066,13 @@ def qualify(app, exe, output, joint_telemetry=False, controlled=False):
                         raise RuntimeError("joint telemetry teardown failed")
                     final = telemetry[1].assertPhoenixTelemetry(
                         receiver.output, receiver.service, run_id,
-                        case / "telemetry/telemetry-browser-result.json",
+                        telemetry_result,
                         drain_receipt=drain)
                     final['scope']['evidence_class'] = mode
                     shipping.write_json(case / "telemetry-final.json", final)
                     delivery = seal_collector_export_delivery(
                         case / "instrumented-runtime.log", fixtures["identity"],
-                        telemetry_browser_result(case / "telemetry/telemetry-browser-result.json"),
+                        telemetry_browser_result(telemetry_result),
                         final, drain, run_id, receiver.service, evidence_mode=mode)
                     shipping.write_json(case / "telemetry-delivery.json", delivery)
             except Exception as error:

@@ -2837,3 +2837,53 @@ Run `38993749887` is fully terminal **failure**: isolated witness failed; Rust
 and all standard lanes succeeded. One causal normal qualification of the exact
 retained-report-proven null correction follows this complete state, with app35f
 unchanged. Stock baseline/resume/overhead/full acceptance constraints remain.
+
+### Six browser scenarios and original raw semantic exports pass; wrapper path blocks drain
+
+Run `38995018348`, sharedca514/app35f, witness `117285561573`, produced actual
+browser status **passed_assertions** for all six distinct contexts: ordinary and
+Global history ready; ordinary and Global pagehide incomplete; ordinary and
+Global same-document Sidebar cancellation canceled. Both histories retain two
+original-owner older GETs and all strict physical/composer/route checks. The
+unauthenticated negative made one POST and received401, expected acceptances0.
+This is actual controlled browser evidence, not a mocked or diagnostic recipe.
+
+Native qualification then failed **after** driver success with FileNotFoundError
+at its duplicate write to `ordinary/telemetry/telemetry-browser-result.json`.
+Controlled mode owns `ordinary/browser-result.json`; unlike the stock child,
+it never creates a telemetry subdirectory. The wrapper attempted a redundant
+copy before collector join/normal server stop. Retained drain shows
+app_stopped=false, receiver_stopped=true. Thus normal app-first drain and the
+complete controlled acceptance packet are still **not** established.
+
+Original artifact `12087087150` is96,476,200 bytes. Bounded browser receipt/log
+read81,221 bytes; native result/lifecycle/drain read82,537 bytes. To falsify later
+semantic-join blockers without another live run, selected the original capture
+index and all16 raw protobuf batches using320,458 range bytes. The unchanged,
+source-hash-checked pinned `final_index` validated exact raw inventory/bytes and
+decoded equality (1,317,489 raw bytes); its actual retrieve/validate_view/
+validate_correlations functions passed all6 authoritative journey expectations,
+with exactly6 exports and zero receiver errors. This was an **offline raw-export
+semantic check**, not assertPhoenixTelemetry with a fabricated successful drain.
+The actual complete drain assertion remains unavailable for this failed run.
+
+A further bounded148,410-byte range read retained the original runtime log.
+The actual collector_acceptances parser independently matched exactly6 unique
+browser reports to6 acceptances; no extra accepted journey or export exists.
+Together: **6 browser reports = 6 actual collector acceptances = 6 actual semantic
+exports**, with the six expected outcomes and negative401, but **without normal
+app-first drain**, so no full controlled qualification claim is made.
+
+The structural fix removes the redundant controlled copy. All collector,
+post-drain semantic assertion and final delivery consumers select the **one
+existing controlled browser receipt**; stock still selects its unchanged nested
+telemetry receipt. An AST-based regression executes the actual qualifier path
+expression in a temporary case containing only browser-result.json and no
+telemetry directory, then verifies the same path threads to all three consumers.
+No directory-creation fallback, fake receipt, weaker join or drain bypass exists.
+
+All72 Python lifecycle tests pass; an intermediate new test omitted local ast
+and pathlib imports, corrected to import ast and use already-imported Path.
+Existing138 shared Node tests apply to the unchanged browser driver. No local
+native/browser/build or hosted diagnostic rerun was used. Rust `117285608206`
+was still running at this entry; next normal push waits for the whole terminal.
