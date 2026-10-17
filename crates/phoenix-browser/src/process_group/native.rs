@@ -1020,6 +1020,22 @@ exit 0
             let _file =
                 std::fs::File::create(std::path::PathBuf::from(path).join("escaped-writer"))
                     .unwrap();
+            if std::env::var_os("PHOENIX_GROUP_TEST_PENDING_WRITER").is_some() {
+                let identity = current_process_identity(std::process::id()).unwrap();
+                let profile = std::path::PathBuf::from(
+                    std::env::var_os("PHOENIX_GROUP_TEST_PROFILE").unwrap(),
+                );
+                std::fs::write(
+                    profile.join("pending-writer"),
+                    format!("{} {}", identity.pid, identity.start_time),
+                )
+                .unwrap();
+                loop {
+                    unsafe {
+                        libc::pause();
+                    }
+                }
+            }
             println!("writer-ready:{}", std::process::id());
             std::io::stdout().flush().unwrap();
             loop {
@@ -1046,27 +1062,54 @@ exit 0
         println!("writer-spawned:{}", writer.0.id());
         std::io::stdout().flush().unwrap();
         let stdout = std::io::BufReader::new(writer.0.stdout.take().unwrap());
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        enum Event {
+            Ready(String),
+            Release,
+            Cancel,
+        }
+        let (events, receiver) = std::sync::mpsc::channel();
+        let readiness = events.clone();
         std::thread::spawn(move || {
             for line in stdout.lines() {
                 if let Some((_, pid)) = line.unwrap().split_once("writer-ready:") {
-                    let _ = ready_tx.send(pid.trim().to_owned());
+                    let _ = readiness.send(Event::Ready(pid.trim().to_owned()));
                     return;
                 }
             }
+            let _ = readiness.send(Event::Cancel);
         });
-        let writer_pid = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        println!("root-ready:{writer_pid}");
-        std::io::stdout().flush().unwrap();
-        let mut release = String::new();
-        std::io::stdin().read_line(&mut release).unwrap();
-        if release.trim() == "release" {
-            std::process::exit(0);
+        std::thread::spawn(move || {
+            let mut release = String::new();
+            let event = match std::io::stdin().read_line(&mut release) {
+                Ok(_) if release.trim() == "release" => Event::Release,
+                _ => Event::Cancel,
+            };
+            let _ = events.send(event);
+        });
+        let mut ready = false;
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::Ready(pid) => {
+                    ready = true;
+                    println!("root-ready:{pid}");
+                    std::io::stdout().flush().unwrap();
+                }
+                Event::Release if ready => std::process::exit(0),
+                Event::Release | Event::Cancel => break,
+            }
         }
+        drop(writer);
+        let profile =
+            std::path::PathBuf::from(std::env::var_os("PHOENIX_GROUP_TEST_PROFILE").unwrap());
+        std::fs::write(profile.join("root-cleaned-writer"), b"cleaned").unwrap();
     }
 
-    async fn escaped_launch(profile: &std::path::Path) -> EscapedLaunchCleanup {
-        let root = tokio::process::Command::new(std::env::current_exe().unwrap())
+    fn escaped_spawn(profile: &std::path::Path, pending_writer: bool) -> EscapedLaunchCleanup {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        if pending_writer {
+            command.env("PHOENIX_GROUP_TEST_PENDING_WRITER", "1");
+        }
+        let root = command
             .args([
                 "--exact",
                 "process_group::native::tests::escaped_writer_fixture",
@@ -1081,7 +1124,11 @@ exit 0
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut cleanup = EscapedLaunchCleanup { root, writer: None };
+        EscapedLaunchCleanup { root, writer: None }
+    }
+
+    async fn escaped_launch(profile: &std::path::Path) -> EscapedLaunchCleanup {
+        let mut cleanup = escaped_spawn(profile, false);
         let mut stdout = tokio::io::BufReader::new(cleanup.root.stdout.take().unwrap());
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1104,6 +1151,43 @@ exit 0
         .await
         .unwrap();
         cleanup
+    }
+
+    #[tokio::test]
+    async fn escaped_writer_unwind_before_identity_cancels_pending_readiness() {
+        let profile = tempfile::tempdir().unwrap();
+        let cleanup = escaped_spawn(profile.path(), true);
+        let root_identity = current_process_identity(cleanup.root.id().unwrap()).unwrap();
+        let writer_identity = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(profile.path().join("pending-writer"))
+                {
+                    let mut fields = contents.split_whitespace();
+                    if let (Some(pid), Some(start_time)) = (fields.next(), fields.next()) {
+                        break ProcessIdentity {
+                            pid: pid.parse().unwrap(),
+                            start_time: start_time.parse().unwrap(),
+                        };
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(cleanup.writer.is_none());
+        assert!(!profile.path().join("root-cleaned-writer").exists());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _cleanup = cleanup;
+            panic!("injected failure before identity or readiness handoff");
+        }));
+        assert!(result.is_err());
+        assert!(
+            profile.path().join("root-cleaned-writer").exists(),
+            "root cleanup must finish before outer fallback"
+        );
+        assert!(!process_identity_matches(writer_identity));
+        assert!(!process_identity_matches(root_identity));
     }
 
     #[tokio::test]
