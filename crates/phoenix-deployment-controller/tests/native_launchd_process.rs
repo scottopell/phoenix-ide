@@ -6,7 +6,8 @@ mod launchd;
 mod native_sampling;
 
 use launchd::{
-    bounded_text, poll_pause, private_file, CleanupFailures, DisposableLaunchdGuardian, ATTEMPT,
+    bounded_text, poll_pause, private_file, CleanupFailures, DisposableLaunchdGuardian,
+    DisposableLaunchdInstallation, DisposableLaunchdRunnerJob, ATTEMPT,
 };
 use native_sampling::{sampling_rows, sampling_runner_command, settled_sampling_keys};
 use phoenix_deployment_controller::{
@@ -199,6 +200,171 @@ fn same_custody(current: &WireSnapshot, original: &WireSnapshot) {
 
 fn snapshot(line: &str, prefix: &str) -> WireSnapshot {
     serde_json::from_str(line.strip_prefix(prefix).unwrap()).unwrap()
+}
+
+fn sampling_table_counts(path: &std::path::Path) -> [i64; 5] {
+    let counts = || {
+        let db = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        [
+            "native_sampling_issues",
+            "native_sampling_applications",
+            "native_sampling_ack_confirmations",
+            "native_reconciliation_completions",
+            "native_reconciliation_activations",
+        ]
+        .map(|table| {
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    counts()
+}
+
+fn assert_initial_applied_ack(
+    runner: &mut DisposableLaunchdRunnerJob<'_>,
+    path: &std::path::Path,
+    original_guardian: phoenix_deployment_controller::ProcessIdentity,
+    original_child: phoenix_deployment_controller::ProcessIdentity,
+    deadline: MonotonicTick,
+) -> (
+    ControllerSqliteStore,
+    phoenix_deployment_controller::DispatchKey,
+    NativeSamplingStatus,
+) {
+    let applied_marker = runner
+        .marker("application_committed_pending_ack revision=")
+        .unwrap();
+    runner.assert_live().unwrap();
+    runner.guardian().assert_original_parent().unwrap();
+    assert_eq!(runner.guardian().guardian(), original_guardian);
+    assert_eq!(runner.guardian().child(), original_child);
+    assert_eq!(runner.guardian().deadline(), deadline);
+    assert!(MonotonicTick::native_now().unwrap() < deadline);
+    runner.assert_witnesses().unwrap();
+    let mut store = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let (key, pending) = store.pending_native_sampling_ack(ATTEMPT).unwrap().unwrap();
+    assert_eq!(
+        applied_marker,
+        format!(
+            "application_committed_pending_ack revision={}",
+            key.revision().get()
+        )
+    );
+    (store, key, pending)
+}
+
+fn assert_fenced_sample(fenced: &WireSnapshot, revision: u64, deadline: MonotonicTick) {
+    assert_eq!(fenced.state, WireState::DetachedFenced);
+    assert_eq!(fenced.deadline, deadline.get());
+    assert_eq!(fenced.retained.len(), 1);
+    assert_eq!(fenced.retained[0].key.attempt, ATTEMPT.get());
+    assert_eq!(fenced.retained[0].key.revision, revision);
+    assert_eq!(fenced.retained[0].key.ordinal, 0);
+    assert!(matches!(
+        &fenced.retained[0].completion,
+        WireCompletion::SampleResources {
+            sequence: 0,
+            result: Ok(result)
+        } if result.sequence == 0
+    ));
+}
+
+#[test]
+fn installed_two_job_launchd_recovers_applied_ack_without_touching_application() {
+    let mut installation = DisposableLaunchdInstallation::start().unwrap();
+    installation.assert_witnesses().unwrap();
+    let guardian = installation.guardian();
+    guardian.assert_original_parent().unwrap();
+    let path = guardian.store();
+    let deadline = guardian.deadline();
+    let original_guardian = guardian.guardian();
+    let original_child = guardian.child();
+    let mut runner = DisposableLaunchdRunnerJob::start(&mut installation).unwrap();
+    runner.assert_live().unwrap();
+    let initial_pid = runner.pid();
+    assert_eq!(
+        runner.marker("verified binding: InitialActive").unwrap(),
+        "verified binding: InitialActive"
+    );
+    let (mut store, key, pending) = assert_initial_applied_ack(
+        &mut runner,
+        &path,
+        original_guardian,
+        original_child,
+        deadline,
+    );
+    let NativeSamplingStatus::AppliedPendingAck {
+        sample,
+        applying_revision,
+        ..
+    } = pending
+    else {
+        panic!("expected durable applied pending ACK");
+    };
+    assert_eq!(sample.sequence, 0);
+    assert_eq!(sampling_rows(&path), (1, 1, 0, applying_revision.get(), 0));
+
+    assert_eq!(sampling_table_counts(&path), [1, 1, 0, 0, 0]);
+    let before = store.load_native_binding(ATTEMPT).unwrap().unwrap();
+    assert_eq!(before.identity().process, original_guardian);
+    assert_eq!(before.slots()[0].process, original_child);
+    assert_eq!(before.deadline(), deadline);
+    runner.kill().unwrap();
+    let fenced = detached(runner.guardian());
+    assert_fenced_sample(&fenced, key.revision().get(), deadline);
+    assert_eq!(sampling_table_counts(&path), [1, 1, 0, 0, 0]);
+    runner.assert_witnesses().unwrap();
+    runner.assert_initial_generation_evidence().unwrap();
+    runner.recover_applied_ack().unwrap();
+    runner.assert_initial_generation_evidence().unwrap();
+    runner.assert_live().unwrap();
+    assert_ne!(runner.pid(), initial_pid);
+    assert_eq!(
+        runner.marker("verified binding: Detached").unwrap(),
+        "verified binding: Detached"
+    );
+    runner
+        .marker("reconciling generation=2 interruption=")
+        .unwrap();
+    assert_eq!(
+        runner.marker("sample_ack_confirmed generation=2").unwrap(),
+        "sample_ack_confirmed generation=2"
+    );
+    runner.assert_live().unwrap();
+    runner.guardian().assert_original_parent().unwrap();
+    runner.assert_witnesses().unwrap();
+    runner.release().unwrap();
+    runner.success().unwrap();
+    assert_eq!(sampling_table_counts(&path), [1, 1, 1, 0, 0]);
+    assert_eq!(sampling_rows(&path), (1, 1, 1, applying_revision.get(), 0));
+    assert!(matches!(store.load_native_sampling_status(key).unwrap(),
+        Some(NativeSamplingStatus::SampleAckConfirmed { sample: confirmed, applying_revision: revision, confirming_session_generation, .. })
+        if confirmed == sample && revision == applying_revision && confirming_session_generation.get() == 2));
+    assert!(store
+        .pending_native_sampling_ack(ATTEMPT)
+        .unwrap()
+        .is_none());
+    let after = store.load_native_binding(ATTEMPT).unwrap().unwrap();
+    assert_eq!(after.identity(), before.identity());
+    assert_eq!(after.slots(), before.slots());
+    assert_eq!(after.deadline(), before.deadline());
+    let settled = detached(runner.guardian());
+    same_custody(&settled, &fenced);
+    assert!(settled.retained.is_empty());
+    assert_eq!(settled.state, WireState::DetachedFenced);
+    runner.guardian().assert_original_parent().unwrap();
+    assert!(MonotonicTick::native_now().unwrap() < deadline);
+    runner.assert_witnesses().unwrap();
+    runner.finish().unwrap();
+    installation.assert_witnesses().unwrap();
+    drop(store);
+    installation.finish().unwrap();
 }
 
 #[test]

@@ -13,10 +13,16 @@ use phoenix_deployment_controller::{
 };
 #[cfg(unix)]
 use std::{
-    ffi::OsString,
+    ffi::{CString, OsString},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     num::{NonZeroU32, NonZeroUsize},
-    path::{Path, PathBuf},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+        io::{AsRawFd, FromRawFd},
+    },
+    path::{Component, Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -39,7 +45,7 @@ enum RunnerMode {
         root: ProcessIdentity,
         fixture: InitialFixture,
     },
-    RecoverAppliedAck,
+    RecoverAppliedAck(AckRecoveryFixture),
     RecoverUnappliedSample {
         fixture: UnappliedRecoveryFixture,
     },
@@ -52,18 +58,29 @@ enum RunnerMode {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
 enum InitialFixture {
     Run,
-    PauseAfterObservation,
-    PauseAfterApplication,
+    PauseAfterObservation(ReleaseSource),
+    PauseAfterApplication(ReleaseSource),
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
+enum AckRecoveryFixture {
+    Run,
+    PauseAfterConfirmation(ReleaseSource),
+}
+
+#[cfg(unix)]
+enum ReleaseSource {
+    Stdin,
+    DisposableFile(PathBuf),
+}
+
+#[cfg(unix)]
 enum UnappliedRecoveryFixture {
     Run,
     PauseAfterVerification,
+    PauseAfterVerificationFile(ReleaseSource),
 }
 
 #[cfg(unix)]
@@ -102,8 +119,79 @@ impl RecoveryRun {
 }
 
 #[cfg(unix)]
+fn parse_number(args: &[OsString], index: usize, usage: &str) -> Result<u64, String> {
+    args.get(index)
+        .and_then(|arg| arg.to_str())
+        .ok_or(usage.to_owned())?
+        .parse()
+        .map_err(|_| usage.to_owned())
+}
+
+#[cfg(unix)]
+fn parse_initial_sample(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
+    if !(16..=19).contains(&args.len())
+        || args[8] != "--deadline-nanoseconds"
+        || args[10] != "--root-pid"
+        || args[12] != "--root-birth-seconds"
+        || args[14] != "--root-birth-nanos"
+        || (args.len() != 16
+            && args[16] != "--fixture-pause-after-apply"
+            && args[16] != "--fixture-pause-after-observation")
+    {
+        return Err(usage.into());
+    }
+    let pid = u32::try_from(parse_number(args, 11, usage)?)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(usage)?;
+    let nanos = u32::try_from(parse_number(args, 15, usage)?).map_err(|_| usage)?;
+    let deadline = MonotonicTick::new(parse_number(args, 9, usage)?);
+    let root = ProcessIdentity::new(
+        ProcessId::new(pid),
+        BirthToken::new(parse_number(args, 13, usage)?, nanos).map_err(|_| usage)?,
+    );
+    let release = match args.len() {
+        16 | 17 => ReleaseSource::Stdin,
+        19 if args[17] == "--fixture-release-file" => {
+            let path = PathBuf::from(&args[18]);
+            validate_release_path(&path)?;
+            ReleaseSource::DisposableFile(path)
+        }
+        _ => return Err(usage.into()),
+    };
+    let fixture = match args.get(16).and_then(|flag| flag.to_str()) {
+        None if args.len() == 16 => InitialFixture::Run,
+        Some("--fixture-pause-after-observation") => InitialFixture::PauseAfterObservation(release),
+        Some("--fixture-pause-after-apply") => InitialFixture::PauseAfterApplication(release),
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::InitialSample {
+        deadline,
+        root,
+        fixture,
+    })
+}
+
+#[cfg(unix)]
+fn parse_recover_applied_ack(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
+    let fixture = match args {
+        [_, _, _, _, _, _, _, _] => AckRecoveryFixture::Run,
+        [_, _, _, _, _, _, _, _, pause, release, path]
+            if pause == "--fixture-pause-after-recovered-ack"
+                && release == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(path);
+            validate_release_path(&path)?;
+            AckRecoveryFixture::PauseAfterConfirmation(ReleaseSource::DisposableFile(path))
+        }
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::RecoverAppliedAck(fixture))
+}
+
+#[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply] | --fixture-pause-after-recovery-verification (recover-unapplied-sample only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -112,16 +200,9 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
     {
         return Err(usage.into());
     }
-    let number = |index: usize| -> Result<u64, String> {
-        args.get(index)
-            .and_then(|arg| arg.to_str())
-            .ok_or(usage.to_owned())?
-            .parse()
-            .map_err(|_| usage.to_owned())
-    };
     let mode = match args[1].to_str().ok_or(usage)? {
         "observe-only" if args.len() == 10 && args[8] == "--observe-seconds" => {
-            let seconds = number(9)?;
+            let seconds = parse_number(args, 9, usage)?;
             if !(1..=60).contains(&seconds) {
                 return Err(usage.into());
             }
@@ -129,7 +210,7 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
                 observe_seconds: seconds,
             }
         }
-        "recover-applied-ack" if args.len() == 8 => RunnerMode::RecoverAppliedAck,
+        "recover-applied-ack" => parse_recover_applied_ack(args, usage)?,
         "recover-unapplied-sample" if args.len() == 8 => RunnerMode::RecoverUnappliedSample {
             fixture: UnappliedRecoveryFixture::Run,
         },
@@ -138,6 +219,19 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
         {
             RunnerMode::RecoverUnappliedSample {
                 fixture: UnappliedRecoveryFixture::PauseAfterVerification,
+            }
+        }
+        "recover-unapplied-sample"
+            if args.len() == 11
+                && args[8] == "--fixture-pause-after-recovery-verification"
+                && args[9] == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(&args[10]);
+            validate_release_path(&path)?;
+            RunnerMode::RecoverUnappliedSample {
+                fixture: UnappliedRecoveryFixture::PauseAfterVerificationFile(
+                    ReleaseSource::DisposableFile(path),
+                ),
             }
         }
         "recover-and-finish" if args.len() == 8 => RunnerMode::RecoverAndFinish {
@@ -163,37 +257,7 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
                 fixture: SampleFixture::ActivationAndSampleBarriers,
             }
         }
-        "initial-sample"
-            if (args.len() == 16 || args.len() == 17)
-                && args[8] == "--deadline-nanoseconds"
-                && args[10] == "--root-pid"
-                && args[12] == "--root-birth-seconds"
-                && args[14] == "--root-birth-nanos"
-                && (args.len() == 16
-                    || args[16] == "--fixture-pause-after-apply"
-                    || args[16] == "--fixture-pause-after-observation") =>
-        {
-            let pid = u32::try_from(number(11)?)
-                .ok()
-                .and_then(NonZeroU32::new)
-                .ok_or(usage)?;
-            let nanos = u32::try_from(number(15)?).map_err(|_| usage)?;
-            RunnerMode::InitialSample {
-                deadline: MonotonicTick::new(number(9)?),
-                root: ProcessIdentity::new(
-                    ProcessId::new(pid),
-                    BirthToken::new(number(13)?, nanos).map_err(|_| usage)?,
-                ),
-                fixture: match args.get(16).and_then(|flag| flag.to_str()) {
-                    None => InitialFixture::Run,
-                    Some("--fixture-pause-after-observation") => {
-                        InitialFixture::PauseAfterObservation
-                    }
-                    Some("--fixture-pause-after-apply") => InitialFixture::PauseAfterApplication,
-                    _ => return Err(usage.into()),
-                },
-            }
-        }
+        "initial-sample" => parse_initial_sample(args, usage)?,
         _ => return Err(usage.into()),
     };
     Ok(RunnerConfig {
@@ -459,6 +523,7 @@ fn run_recover_applied_ack(
     store: &mut ControllerSqliteStore,
     client: &mut GuardianClient,
     key: phoenix_deployment_controller::DispatchKey,
+    fixture: &AckRecoveryFixture,
 ) -> Result<(), String> {
     let confirmed = recover_native_sampling_ack(store, client, key)
         .map_err(|error| format!("ACK recovery: {error:?}"))?;
@@ -469,8 +534,18 @@ fn run_recover_applied_ack(
     else {
         return Err("recovery did not confirm ACK".into());
     };
+    let gate = match fixture {
+        AckRecoveryFixture::PauseAfterConfirmation(release) => Some(release.prepare()?),
+        AckRecoveryFixture::Run => None,
+    };
     println!("sample_ack_confirmed generation={confirming_session_generation}");
-    std::io::stdout().flush().map_err(|error| error.to_string())
+    std::io::stdout()
+        .flush()
+        .map_err(|error| error.to_string())?;
+    if let Some(gate) = gate {
+        gate.wait()?;
+    }
+    Ok(())
 }
 
 fn preflight_recover_and_finish(
@@ -668,7 +743,7 @@ fn run_recover_unapplied_sample(
     client: &mut GuardianClient,
     attempt: AttemptId,
     session: phoenix_deployment_controller::guardian_ipc::WireSession,
-    fixture: UnappliedRecoveryFixture,
+    fixture: &UnappliedRecoveryFixture,
 ) -> Result<(), String> {
     let loaded = store
         .load_attempt(attempt)
@@ -681,7 +756,15 @@ fn run_recover_unapplied_sample(
     let verified = client
         .verify_recovered_native_sampling(candidate)
         .map_err(|error| format!("verify recovered sample: {error:?}"))?;
-    if matches!(fixture, UnappliedRecoveryFixture::PauseAfterVerification) {
+    if !matches!(fixture, UnappliedRecoveryFixture::Run) {
+        let gate = match fixture {
+            UnappliedRecoveryFixture::PauseAfterVerificationFile(release) => {
+                Some(release.prepare()?)
+            }
+            UnappliedRecoveryFixture::Run | UnappliedRecoveryFixture::PauseAfterVerification => {
+                None
+            }
+        };
         println!(
             "recovered_sample_verified_pending_application revision={} sequence={}",
             issue.key().revision().get(),
@@ -690,7 +773,11 @@ fn run_recover_unapplied_sample(
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
-        activation_barrier(FinishFixture::ActivationBarriers)?;
+        if let Some(gate) = gate {
+            gate.wait()?;
+        } else {
+            activation_barrier(FinishFixture::ActivationBarriers)?;
+        }
     }
     let applied = store
         .apply_recovered_native_sampling(verified)
@@ -744,15 +831,196 @@ fn dispatch_sampling(
     }
 }
 
-fn initial_fixture_gate() -> Result<(), String> {
-    let mut byte = [0];
-    std::io::stdin()
-        .read_exact(&mut byte)
-        .map_err(|error| format!("fixture gate EOF: {error}"))?;
-    if byte != [b'R'] {
-        return Err("invalid fixture gate release".into());
+#[cfg(unix)]
+fn release_leaf(path: &Path) -> Result<OsString, String> {
+    let components: Vec<_> = path.components().collect();
+    if !matches!(components.as_slice(), [Component::RootDir, Component::Normal(tmp), Component::Normal(root), Component::Normal(file)]
+        if *tmp == "tmp" && root.to_str().is_some_and(|s| s.starts_with("sdc-disposable-") && s.len() > "sdc-disposable-".len()) && *file == "runner-release.signal")
+    {
+        return Err("release file must be directly below a disposable /tmp root".into());
     }
-    Ok(())
+    Ok(path
+        .file_name()
+        .ok_or("missing release leaf")?
+        .to_os_string())
+}
+
+#[cfg(unix)]
+type ReleaseIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn metadata_identity(metadata: &fs::Metadata) -> ReleaseIdentity {
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(target_os = "macos")]
+fn stat_identity(stat: &libc::stat) -> Result<ReleaseIdentity, String> {
+    let device = u64::try_from(stat.st_dev).map_err(|_| "negative release device id")?;
+    Ok((device, stat.st_ino))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn stat_identity(stat: &libc::stat) -> ReleaseIdentity {
+    (stat.st_dev, stat.st_ino)
+}
+
+#[cfg(unix)]
+fn baseline_leaf(directory: &File, leaf: &OsString) -> Result<Option<ReleaseIdentity>, String> {
+    let leaf = CString::new(leaf.as_bytes()).map_err(|e| e.to_string())?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: leaf is NUL-terminated, directory owns a live fd, and stat is writable.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error.to_string())
+        };
+    }
+    // SAFETY: successful fstatat initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_mode & 0o777 != 0o600
+    {
+        return Err("release file is not a private regular file".into());
+    }
+    #[cfg(target_os = "macos")]
+    let identity = stat_identity(&stat)?;
+    #[cfg(not(target_os = "macos"))]
+    let identity = stat_identity(&stat);
+    Ok(Some(identity))
+}
+
+#[cfg(unix)]
+enum PreparedReleaseGate {
+    Stdin,
+    File {
+        directory: File,
+        leaf: OsString,
+        before: Option<ReleaseIdentity>,
+    },
+}
+
+#[cfg(unix)]
+impl ReleaseSource {
+    fn prepare(&self) -> Result<PreparedReleaseGate, String> {
+        match self {
+            Self::Stdin => Ok(PreparedReleaseGate::Stdin),
+            Self::DisposableFile(path) => {
+                let leaf = release_leaf(path)?;
+                let root = path.parent().ok_or("missing disposable root")?;
+                let directory = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(root)
+                    .map_err(|e| e.to_string())?;
+                let metadata = directory.metadata().map_err(|e| e.to_string())?;
+                if !metadata.is_dir()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o777 != 0o700
+                {
+                    return Err("release directory is not private".into());
+                }
+                let before = baseline_leaf(&directory, &leaf)?;
+                Ok(PreparedReleaseGate::File {
+                    directory,
+                    leaf,
+                    before,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn validate_release_path(path: &Path) -> Result<(), String> {
+    ReleaseSource::DisposableFile(path.to_owned())
+        .prepare()
+        .map(|_| ())
+}
+
+#[cfg(unix)]
+impl PreparedReleaseGate {
+    fn poll_once(&self) -> Result<bool, String> {
+        let Self::File {
+            directory,
+            leaf,
+            before,
+        } = self
+        else {
+            return Err("stdin release cannot be polled".into());
+        };
+        let leaf = CString::new(leaf.as_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: the pinned directory fd is live and the leaf is NUL-terminated.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error.to_string())
+            };
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.len() != 1
+        {
+            return Err("release file is not a one-byte private regular file".into());
+        }
+        if Some(metadata_identity(&metadata)) == *before {
+            return Ok(false);
+        }
+        let mut byte = [0];
+        file.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte != [b'R'] {
+            return Err("invalid fixture gate release".into());
+        }
+        Ok(true)
+    }
+
+    fn wait(self) -> Result<(), String> {
+        if matches!(&self, Self::Stdin) {
+            let mut byte = [0];
+            std::io::stdin()
+                .read_exact(&mut byte)
+                .map_err(|error| format!("fixture gate EOF: {error}"))?;
+            return if byte == [b'R'] {
+                Ok(())
+            } else {
+                Err("invalid fixture gate release".into())
+            };
+        }
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            if self.poll_once()? {
+                return Ok(());
+            }
+            if Instant::now() >= until {
+                return Err("fixture release file timed out".into());
+            }
+            // test-timing-allow: deadline is only an outer liveness guard; file observation is causal.
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 fn run_initial_sample(
@@ -760,7 +1028,7 @@ fn run_initial_sample(
     store: &mut ControllerSqliteStore,
     client: &mut GuardianClient,
     committed: CommittedTransition,
-    fixture: InitialFixture,
+    fixture: &InitialFixture,
 ) -> Result<(), String> {
     let binding = store
         .load_native_binding(config.attempt)
@@ -775,7 +1043,7 @@ fn run_initial_sample(
     let verified = client
         .observe_native_sampling(dispatched)
         .map_err(|error| format!("observe sample: {error:?}"))?;
-    if matches!(fixture, InitialFixture::PauseAfterObservation) {
+    if let InitialFixture::PauseAfterObservation(release) = fixture {
         let snapshot = client
             .snapshot()
             .map_err(|error| format!("observed snapshot: {error:?}"))?;
@@ -788,6 +1056,7 @@ fn run_initial_sample(
         {
             return Err("observation fixture lacks exact active retained sample".into());
         }
+        let gate = release.prepare()?;
         println!(
             "sample_observed_pending_application revision={} sequence={} snapshot={}",
             issue.key().revision().get(),
@@ -797,7 +1066,7 @@ fn run_initial_sample(
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
-        initial_fixture_gate()?;
+        gate.wait()?;
     }
     let progress = policy
         .apply_native_sampling(verified, store)
@@ -819,7 +1088,8 @@ fn run_initial_sample(
     if key != issue.key() {
         return Err("wrong pending ACK".into());
     }
-    if matches!(fixture, InitialFixture::PauseAfterApplication) {
+    if let InitialFixture::PauseAfterApplication(release) = fixture {
+        let gate = release.prepare()?;
         println!(
             "application_committed_pending_ack revision={}",
             key.revision().get()
@@ -827,7 +1097,7 @@ fn run_initial_sample(
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
-        initial_fixture_gate()?;
+        gate.wait()?;
     }
     let confirmed = recover_native_sampling_ack(store, client, key)
         .map_err(|error| format!("ACK: {error:?}"))?;
@@ -851,7 +1121,7 @@ fn main() -> Result<(), String> {
     ) {
         preflight_recover_and_finish(&mut store, config.attempt)?;
     }
-    let pending_recovery_key = if matches!(config.mode, RunnerMode::RecoverAppliedAck) {
+    let pending_recovery_key = if matches!(config.mode, RunnerMode::RecoverAppliedAck(_)) {
         Some(
             store
                 .pending_native_sampling_ack(config.attempt)
@@ -880,7 +1150,7 @@ fn main() -> Result<(), String> {
     }
     if matches!(
         config.mode,
-        RunnerMode::RecoverAppliedAck
+        RunnerMode::RecoverAppliedAck(_)
             | RunnerMode::RecoverUnappliedSample { .. }
             | RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
@@ -922,14 +1192,14 @@ fn main() -> Result<(), String> {
                 RunnerMode::RecoverFinishAndSample { .. }
                 | RunnerMode::ObserveOnly { .. }
                 | RunnerMode::InitialSample { .. }
-                | RunnerMode::RecoverAppliedAck
+                | RunnerMode::RecoverAppliedAck(_)
                 | RunnerMode::RecoverUnappliedSample { .. } => FinishFixture::Run,
             },
         )?)
     };
-    match config.mode {
+    match &config.mode {
         RunnerMode::ObserveOnly { observe_seconds } => {
-            observe_until(&mut client, &snapshot, observe_seconds)
+            observe_until(&mut client, &snapshot, *observe_seconds)
         }
         RunnerMode::RecoverAndFinish { fixture } => run_recover_and_finish(
             &mut store,
@@ -937,7 +1207,7 @@ fn main() -> Result<(), String> {
             config.attempt,
             &snapshot,
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
-            RecoveryRun::Finish(fixture),
+            RecoveryRun::Finish(*fixture),
         ),
         RunnerMode::RecoverFinishAndSample { fixture } => run_recover_and_finish(
             &mut store,
@@ -945,7 +1215,7 @@ fn main() -> Result<(), String> {
             config.attempt,
             &snapshot,
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
-            RecoveryRun::FinishAndSample(fixture),
+            RecoveryRun::FinishAndSample(*fixture),
         ),
         RunnerMode::RecoverUnappliedSample { fixture } => run_recover_unapplied_sample(
             &mut store,
@@ -954,10 +1224,11 @@ fn main() -> Result<(), String> {
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
             fixture,
         ),
-        RunnerMode::RecoverAppliedAck => run_recover_applied_ack(
+        RunnerMode::RecoverAppliedAck(fixture) => run_recover_applied_ack(
             &mut store,
             &mut client,
             pending_recovery_key.ok_or("missing preflight pending ACK")?,
+            fixture,
         ),
         RunnerMode::InitialSample { fixture, .. } => run_initial_sample(
             &config,
@@ -997,6 +1268,249 @@ mod tests {
     }
 
     #[test]
+    fn release_file_is_only_allowed_with_one_initial_pause_and_private_disposable_path() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("runner-release.signal");
+        assert!(validate_release_path(&path).is_ok());
+        let mut initial = args("initial-sample");
+        initial.extend(
+            [
+                "--deadline-nanoseconds",
+                "100",
+                "--root-pid",
+                "42",
+                "--root-birth-seconds",
+                "1",
+                "--root-birth-nanos",
+                "0",
+            ]
+            .map(OsString::from),
+        );
+        let mut paused = initial.clone();
+        paused.push("--fixture-pause-after-apply".into());
+        paused.push("--fixture-release-file".into());
+        paused.push(path.as_os_str().into());
+        assert!(matches!(
+            parse_args(&paused),
+            Ok(RunnerConfig {
+                mode: RunnerMode::InitialSample {
+                    fixture: InitialFixture::PauseAfterApplication(ReleaseSource::DisposableFile(
+                        _
+                    )),
+                    ..
+                },
+                ..
+            })
+        ));
+        let mut observe = args("observe-only");
+        observe.extend([OsString::from("--observe-seconds"), OsString::from("5")]);
+        for mut invalid in [initial.clone(), args("recover-applied-ack"), observe] {
+            invalid.extend([
+                OsString::from("--fixture-release-file"),
+                path.as_os_str().into(),
+            ]);
+            assert!(parse_args(&invalid).is_err());
+        }
+        for tail in [
+            vec!["--fixture-release-file"],
+            vec!["--fixture-release-file", "--fixture-pause-after-apply"],
+            vec!["--fixture-release-file", "/tmp/elsewhere"],
+        ] {
+            let mut invalid = paused.clone();
+            invalid.extend(tail.into_iter().map(OsString::from));
+            assert!(parse_args(&invalid).is_err());
+        }
+        let mut missing = paused.clone();
+        missing.pop();
+        assert!(parse_args(&missing).is_err());
+        let mut wrong = paused.clone();
+        wrong[18] = root.path().join("other.signal").into_os_string();
+        assert!(parse_args(&wrong).is_err());
+        for path in [
+            Path::new("/tmp/sdc-disposable-x/../runner-release.signal"),
+            Path::new("/tmp/sdc-disposable-x/nested/runner-release.signal"),
+            Path::new("/var/tmp/sdc-disposable-x/runner-release.signal"),
+        ] {
+            assert!(validate_release_path(path).is_err());
+        }
+        symlink("/tmp/target", &path).unwrap();
+        assert!(validate_release_path(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"R").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_release_path(&path).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_release_path(&path).is_err());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_release_path(&root.path().join("runner-release.signal")).is_err());
+    }
+
+    #[test]
+    fn prepared_file_gate_accepts_release_created_after_prepare() {
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("runner-release.signal");
+        let gate = ReleaseSource::DisposableFile(path.clone())
+            .prepare()
+            .unwrap();
+        fs::write(&path, b"R").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        gate.wait().unwrap();
+    }
+
+    #[test]
+    fn prepared_file_gate_refuses_fifo_without_blocking() {
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("runner-release.signal");
+        let gate = ReleaseSource::DisposableFile(path.clone())
+            .prepare()
+            .unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo reads the NUL-terminated name and does not retain it.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let start = Instant::now();
+        assert!(gate.poll_once().is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn prepared_file_gate_ignores_replaced_parent_path() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = tempfile::tempdir_in("/tmp").unwrap();
+        let path = root.path().join("runner-release.signal");
+        let gate = ReleaseSource::DisposableFile(path.clone())
+            .prepare()
+            .unwrap();
+        let renamed = root.path().with_extension("moved");
+        fs::rename(root.path(), &renamed).unwrap();
+        let outside_release = outside.path().join("runner-release.signal");
+        fs::write(&outside_release, b"R").unwrap();
+        fs::set_permissions(&outside_release, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(outside.path(), root.path()).unwrap();
+        assert!(!gate.poll_once().unwrap());
+        fs::remove_file(root.path()).unwrap();
+        fs::remove_dir_all(renamed).unwrap();
+    }
+
+    #[test]
+    fn unapplied_verification_file_gate_requires_private_disposable_path() {
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = args("recover-unapplied-sample");
+        command.extend([
+            OsString::from("--fixture-pause-after-recovery-verification"),
+            OsString::from("--fixture-release-file"),
+            root.path().join("runner-release.signal").into_os_string(),
+        ]);
+        assert!(matches!(
+            parse_args(&command),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverUnappliedSample {
+                    fixture: UnappliedRecoveryFixture::PauseAfterVerificationFile(
+                        ReleaseSource::DisposableFile(_)
+                    )
+                },
+                ..
+            })
+        ));
+        command[10] = OsString::from("/tmp/other/runner-release.signal");
+        assert!(parse_args(&command).is_err());
+    }
+
+    #[test]
+    fn recovered_ack_pause_requires_exact_file_gate_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .prefix("sdc-disposable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("runner-release.signal");
+        let mut paused = args("recover-applied-ack");
+        paused.extend([
+            OsString::from("--fixture-pause-after-recovered-ack"),
+            OsString::from("--fixture-release-file"),
+            path.as_os_str().into(),
+        ]);
+        assert!(matches!(
+            parse_args(&paused),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverAppliedAck(AckRecoveryFixture::PauseAfterConfirmation(
+                    ReleaseSource::DisposableFile(_)
+                )),
+                ..
+            })
+        ));
+        for size in [9, 10] {
+            assert!(
+                parse_args(&paused[..size]).is_err(),
+                "missing release arg {size}"
+            );
+        }
+        let mut invalid = paused.clone();
+        invalid[9] = "--fixture-pause-after-recovered-ack".into();
+        assert!(parse_args(&invalid).is_err(), "duplicate pause flag");
+        invalid = paused.clone();
+        invalid.extend(paused[8..].iter().cloned());
+        assert!(parse_args(&invalid).is_err(), "duplicate flag group");
+        invalid = paused.clone();
+        invalid[10] = root.path().join("other.signal").into_os_string();
+        assert!(parse_args(&invalid).is_err(), "wrong release path");
+        for mode in [
+            "observe-only",
+            "initial-sample",
+            "recover-unapplied-sample",
+            "recover-and-finish",
+            "recover-finish-and-sample",
+        ] {
+            let mut candidate = args(mode);
+            if mode == "observe-only" {
+                candidate.extend(["--observe-seconds", "5"].map(OsString::from));
+            }
+            if mode == "initial-sample" {
+                candidate.extend(
+                    [
+                        "--deadline-nanoseconds",
+                        "100",
+                        "--root-pid",
+                        "42",
+                        "--root-birth-seconds",
+                        "1",
+                        "--root-birth-nanos",
+                        "0",
+                    ]
+                    .map(OsString::from),
+                );
+            }
+            candidate.extend(paused[8..].iter().cloned());
+            assert!(parse_args(&candidate).is_err(), "cross-mode {mode}");
+        }
+        let mut no_file = args("recover-applied-ack");
+        no_file.push("--fixture-pause-after-recovered-ack".into());
+        assert!(parse_args(&no_file).is_err(), "stdin not accepted");
+    }
+
+    #[test]
     fn runner_modes_parse_into_variant_specific_configs() {
         let mut observe = args("observe-only");
         observe.extend([OsString::from("--observe-seconds"), OsString::from("5")]);
@@ -1010,7 +1524,7 @@ mod tests {
         assert!(matches!(
             parse_args(&args("recover-applied-ack")),
             Ok(RunnerConfig {
-                mode: RunnerMode::RecoverAppliedAck,
+                mode: RunnerMode::RecoverAppliedAck(AckRecoveryFixture::Run),
                 ..
             })
         ));
@@ -1042,7 +1556,7 @@ mod tests {
             parse_args(&initial),
             Ok(RunnerConfig {
                 mode: RunnerMode::InitialSample {
-                    fixture: InitialFixture::PauseAfterApplication,
+                    fixture: InitialFixture::PauseAfterApplication(ReleaseSource::Stdin),
                     ..
                 },
                 ..
@@ -1086,39 +1600,22 @@ mod tests {
                 ..
             })
         ));
-        for (flag, fixture) in [
-            (
-                "--fixture-pause-after-observation",
-                InitialFixture::PauseAfterObservation,
-            ),
-            (
-                "--fixture-pause-after-apply",
-                InitialFixture::PauseAfterApplication,
-            ),
+        for flag in [
+            "--fixture-pause-after-observation",
+            "--fixture-pause-after-apply",
         ] {
             let mut selected = initial.clone();
             selected.push(flag.into());
             assert!(matches!(
-                (parse_args(&selected), fixture),
-                (
-                    Ok(RunnerConfig {
-                        mode: RunnerMode::InitialSample {
-                            fixture: InitialFixture::PauseAfterObservation,
-                            ..
-                        },
+                parse_args(&selected),
+                Ok(RunnerConfig {
+                    mode: RunnerMode::InitialSample {
+                        fixture: InitialFixture::PauseAfterObservation(ReleaseSource::Stdin)
+                            | InitialFixture::PauseAfterApplication(ReleaseSource::Stdin),
                         ..
-                    }),
-                    InitialFixture::PauseAfterObservation
-                ) | (
-                    Ok(RunnerConfig {
-                        mode: RunnerMode::InitialSample {
-                            fixture: InitialFixture::PauseAfterApplication,
-                            ..
-                        },
-                        ..
-                    }),
-                    InitialFixture::PauseAfterApplication
-                )
+                    },
+                    ..
+                })
             ));
             for second in [
                 "--fixture-pause-after-observation",
@@ -1322,7 +1819,7 @@ mod tests {
                     &mut store,
                     &mut client,
                     committed,
-                    InitialFixture::Run,
+                    &InitialFixture::Run,
                 )
                 .unwrap_err();
                 assert!(
@@ -1570,6 +2067,10 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sample_barrier_fixtures_are_restricted_to_their_modes() {
         for mode in [
             "observe-only",
             "initial-sample",
@@ -1598,6 +2099,7 @@ mod tests {
             for (flag, owner) in [
                 ("--fixture-pause-after-observation", "initial-sample"),
                 ("--fixture-pause-after-apply", "initial-sample"),
+                ("--fixture-pause-after-recovered-ack", "none"),
                 ("--fixture-pause-before-begin", "recover-and-finish"),
                 ("--fixture-activation-barriers", "recover-and-finish"),
                 (
@@ -1614,6 +2116,10 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sample_mode_refuses_other_mode_options_with_its_usage() {
         for options in [
             vec!["--observe-seconds", "5"],
             vec![
