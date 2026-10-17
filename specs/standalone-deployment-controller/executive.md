@@ -159,8 +159,10 @@ SQLite regressions cover exact deletion, rollback, absent-row replay, key/sequen
 guardian mismatch, and applied/confirmed refusal. Compile-fail examples cover construction
 and Clone denial; client tests cover pre-admit refusal/connection closure and post-submit
 ambiguity. An initial-runner regression covers deadline and admission-refusal cancellation.
-Linux controller tests and all-target Clippy pass locally; hosted macOS continuation
-evidence remains pending.
+Linux controller tests and all-target Clippy pass locally. Exact-head macOS
+[run 39012241514](https://github.com/scottopell/phoenix-ide/actions/runs/39012241514)
+and full CI [run 39012245789](https://github.com/scottopell/phoenix-ide/actions/runs/39012245789)
+pass at `1d6f09bb40cf617a0fdbf13275e6297b8d047702`.
 
 No schema, protocol, executor, general dispatch, or signal surface changes accompany this unit.
 
@@ -196,15 +198,15 @@ direct-process death/lost-ACK/activation-only journeys remain unchanged. Four la
 shape/parser tests still cover disposable namespace/paths, direct escaped plist arguments,
 exact-job absence classification, and complete native identity parsing.
 The launchd-free continuation/parser/IPC units pass local Linux controller tests and all-target
-Clippy. The direct and launchd process journeys are not hosted-qualified by this slice. The prior
-green launchd run does not qualify this continuation. Hosted launchd qualification requires the
-invoking UID's logged-in GUI domain. Missing domain/bootstrap permission is an explicit
-failure, never a silent skip or user/system-domain fallback.
+Clippy. The direct and launchd process journeys pass exact-head macOS run `39012241514`.
+Manual duplicate run `39012244386` failed explicitly before guardian startup when that runner
+lacked GUI-domain bootstrap permission; it did not silently skip, fall back to a user/system
+domain, or touch an installed agent.
 
-The remaining native contract requires hosted qualification of the new bounded continuation,
-generalized mutation dispatch, a general continuing `PolicyLoop` over IPC, and production-exclusive store
-ownership. Guardian replacement, cross-boot recovery, installer integration, and
-production adoption remain outside this pre-adoption qualification.
+The remaining native contract requires runner-death recovery before application commit,
+generalized mutation dispatch, a general continuing `PolicyLoop` over IPC, and
+production-exclusive store ownership. Guardian replacement, cross-boot recovery, installer
+integration, and production adoption remain outside this pre-adoption qualification.
 
 ## Requirement coverage
 
@@ -221,15 +223,15 @@ production adoption remain outside this pre-adoption qualification.
 | REQ-SDC-009 | `CompatibilityBoundary::CandidateMigrationInvoked` retains full commit plus artifact digest and recovers only through candidate reverification. |
 | REQ-SDC-010 | `ControllerOs` is typed and fake-backed; hosted macOS tests qualify native observation and fail-closed capacity/contention sampling, including counter-regression and capacity-arithmetic regressions. |
 | REQ-SDC-011 | The standalone `ControllerSqliteStore` owns exact schema-v5 normalized attempt, policy-child, guardian-binding/session/slot, native sampling issue/application/ACK-confirmation, and native reconciliation-completion/activation rows with revision compare-and-swap, strict load validation, affine recovery evidence, and fail-stop poisoning. It is distinct from the Phoenix application database. Production-exclusive store ownership remains a gap. |
-| REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. Native disconnect fences, fresh interruption revisions outpace unfinished reconciliation, and the original monotonic deadline refuses expired release/begin. The preceding disposable launchd ownership/activation-only journey passes run `39009502330`; the extended one-sample continuation is authored but not hosted-qualified. Guardian replacement and production recovery remain unresolved risk. |
+| REQ-SDC-012 | `SupervisedChild` retains a direct child through original-group finalization. Native disconnect fences, fresh interruption revisions outpace unfinished reconciliation, and the original monotonic deadline refuses expired release/begin. The preceding disposable launchd ownership/activation-only journey passes run `39009502330`; the extended one-sample continuation passes run `39012241514`. Guardian replacement and production recovery remain unresolved risk. |
 | REQ-SDC-013 | `driver` issues affine correlated tickets only from committed plans; exhaustive executor, CLI, completion-to-checkpoint, guardian integration, replay, and capacity-reservation coverage pass full CI/macOS at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
 | REQ-SDC-014 | Safe binary status/closeout, `open_existing`, typed JSON and category exits, and isolated CLI regressions cover missing stores, phase fences, CAS/load poisoning, malformed arguments, and non-native scope; hosted qualification passes at `907ca04670f46c5c2ea9f0b15993a996a83ac911`. |
-| REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The disposable initial runner owns one committed sampling round end to end; a distinct replacement runner settles its pending ACK after death. The guardian remains the harmless child's original parent. A test-only exact-label launchd adapter and preceding three-independent-runner death/ACK/two-phase-activation journey pass run `39009502330`. The distinct one-retained-sample continuation mode and extended direct/launchd journeys are authored but unqualified; a general continuing policy loop remains a gap. |
+| REQ-SDC-015 | Separate guardian and runner executables preserve the status/closeout-only safe CLI. The disposable initial runner owns one committed sampling round end to end; a distinct replacement runner settles its pending ACK after death. The guardian remains the harmless child's original parent. A test-only exact-label launchd adapter and preceding three-independent-runner death/ACK/two-phase-activation journey pass run `39009502330`. The distinct one-retained-sample continuation mode and extended direct/launchd journeys pass run `39012241514`; a general continuing policy loop remains a gap. |
 | REQ-SDC-016 | Owner-only path checks, same-UID peer admission, exact source-input digest Hello identity, protocol-v4 four-byte big-endian bounded typed JSON framing, strict request fields, version-3/malformed/oversized-frame fencing, and replacement connections pass exact-head macOS/full-CI qualification at `55a90279c54ea30c82f3803d80efd340db319a88`. |
 | REQ-SDC-017 | Explicit wire DTOs remain separate from affine tickets. The native server independently validates durable evidence before consuming its initial gate, entering reconciliation, minting one-use exact sampling admission, dropping retained successful-sample custody after application, or preparing and activating sampling reconciliation. Live preparation, durable activation, and final live activation each consume a distinct opaque capability; completion/activation rows and wire locators cannot construct them. General mutation remains refused. |
-| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated reconciliation are implemented for the bounded resource-sampling path. Schema v5 persists exact sampling issue/application/confirmation, immutable prepared completion, and separate atomic activation evidence, with relational insertion guards and rollback/replay tests. Separate fresh runners settle `AppliedPendingAck` and later complete a newer reconciliation generation without redispatch or reapplication. Activation-only recovery does not execute its retained ticket. A distinct authored continuation retains the original loop/ticket through activation and executes exactly one new sample with atomic application and ACK confirmation. Ownership-tree reconciliation and general continuing post-activation orchestration remain gaps; this new bounded continuation awaits hosted qualification. |
+| REQ-SDC-018 | Normalized exact guardian/session/slot binding, binding-before-workload release, persisted liveness refresh, durable fresh interruption, and guardian-validated reconciliation are implemented for the bounded resource-sampling path. Schema v5 persists exact sampling issue/application/confirmation, immutable prepared completion, and separate atomic activation evidence, with relational insertion guards and rollback/replay tests. Separate fresh runners settle `AppliedPendingAck` and later complete a newer reconciliation generation without redispatch or reapplication. Activation-only recovery does not execute its retained ticket. A distinct qualified continuation retains the original loop/ticket through activation and executes exactly one new sample with atomic application and ACK confirmation. Ownership-tree reconciliation and general continuing post-activation orchestration remain gaps. |
 | REQ-SDC-019 | Exact controller-store schema compatibility, source-input build identity, protocol-v4 admission with explicit version-3 rejection, and platform capability checks exist. The transport remains pre-adoption and same-build-only; no controller-store v3/v4 upgrade, downgrade, rolling/replacement/cross-boot promise is made, and no Phoenix application-DB migration is involved. |
-| REQ-SDC-020 | Linux policy/IPC/SQLite tests and macOS process tests cover exact source-input handshake, gated start, one native sample, original parenthood, runner death after application/before ACK, guardian receipt before a lost ACK response, same-live reconnection, durable confirmation with one issue/application, and pending-begin death/catch-up/two-phase activation without another effect; these pass exact-head macOS/full-CI qualification at `55a90279c54ea30c82f3803d80efd340db319a88`. The preceding test-only launchd three-runner application-death/ACK/reconciliation-activation journey and four launchd-free shape/parser units pass run `39009502330` and full CI `39009503934` at `26692b6daef41ef2ae2c4ca80ae17eb87ed07350`. The extended launchd and added direct-process three-barrier/one-sample-continuation journeys, mode-parser regression, and live-Reconciling admission regression are authored but unqualified. Runner death before application commit, post-activation mutation, ownership-tree reconciliation, guardian replacement, updater, and rollback scenarios remain required. |
+| REQ-SDC-020 | Linux policy/IPC/SQLite tests and macOS process tests cover exact source-input handshake, gated start, one native sample, original parenthood, runner death after application/before ACK, guardian receipt before a lost ACK response, same-live reconnection, durable confirmation with one issue/application, and pending-begin death/catch-up/two-phase activation without another effect; these pass exact-head macOS/full-CI qualification at `55a90279c54ea30c82f3803d80efd340db319a88`. The preceding test-only launchd three-runner application-death/ACK/reconciliation-activation journey and four launchd-free shape/parser units pass run `39009502330` and full CI `39009503934` at `26692b6daef41ef2ae2c4ca80ae17eb87ed07350`. The extended launchd and added direct-process three-barrier/one-sample-continuation journeys, mode-parser regression, and live-Reconciling admission regression pass macOS run `39012241514` and full CI `39012245789` at `1d6f09bb40cf617a0fdbf13275e6297b8d047702`. Runner death before application commit, post-activation mutation, ownership-tree reconciliation, guardian replacement, updater, and rollback scenarios remain required. |
 
 ## Next work
 
@@ -249,12 +251,13 @@ The reconciliation units pass exact-head macOS/full-CI qualification at
 `55a90279c54ea30c82f3803d80efd340db319a88`; the preceding launchd activation-only journey
 passes `39009502330` and full CI `39009503934` at
 `26692b6daef41ef2ae2c4ca80ae17eb87ed07350`.
-The bounded continuation support, mode-parser unit and live-Reconciling admission unit pass
-local Linux controller tests and Clippy. The direct-process and extended launchd journeys await
-hosted qualification; no local launchctl invocation was performed.
-The next controller-owned work is qualification of that bounded unit, runner death before
-application commit, general continuing orchestration beyond one retained sampling ticket,
-ownership-tree reconciliation, and the remaining process-death matrix. Those surfaces must complete
+The bounded continuation, mode-parser unit, live-Reconciling admission unit, direct-process
+journey, and extended launchd journey pass exact-head macOS run `39012241514` and full CI
+`39012245789` at `1d6f09bb40cf617a0fdbf13275e6297b8d047702`; no local launchctl invocation was
+performed.
+The next controller-owned work is runner death before application commit, general continuing
+orchestration beyond one retained sampling ticket, ownership-tree reconciliation, and the
+remaining process-death matrix. Those surfaces must complete
 REQ-SDC-015–020 and ADR-117 while preserving ADR-116 **detach-and-fence**, exact-instance
 recovery, the original absolute deadline, retained results, monotonic reconciliation generations,
 and whole-round signal-result reservation.
