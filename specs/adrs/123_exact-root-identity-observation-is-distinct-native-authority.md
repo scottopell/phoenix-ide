@@ -1,4 +1,4 @@
-# ADR-120: Exact-root identity observation is distinct native authority
+# ADR-123: Exact-root identity observation is distinct native authority
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-119 admits one bounded `ListChildren` operation for the exact guardian-owned root
+ADR-122 admits one bounded `ListChildren` operation for the exact guardian-owned root
 and deliberately stops at `CleaningOwnedTree`. An empty child list closes discovery but
 does not prove that the root is absent. Reaching `ReadyForDisruption` requires fresh
 PID-plus-birth observation of every acquired identity and no unresolved discovery.

@@ -104,6 +104,13 @@ AND SHALL NOT abandon an initialization future that may own an unregistered Chro
 WHEN `open` successfully navigates
 THE SYSTEM SHALL return the final URL, page title, compact interactive accessibility snapshot with usable references, and relevant console errors observed for that navigation.
 
+WHEN `open` targets the current URL
+THE SYSTEM SHALL reload the document while retaining the browser session, cookies, and origin storage.
+
+WHEN only the URL fragment changes
+THE SYSTEM SHALL preserve native navigation semantics
+AND SHALL NOT wait for a replacement document when the browser completes a same-document navigation.
+
 WHEN navigation succeeds but snapshot collection, console capture, or final URL/title observation fails
 THE SYSTEM SHALL preserve the successful navigation result and report each observation failure separately
 AND SHALL NOT represent the failed snapshot as an empty successful tree.
@@ -120,6 +127,18 @@ THE SYSTEM SHALL expose navigation, accessibility snapshots, JavaScript evaluati
 
 THE SYSTEM SHALL accept both accessibility references and CSS selectors for click and text input under REQ-BT-008, REQ-BT-009, and REQ-BT-025
 AND SHALL support `eval --stdin` for JavaScript input.
+
+WHEN `eval` returns a JSON-representable value
+THE SYSTEM SHALL expose that value as typed JSON in machine-readable output without requiring callers to parse a text wrapper.
+
+THE SYSTEM SHALL distinguish JavaScript `undefined` and non-JSON scalar values from JSON `null`
+AND SHALL preserve user-returned object keys as data, including names also used for artifact metadata.
+
+WHEN an evaluation result is externalized under REQ-BT-002
+THE SYSTEM SHALL identify the artifact's encoding and expose its saved handle explicitly.
+
+THE SYSTEM SHALL support `screenshot --output PATH`
+AND SHALL resolve a relative output path against the calling process's working directory before sending the request to the daemon.
 
 THE SYSTEM SHALL preserve profiling readiness boundaries, reset and warmup behavior, raw per-run samples, unavailable/null distinctions, warnings, and artifacts under REQ-BT-019
 AND SHALL preserve structured failure data, including blocked-step and methodology information, when the operation fails.
@@ -141,6 +160,9 @@ THE SYSTEM SHALL expose artifact paths explicitly
 AND SHALL return nonzero exit status for failed commands
 AND SHALL include stable error codes and actionable recovery instructions where recovery is possible.
 
+WHEN JavaScript evaluation throws
+THE SYSTEM SHALL return a concise human-readable message and preserve full exception context in structured error details.
+
 THE SYSTEM SHALL reject requests exceeding the 32 MiB encoded JSON message budget, including framing, before session lookup or startup
 AND SHALL report invalid input rather than an uncertain delivery outcome for requests that were never sent.
 
@@ -160,5 +182,7 @@ AND SHALL NOT automatically replay that operation or substitute a new browser li
 ### REQ-BCLI-012: Harness Usage Guidance
 
 THE SYSTEM SHALL provide concise usage guidance covering session binding and fallback sharing, open/snapshot/reference interaction, debugging artifacts, profiling, and explicit close.
+
+THE SYSTEM SHALL include a complete documentation URL in command help that remains useful outside the source checkout.
 
 **Rationale:** Harness authors should discover the intended workflow without reverse engineering daemon internals.

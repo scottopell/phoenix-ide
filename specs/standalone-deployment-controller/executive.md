@@ -56,8 +56,8 @@ survival, IPC correctness, or production orchestration.
 
 ## Native architecture contract
 
-[ADR-117](../adrs/117_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
-extends ADR-116 without changing its detach-and-fence decision. REQ-SDC-015–022
+[ADR-120](../adrs/120_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
+extends ADR-119 without changing its detach-and-fence decision. REQ-SDC-015–022
 specify separate same-build guardian and runner executables, owner-only Unix socket
 IPC with bounded length-prefixed typed JSON, and explicit wire DTOs that cannot
 materialize internal affine authority. The guardian mints one-use dispatch admissions
@@ -104,9 +104,9 @@ afterward leave the guardian non-active until activation or disconnect fencing. 
 activation diagnostics have private fields and cannot reconstruct either capability. Generic
 dispatch effects and signal/mutation remain refused.
 
-Schema v6 is the exact schema of the standalone controller-owned disposable store. It is
+Schema v7 is the exact schema of the standalone controller-owned disposable store. It is
 not the Phoenix application database and is not a Phoenix application-database migration.
-Exact predecessor schema-v5 controller stores and protocol-v5 peers fail closed before
+Exact predecessor schema-v6 controller stores and protocol-v7 peers fail closed before
 mutation; no upgrade, downgrade, mixed-build, or guardian-replacement promise is made.
 
 The disposable runner has structurally separate observe-only, initial-sample,
@@ -367,7 +367,7 @@ The remaining replacement gaps are explicit:
 The next controller-owned work is completed-before-application identity-observation recovery,
 terminal/failed retained-result settlement, discovered-child identity acquisition, signal
 mutation, general continuing orchestration, and the remaining process-death matrix. Those
-surfaces must extend REQ-SDC-015–022 and ADR-117/118/119/120 while preserving ADR-116
+surfaces must extend REQ-SDC-015–022 and ADR-120/121/122/123 while preserving ADR-119
 **detach-and-fence**, exact-instance
 recovery, the original absolute deadline, retained results, monotonic reconciliation generations,
 and whole-round signal-result reservation.

@@ -1,4 +1,4 @@
-# ADR-119: Owned-root child enumeration is distinct native authority
+# ADR-122: Owned-root child enumeration is distinct native authority
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-115 through ADR-118 establish controller durability, surviving-guardian fencing,
+ADR-118 through ADR-121 establish controller durability, surviving-guardian fencing,
 same-build native IPC, and application-only recovery for retained sampling results.
 Resource admission already produces an affine `ListChildren` successor, but the native
 path admitted only resource sampling. The wire representation of a PID and birth token

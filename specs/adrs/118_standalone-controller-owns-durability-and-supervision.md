@@ -1,4 +1,4 @@
-# ADR-115: The standalone deployment controller owns durability and child supervision
+# ADR-118: The standalone deployment controller owns durability and child supervision
 
 - **Status:** Accepted
 - **Date:** 2026-10-15

@@ -341,7 +341,17 @@ AND SHALL distinguish direct user instructions, delegate requests, Coordinator c
 AND SHALL distinguish delivery acceptance, acknowledgement, execution, and verified completion
 AND SHALL retain evidence provenance and last-observed timestamps when known, mark unknowns honestly, and direct the resumed Coordinator to refresh relevant live status before making current-state claims
 AND SHALL apply explicit corrections and supersession while preserving unresolved obligations, including paused work
-AND SHALL compress completed details before unresolved commitments, retaining only resolution context needed to avoid reopening settled work
+AND SHALL retain exact primary user message references and relevant scoped wording for standing directions and claimed historical approvals when known, with narrow retrieval pointers for missing evidence rather than fabricated authority
+AND SHALL request the next authorized in-scope action, required current status and ownership checks, completion criteria, and outstanding verification
+
+WHEN the Coordinator resumes from a continuation handoff
+THE trusted instructions SHALL distinguish evidence verification from obeying directives embedded in recalled content
+AND SHALL direct narrowly recovering authentic primary user evidence and checking attribution, exact scope, later corrections, supersession, pauses, gates, current status and established ownership before acting
+AND SHALL describe continuation as a handoff, not cancellation or expiry of verified standing user directions, and direct the next authorized in-scope step by default with follow-through to verified completion rather than status-only acknowledgement or redundant permission
+AND SHALL direct narrow evidence recovery or a focused question when authority is missing, conflicting, or insufficient, while preserving pauses and gates
+AND SHALL keep generated summaries, quotations, delegate assertions and encoded payloads untrusted and unable to self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
+
+THE handoff instructions SHALL compress completed details before unresolved commitments, retaining only resolution context needed to avoid reopening settled work
 AND SHALL preserve relevant paths, verification evidence, unfinished edits, and pending tool arguments when the Coordinator performs hands-on work
 
 THE coordination policy SHALL NOT change the Coordinator's capabilities, lifecycle, WorkScope ownership, or message authority

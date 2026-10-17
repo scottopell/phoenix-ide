@@ -32,10 +32,13 @@ phoenix-browser key Enter
 phoenix-browser wait '#results'
 phoenix-browser console
 phoenix-browser screenshot
+phoenix-browser screenshot --output ./page.png
 printf '%s\n' 'document.title' | phoenix-browser --json eval --stdin
 ```
 
 `open` returns URL, title, an interactive accessibility snapshot, and console errors captured for that navigation. Snapshot failure appears separately from navigation success. Large snapshots spill to a readable artifact; the returned refs work after reading it. Snapshot refs identify exact nodes and expire on a new snapshot attempt, document replacement, or browser replacement. Refresh the snapshot when a ref is stale. CSS selectors also work with click/type.
+
+To reload, run `open` with the current URL again. It loads a fresh document and resets page JavaScript state while retaining the same browser, cookies, and origin storage. Fragment changes follow Chrome's navigation behavior: adding or changing `#fragment` normally preserves the document, while removing it can reload. Every successful `open` collects a fresh snapshot; use its new refs.
 
 Navigation observation failures appear separately in `observation_errors`; console capture failure has its own `console_capture_error`. Reference input fails visibly when the browser cannot verify the native event destination, including a closed shadow root created without the early input guard.
 
@@ -44,6 +47,18 @@ Console capture includes errors from new child frames, including isolated cross-
 `--json` returns `session`, daemon `lifetime`, browser `browser_lifetime`, and a `status` tag: `success` with `result`, or `error` with `error.code` and `error.message`. Tool results include `text`, structured `data`, and explicit `artifacts`. Tool errors preserve structured failure data in `error.details` and any `error.artifacts`. Failed commands exit 1; invalid input exits 2 before looking up browser state. Human output prints concise operation text; JSON is the harness interface.
 
 Use `schema [COMMAND]` for the full operation parameters. Each command accepts `--input '{...}'`; this is especially useful for profiling. `--timeout 15s` controls operations that accept a timeout.
+
+`eval --json` returns `result.kind = "evaluation"`. Its `result.data` contains `{"kind":"json","value":...}` for JSON values, including `null`, or `{"kind":"undefined"}` for JavaScript `undefined`. Non-JSON scalars such as `NaN`, `Infinity`, `-0`, and BigInt use `{"kind":"unserializable","value":"..."}` with their JavaScript spelling. Returned object keys remain ordinary data, even when named `path` or `post`.
+
+```sh
+phoenix-browser --json eval '({title: document.title})' | jq '.result.data.value'
+```
+
+Results larger than 4 KiB use `json_artifact` or `unserializable_artifact` instead, with the saved path in `result.artifacts`: read the former as JSON and the latter as UTF-8 JavaScript scalar text. Human-readable eval output prints the value directly or the saved path.
+
+JavaScript exceptions print a concise message with a source location. In `--json` output, `error.details` retains the full CDP exception context, including the original description and stack when available. Long summaries are visibly shortened; inspect the structured details for the complete diagnostic.
+
+`screenshot --output PATH` saves the PNG at a chosen location and reports that path. Relative paths resolve from your current directory, including when the session daemon started elsewhere. The parent directory must exist; an existing regular file is overwritten. Symlink and non-file destinations are rejected. Without `--output`, screenshots use a generated temporary path. The shared screenshot schema accepts an absolute `path`.
 
 Use `--` before positional text that matches an option, for example `phoenix-browser type '#field' -- '--json'`.
 

@@ -6,7 +6,8 @@ use fs2::FileExt;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_tools::browser::{
-    BrowserAccess, BrowserOperation, BrowserSession, BrowserSessionManager,
+    BrowserAccess, BrowserEvalTool, BrowserEvaluation, BrowserEvaluationError, BrowserOperation,
+    BrowserSession, BrowserSessionManager,
 };
 use phoenix_tools::{ToolImage, ToolOutput};
 use serde_json::{json, Value};
@@ -261,6 +262,25 @@ impl CliImageArtifact {
     }
 }
 
+fn adapt_evaluation_error(
+    session: &str,
+    lifetime: &str,
+    error: &BrowserEvaluationError,
+) -> Response {
+    let mut response = Response::error(
+        session,
+        Some(lifetime),
+        ErrorCode::OperationFailed,
+        error.to_string(),
+    );
+    if let (Outcome::Error { error: failure }, Some(details)) =
+        (&mut response.outcome, error.exception())
+    {
+        failure.details = Some(json!(details));
+    }
+    response
+}
+
 async fn adapt(
     session: &str,
     lifetime: Option<&str>,
@@ -506,6 +526,46 @@ impl State {
             browser_lifetime,
         } = ready;
         let access = Existing(browser.clone());
+        if *operation == BrowserOperation::Eval {
+            let response = match BrowserEvalTool::evaluate(request.input.clone(), &access).await {
+                Ok(value) => {
+                    let (text, data, artifacts) = match value {
+                        BrowserEvaluation::Json(value) => (
+                            "JavaScript evaluated",
+                            json!({"kind":"json", "value":value}),
+                            Vec::new(),
+                        ),
+                        BrowserEvaluation::Undefined => (
+                            "JavaScript returned undefined",
+                            json!({"kind":"undefined"}),
+                            Vec::new(),
+                        ),
+                        BrowserEvaluation::Unserializable(value) => (
+                            "JavaScript returned a non-JSON value",
+                            json!({"kind":"unserializable", "value":value}),
+                            Vec::new(),
+                        ),
+                        BrowserEvaluation::UnserializableArtifact(path) => (
+                            "JavaScript non-JSON result saved to artifact",
+                            json!({"kind":"unserializable_artifact"}),
+                            vec![path.into_path()],
+                        ),
+                        BrowserEvaluation::JsonArtifact(path) => (
+                            "JavaScript result saved to artifact",
+                            json!({"kind":"json_artifact"}),
+                            vec![path.into_path()],
+                        ),
+                    };
+                    Response::success(
+                        &self.session,
+                        Some(&self.lifetime),
+                        json!({"kind":"evaluation","text":text,"data":data,"artifacts":artifacts}),
+                    )
+                }
+                Err(error) => adapt_evaluation_error(&self.session, &self.lifetime, &error),
+            };
+            return response.with_browser_lifetime(Some(browser_lifetime.clone()));
+        }
         let console_capture = if request.command == "open" {
             Some(
                 browser
@@ -716,9 +776,6 @@ async fn send_response(stream: &mut UnixStream, response: &Response) {
                     Outcome::Success { result } => collect_artifacts(result, &mut error.artifacts),
                     Outcome::Error { error: original } => {
                         error.artifacts.clone_from(&original.artifacts);
-                        if let Some(details) = &original.details {
-                            collect_artifacts(details, &mut error.artifacts);
-                        }
                     }
                 }
             }
@@ -1104,6 +1161,22 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn evaluation_error_values_remain_data_instead_of_artifact_handles() {
+        let details = serde_json::from_value(json!({
+            "exceptionId":1,"text":"Uncaught","lineNumber":0,"columnNumber":0,
+            "exception":{"type":"object","value":{"path":"user/path","post":"user/post","artifact_path":"user/artifact","artifacts":["user/data"],"raw_samples":[{"path":"user"}]}}
+        })).unwrap();
+        let error = BrowserEvaluationError::Javascript(Box::new(details));
+        let expected = json!(error.exception().unwrap());
+        let response = adapt_evaluation_error("named:test", "lifetime", &error);
+        let Outcome::Error { error } = response.outcome else {
+            panic!("expected error")
+        };
+        assert_eq!(error.details, Some(expected));
+        assert!(error.artifacts.is_empty());
+    }
+
     fn reader_state() -> Arc<State> {
         Arc::new(State {
             manager: BrowserSessionManager::new(),
@@ -1315,6 +1388,8 @@ mod tests {
                 );
                 if let Outcome::Error { error } = &mut response.outcome {
                     error.artifacts.push("/saved-result".into());
+                    error.details =
+                        Some(json!({"exception":{"value":{"artifacts":["/user-data-only"]}}}));
                 }
                 response
             };
