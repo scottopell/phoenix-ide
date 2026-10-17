@@ -54,6 +54,27 @@ impl OwnedChromeGroup {
         Ok(unsafe { status.si_pid() } == pid)
     }
 
+    #[cfg(target_os = "macos")]
+    fn darwin_wait_diagnostic(&self) -> String {
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        // SAFETY: another non-consuming observation, only on the error path.
+        let result = unsafe { libc::waitid(libc::P_PID, self.root.pid, &raw mut status, options) };
+        let wait_error = (result != 0).then(io::Error::last_os_error);
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action observes SIGCHLD disposition without changing it.
+        let action_result =
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &raw mut action) };
+        let action_error = (action_result != 0).then(io::Error::last_os_error);
+        format!(
+            "waitid_result={result} waitid_errno={wait_error:?} options={options} p_pid={} siginfo_size={} si_signo={} si_errno={} si_code={} si_pid={} si_uid={} si_status={} sigaction_result={action_result} sigaction_errno={action_error:?} sigchld_handler={} sigchld_flags={} sig_ign={} sa_nocldwait={}",
+            libc::P_PID, std::mem::size_of::<libc::siginfo_t>(), status.si_signo,
+            status.si_errno, status.si_code, status.si_pid, status.si_uid,
+            status.si_status, action.sa_sigaction, action.sa_flags, libc::SIG_IGN,
+            libc::SA_NOCLDWAIT,
+        )
+    }
+
     pub(crate) fn root_exited(&self, child: &mut tokio::process::Child) -> io::Result<bool> {
         if child.id() != Some(self.root.pid) {
             return Err(io::Error::other(
@@ -79,6 +100,8 @@ impl OwnedChromeGroup {
         if self.waitable_exit()? {
             return Ok(true);
         }
+        #[cfg(target_os = "macos")]
+        eprintln!("owned_chrome_darwin_wait {}", self.darwin_wait_diagnostic());
         Err(io::Error::other(format!(
             "live Chrome root birth identity or launch group changed: expected={:?} observed={observed_identity:?} child_pid={:?} pgid={observed_group} pgid_error={group_error:?} waitable_exit=false",
             self.root, child.id(),
@@ -240,6 +263,34 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "macos")]
+    async fn diagnose_exit_transition(group: &OwnedChromeGroup, child: &mut tokio::process::Child) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut samples = 0;
+        loop {
+            let pid = libc::pid_t::try_from(group.root.pid).unwrap();
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap();
+            // SAFETY: bounded observation of the retained owned child's PID only.
+            let read = unsafe {
+                libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+            };
+            let read_error = (read != size).then(io::Error::last_os_error);
+            // SAFETY: observes the same retained owned child's process group.
+            let pgid = unsafe { libc::getpgid(pid) };
+            let pgid_error = (pgid == -1).then(io::Error::last_os_error);
+            eprintln!("owned_chrome_transition sample={samples} child={:?} proc_rc={read} proc_errno={read_error:?} proc_status={} proc_group={} pgid={pgid} pgid_errno={pgid_error:?} {}", child.id(), info.pbi_status, info.pbi_pgid, group.darwin_wait_diagnostic());
+            samples += 1;
+            if group.waitable_exit().is_ok_and(|exited| exited)
+                || Instant::now() >= deadline
+                || samples >= 32
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn exited_root_drains_stderr_closed_writer_before_profile_removal() {
         let profile = tempfile::tempdir().unwrap();
@@ -275,8 +326,16 @@ exit 0
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !group.root_exited(&mut root).unwrap() {
-                tokio::task::yield_now().await;
+            loop {
+                match group.root_exited(&mut root) {
+                    Ok(true) => break,
+                    Ok(false) => tokio::task::yield_now().await,
+                    Err(error) => {
+                        #[cfg(target_os = "macos")]
+                        diagnose_exit_transition(&group, &mut root).await;
+                        panic!("strict owned-root observation failed: {error}");
+                    }
+                }
             }
         })
         .await
