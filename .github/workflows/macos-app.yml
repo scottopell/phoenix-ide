@@ -178,29 +178,15 @@ jobs:
       - name: Admit exact causal source and preserved runtime qualification
         run: |
           set -o pipefail
-          git diff --exit-code f4d0f6c8c5a1f79332a25f4a82bc50e77435a612 HEAD -- crates ui dev.py docs specs tests
+          git diff --exit-code f3893088b3cb224be9403f600173d5216e3a2f6b HEAD -- crates ui dev.py docs specs tests
           mkdir -p "$RUNNER_TEMP/observation-qualification"
-          printf '%s\n' 'Scoped successor to39045775405: runtime contracts, codegen136, UI and binary passed there; only unused db accessor failed Clippy.' 'Prior scoped39048649141 passed accessor Clippy and generated consumers. This successor proves portable-ui embedded HTML/entry JS and packages same-feature binary; no fixture/export qualification is claimed.' > "$RUNNER_TEMP/observation-qualification/scope.txt"
+          printf '%s\n' 'Scoped successor to39045775405: runtime contracts, codegen136, UI and binary passed there; only unused db accessor failed Clippy.' 'Prior scoped39048649141 passed accessor Clippy and generated consumers. Portable runtime/build39050189155 passed and receiving-machine browser admission passed on that exact artifact. This successor checks only the test extension-comparison Clippy fix; no new artifact/runtime claim.' > "$RUNNER_TEMP/observation-qualification/scope.txt"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/observation-qualification/source.txt"
       - name: Check actual generated type consumers
         working-directory: ui
         run: |
           pnpm exec tsc -b --noEmit
           pnpm exec vitest run src/pages/PersistedObservation.test.tsx --maxWorkers=1
-      - name: Prove portable embedded UI from private cwd
-        run: |
-          set -o pipefail
-          cargo test -p phoenix_ide --features portable-ui --test observation_startup portable_ui_serves_exact_built_entry_assets_from_private_cwd -- --exact --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/observation-qualification/portable-ui.log"
-          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/observation-qualification/portable-ui.log"
-          grep -F 'portable_ui_asset_manifest=' "$RUNNER_TEMP/observation-qualification/portable-ui.log" > "$RUNNER_TEMP/observation-qualification/portable-ui-served-manifest.txt"
-      - name: Package same-feature existing executable and exact built UI hashes
-        run: |
-          cargo build -p phoenix_ide --bin phoenix_ide --features portable-ui
-          mkdir -p "$RUNNER_TEMP/observation-qualification/bin"
-          cp target/debug/phoenix_ide "$RUNNER_TEMP/observation-qualification/bin/"
-          shasum -a 256 "$RUNNER_TEMP/observation-qualification/bin/phoenix_ide" > "$RUNNER_TEMP/observation-qualification/binary-sha256.txt"
-          (cd ui/dist && find . -type f -exec shasum -a 256 {} \; | sort) > "$RUNNER_TEMP/observation-qualification/ui-dist-sha256.txt"
-          printf '%s\n' 'portable-ui=rust-embed/debug-embed; default debug assets failure retained; no fixture data included' > "$RUNNER_TEMP/observation-qualification/portable-build.txt"
       - name: Check portable feature with Clippy
         run: cargo clippy -p phoenix_ide --features portable-ui --lib --tests -- -D warnings
       - name: Retain source-only qualification logs, never fixture data
