@@ -69,6 +69,26 @@ with `crate::api::application_state::LiveState` without changing assertions and 
 a negative source guard. The corrected child remains uncompiled until its separate
 hosted qualification. Original failure logs remain retained by the integration owner.
 
+## Startup-route correction
+
+Hosted run 39041992132 at source `6e9d6aec` terminated with startup integration
+results **3 passed / 1 failed**. The failing assertion expected HTTP 200 from the
+legacy live-member observation route; the actual shared router correctly returned
+503 because that live authority is unavailable. The persisted-only UI gates the
+member authority/transcript hooks with a null live ID and does not require this
+route. The preceding shared-projection/owning API step completed successfully;
+exact additional counts remain with the integration owner's downloaded logs.
+Codegen and candidate artifact acceptance were not reached.
+
+The causal child preserves the unavailable-member assertion explicitly and adds
+independent real-binary target discovery and full current ordinary/Global history
+checks. Six child launches cover pending/accepted openings through product ID,
+ordinary slug and Global reference; rich persisted messages decode through the
+public content discriminator, nonempty original boundaries retain exact identity,
+and nullable event presentation is required. Existing no-provider/no-write,
+forwarded-peer denial and shutdown checks remain. Independent source review found
+no concrete blocker, but this corrected child has not been compiled or executed.
+
 ## Next qualification boundary
 
 Integrate the retained server source and this launcher without changing existing

@@ -7,6 +7,11 @@ use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
+use phoenix_core::domain::{
+    db_schema::{MessageContent, MessageType},
+    llm_types::ContentBlock,
+    sm_state::ConvState,
+};
 use phoenix_db::Database;
 use serde_json::Value;
 use std::{
@@ -95,10 +100,17 @@ struct Fixture {
     original: Vec<u8>,
     product: String,
     coordinator: String,
+    coordinator_product: String,
+    root_successor: String,
+    coordinator_successor: String,
 }
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_opening(false).await
+    }
+
+    async fn with_opening(accepted: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fixture.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -114,6 +126,8 @@ impl Fixture {
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
+        let root_successor = seed_history(&db, &root.id, "ordinary", accepted).await;
+        let coordinator_successor = seed_history(&db, &coordinator.id, "global", accepted).await;
         let (busy, frames, checkpointed): (i64, i64, i64) =
             sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
                 .fetch_one(db.pool())
@@ -130,6 +144,9 @@ impl Fixture {
             original,
             product: root.product_conversation_id.to_string(),
             coordinator: coordinator.id,
+            coordinator_product: coordinator.product_conversation_id.to_string(),
+            root_successor,
+            coordinator_successor,
         }
     }
 
@@ -216,6 +233,258 @@ impl Fixture {
     }
 }
 
+fn history_messages(prefix: &str) -> Vec<(String, MessageContent)> {
+    vec![
+        (
+            format!("{prefix}-prompt"),
+            MessageContent::user("# Persisted prompt\n\n**Inspect** `fixture` without execution."),
+        ),
+        (
+            format!("{prefix}-agent"),
+            MessageContent::agent(vec![
+                ContentBlock::Text {
+                    text: "Persisted **analysis** with a tool call.".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: format!("{prefix}-tool-use"),
+                    name: "think".into(),
+                    input: serde_json::json!({"thoughts": "synthetic persisted reasoning"}),
+                },
+            ]),
+        ),
+        (
+            format!("{prefix}-tool"),
+            MessageContent::tool(format!("{prefix}-tool-use"), "Persisted tool result", false),
+        ),
+        (
+            format!("{prefix}-boundary"),
+            MessageContent::continuation("persisted summary"),
+        ),
+    ]
+}
+
+async fn seed_history(db: &Database, root: &str, prefix: &str, accepted: bool) -> String {
+    for (id, content) in history_messages(prefix) {
+        db.add_message(&id, root, &content, None, None)
+            .await
+            .unwrap();
+    }
+    db.update_conversation_state(
+        root,
+        &ConvState::ContextExhausted {
+            summary: "persisted summary".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let opening_id = format!("{prefix}-opening");
+    let (outcome, _) = db
+        .continue_conversation_with_intent(
+            root,
+            phoenix_db::NewContinuationDispatchIntent::generated_predecessor_context(
+                phoenix_workflow::ClientTurnKey::try_from(opening_id.as_str()).unwrap(),
+                "persisted summary".into(),
+            ),
+        )
+        .await
+        .unwrap();
+    let phoenix_db::ContinueOutcome::Created(successor) = outcome else {
+        panic!("expected a newly reserved continuation")
+    };
+    if accepted {
+        db.add_message(
+            &opening_id,
+            &successor.id,
+            &MessageContent::continuation("persisted summary"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    successor.id
+}
+
+fn require_fields(value: &Value, fields: &[&str]) {
+    let object = value.as_object().expect("wire object");
+    for field in fields {
+        assert!(
+            object.contains_key(*field),
+            "missing required wire field {field}: {value}"
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_history(
+    history: &Value,
+    product: &str,
+    root: &str,
+    successor: &str,
+    prefix: &str,
+    accepted: bool,
+    global: bool,
+) {
+    // API views are private and Serialize-only; check their required JSON fields here.
+    require_fields(
+        history,
+        &[
+            "product_conversation_id",
+            "canonical_route",
+            "requested_transcript_row_id",
+            "canonical_root",
+            "latest_transcript_row_id",
+            "writable_transcript_row_id",
+            "latest_opening",
+            "updated_at",
+            "segments",
+            "boundaries",
+            "before",
+            "has_older",
+        ],
+    );
+    assert_eq!(history["product_conversation_id"], product);
+    assert!(history["canonical_route"]
+        .as_str()
+        .unwrap()
+        .starts_with(if global { "/global/" } else { "/c/" }));
+    assert_eq!(history["canonical_root"]["transcript_row_id"], root);
+    require_fields(
+        &history["canonical_root"],
+        &["transcript_row_id", "slug", "title"],
+    );
+    assert_eq!(history["latest_transcript_row_id"], successor);
+    assert!(history["updated_at"].as_str().is_some());
+    assert!(history["before"].is_null());
+    assert_eq!(history["has_older"], false);
+    if global {
+        for field in [
+            "ordinary_lifecycle",
+            "close",
+            "work_identity",
+            "presentation",
+            "source",
+            "chain_qa_compatibility",
+        ] {
+            assert!(
+                history.get(field).is_none(),
+                "ordinary authority leaked into Global: {field}"
+            );
+        }
+    } else {
+        require_fields(
+            history,
+            &[
+                "ordinary_lifecycle",
+                "close",
+                "presentation",
+                "work_identity",
+                "source",
+                "chain_qa_compatibility",
+            ],
+        );
+    }
+    let opening = &history["latest_opening"];
+    require_fields(opening, &["status", "edge", "opening_authority"]);
+    assert_eq!(
+        opening["status"],
+        if accepted { "accepted" } else { "pending" }
+    );
+    assert_eq!(
+        opening["opening_authority"],
+        "generated_predecessor_context"
+    );
+    assert_eq!(
+        opening["edge"],
+        serde_json::json!({
+            "product_conversation_id": product,
+            "predecessor_transcript_row_id": root,
+            "successor_transcript_row_id": successor,
+            "continuation_message_id": format!("{prefix}-boundary"),
+        })
+    );
+    if accepted {
+        require_fields(opening, &["accepted_message_id", "presentation"]);
+        assert_eq!(opening["accepted_message_id"], format!("{prefix}-opening"));
+        assert_eq!(opening["presentation"], "boundary");
+        assert_eq!(history["writable_transcript_row_id"], successor);
+    } else {
+        assert_eq!(opening["client_turn_key"], format!("{prefix}-opening"));
+        assert!(history["writable_transcript_row_id"].is_null());
+    }
+    let segments = history["segments"].as_array().unwrap();
+    assert_eq!(segments.len(), 2);
+    let mut messages = Vec::new();
+    for (segment, member) in segments.iter().zip([root, successor]) {
+        require_fields(
+            segment,
+            &[
+                "segment_ordinal",
+                "transcript_row_id",
+                "slug",
+                "title",
+                "messages",
+            ],
+        );
+        assert_eq!(segment["transcript_row_id"], member);
+        assert!(segment.get("handoff").is_none());
+        messages.extend(segment["messages"].as_array().unwrap());
+    }
+    let expected = history_messages(prefix);
+    assert_eq!(messages.len(), expected.len());
+    for (index, (message, (id, content))) in messages.iter().zip(expected).enumerate() {
+        require_fields(
+            message,
+            &[
+                "message_id",
+                "origin",
+                "event_presentation",
+                "conversation_id",
+                "sequence_id",
+                "message_type",
+                "content",
+                "display_data",
+                "usage_data",
+                "created_at",
+            ],
+        );
+        assert_eq!(message["message_id"], id);
+        assert_eq!(message["conversation_id"], root);
+        assert_eq!(
+            message["sequence_id"].as_u64().unwrap(),
+            u64::try_from(index + 1).unwrap()
+        );
+        assert!(message["event_presentation"].is_null());
+        let message_type: MessageType =
+            serde_json::from_value(message["message_type"].clone()).unwrap();
+        let decoded = MessageContent::from_json(message_type, message["content"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(content).unwrap()
+        );
+    }
+    let boundaries = history["boundaries"].as_array().unwrap();
+    if accepted {
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(
+            boundaries[0],
+            serde_json::json!({
+                "message_id": format!("{prefix}-boundary"),
+                "represented_successor_opening_message_id": format!("{prefix}-opening"),
+                "predecessor_transcript_row_id": root,
+                "successor_transcript_row_id": successor,
+                "segment_ordinal": segments[0]["segment_ordinal"],
+            })
+        );
+    }
+}
+
+async fn get_json(client: &reqwest::Client, url: &str) -> Value {
+    let response = client.get(url).send().await.unwrap();
+    assert_eq!(response.status(), 200, "required persisted read: {url}");
+    response.json().await.unwrap()
+}
+
 struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -245,9 +514,15 @@ fn sentinel() -> TcpListener {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn ordinary_and_global_fixture_startup_are_loopback_immutable_and_inert() {
-    let fixture = Fixture::new().await;
+    for accepted in [false, true] {
+        assert_fixture_startup(accepted).await;
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_fixture_startup(accepted: bool) {
+    let fixture = Fixture::with_opening(accepted).await;
     let sentinel = sentinel();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -298,11 +573,23 @@ async fn ordinary_and_global_fixture_startup_are_loopback_immutable_and_inert() 
                 .status(),
             200
         );
-        let member = if target == fixture.coordinator {
-            target
+        let global = target == fixture.coordinator;
+        let (member, successor, product, prefix) = if global {
+            (
+                target,
+                fixture.coordinator_successor.as_str(),
+                fixture.coordinator_product.as_str(),
+                "global",
+            )
         } else {
-            "root"
+            (
+                "root",
+                fixture.root_successor.as_str(),
+                fixture.product.as_str(),
+                "ordinary",
+            )
         };
+        // This member endpoint requires live conversation observations, not persisted history.
         assert_eq!(
             client
                 .get(format!("{url}/api/conversations/{member}/observation"))
@@ -310,7 +597,48 @@ async fn ordinary_and_global_fixture_startup_are_loopback_immutable_and_inert() 
                 .await
                 .unwrap()
                 .status(),
-            200
+            503
+        );
+        let discovery = get_json(&client, &format!("{url}/api/observation/target")).await;
+        assert_eq!(
+            discovery["kind"],
+            if global { "coordinator" } else { "ordinary" }
+        );
+        let discovered = &discovery["conversation"];
+        require_fields(
+            discovered,
+            &[
+                "product_conversation_id",
+                "canonical_route",
+                "canonical_root",
+                "latest_transcript_row_id",
+                "updated_at",
+            ],
+        );
+        require_fields(
+            &discovered["canonical_root"],
+            &["transcript_row_id", "slug", "title"],
+        );
+        assert_eq!(discovered["product_conversation_id"], product);
+        assert_eq!(discovered["canonical_root"]["transcript_row_id"], member);
+        assert_eq!(discovered["latest_transcript_row_id"], successor);
+        if global {
+            assert_eq!(discovered.as_object().unwrap().len(), 5);
+        } else {
+            require_fields(discovered, &["lifecycle", "presentation"]);
+            assert!(discovered["presentation"]["display_name"]
+                .as_str()
+                .is_some());
+        }
+        let history_path = if global {
+            format!("/api/global/coordinator/history/{member}?message_limit=100")
+        } else {
+            format!("/api/product-conversations/{target}?boundary_representation=original_messages&message_limit=100")
+        };
+        let history = get_json(&client, &format!("{url}{history_path}")).await;
+        assert_eq!(discovered["canonical_route"], history["canonical_route"]);
+        assert_history(
+            &history, product, member, successor, prefix, accepted, global,
         );
         assert_eq!(
             client

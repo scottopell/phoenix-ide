@@ -43,10 +43,18 @@ services. Filesystem admission SHALL NOT be represented as privacy verification.
 
 THE server SHALL expose supported persisted observations scoped to the admitted
 ordinary or coordinator ProductConversation and SHALL NOT construct live runtime
-services. Unsupported live capabilities SHALL remain unavailable. THE listener
+services. Target discovery (`GET /api/observation/target`), ordinary original-message
+history (`GET /api/product-conversations/{reference}?boundary_representation=original_messages`)
+and coordinator history (`GET /api/global/coordinator/history/{reference}`) SHALL
+provide the persisted-only UI contract, including `latest_opening`, `boundaries`
+and an explicit `event_presentation` field on each returned message. Unsupported
+live capabilities, including member runtime observations at
+`GET /api/conversations/{member}/observation`, SHALL remain unavailable; they SHALL
+NOT be prerequisites for persisted-only UI history. THE listener
 SHALL bind loopback, reject forwarded access and print its actual bound address
 only after admission succeeds. This local unauthenticated authority SHALL NOT be
 represented as authorization to publish a proxy or tunnel.
+
 
 ### REQ-COBS-005: Portable, privacy-aware handoff
 
