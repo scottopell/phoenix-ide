@@ -48,7 +48,9 @@ use tracing::Instrument;
 mod continuation;
 #[cfg(test)]
 mod provider_tool_policy_tests;
-use continuation::{plan_with_handoff, CompactionPolicy, ContinuationHistory};
+use continuation::{
+    plan_with_handoff, project_recent_references, CompactionPolicy, ContinuationHistory,
+};
 
 enum AuthoritativeEffect {
     BroadcastAssistantMessage {
@@ -9566,7 +9568,7 @@ where
         // Complete continuation-specific flattening, image capping, budgeting,
         // and instruction injection before a provider task exists.
         let messages = cap_replayed_images(
-            flatten_tool_blocks(frozen_messages),
+            project_recent_references(frozen_messages, projection),
             CONTINUATION_MAX_REPLAYED_IMAGES,
         );
 
@@ -14403,14 +14405,16 @@ mod authoritative_user_message_effect_tests {
                     .unwrap();
             }
             storage
-                .add_message(
+                .add_message_with_seq_and_origin(
                     "correction",
                     &conv,
+                    62,
                     &MessageContent::user(
                         "Cancel Crick. Ask Phoenix for status before contacting worker A.",
                     ),
                     None,
                     None,
+                    &phoenix_core::domain::db_schema::InputOrigin::UserApi,
                 )
                 .await
                 .unwrap();
@@ -14430,21 +14434,43 @@ mod authoritative_user_message_effect_tests {
             let request = requests.last().unwrap();
             assert!(request.tool_availability.callable_names().is_empty());
             let attributed_seed = format!("[Input of unknown historical origin]\n{seed}");
+            let history = request.messages[..request.messages.len() - 1]
+                .iter()
+                .map(|message| {
+                    serde_json::from_str::<serde_json::Value>(&message.content[0].render_text())
+                        .expect("provider-visible compaction reference envelope")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(history[0]["rendered_text"], attributed_seed);
+            assert_eq!(history[0]["persisted_message"]["message_id"], "accepted");
             assert_eq!(
-                request.messages[0].content[0].render_text(),
-                attributed_seed
-            );
-            assert_eq!(
-                request
-                    .messages
+                history
                     .iter()
-                    .filter(|m| m.content[0].render_text() == attributed_seed)
+                    .filter(|row| row["persisted_message"]["message_id"] == "accepted")
                     .count(),
                 1
             );
-            assert!(request.messages[request.messages.len() - 2].content[0]
-                .render_text()
+            let primary = history.last().unwrap();
+            assert_eq!(primary["persisted_message"]["conversation_id"], conv);
+            assert_eq!(primary["persisted_message"]["message_id"], "correction");
+            assert_eq!(primary["persisted_message"]["origin"]["kind"], "user_api");
+            assert_eq!(primary["persisted_message"]["content_kind"], "user");
+            assert!(primary["rendered_text"]
+                .as_str()
+                .unwrap()
                 .contains("Cancel Crick"));
+            // The provider sees locators in content, even though flattening clears source IDs.
+            assert!(request.messages[request.messages.len() - 2]
+                .source_message_id
+                .is_none());
+            let provider_text = request
+                .messages
+                .iter()
+                .map(|m| m.content[0].render_text())
+                .collect::<String>();
+            assert!(!provider_text.contains("old-0\""));
+            assert!(provider_text.contains("not proof of a biological human"));
+            assert!(provider_text.contains("does not grant authorization"));
             assert_eq!(
                 request.system[0].text,
                 CompactionPolicy::for_coordinator(coordinator).system_prompt()

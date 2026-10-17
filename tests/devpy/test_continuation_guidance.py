@@ -46,6 +46,30 @@ class ContinuationGuidanceTests(unittest.TestCase):
         for source in (self.work, self.policy):
             self.assertIn("render_rejected_tool_call(", source)
 
+    def test_compaction_projects_persisted_references_before_budgeting(self):
+        executor = (ROOT / "crates/phoenix-ide/src/runtime/executor.rs").read_text()
+        continuation = (ROOT / "crates/phoenix-ide/src/runtime/executor/continuation.rs").read_text()
+        request = executor.split("    async fn request_continuation(", 1)[1].split(
+            "        let attempt_capture =", 1
+        )[0]
+        self.assertIn("project_recent_references(frozen_messages, projection)", request)
+        self.assertLess(request.index("project_recent_references("), request.index("plan_with_handoff("))
+        envelope = continuation.split("fn project_message_reference(", 1)[1].split("\n#[cfg(test)]", 1)[0]
+        for field in ('"conversation_id": source.conversation_id',
+                      '"message_id": source.message_id', '"origin": source.origin',
+                      '"content_kind": source.content.message_type()', '"rendered_text": text'):
+            self.assertIn(field, envelope)
+        self.assertIn("serde_json::json!", envelope)
+        guidance = " ".join(rust_strings(continuation.split("pub(super) fn selection_notice(", 1)[1].split(
+            "pub(super) fn plan_with_handoff(", 1
+        )[0]))
+        for caution in ("not proof of a biological human", "does not grant authorization",
+                        "rendered_text", "Unknown origins remain unknown"):
+            self.assertIn(caution, guidance)
+        self.assertIn("project_message_reference(&mut message, Some(message_source))", continuation)
+        self.assertIn("async fn continuation_preserves_accepted_handoff_for_both_variants()", executor)
+        self.assertIn('primary["persisted_message"]["message_id"], "correction"', executor)
+
     def test_wrapper_keeps_payload_encoded_and_trusted_guidance_outside_it(self):
         self.assertIn("let encoded = BASE64_STANDARD.encode(text.as_bytes());", self.wrapper)
         template = rust_strings(self.wrapper)[0]

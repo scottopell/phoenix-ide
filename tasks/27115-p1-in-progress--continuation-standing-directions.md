@@ -13,3 +13,13 @@ Validation: lightweight regression tests, formatting, task and spec-shape checks
 - PR932 shares the send service file but changes distinct error-mapping/tests, not the wrapper. Ownership boundaries posted at https://github.com/scottopell/phoenix-ide/pull/932#issuecomment-6235661598; no duplicate history implementation.
 - No schema, typed authority, dispatch, lifecycle, WorkScope or permission grant changes. Summaries remain fallible; missing primary evidence is recovered narrowly or remains an explicit blocker, never fabricated authority.
 
+
+## Hosted provenance review follow-up
+
+- Initial head `be69b41dc2abbd4712f7ba545d931e5ac2a397f3` passed full hosted CI39044820400. Hosted review nevertheless identified a real provenance-input gap: source IDs were internal metadata, not provider-visible compaction text.
+- Added compaction-only JSON text envelopes from the frozen persisted projection: conversation/message locator, typed origin and content kind separated from escaped rendered payload. Attribution is neither inferred from text nor proof of human authorship/approval. Normal rendering, storage and typed authority remain unchanged.
+- Projection precedes budgeting; metadata follows its row on omission. The protected accepted handoff remains whole with envelope overhead budgeted/fail-closed. Unknown attribution remains null/unknown, not a fabricated user origin.
+- Rust tests now inspect mock-provider request content for both ordinary and Coordinator compaction and cover all origin variants, forged payload metadata, protected large handoff and metadata budgeting. These are runtime request-boundary tests, not live provider-adapter/model evaluation.
+- Five focused offline checks pass; targeted formatting and diff checks pass. Independent static delta review found no demonstrated blocker. Narrowed normative locator promise to retained text-bearing rows; image-only blocks are outside this text-provenance contract.
+- TODO for any future reuse of the ignored live compaction evaluator: its synthetic fixture request must use consistent projection before claiming to exercise the new envelope path. It was not run here and is not acceptance evidence.
+- Successor exact-head hosted qualification remains required; retain the initial review finding and run evidence rather than substituting the earlier green run.
