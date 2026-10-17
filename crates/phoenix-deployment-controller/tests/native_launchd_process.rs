@@ -11,7 +11,10 @@ use launchd::{
 };
 use native_sampling::{sampling_rows, sampling_runner_command, settled_sampling_keys};
 use phoenix_deployment_controller::{
-    guardian_ipc::{WireCompletion, WireMemoryPressure, WireObservation, WireSnapshot, WireState},
+    guardian_ipc::{
+        WireCompletion, WireIdentityObservation, WireMemoryPressure, WireObservation, WireSnapshot,
+        WireState,
+    },
     native_guardian::{verify_native_binding, GuardianClient, VerifiedBindingStatus},
     CleanupOutcome, ControllerOs, ControllerSqliteStore, IdentityObservation, MacOsControllerOs,
     MonotonicTick, NativeChildListStatus, NativeSamplingStatus, NativeSessionState, Phase,
@@ -234,6 +237,23 @@ fn child_list_table_counts(path: &std::path::Path) -> [i64; 4] {
         "native_child_list_applications",
         "native_child_list_ack_confirmations",
         "native_child_list_result_children",
+    ]
+    .map(|table| {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    })
+}
+
+fn identity_observation_table_counts(path: &std::path::Path) -> [i64; 3] {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    [
+        "native_identity_observation_issues",
+        "native_identity_observation_applications",
+        "native_identity_observation_ack_confirmations",
     ]
     .map(|table| {
         db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
@@ -569,6 +589,207 @@ fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signa
     assert!(
         !root_path.exists(),
         "installed fixture root was not torn down"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobservation() {
+    let mut installation = DisposableLaunchdInstallation::start_with_timing(30, 60, 70).unwrap();
+    installation.assert_witnesses().unwrap();
+    let root_path = installation.guardian().root().to_path_buf();
+    let path = installation.guardian().store();
+    let deadline = installation.guardian().deadline();
+    let original_guardian = installation.guardian().guardian();
+    let original_root = installation.guardian().child();
+    installation.guardian().assert_original_parent().unwrap();
+
+    let mut runner = DisposableLaunchdRunnerJob::start(&mut installation).unwrap();
+    runner.assert_live().unwrap();
+    let first_pid = runner.pid();
+    assert_eq!(
+        runner.marker("verified binding: InitialActive").unwrap(),
+        "verified binding: InitialActive"
+    );
+    runner
+        .marker("application_committed_pending_ack revision=")
+        .unwrap();
+    runner.kill().unwrap();
+    let initial_detached = detached(runner.guardian());
+    assert_eq!(initial_detached.retained.len(), 1);
+
+    runner.recover_applied_ack().unwrap();
+    runner.assert_archived_generation(1).unwrap();
+    let second_pid = runner.pid();
+    assert_ne!(second_pid, first_pid);
+    assert_eq!(
+        runner.marker("verified binding: Detached").unwrap(),
+        "verified binding: Detached"
+    );
+    runner
+        .marker("reconciling generation=2 interruption=")
+        .unwrap();
+    assert_eq!(
+        runner.marker("sample_ack_confirmed generation=2").unwrap(),
+        "sample_ack_confirmed generation=2"
+    );
+    runner.release().unwrap();
+    runner.success().unwrap();
+    let settled_initial = detached(runner.guardian());
+    same_custody(&settled_initial, &initial_detached);
+    assert!(settled_initial.retained.is_empty());
+
+    runner
+        .recover_finish_and_ready_before_identity_application()
+        .unwrap();
+    runner.assert_archived_generation(2).unwrap();
+    let third_pid = runner.pid();
+    assert_ne!(third_pid, second_pid);
+    assert_ne!(third_pid, first_pid);
+    assert_eq!(
+        runner.marker("verified binding: Detached").unwrap(),
+        "verified binding: Detached"
+    );
+    runner
+        .marker("reconciling generation=3 interruption=")
+        .unwrap();
+    runner.marker("prepared_snapshot=").unwrap();
+    runner.marker("durable_activation_snapshot=").unwrap();
+    runner
+        .marker("reconciliation_active generation=3 interruption=")
+        .unwrap();
+    runner.marker("active_snapshot=").unwrap();
+    runner
+        .marker("recovered_sample_applied_ack attempt=64")
+        .unwrap();
+    let observed = runner
+        .marker_with_timeout(
+            "identity_observation_completed_pending_application revision=",
+            Duration::from_secs(45),
+        )
+        .unwrap();
+    let issue_revision = observed
+        .strip_prefix("identity_observation_completed_pending_application revision=")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    runner.assert_live().unwrap();
+    runner.assert_witnesses().unwrap();
+    runner.guardian().assert_original_parent().unwrap();
+    assert_eq!(runner.guardian().guardian(), original_guardian);
+    assert_eq!(runner.guardian().child(), original_root);
+    assert_eq!(runner.guardian().deadline(), deadline);
+    assert!(MonotonicTick::native_now().unwrap() < deadline);
+    assert_eq!(identity_observation_table_counts(&path), [1, 0, 0]);
+    assert_eq!(child_list_table_counts(&path), [1, 1, 1, 0]);
+    let observed_sampling = sampling_rows(&path);
+    let mut store = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let binding = store.load_native_binding(ATTEMPT).unwrap().unwrap();
+    assert_eq!(binding.identity().process, original_guardian);
+    assert_eq!(binding.slots().len(), 1);
+    assert_eq!(binding.slots()[0].process, original_root);
+    assert_eq!(binding.deadline(), deadline);
+    assert!(store
+        .pending_native_identity_observation_ack(ATTEMPT)
+        .unwrap()
+        .is_none());
+
+    runner.kill().unwrap();
+    let crashed = detached(runner.guardian());
+    same_custody(&crashed, &settled_initial);
+    assert_eq!(crashed.retained.len(), 1);
+    let retained = &crashed.retained[0];
+    assert_eq!(retained.key.attempt, ATTEMPT.get());
+    assert_eq!(retained.key.revision, issue_revision);
+    assert_eq!(retained.key.ordinal, 0);
+    assert!(matches!(
+        &retained.completion,
+        WireCompletion::ObserveIdentity {
+            identity,
+            observation: WireIdentityObservation::ExactIdentityAbsent,
+        } if *identity == original_root.into()
+    ));
+    assert_eq!(identity_observation_table_counts(&path), [1, 0, 0]);
+    assert_eq!(sampling_rows(&path), observed_sampling);
+
+    runner.recover_unapplied_identity().unwrap();
+    runner.assert_archived_generation(3).unwrap();
+    assert_ne!(runner.pid(), third_pid);
+    assert_ne!(runner.pid(), second_pid);
+    assert_ne!(runner.pid(), first_pid);
+    assert_eq!(
+        runner.marker("verified binding: Detached").unwrap(),
+        "verified binding: Detached"
+    );
+    runner
+        .marker("reconciling generation=4 interruption=")
+        .unwrap();
+    assert_eq!(
+        runner
+            .marker("recovered_identity_verified_pending_application revision=")
+            .unwrap(),
+        format!("recovered_identity_verified_pending_application revision={issue_revision}")
+    );
+    runner.assert_live().unwrap();
+    runner.assert_witnesses().unwrap();
+    runner.guardian().assert_original_parent().unwrap();
+    assert_eq!(identity_observation_table_counts(&path), [1, 0, 0]);
+    assert_eq!(sampling_rows(&path), observed_sampling);
+    runner.release().unwrap();
+    assert_eq!(
+        runner
+            .marker("recovered_identity_applied_ack attempt=64")
+            .unwrap(),
+        format!("recovered_identity_applied_ack attempt=64 revision={issue_revision} ordinal=0 effects=0 observe_identity=0 signal_exact_identity=0")
+    );
+    runner.success().unwrap();
+    runner.assert_witnesses().unwrap();
+    let confirmed = detached(runner.guardian());
+    same_custody(&confirmed, &crashed);
+    assert!(confirmed.retained.is_empty());
+    assert_eq!(identity_observation_table_counts(&path), [1, 1, 1]);
+    assert_eq!(sampling_rows(&path), observed_sampling);
+    assert!(store
+        .pending_native_identity_observation_ack(ATTEMPT)
+        .unwrap()
+        .is_none());
+    let final_attempt = store.load_attempt(ATTEMPT).unwrap().unwrap();
+    assert_eq!(final_attempt.phase(), Phase::Interrupted);
+    assert_ne!(final_attempt.phase(), Phase::ReadyForDisruption);
+    assert_eq!(final_attempt.deadline(), deadline);
+    let final_binding = store.load_native_binding(ATTEMPT).unwrap().unwrap();
+    assert_eq!(final_binding.identity(), binding.identity());
+    assert_eq!(final_binding.slots(), binding.slots());
+    assert_eq!(final_binding.deadline(), binding.deadline());
+    let db =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (outcome, confirming_generation): (String, Vec<u8>) = db
+        .query_row(
+            "SELECT a.outcome,c.confirming_session_generation FROM native_identity_observation_applications a JOIN native_identity_observation_ack_confirmations c USING(attempt_id,dispatch_revision,ordinal)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "exact_identity_absent");
+    assert_eq!(
+        u64::from_be_bytes(confirming_generation.try_into().unwrap()),
+        4
+    );
+    assert_eq!(
+        MacOsControllerOs::new("/tmp")
+            .unwrap()
+            .observe_identity(original_root),
+        IdentityObservation::ExactIdentityAbsent
+    );
+    runner.guardian().assert_original_parent().unwrap();
+    runner.finish().unwrap();
+    installation.assert_witnesses().unwrap();
+    drop((store, db));
+    installation.finish().unwrap();
+    assert!(
+        !root_path.exists(),
+        "qualified fixture root was not torn down"
     );
 }
 

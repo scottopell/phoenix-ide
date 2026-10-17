@@ -228,3 +228,118 @@ fn issue_rejects_non_root_and_expired_authority() {
         Err(ControllerStoreError::RevisionConflict)
     ));
 }
+
+fn recovery_fixture() -> (
+    ControllerSqliteStore,
+    LoadedAttempt,
+    NativeGuardianBinding,
+    NativeIdentityObservationIssue,
+) {
+    let deadline = MonotonicTick::new(500);
+    let (mut store, mut policy, binding) = setup_cleaning(deadline);
+    let ticket = policy.issue_next().unwrap();
+    let issue = store
+        .commit_native_identity_observation_issue_at(&ticket, &binding, MonotonicTick::new(499))
+        .unwrap();
+    let checkpoint = store
+        .load_attempt(issue.key().attempt_id())
+        .unwrap()
+        .unwrap()
+        .checkpoint;
+    let detached = store
+        .commit_detached_binding(&binding, binding.slots())
+        .unwrap();
+    let interrupted = checkpoint.interrupt().unwrap().persist(&mut store).unwrap();
+    let binding = store
+        .commit_fresh_interruption_binding(
+            &detached,
+            interrupted.checkpoint().persistence_revision().unwrap(),
+        )
+        .unwrap();
+    let loaded = store
+        .load_attempt(issue.key().attempt_id())
+        .unwrap()
+        .unwrap();
+    (store, loaded, binding, issue)
+}
+
+#[test]
+fn recovered_identity_folds_only_the_root_without_activating_cleanup() {
+    for observation in [
+        IdentityObservation::ExactIdentityAbsent,
+        IdentityObservation::PidReused(ProcessIdentity::new(
+            identity(42).pid(),
+            BirthToken::new(13, 0).unwrap(),
+        )),
+    ] {
+        let (mut store, loaded, _, issue) = recovery_fixture();
+        let original = loaded.checkpoint.clone();
+        let candidate = store
+            .prepare_native_identity_observation_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        let applied = store
+            .apply_recovered_native_identity_observation_at(
+                VerifiedRecoveredNativeIdentityObservation::after_live_verification(
+                    candidate,
+                    observation,
+                ),
+                MonotonicTick::new(499),
+            )
+            .unwrap();
+        assert!(
+            matches!(applied, NativeIdentityObservationStatus::AppliedPendingAck { issue: saved, observation: value, .. } if saved == issue && value == observation)
+        );
+        let saved = store
+            .load_attempt(issue.key().attempt_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.phase(), Phase::Interrupted);
+        assert_ne!(saved.checkpoint, original);
+        assert_eq!(
+            store
+                .pending_native_identity_observation_ack(issue.key().attempt_id())
+                .unwrap()
+                .unwrap()
+                .0,
+            issue.key()
+        );
+        assert!(matches!(
+            store.prepare_native_identity_observation_recovery_at(saved, MonotonicTick::new(499)),
+            Err(ControllerStoreError::RevisionConflict)
+        ));
+    }
+}
+
+#[test]
+fn recovered_identity_expiry_rolls_back_checkpoint_and_application() {
+    let (mut store, loaded, _, issue) = recovery_fixture();
+    let original = loaded.checkpoint.clone();
+    let candidate = store
+        .prepare_native_identity_observation_recovery_at(loaded, MonotonicTick::new(499))
+        .unwrap();
+    let mut ticks = [
+        MonotonicTick::new(499),
+        MonotonicTick::new(499),
+        MonotonicTick::new(500),
+    ]
+    .into_iter();
+    assert!(matches!(
+        store.apply_recovered_native_identity_observation_with_clock(
+            VerifiedRecoveredNativeIdentityObservation::after_live_verification(
+                candidate,
+                IdentityObservation::ExactIdentityAbsent
+            ),
+            || Ok(ticks.next().unwrap_or(MonotonicTick::new(500)))
+        ),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+    assert!(ticks.next().is_none());
+    assert_eq!(
+        read_attempt(&store.connection, issue.key().attempt_id()).unwrap(),
+        Some(original)
+    );
+    assert_eq!(
+        read_status(&store.connection, issue.key()).unwrap(),
+        Some(NativeIdentityObservationStatus::IssuedPendingApplication { issue })
+    );
+}

@@ -724,6 +724,46 @@ impl DeploymentAttempt {
         Some(Self::Interrupted(interrupted))
     }
 
+    pub(crate) fn fold_interrupted_identity_observation(
+        self,
+        target: ProcessIdentity,
+        observation: IdentityObservation,
+    ) -> Option<Self> {
+        if !self.interrupted_native_root_identity_observation(target) {
+            return None;
+        }
+        let Self::Interrupted(mut interrupted) = self else {
+            return None;
+        };
+        let ActiveAttempt::Ownership(ref mut ownership) = interrupted.resume else {
+            return None;
+        };
+        ownership
+            .tree
+            .record_identity_observation(target, observation)
+            .ok()?;
+        Some(Self::Interrupted(interrupted))
+    }
+
+    pub(crate) fn interrupted_native_root_identity_observation(
+        &self,
+        target: ProcessIdentity,
+    ) -> bool {
+        let Self::Interrupted(InterruptedAttempt {
+            resume:
+                ActiveAttempt::Ownership(OwnershipAttempt {
+                    phase: OwnershipPhase::Cleaning | OwnershipPhase::Verifying,
+                    tree,
+                    ..
+                }),
+            ..
+        }) = self
+        else {
+            return false;
+        };
+        tree.identities().len() == 1 && tree.identities().contains_key(&target)
+    }
+
     pub(crate) fn fold_interrupted_child_list(
         self,
         parent: ProcessIdentity,

@@ -907,6 +907,8 @@ pub(super) enum InstalledRunnerMode {
     RecoverFinishAndChildListPauseAfterApplication,
     RecoverFinishAndChildListPauseAfterObservation,
     RecoverUnappliedChildListPauseAfterVerification,
+    RecoverUnappliedIdentityPauseAfterVerification,
+    RecoverFinishAndReadyPauseAfterIdentityObservation,
     RecoverChildListAckPauseAfterConfirmation,
 }
 
@@ -976,6 +978,12 @@ impl RunnerJobSpec {
                 InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification => {
                     "recover-unapplied-child-list"
                 }
+                InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification => {
+                    "recover-unapplied-identity"
+                }
+                InstalledRunnerMode::RecoverFinishAndReadyPauseAfterIdentityObservation => {
+                    "recover-finish-and-ready"
+                }
                 InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => {
                     "recover-child-list-ack"
                 }
@@ -1023,6 +1031,18 @@ impl RunnerJobSpec {
                 "--fixture-release-file".into(),
                 self.release_file().to_str().unwrap().into(),
             ]),
+            InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification => args.extend([
+                "--fixture-pause-after-recovery-verification".into(),
+                "--fixture-release-file".into(),
+                self.release_file().to_str().unwrap().into(),
+            ]),
+            InstalledRunnerMode::RecoverFinishAndReadyPauseAfterIdentityObservation => {
+                args.extend([
+                    "--fixture-pause-after-identity-observation".into(),
+                    "--fixture-release-file".into(),
+                    self.release_file().to_str().unwrap().into(),
+                ])
+            }
             InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => args.extend([
                 "--fixture-pause-after-child-list-ack".into(),
                 "--fixture-release-file".into(),
@@ -1503,6 +1523,20 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
         self.bootstrap(InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification)
     }
 
+    pub(super) fn recover_finish_and_ready_before_identity_application(
+        &mut self,
+    ) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(2)?;
+        self.bootstrap(InstalledRunnerMode::RecoverFinishAndReadyPauseAfterIdentityObservation)
+    }
+
+    pub(super) fn recover_unapplied_identity(&mut self) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(3)?;
+        self.bootstrap(InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification)
+    }
+
     pub(super) fn recover_child_list_ack(&mut self) -> io::Result<()> {
         self.bootout()?;
         self.archive_generation(3)?;
@@ -1963,6 +1997,8 @@ mod tests {
             InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication,
             InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation,
             InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification,
+            InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification,
+            InstalledRunnerMode::RecoverFinishAndReadyPauseAfterIdentityObservation,
             InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation,
         ] {
             let args = runner.arguments(mode);
@@ -2045,6 +2081,16 @@ mod tests {
                             runner.release_file().to_str().unwrap()
                         ]
                     );
+                }
+                InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification => {
+                    assert_eq!(args.len(), 12);
+                    assert_eq!(args[2], "recover-unapplied-identity");
+                    assert_eq!(args[9], "--fixture-pause-after-recovery-verification");
+                }
+                InstalledRunnerMode::RecoverFinishAndReadyPauseAfterIdentityObservation => {
+                    assert_eq!(args.len(), 12);
+                    assert_eq!(args[2], "recover-finish-and-ready");
+                    assert_eq!(args[9], "--fixture-pause-after-identity-observation");
                 }
                 InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => {
                     assert_eq!(args.len(), 12);

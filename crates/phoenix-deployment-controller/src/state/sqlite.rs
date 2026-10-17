@@ -43,8 +43,9 @@ pub use native_child_list::{
 };
 pub use native_identity_observation::{
     NativeIdentityObservationDispatch, NativeIdentityObservationIssue,
-    NativeIdentityObservationStatus, VerifiedNativeIdentityObservationAckConfirmation,
-    VerifiedNativeIdentityObservationCompletion,
+    NativeIdentityObservationRecoveryCandidate, NativeIdentityObservationStatus,
+    VerifiedNativeIdentityObservationAckConfirmation, VerifiedNativeIdentityObservationCompletion,
+    VerifiedRecoveredNativeIdentityObservation,
 };
 mod native_reconciliation;
 pub use native_reconciliation::{
@@ -568,6 +569,7 @@ impl ControllerSqliteStore {
             recovered_sample,
             None,
             None,
+            None,
             clock,
         )
     }
@@ -595,6 +597,11 @@ impl ControllerSqliteStore {
         identity_application: Option<(
             &NativeIdentityObservationIssue,
             &crate::IdentityObservation,
+        )>,
+        recovered_identity: Option<(
+            &DeploymentAttempt,
+            &NativeGuardianBinding,
+            &NativeIdentityObservationIssue,
         )>,
         clock: &mut (impl FnMut() -> Result<MonotonicTick> + ?Sized),
     ) -> Result<PersistenceRevision> {
@@ -660,6 +667,22 @@ impl ControllerSqliteStore {
                 return Err(ControllerStoreError::RevisionConflict);
             }
         }
+        if let Some((interrupted, binding, issue)) = recovered_identity {
+            native_identity_observation::validate_recovery_candidate(
+                &transaction,
+                interrupted,
+                binding,
+                *issue,
+                clock()?,
+            )?;
+            if durable.as_ref() != Some(interrupted)
+                || !matches!(identity_application, Some((applied_issue, observation))
+                    if applied_issue == issue
+                    && interrupted.clone().fold_interrupted_identity_observation(issue.target(), *observation).as_ref() == Some(checkpoint))
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+        }
         if (child_application.is_some() || identity_application.is_some())
             && clock()?
                 >= required(durable.as_ref(), "missing native child list checkpoint")?.deadline()
@@ -677,14 +700,16 @@ impl ControllerSqliteStore {
                 )?;
             }
         }
-        if let Some((issue, observation)) = identity_application {
-            native_identity_observation::validate_application(
-                &transaction,
-                durable.as_ref(),
-                checkpoint,
-                issue,
-                observation,
-            )?;
+        if recovered_identity.is_none() {
+            if let Some((issue, observation)) = identity_application {
+                native_identity_observation::validate_application(
+                    &transaction,
+                    durable.as_ref(),
+                    checkpoint,
+                    issue,
+                    observation,
+                )?;
+            }
         }
         let mut next = checkpoint.clone();
         next.set_revision(revision);

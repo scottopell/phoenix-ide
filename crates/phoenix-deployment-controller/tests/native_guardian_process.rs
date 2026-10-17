@@ -689,6 +689,108 @@ fn naturally_exited_exact_root_reaches_ready_without_signals() {
     guardian.finish();
 }
 
+fn identity_issue_and_application_counts(path: &std::path::Path) -> (i64, i64, i64) {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let count = |table: &str| {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    (
+        count("native_identity_observation_issues"),
+        count("native_identity_observation_applications"),
+        count("native_identity_observation_ack_confirmations"),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn identity_completed_before_application_recovers_exact_root_without_reobservation() {
+    let ChildListProcessFixture {
+        _parent,
+        dir,
+        path,
+        attempt,
+        deadline,
+        root,
+        mut guardian,
+    } = start_child_list_fixture_with_timing(12, 40, 30);
+    settle_initial_sample_with_replacement_ack(&dir, &path, deadline, root);
+    let mut runner = GuardedRunner::new(
+        child_list_runner_command(&dir, &path, "recover-finish-and-ready")
+            .arg("--fixture-pause-after-identity-observation")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = BufReader::new(runner.stdout.take().unwrap());
+    assert_eq!(line(&mut output), "verified binding: Detached");
+    assert!(line(&mut output).starts_with("reconciling generation=3 interruption="));
+    assert!(line(&mut output).starts_with("prepared_snapshot="));
+    assert!(line(&mut output).starts_with("durable_activation_snapshot="));
+    assert!(line(&mut output).starts_with("reconciliation_active generation=3 interruption="));
+    assert!(line(&mut output).starts_with("active_snapshot="));
+    assert!(line(&mut output).starts_with("recovered_sample_applied_ack attempt=64"));
+    let marker = line_with_timeout(&mut output, Duration::from_secs(20));
+    let revision: u64 = marker
+        .strip_prefix("identity_observation_completed_pending_application revision=")
+        .unwrap_or_else(|| panic!("unexpected observation marker: {marker}"))
+        .parse()
+        .unwrap();
+    assert_eq!(identity_issue_and_application_counts(&path), (1, 0, 0));
+    assert_native_identity_issue_target(&path, root);
+    runner.kill_checked();
+    let crashed = wait_for_detached(&dir);
+    assert_eq!(crashed.retained.len(), 1);
+    assert_eq!(crashed.retained[0].key.revision, revision);
+    assert!(
+        matches!(&crashed.retained[0].completion, WireCompletion::ObserveIdentity { identity, .. } if *identity == root.into())
+    );
+    let mut replacement = GuardedRunner::new(
+        child_list_runner_command(&dir, &path, "recover-unapplied-identity")
+            .arg("--fixture-pause-after-recovery-verification")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert_ne!(runner.id(), replacement.id());
+    let mut recovered = BufReader::new(replacement.stdout.take().unwrap());
+    assert_eq!(line(&mut recovered), "verified binding: Detached");
+    assert!(line(&mut recovered).starts_with("reconciling generation=4 interruption="));
+    assert_eq!(
+        line(&mut recovered),
+        format!("recovered_identity_verified_pending_application revision={revision}")
+    );
+    assert_eq!(identity_issue_and_application_counts(&path), (1, 0, 0));
+    replacement.stdin.as_mut().unwrap().write_all(b"!").unwrap();
+    assert_eq!(
+        line(&mut recovered),
+        format!("recovered_identity_applied_ack attempt=64 revision={revision} ordinal=0 effects=0 observe_identity=0 signal_exact_identity=0")
+    );
+    success(&mut replacement);
+    replacement.finish();
+    assert_eq!(
+        native_identity_observation_rows(&path),
+        (1, 1, 1, "exact_identity_absent".into())
+    );
+    assert!(wait_for_detached(&dir).retained.is_empty());
+    let mut store = ControllerSqliteStore::open_read_only(&path).unwrap();
+    assert_eq!(
+        store.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::Interrupted
+    );
+    assert!(store
+        .pending_native_identity_observation_ack(attempt)
+        .unwrap()
+        .is_none());
+    guardian.finish();
+}
+
 #[allow(clippy::too_many_lines)]
 #[test]
 fn identity_application_commit_survives_runner_death_before_ack_without_cleanup_continuation() {

@@ -55,6 +55,9 @@ enum RunnerMode {
     RecoverUnappliedChildList {
         fixture: UnappliedRecoveryFixture,
     },
+    RecoverUnappliedIdentity {
+        fixture: UnappliedRecoveryFixture,
+    },
     RecoverAndFinish {
         fixture: FinishFixture,
     },
@@ -132,6 +135,7 @@ enum ChildListAckFixture {
 #[derive(Clone)]
 enum ReadyFixture {
     Run,
+    PauseAfterIdentityObservation(ReleaseSource),
     PauseAfterIdentityApplication(ReleaseSource),
 }
 
@@ -289,16 +293,26 @@ fn parse_recover_child_list_ack(args: &[OsString], usage: &str) -> Result<Runner
 fn parse_recover_finish_and_ready(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
     let fixture = match args {
         [_, _, _, _, _, _, _, _] => ReadyFixture::Run,
+        [_, _, _, _, _, _, _, _, pause]
+            if pause == "--fixture-pause-after-identity-observation" =>
+        {
+            ReadyFixture::PauseAfterIdentityObservation(ReleaseSource::Stdin)
+        }
         [_, _, _, _, _, _, _, _, pause] if pause == "--fixture-pause-after-identity-apply" => {
             ReadyFixture::PauseAfterIdentityApplication(ReleaseSource::Stdin)
         }
         [_, _, _, _, _, _, _, _, pause, release, path]
-            if pause == "--fixture-pause-after-identity-apply"
+            if (pause == "--fixture-pause-after-identity-apply"
+                || pause == "--fixture-pause-after-identity-observation")
                 && release == "--fixture-release-file" =>
         {
             let path = PathBuf::from(path);
             validate_release_path(&path)?;
-            ReadyFixture::PauseAfterIdentityApplication(ReleaseSource::DisposableFile(path))
+            if pause == "--fixture-pause-after-identity-observation" {
+                ReadyFixture::PauseAfterIdentityObservation(ReleaseSource::DisposableFile(path))
+            } else {
+                ReadyFixture::PauseAfterIdentityApplication(ReleaseSource::DisposableFile(path))
+            }
         }
         _ => return Err(usage.into()),
     };
@@ -346,12 +360,16 @@ fn parse_recover_unapplied_child_list(
         }
         _ => return Err(usage.into()),
     };
-    Ok(RunnerMode::RecoverUnappliedChildList { fixture })
+    Ok(if args[1] == "recover-unapplied-identity" {
+        RunnerMode::RecoverUnappliedIdentity { fixture }
+    } else {
+        RunnerMode::RecoverUnappliedChildList { fixture }
+    })
 }
 
 #[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-unapplied-child-list|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-finish-and-ready|recover-child-list-ack|recover-identity-ack> --socket-dir <private fixture> --store <existing schema-v7 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample or recover-unapplied-child-list only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-observation|--fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only) | --fixture-pause-after-identity-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-ready only) | --fixture-pause-after-identity-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-identity-ack only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-unapplied-child-list|recover-unapplied-identity|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-finish-and-ready|recover-child-list-ack|recover-identity-ack> --socket-dir <private fixture> --store <existing schema-v7 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample, recover-unapplied-child-list or recover-unapplied-identity only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-observation|--fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only) | --fixture-pause-after-identity-observation|--fixture-pause-after-identity-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-ready only) | --fixture-pause-after-identity-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-identity-ack only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -371,7 +389,9 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
             }
         }
         "recover-applied-ack" => parse_recover_applied_ack(args, usage)?,
-        "recover-unapplied-child-list" => parse_recover_unapplied_child_list(args, usage)?,
+        "recover-unapplied-child-list" | "recover-unapplied-identity" => {
+            parse_recover_unapplied_child_list(args, usage)?
+        }
         "recover-unapplied-sample" if args.len() == 8 => RunnerMode::RecoverUnappliedSample {
             fixture: UnappliedRecoveryFixture::Run,
         },
@@ -1105,6 +1125,17 @@ fn run_recovered_identity_to_ready(
     let verified = client
         .observe_native_identity_observation(dispatched)
         .map_err(|error| format!("identity observe: {error:?}"))?;
+    if let ReadyFixture::PauseAfterIdentityObservation(release) = fixture {
+        let gate = release.prepare()?;
+        println!(
+            "identity_observation_completed_pending_application revision={}",
+            issue.key().revision().get()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        gate.wait()?;
+    }
     let progress = policy
         .apply_native_identity_observation(verified, store)
         .map_err(|error| format!("identity apply: {error:?}"))?;
@@ -1195,8 +1226,12 @@ fn run_recovered_identity_to_ready(
     {
         return Err("ready checkpoint was not verified clean with no pending effects".into());
     }
-    println!("recover_finish_and_ready attempt={} identity_revision={} generation={} phase=ReadyForDisruption cleanup=VerifiedClean effects=0 signal_exact_identity=0",
-        attempt.get(), issue.key().revision().get(), session.generation);
+    println!(
+        "recover_finish_and_ready attempt={} identity_revision={} generation={} phase=ReadyForDisruption cleanup=VerifiedClean effects=0 signal_exact_identity=0",
+        attempt.get(),
+        issue.key().revision().get(),
+        session.generation
+    );
     std::io::stdout().flush().map_err(|error| error.to_string())
 }
 
@@ -1424,6 +1459,69 @@ fn run_recover_unapplied_child_list(
     println!(
         "recovered_child_list_applied_ack attempt={} revision={} ordinal={}",
         issue.key().attempt_id().get(),
+        issue.key().revision().get(),
+        issue.key().ordinal()
+    );
+    std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
+fn run_recover_unapplied_identity(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    attempt: AttemptId,
+    session: phoenix_deployment_controller::guardian_ipc::WireSession,
+    fixture: &UnappliedRecoveryFixture,
+) -> Result<(), String> {
+    let loaded = store
+        .load_attempt(attempt)
+        .map_err(|error| error.to_string())?
+        .ok_or("missing interrupted attempt")?;
+    let candidate = store
+        .prepare_native_identity_observation_recovery(loaded)
+        .map_err(|error| format!("prepare recovered identity: {error}"))?;
+    let issue = candidate.issue();
+    let verified = client
+        .verify_recovered_native_identity_observation(candidate)
+        .map_err(|error| format!("verify recovered identity: {error:?}"))?;
+    if !matches!(fixture, UnappliedRecoveryFixture::Run) {
+        let gate = match fixture {
+            UnappliedRecoveryFixture::PauseAfterVerificationFile(release) => {
+                Some(release.prepare()?)
+            }
+            UnappliedRecoveryFixture::Run | UnappliedRecoveryFixture::PauseAfterVerification => {
+                None
+            }
+        };
+        println!(
+            "recovered_identity_verified_pending_application revision={}",
+            issue.key().revision().get()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        if let Some(gate) = gate {
+            gate.wait()?;
+        } else {
+            activation_barrier(FinishFixture::ActivationBarriers)?;
+        }
+    }
+    let applied = store
+        .apply_recovered_native_identity_observation(verified)
+        .map_err(|error| format!("apply recovered identity: {error}"))?;
+    if !matches!(applied, NativeIdentityObservationStatus::AppliedPendingAck { issue: stored, .. } if stored == issue)
+    {
+        return Err("recovered identity did not produce exact pending ACK".into());
+    }
+    let confirmed = recover_native_identity_observation_ack(store, client, issue.key())
+        .map_err(|error| format!("recovered identity ACK: {error:?}"))?;
+    if !matches!(confirmed, NativeIdentityObservationStatus::AckConfirmed { issue: stored, confirming_session_generation, .. }
+        if stored == issue && confirming_session_generation.get() == session.generation)
+    {
+        return Err("recovered identity ACK confirmation mismatch".into());
+    }
+    println!(
+        "recovered_identity_applied_ack attempt={} revision={} ordinal={} effects=0 observe_identity=0 signal_exact_identity=0",
+        attempt.get(),
         issue.key().revision().get(),
         issue.key().ordinal()
     );
@@ -1814,6 +1912,7 @@ fn main() -> Result<(), String> {
         RunnerMode::RecoverAppliedAck(_)
             | RunnerMode::RecoverUnappliedSample { .. }
             | RunnerMode::RecoverUnappliedChildList { .. }
+            | RunnerMode::RecoverUnappliedIdentity { .. }
             | RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
             | RunnerMode::RecoverFinishAndChildList { .. }
@@ -1863,6 +1962,7 @@ fn main() -> Result<(), String> {
                 | RunnerMode::RecoverAppliedAck(_)
                 | RunnerMode::RecoverUnappliedSample { .. }
                 | RunnerMode::RecoverUnappliedChildList { .. }
+                | RunnerMode::RecoverUnappliedIdentity { .. }
                 | RunnerMode::RecoverChildListAck(_)
                 | RunnerMode::RecoverIdentityAck(_) => FinishFixture::Run,
             },
@@ -1905,6 +2005,13 @@ fn main() -> Result<(), String> {
             RecoveryRun::FinishAndReady(fixture.clone()),
         ),
         RunnerMode::RecoverUnappliedSample { fixture } => run_recover_unapplied_sample(
+            &mut store,
+            &mut client,
+            config.attempt,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
+            fixture,
+        ),
+        RunnerMode::RecoverUnappliedIdentity { fixture } => run_recover_unapplied_identity(
             &mut store,
             &mut client,
             config.attempt,

@@ -195,7 +195,7 @@ impl<'de> Deserialize<'de> for BuildIdentity {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum number of child PIDs accepted in one native root scan.
 pub const MAX_NATIVE_CHILDREN: usize = 4096;
@@ -713,6 +713,11 @@ pub enum Request {
         parent: WireIdentity,
         issuing_session_generation: u64,
     },
+    VerifyRecoveredNativeIdentityObservation {
+        session: WireSession,
+        key: WireKey,
+        issuing_session_generation: u64,
+    },
     AckAfterAppliedRevision {
         session: WireSession,
         key: WireKey,
@@ -809,6 +814,10 @@ pub enum Response {
         key: WireKey,
         parent: WireIdentity,
         children: Vec<u32>,
+    },
+    RecoveredNativeIdentityObservation {
+        key: WireKey,
+        observation: WireIdentityObservation,
     },
     Acked {
         key: WireKey,
@@ -1339,6 +1348,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ObserveRetained { .. }
                     | Request::VerifyRecoveredNativeSampling { .. }
                     | Request::VerifyRecoveredNativeChildList { .. }
+                    | Request::VerifyRecoveredNativeIdentityObservation { .. }
                     | Request::Fence { .. }
                     | Request::BeginReconciliation { .. }
                     | Request::FinishReconciliation { .. }
@@ -1846,6 +1856,99 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             key: key.try_into()?,
             parent: returned,
             children,
+        })
+    }
+
+    fn verify_recovered_native_identity_observation(
+        &mut self,
+        session: WireSession,
+        key: WireKey,
+        issuing_session_generation: u64,
+    ) -> Result<Response, WireError> {
+        if !self.native_unbound {
+            return Err(WireError::UnsupportedDurableBinding);
+        }
+        self.resolve_session(session)?;
+        let key = self.resolve_key(key)?;
+        let origin = NonZeroU64::new(issuing_session_generation).ok_or(WireError::InvalidValue)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let (checkpoint, binding, status) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .identity_observation_evidence(key)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let crate::NativeIdentityObservationStatus::IssuedPendingApplication { issue } = status
+        else {
+            return Err(WireError::MissingProof);
+        };
+        let current = binding.current_session();
+        let target = issue.target();
+        if live.state != WireState::Reconciling
+            || live.session != session
+            || live.session.instance != live.instance
+            || live.attempt != key.attempt_id().get()
+            || wire.attempt != live.attempt
+            || wire.deadline != live.deadline
+            || checkpoint.attempt_id() != key.attempt_id()
+            || checkpoint.phase() != crate::Phase::Interrupted
+            || !checkpoint.interrupted_native_root_identity_observation(target)
+            || checkpoint.persistence_revision() != current.interruption_revision
+            || checkpoint.deadline() != binding.deadline()
+            || binding.attempt_id() != key.attempt_id()
+            || binding.dispatch_floor() != current.interruption_revision
+            || key.revision() >= current.interruption_revision
+            || current.state != crate::NativeSessionState::Reconciling
+            || current.generation.get() != session.generation
+            || origin >= current.generation
+            || !binding
+                .sessions()
+                .iter()
+                .any(|old| old.generation == origin)
+            || issue.key() != key
+            || issue.session_generation() != origin
+            || issue.guardian_identity() != binding.identity()
+            || !self
+                .native_identity_observation_retained_origins
+                .contains(&(key, target, origin))
+            || self.native_identity != Some(binding.identity())
+            || binding.deadline() != self.guardian.original_deadline()
+            || wire.nonce != binding.identity().nonce.bytes()
+            || wire.guardian != binding.identity().process.into()
+            || binding.slots().len() != 1
+            || binding.slots()[0].process != target
+            || !recovered_sampling_slots_match(
+                &binding,
+                wire,
+                &live,
+                &self.guardian.diagnostic_slots(),
+            )
+            || !before_native_deadline(live.deadline)
+        {
+            return Err(WireError::MissingProof);
+        }
+        let retained = self
+            .guardian
+            .retained_result(key)
+            .ok_or(WireError::MissingProof)?;
+        let WireCompletion::ObserveIdentity {
+            identity,
+            observation,
+        } = WireRetained::from(retained).completion
+        else {
+            return Err(WireError::MissingProof);
+        };
+        if identity != target.into() {
+            return Err(WireError::MissingProof);
+        }
+        Ok(Response::RecoveredNativeIdentityObservation {
+            key: key.try_into()?,
+            observation,
         })
     }
 
@@ -2776,6 +2879,15 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 parent,
                 issuing_session_generation,
             )?,
+            Request::VerifyRecoveredNativeIdentityObservation {
+                session,
+                key,
+                issuing_session_generation,
+            } => self.verify_recovered_native_identity_observation(
+                session,
+                key,
+                issuing_session_generation,
+            )?,
             Request::AckAfterAppliedRevision {
                 session,
                 key,
@@ -3126,6 +3238,33 @@ mod tests {
     }
 
     #[test]
+    fn recovered_identity_verification_wire_carries_only_key_session_and_provenance() {
+        let request = Request::VerifyRecoveredNativeIdentityObservation {
+            session: WireSession {
+                instance: 1,
+                generation: 2,
+            },
+            key: WireKey {
+                attempt: 3,
+                revision: 4,
+                ordinal: 0,
+            },
+            issuing_session_generation: 1,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["data"].as_object().unwrap().len(), 3);
+        assert!(value["data"].get("identity").is_none());
+        assert!(serde_json::from_value::<Request>(serde_json::json!({
+            "op": "verify_recovered_native_identity_observation",
+            "data": { "session": { "instance": 1, "generation": 2 },
+                "key": { "attempt": 3, "revision": 4, "ordinal": 0 },
+                "issuing_session_generation": 1,
+                "identity": { "pid": 42, "birth_seconds": 1, "birth_nanos": 0 } }
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn native_child_vector_is_bounded_during_deserialization() {
         let completion = |count| WireCompletion::ListChildren {
             parent: WireIdentity {
@@ -3203,9 +3342,9 @@ mod tests {
             read_frame::<Request>(&mut Cursor::new(unknown)),
             Err(CodecError::UnsupportedVersion(version)) if version == unsupported
         ));
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
         let old = serde_json::to_vec(&Envelope {
-            version: 7,
+            version: 8,
             body: Request::Snapshot,
         })
         .unwrap();
@@ -3213,7 +3352,7 @@ mod tests {
         old_frame.extend(old);
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(old_frame)),
-            Err(CodecError::UnsupportedVersion(7))
+            Err(CodecError::UnsupportedVersion(8))
         ));
         let mut unknown_op = Vec::new();
         let bytes =
@@ -6703,6 +6842,7 @@ mod native_evidence_tests {
                 | Request::ObserveRetained { .. }
                 | Request::VerifyRecoveredNativeSampling { .. }
                 | Request::VerifyRecoveredNativeChildList { .. }
+                | Request::VerifyRecoveredNativeIdentityObservation { .. }
                 | Request::NativeChildListAdmit { .. }
                 | Request::NativeChildListSubmit { .. }
                 | Request::ObserveNativeChildList { .. }

@@ -18,6 +18,16 @@ impl LoadedAttempt {
     }
 }
 
+impl LoadedAttempt {
+    pub(crate) fn interrupted_native_root_identity_observation(
+        &self,
+        target: ProcessIdentity,
+    ) -> bool {
+        self.checkpoint
+            .interrupted_native_root_identity_observation(target)
+    }
+}
+
 /// Diagnostic identity; it cannot reconstruct a policy-issued ticket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeIdentityObservationIssue {
@@ -135,6 +145,224 @@ pub enum NativeIdentityObservationStatus {
         applying_revision: PersistenceRevision,
         confirming_session_generation: NonZeroU64,
     },
+}
+
+/// One-use custody of the exact interrupted root and sole unapplied issue.
+#[derive(Debug)]
+pub struct NativeIdentityObservationRecoveryCandidate {
+    loaded: LoadedAttempt,
+    binding: NativeGuardianBinding,
+    issue: NativeIdentityObservationIssue,
+}
+impl NativeIdentityObservationRecoveryCandidate {
+    #[must_use]
+    pub const fn issue(&self) -> NativeIdentityObservationIssue {
+        self.issue
+    }
+    #[must_use]
+    pub const fn binding(&self) -> &NativeGuardianBinding {
+        &self.binding
+    }
+}
+
+#[derive(Debug)]
+pub struct VerifiedRecoveredNativeIdentityObservation {
+    candidate: NativeIdentityObservationRecoveryCandidate,
+    observation: IdentityObservation,
+}
+impl VerifiedRecoveredNativeIdentityObservation {
+    pub(crate) fn after_live_verification(
+        candidate: NativeIdentityObservationRecoveryCandidate,
+        observation: IdentityObservation,
+    ) -> Self {
+        Self {
+            candidate,
+            observation,
+        }
+    }
+}
+
+fn unique_recovery_issue(
+    tx: &rusqlite::Transaction<'_>,
+    attempt: crate::AttemptId,
+) -> Result<NativeIdentityObservationIssue> {
+    let mut stmt = tx.prepare("SELECT dispatch_revision, ordinal FROM native_identity_observation_issues WHERE attempt_id=?1")?;
+    let rows = stmt.query_map([key(attempt)], |row| {
+        Ok((row.get::<_, Word>(0)?.0, row.get::<_, i64>(1)?))
+    })?;
+    let mut candidate = None;
+    for row in rows {
+        let (revision, ordinal) = row?;
+        let dispatch = DispatchKey::from_committed_parts(
+            attempt,
+            binding_revision(revision)?,
+            usize::try_from(ordinal).map_err(|_| ControllerStoreError::RevisionConflict)?,
+        );
+        match read_status(tx, dispatch)? {
+            Some(NativeIdentityObservationStatus::IssuedPendingApplication { issue }) => {
+                if candidate.replace(issue).is_some() {
+                    return Err(ControllerStoreError::RevisionConflict);
+                }
+            }
+            Some(NativeIdentityObservationStatus::AckConfirmed { .. }) => {}
+            _ => return Err(ControllerStoreError::RevisionConflict),
+        }
+    }
+    candidate.ok_or(ControllerStoreError::RevisionConflict)
+}
+
+pub(super) fn validate_recovery_candidate(
+    tx: &rusqlite::Transaction<'_>,
+    interrupted: &DeploymentAttempt,
+    binding: &NativeGuardianBinding,
+    issue: NativeIdentityObservationIssue,
+    now: MonotonicTick,
+) -> Result<()> {
+    let current = binding.current_session();
+    if now >= interrupted.deadline()
+        || unique_recovery_issue(tx, interrupted.attempt_id())? != issue
+        || !matches!(interrupted.phase(), Phase::Interrupted)
+        || !interrupted.interrupted_native_root_identity_observation(issue.target())
+        || interrupted.attempt_id() != issue.key().attempt_id()
+        || interrupted.persistence_revision() != Some(current.interruption_revision)
+        || interrupted.deadline() != binding.deadline()
+        || binding.attempt_id() != issue.key().attempt_id()
+        || binding.identity() != issue.guardian_identity()
+        || binding.slots().len() != 1
+        || binding.slots()[0].process != issue.target()
+        || current.state != NativeSessionState::Reconciling
+        || issue.session_generation() >= current.generation
+        || !binding
+            .sessions()
+            .iter()
+            .any(|old| old.generation == issue.session_generation())
+        || issue.key().revision() >= current.interruption_revision
+        || binding.dispatch_floor() != current.interruption_revision
+        || read_attempt(tx, issue.key().attempt_id())?.as_ref() != Some(interrupted)
+        || read_binding(tx, issue.key().attempt_id())?.as_ref() != Some(binding)
+        || read_status(tx, issue.key())?
+            != Some(NativeIdentityObservationStatus::IssuedPendingApplication { issue })
+    {
+        return Err(ControllerStoreError::RevisionConflict);
+    }
+    Ok(())
+}
+
+impl ControllerSqliteStore {
+    /// # Errors
+    /// Invalid or stale recovery evidence poisons this handle.
+    pub fn prepare_native_identity_observation_recovery(
+        &mut self,
+        loaded: LoadedAttempt,
+    ) -> Result<NativeIdentityObservationRecoveryCandidate> {
+        self.prepare_native_identity_observation_recovery_with_clock(
+            loaded,
+            super::native_sampling::native_deadline_now,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn prepare_native_identity_observation_recovery_at(
+        &mut self,
+        loaded: LoadedAttempt,
+        now: MonotonicTick,
+    ) -> Result<NativeIdentityObservationRecoveryCandidate> {
+        self.prepare_native_identity_observation_recovery_with_clock(loaded, || Ok(now))
+    }
+    fn prepare_native_identity_observation_recovery_with_clock(
+        &mut self,
+        loaded: LoadedAttempt,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeIdentityObservationRecoveryCandidate> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            let binding = required(
+                read_binding(&tx, loaded.checkpoint.attempt_id())?,
+                "missing identity binding",
+            )?;
+            let issue = unique_recovery_issue(&tx, loaded.checkpoint.attempt_id())?;
+            validate_recovery_candidate(&tx, &loaded.checkpoint, &binding, issue, clock()?)?;
+            if clock()? >= loaded.checkpoint.deadline() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.commit()?;
+            Ok(NativeIdentityObservationRecoveryCandidate {
+                loaded,
+                binding,
+                issue,
+            })
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// # Errors
+    /// Invalid or stale evidence poisons this handle; no effects are emitted.
+    pub fn apply_recovered_native_identity_observation(
+        &mut self,
+        verified: VerifiedRecoveredNativeIdentityObservation,
+    ) -> Result<NativeIdentityObservationStatus> {
+        self.apply_recovered_native_identity_observation_with_clock(
+            verified,
+            super::native_sampling::native_deadline_now,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn apply_recovered_native_identity_observation_at(
+        &mut self,
+        verified: VerifiedRecoveredNativeIdentityObservation,
+        now: MonotonicTick,
+    ) -> Result<NativeIdentityObservationStatus> {
+        self.apply_recovered_native_identity_observation_with_clock(verified, || Ok(now))
+    }
+    fn apply_recovered_native_identity_observation_with_clock(
+        &mut self,
+        verified: VerifiedRecoveredNativeIdentityObservation,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeIdentityObservationStatus> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let VerifiedRecoveredNativeIdentityObservation {
+                candidate:
+                    NativeIdentityObservationRecoveryCandidate {
+                        loaded,
+                        binding,
+                        issue,
+                    },
+                observation,
+            } = verified;
+            let checkpoint = loaded
+                .checkpoint
+                .clone()
+                .fold_interrupted_identity_observation(issue.target(), observation)
+                .ok_or(ControllerStoreError::RevisionConflict)?;
+            let revision = self.persist_checkpoint_with_recovery(
+                &checkpoint,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some((&issue, &observation)),
+                Some((&loaded.checkpoint, &binding, &issue)),
+                &mut clock,
+            )?;
+            Ok(NativeIdentityObservationStatus::AppliedPendingAck {
+                issue,
+                observation,
+                applying_revision: revision,
+            })
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
 }
 
 fn parts(issue: NativeIdentityObservationIssue) -> Result<(Vec<u8>, Word, i64)> {
@@ -486,6 +714,7 @@ impl ControllerSqliteStore {
             None,
             None,
             Some((issue, observation)),
+            None,
             clock,
         );
         if result.is_err() {

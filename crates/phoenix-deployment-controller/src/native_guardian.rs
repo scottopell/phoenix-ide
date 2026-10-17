@@ -983,6 +983,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1013,6 +1014,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1046,6 +1048,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1072,6 +1075,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1095,6 +1099,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1118,6 +1123,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1327,6 +1333,89 @@ impl GuardianClient {
         ))
     }
 
+    /// Verify the retained identity completion in the same-guardian reconciling session.
+    /// # Errors
+    /// Stale custody or an unmatched response fences this connection.
+    pub fn verify_recovered_native_identity_observation(
+        &mut self,
+        candidate: crate::NativeIdentityObservationRecoveryCandidate,
+    ) -> Result<crate::VerifiedRecoveredNativeIdentityObservation, ClientError> {
+        let result = (|| {
+            if self.verified_snapshot.is_none() {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let snapshot = self.snapshot()?;
+            let binding = candidate.binding();
+            let issue = candidate.issue();
+            let native = snapshot
+                .native_binding
+                .as_ref()
+                .ok_or(ClientError::UnexpectedResponse)?;
+            let current = binding.current_session();
+            if snapshot.state != crate::guardian_ipc::WireState::Reconciling
+                || snapshot.session.instance != snapshot.instance
+                || snapshot.session.generation != current.generation.get()
+                || current.state != crate::NativeSessionState::Reconciling
+                || current.generation <= issue.session_generation()
+                || !binding
+                    .sessions()
+                    .iter()
+                    .any(|old| old.generation == issue.session_generation())
+                || binding.dispatch_floor() != current.interruption_revision
+                || issue.key().revision() >= current.interruption_revision
+                || binding.identity() != issue.guardian_identity()
+                || binding.attempt_id() != issue.key().attempt_id()
+                || snapshot.attempt != binding.attempt_id().get()
+                || snapshot.deadline != binding.deadline().get()
+                || native.attempt != snapshot.attempt
+                || native.deadline != snapshot.deadline
+                || native.nonce != binding.identity().nonce.bytes()
+                || native.guardian != binding.identity().process.into()
+                || binding.slots().len() != 1
+                || binding.slots()[0].process != issue.target()
+                || !recovered_sampling_slots_match(binding, &snapshot, native)
+                || !crate::MonotonicTick::native_now()
+                    .is_ok_and(|now| now.get() < snapshot.deadline)
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let key = crate::guardian_ipc::WireKey::try_from(issue.key())
+                .map_err(ClientError::Refused)?;
+            let Response::RecoveredNativeIdentityObservation {
+                key: returned,
+                observation,
+            } = self.exchange(&Request::VerifyRecoveredNativeIdentityObservation {
+                session: snapshot.session,
+                key,
+                issuing_session_generation: issue.session_generation().get(),
+            })?
+            else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+            if returned != key {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let observation = identity_observation_completion(
+                crate::guardian_ipc::WireCompletion::ObserveIdentity {
+                    identity: issue.target().into(),
+                    observation,
+                },
+                issue.target(),
+            )?;
+            Ok(
+                crate::VerifiedRecoveredNativeIdentityObservation::after_live_verification(
+                    candidate,
+                    observation,
+                ),
+            )
+        })();
+        if result.is_err() {
+            self.stream.take();
+            self.verified_snapshot = None;
+        }
+        result
+    }
+
     /// Confirm an ACK only after the exact durable application and correlated guardian receipt.
     /// # Errors
     /// Rejects stale evidence, an unmatched ACK receipt, or transport failure.
@@ -1492,6 +1581,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1618,6 +1708,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -1675,7 +1766,7 @@ impl GuardianClient {
             | crate::guardian_ipc::WireCompletion::ObserveIdentity { .. }
             | crate::guardian_ipc::WireCompletion::SignalExactIdentity { .. }
             | crate::guardian_ipc::WireCompletion::ReverifyRetainedCandidate { .. } => {
-                return Err(ClientError::UnexpectedResponse)
+                return Err(ClientError::UnexpectedResponse);
             }
         };
         Ok(crate::VerifiedNativeSamplingCompletion::new(
@@ -1949,6 +2040,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -2053,6 +2145,7 @@ impl GuardianClient {
             | Response::Retained(_)
             | Response::RecoveredNativeSampling { .. }
             | Response::RecoveredNativeChildList { .. }
+            | Response::RecoveredNativeIdentityObservation { .. }
             | Response::Acked { .. }
             | Response::SignalRoundReserved
             | Response::Admitted { .. }
@@ -2757,7 +2850,10 @@ mod native_sampling_snapshot_tests {
             let before = durable_rows(&path);
             assert!(store.cancel_unsubmitted_native_sampling(cap).is_err());
             assert_eq!(durable_rows(&path), before, "{mutation}");
-            assert!(matches!(store.load_native_sampling_status(issue.key()), Err(crate::ControllerStoreError::Poisoned)));
+            assert!(matches!(
+                store.load_native_sampling_status(issue.key()),
+                Err(crate::ControllerStoreError::Poisoned)
+            ));
         }
     }
 
