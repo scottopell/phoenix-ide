@@ -465,7 +465,9 @@ fn installed_two_job_launchd_recovers_child_list_ack_without_reenumeration_or_mu
         .unwrap();
     runner.marker("prepared_snapshot=").unwrap();
     runner.marker("durable_activation_snapshot=").unwrap();
-    runner.marker("reconciliation_active attempt=64").unwrap();
+    runner
+        .marker("reconciliation_active generation=3 interruption=")
+        .unwrap();
     runner.marker("active_snapshot=").unwrap();
     let sample_marker = runner
         .marker("recovered_sample_applied_ack attempt=64")
@@ -903,7 +905,7 @@ fn launchd_journey(continuation: bool) {
     assert_eq!(
         raw.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        5
+        6
     );
     drop(raw);
     guardian.assert_original_parent().unwrap();
