@@ -1,0 +1,71 @@
+name: Separate bounded native BFCache capability probe
+on:
+  push:
+    branches: [qualification/history-bfcache-once]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: history-bfcache-once
+  cancel-in-progress: false
+jobs:
+  native-capability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      APP_ROOT: ${{ github.workspace }}/pinned-app
+      PROBE_ARTIFACT: ${{ github.workspace }}/retained-artifact
+      PROBE_OUTPUT: ${{ github.workspace }}/bfcache-evidence
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 26d40cb8d61f3e0fe80fb520ad5a3e1af49abe84
+          path: pinned-app
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - uses: astral-sh/setup-uv@v6
+      - name: Admit exact retained candidate artifact; no compiler or UI build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir retained-artifact bfcache-evidence
+          gh api repos/scottopell/phoenix-ide/actions/artifacts/12093422759 > bfcache-evidence/github-artifact.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a=json.loads(Path('bfcache-evidence/github-artifact.json').read_text())
+          assert a['id']==12093422759 and a['workflow_run']['id']==39012783179
+          assert a['name']=='opening-codegen-1e0423216453f7487a3d3e4ac5f3620303a33b82-1'
+          assert a['size_in_bytes']==97800666 and a['expired'] is False
+          PY
+          gh run download 39012783179 --repo scottopell/phoenix-ide --name opening-codegen-1e0423216453f7487a3d3e4ac5f3620303a33b82-1 --dir retained-artifact
+      - name: Frozen runtime dependencies only
+        working-directory: pinned-app/ui
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm exec playwright install --with-deps chromium
+      - name: Exactly one authenticated disposable native round trip
+        working-directory: harness
+        run: timeout --signal=TERM --kill-after=5s 300s uv run tests/e2e/history_bfcache_probe.py
+      - name: Retain bounded safe probe receipts, not private logs or credentials
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bfcache-native-capability-not-full-acceptance
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            bfcache-evidence/native-capability.json
+            bfcache-evidence/provenance.json
+            bfcache-evidence/github-artifact.json
+            bfcache-evidence/completion.json
+            bfcache-evidence/server-completion.json
+            bfcache-evidence/driver-exit.json
