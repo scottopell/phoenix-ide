@@ -190,6 +190,21 @@ fn detached(guardian: &mut DisposableLaunchdGuardian) -> WireSnapshot {
     }
 }
 
+fn detached_after_root_exit(guardian: &DisposableLaunchdGuardian) -> WireSnapshot {
+    let until = Instant::now() + WAIT;
+    loop {
+        if let Ok(mut client) = GuardianClient::connect(&guardian.socket_dir()) {
+            if let Ok(snapshot) = client.hello() {
+                if snapshot.state == WireState::DetachedFenced {
+                    return snapshot;
+                }
+            }
+        }
+        assert!(Instant::now() < until, "guardian did not fence runner exit");
+        poll_pause();
+    }
+}
+
 fn same_custody(current: &WireSnapshot, original: &WireSnapshot) {
     assert_eq!(current.instance, original.instance);
     assert_eq!(current.attempt, original.attempt);
@@ -694,7 +709,7 @@ fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobs
         .is_none());
 
     runner.kill().unwrap();
-    let crashed = detached(runner.guardian());
+    let crashed = detached_after_root_exit(runner.guardian());
     same_custody(&crashed, &settled_initial);
     assert_eq!(crashed.retained.len(), 1);
     let retained = &crashed.retained[0];
@@ -742,7 +757,7 @@ fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobs
     );
     runner.success().unwrap();
     runner.assert_witnesses().unwrap();
-    let confirmed = detached(runner.guardian());
+    let confirmed = detached_after_root_exit(runner.guardian());
     same_custody(&confirmed, &crashed);
     assert!(confirmed.retained.is_empty());
     assert_eq!(identity_observation_table_counts(&path), [1, 1, 1]);
