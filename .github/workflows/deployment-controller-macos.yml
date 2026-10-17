@@ -50,8 +50,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: Run deployment controller tests
-        run: cargo nextest run -p phoenix-deployment-controller
+      - name: Run deployment controller tests serially
+        run: cargo nextest run -p phoenix-deployment-controller --test-threads 1
       - name: Lint deployment controller
         run: cargo clippy -p phoenix-deployment-controller --all-targets -- -D warnings
       - name: Check workspace formatting
