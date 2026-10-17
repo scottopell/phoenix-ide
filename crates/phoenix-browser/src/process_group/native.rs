@@ -259,8 +259,6 @@ exit 0
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let identity = current_process_identity(root.id().unwrap()).unwrap();
-        let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         let mut stdout = tokio::io::BufReader::new(root.stdout.take().unwrap());
         let mut ready = String::new();
         tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut ready))
@@ -268,6 +266,8 @@ exit 0
             .unwrap()
             .unwrap();
         assert_eq!(ready.trim(), "ready");
+        let identity = current_process_identity(root.id().unwrap()).unwrap();
+        let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         root.stdin
             .take()
             .unwrap()
@@ -430,12 +430,20 @@ exit 0
         let profile = tempfile::tempdir().unwrap();
         let mut unrelated = sentinel();
         let mut root = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "read release"])
+            .args(["-c", "echo ready; read release"])
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let mut stdout = tokio::io::BufReader::new(root.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
         let identity = current_process_identity(root.id().unwrap()).unwrap();
         let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         assert!(
