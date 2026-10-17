@@ -122,12 +122,12 @@ impl OwnedChromeGroup {
             return Ok(RootObservation::Exited);
         }
         #[cfg(target_os = "macos")]
-        if observed_identity.is_none()
-            && observed_group == -1
-            && group_error
-                .as_ref()
-                .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH))
-        {
+        if darwin_exit_is_pending(
+            self.root,
+            observed_identity,
+            observed_group,
+            group_error.as_ref().and_then(io::Error::raw_os_error),
+        ) {
             return Ok(RootObservation::ExitPending);
         }
         #[cfg(target_os = "macos")]
@@ -204,6 +204,18 @@ impl OwnedChromeGroup {
             tokio::task::yield_now().await;
         }
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_exit_is_pending(
+    root: ProcessIdentity,
+    observed_identity: Option<ProcessIdentity>,
+    observed_group: libc::pid_t,
+    group_errno: Option<libc::c_int>,
+) -> bool {
+    (observed_identity.is_none() || observed_identity == Some(root))
+        && observed_group == -1
+        && group_errno == Some(libc::ESRCH)
 }
 
 fn signal_delivery(result: io::Result<()>) -> io::Result<bool> {
@@ -510,6 +522,47 @@ mod tests {
             );
         }
         assert!(!RootObservation::Live.permits_completion());
+        assert!(!RootObservation::ExitPending.permits_completion());
+    }
+
+    #[test]
+    fn darwin_pending_exit_preserves_birth_identity_and_requires_missing_group() {
+        let root = ProcessIdentity {
+            pid: 42,
+            start_time: 100,
+        };
+        let replacement = ProcessIdentity {
+            pid: 42,
+            start_time: 101,
+        };
+        let other_pid = ProcessIdentity {
+            pid: 43,
+            start_time: 100,
+        };
+        for (identity, consistent_birth) in [
+            (None, true),
+            (Some(root), true),
+            (Some(replacement), false),
+            (Some(other_pid), false),
+        ] {
+            for (group, errno, missing_group) in [
+                (-1, Some(libc::ESRCH), true),
+                (-1, Some(libc::EPERM), false),
+                (-1, Some(libc::EINVAL), false),
+                (-1, None, false),
+                (42, None, false),
+                (43, None, false),
+                (0, None, false),
+                (42, Some(libc::ESRCH), false),
+            ] {
+                assert_eq!(
+                    darwin_exit_is_pending(root, identity, group, errno),
+                    consistent_birth && missing_group,
+                    "identity={identity:?} group={group} errno={errno:?}",
+                );
+            }
+        }
+        assert!(!RootObservation::ExitPending.permits_signal());
         assert!(!RootObservation::ExitPending.permits_completion());
     }
 
