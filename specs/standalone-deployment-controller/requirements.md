@@ -496,6 +496,18 @@ the ordinary durable-application proof. A crash or lost response before applicat
 commit SHALL permit fresh verification of retained custody, not effect reexecution;
 a crash after application commit SHALL use acknowledgement-only recovery.
 
+WHEN the same live guardian retains a successful exact-root child enumeration that the
+issuing runner did not durably apply
+THE recovering runner MAY obtain a distinct application-only capability after the same
+fresh interruption, exact reconciling-session, issuing-provenance, slot, deadline, and
+live-result checks. That capability SHALL atomically append the exact child-list result
+to the interrupted ownership resume state and normalized result rows, preserve received
+PID order while policy canonicalizes discovery hints, leave the attempt interrupted,
+and return no executable plan. It SHALL NOT reconstruct the original dispatch ticket,
+re-enumerate the root, activate reconciliation, observe identity, mutate a process, or
+itself authorize ACK. A pre-commit crash MAY repeat live verification; a post-commit
+crash SHALL use acknowledgement-only recovery.
+
 ---
 
 ### REQ-SDC-019: Pre-Adoption Same-Version Boundary
@@ -572,3 +584,48 @@ re-reading durable application evidence without re-enumerating or reapplying it.
 Establishing that fresh session interrupts the ownership checkpoint; acknowledgement
 alone SHALL NOT reconstruct a policy loop, resume cleanup, authorize identity
 observation, or claim readiness for disruption.
+
+---
+
+### REQ-SDC-022: Exact Native Owned-Root Identity Observation
+
+WHEN owned-tree cleanup or verification produces an exact identity-observation
+obligation for the harmless supervised root
+THE runner SHALL durably issue that committed `ObserveIdentity` effect before native
+submission, and the guardian SHALL derive the target from the durable issue and verify
+its current session, key, revision, original deadline, guardian identity, policy phase,
+and sole exact owned-root slot including PID and birth token. The native request SHALL
+NOT accept a caller-selected PID, birth token, parent, or generalized effect as
+observation authority.
+
+WHEN native identity observation completes
+THE runner SHALL correlate the exact retained typed result and atomically apply it
+through the same policy loop before acknowledgement. The controller store SHALL retain
+normalized immutable issue, typed application, and acknowledgement evidence without a
+result blob or duplicate deadline. Malformed, stale, ambiguous, mismatched, or expired
+evidence SHALL remain retained or fail stopped without advancing cleanup policy or
+authorizing acknowledgement. A
+correlated typed `Unresolved` result MAY be durably applied and acknowledged as
+uncertainty, but SHALL NOT advance cleanup, authorize mutation, or establish readiness.
+
+WHEN the supervised root exits naturally and its original process group has no retained
+member
+THE guardian MAY reap that exact supervised child before observing the issued identity.
+An exited leader whose original process group still has a member SHALL remain unresolved
+and SHALL NOT become exact-absence evidence. No signal or other cleanup mutation is
+authorized by this observation path.
+
+WHEN exact absence or valid PID reuse is durably applied and acknowledged before the
+original deadline
+THE runner MAY wait for that unchanged deadline and ask policy to settle cleanup. Policy
+MAY enter `ReadyForDisruption` with `VerifiedClean` only when every acquired identity is
+verified absent and no discovery obligation remains. This already-clean deadline path
+SHALL issue no `SignalExactIdentity` effect. Empty child enumeration, slot liveness,
+process exit alone, or a PID without its acquired birth token SHALL NOT authorize
+readiness.
+
+WHEN a runner dies after identity-observation application but before acknowledgement
+A same-live replacement session MAY acknowledge the exact retained result from durable
+application evidence without repeating observation or reconstructing a policy loop. The
+fresh session interrupts the checkpoint, so acknowledgement-only recovery SHALL remain
+`Interrupted` and SHALL NOT claim cleanup completion or readiness.

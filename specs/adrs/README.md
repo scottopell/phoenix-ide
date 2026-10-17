@@ -136,6 +136,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [117](117_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
 | [118](118_retained-native-results-use-application-only-recovery.md) | Retained native results use application-only recovery | Accepted | REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–020; completed-but-unapplied native sampling recovery |
 | [119](119_owned-root-child-enumeration-is-distinct-native-authority.md) | Owned-root child enumeration is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–021; native `ListChildren`, schema v6, protocol v6 |
+| [120](120_exact-root-identity-observation-is-distinct-native-authority.md) | Exact-root identity observation is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–022; native `ObserveIdentity`, schema v7, protocol v8 |
 
 ## For agents: which decisions bind your task
 
@@ -248,6 +249,7 @@ ADR-000 (adopt spEARS v2 for new work)
       │           └── ADR-117 (Same-build pre-adoption native guardian IPC and runner)
       │               └── ADR-118 (Retained native results use application-only recovery)
       │                   └── ADR-119 (Owned-root child enumeration is distinct native authority)
+      │                       └── ADR-120 (Exact-root identity observation is distinct native authority)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)

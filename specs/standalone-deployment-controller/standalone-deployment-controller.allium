@@ -987,6 +987,15 @@ contract NativeDispatchAdmissionBoundary {
         -- label, or socket path alone cannot authorize enumeration. The complete
         -- child vector is bounded before allocation and retained as one typed result.
 
+    @invariant ExactOwnedRootIdentityObservation
+        -- A native ObserveIdentity admission names only the durable issue key. The
+        -- guardian independently derives the target from that issue and accepts only
+        -- the current session, revision, original deadline, cleanup or verification
+        -- phase, and its sole exact owned-root slot including PID and birth token.
+        -- The wire request accepts no caller-selected identity or generalized effect.
+        -- An exited leader is exact-absence evidence only after the guardian proves
+        -- its retained original process group has no member and reaps that child.
+
     @invariant CapacityBeforeFirstMutation
         -- Reserve result custody for the complete mutation round before its first
         -- effect. Reservation or admission refusal before execution emits no partial
@@ -1041,6 +1050,34 @@ contract NativeGuardianPersistenceBoundary {
         -- cleanup authority. Establishing the replacement session interrupts the
         -- ownership checkpoint, so ACK-only recovery remains interrupted and
         -- cleanup progress requires the separate identity-reconciliation barrier.
+
+    @invariant RecoveredChildListApplicationIsNotDispatch
+        -- A same-live fresh reconciling session may combine the sole durable pending
+        -- child-list issue with exact retained issuing provenance to obtain one
+        -- application-only capability. Atomic application preserves received child
+        -- order, advances only the interrupted ownership resume state, and returns no
+        -- executable plan, activation, identity observation, mutation, or ACK authority.
+        -- Reverification never re-enumerates the root; post-commit recovery is ACK-only.
+
+    @invariant NormalizedRootIdentityApplication
+        -- Exact-root identity issue, typed application, and ACK evidence occupy
+        -- normalized immutable rows. Successful application consumes the original
+        -- affine ticket and verified retained completion through the same policy loop
+        -- and checkpoint transaction before ACK. Exact absence or valid PID reuse is
+        -- cleanup evidence; liveness, empty enumeration, a PID hint, malformed reuse,
+        -- uncertainty, or an unfinished original process group is not.
+
+    @invariant IdentityAckRecoveryIsNotReadinessRecovery
+        -- A same-live fresh session may ACK an earlier identity observation only from
+        -- exact durable application evidence. It does not repeat observation,
+        -- reconstruct a ticket or policy loop, resume cleanup, or claim readiness.
+        -- The replacement session leaves the attempt interrupted.
+
+    @invariant AlreadyCleanDeadlinePathIssuesNoSignal
+        -- Once every acquired exact identity is durably verified absent and no
+        -- discovery obligation remains, policy may reach ReadyForDisruption at the
+        -- unchanged original deadline without issuing SignalExactIdentity. Durable
+        -- identity application and ACK precede this zero-effect transition.
 
     @invariant RecoveredSampleApplicationIsNotDispatch
         -- A fresh reconciling session may combine the sole durable pending issue with
