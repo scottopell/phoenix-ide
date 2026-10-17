@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootObservation {
     Live,
+    #[cfg(any(target_os = "macos", test))]
     ExitPending,
     Exited,
 }
@@ -384,12 +385,14 @@ exit 0
         })
         .await
         .unwrap();
-        assert!(
-            group.observe_root(&mut root).unwrap() == RootObservation::Exited,
+        assert_eq!(
+            group.observe_root(&mut root).unwrap(),
+            RootObservation::Exited,
             "WNOWAIT must retain the same exited-child anchor"
         );
-        assert!(
-            group.observe_root(&mut root).unwrap() == RootObservation::Exited,
+        assert_eq!(
+            group.observe_root(&mut root).unwrap(),
+            RootObservation::Exited,
             "observing exit must not reap the root"
         );
         assert!(path.join("writer").exists());
