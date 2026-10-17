@@ -289,22 +289,24 @@ jobs:
           git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt
           python3 -c 'import runpy,subprocess; d=runpy.run_path("dev.py"); raise SystemExit(subprocess.call(["node","node_modules/@ladle/react/lib/cli/cli.js","serve","--host","127.0.0.1","--port","61129"],cwd="ui",env=d["node_env"]()))' > ui/qa-artifacts/assistant-finalization/ladle.log 2>&1 &
           server=$!
-          trap 'kill "$server" 2>/dev/null || true; git -C "$GITHUB_WORKSPACE" restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx' EXIT
+          trap 'kill "$server" 2>/dev/null || true; git -C "$GITHUB_WORKSPACE" restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx ui/src/index.css' EXIT
           for attempt in $(seq 1 60); do
             if curl -fsS "$LADLE_URL" >/dev/null; then break; fi
             sleep 1
           done
-          cd ui
-          node scripts/capture-assistant-finalization.mjs
-          node scripts/capture-assistant-finalization-transcript.mjs
-          cd ..
-          # Immutable pre-fix source: same fixtures/styles, only the two renderer
-          # entry points restored. This is a causal control, not a shipped build.
+          # Causal controls restore only the named pre-fix seams, not a shipped build.
           baseline=4894426888d175d4fd65095647bede65bb09718e
           git restore --source="$baseline" -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx
           echo "$baseline (renderer control)" > ui/qa-artifacts/assistant-finalization/baseline-source.txt
+          (cd ui && FINALIZATION_QA_BASELINE=1 node scripts/capture-assistant-finalization.mjs)
+          git restore --source=HEAD -- ui/src/components/StreamingMessage.tsx ui/src/components/MessageComponents.tsx
+          git restore --source="$baseline" -- ui/src/index.css
+          (cd ui && STREAMING_TABLE_QA_BASELINE=1 node scripts/capture-streaming-table.mjs)
+          git restore --source=HEAD -- ui/src/index.css
           cd ui
-          FINALIZATION_QA_BASELINE=1 node scripts/capture-assistant-finalization.mjs
+          node scripts/capture-assistant-finalization.mjs
+          node scripts/capture-streaming-table.mjs
+          node scripts/capture-assistant-finalization-transcript.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

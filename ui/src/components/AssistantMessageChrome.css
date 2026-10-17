@@ -41,7 +41,7 @@
     display: flex;
   }
 
-  .assistant-message-actions > .copy-btn {
+  .assistant-message .assistant-message-actions > .copy-btn {
     width: 44px;
     height: 44px;
   }
