@@ -1639,6 +1639,111 @@ fn blocked_profile_preserves_structured_measurement_failure() {
     cli.ok(&["close"]);
 }
 
+fn record_owned_chrome_layout(
+    resources: &(PathBuf, ProcessIdentity),
+    phase: &str,
+    require_group: bool,
+) {
+    use std::collections::BTreeSet;
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat=,args="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let rows: Vec<_> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let parent = fields.next()?.parse::<u32>().ok()?;
+            let group = fields.next()?.parse::<u32>().ok()?;
+            let state = fields.next()?.to_string();
+            Some((pid, parent, group, state, line))
+        })
+        .collect();
+    let mut owned = BTreeSet::from([resources.1.pid]);
+    loop {
+        let before = owned.len();
+        for (pid, parent, _, _, _) in &rows {
+            if owned.contains(parent) {
+                owned.insert(*pid);
+            }
+        }
+        if before == owned.len() {
+            break;
+        }
+    }
+    let profile = resources.0.to_str().unwrap();
+    let selected: Vec<_> = rows
+        .iter()
+        .filter(|(pid, _, _, _, line)| owned.contains(pid) || line.contains(profile))
+        .collect();
+    eprintln!(
+        "chrome_layout {}",
+        serde_json::json!({
+            "phase": phase, "root": resources.1.pid, "root_start_time": resources.1.start_time,
+            "profile": profile,
+            "processes": selected.iter().map(|(pid, parent, group, state, _)| serde_json::json!({
+                "pid": pid, "parent": parent, "group": group, "state": state,
+                "identity": current_process_identity(*pid).map(|identity| identity.start_time),
+            })).collect::<Vec<_>>(),
+        })
+    );
+    if require_group {
+        assert!(process_identity_matches(resources.1));
+        assert!(!selected.is_empty());
+        for (pid, _, group, _, _) in selected {
+            assert_eq!(
+                *group, resources.1.pid,
+                "unsupported escaped Chrome helper {pid}; no all-writers cleanup qualification"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_chrome_exec_shim_preserves_arguments_and_clears_internal_request() {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let target = std::fs::canonicalize("/bin/sh").expect("shell executable");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(target.as_os_str().as_bytes());
+    let output = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"))
+        .env("PHOENIX_INTERNAL_CHROME_EXEC", encoded)
+        .args(["-c", r#"printf '%s\n' "$$"; ps -o pgid= -p "$$"; printf '%s\000' "${PHOENIX_INTERNAL_CHROME_EXEC-unset}" "$@""#, "shim", "space value", "--chrome-argument", "line\nbreak"])
+        .arg(std::ffi::OsString::from_vec(vec![b'x', 0xff, b'y']))
+        .output().expect("native shim process");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut lines = output.stdout.splitn(3, |byte| *byte == b'\n');
+    let pid = std::str::from_utf8(lines.next().unwrap()).unwrap().trim();
+    let group = std::str::from_utf8(lines.next().unwrap()).unwrap().trim();
+    assert_eq!(pid, group, "shim must isolate the group before exec");
+    assert_eq!(
+        lines.next().unwrap(),
+        b"unset\0space value\0--chrome-argument\0line\nbreak\0x\xffy\0"
+    );
+}
+
+#[test]
+fn malformed_or_recursive_chrome_exec_request_never_enters_cli() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_phoenix-browser")).unwrap();
+    let recursive = base64::engine::general_purpose::STANDARD.encode(binary.as_os_str().as_bytes());
+    for request in ["%%%".to_string(), recursive] {
+        let output = Command::new(&binary)
+            .env("PHOENIX_INTERNAL_CHROME_EXEC", request)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Chrome exec failed:"));
+    }
+}
+
 #[test]
 fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
     // REQ-BCLI-004, REQ-BCLI-005: the daemon can outlive its owned Chrome.
@@ -1658,7 +1763,9 @@ fn lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime() {
     let resources = live_resources(&cli);
     let sentinel = resources.0.join("old-lifetime-sentinel");
     std::fs::write(&sentinel, b"old browser state").unwrap();
+    record_owned_chrome_layout(&resources, "before-root-kill", true);
     signal_owned(resources.1, libc::SIGKILL);
+    record_owned_chrome_layout(&resources, "after-root-kill-before-status", false);
     let status = wait_for_observation("owned Chrome was reaped", || {
         let status = cli.ok(&["status"]);
         (status["result"]["active"] == false).then_some(status)

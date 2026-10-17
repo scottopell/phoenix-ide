@@ -29,6 +29,32 @@ The lifecycle contract is specified in `browser-cli.allium`; browser operation s
 
 **Progress:** 12 of 12 implemented and covered. PR review and final CI qualification are tracked in [PR #925](https://github.com/scottopell/phoenix-ide/pull/925).
 
+## Native teardown qualification candidate
+
+The source candidate isolates Chrome through the existing CLI/server executable's
+native re-exec entry, without changing chromiumoxide or rebuilding its argument
+list. Linux/macOS launch-group ownership retains the exact root as an unreaped
+child (`waitid(WNOWAIT)`), observes status without `try_wait`, and bounds TERM →
+KILL → group drain before root reap and profile deletion. Binaries explicitly
+install the shim capability; libtest/other embedders do not infer it from
+`current_exe`. Other platforms retain the direct-launch path and cannot install
+the Unix capability.
+
+**Not an acceptance or all-descendants claim:** the barrier covers members of the
+launch group, not a helper that calls `setsid`/`setpgid`. A deterministic escaped
+writer negative demonstrates that limitation. The real lost-Chrome regression
+records bounded profile/ancestry-selected process layout and rejects observed
+escaped helpers before qualifying cleanup. Exact Linux and macOS compiled tests
+and actual Chrome layout remain required; source formatting is not runtime proof.
+A supplementary retained macOS binary observation is not exact-candidate evidence.
+
+Launch failures before chromiumoxide returns a child handle preserve the
+unmarked profile because the dependency may already have reaped the root.
+Group-marked profiles without retained drain authority are also preserved and
+refused for reuse. This is fail-closed, with an explicit availability limitation;
+there is no new automatic epoch allocation, recovery, or downgrade guarantee.
+Existing cleanup assertions are not weakened and deletion is never retried.
+
 ## Verification
 
 Lifecycle and installed-command coverage live in `crates/phoenix-tools/tests/browser_cli.rs`. Browser-free preflight and operation-catalog parity live in `browser::access_tests`; profiling validation and methodology retain their existing unit coverage. Engine snapshot and console tests use actual Chrome for document replacement, native input, artifacts, source-event capture, and iframe diagnostics.
