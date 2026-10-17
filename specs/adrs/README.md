@@ -131,6 +131,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [112](112_browser-cli-shares-verified-release-publication.md) | Browser CLI shares verified release publication | Accepted | REQ-DESKTOP-REL-005/009/010/011 |
 | [113](113_coordinator-api-recipes-are-non-exhaustive.md) | Coordinator API recipes are non-exhaustive | Accepted | REQ-GR-007, REQ-AUQ-009; Phoenix API guidance |
 | [114](114_admit-exact-target-ledger-for-prepared-current-schema-activation.md) | Admit the exact target ledger for prepared current-schema activation | Accepted; partially supersedes ADR-105's prepared-source restriction | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
+| [115](115_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Accepted | REQ-BASH-017 |
 
 ## For agents: which decisions bind your task
 

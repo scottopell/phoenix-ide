@@ -24,21 +24,23 @@ use tokio::process::Command;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
+use super::ValidatedBashSpawnTarget;
 use super::handle::{
-    BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState,
-    KillSignal, BASH_LAUNCH_UUID_ENV_VAR, TOMBSTONE_TAIL_LINES,
+    BASH_LAUNCH_UUID_ENV_VAR, BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause,
+    Handle, HandleId, HandleState, KillSignal, TOMBSTONE_TAIL_LINES,
 };
-use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary};
+use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary, SpawnReservation};
+use super::ring::RingBuffer;
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
-use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
-    BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
-    BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
-    BashStillRunningPayload, BashTombstonedPayload, BashWaiterPanickedPayload,
+    BashErrorResponse, BashKillPendingKernelPayload, BashLaunchError, BashLiveHandleSummary,
+    BashResponse, BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
+    BashStillRunningPayload, BashTombstonedPayload, BashUnregisteredRun,
+    BashUnregisteredTerminalPayload, BashUnregisteredUnknownPayload, BashWaiterPanickedPayload,
 };
 use phoenix_core::process_identity::current_process_identity;
 
@@ -70,8 +72,7 @@ const CAP_HINT: &str =
 
 // Hint text for handle_not_found responses (REQ-BASH-008/010): tmux pointer
 // for handles that may predate this Phoenix process.
-const HANDLE_NOT_FOUND_HINT: &str =
-    "if Phoenix restarted since this handle was created, the handle was lost — bash handles do \
+const HANDLE_NOT_FOUND_HINT: &str = "if Phoenix restarted since this handle was created, the handle was lost — bash handles do \
      not survive Phoenix restart. For processes that should survive Phoenix restart, use the \
      tmux tool.";
 
@@ -534,6 +535,30 @@ async fn run_run(
     spawn_context: &SpawnContext,
     spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
+    run_run_with_identity_probe(
+        cmd,
+        label,
+        wait_seconds,
+        read_args,
+        ctx,
+        spawn_context,
+        spawn_mode,
+        current_process_identity,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_run_with_identity_probe(
+    cmd: &str,
+    label: Option<String>,
+    wait_seconds: u64,
+    read_args: ReadArgs,
+    ctx: &ToolContext,
+    spawn_context: &SpawnContext,
+    spawn_mode: BashSpawnMode,
+    probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
+) -> ToolOutput {
     // REQ-BASH-011: command safety is enforced upstream by the permission seam
     // (specs/permissions, the deterministic deny layer) before this tool runs,
     // not here — see `crate::bash_check`, which the seam invokes. No second
@@ -568,66 +593,330 @@ async fn run_run(
     };
 
     let ring_bytes_cap = registry.ring_bytes_cap();
-    match spawn_child(
+    let launched = spawn_child_with_identity_probe(
         cmd,
-        label,
+        label.clone(),
         ctx,
         spawn_context,
         reservation.handle_id().clone(),
         ring_bytes_cap,
         &spawn_mode,
-    ) {
-        Ok((handle, spawned)) => {
-            let inserted = match registry
-                .commit_spawn(&mut reservation, handle.clone())
-                .await
-            {
-                Ok(inserted) => inserted,
-                Err(error) => {
-                    return BashError::SpawnFailed {
-                        error_message: error.to_string(),
-                    }
-                    .into_tool_output();
-                }
-            };
-            // Spawn edge: a new bash handle exists for this scope. Emit a
-            // work-scope state-transition signal (REQ-WSUI-007). The
-            // detached waiter started below carries the sink so it can
-            // emit the terminal edge off-thread.
-            registry.emit_lifecycle(
-                &spawn_context.lifecycle_scope,
-                Some(handle.handle_id.clone()),
-                crate::bash::registry::BashLifecyclePhase::Spawned,
-                None,
-                None,
-            );
-            let progress_reporter = ctx
-                .bash_progress_sink()
-                .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
-            let _progress_lease = progress_reporter
-                .as_ref()
-                .map(|reporter| LiveBashProgressLease(reporter.clone()));
-            let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
-            start_io_tasks(
-                &inserted,
-                spawn_context.lifecycle_scope.clone(),
+        probe,
+    )
+    .map(|(handle, spawned)| {
+        let started_at = spawned.started_at;
+        let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
+        (
+            handle,
+            UnregisteredChild {
                 child,
-                registry.lifecycle_sink(),
-                spawn_context.terminal_effect,
                 sandbox_scratch_dir,
-                progress_reporter.clone(),
+                started_at,
+            },
+        )
+    });
+    if !matches!(&launched, Err(SpawnChildError::NotSpawned(_))) {
+        reservation.mark_launched();
+    }
+    let fallback_cmd = cmd.to_string();
+    let fallback_label = label.clone();
+    let cmd = cmd.to_string();
+    let ctx = ctx.clone();
+    let spawn_context = spawn_context.clone();
+    let owner = tokio::spawn(async move {
+        let cmd = cmd.as_str();
+        let ctx = &ctx;
+        match launched {
+            Ok((handle, spawned)) => {
+                let inserted = match tokio::time::timeout(
+                    REGISTRATION_TIMEOUT,
+                    registry.commit_spawn(&mut reservation, handle.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(inserted)) => inserted,
+                    _ => {
+                        return settle_unregistered_run(
+                            spawned,
+                            reservation,
+                            cmd,
+                            label,
+                            ring_bytes_cap,
+                            &read_args,
+                            BashLaunchError::RegistrationFailed,
+                        )
+                        .await;
+                    }
+                };
+                // Spawn edge: a new bash handle exists for this scope. Emit a
+                // work-scope state-transition signal (REQ-WSUI-007). The
+                // detached waiter started below carries the sink so it can
+                // emit the terminal edge off-thread.
+                registry.emit_lifecycle(
+                    &spawn_context.lifecycle_scope,
+                    Some(handle.handle_id.clone()),
+                    crate::bash::registry::BashLifecyclePhase::Spawned,
+                    None,
+                    None,
+                );
+                let progress_reporter = ctx
+                    .bash_progress_sink()
+                    .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+                let _progress_lease = progress_reporter
+                    .as_ref()
+                    .map(|reporter| LiveBashProgressLease(reporter.clone()));
+                let UnregisteredChild {
+                    child,
+                    sandbox_scratch_dir,
+                    ..
+                } = spawned;
+                start_io_tasks(
+                    &inserted,
+                    spawn_context.lifecycle_scope.clone(),
+                    child,
+                    registry.lifecycle_sink(),
+                    spawn_context.terminal_effect,
+                    sandbox_scratch_dir,
+                    progress_reporter.clone(),
+                );
+                race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
+            }
+            Err(SpawnChildError::NotSpawned(error_message)) => {
+                registry.abort_spawn(reservation);
+                BashError::SpawnFailed { error_message }.into_tool_output()
+            }
+            Err(SpawnChildError::Unregistered(child)) => {
+                settle_unregistered_run(
+                    child,
+                    reservation,
+                    cmd,
+                    label,
+                    ring_bytes_cap,
+                    &read_args,
+                    BashLaunchError::IdentityUnavailable,
+                )
+                .await
+            }
+        }
+    });
+    owner.await.unwrap_or_else(|error| {
+        tracing::error!(%error, "bash launch custody task failed; outcome unknown");
+        let ring = RingBuffer::new(ring_bytes_cap);
+        let read = read_window_from_ring(&ring, &ReadArgs::default());
+        unregistered_tool_output(
+            BashUnregisteredRun {
+                cmd: fallback_cmd,
+                label: fallback_label,
+                launch_error: BashLaunchError::RegistrationFailed,
+                descendants: "unverified".to_string(),
+                output_complete: false,
+                duration_ms: 0,
+                window: window_to_typed(&read.view, read.partial),
+            },
+            None,
+        )
+    })
+}
+
+#[derive(Debug)]
+enum SpawnChildError {
+    NotSpawned(String),
+    Unregistered(UnregisteredChild),
+}
+
+impl From<String> for SpawnChildError {
+    fn from(message: String) -> Self {
+        Self::NotSpawned(message)
+    }
+}
+
+#[derive(Debug)]
+struct UnregisteredChild {
+    child: tokio::process::Child,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
+    started_at: Instant,
+}
+
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(1);
+const UNREGISTERED_SETTLEMENT_TIMEOUT: Duration = Duration::from_millis(250);
+const DIRECT_CHILD_KILL_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn settle_direct_child(child: &mut tokio::process::Child) -> Option<FinalCause> {
+    match child.try_wait() {
+        Ok(Some(status)) => return Some(exit_status_to_cause(status)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, errno = error.raw_os_error(), "unregistered bash initial try_wait failed; outcome unknown");
+            return None;
+        }
+    }
+    match tokio::time::timeout(UNREGISTERED_SETTLEMENT_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => return Some(exit_status_to_cause(status)),
+        Ok(Err(error)) => {
+            tracing::error!(%error, errno = error.raw_os_error(), "unregistered bash wait failed; no further signal attempted");
+            return None;
+        }
+        Err(_) => {}
+    }
+    match child.try_wait() {
+        Ok(Some(status)) => return Some(exit_status_to_cause(status)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, errno = error.raw_os_error(), "unregistered bash try_wait failed; no further signal attempted");
+            return None;
+        }
+    }
+    // Child owns this unreaped process; start_kill never targets its process group.
+    if let Err(error) = child.start_kill() {
+        tracing::error!(%error, errno = error.raw_os_error(), "unregistered bash direct-child termination failed");
+    }
+    match tokio::time::timeout(DIRECT_CHILD_KILL_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => Some(exit_status_to_cause(status)),
+        Ok(Err(error)) => {
+            tracing::error!(%error, errno = error.raw_os_error(), "unregistered bash reap failed");
+            None
+        }
+        Err(_) => {
+            tracing::error!(
+                "unregistered bash direct-child settlement deadline elapsed; outcome remains unknown"
             );
-            race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
+            None
         }
-        Err(e) => {
-            registry.abort_spawn(reservation);
-            BashError::SpawnFailed { error_message: e }.into_tool_output()
+    }
+}
+
+async fn drain_unregistered_readers(
+    mut readers: tokio::task::JoinSet<std::io::Result<()>>,
+    ring: Arc<tokio::sync::Mutex<RingBuffer>>,
+) -> bool {
+    let complete = tokio::time::timeout(READER_DRAIN_TIMEOUT, async {
+        let mut complete = true;
+        while let Some(result) = readers.join_next().await {
+            complete &= matches!(result, Ok(Ok(())));
         }
+        complete
+    })
+    .await
+    .unwrap_or(false);
+    readers.abort_all();
+    while readers.join_next().await.is_some() {}
+    ring.lock().await.flush_partial();
+    if !complete {
+        tracing::warn!(
+            "unregistered bash output capture incomplete; closing bounded readers without signaling child or descendants"
+        );
+    }
+    complete
+}
+
+async fn read_unregistered_pipe<R: tokio::io::AsyncRead + Unpin>(
+    mut pipe: R,
+    ring: Arc<tokio::sync::Mutex<RingBuffer>>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = [0; 4096];
+    loop {
+        let count = pipe.read(&mut bytes).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        ring.lock().await.append(&bytes[..count]);
+    }
+}
+
+fn settle_unregistered_run(
+    mut unregistered: UnregisteredChild,
+    mut reservation: SpawnReservation,
+    cmd: &str,
+    label: Option<String>,
+    ring_bytes_cap: usize,
+    read_args: &ReadArgs,
+    launch_error: BashLaunchError,
+) -> impl std::future::Future<Output = ToolOutput> + Send + 'static {
+    let started = unregistered.started_at;
+    let cmd = cmd.to_string();
+    let read_args = read_args.clone();
+    reservation.mark_launched();
+    tracing::warn!(
+        ?launch_error,
+        "bash child launched without a registered handle; bounded direct-child settlement, never retrying"
+    );
+    let ring = Arc::new(tokio::sync::Mutex::new(RingBuffer::new(ring_bytes_cap)));
+    let mut readers = tokio::task::JoinSet::new();
+    if let Some(stdout) = unregistered.child.stdout.take() {
+        readers.spawn(read_unregistered_pipe(stdout, ring.clone()));
+    }
+    if let Some(stderr) = unregistered.child.stderr.take() {
+        readers.spawn(read_unregistered_pipe(stderr, ring.clone()));
+    }
+    let capture = ring.clone();
+    let owner = tokio::spawn(async move {
+        let cause = settle_direct_child(&mut unregistered.child).await;
+        let output_complete = if cause.is_some() {
+            drain_unregistered_readers(readers, capture).await
+        } else {
+            tracing::warn!(
+                "unregistered bash settlement exhausted; closing capture as explicitly incomplete while direct-child outcome remains unknown"
+            );
+            readers.abort_all();
+            while readers.join_next().await.is_some() {}
+            capture.lock().await.flush_partial();
+            false
+        };
+        if cause.is_some() {
+            // Descendants are unverified and may still use the sandbox scratch.
+            if unregistered.sandbox_scratch_dir.is_some() {
+                tracing::warn!(
+                    "retaining unregistered bash sandbox scratch: descendant shutdown is unverified"
+                );
+            }
+        }
+        drop(unregistered);
+        drop(reservation);
+        (cause, output_complete)
+    });
+    async move {
+        let (cause, output_complete) = owner.await.unwrap_or((None, false));
+        let ring = ring.lock().await;
+        let read = read_window_from_ring(&ring, &read_args);
+        unregistered_tool_output(
+            BashUnregisteredRun {
+                cmd,
+                label,
+                launch_error,
+                descendants: "unverified".to_string(),
+                output_complete,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                window: window_to_typed(&read.view, read.partial),
+            },
+            cause,
+        )
+    }
+}
+
+fn unregistered_tool_output(run: BashUnregisteredRun, cause: Option<FinalCause>) -> ToolOutput {
+    let is_error = cause.is_none();
+    let response = match cause {
+        Some(FinalCause::Exited { exit_code }) => BashResponse::UnregisteredExited(BashUnregisteredTerminalPayload { run, exit_code, signal_number: None }),
+        Some(FinalCause::Killed { exit_code, signal_number }) => BashResponse::UnregisteredKilled(BashUnregisteredTerminalPayload { run, exit_code, signal_number }),
+        None => BashResponse::OutcomeUnknown(BashUnregisteredUnknownPayload {
+            run,
+            error: "launch_outcome_unknown".to_string(),
+            error_message: "The command was launched but its outcome is unverified. It may have performed side effects and may still be running. Do not automatically retry. No controllable handle was registered; descendants are unverified.".to_string(),
+        }),
+    };
+    let value = serde_json::to_value(response).expect("unregistered run response serializes");
+    let serialized = value.to_string();
+    if is_error {
+        ToolOutput::error(serialized).with_display(value)
+    } else {
+        ToolOutput::success(serialized).with_display(value)
     }
 }
 
 struct SpawnedProcessGroup {
     child: Option<tokio::process::Child>,
+    started_at: Instant,
     pgid: i32,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
 }
@@ -637,9 +926,11 @@ impl SpawnedProcessGroup {
         child: tokio::process::Child,
         pgid: i32,
         sandbox_scratch_dir: Option<std::path::PathBuf>,
+        started_at: Instant,
     ) -> Self {
         Self {
             child: Some(child),
+            started_at,
             pgid,
             sandbox_scratch_dir,
         }
@@ -685,6 +976,7 @@ impl Drop for SpawnedProcessGroup {
 
 // `pgid` and `pid` mirror the Allium-spec field names; renaming for the
 // similar-names lint would diverge from the spec.
+#[cfg(test)]
 #[allow(clippy::similar_names)]
 fn spawn_child(
     cmd: &str,
@@ -694,7 +986,30 @@ fn spawn_child(
     handle_id: HandleId,
     ring_bytes_cap: usize,
     spawn_mode: &BashSpawnMode,
-) -> Result<(Arc<Handle>, SpawnedProcessGroup), String> {
+) -> Result<(Arc<Handle>, SpawnedProcessGroup), SpawnChildError> {
+    spawn_child_with_identity_probe(
+        cmd,
+        label,
+        ctx,
+        spawn_context,
+        handle_id,
+        ring_bytes_cap,
+        spawn_mode,
+        current_process_identity,
+    )
+}
+
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+fn spawn_child_with_identity_probe(
+    cmd: &str,
+    label: Option<String>,
+    ctx: &ToolContext,
+    spawn_context: &SpawnContext,
+    handle_id: HandleId,
+    ring_bytes_cap: usize,
+    spawn_mode: &BashSpawnMode,
+    probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
+) -> Result<(Arc<Handle>, SpawnedProcessGroup), SpawnChildError> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
@@ -752,22 +1067,31 @@ fn spawn_child(
         });
     }
 
+    let started_at = Instant::now();
     let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             if let Some(dir) = &sandbox_scratch_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
-            return Err(format!("failed to spawn bash child: {e}"));
+            return Err(SpawnChildError::NotSpawned(format!(
+                "failed to spawn bash child: {e}"
+            )));
         }
     };
 
-    let pid = child
+    let Some((pid, process)) = child
         .id()
-        .ok_or_else(|| "spawned child has no pid".to_string())?;
+        .and_then(|pid| probe(pid).map(|identity| (pid, identity)))
+    else {
+        return Err(SpawnChildError::Unregistered(UnregisteredChild {
+            child,
+            sandbox_scratch_dir,
+            started_at,
+        }));
+    };
     let launch_identity = BashLaunchIdentity {
-        process: current_process_identity(pid)
-            .ok_or_else(|| format!("spawned child identity unavailable for pid {pid}"))?,
+        process,
         launch_uuid,
     };
     // pgid == pid because we made the child a process group leader.
@@ -788,7 +1112,7 @@ fn spawn_child(
     );
     Ok((
         handle,
-        SpawnedProcessGroup::new(child, pgid, sandbox_scratch_dir),
+        SpawnedProcessGroup::new(child, pgid, sandbox_scratch_dir, started_at),
     ))
 }
 
@@ -1967,7 +2291,7 @@ mod tests {
     use super::*;
     use crate::bash::handle::{Handle, HandleId};
     use crate::bash::registry::BashLifecyclePhase;
-    use crate::bash::ring::{RingBuffer, PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
+    use crate::bash::ring::{PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
     use phoenix_core::work_scope::ResourceScopeKey;
     use std::future::Future;
     use std::pin::Pin;
@@ -1985,6 +2309,501 @@ mod tests {
             lifecycle_scope: ctx.work_scope.clone(),
             terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
         }
+    }
+
+    #[cfg(unix)]
+    fn injected_unregistered_child(
+        ctx: &ToolContext,
+        working_dir: &std::path::Path,
+        cmd: &str,
+        probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
+    ) -> UnregisteredChild {
+        let mut context = spawn_context_for(ctx);
+        context.working_dir = working_dir.to_path_buf();
+        match spawn_child_with_identity_probe(
+            cmd,
+            None,
+            ctx,
+            &context,
+            HandleId::new("b-injected"),
+            RING_BUFFER_BYTES,
+            &BashSpawnMode::Direct,
+            probe,
+        ) {
+            Err(SpawnChildError::Unregistered(child)) => child,
+            Err(SpawnChildError::NotSpawned(error)) => panic!("OS spawn failed: {error}"),
+            Ok(_) => panic!("an unverified child must not get a handle"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn response_json(output: ToolOutput) -> Value {
+        serde_json::from_str(output.output()).expect("response JSON")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_during_registration_keeps_launch_owned_and_never_group_kills() {
+        let ctx = test_context(&scope("cancel-registration"));
+        let registry = ctx.bash_handle_registry().clone();
+        let table = registry.get_or_create(&ctx.work_scope).await;
+        let held_lock = Arc::new(std::sync::Mutex::new(None));
+        let lock_slot = held_lock.clone();
+        let launched = Arc::new(tokio::sync::Notify::new());
+        let launch_signal = launched.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = spawn_context_for(&ctx);
+        context.working_dir = dir.path().to_path_buf();
+        let command = "printf once >> count; while [ ! -e release ]; do sleep 0.01; done; printf survived > finished";
+        let task_ctx = ctx.clone();
+        let caller = tokio::spawn(async move {
+            run_run_with_identity_probe(
+                command,
+                None,
+                30,
+                ReadArgs::default(),
+                &task_ctx,
+                &context,
+                BashSpawnMode::Direct,
+                |pid| {
+                    let identity = current_process_identity(pid).expect("live child identity");
+                    *lock_slot.lock().unwrap() = Some(table.try_write_owned().unwrap());
+                    launch_signal.notify_one();
+                    Some(identity)
+                },
+            )
+            .await
+        });
+        launched.notified().await;
+        caller.abort();
+        let _ = caller.await;
+        drop(held_lock.lock().unwrap().take());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while registry.owner_handles(&ctx.work_scope).await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller cancellation lost registration owner");
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !dir.path().join("finished").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller cancellation killed the launched process group");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("count")).unwrap(),
+            "once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_launch_serialization_has_no_control_identity_or_fabricated_exit() {
+        let ring = RingBuffer::new(1024);
+        let read = read_window_from_ring(&ring, &ReadArgs::default());
+        let output = unregistered_tool_output(
+            BashUnregisteredRun {
+                cmd: "may-have-side-effects".to_string(),
+                label: None,
+                launch_error: BashLaunchError::IdentityUnavailable,
+                descendants: "unverified".to_string(),
+                output_complete: false,
+                duration_ms: 1,
+                window: window_to_typed(&read.view, read.partial),
+            },
+            None,
+        );
+        let response = response_json(output);
+        assert_eq!(response["status"], "outcome_unknown");
+        assert!(
+            response["error_message"]
+                .as_str()
+                .unwrap()
+                .contains("Do not automatically retry")
+        );
+        for key in [
+            "handle",
+            "pid",
+            "pgid",
+            "exit_code",
+            "signal_number",
+            "launch_identity",
+        ] {
+            assert!(
+                response.get(key).is_none(),
+                "unexpected control/terminal field {key}"
+            );
+        }
+        assert!(matches!(
+            serde_json::from_value::<BashResponse>(response).unwrap(),
+            BashResponse::OutcomeUnknown(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unregistered_capture_stays_open_until_direct_child_terminal() {
+        let ctx = test_context(&scope("capture-until-exit"));
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = "sleep 0.22; printf 'late-tail'; exit 4";
+        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let reservation = ctx
+            .bash_handle_registry()
+            .reserve_spawn(&ctx.work_scope)
+            .await
+            .unwrap();
+        let response = response_json(
+            settle_unregistered_run(
+                child,
+                reservation,
+                cmd,
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["status"], "unregistered_exited");
+        assert_eq!(response["exit_code"], 4);
+        assert_eq!(response["lines"][0]["bytes"], "late-tail");
+        assert_eq!(response["output_complete"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_none_retains_terminal_output_exit_and_executes_once() {
+        let ctx = test_context(&scope("identity-none"));
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = "printf once >> count; printf 'stdout\\n'; printf 'stderr-tail' >&2; exit 23";
+        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let registry = ctx.bash_handle_registry();
+        let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
+        let response = response_json(
+            settle_unregistered_run(
+                child,
+                reservation,
+                cmd,
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["status"], "unregistered_exited");
+        assert_eq!(response["exit_code"], 23);
+        assert_eq!(response["output_complete"], true);
+        assert!(response.get("handle").is_none());
+        assert!(response.get("error").is_none());
+        let lines = response["lines"].as_array().unwrap();
+        assert!(lines.iter().any(|line| line["bytes"] == "stdout"));
+        assert!(lines.iter().any(|line| line["bytes"] == "stderr-tail"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("count")).unwrap(),
+            "once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_birth_probe_never_adopts_reused_pid_observation() {
+        use phoenix_core::process_identity::{ProcessIdentity, process_identity_matches};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ctx = test_context(&scope("identity-missing-birth"));
+        let dir = tempfile::tempdir().unwrap();
+        let calls = AtomicUsize::new(0);
+        let mut replacement = None;
+        let child = injected_unregistered_child(
+            &ctx,
+            dir.path(),
+            "printf once >> count; printf success; exit 0",
+            |pid| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // Model a later occupant of this numeric PID with a different birth.
+                replacement = Some(ProcessIdentity {
+                    pid,
+                    start_time: u128::MAX,
+                });
+                None
+            },
+        );
+        let registry = ctx.bash_handle_registry();
+        let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
+        let response = response_json(
+            settle_unregistered_run(
+                child,
+                reservation,
+                "success",
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["status"], "unregistered_exited");
+        assert_eq!(response["exit_code"], 0);
+        assert!(response.get("handle").is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "fallback must never reprobe and adopt a later birth"
+        );
+        assert!(!process_identity_matches(replacement.unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("count")).unwrap(),
+            "once"
+        );
+        // The wire contract accepts a terminal result with no handle.
+        let decoded: BashResponse = serde_json::from_value(response).unwrap();
+        assert!(matches!(decoded, BashResponse::UnregisteredExited(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_missing_probe_preserves_owned_child_wait_status() {
+        let ctx = test_context(&scope("identity-delayed"));
+        let dir = tempfile::tempdir().unwrap();
+        let child = injected_unregistered_child(&ctx, dir.path(), "printf tail; exit 7", |_| {
+            // Models a descheduled launch thread; no second identity observation.
+            std::thread::sleep(Duration::from_millis(100));
+            None
+        });
+        let reservation = ctx
+            .bash_handle_registry()
+            .reserve_spawn(&ctx.work_scope)
+            .await
+            .unwrap();
+        let response = response_json(
+            settle_unregistered_run(
+                child,
+                reservation,
+                "printf tail; exit 7",
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["exit_code"], 7);
+        assert_eq!(response["lines"][0]["bytes"], "tail");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unverified_live_child_is_directly_reaped_and_teardown_is_finite() {
+        let mut ctx = test_context(&scope("identity-live"));
+        ctx.bash_handles = Arc::new(crate::bash::registry::BashHandleRegistry::with_caps(
+            RING_BUFFER_BYTES,
+            1,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = "printf once >> count; printf 'before\\n'; while [ ! -e release ]; do sleep 0.01; done; printf after";
+        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let registry = ctx.bash_handle_registry();
+        let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
+        let response = response_json(
+            settle_unregistered_run(
+                child,
+                reservation,
+                cmd,
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["status"], "unregistered_killed");
+        assert_eq!(response["signal_number"], libc::SIGKILL);
+        assert!(response.get("handle").is_none());
+        assert!(response.get("pid").is_none());
+        assert!(registry.reserve_spawn(&ctx.work_scope).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("count")).unwrap(),
+            "once"
+        );
+        let permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.begin_retirement(&ctx.work_scope),
+        )
+        .await
+        .expect("settled launch kept teardown pending");
+        assert!(permit.exact_process_groups.is_empty());
+        let outcome = registry.complete_retirement(&permit).await;
+        assert_eq!(outcome.report().kill_failures.len(), 1);
+        assert_eq!(outcome.report().kill_failures[0].0, 0);
+        assert!(outcome.report().kill_failures[0].1.contains("unverified"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unverified_descendant_pipe_drain_is_bounded_without_group_signals() {
+        let ctx = test_context(&scope("identity-descendant"));
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = "(sleep 0.8; printf survived > descendant) & printf 'parent\\n'; exit 19";
+        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let reservation = ctx
+            .bash_handle_registry()
+            .reserve_spawn(&ctx.work_scope)
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            settle_unregistered_run(
+                child,
+                reservation,
+                cmd,
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            ),
+        )
+        .await
+        .expect("descendant held settlement open");
+        let response = response_json(response);
+        assert_eq!(response["status"], "unregistered_exited");
+        assert_eq!(response["exit_code"], 19);
+        assert_eq!(response["output_complete"], false);
+        assert_eq!(response["descendants"], "unverified");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dir.path().join("descendant").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unverified group was signalled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_failure_settles_child_without_claiming_spawn_failure() {
+        let ctx = test_context(&scope("registration-failed"));
+        let registry = ctx.bash_handle_registry();
+        let mut reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = spawn_context_for(&ctx);
+        context.working_dir = dir.path().to_path_buf();
+        let (handle, spawned) = spawn_child(
+            "while [ ! -e release ]; do sleep 0.01; done; printf registered-once; exit 6",
+            None,
+            &ctx,
+            &context,
+            reservation.handle_id().clone(),
+            RING_BUFFER_BYTES,
+            &BashSpawnMode::Direct,
+        )
+        .expect("spawn");
+        // A registry with no owner table deterministically refuses registration.
+        let missing_owner_registry = crate::bash::registry::BashHandleRegistry::new();
+        assert!(
+            missing_owner_registry
+                .commit_spawn(&mut reservation, handle)
+                .await
+                .is_err()
+        );
+        let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        let response = response_json(
+            settle_unregistered_run(
+                UnregisteredChild {
+                    child,
+                    sandbox_scratch_dir,
+                    started_at: Instant::now(),
+                },
+                reservation,
+                "registration test",
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::RegistrationFailed,
+            )
+            .await,
+        );
+        assert_eq!(response["launch_error"], "registration_failed");
+        assert_eq!(response["status"], "unregistered_exited");
+        assert_eq!(response["exit_code"], 6);
+        assert_eq!(response["lines"][0]["bytes"], "registered-once");
+        assert!(response.get("handle").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_unverified_response_before_poll_keeps_bounded_child_custody() {
+        let ctx = test_context(&scope("identity-cancelled"));
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let cmd = "while [ ! -e release ]; do sleep 0.01; done; printf done > finished";
+        let mut child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        child.sandbox_scratch_dir = Some(scratch.clone());
+        let reservation = ctx
+            .bash_handle_registry()
+            .reserve_spawn(&ctx.work_scope)
+            .await
+            .unwrap();
+        let read_args = ReadArgs::default();
+        let future = settle_unregistered_run(
+            child,
+            reservation,
+            cmd,
+            None,
+            RING_BUFFER_BYTES,
+            &read_args,
+            BashLaunchError::IdentityUnavailable,
+        );
+        drop(future);
+        let registry = ctx.bash_handle_registry();
+        let permit = tokio::time::timeout(
+            Duration::from_secs(3),
+            registry.begin_retirement(&ctx.work_scope),
+        )
+        .await
+        .expect("cancelled caller lost bounded custody");
+        let outcome = registry.complete_retirement(&permit).await;
+        assert!(!outcome.report().kill_failures.is_empty());
+        assert!(
+            scratch.exists(),
+            "unverified descendants may still use scratch"
+        );
+        assert!(!dir.path().join("finished").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_with_cached_exit_retains_owned_wait_status() {
+        let ctx = test_context(&scope("identity-reuse"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut child =
+            injected_unregistered_child(&ctx, dir.path(), "printf cached; exit 11", |_| None);
+        let status = child.child.wait().await.unwrap();
+        assert_eq!(status.code(), Some(11));
+        assert!(child.child.id().is_none());
+        let reservation = ctx
+            .bash_handle_registry()
+            .reserve_spawn(&ctx.work_scope)
+            .await
+            .unwrap();
+        let response = response_json(
+            settle_unregistered_run(
+                child,
+                reservation,
+                "cached",
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["exit_code"], 11);
+        assert!(response.get("handle").is_none());
     }
 
     #[cfg(unix)]
@@ -2579,9 +3398,11 @@ mod tests {
         )
         .await;
         assert!(!output.is_success());
-        assert!(output
-            .output()
-            .contains("bash processes require a conversation-scoped owner"));
+        assert!(
+            output
+                .output()
+                .contains("bash processes require a conversation-scoped owner")
+        );
     }
 
     #[tokio::test]

@@ -20,8 +20,8 @@
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::SystemTime;
 
@@ -47,7 +47,9 @@ pub enum BashHandleError {
         cap: usize,
         live_handles: Vec<LiveHandleSummary>,
     },
-    #[error("this work scope is being torn down and no longer accepts bash spawns")]
+    #[error(
+        "this work scope no longer accepts bash spawns: teardown or an unverified prior launch; do not automatically retry"
+    )]
     SpawnFenced,
 }
 
@@ -98,6 +100,7 @@ pub struct RegisteredHandle {
 struct SpawnAdmission {
     pending: AtomicUsize,
     settled: Arc<Notify>,
+    unverified_launch: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -105,6 +108,7 @@ pub struct SpawnReservation {
     owner: ResourceScopeKey,
     handle_id: HandleId,
     committed: bool,
+    launched: bool,
     admission: Arc<SpawnAdmission>,
 }
 
@@ -202,6 +206,10 @@ impl SpawnReservation {
 }
 
 impl SpawnReservation {
+    pub(super) fn mark_launched(&mut self) {
+        self.launched = true;
+    }
+
     fn settle(&mut self) {
         if !self.committed {
             self.committed = true;
@@ -213,6 +221,12 @@ impl SpawnReservation {
 
 impl Drop for SpawnReservation {
     fn drop(&mut self) {
+        if self.launched && !self.committed {
+            self.admission
+                .unverified_launch
+                .store(true, Ordering::Release);
+            tracing::warn!(handle = %self.handle_id, "bash launch was not registered; descendant cleanup remains unverified");
+        }
         self.settle();
     }
 }
@@ -617,7 +631,7 @@ impl BashHandleRegistry {
     ) -> Result<SpawnReservation, BashHandleError> {
         let entry = self.get_or_create(owner).await;
         let handles = entry.write().await;
-        if handles.teardown_started {
+        if handles.teardown_started || handles.admission.unverified_launch.load(Ordering::Acquire) {
             return Err(BashHandleError::SpawnFenced);
         }
         if handles.live_count().await + handles.admission.pending.load(Ordering::Acquire)
@@ -633,6 +647,7 @@ impl BashHandleRegistry {
             owner: owner.clone(),
             handle_id: Self::allocate_handle_id(),
             committed: false,
+            launched: false,
             admission: handles.admission.clone(),
         })
     }
@@ -897,6 +912,9 @@ impl BashHandleRegistry {
         };
         let table = permit.entry.read().await;
         if table.teardown_started && table.teardown_generation == permit.generation().0 {
+            if table.admission.unverified_launch.load(Ordering::Acquire) {
+                report.kill_failures.push((0, "unregistered bash launch: descendant shutdown is unverified; no PID or process-group action is authorized".to_string()));
+            }
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
             }
@@ -1099,8 +1117,9 @@ pub struct CascadeBashReport {
     /// to land yet). Surfaced separately because these are the most
     /// likely D-state offenders for an operator chasing orphans.
     pub kill_pending_kernel_pids: Vec<i32>,
-    /// Per-pgid kill failures (`kill(2)` returned non-zero). Successful
-    /// kills and `ESRCH` (process already gone) do not appear here.
+    /// Retirement failures. A group id of zero denotes an unregistered launch
+    /// with no signal authority; it is diagnostic only, never a signal target.
+    /// Successful kills and `ESRCH` do not appear here.
     pub kill_failures: Vec<(i32, String)>,
     /// Fence identity installed by an owner-level teardown. Absent when the
     /// owner was preserved and only actor-restricted handles were removed.
@@ -2416,10 +2435,12 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            assert!(replacement_child
-                .try_wait()
-                .expect("try_wait replacement")
-                .is_none());
+            assert!(
+                replacement_child
+                    .try_wait()
+                    .expect("try_wait replacement")
+                    .is_none()
+            );
             unsafe {
                 let _ = libc::kill(replacement_pgid, libc::SIGKILL);
             }

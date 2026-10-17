@@ -26,7 +26,7 @@
 --     within a ResourceScope but do NOT survive a Phoenix restart (see
 --     specs/tmux-integration/ for the persistent path)
 --
--- Requirement traceability: REQ-BASH-001 through REQ-BASH-016,
+-- Requirement traceability: REQ-BASH-001 through REQ-BASH-017,
 --   REQ-BASH-WS-001, REQ-BASH-WS-002. REQ-BASH-011 (command safety) is
 --   enforced by the permission seam (specs/permissions/) and is not modelled
 --   as a bash run-path rule here. REQ-BASH-010a..010c (terminal-edge
@@ -392,6 +392,29 @@ config {
 --       and changes no command, path, scope, operation, handle, or wait value.
 --
 
+deferred BashPostLaunchSettlement
+    -- REQ-BASH-017. Implemented at bash/operations.rs::settle_unregistered_run
+    -- and bash/registry.rs::SpawnReservation. This is the exception path when
+    -- the OS returned an owned Child but birth identity or registration failed;
+    -- HandleSpawned and the registered wait-window rules do not create a Handle
+    -- on this path. A failed OS spawn alone returns spawn_failed.
+    -- Before the first await after OS launch, transfer the child and reservation
+    -- into a caller-independent owner task. Registration is bounded to one second.
+    -- An unregistered child keeps bounded ring readers open during natural-exit
+    -- grace, then start_kill on the held Child only, then a bounded owned wait.
+    -- No birth re-probe, numeric-PID signal, group signal, replay or handle adoption.
+    -- Cached try_wait terminal status is authoritative. Reader drain begins only
+    -- after direct-child terminal observation and lasts at most 200ms. Settlement
+    -- exhaustion closes capture explicitly as incomplete, returns outcome_unknown,
+    -- and delegates the unreaped child to Tokio's orphan reaper. Exit/killed
+    -- responses without handles are unregistered_exited/unregistered_killed.
+    -- Every unregistered response marks descendants unverified. Dropping the
+    -- reservation releases pending admission and records scope uncertainty before
+    -- notifying teardown. The uncertainty fences further spawn admission and is
+    -- surfaced through the retirement failure report; it never authorizes signals.
+    -- Teardown must return that failure, not wait forever or certify absence.
+    -- Unverified descendant scratch is retained, not recursively removed.
+
 deferred BashTerminalEdgeWorkScopeReconciliation
     -- REQ-BASH-010a, REQ-BASH-010b, REQ-BASH-010c. When a Work-owned bash handle
     -- reaches a terminal lifecycle edge, Phoenix schedules one authoritative local-Git
@@ -509,6 +532,9 @@ rule HandleSpawned {
         --      pre_exec(setpgid(0,0)) so the child becomes its own process
         --      group leader. stdout and stderr piped, stdin null. Working
         --      dir from spawn_target.canonical_working_dir.
+        --      Capture birth identity exactly once and register within a bounded
+        --      caller-independent task. On failure, BashPostLaunchSettlement applies
+        --      instead of creating a Handle or entering the registered wait race.
         --   6. Spawn two reader tasks (stdout, stderr) feeding the same ring
         --      under a mutex. Each task ingests bytes, splits on '\n', and
         --      appends RingLine entries with monotonically increasing
