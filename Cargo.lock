@@ -3186,6 +3186,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "phoenix-agents",
+ "phoenix-browser",
  "phoenix-core",
  "phoenix-db",
  "phoenix-llm",
