@@ -1073,6 +1073,16 @@ contract NativeGuardianPersistenceBoundary {
         -- reconstruct a ticket or policy loop, resume cleanup, or claim readiness.
         -- The replacement session leaves the attempt interrupted.
 
+    @invariant RecoveredIdentityApplicationIsNotObservation
+        -- A same-live fresh reconciling session may combine the sole durable pending
+        -- exact-root identity issue with retained issuing provenance and the unchanged
+        -- sole root slot to obtain one application-only capability. The request names
+        -- no caller-selected PID or birth token. Atomic application records the exact
+        -- retained typed observation while leaving the attempt interrupted and returning
+        -- no plan, dispatch, activation, mutation, cleanup continuation, readiness, or
+        -- ACK authority. Verification never repeats observation; post-commit recovery
+        -- is ACK-only. Deadline expiry after writer ownership or before commit rolls back.
+
     @invariant AlreadyCleanDeadlinePathIssuesNoSignal
         -- Once every acquired exact identity is durably verified absent and no
         -- discovery obligation remains, policy may reach ReadyForDisruption at the

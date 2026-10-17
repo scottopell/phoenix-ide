@@ -629,3 +629,21 @@ A same-live replacement session MAY acknowledge the exact retained result from d
 application evidence without repeating observation or reconstructing a policy loop. The
 fresh session interrupts the checkpoint, so acknowledgement-only recovery SHALL remain
 `Interrupted` and SHALL NOT claim cleanup completion or readiness.
+
+WHEN the same live guardian retains a completed exact-root identity observation that the
+issuing runner did not durably apply
+THE recovering runner MAY obtain a distinct application-only capability only after a
+fresh interruption and exact reconciling session before the original absolute deadline.
+The authority SHALL require the sole durable `IssuedPendingApplication` issue, exact
+issuing-session provenance retained by that guardian, the guardian's unchanged sole
+PID-plus-birth root slot, and a correlated live response; the recovery request SHALL NOT
+accept a caller-selected PID or birth token.
+
+THE recovered application SHALL atomically apply the exact retained typed observation
+to the interrupted ownership resume state and normalized application row, leave the
+attempt `Interrupted`, and return no executable plan, dispatch, reconciliation activation,
+process mutation, cleanup continuation, readiness, or acknowledgement authority. It
+SHALL NOT reconstruct the original dispatch ticket or repeat identity observation.
+Deadline expiry after writer ownership or before commit SHALL roll back without policy
+advance. A pre-commit crash MAY repeat live verification; a post-commit crash SHALL use
+acknowledgement-only recovery.
