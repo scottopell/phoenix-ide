@@ -297,8 +297,8 @@ exit 0
             .unwrap();
         let stdout = std::io::BufReader::new(writer.stdout.take().unwrap());
         for line in stdout.lines() {
-            if let Some(pid) = line.unwrap().strip_prefix("writer-ready:") {
-                println!("root-ready:{pid}");
+            if let Some((_, pid)) = line.unwrap().split_once("writer-ready:") {
+                println!("root-ready:{}", pid.trim());
                 std::io::stdout().flush().unwrap();
                 break;
             }
@@ -330,8 +330,8 @@ exit 0
             loop {
                 let mut line = String::new();
                 assert_ne!(stdout.read_line(&mut line).await.unwrap(), 0);
-                if let Some(pid) = line.trim().strip_prefix("root-ready:") {
-                    break pid.parse::<u32>().unwrap();
+                if let Some((_, pid)) = line.split_once("root-ready:") {
+                    break pid.trim().parse::<u32>().unwrap();
                 }
             }
         })

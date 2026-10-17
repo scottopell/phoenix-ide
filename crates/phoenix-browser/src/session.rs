@@ -1000,6 +1000,30 @@ impl BrowserSession {
         }
     }
 
+    async fn reject_unadopted_browser(browser: &mut Browser, reason: &str) -> BrowserError {
+        let cleanup = match tokio::time::timeout(SESSION_INIT_TIMEOUT, browser.kill()).await {
+            Ok(Some(Ok(()))) => "owned root stopped; descendant closure unproven".to_string(),
+            Ok(Some(Err(error))) => format!("owned root stop failed: {error}"),
+            Ok(None) => "owned root handle missing".to_string(),
+            Err(_) => "owned root stop deadline expired".to_string(),
+        };
+        BrowserError::LaunchFailed(format!("{reason}; {cleanup}; unmarked profile retained"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn adopt_launch_group(
+        browser: &mut Browser,
+        identity: ProcessIdentity,
+    ) -> Result<Option<crate::process_group::OwnedChromeGroup>, BrowserError> {
+        if crate::process_group::ChromeExecShim::registered().is_none() {
+            return Ok(None);
+        }
+        match crate::process_group::OwnedChromeGroup::adopt(identity) {
+            Ok(group) => Ok(Some(group)),
+            Err(error) => Err(Self::reject_unadopted_browser(browser, &error.to_string()).await),
+        }
+    }
+
     /// Launch browser and create a session
     async fn launch_and_init(
         tmp_root: &Path,
@@ -1013,20 +1037,14 @@ impl BrowserSession {
             .get_mut_child()
             .and_then(|child| child.as_mut_inner().id());
         let Some(chrome_process) = chrome_pid.and_then(current_process_identity) else {
-            let _ = browser.kill().await;
-            return Err(BrowserError::LaunchFailed(
-                "could not capture Chrome process identity".to_string(),
-            ));
+            return Err(Self::reject_unadopted_browser(
+                &mut browser,
+                "could not capture Chrome process identity",
+            )
+            .await);
         };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let mut owned_group = if crate::process_group::ChromeExecShim::registered().is_some() {
-            Some(
-                crate::process_group::OwnedChromeGroup::adopt(chrome_process)
-                    .map_err(|error| BrowserError::LaunchFailed(error.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let mut owned_group = Self::adopt_launch_group(&mut browser, chrome_process).await?;
         let launch_identity = BrowserLaunchIdentity {
             launch_uuid: launch_uuid.to_string(),
             chrome_process: Some(chrome_process),
