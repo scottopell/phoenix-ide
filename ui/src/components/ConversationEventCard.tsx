@@ -1,0 +1,76 @@
+import { useLayoutEffect, useRef, type ReactNode } from 'react';
+import { Link as RouterLink, useLocation } from 'react-router-dom';
+import type { EventPresentation } from '../generated/EventPresentation';
+import type { ConversationHighlight } from './MessageComponents';
+import { CopyButton } from './CopyButton';
+import { coordinatorConversationLinkState } from './conversationReturnOrigin';
+import './ConversationEventCard.css';
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function eventCardFragments(presentation: EventPresentation | null, eventId: string) {
+  if (!presentation || presentation.status === 'unavailable') {
+    return { title: 'Conversation event', outcome: 'Details unavailable', time: '', provenance: `Event ID: ${presentation?.event_id ?? eventId}${presentation ? `\nUnavailable: ${presentation.reason}` : ''}`, reason: '' };
+  }
+  const outcome = presentation.outcome;
+  const labels = {
+    turn_finished: 'Turn finished', failed: 'Failed', cleanup_failed: 'Cleanup failed',
+    cancelled: 'Cancelled', awaiting_user_response: 'Awaiting user response', awaiting_task_approval: 'Awaiting task approval',
+  };
+  const date = new Date(presentation.occurred_at_us / 1000);
+  return {
+    title: presentation.display_name?.trim() ? presentation.display_name : 'Untitled conversation',
+    outcome: labels[outcome.kind],
+    time: date.toLocaleString(),
+    reason: outcome.kind === 'failed' || outcome.kind === 'cleanup_failed' ? outcome.reason : '',
+    provenance: [
+      `Event ID: ${presentation.event_id}`, `Conversation ID: ${presentation.product_conversation_id}`,
+      `Transcript ID: ${presentation.source_transcript_id}`, `Occurrence kind: ${presentation.source_occurrence_kind}`,
+      `Occurrence ID: ${presentation.source_occurrence_id}`, `Generation: ${presentation.source_generation}`,
+      `Time (microseconds): ${presentation.occurred_at_us}`, `Provenance: ${presentation.provenance}`,
+    ].join('\n'),
+  };
+}
+
+export function ConversationEventCard({ presentation, eventId, originalText, activeHighlight, children }: {
+  presentation: EventPresentation | null;
+  eventId: string;
+  originalText: string;
+  activeHighlight?: ConversationHighlight | null;
+  children: ReactNode;
+}) {
+  const location = useLocation();
+  const details = useRef<HTMLDetailsElement>(null);
+  const fragments = eventCardFragments(presentation, eventId);
+  const available = presentation?.status === 'available' ? presentation : null;
+  const href = available ? `/c/${encodeURIComponent(available.product_conversation_id)}` : null;
+  useLayoutEffect(() => {
+    if (activeHighlight && details.current && (
+      activeHighlight.fragmentId === 'event-provenance' || activeHighlight.fragmentId === 'event-reason'
+      || activeHighlight.fragmentId === 'message-text' || activeHighlight.owner === 'message-attachment'
+    )) details.current.open = true;
+  }, [activeHighlight]);
+  function fragment(id: string, text: string) {
+    const highlight = activeHighlight?.fragmentId === id ? activeHighlight : null;
+    return <span data-fragment-id={id}>{highlight
+      ? <>{text.slice(0, highlight.start)}<mark className="viewer-find-inline-match viewer-find-inline-match--active">{text.slice(highlight.start, highlight.end)}</mark>{text.slice(highlight.end)}</>
+      : text}</span>;
+  }
+  return (
+    <section className="conversation-event-card" aria-label="Conversation event">
+      <div className="conversation-event-summary">
+        {href ? <RouterLink className="conversation-event-title" to={href} state={coordinatorConversationLinkState(`${location.pathname}${location.search}${location.hash}`, href)}>{fragment('event-title', fragments.title)}</RouterLink>
+          : fragment('event-title', fragments.title)}
+        <span className={available && (available.outcome.kind === 'failed' || available.outcome.kind === 'cleanup_failed') ? 'conversation-event-outcome failure' : 'conversation-event-outcome'}>{fragment('event-outcome', fragments.outcome)}</span>
+        {available && <time dateTime={new Date(available.occurred_at_us / 1000).toISOString()} aria-label={fragments.time}>{fragment('event-time', fragments.time)}</time>}
+      </div>
+      <details ref={details}>
+        <summary>Event details</summary>
+        {fragments.reason && <p className="conversation-event-reason">{fragment('event-reason', fragments.reason)}</p>}
+        <pre className="conversation-event-provenance">{fragment('event-provenance', fragments.provenance)}</pre>
+        <CopyButton text={fragments.provenance} title="Copy event provenance" />
+        <CopyButton text={originalText} title="Copy original event text" />
+        {children}
+      </details>
+    </section>
+  );
+}

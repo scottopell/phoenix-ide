@@ -72,6 +72,7 @@ pub enum BoundaryRepresentation {
 pub struct CoordinatorHistoryQuery {
     pub before: Option<String>,
     pub message_limit: Option<usize>,
+    pub open_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -472,6 +473,23 @@ pub async fn get_coordinator_history(
     Path(reference): Path<String>,
     Query(query): Query<CoordinatorHistoryQuery>,
 ) -> Result<Json<CoordinatorConversationSnapshotView>, AppError> {
+    let span = if query.before.is_none() && query.open_id.is_some() {
+        tracing::info_span!(target: "phoenix_ide::otel", "coordinator.history_open",
+            "open.id" = query.open_id.as_ref().map(uuid::Uuid::to_string),
+            "product_conversation.id" = tracing::field::Empty)
+    } else {
+        tracing::Span::none()
+    };
+    get_coordinator_history_snapshot(state, reference, query)
+        .instrument(span)
+        .await
+}
+
+async fn get_coordinator_history_snapshot(
+    state: AppState,
+    reference: String,
+    query: CoordinatorHistoryQuery,
+) -> Result<Json<CoordinatorConversationSnapshotView>, AppError> {
     let limit = message_limit(query.message_limit)?;
     let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
     let ceilings = cursor.as_ref().map(|cursor| {
@@ -502,6 +520,10 @@ pub async fn get_coordinator_history(
         .await
         .map_err(db_to_app)?;
     let aggregate = snapshot.aggregate;
+    tracing::Span::current().record(
+        "product_conversation.id",
+        aggregate.product_conversation.id().as_str(),
+    );
     if let Some(cursor) = &cursor {
         validate_cursor(&aggregate, cursor)?;
     }
@@ -511,11 +533,13 @@ pub async fn get_coordinator_history(
         |cursor| cursor.segment_ceilings.clone(),
     );
     let (messages, has_older, page, _) = aggregate_messages(
+        &state.db,
         &aggregate,
         snapshot.messages,
         limit,
         BoundaryRepresentation::OriginalMessages,
-    );
+    )
+    .await;
     let latest = &aggregate
         .segments
         .last()
@@ -524,8 +548,8 @@ pub async fn get_coordinator_history(
         .conversation;
     let writable = (accepts_user_message_direct_or_steering(&latest.state)
         && latest.continued_in_conv_id.is_none()
-        && !snapshot.latest_opening_pending)
-        .then(|| latest.id.clone());
+        && !snapshot.latest_opening.is_pending())
+    .then(|| latest.id.clone());
     Ok(Json(CoordinatorConversationSnapshotView {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: format!("/global/{}", aggregate.latest_transcript_row_id),
@@ -537,7 +561,7 @@ pub async fn get_coordinator_history(
         },
         latest_transcript_row_id: aggregate.latest_transcript_row_id.clone(),
         writable_transcript_row_id: writable,
-        latest_opening_pending: snapshot.latest_opening_pending,
+        latest_opening: snapshot.latest_opening.into(),
         updated_at: aggregate.updated_at.to_rfc3339(),
         segments: aggregate
             .segments
@@ -663,7 +687,7 @@ fn decode_recovery_cursor(cursor: &str) -> Result<(i64, String), AppError> {
     Ok((updated_at, request_id.to_string()))
 }
 
-fn creation_allowed_actions(
+pub(super) fn creation_allowed_actions(
     status: &str,
     delivery_retryable: bool,
 ) -> Vec<ProductConversationCreationAllowedActionView> {
@@ -673,8 +697,13 @@ fn creation_allowed_actions(
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
             actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
-        "delivery_failed" if delivery_retryable => {
-            actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
+        "delivery_pending" => {
+            actions.push(ProductConversationCreationAllowedActionView::Cancel);
+        }
+        "delivery_failed" => {
+            if delivery_retryable {
+                actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
+            }
         }
         "failed" | "cancelled" => {
             actions.push(ProductConversationCreationAllowedActionView::Delete);
@@ -693,13 +722,33 @@ mod creation_allowed_actions_tests {
     use super::{creation_allowed_actions, ProductConversationCreationAllowedActionView};
 
     #[test]
-    fn terminal_publication_has_no_retry_but_transient_delivery_failure_does() {
+    fn permanent_delivery_failure_has_no_backend_recovery_actions() {
         assert!(creation_allowed_actions("delivery_failed", false).is_empty());
-        assert!(creation_allowed_actions("published", false).is_empty());
+    }
+
+    #[test]
+    fn pending_delivery_offers_cancel_only() {
+        for delivery_retryable in [false, true] {
+            assert_eq!(
+                creation_allowed_actions("delivery_pending", delivery_retryable),
+                vec![ProductConversationCreationAllowedActionView::Cancel]
+            );
+        }
+    }
+
+    #[test]
+    fn transient_delivery_failure_offers_retry_only() {
         assert_eq!(
             creation_allowed_actions("delivery_failed", true),
             vec![ProductConversationCreationAllowedActionView::RetryDelivery]
         );
+    }
+
+    #[test]
+    fn published_creation_has_no_recovery_actions() {
+        for delivery_retryable in [false, true] {
+            assert!(creation_allowed_actions("published", delivery_retryable).is_empty());
+        }
     }
 }
 
@@ -772,7 +821,7 @@ async fn snapshot_view(
 ) -> Result<OrdinarySnapshotResponse, AppError> {
     let crate::db::ProductConversationSnapshotRead {
         mut aggregate,
-        latest_opening_pending,
+        latest_opening,
         close,
         requested_transcript_row_id,
         messages: page,
@@ -781,7 +830,7 @@ async fn snapshot_view(
         .product_conversation
         .ordinary_lifecycle()
         .expect("ordinary aggregate read returned Coordinator");
-    let writable = close.is_none() && !latest_opening_pending;
+    let writable = close.is_none() && !latest_opening.is_pending();
     let close = match close {
         Some(projection) => {
             use phoenix_core::domain::close::CloseCompletionOutcome;
@@ -810,7 +859,7 @@ async fn snapshot_view(
         |cursor| cursor.segment_ceilings.clone(),
     );
     let (messages, has_older, page_messages, boundary_message_ids) =
-        aggregate_messages(&aggregate, page, message_limit, representation);
+        aggregate_messages(&state.db, &aggregate, page, message_limit, representation).await;
     let source = match aggregate.source.as_mut() {
         Some(source) => {
             source.deleted = state
@@ -847,7 +896,7 @@ async fn snapshot_view(
         } else {
             None
         },
-        latest_opening_pending,
+        latest_opening: latest_opening.into(),
         updated_at: aggregate.updated_at.to_rfc3339(),
         presentation: presentation(
             root_title,
@@ -924,7 +973,8 @@ type AggregatePage = (
     std::collections::HashSet<String>,
 );
 
-fn aggregate_messages(
+async fn aggregate_messages(
+    db: &crate::db::Database,
     aggregate: &ProductConversationAggregate,
     mut messages: Vec<(i64, crate::db::Message)>,
     limit: usize,
@@ -932,6 +982,11 @@ fn aggregate_messages(
 ) -> AggregatePage {
     let has_older = messages.len() > limit;
     messages.truncate(limit);
+    let presentations = super::event_presentation::EventPresentations::load(
+        db,
+        messages.iter().map(|(_, message)| message),
+    )
+    .await;
     let boundary_message_ids = aggregate
         .segments
         .iter()
@@ -963,7 +1018,7 @@ fn aggregate_messages(
             by_segment
                 .entry(message.conversation_id.clone())
                 .or_default()
-                .push(crate::api::wire::EnrichedMessage::from(message));
+                .push(presentations.enrich(message));
         }
     }
     for segment_messages in by_segment.values_mut() {
@@ -2502,7 +2557,7 @@ mod tests {
                 serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                     .unwrap();
             assert_eq!(pending["latest_transcript_row_id"], successor.id);
-            assert_eq!(pending["latest_opening_pending"], true);
+            assert_eq!(pending["latest_opening"]["status"], "pending");
             assert!(pending["writable_transcript_row_id"].is_null());
             state
                 .db
@@ -2533,7 +2588,7 @@ mod tests {
             let ready: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                     .unwrap();
-            assert_eq!(ready["latest_opening_pending"], false);
+            assert_eq!(ready["latest_opening"]["status"], "accepted");
             assert_eq!(ready["writable_transcript_row_id"], successor.id);
             assert_eq!(
                 ready["boundaries"][0]["represented_successor_opening_message_id"],

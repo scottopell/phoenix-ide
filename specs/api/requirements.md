@@ -301,10 +301,12 @@ WHEN the browser successfully completes an initial ProductConversation detail op
 THE SYSTEM SHALL assign an opaque per-open identifier and pass it with the detail request
 AND SHALL emit content-free server stage telemetry for pool wait, read-transaction start, reference resolution, aggregate hydration, bounded message-page hydration, read rollback, post-snapshot projection, and total detail handling
 AND SHALL correlate the detail request's server stages by the opaque open identifier and server-resolved durable product reference
-AND SHALL correlate the browser snapshot receipt, committed store readiness, and—when the open starts visible—first-paint timing to that detail request by the opaque open identifier
-AND SHALL record hidden-at-start opens without fabricating a first-paint duration
+AND SHALL correlate the browser snapshot receipt, committed store readiness, and—when the open starts visible—a frame-based presentation estimate to that detail request by the opaque open identifier
+AND SHALL treat the `first_paint_ms` field as a scheduling estimate, not proof of compositor paint
+AND SHALL record hidden-at-start opens without fabricating a presentation duration
 AND SHALL validate that reported browser durations are finite, non-negative, ordered, and no greater than five minutes
-AND SHALL permit only the opaque open identifier and server-resolved durable product reference as high-cardinality trace correlation attributes
+AND SHALL permit only the opaque open identifier and server-resolved durable product reference as high-cardinality trace correlation attributes for this detail-open report
+AND SHALL apply the separately bounded conversation-view correlation contract in `specs/conversation-view-telemetry/requirements.md` to journey reports
 AND SHALL NOT emit message content, SQL text, credentials, filesystem paths, caller-defined trace attributes, or dynamic metric labels in this telemetry.
 
 WHEN the browser loads older ProductConversation pages or performs a background refresh

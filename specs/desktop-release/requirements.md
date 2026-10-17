@@ -46,8 +46,11 @@ AND SHALL reject an archive whose embedded helper lacks the required architectur
 
 ## REQ-DESKTOP-REL-005 — Checksum the exact release set
 
-THE direct-distribution release surface SHALL publish exactly the six standalone artifacts, two desktop archives, and `SHA256SUMS`,
-AND `SHA256SUMS` SHALL contain exactly one matching SHA-256 digest for each of the eight non-manifest assets.
+THE direct-distribution release surface SHALL publish exactly the six standalone server artifacts, four browser CLI artifacts under REQ-DESKTOP-REL-011, two desktop archives, and `SHA256SUMS`,
+AND `SHA256SUMS` SHALL contain exactly one matching SHA-256 digest for each of the twelve non-manifest assets.
+
+WHEN retrying a historical tagged source without the browser CLI entrypoint,
+THE SYSTEM SHALL retain that source's exact six-server/two-desktop artifact contract.
 
 ## REQ-DESKTOP-REL-006 — Keep packaging locally verifiable
 
@@ -130,3 +133,17 @@ WHILE executing preparation,
 THE SYSTEM SHALL NOT create or move a tag, create or mutate a GitHub release, run release publication, deploy, or install the prepared artifacts.
 
 The preparation identity SHALL NOT authorize a release version, release tag, stable/RC classification decision, or byte-identical future rebuild. Public release SHALL continue to require the separately authorized version-bump/tag/publication flow.
+
+## REQ-DESKTOP-REL-011 — Publish standalone browser CLI binaries
+
+WHEN the immutable release source includes the browser CLI entrypoint,
+THE SYSTEM SHALL build and publish `phoenix-browser-aarch64-apple-darwin`, `phoenix-browser-x86_64-apple-darwin`, `phoenix-browser-aarch64-unknown-linux-musl`, and `phoenix-browser-x86_64-unknown-linux-musl` from that same exact tagged commit,
+SHALL include those bytes in the exact private/public asset and checksum verification,
+AND SHALL execute browser-free help and schema discovery on each matching native build host before publication.
+
+BEFORE publishing a macOS browser CLI binary,
+THE SYSTEM SHALL sign it with the configured Developer ID Application authority, hardened runtime, and secure timestamp,
+SHALL strictly verify the signature and configured team,
+AND SHALL require accepted Apple notarization of the signed bytes.
+
+Browser CLI publication SHALL NOT change the protected desktop-only preparation asset or receipt contract.

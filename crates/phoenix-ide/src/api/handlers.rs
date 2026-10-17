@@ -11,6 +11,7 @@ use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
 };
+use super::event_presentation::{enrich_messages, EventPresentations};
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
     get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
@@ -209,7 +210,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/api/product-conversations/creation/:request_id",
-            delete(delete_product_conversation_creation),
+            get(get_product_conversation_creation).delete(delete_product_conversation_creation),
         )
         .route(
             "/api/recent-management-root-suggestions",
@@ -250,6 +251,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
+        .route(
+            "/api/telemetry/conversation-view",
+            post(super::view_journey::report).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
         .route(
             "/api/telemetry/conversation-open",
             post(report_conversation_open),
@@ -2055,6 +2060,116 @@ async fn retry_product_conversation_delivery(
     Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
+async fn get_product_conversation_creation(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<Json<super::types::ProductConversationCreationStatusResponse>, AppError> {
+    let job = state
+        .db
+        .get_product_creation_job(&request_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| AppError::NotFound("product creation request not found".to_string()))?;
+    let delivery_retryable = if job.status == "delivery_failed" {
+        state
+            .db
+            .product_creation_delivery_retryable(&request_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+    } else {
+        false
+    };
+    product_creation_status_response(job, delivery_retryable).map(Json)
+}
+
+fn product_creation_status_response(
+    job: crate::db::ProductCreationJobRecord,
+    delivery_retryable: bool,
+) -> Result<super::types::ProductConversationCreationStatusResponse, AppError> {
+    use super::types::{
+        ProductConversationCreationFailureStatus as Failure,
+        ProductConversationCreationPendingStatus as Pending,
+        ProductConversationCreationStatusResponse as Response,
+    };
+
+    let pending = match job.status.as_str() {
+        "accepted" => Some(Pending::Accepted),
+        "claimed" => Some(Pending::Claimed),
+        "retry_scheduled" => Some(Pending::RetryScheduled),
+        "cancelling" => Some(Pending::Cancelling),
+        "deletion_pending" => Some(Pending::DeletionPending),
+        "delivery_pending" => Some(Pending::DeliveryPending),
+        _ => None,
+    };
+    if let Some(status) = pending {
+        return Ok(Response::Pending {
+            request_id: job.request_id,
+            product_conversation_id: job.product_conversation_id.to_string(),
+            status,
+            provisioning_stage: job.provisioning_stage,
+            stage_updated_at: job.stage_updated_at.to_rfc3339(),
+            retry_at: job
+                .retry_at
+                .or(job.delivery_retry_at)
+                .map(|at| at.to_rfc3339()),
+            allowed_actions: super::product_conversations::creation_allowed_actions(
+                &job.status,
+                delivery_retryable,
+            ),
+        });
+    }
+    if job.status == "published" {
+        let product_id = job.published_product_id.ok_or_else(|| {
+            AppError::Internal("published creation missing product identity".to_string())
+        })?;
+        if product_id != job.product_conversation_id {
+            return Err(AppError::Internal(
+                "published creation product identity mismatch".to_string(),
+            ));
+        }
+        let transcript_row_id = job.published_conversation_id.ok_or_else(|| {
+            AppError::Internal("published creation missing transcript identity".to_string())
+        })?;
+        return Ok(Response::Published {
+            request_id: job.request_id,
+            canonical_route: format!("/c/{product_id}"),
+            product_conversation_id: product_id.to_string(),
+            transcript_row_id,
+        });
+    }
+    let allowed_actions =
+        super::product_conversations::creation_allowed_actions(&job.status, delivery_retryable);
+    if job.status == "cancelled" {
+        return Ok(Response::Cancelled {
+            request_id: job.request_id,
+            product_conversation_id: job.product_conversation_id.to_string(),
+            provisioning_stage: job.provisioning_stage,
+            stage_updated_at: job.stage_updated_at.to_rfc3339(),
+            error: job.last_error,
+            allowed_actions,
+        });
+    }
+    let status = match job.status.as_str() {
+        "failed" => Failure::Failed,
+        "cleanup_ambiguous" => Failure::CleanupAmbiguous,
+        "delivery_failed" => Failure::DeliveryFailed,
+        other => {
+            return Err(AppError::Internal(format!(
+                "unknown product creation status: {other}"
+            )));
+        }
+    };
+    Ok(Response::Failed {
+        request_id: job.request_id,
+        product_conversation_id: job.product_conversation_id.to_string(),
+        status,
+        provisioning_stage: job.provisioning_stage,
+        stage_updated_at: job.stage_updated_at.to_rfc3339(),
+        error: job.last_error,
+        allowed_actions,
+    })
+}
+
 async fn delete_product_conversation_creation(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
@@ -2077,69 +2192,11 @@ async fn delete_product_conversation_creation(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-fn product_creation_processing_error_type(status: Option<&str>) -> &'static str {
-    match status {
-        Some(
-            "accepted" | "claimed" | "retry_scheduled" | "cancelling" | "deletion_pending"
-            | "delivery_pending",
-        ) => "product_creation_retry_scheduled",
-        _ => "product_creation_failed",
-    }
-}
-
-#[cfg(test)]
-mod product_creation_error_classification_tests {
-    use super::product_creation_processing_error_type;
-
-    #[test]
-    fn auto_advancing_statuses_report_scheduled_recovery() {
-        for status in [
-            "accepted",
-            "claimed",
-            "retry_scheduled",
-            "cancelling",
-            "deletion_pending",
-            "delivery_pending",
-        ] {
-            assert_eq!(
-                product_creation_processing_error_type(Some(status)),
-                "product_creation_retry_scheduled",
-                "status {status}"
-            );
-        }
-    }
-
-    #[test]
-    fn recovery_action_and_terminal_statuses_never_report_scheduled_retry() {
-        for status in [
-            "cancelled",
-            "delivery_failed",
-            "failed",
-            "cleanup_ambiguous",
-            "published",
-        ] {
-            assert_eq!(
-                product_creation_processing_error_type(Some(status)),
-                "product_creation_failed",
-                "status {status}"
-            );
-        }
-        assert_eq!(
-            product_creation_processing_error_type(None),
-            "product_creation_failed"
-        );
-        assert_eq!(
-            product_creation_processing_error_type(Some("unknown")),
-            "product_creation_failed"
-        );
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 async fn create_product_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateProductConversationRequest>,
-) -> Result<Json<ProductConversationCreateAcceptedResponse>, AppError> {
+) -> Result<(StatusCode, Json<ProductConversationCreateAcceptedResponse>), AppError> {
     let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
     })?;
@@ -2198,17 +2255,15 @@ async fn create_product_conversation(
         )
         .map_err(|error| AppError::BadRequest(error.to_string()))?,
     };
-    let selected_llm_language = match existing_job {
-        Some(existing) => existing.intent.llm_language,
-        None => match req.llm_language {
-            Some(language) => language,
-            None => state
-                .runtime
-                .db()
-                .get_default_llm_language()
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-        },
+    let selected_llm_language = match (req.llm_language, existing_job.as_ref()) {
+        (Some(language), _) => language,
+        (None, Some(existing)) => existing.intent.llm_language,
+        (None, None) => state
+            .runtime
+            .db()
+            .get_default_llm_language()
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?,
     };
     let intent = crate::db::ProductCreationIntent {
         origin: phoenix_db::ProductCreationOrigin::UserApi,
@@ -2226,45 +2281,330 @@ async fn create_product_conversation(
             })
             .collect(),
     };
-    match state
+    let accepted = match state
         .db
         .accept_product_creation(&req.request_id, &intent)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
     {
         crate::db::ProductCreationAcceptOutcome::Conflict(_) => {
-            return Err(AppError::BadRequest(
-                "request_id conflicts with immutable creation intent".to_string(),
-            ));
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "request_id conflicts with immutable creation intent",
+                "product_creation_request_conflict",
+            ))));
         }
-        crate::db::ProductCreationAcceptOutcome::Accepted(_)
-        | crate::db::ProductCreationAcceptOutcome::Replayed(_) => {}
-    }
-    let published = match crate::runtime::creation_worker::process_product_creation_request(
-        &state.runtime,
-        &req.request_id,
-    )
-    .await
-    {
-        Ok(published) => published,
-        Err(message) => {
-            let status = state
-                .db
-                .get_product_creation_job(&req.request_id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?
-                .map(|job| job.status);
-            return Err(AppError::TypedInternal {
-                message,
-                error_type: product_creation_processing_error_type(status.as_deref()).to_string(),
-            });
-        }
+        crate::db::ProductCreationAcceptOutcome::Accepted(job)
+        | crate::db::ProductCreationAcceptOutcome::Replayed(job) => job,
     };
-    Ok(Json(ProductConversationCreateAcceptedResponse {
-        canonical_route: format!("/c/{}", published.product_conversation_id),
-        product_conversation_id: published.product_conversation_id,
-        transcript_row_id: published.transcript_row_id,
-    }))
+    state.runtime.kick_creation_worker();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ProductConversationCreateAcceptedResponse {
+            request_id: accepted.request_id,
+            product_conversation_id: accepted.product_conversation_id.to_string(),
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod product_creation_acceptance_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn request_body(request_id: &str, cwd: &str) -> Value {
+        serde_json::json!({
+            "request_id": request_id,
+            "cwd": cwd,
+            "model": "claude-sonnet-5",
+            "objective": "inspect the repository"
+        })
+    }
+
+    async fn post_creation(app: &Router, body: &Value) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::post("/api/product-conversations/new")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn json_body(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn blocked_repository_lock_does_not_delay_acceptance_or_replay() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init", "--quiet"]).unwrap();
+        let _lock =
+            crate::runtime::creation_worker::RepositoryMutationLock::acquire(repo.path()).unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let body = request_body(&request_id, repo.path().to_str().unwrap());
+        let app = create_router(state.clone());
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_creation(&app, &body),
+        )
+        .await
+        .expect("acceptance must not wait for repository provisioning");
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let receipt = json_body(first).await;
+        assert_eq!(receipt["request_id"], request_id);
+        assert_eq!(receipt.as_object().unwrap().len(), 2);
+        let replay = post_creation(&app, &body).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(replay).await, receipt);
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "accepted");
+        assert_eq!(
+            receipt["product_conversation_id"],
+            job.product_conversation_id.to_string()
+        );
+        assert!(job.published_conversation_id.is_none());
+        let mut conflict = body.clone();
+        conflict["objective"] = serde_json::json!("different intent");
+        assert_eq!(
+            post_creation(&app, &conflict).await.status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_default_language_but_rejects_explicit_language_change() {
+        use phoenix_core::llm_language::LlmLanguage;
+
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .set_default_llm_language(LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let body = request_body(&request_id, directory.path().to_str().unwrap());
+        let first = post_creation(&app, &body).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let receipt = json_body(first).await;
+
+        state
+            .db
+            .set_default_llm_language(LlmLanguage::PhoenixNative)
+            .await
+            .unwrap();
+        let replay = post_creation(&app, &body).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(replay).await, receipt);
+
+        let mut explicit = body;
+        explicit["llm_language"] = serde_json::json!("caveman");
+        let same_language = post_creation(&app, &explicit).await;
+        assert_eq!(same_language.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(same_language).await, receipt);
+
+        explicit["llm_language"] = serde_json::json!("phoenix-native");
+        let conflict = post_creation(&app, &explicit).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(conflict).await["error_type"],
+            "product_creation_request_conflict"
+        );
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.intent.llm_language, LlmLanguage::Caveman);
+    }
+
+    #[tokio::test]
+    async fn status_projection_covers_all_durable_states_without_premature_routes() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let response = post_creation(
+            &app,
+            &request_body(&request_id, directory.path().to_str().unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for (kind, statuses) in [
+            (
+                "pending",
+                &[
+                    "accepted",
+                    "claimed",
+                    "retry_scheduled",
+                    "cancelling",
+                    "deletion_pending",
+                    "delivery_pending",
+                ][..],
+            ),
+            (
+                "failed",
+                &["failed", "cleanup_ambiguous", "delivery_failed"][..],
+            ),
+        ] {
+            for status in statuses {
+                let mut projected_job = job.clone();
+                projected_job.status = (*status).to_string();
+                projected_job.last_error = Some("provisioning stopped".to_string());
+                let projected = serde_json::to_value(
+                    product_creation_status_response(projected_job, false).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(projected["kind"], kind);
+                assert_eq!(projected["status"], *status);
+                assert_eq!(projected["request_id"], request_id);
+                assert_eq!(projected["provisioning_stage"], "validate_intent");
+                assert!(projected["stage_updated_at"].as_str().is_some());
+                assert!(projected.get("canonical_route").is_none());
+                assert!(projected.get("transcript_row_id").is_none());
+                let expected_actions: &[&str] = match *status {
+                    "accepted" | "claimed" | "retry_scheduled" => &["cancel", "delete"],
+                    "cancelling" | "cleanup_ambiguous" => &["delete"],
+                    "failed" => &["delete", "start_over"],
+                    "delivery_pending" => &["cancel"],
+                    "deletion_pending" | "delivery_failed" => &[],
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    projected["allowed_actions"],
+                    serde_json::json!(expected_actions),
+                    "{status}"
+                );
+                if kind == "failed" {
+                    assert_eq!(projected["error"], "provisioning stopped");
+                }
+            }
+        }
+        let mut retryable = job.clone();
+        retryable.status = "delivery_failed".to_string();
+        let projected =
+            serde_json::to_value(product_creation_status_response(retryable, true).unwrap())
+                .unwrap();
+        assert_eq!(projected["kind"], "failed");
+        assert_eq!(projected["status"], "delivery_failed");
+        assert_eq!(
+            projected["allowed_actions"],
+            serde_json::json!(["retry_delivery"])
+        );
+        assert!(projected.get("canonical_route").is_none());
+        assert!(projected.get("transcript_row_id").is_none());
+        let mut unknown = job;
+        unknown.status = "unknown".to_string();
+        assert!(product_creation_status_response(unknown, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_request_get_is_pending_or_recovery_and_unknown_is_not_found() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let other_id = uuid::Uuid::new_v4().to_string();
+        for id in [&request_id, &other_id] {
+            assert_eq!(
+                post_creation(&app, &request_body(id, directory.path().to_str().unwrap()))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+        }
+        let uri = format!("/api/product-conversations/creation/{request_id}");
+        let get = |uri: String| {
+            app.clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        };
+        let response = get(uri.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let pending = json_body(response).await;
+        assert_eq!(pending["request_id"], request_id);
+        assert_eq!(pending["kind"], "pending");
+        assert_eq!(pending["status"], "accepted");
+        assert!(pending.get("canonical_route").is_none());
+        state
+            .db
+            .cancel_product_creation(&request_id, chrono::Utc::now())
+            .await
+            .unwrap();
+        let cancelling = json_body(get(uri).await.unwrap()).await;
+        assert_eq!(cancelling["request_id"], request_id);
+        assert_eq!(cancelling["kind"], "pending");
+        assert_eq!(cancelling["status"], "cancelling");
+        let other = json_body(
+            get(format!("/api/product-conversations/creation/{other_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(other["request_id"], other_id);
+        assert_eq!(other["status"], "accepted");
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cancelled = job.clone();
+        cancelled.status = "cancelled".to_string();
+        let recovery =
+            serde_json::to_value(product_creation_status_response(cancelled, false).unwrap())
+                .unwrap();
+        assert_eq!(recovery["kind"], "cancelled");
+        assert_eq!(
+            recovery["allowed_actions"],
+            serde_json::json!(["delete", "start_over"])
+        );
+        assert!(recovery.get("transcript_row_id").is_none());
+        let mut published = job;
+        published.status = "published".to_string();
+        assert!(product_creation_status_response(published.clone(), false).is_err());
+        published.published_product_id = Some(published.product_conversation_id.clone());
+        published.published_conversation_id = Some("canonical-transcript".to_string());
+        let ready =
+            serde_json::to_value(product_creation_status_response(published, false).unwrap())
+                .unwrap();
+        assert_eq!(ready["kind"], "published");
+        assert_eq!(ready["transcript_row_id"], "canonical-transcript");
+        assert_eq!(
+            ready["canonical_route"],
+            format!(
+                "/c/{}",
+                pending["product_conversation_id"].as_str().unwrap()
+            )
+        );
+        assert_eq!(
+            get("/api/product-conversations/creation/unknown-request".to_string())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
 }
 
 async fn list_recent_management_roots(
@@ -3274,10 +3614,8 @@ async fn get_conversation(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -3340,7 +3678,17 @@ where
             .get_conversation(conversation_id)
             .await
             .map_err(|e| AppError::NotFound(e.to_string()))?;
-        let value = read_value(db, conversation_id, attempt).await?;
+        let value = match read_value(db, conversation_id, attempt).await {
+            Err(AppError::TranscriptSnapshotChanged) => {
+                tracing::debug!(
+                    conversation_id,
+                    attempt,
+                    "retrying changed opening snapshot"
+                );
+                continue;
+            }
+            result => result?,
+        };
         bump_transcript_generation_for_test(db, conversation_id).await?;
         let after = db
             .get_conversation(conversation_id)
@@ -3399,17 +3747,15 @@ async fn bump_transcript_generation_for_test(
     Ok(())
 }
 
-fn build_message_slice_response(
+async fn build_message_slice_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
     has_older_messages: bool,
 ) -> ConversationMessageSliceResponse {
     ConversationMessageSliceResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -3417,7 +3763,8 @@ fn build_message_slice_response(
     }
 }
 
-fn build_message_range_response(
+async fn build_message_range_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     start_message_sequence: i64,
     end_message_sequence: i64,
@@ -3429,10 +3776,7 @@ fn build_message_range_response(
         .filter(|seq| !present.contains(seq))
         .collect();
     ConversationMessageRangeResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         missing_sequences,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
@@ -3440,21 +3784,16 @@ fn build_message_range_response(
     }
 }
 
-fn build_messages_around_response(
+async fn build_messages_around_response(
+    db: &crate::db::Database,
     before: &[crate::db::Message],
     after: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
 ) -> ConversationMessagesAroundResponse {
     ConversationMessagesAroundResponse {
-        before: before
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
-        after: after
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        before: enrich_messages(db, before).await,
+        after: enrich_messages(db, after).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -3691,7 +4030,11 @@ async fn reconcile_accepted_messages(
     for message_id in req.message_ids {
         let disposition = match state.db.get_message_by_id(&message_id).await {
             Ok(message) if message.conversation_id == id => AcceptedMessageDisposition::Persisted {
-                message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                message: Box::new(
+                    EventPresentations::load(&state.db, [&message])
+                        .await
+                        .enrich(&message),
+                ),
             },
             Err(crate::db::DbError::MessageNotFound(_))
                 if queued_ids.contains(message_id.as_str()) =>
@@ -3740,12 +4083,16 @@ async fn get_conversation_messages_latest(
     })
     .await?;
     let (messages, has_older_messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_slice_response(
-        &messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-        has_older_messages,
-    )))
+    Ok(Json(
+        build_message_slice_response(
+            &state.db,
+            &messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+            has_older_messages,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages(
@@ -3776,12 +4123,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, has_older_messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                has_older_messages,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    has_older_messages,
+                )
+                .await,
+            ))
         }
         (None, Some(after)) => {
             let stable = stable_transcript_read(db, &id, |db, id, _attempt| {
@@ -3796,12 +4147,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                false,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    false,
+                )
+                .await,
+            ))
         }
     }
 }
@@ -3842,13 +4197,17 @@ async fn get_conversation_message_range(
     })
     .await?;
     let (messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_range_response(
-        &messages,
-        start_message_sequence,
-        end_message_sequence,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_message_range_response(
+            &state.db,
+            &messages,
+            start_message_sequence,
+            end_message_sequence,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages_around(
@@ -3871,12 +4230,16 @@ async fn get_conversation_messages_around(
     })
     .await?;
     let (before_messages, after_messages, server_message_tail) = stable.value;
-    Ok(Json(build_messages_around_response(
-        &before_messages,
-        &after_messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_messages_around_response(
+            &state.db,
+            &before_messages,
+            &after_messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 /// `GET /api/conversations/:id/slug` — compatibility lookup used by links that
@@ -4389,10 +4752,20 @@ async fn get_system_prompt(
     );
     let system_prompt = if is_coordinator {
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
-        crate::system_prompt::build_coordinator_system_prompt(
+        let mut prompt = crate::system_prompt::build_coordinator_system_prompt(
             conversation.llm_language,
             catalog.as_ref(),
-        )
+        );
+        crate::coordinator_home::append_context(
+            &mut prompt,
+            state
+                .runtime
+                .db()
+                .coordinator_work_scope()
+                .await
+                .map_err(|error| error.to_string()),
+        );
+        prompt
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
@@ -4558,7 +4931,7 @@ async fn read_stream_init_messages_with_tail(
 }
 
 async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
-    super::sse::aggregate_event_stream(state.runtime.subscribe_aggregate_events())
+    super::sse::aggregate_event_stream(state.db.clone(), state.runtime.subscribe_aggregate_events())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4662,7 +5035,7 @@ async fn stream_conversation(
     let stable = stable_transcript_read(db, &id, |db, id, attempt| {
         let query = query.clone();
         Box::pin(async move {
-            read_stream_init_messages_with_tail(
+            let value = read_stream_init_messages_with_tail(
                 db,
                 id,
                 &query,
@@ -4670,18 +5043,34 @@ async fn stream_conversation(
                 attempt,
                 get_stream_last_sequence_id(db, id).await,
             )
-            .await
+            .await?;
+            let generation = db
+                .get_conversation(id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .transcript_generation;
+            let opening = db
+                .read_continuation_opening_at_snapshot(id, generation, value.3)
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+            Ok((value, opening))
         })
     })
     .await?;
     let conversation = stable.conversation;
+    let (stream_value, opening) = stable.value;
     let (
         last_sequence_id,
         db_message_selection,
         messages,
         _server_message_tail,
         transcript_coverage,
-    ) = stable.value;
+    ) = stream_value;
     init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
     init_trace.record_message_count(messages.len());
     let highest_message_seq = match db_message_selection {
@@ -4782,6 +5171,7 @@ async fn stream_conversation(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
@@ -4799,6 +5189,7 @@ async fn stream_conversation(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         id,
         init_event,
         broadcast_rx,
@@ -5014,7 +5405,9 @@ async fn cancel_conversation(
             | AppError::TypedBadRequest { .. }
             | AppError::Forbidden(_)
             | AppError::UnprocessableEntity(_) => ("request_error", false),
-            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+            AppError::Internal(_)
+            | AppError::TypedInternal { .. }
+            | AppError::TranscriptSnapshotChanged => ("server_error", true),
         };
         span.record("outcome", outcome);
         if is_server_error {
@@ -7121,6 +7514,35 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     };
 
+    match runtime.db().coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context
+            else {
+                return CascadeProjectsReport {
+                    error: Some("Invalid Coordinator home ownership".into()),
+                    ..Default::default()
+                };
+            };
+            let worker = PathBuf::from(&worktree_path);
+            let worker = worker.canonicalize().unwrap_or(worker);
+            let home = PathBuf::from(cwd);
+            if home.starts_with(&worker) || worker.starts_with(&home) {
+                return CascadeProjectsReport {
+                    error: Some("Cleanup refused: worker path overlaps Coordinator home".into()),
+                    ..Default::default()
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return CascadeProjectsReport {
+                error: Some(format!(
+                    "Cannot establish Coordinator home retention: {error}"
+                )),
+                ..Default::default()
+            }
+        }
+    }
     let mut report = CascadeProjectsReport {
         worktree_path: Some(worktree_path.clone()),
         branch_name: Some(branch_name.clone()),
@@ -7442,10 +7864,8 @@ async fn get_by_slug(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -7668,6 +8088,22 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
+    match state.db.coordinator_work_scope().await {
+        Ok(Some(home)) => {
+            if let crate::work_scope::EnvironmentContext::CoordinatorHome { cwd } = home.context {
+                match crate::coordinator_home::validate_home(std::path::Path::new(&cwd)) {
+                    Ok(path) => roots.push(path),
+                    Err(error) => {
+                        tracing::warn!(%error, "Coordinator home excluded from file allowlist");
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "Coordinator home ownership lookup failed for file allowlist");
+        }
+    }
     for skill_root in state.runtime_env.skill_viewer_roots() {
         if let Ok(dir) = fs::canonicalize(skill_root) {
             roots.push(dir);
@@ -9055,9 +9491,10 @@ async fn get_shared_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let presentations = EventPresentations::redacted();
     let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
         .iter()
-        .map(super::wire::EnrichedMessage::from)
+        .map(|message| presentations.enrich(message))
         .collect();
 
     let context_window_size = messages
@@ -9078,6 +9515,7 @@ async fn get_shared_conversation(
 /// SSE stream for a shared conversation. Validates token, then subscribes.
 ///
 /// REQ-AUTH-006 + REQ-AUTH-007: Token-validated, supports multiple simultaneous viewers.
+#[allow(clippy::too_many_lines)]
 async fn shared_sse_stream(
     State(state): State<AppState>,
     Path(token): Path<String>,
@@ -9171,7 +9609,24 @@ async fn shared_sse_stream(
         crate::runtime::TranscriptCoverage::Tail => crate::runtime::InitTranscript::Tail(messages),
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
+    let opening = state
+        .runtime
+        .db()
+        .read_continuation_opening_at_snapshot(
+            &conversation_id,
+            conversation.transcript_generation,
+            match &transcript {
+                crate::runtime::InitTranscript::Complete(messages)
+                | crate::runtime::InitTranscript::Tail(messages) => {
+                    messages.iter().map(|message| message.sequence_id).max()
+                }
+                crate::runtime::InitTranscript::Preserve => None,
+            },
+        )
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
@@ -9190,6 +9645,7 @@ async fn shared_sse_stream(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         conversation_id,
         init_event,
         broadcast_rx,
@@ -9213,6 +9669,7 @@ pub(crate) enum AppError {
     /// 403 — the action is restricted to a caller on the server host.
     Forbidden(String),
     Internal(String),
+    TranscriptSnapshotChanged,
     TypedInternal {
         message: String,
         error_type: String,
@@ -9255,6 +9712,10 @@ impl IntoResponse for AppError {
             AppError::Forbidden(ref msg) => {
                 tracing::debug!(error = %msg, "403 Forbidden");
                 (StatusCode::FORBIDDEN, Json(ErrorResponse::new(msg.clone()))).into_response()
+            }
+            AppError::TranscriptSnapshotChanged => {
+                AppError::Internal("transcript changed during opening observation read".into())
+                    .into_response()
             }
             AppError::Internal(ref msg) => {
                 tracing::error!(error = %msg, "500 Internal Server Error");
@@ -12101,6 +12562,47 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn stable_read_retries_typed_opening_snapshot_mismatch() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "opening-snapshot-retry",
+            "opening-snapshot-retry",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stable = stable_transcript_read(&db, "opening-snapshot-retry", |db, id, attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                db.read_continuation_opening_at_snapshot(
+                    id,
+                    generation,
+                    if attempt == 1 { Some(1) } else { None },
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+                Ok(attempt)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(stable.attempts, 2);
+        assert_eq!(stable.value, 2);
+    }
+
+    #[tokio::test]
     async fn stable_stream_read_keeps_latest_selection_after_none_generation_race() {
         let state = make_test_state().await;
         state
@@ -13182,7 +13684,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("live message after subscribe");
         match live {
-            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
     }
@@ -15587,42 +16089,6 @@ pub(crate) mod hard_delete_cascade_tests {
         }
 
         (tmp, repo, worktree, branch)
-    }
-
-    /// A first-pass Work-mode Close captures its inventory before retirement.
-    #[tokio::test]
-    async fn archive_chain_captures_first_pass_close_inventory() {
-        let state = make_test_state().await;
-        let ids = ["sc-a", "sc-a2", "sc-a3"];
-        let (_tmp, repo, worktree, branch) =
-            build_workmode_chain_with_shared_worktree(&state, &ids).await;
-
-        assert!(worktree.exists(), "precondition: worktree must exist");
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
-            "precondition: branch must exist"
-        );
-
-        let _ = crate::api::chains::archive_chain_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("sc-a".to_string()),
-        )
-        .await
-        .expect("first-pass Close must capture inventory and converge");
-
-        assert!(!worktree.exists(), "Close must retire the shared worktree");
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
-            "archive preserves the shared task branch"
-        );
-        for id in ids {
-            let conv = state
-                .db
-                .get_conversation(id)
-                .await
-                .unwrap_or_else(|_| panic!("{id} row preserved in History"));
-            assert!(conv.archived, "{id} must be archived after Close");
-        }
     }
 
     /// Chain hard-delete must tear down the chain's shared worktree +

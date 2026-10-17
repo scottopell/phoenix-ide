@@ -6265,7 +6265,7 @@ where
                         let _ = self
                             .broadcast_tx
                             .admitted_publication(&mut materialization_owner)
-                            .persisted_message(*message);
+                            .persisted_opening_message(&self.storage, *message).await?;
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
@@ -6354,7 +6354,8 @@ where
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
-                    .persisted_message(msg);
+                    .persisted_opening_message(&self.storage, msg)
+                    .await?;
                 Ok(None)
             }
 
@@ -8151,6 +8152,12 @@ where
                 explore_bash_capability,
             )
         };
+        if is_coordinator {
+            crate::coordinator_home::append_context(
+                &mut system_prompt,
+                self.storage.coordinator_home_scope().await,
+            );
+        }
         if is_sub_agent
             && matches!(
                 self.context.resource_authority,
@@ -8548,6 +8555,7 @@ where
         let display_for_broadcast = serde_json::Value::Object(patch);
 
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: seq,
             message_id: assistant_message_id.clone(),
             transcript_generation: None,
@@ -8654,6 +8662,17 @@ where
             return self.handle_spawn_agents_tool(tool).await;
         }
 
+        let legacy_tmux_conversation_id = match &self.context.resource_scope {
+            phoenix_core::work_scope::ResourceScopeKey::Work(scope_id) => {
+                self.storage
+                    .get_work_scope_legacy_conversation_id(scope_id)
+                    .await?
+            }
+            phoenix_core::work_scope::ResourceScopeKey::Unattached(id) => Some(id.clone()),
+            phoenix_core::work_scope::ResourceScopeKey::Coordinator
+            | phoenix_core::work_scope::ResourceScopeKey::GlobalTerminal => None,
+        };
+
         // REQ-WPV-002: stamp the per-tool start time into the parent
         // assistant message's `display_data.tool_starts[tool_use_id]` map
         // (unix ms, server-authoritative) and broadcast `MessageUpdated`
@@ -8740,6 +8759,7 @@ where
         }
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
+        .with_legacy_tmux_conversation_id(legacy_tmux_conversation_id)
         .with_tool_use_id(tool.id.clone())
         .with_svg_artifact_store(Arc::new(
             super::svg_artifacts::RuntimeSvgArtifactStore::new(
@@ -9273,6 +9293,7 @@ where
                 .broadcast_tx
                 .admitted_publication(admitted)
                 .event(|seq| SseEvent::MessageUpdated {
+                    opening: None,
                     sequence_id: seq,
                     message_id: message_id.clone(),
                     transcript_generation: Some(transcript_generation),
@@ -14085,7 +14106,7 @@ mod authoritative_user_message_effect_tests {
         .unwrap();
 
         let event = rx.try_recv().expect("persisted message broadcast");
-        let SseEvent::Message { message } = event else {
+        let SseEvent::Message { message, .. } = event else {
             panic!("expected message event")
         };
         assert_eq!(message.message_id, "msg-direct");
@@ -14785,7 +14806,7 @@ mod authoritative_user_message_effect_tests {
                 && matches!(&message.content, crate::db::MessageContent::Agent(blocks)
                     if blocks == &vec![ContentBlock::text("response")])
         }));
-        let SseEvent::Message { message } = rx.try_recv().expect("retained response broadcast")
+        let SseEvent::Message { message, .. } = rx.try_recv().expect("retained response broadcast")
         else {
             panic!("expected retained response before recovery state")
         };
@@ -16178,7 +16199,7 @@ mod authoritative_user_message_effect_tests {
         );
         assert!(matches!(
             broadcast_rx.try_recv(),
-            Ok(SseEvent::Message { message }) if message.message_id == "msg-direct"
+            Ok(SseEvent::Message { message, .. }) if message.message_id == "msg-direct"
         ));
         assert!(matches!(
             broadcast_rx.try_recv(),
@@ -21849,7 +21870,7 @@ mod steer_drain_detector_tests {
         result.expect("admitted message write completes");
         assert!(matches!(
             receiver.try_recv(),
-            Ok(SseEvent::Message { message }) if message.message_id == "admitted-nonterminal"
+            Ok(SseEvent::Message { message, .. }) if message.message_id == "admitted-nonterminal"
         ));
         assert_eq!(fence.owner_count(), 0);
     }
@@ -22786,7 +22807,7 @@ mod steer_drain_detector_tests {
         let mut saw_duration_update = false;
         loop {
             match rx.try_recv() {
-                Ok(SseEvent::Message { message }) => {
+                Ok(SseEvent::Message { message, .. }) => {
                     if message.message_id == tool_row.message_id {
                         saw_tool_message = true;
                     }

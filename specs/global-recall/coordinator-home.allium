@@ -1,0 +1,95 @@
+-- allium: 3
+-- REQ-GR-016–018: local instance ownership, initialization and continuation.
+
+entity InstanceHome {
+    configured_path: String
+    scope_id: String?
+    persisted_path: String?
+    state: unbound | ready | unavailable
+}
+
+entity CoordinatorMember {
+    scope_id: String?
+}
+
+entity HomeObservation {
+    scope_identity: String
+    canonical_path: String
+    directory_valid: Boolean
+    worker_overlap: Boolean
+}
+
+rule InitializeHome {
+    when: InitializeRequested(home, observation)
+    requires: home.state = unbound
+    requires: observation.directory_valid
+    requires: not observation.worker_overlap
+    requires: observation.canonical_path = home.configured_path
+    ensures:
+        home.scope_id = observation.scope_identity
+        home.persisted_path = observation.canonical_path
+        home.state = ready
+    @guidance
+        -- Validate the filesystem and configuration before atomically binding one
+        -- instance-owned active scope. Concurrent initialization adopts that same
+        -- binding; it must not allocate another scope or import worker files.
+}
+
+rule ReconcileBoundHome {
+    when: InitializeRequested(home, observation)
+    requires: home.scope_id != null
+    requires: observation.directory_valid
+    requires: not observation.worker_overlap
+    requires: home.persisted_path = observation.canonical_path
+    requires: home.configured_path = observation.canonical_path
+    ensures:
+        home.state = ready
+}
+
+rule RejectInvalidBoundHome {
+    when: InitializeRequested(home, observation)
+    requires: home.scope_id != null
+    requires: not observation.directory_valid or observation.worker_overlap or home.persisted_path != observation.canonical_path or home.configured_path != observation.canonical_path
+    ensures:
+        home.state = unavailable
+    @guidance
+        -- Fail initialization with an actionable error; preserve binding and
+        -- retained bytes. Never silently recreate, relocate, or delete a bound home.
+}
+
+rule CoordinatorContinues {
+    when: CoordinatorContinuationAccepted(home, successor)
+    requires: home.scope_id != null
+    ensures:
+        successor.scope_id = home.scope_id
+    @guidance
+        -- Attach the successor to the same instance-owned scope, irrespective
+        -- of ordinary mode or current transcript identity. Regenerate trusted
+        -- home context and preserve deliberate historical pointers, not file instructions.
+}
+
+invariant ReadyHomeHasAuthority {
+    for home in InstanceHome:
+        home.state = ready implies (home.scope_id != null and home.persisted_path != null)
+}
+
+surface ServerHomeInitialization {
+    facing observation: HomeObservation
+    context home: InstanceHome
+    provides:
+        InitializeRequested(home, observation)
+    @guarantee IndependentRetention
+        -- Ordinary Close/Delete, task approval, Git cleanup and continuation
+        -- cannot mutate/delete the binding or retained home. Explicit scoped
+        -- execution remains required; notes never confer authority.
+    @guarantee TrustedObservation
+        -- Filesystem validation and identity allocation are server-owned; this
+        -- surface does not accept paths or identities from model-authored notes.
+}
+
+surface CoordinatorContinuation {
+    facing successor: CoordinatorMember
+    context home: InstanceHome
+    provides:
+        CoordinatorContinuationAccepted(home, successor)
+}

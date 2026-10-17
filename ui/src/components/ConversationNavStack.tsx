@@ -13,7 +13,7 @@ import type { ConversationHistoryBoundaryView } from '../generated/ConversationH
 type StackProps = Omit<
   React.ComponentProps<typeof MessageList>,
   'onVisibleRangeChange' | 'onChaptersChange' | 'ref'
-> & { historyBoundaries?: ConversationHistoryBoundaryView[] };
+> & { historyBoundaries?: ConversationHistoryBoundaryView[]; onViewChaptersReady?: ((count: number) => void) | undefined };
 
 /**
  * Coordinates the conversation nav strip with the virtualized message list.
@@ -23,7 +23,7 @@ type StackProps = Omit<
  * active index. Renders the nav as a fixed-height strip above the list.
  */
 export const ConversationNavStack = memo(function ConversationNavStack(props: StackProps) {
-  const { onLoadOlderMessages, onUpdateOlderMessagesRestore, historyBoundaries, ...listProps } = props;
+  const { onLoadOlderMessages, onUpdateOlderMessagesRestore, historyBoundaries, onViewChaptersReady, ...listProps } = props;
   const location = useLocation();
   const navigate = useNavigate();
   const sourceToolId = new URLSearchParams(location.search).get('source_tool');
@@ -41,7 +41,8 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
 
   const handleChaptersChange = useCallback((next: Chapter[]) => {
     setChapters(next);
-  }, []);
+    onViewChaptersReady?.(next.length);
+  }, [onViewChaptersReady]);
 
   const handleVisibleRangeChange = useCallback((range: VirtualTranscriptRange) => {
     const next = resolveActiveUnitIndex(chaptersRef.current, range);

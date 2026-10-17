@@ -50,13 +50,13 @@ After exact verification, the system shall write `deployed.sha` from the selecte
 
 ### REQ-LDD-010 — Recoverable interruption
 
-When status or deployment encounters a stale nonterminal transaction, the system shall expose the transaction and actionable recovery guidance without silently treating it as success.
+When status or deployment encounters a stale nonterminal transaction, the system shall expose the transaction and actionable recovery guidance without silently treating it as success. Status SHALL always identify an active claim owner even when the shared last-status record is absent, unreadable, or belongs to another transaction. Active-owner terminal proof SHALL require an owned regular non-symlink status object with explicit literal `finalization_pending` and `rollback_failure` fields, an exact source kind coherent with retained mode evidence, and a recognized terminal state. Any unreadable, empty, non-regular, or symlinked active deploy/restart marker SHALL remain an unresolved ownership fence and SHALL be shown by status.
 
 ### REQ-LDD-011 — Explicit candidate sources
 
 The local command shall deploy exact local `HEAD` after checks and compilation and require the candidate to embed that complete 40-character lowercase commit SHA. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry, and require its complete 40-character lowercase embedded git SHA to equal that commit exactly; it shall not run repository checks, dependency installation, worktree mutation, or compilation.
 
-The explicitly selected prepared-artifact source SHALL be admitted only under REQ-LDD-017, without local rebuild or ad-hoc resigning; it SHALL NOT expand ordinary local/release rollback guarantees.
+The explicitly selected prepared-artifact source SHALL be admitted only under REQ-LDD-017, without local rebuild or ad-hoc resigning; it SHALL NOT expand ordinary local/release rollback guarantees. Retained mode evidence SHALL use an exact source kind: paired/current-schema modes require `prepared_artifact`, while ordinary-forward mode requires `local_head` or `published_release`; missing or unknown source kinds SHALL fail closed.
 
 WHEN `latest` is requested,
 THE release command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
@@ -113,3 +113,65 @@ THE SYSTEM SHALL use only the retained byte-bound helper and immutable transacti
 THE SYSTEM SHALL retry only atomic publication of that captured candidate plist and removal/fsync of the transaction-owned temporary restore reservation, retain authoritative audit backup/proof, and persist pending status/claim through interruption or error. It SHALL clear pending and release only the owned claim after durable completion. An already completed rerun SHALL verify that same candidate/configuration and produce an idempotent result without applying ambient configuration.
 
 THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an older runtime, or generalize this operation into downgrade or cross-version recovery. Unknown, stale, mismatched, or absent evidence SHALL refuse without releasing ownership.
+
+### REQ-LDD-019: Explicit current-schema prepared-artifact mode
+
+**Condition:** When an authorized operator selects a prepared artifact to replace a production database whose complete ordered ledger is either the qualified migration-123 baseline or exactly equal to the qualified migration-128 candidate registry,
+**System:** the deployment controller SHALL require an explicit current-schema mode distinct from paired legacy upgrade, preserve every prepared-artifact receipt/signature/identity check, bind the retained controller helper and candidate migration registry by exact path and SHA-256, reject release and runtime-only sources, and fail closed for a missing, partial, unknown, mismatched, or newer migration ledger.
+
+**Rationale:** Relaxing the legacy eligibility gate would make incompatible database families indistinguishable and would weaken the signed-artifact handoff.
+
+### REQ-LDD-020: Current-schema snapshot and capacity proof
+
+**Condition:** When current-schema activation is prepared,
+**System:** the activation helper SHALL verify the exact qualified migration ledger, required ProductConversation tables, SQLite integrity, and foreign keys before disruption; physically reserve both backup and restore capacity using the observed live database plus WAL size and a growth margin equal to 10 percent of that observation and clamped to 1–8 GiB, capped by each capacity pool's safe ceiling, computed without crediting existing live database or WAL logical bytes against copy-on-write peak demand, while retaining at least 20 GiB free after prepared install overhead; treat APFS volumes in one container as one capacity pool and use the minimum reported free value among its affected paths for every initial, stopped, and post-migration evidence check; budget 2 MiB for the complete durable-evidence lifecycle, including allocation-unit-rounded old and replacement proof generations during atomic publication plus capacity evidence; reject any database proof generation larger than 1 MiB and reject a projected evidence lifecycle exceeding 2 MiB before disruption; prove the floor plus the exact pending atomic evidence peak before publishing either initial capacity evidence or a replacement generation; refuse disruption if adequate capacity cannot be held; stop the service and prove exclusive database ownership; recheck the required size against held capacity while stopped and exclusive, retaining the 20 GiB floor plus the not-yet-resident portion of the evidence allowance and treating that recheck as authoritative; create a SQLite backup snapshot; after offline migration, reject committed activation if actual database-plus-WAL growth exceeds the held target or any affected capacity pool loses the 20 GiB floor or remaining evidence allowance; and bind snapshot hash, logical contents, source and target ledgers, controller, helper, candidate, predecessor, and transaction identity in a private durable proof before running a migration.
+
+**Rationale:** Free-space estimates and a highest-version check do not prove that a multi-gigabyte live database can be restored or that it belongs to the qualified migration lineage.
+
+### REQ-LDD-021: Offline migration commit boundary and rollback prohibition
+
+**Condition:** When a qualified current-schema snapshot exists,
+**System:** the activation helper SHALL install the exact candidate binary, invoke that binary's bounded `--migrate-only` operation against the manifest-bound database while exclusive ownership remains proven, and verify the exact target ledger, SQLite integrity, and foreign keys before admitting candidate runtime traffic. It SHALL invoke that offline operation even when the admitted source ledger already equals the target registry, because candidate-owned reconciliation may write and invocation remains the irreversible forward boundary.
+
+**Condition:** When current-schema activation fails before offline candidate migration was invoked and the stopped, exclusively owned database retains the exact source ledger and logical contents,
+**System:** the activation helper MAY restore only the matching verified snapshot and predecessor binary/configuration, then SHALL verify predecessor identity before releasing ownership.
+
+**Condition:** When offline candidate migration is invoked, including when it fails, is interrupted, commits only a proper prefix of the target ledger, or leaves its write outcome ambiguous,
+**System:** the activation helper SHALL NOT replay the snapshot or start the predecessor, SHALL retain exclusive deployment ownership and the compatible candidate artifacts, and SHALL report whether candidate start/publication is pending or migration repair is required.
+
+**Rationale:** Migrations commit independently: migration 126 retires wake behavior while preserving history, migration 127 changes coordinator-home ownership, and migration 128 adds durable creation checkpoints under REQ-CCR-012. Invocation ends rollback authority because a failed process cannot prove that no migration or reconciliation write committed. Treating a successful, partially committed, or ambiguous migration as reversible could erase committed state or run an incompatible predecessor.
+
+### REQ-LDD-022: Current-schema finalization and recovery
+
+**Condition:** When the exact target ledger was durably verified but candidate start or persistent plist publication did not finish,
+**System:** `prod finalize-current <transaction>` SHALL re-verify the retained helper, candidate, private plist, database commit proof, and claim before startup; MAY start only that exact candidate; SHALL NOT replay the snapshot or invoke offline migration again; and SHALL publish the persistent plist and release temporary restore capacity only after candidate identity succeeds. Normal startup MAY perform candidate-owned idempotent initialization and reconciliation because those writes use the already committed forward-compatible runtime.
+
+**Condition:** When activation failed before offline candidate migration was invoked and the stopped, exclusively owned database still has the exact source ledger and logical contents,
+**System:** `prod recover-current <transaction>` SHALL use the retained immutable transaction to restore and verify the predecessor, while refusing recovery whenever offline migration was invoked, the database changed, or either fact is ambiguous.
+
+**Rationale:** Current-schema committed-state finalization needs a compatible candidate runtime, whereas paired legacy finalization remains publication-only and never bootstraps a runtime.
+
+### REQ-LDD-023: Ordinary forward activation failure boundary
+
+**Condition:** When ordinary in-place launchd deployment detects the exact migration-123 baseline and exact migration-128 candidate registry defined by REQ-COMP-012,
+**System:** the controller SHALL retain the complete candidate registry and its SHA-256 digest as immutable transaction evidence bound to the exact candidate and helper without requiring a standalone database backup; SHALL re-verify that evidence before activation; SHALL reject any different, missing, or newer registry; and the helper SHALL preserve ordinary predecessor rollback only for failures before candidate startup is attempted.
+
+**Condition:** When candidate startup is attempted,
+**System:** the helper SHALL treat migration 126 (`retire_wake_feature_preserving_history`), migration 127 (`coordinator_owned_work_scope_home`), migration 128 (`product_creation_provisioning_stage`), and coordinator-home initialization as possibly committed even when startup or health fails; SHALL stop the failed candidate when possible; SHALL retain the candidate binary/configuration, transaction evidence, and ownership fence; SHALL NOT launch the predecessor; and SHALL report a forward-only recovery state.
+A markerless forward-only status SHALL block a new deployment claim even when its retained manifest is missing or contradicts that status; the controller SHALL preserve the candidate and transaction evidence for ownership diagnosis rather than overwrite or prune them.
+A forward-only failed state SHALL never be treated as terminal or release its claim solely because retained manifest evidence is missing, malformed, or contradictory.
+
+**Condition:** When an operator explicitly authorizes `prod resume-forward <transaction>`,
+**System:** the controller SHALL re-verify the retained helper, candidate binary/configuration, immutable complete candidate registry and its SHA-256 digest, stopped target, and ownership claim; SHALL start only that exact retained candidate; and SHALL retain the forward-only fence on another failure.
+
+**Rationale:** Migration 126 commits independently and older wake logic does not understand its retirement metadata. Migration 127 plus coordinator-home initialization can durably introduce an environment kind the predecessor resource-authority reader rejects. Migration 128 adds durable creation checkpoints under REQ-CCR-012. A failed health check cannot establish that the database remained predecessor-compatible.
+
+### REQ-LDD-024: Pre-stop reservation cleanup fence
+
+**Condition:** When any pre-stop abandonment or capacity cleanup fails and durability of cleanup of transaction-owned reservation or evidence files is uncertain,
+**System:** the helper SHALL record a distinct pre-stop cleanup-pending state and retain the matching deployment claim; it SHALL NOT report durable `precondition_failed` or release that claim while cleanup remains uncertain. An initial failure whose reservation and evidence cleanup is durably complete MAY terminalize as `precondition_failed` without entering cleanup-pending.
+
+**Condition:** When an operator retries a pre-stop cleanup-pending transaction,
+**System:** the cleanup-only retry and any pre-handoff abandonment SHALL require the exact retained transaction, matching claim, and requested paired/current-schema mode—persisted in initial status before manifest publication—before any cleanup, terminal status, or claim release; the cleanup-only retry SHALL remove only that transaction's unsnapshotted reservation and evidence files, including owned atomic-write temporaries and SQLite reservation sidecars on both initial reservation abort and explicit cleanup, fsync their parent directories, durably record `precondition_failed`, and only then release and parent-directory-fsync the matching claim. If reservation abort, cleanup, terminal-status durability, claim unlink, or claim-parent fsync fails, the system SHALL retain or restore a visible exact-owner claim, durably return to cleanup-pending where possible, and SHALL NOT report success. It SHALL NOT stop, start, or inspect the runtime, touch database contents or the production plist or binary, perform snapshot recovery, or invoke `recover-current` or `recover-paired`.
+The prepared recovery commands SHALL reject cleanup-pending and cleanup-completed transactions without rewriting their cleanup-only state.
+A markerless cleanup-pending status SHALL fence deploy, restart, and stop operations until ownership is diagnosed. Any markerless status SHALL fence those operations unless it is a readable object that positively names a nonempty transaction, an exact supported source kind, a recognized terminal state, `finalization_pending` absent or literally `false`, and `rollback_failure` absent or literally `null`; unreadable, invalid, non-object, unknown, and recognized nonterminal statuses SHALL fail closed rather than permit evidence overwrite. The retained helper SHALL request bootout only for the exact generated deployment-helper label verified from its immutable transaction identity; identity rejection SHALL NOT request any bootout.

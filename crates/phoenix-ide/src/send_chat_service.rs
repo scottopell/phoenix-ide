@@ -576,6 +576,9 @@ impl SendChatApplicationService {
                     crate::runtime::SteeringAdmissionError::QueueFull => {
                         Ok(steering_queue_full_outcome())
                     }
+                    crate::runtime::SteeringAdmissionError::ProductCreationClaimLost => {
+                        Err(SendChatServiceError::Dispatch(error.to_string()))
+                    }
                     crate::runtime::SteeringAdmissionError::Internal(error) => {
                         Err(SendChatServiceError::Dispatch(error))
                     }
@@ -976,8 +979,10 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         other @ (crate::db::DbError::Sqlx(_)
         | crate::db::DbError::MessageNotFound(_)
         | crate::db::DbError::MessageConflict(_)
+        | crate::db::DbError::TranscriptSnapshotChanged
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
+        | crate::db::DbError::CoordinatorWorkScope(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::SubAgentLifecycleConflict(_)
         | crate::db::DbError::ContinuationPrecondition(_)
@@ -994,9 +999,8 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
-        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
-            map_db_internal_error(&other)
-        }
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
+        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
     }
 }
 
@@ -1029,7 +1033,9 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::MessageNotFound(_)
         | crate::db::DbError::MessageConflict(_)
+        | crate::db::DbError::TranscriptSnapshotChanged
         | crate::db::DbError::SlugExists(_)
+        | crate::db::DbError::CoordinatorWorkScope(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::SubAgentLifecycleConflict(_)
         | crate::db::DbError::ContinuationPrecondition(_)
@@ -1045,9 +1051,8 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
-        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
-            map_db_internal_error(&other)
-        }
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
+        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
     }
 }
 
@@ -2254,6 +2259,14 @@ mod tests {
 
     #[test]
     fn typed_db_errors_map_to_distinct_service_errors() {
+        assert!(matches!(
+            map_conversation_load_error(crate::db::DbError::TranscriptSnapshotChanged),
+            SendChatServiceError::Internal(_)
+        ));
+        assert!(matches!(
+            map_direct_turn_accept_error(crate::db::DbError::TranscriptSnapshotChanged),
+            SendChatServiceError::Internal(_)
+        ));
         assert!(matches!(
             map_conversation_load_error(crate::db::DbError::ConversationNotFound(
                 "missing".to_string()

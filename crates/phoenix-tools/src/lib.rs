@@ -33,8 +33,8 @@ pub use bash::{
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
     BrowserKeyPressTool, BrowserNavigateTool, BrowserProfileTool, BrowserRecentConsoleLogsTool,
-    BrowserResizeTool, BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
-    BrowserWaitForSelectorTool,
+    BrowserResizeTool, BrowserSessionManager, BrowserSnapshotTool, BrowserTakeScreenshotTool,
+    BrowserTypeTool, BrowserWaitForSelectorTool,
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
@@ -292,6 +292,9 @@ pub struct ToolContext {
     /// The conversation this tool is executing within
     pub conversation_id: String,
 
+    /// Persisted same-scope transcript hint for pre-opaque-scope tmux sockets.
+    legacy_tmux_conversation_id: Option<String>,
+
     /// Actor identity and effective authority for same-scope resources.
     pub resource_access: phoenix_core::work_scope::EffectiveResourceAccess,
 
@@ -334,9 +337,6 @@ pub struct ToolContext {
     pub worktree_path: Option<PathBuf>,
 
     /// Durable owner for work-affine resources created by this tool call.
-    /// Worktree-backed conversations scope to the worktree path so resources
-    /// survive context-exhaustion continuations; Direct conversations fall
-    /// back to the conversation id.
     pub work_scope: ResourceScopeKey,
 
     /// Optional sink for typed ephemeral bash progress snapshots.
@@ -418,6 +418,7 @@ impl ToolContext {
         let root_conversation_id = conversation_id.clone();
         Self {
             cancel,
+            legacy_tmux_conversation_id: Some(conversation_id.clone()),
             resource_access: phoenix_core::work_scope::EffectiveResourceAccess::new(
                 conversation_id.clone(),
                 phoenix_core::work_scope::ResourceAuthority::Work,
@@ -476,6 +477,7 @@ impl ToolContext {
         );
         Self {
             cancel,
+            legacy_tmux_conversation_id: Some(conversation_id.clone()),
             conversation_id,
             resource_access,
             root_conversation_id,
@@ -507,6 +509,13 @@ impl ToolContext {
     #[must_use]
     pub fn with_bash_progress_sink(mut self, sink: Arc<dyn BashProgressSink>) -> Self {
         self.bash_progress_sink = Some(sink);
+        self
+    }
+
+    /// Replace the legacy socket hint; `None` disables conversation-socket fallback.
+    #[must_use]
+    pub fn with_legacy_tmux_conversation_id(mut self, conversation_id: Option<String>) -> Self {
+        self.legacy_tmux_conversation_id = conversation_id;
         self
     }
 
@@ -647,7 +656,7 @@ impl ToolContext {
                 &self.work_scope,
                 self.working_dir(),
                 self.worktree_path.as_deref(),
-                Some(&self.conversation_id),
+                self.legacy_tmux_conversation_id.as_deref(),
             )
             .await
     }
@@ -835,6 +844,7 @@ fn write_tools() -> Vec<Arc<dyn Tool>> {
 fn browser_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BrowserNavigateTool),
+        Arc::new(BrowserSnapshotTool),
         Arc::new(BrowserEvalTool),
         Arc::new(BrowserTakeScreenshotTool),
         Arc::new(BrowserRecentConsoleLogsTool),
@@ -1236,6 +1246,97 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    fn legacy_tmux_test_context(
+        actor: &str,
+        cwd: PathBuf,
+        registry: Arc<TmuxRegistry>,
+    ) -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            actor.into(),
+            cwd,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            registry,
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse("legacy-test-scope").unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn continued_tool_context_adopts_same_scope_predecessor_legacy_socket_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = tmux::fake_backend::FakeTmuxBackend::new();
+        let registry = Arc::new(TmuxRegistry::with_backend(
+            temp.path().into(),
+            fake.clone(),
+            None,
+        ));
+        let legacy = tmux::registry::socket_path_for(temp.path(), "legacy-parent");
+        registry
+            .ensure_live(
+                &ResourceScopeKey::Unattached("legacy-parent".into()),
+                temp.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let before = fake.server(&legacy).unwrap();
+        drop(registry);
+        let registry = Arc::new(TmuxRegistry::with_backend(
+            temp.path().into(),
+            fake.clone(),
+            None,
+        ));
+        let child = legacy_tmux_test_context("successor", temp.path().into(), registry)
+            .with_root_conversation_id("unrelated-product-root".into())
+            .with_legacy_tmux_conversation_id(Some("legacy-parent".into()));
+        let server = child.tmux().await.unwrap();
+        assert_eq!(server.read().await.socket_path, legacy);
+        assert_eq!(child.conversation_id, "successor");
+        assert_eq!(fake.server(&legacy).unwrap(), before);
+        assert_eq!(fake.spawn_count(&legacy), 1);
+        let canonical =
+            tmux::registry::socket_path_for_worktree(temp.path(), Path::new("legacy-test-scope"));
+        assert_eq!(fake.spawn_count(&canonical), 0);
+        assert_eq!(
+            fake.spawn_count(&tmux::registry::socket_path_for(temp.path(), "successor")),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_absence_of_same_scope_legacy_hint_does_not_adopt_actor_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = tmux::fake_backend::FakeTmuxBackend::new();
+        let registry = Arc::new(TmuxRegistry::with_backend(
+            temp.path().into(),
+            fake.clone(),
+            None,
+        ));
+        let legacy = tmux::registry::socket_path_for(temp.path(), "successor");
+        registry
+            .ensure_live(
+                &ResourceScopeKey::Unattached("successor".into()),
+                temp.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let before = fake.server(&legacy).unwrap();
+        let child = legacy_tmux_test_context("successor", temp.path().into(), registry)
+            .with_legacy_tmux_conversation_id(None);
+        let server = child.tmux().await.unwrap();
+        let canonical =
+            tmux::registry::socket_path_for_worktree(temp.path(), Path::new("legacy-test-scope"));
+        assert_eq!(server.read().await.socket_path, canonical);
+        assert_eq!(fake.server(&legacy).unwrap(), before);
+    }
+
     struct NamedTool(&'static str);
 
     #[async_trait]
@@ -1383,6 +1484,7 @@ mod tests {
         let names = names(&ToolRegistry::standard());
         for expected in [
             "browser_navigate",
+            "browser_snapshot",
             "browser_eval",
             "browser_take_screenshot",
             "browser_recent_console_logs",

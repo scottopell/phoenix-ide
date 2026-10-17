@@ -2,6 +2,7 @@ import { makeVirtualizedReactionScenario } from '../fixtures/productConversation
 import type { Story } from '@ladle/react';
 import {
   getProductConversationScenario,
+  makeCompactEventsScenario,
   ProductConversationFixture,
   type ProductConversationScenarioId,
 } from '../fixtures/productConversation';
@@ -56,3 +57,10 @@ export const OrdinaryLazyHistory = storyFor('ordinary-lazy-history');
 OrdinaryLazyHistory.storyName = 'ordinary-lazy-history';
 export const GlobalLazyHistory = storyFor('global-lazy-history');
 GlobalLazyHistory.storyName = 'global-lazy-history';
+
+const compactOrdinary = makeCompactEventsScenario(false);
+const compactGlobal = makeCompactEventsScenario(true);
+export const CompactEventsOrdinary: Story = () => <ProductConversationFixture scenario={compactOrdinary} />;
+CompactEventsOrdinary.storyName = 'compact-events-ordinary';
+export const CompactEventsGlobal: Story = () => <ProductConversationFixture scenario={compactGlobal} />;
+CompactEventsGlobal.storyName = 'compact-events-global';

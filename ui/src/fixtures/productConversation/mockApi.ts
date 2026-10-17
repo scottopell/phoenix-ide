@@ -147,8 +147,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     await heldOlderPage;
     return older;
   };
-  api.listActiveCoordinatorWatches = async () => [];
-  api.listLiveCoordinatorBashHandles = async () => [];
+  if (!scenario.initialEntry?.startsWith('/global/')) {
+    api.listActiveCoordinatorWatches = async () => [];
+    api.listLiveCoordinatorBashHandles = async () => [];
+  }
 
   api.getChain = async (rootConvId) => {
     if (!scenario.chain) throw new Error(`Scenario ${scenario.id} is missing Recall data`);
@@ -188,7 +190,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
   api.ensureGlobalCoordinator = async () => ({ conversation: scenario.kind === 'coordinator' ? conversation : { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });
-  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && scenario.snapshot.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : id === sourceId && scenario.sourceIsGlobal ? 'source-product' : null });
+  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && scenario.snapshot.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : scenario.initialEntry === `/global/${id}` ? id : id === sourceId && scenario.sourceIsGlobal ? 'source-product' : null });
   api.listConversations = async () => [];
   api.listArchivedConversations = async () => [];
   api.listModels = async () => ({
@@ -234,6 +236,16 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       record('SendCount', sendCount);
       record('LastSentText', body.text ?? '');
       return Response.json({ queued: false, already_persisted: true });
+    }
+    if ((init?.method ?? 'GET') === 'GET' && scenario.initialEntry?.startsWith('/global/')) {
+      if (url === '/api/coordinator/watches') {
+        record('WatchRequests', Number(document.documentElement.dataset['productConversationFixtureWatchRequests'] ?? '0') + 1);
+        return Response.json([] satisfies Awaited<ReturnType<typeof api.listActiveCoordinatorWatches>>);
+      }
+      if (url === '/api/coordinator/bash/live') {
+        record('LiveBashRequests', Number(document.documentElement.dataset['productConversationFixtureLiveBashRequests'] ?? '0') + 1);
+        return Response.json([] satisfies Awaited<ReturnType<typeof api.listLiveCoordinatorBashHandles>>);
+      }
     }
     if (new URL(url, location.href).pathname.startsWith('/api/')) throw new Error(`Unexpected fixture API request: ${url}`);
     return originalFetch(input, init);
@@ -315,7 +327,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
           eventSourceInitCount += 1;
           record('EventSourceInits', eventSourceInitCount);
           record('EventSourceLastInitializedInstance', this.instanceId);
-          const init = {
+          const init = { opening: null,
             sequence_id: 1,
             conversation: this.isSource ? sourceConversation : conversation,
             transcript_generation: 1,

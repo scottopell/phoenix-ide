@@ -1043,6 +1043,115 @@ def _user_message_images(message: dict) -> list[dict]:
 # ----------------------- scenarios -----------------------
 
 
+def scenario_coordinator_home(_base_url: str) -> None:
+    """Disposable server: actual scoped tool dispatch and persistent home, no worker bootstrap."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory(prefix="phoenix-coordinator-home-") as directory:
+        root = Path(directory)
+        env = _server_env(root)
+        proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+        def stop():
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            log_file.close()
+        def binding():
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                row = db.execute("SELECT s.id,s.cwd FROM coordinator_work_scope c JOIN work_scopes s ON s.id=c.work_scope_id WHERE s.environment_kind='coordinator_home' AND s.lifecycle='active'").fetchone()
+                assert row is not None
+                return row
+        try:
+            scope, cwd = binding()
+            assert Path(cwd) == (root / "data" / "coordinator").resolve()
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                assert db.execute("SELECT COUNT(*) FROM product_conversation_work_scopes").fetchone()[0] == 0
+            response = httpx.post(f"{base_url}/api/global/coordinator", timeout=10)
+            response.raise_for_status()
+            coordinator = response.json()['conversation']
+            assert coordinator['cwd'] == cwd
+            conv_id = coordinator['id']
+            inspected = httpx.get(f"{base_url}/api/conversations/{conv_id}/system-prompt", timeout=10)
+            inspected.raise_for_status()
+            assert f'active work_scope_id={scope}' in inspected.json()['system_prompt']
+            assert f'server directory={cwd}' in inspected.json()['system_prompt']
+            _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
+            _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages), 'Coordinator home Bash completed', timeout=SCENARIO_TIMEOUT_SECONDS)
+            final = _get_conv(base_url, conv_id)
+            results = [m.get('content', {}) for m in final['messages'] if m.get('message_type') == 'tool']
+            assert any(r.get('is_error') is False and cwd in str(r) for r in results), results
+            read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
+            read.raise_for_status()
+            assert read.json()['content'] == 'coordinator-home-proof'
+            listing = httpx.get(f"{base_url}/api/files/list", params={'path': cwd}, timeout=10)
+            listing.raise_for_status()
+            assert 'e2e-home-evidence.txt' in listing.text
+            for bad in ['missing', 'not-an-active-scope']:
+                before = len(_get_conv(base_url, conv_id)['messages'])
+                _send_chat_and_stream(base_url, conv_id, f"[[coordinator_home_bash:{bad}]]", SCENARIO_TIMEOUT_SECONDS)
+                _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages[before:]), 'invalid scope rejected', timeout=SCENARIO_TIMEOUT_SECONDS)
+                results = [m.get('content', {}) for m in _get_conv(base_url, conv_id)['messages'][before:] if m.get('message_type') == 'tool']
+                assert any(r.get('is_error') is True for r in results), results
+            exhausted_chat = httpx.post(f'{base_url}/api/conversations/{conv_id}/chat', json={'text':'[[scenario:context_window_exceeded]] exhaust Coordinator for continuation','images':[], 'message_id':str(uuid.uuid4())}, timeout=10)
+            exhausted_chat.raise_for_status()
+            _wait_for_sse_signal(base_url, conv_id, _context_exhausted_event, SCENARIO_TIMEOUT_SECONDS)
+            handoff = f"[[scenario:plain_text]] Continue local proof. Retained historical pointer: {cwd}/e2e-home-evidence.txt. Refresh runtime evidence; file is not authority."
+            continued = httpx.post(f"{base_url}/api/conversations/{conv_id}/continue", json={'handoff':handoff, 'message_id':str(uuid.uuid4())}, timeout=10)
+            continued.raise_for_status()
+            predecessor = conv_id
+            conv_id = continued.json()['conversation_id']
+            _poll_to_idle_with_messages(base_url, conv_id, lambda m: 'analyzed the situation' in _agent_text(m), 'continued Coordinator', timeout=SCENARIO_TIMEOUT_SECONDS)
+            assert binding() == (scope, cwd)
+            assert _get_conv(base_url, predecessor)['conversation']['work_scope_id'] == scope
+            assert _get_conv(base_url, conv_id)['conversation']['work_scope_id'] == scope
+            assert _get_conv(base_url, conv_id)['conversation']['cwd'] == cwd
+            worker_root = root / 'ordinary-worker'
+            worker_root.mkdir()
+            worker_root = worker_root.resolve()
+            sentinel = worker_root / 'worker-sentinel.txt'
+            sentinel.write_text('separate-worker-bytes')
+            worker = _new_conv_in(base_url, str(worker_root), '[[scenario:plain_text]] separate ordinary work')
+            _poll_to_idle_with_messages(base_url, worker['id'], lambda m: 'analyzed the situation' in _agent_text(m), 'separate worker', timeout=SCENARIO_TIMEOUT_SECONDS)
+            assert worker['cwd'] != cwd
+            stop()
+            proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+            assert binding() == (scope, cwd)
+            response = httpx.get(f"{base_url}/api/global/coordinator", timeout=10)
+            response.raise_for_status()
+            assert response.json()['conversation']['id'] == conv_id
+            read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
+            read.raise_for_status()
+            assert read.json()['content'] == 'coordinator-home-proof'
+            before = len(_get_conv(base_url, conv_id)['messages'])
+            _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
+            _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' and m.get('content', {}).get('is_error') is False for m in messages[before:]), 'restarted successor rediscovers owned scope from system context', timeout=SCENARIO_TIMEOUT_SECONDS)
+            worker_cwd_after_restart = _get_conv(base_url, worker['id'])['conversation']['cwd']
+            assert worker_cwd_after_restart == str(worker_root), (worker_cwd_after_restart, str(worker_root))
+            closed = httpx.post(f"{base_url}/api/conversations/{worker['id']}/archive", timeout=10)
+            closed.raise_for_status()
+            deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+            while not _get_conv(base_url, worker['id'])['conversation'].get('archived'):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('ordinary Close did not commit History')
+                time.sleep(0.05)
+            assert binding() == (scope, cwd)
+            assert sentinel.read_text() == 'separate-worker-bytes'
+            deleted = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
+            deleted.raise_for_status()
+            assert binding() == (scope, cwd)
+            assert Path(cwd, 'e2e-home-evidence.txt').read_text() == 'coordinator-home-proof'
+            outside = root / 'data' / 'outside.txt'
+            outside.write_text('not in home')
+            denied = httpx.get(f"{base_url}/api/files/read", params={'path': str(outside)}, timeout=10)
+            assert denied.status_code == 404, denied.text
+            assert sentinel.read_text() == 'separate-worker-bytes'
+        finally:
+            stop()
+
+
 def scenario_text_streaming(base_url: str) -> None:
     word_count = 8
     conv_id = _new_conv_and_stream(
@@ -1144,6 +1253,7 @@ def scenario_continuation(base_url: str) -> None:
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
     worktrees_before = _git_worktree_inventory()
     with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
+        request_id = str(uuid.uuid4())
         create = httpx.post(
             f"{base_url}/api/product-conversations/new",
             json={
@@ -1151,15 +1261,36 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
                 "model": _default_model(base_url),
                 "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
                 "images": [],
-                "request_id": str(uuid.uuid4()),
+                "request_id": request_id,
             },
             timeout=10.0,
         )
         create.raise_for_status()
-        created = create.json()
-        product_conversation_id = created["product_conversation_id"]
-        canonical_route = created["canonical_route"]
-        root_conv_id = created["transcript_row_id"]
+        assert create.status_code == 202, f"unexpected creation acceptance: {create.status_code}"
+        accepted = create.json()
+        product_conversation_id = accepted["product_conversation_id"]
+        assert accepted["request_id"] == request_id
+
+        deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+        while True:
+            status_response = httpx.get(
+                f"{base_url}/api/product-conversations/creation/{request_id}",
+                timeout=10.0,
+            )
+            status_response.raise_for_status()
+            creation = status_response.json()
+            kind = creation["kind"]
+            if kind == "published":
+                break
+            if kind in {"failed", "cancelled"}:
+                raise AssertionError(f"product creation did not publish: {creation!r}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for product publication: {creation!r}")
+            time.sleep(0.05)
+
+        assert creation["product_conversation_id"] == product_conversation_id
+        canonical_route = creation["canonical_route"]
+        root_conv_id = creation["transcript_row_id"]
 
         assert canonical_route == f"/c/{product_conversation_id}", (
             f"unexpected canonical route: {canonical_route!r}"
@@ -1183,6 +1314,14 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
             "root row should not yet point at a continuation"
         )
 
+        original_scope = exhausted['conversation']['work_scope_id']
+        assert original_scope, 'non-Git creation must own a persisted WorkScope'
+        assert exhausted['conversation']['conv_mode']['mode'] == 'Direct'
+        original_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{root_conv_id}'}, timeout=10)
+        original_resolution.raise_for_status()
+        original_environment = original_resolution.json()['work_scope']
+        assert original_environment['work_scope_id'] == original_scope
+        assert original_environment['environment_kind'] == 'unowned_cwd'
         handoff = "Continue with the same ProductConversation after natural context exhaustion."
         continue_response = httpx.post(
             f"{base_url}/api/conversations/{root_conv_id}/continue",
@@ -1218,6 +1357,11 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
         assert successor["conversation"].get("continued_in_conv_id") is None, (
             "successor should be the latest leaf row"
         )
+        assert successor['conversation']['work_scope_id'] == original_scope
+        assert successor['conversation']['cwd'] == exhausted['conversation']['cwd']
+        successor_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{successor_id}'}, timeout=10)
+        successor_resolution.raise_for_status()
+        assert successor_resolution.json()['work_scope'] == original_environment
         successor_state = _state_str(successor["conversation"]["state"])
         assert successor_state == "idle", f"successor not idle after handoff: {successor_state}"
         successor_agent_messages = [
@@ -1579,6 +1723,7 @@ def scenario_perf_stream(base_url: str) -> None:
 
 
 SCENARIOS = [
+    ("coordinator_home", scenario_coordinator_home),
     ("list_models", scenario_list_models),
     ("text_streaming", scenario_text_streaming),
     ("multi_tool", scenario_multi_tool),

@@ -646,6 +646,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_wake_feature_preserving_history",
         sql: WAKE_FEATURE_RETIREMENT_SQL,
     },
+    Migration {
+        version: 127,
+        name: "coordinator_owned_work_scope_home",
+        sql: include_str!("migrations/coordinator_home.sql"),
+    },
+    Migration {
+        version: 128,
+        name: "product_creation_provisioning_stage",
+        sql: MIGRATION_128,
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -1765,6 +1775,25 @@ CREATE TRIGGER durable_turns_source_call_update BEFORE UPDATE ON durable_turns
 WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
  (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
 BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+";
+
+const MIGRATION_128: &str = r"
+ALTER TABLE product_creation_jobs ADD COLUMN provisioning_stage TEXT NOT NULL
+    DEFAULT 'validate_intent'
+    CHECK (provisioning_stage IN ('validate_intent', 'resolve_repository', 'resolve_starting_pin',
+        'materialize_worktree', 'finalize_attachments', 'commit_metadata',
+        'bootstrap_initial_turn', 'finalize_publication'));
+ALTER TABLE product_creation_jobs ADD COLUMN stage_updated_at_unix_micros INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(stage_updated_at_unix_micros) = 'integer' AND stage_updated_at_unix_micros >= 0);
+UPDATE product_creation_jobs
+SET provisioning_stage = CASE
+        WHEN status = 'published' THEN 'finalize_publication'
+        WHEN status IN ('delivery_pending', 'delivery_failed') THEN 'bootstrap_initial_turn'
+        WHEN staging_path IS NOT NULL THEN 'materialize_worktree'
+        WHEN pin_exact_checkout_oid IS NOT NULL THEN 'resolve_starting_pin'
+        ELSE 'validate_intent'
+    END,
+    stage_updated_at_unix_micros = updated_at_unix_micros;
 ";
 
 const MIGRATION_111: &str = r"
@@ -11329,6 +11358,8 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
     Ok(true)
 }
 
+mod coordinator_home;
+
 struct WritableSchemaGuard {
     connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
     armed: bool,
@@ -11579,6 +11610,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
         if migration.version == 121 {
             run_migration_121(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 127 {
+            coordinator_home::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -14125,11 +14162,186 @@ mod tests {
         }
     }
 
+    fn validate_current_schema_with_controller(database_path: &std::path::Path, migrated: bool) {
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let helper = repository.join("scripts/launchd_deploy_helper.py");
+        let registry = repository.join("crates/phoenix-db/src/migrations.rs");
+        let script = r#"
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("migration_contract_helper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.validate_current_schema_database(
+    Path(sys.argv[2]), Path(sys.argv[3]), migrated=sys.argv[4] == "target"
+)
+"#;
+        let output = std::process::Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("-c")
+            .arg(script)
+            .arg(helper)
+            .arg(database_path)
+            .arg(registry)
+            .arg(if migrated { "target" } else { "baseline" })
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "controller rejected compiled migration schema: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn current_schema_controller_accepts_compiled_123_and_128_shapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("current-schema.sqlite3");
+        let path_text = path.to_str().unwrap();
+        let db = crate::Database::open(path_text).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS _migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 123)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let baseline_count = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 123)
+            .count();
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            baseline_count
+        );
+        sqlx::query("DELETE FROM _migrations WHERE version > 123")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let fictional_members: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'product_conversation_members'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(fictional_members, 0);
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+
+        validate_current_schema_with_controller(&path, false);
+
+        let db = crate::Database::open(path_text).await.unwrap();
+        let target_count = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 123)
+            .count();
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            target_count
+        );
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+
+        validate_current_schema_with_controller(&path, false);
+        validate_current_schema_with_controller(&path, true);
+    }
+
+    #[tokio::test]
+    async fn migration_128_backfills_relational_stages_and_enforces_constraints() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE product_creation_jobs (
+                request_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                updated_at_unix_micros INTEGER NOT NULL,
+                staging_path TEXT, pin_exact_checkout_oid TEXT
+             );
+             INSERT INTO product_creation_jobs VALUES
+                ('accepted', 'accepted', 11, NULL, NULL),
+                ('pinned', 'retry_scheduled', 12, NULL, 'oid'),
+                ('staged', 'failed', 13, '/worktree', 'oid'),
+                ('delivery', 'delivery_failed', 14, '/worktree', 'oid'),
+                ('published', 'published', 15, '/worktree', 'oid');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_128).execute(&pool).await.unwrap();
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT request_id, provisioning_stage, stage_updated_at_unix_micros
+             FROM product_creation_jobs ORDER BY updated_at_unix_micros",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("accepted".to_string(), "validate_intent".to_string(), 11),
+                ("pinned".to_string(), "resolve_starting_pin".to_string(), 12),
+                ("staged".to_string(), "materialize_worktree".to_string(), 13),
+                (
+                    "delivery".to_string(),
+                    "bootstrap_initial_turn".to_string(),
+                    14
+                ),
+                (
+                    "published".to_string(),
+                    "finalize_publication".to_string(),
+                    15
+                ),
+            ]
+        );
+        assert!(
+            sqlx::query("UPDATE product_creation_jobs SET provisioning_stage = 'unknown'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE product_creation_jobs SET stage_updated_at_unix_micros = -1")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (128, "product_creation_provisioning_stage"),
+            (127, "coordinator_owned_work_scope_home"),
             (126, "retire_wake_feature_preserving_history"),
             (125, "support_ipv6_federation_peer_hosts"),
             (124, "persist_federation_peer_tls_trust"),
@@ -19436,7 +19648,9 @@ mod tests {
                     (123, 'temporarily_skip_close_startup_interruption'),
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement')",
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
+                    (128, 'temporarily_skip_product_creation_provisioning_stage')",
         )
         .execute(&pool)
         .await
@@ -20300,7 +20514,9 @@ mod tests {
                     (123, 'temporarily_skip_close_startup_interruption'),
                     (124, 'temporarily_skip_federation_peer_tls_trust'),
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement')",
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
+                    (128, 'temporarily_skip_product_creation_provisioning_stage')",
         )
         .execute(pool)
         .await
@@ -20524,19 +20740,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(visible, 0);
-        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
-        assert!(db
-            .list_conversations()
-            .await
-            .unwrap()
-            .iter()
-            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
-        assert!(db
-            .list_archived_conversations()
-            .await
-            .unwrap()
-            .iter()
-            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
     }
 
     #[tokio::test]

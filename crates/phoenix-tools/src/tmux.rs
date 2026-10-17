@@ -85,7 +85,7 @@ use phoenix_core::domain::tool_wire::{TmuxErrorResponse, TmuxToolResponse};
 
 /// Pass-through tmux tool.
 ///
-/// Stateless dispatcher; per-conversation state lives in
+/// Stateless dispatcher; resource-scope state lives in
 /// [`TmuxRegistry`], reached through [`ToolContext::tmux`]. A single
 /// instance is registered once and reused across conversations
 /// (REQ-TMUX-013).
@@ -112,16 +112,14 @@ impl Tool for TmuxTool {
     }
 
     fn description(&self) -> String {
-        // Mirrors specs/tmux-integration/design.md §"Description
-        // Template", with the configured byte limit interpolated.
         let max_kb = TMUX_OUTPUT_MAX_BYTES / 1024;
         format!(
-            r#"Invokes tmux against this conversation's dedicated socket. The full tmux CLI
+            r#"Invokes tmux against the selected resource scope's socket. The full tmux CLI
 is available; provide the subcommand + flags as `args`.
 
-This conversation's tmux server is isolated from every other conversation
-and from any tmux server you may have running on the host: the socket path
-is fixed by Phoenix and cannot be overridden by passing -L or -S in args.
+Ordinary continuation transcripts retaining the same persisted WorkScope share
+its tmux server. Distinct persisted scopes and host tmux servers are separate:
+the socket path is fixed by Phoenix and cannot be overridden with -L or -S.
 If you do pass them, tmux will reject the duplicate server-selection flag
 with a usage error.
 

@@ -2,7 +2,8 @@
 -- Durable Conversation Creation: Behavioural Specification
 --
 -- Scope: request-bound durable acceptance, exclusive provisioning authority,
--- immutable starting-pin selection, atomic publication, retry and
+-- immutable starting-pin selection, hidden staging, durable objective delivery,
+-- atomic user-visible publication, retry and
 -- reconciliation, cancellation, and deletion cleanup.
 --
 -- Creation has no unresolved success outcome, no visible shell before publication,
@@ -29,7 +30,7 @@ config {
 
 enum CreationStatus {
     accepted | claimed | retry_scheduled | cancelling | cancelled
-    | deletion_pending | ready | failed | cleanup_ambiguous
+    | deletion_pending | delivery_pending | delivery_failed | ready | failed | cleanup_ambiguous
 }
 
 enum CreationStage {
@@ -61,11 +62,14 @@ entity CreationJob {
     creation_intent: String
     accepted_handle: String
 
-    claim_owner: CreationWorker when status = claimed
-    claim_token: String when status = claimed
-    lease_until: Timestamp when status = claimed
+    claim_owner: CreationWorker?
+    claim_token: String?
+    lease_until: Timestamp?
+    stage_updated_at: Timestamp
+    delivery_attempt: Integer
+    delivery_retry_at: Timestamp? when status = delivery_pending
     next_attempt_at: Timestamp when status = retry_scheduled
-    error_message: String when status = failed
+    error_message: String when status in { failed, delivery_failed }
 
     transitions status {
         accepted -> claimed
@@ -73,7 +77,7 @@ entity CreationJob {
         accepted -> deletion_pending
         claimed -> claimed
         claimed -> retry_scheduled
-        claimed -> ready
+        claimed -> delivery_pending
         claimed -> failed
         claimed -> cancelling
         claimed -> deletion_pending
@@ -81,6 +85,11 @@ entity CreationJob {
         retry_scheduled -> failed
         retry_scheduled -> cancelling
         retry_scheduled -> deletion_pending
+        delivery_pending -> delivery_pending
+        delivery_pending -> delivery_failed
+        delivery_pending -> ready
+        delivery_pending -> cancelling
+        delivery_failed -> delivery_pending
         cancelling -> cancelled
         cancelling -> deletion_pending
         cancelling -> cleanup_ambiguous
@@ -95,8 +104,38 @@ entity CreationJob {
     }
 
     invariant ClaimedGenerationCurrent {
-        status = claimed implies generation > 0
+        status in { claimed, delivery_pending } implies generation > 0
     }
+
+    invariant ClaimFieldsWhole {
+        (claim_owner = null and claim_token = null and lease_until = null)
+        or (claim_owner != null and claim_token != null and lease_until != null)
+    }
+
+    invariant ClaimRequiredForProvisioning {
+        status = claimed implies claim_owner != null
+    }
+
+    invariant ClaimOnlyForActiveWork {
+        claim_owner != null implies status in { claimed, delivery_pending }
+    }
+
+    invariant DeliveryAttemptBudgetBounded {
+        delivery_attempt >= 1 and delivery_attempt <= config.max_attempts
+    }
+}
+
+entity StagedAggregate {
+    job: CreationJob
+
+    invariant HiddenUntilReady {
+        job.status != ready implies hidden_from_normal_surfaces(job.conversation_id)
+    }
+}
+
+entity ObjectiveAcceptance {
+    job: CreationJob
+    fingerprint: String
 }
 
 entity StartingPin {
@@ -121,6 +160,11 @@ rule CreationAcceptedDurably {
         stage: validate_intent,
         attempt: 0,
         generation: 0,
+        claim_owner: null,
+        claim_token: null,
+        lease_until: null,
+        stage_updated_at: now(),
+        delivery_attempt: 1,
         creation_intent: creation_intent,
         accepted_handle: accepted_handle
     )
@@ -168,6 +212,7 @@ rule ExpiredClaimReconciledBeforeResume {
     when: WorkerReplacesExpiredClaim(worker, job)
 
     requires: job.status = claimed
+    requires: job.lease_until != null
     requires: job.lease_until <= now()
 
     ensures: ExternalStateInspectionRequested(worker, job, job.stage)
@@ -184,10 +229,13 @@ rule CurrentClaimAdvancesStage {
     requires: job.claim_owner = worker
     requires: job.claim_token = token
     requires: job.generation = generation
+    requires: job.lease_until != null
     requires: job.lease_until > now()
-    requires: job.stage != finalize_publication
+    requires: job.stage in { validate_intent, resolve_repository, resolve_starting_pin, materialize_worktree, finalize_attachments }
+    requires: job.stage_updated_at <= now()
 
     ensures: job.stage = next_creation_stage(job.stage)
+    ensures: job.stage_updated_at = now()
 }
 
 rule OriginDefaultStartingPinSelected {
@@ -229,25 +277,198 @@ rule StartingPinResolutionFailureIsRetryableAndNeverFallsBack {
     requires: not StartingPin.exists(job: job)
 
     ensures: job.status = retry_scheduled
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
     ensures: job.next_attempt_at = retry_deadline(job.attempt + 1)
     ensures: CreationSchedulerWakeRequested(job.next_attempt_at)
     ensures: NoFallbackBranchGuessed(job)
 }
 
-rule CurrentClaimCompletesCreation {
+-- REQ-CCR-002, REQ-CCR-006, REQ-CCR-006A
+rule CurrentClaimStagesWholeAggregate {
     when: ProvisioningStageSucceeded(job, worker, token, generation)
 
     requires: job.status = claimed
     requires: job.claim_owner = worker
     requires: job.claim_token = token
     requires: job.generation = generation
+    requires: job.lease_until != null
     requires: job.lease_until > now()
-    requires: job.stage = finalize_publication
+    requires: job.stage = commit_metadata
+    requires: job.stage_updated_at <= now()
     requires: WholePublicationFactsAvailable(job)
+    requires: not StagedAggregate.exists(job: job)
+
+    ensures: StagedAggregate.created(job: job)
+    ensures: job.status = delivery_pending
+    ensures: job.stage = bootstrap_initial_turn
+    ensures: job.stage_updated_at = now()
+    ensures: job.delivery_retry_at = now() + config.retry_delay_2
+    ensures: AggregateStagedAtomicallyButHidden(job.conversation_id)
+
+    @guidance
+        -- Keep the current claim for immediate delivery. Metadata, transcript,
+        -- usable WorkScope, and pin commit together, but normal conversation
+        -- surfaces and canonical navigation remain hidden until ready.
+}
+
+-- REQ-CCR-002, REQ-CCR-003, REQ-CCR-009
+rule EligibleDeliveryClaimed {
+    when: WorkerClaimsDelivery(worker, job, token, lease_until)
+
+    requires: job.status = delivery_pending
+    requires: job.delivery_retry_at = null or job.delivery_retry_at <= now()
+    requires: job.lease_until = null or job.lease_until <= now()
+
+    ensures: job.claim_owner = worker
+    ensures: job.claim_token = token
+    ensures: job.lease_until = lease_until
+    ensures: job.generation = job.generation + 1
+}
+
+rule LiveClaimHeartbeatRenewsLease {
+    when: ClaimHeartbeat(job, worker, token, generation)
+
+    requires: job.status in { claimed, delivery_pending }
+    requires: current_claim_matches(job, worker, token, generation)
+
+    ensures: job.lease_until = now() + config.claim_lease
+
+    @guidance
+        -- The worker renews while awaiting delivery work, including objective
+        -- expansion and enqueue. Renewal retains owner, token, and generation.
+        -- An expired lease cannot be revived by a heartbeat.
+}
+
+rule LostClaimHeartbeatStopsWork {
+    when: ClaimHeartbeat(job, worker, token, generation)
+
+    requires: job.status not in { claimed, delivery_pending }
+        or not current_claim_matches(job, worker, token, generation)
+
+    ensures: InFlightWorkDroppedWithoutLateEnqueue(job, generation)
+}
+
+-- REQ-CCR-006, REQ-CCR-007
+rule CurrentDeliveryClaimAcceptsObjectiveAtomically {
+    when: ObjectiveEnqueueRequested(job, worker, token, generation, fingerprint)
+
+    requires: job.status = delivery_pending
+    requires: job.stage = bootstrap_initial_turn
+    requires: current_claim_matches(job, worker, token, generation)
+    requires: StagedAggregate.exists(job: job)
+    requires: not ObjectiveAcceptance.exists(job: job)
+
+    ensures: ObjectiveAcceptance.created(job: job, fingerprint: fingerprint)
+    ensures: ObjectiveQueuedDurably(job.conversation_id, job.request_id)
+
+    @guidance
+        -- Validate the claim and exact accepted product/transcript identity,
+        -- persist the acceptance receipt, and enqueue under one write authority
+        -- shared with cancellation. Cancellation-first makes this rule
+        -- ineligible; enqueue-first makes cancellation ineligible. The receipt
+        -- survives queue drain and runtime consumption.
+}
+
+rule DuplicateObjectiveAcceptanceReplaysWithoutEnqueue {
+    when: ObjectiveEnqueueRequested(job, worker, token, generation, fingerprint)
+
+    requires: job.status = delivery_pending
+    requires: current_claim_matches(job, worker, token, generation)
+    requires: ObjectiveAcceptance.exists(job: job)
+    requires: ObjectiveAcceptance{job: job}.fingerprint = fingerprint
+
+    ensures: ObjectiveAcceptanceReplayedWithoutDuplicate(job.request_id)
+}
+
+rule StaleDeliveryEnqueueRejected {
+    when: ObjectiveEnqueueRequested(job, worker, token, generation, fingerprint)
+
+    requires: job.status != delivery_pending
+        or not current_claim_matches(job, worker, token, generation)
+
+    ensures: ObjectiveEnqueueRejectedWithoutReceiptOrQueueMutation(job.request_id)
+}
+
+-- REQ-CCR-002, REQ-CCR-006A
+rule CurrentDeliveryClaimCompletesCreation {
+    when: DeliveryCompletionRequested(job, worker, token, generation, fingerprint)
+
+    requires: job.status = delivery_pending
+    requires: job.stage = bootstrap_initial_turn
+    requires: job.stage_updated_at <= now()
+    requires: current_claim_matches(job, worker, token, generation)
+    requires: ObjectiveAcceptance.exists(job: job)
+    requires: ObjectiveAcceptance{job: job}.fingerprint = fingerprint
+    requires: delivery_target_open_and_admissible(job)
 
     ensures: job.status = ready
+    ensures: job.stage = finalize_publication
+    ensures: job.stage_updated_at = now()
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
     ensures: ConversationCreationPublishedAtomically(job.conversation_id)
-    ensures: ObjectiveOrNavigationQueuedAfterPublication(job.conversation_id)
+    ensures: CanonicalNavigationAvailable(job.conversation_id)
+
+    @guidance
+        -- An exact durable receipt permits completion after takeover without
+        -- re-expansion or re-enqueue. Ready corresponds to persisted published
+        -- status; only this boundary exposes the staged aggregate normally.
+}
+
+-- REQ-CCR-004, REQ-CCR-009
+rule DeliveryFailureSchedulesRetry {
+    when: ObjectiveDeliveryFailed(job, worker, token, generation, error_message)
+
+    requires: job.status = delivery_pending
+    requires: current_claim_matches(job, worker, token, generation)
+    requires: job.delivery_attempt < config.max_attempts
+
+    ensures: job.delivery_attempt = job.delivery_attempt + 1
+    ensures: job.delivery_retry_at = retry_deadline(job.delivery_attempt + 1)
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
+    ensures: DeliveryErrorPreserved(job.request_id, error_message)
+    ensures: CreationSchedulerWakeRequested(job.delivery_retry_at)
+}
+
+rule DeliveryRetryBudgetExhausted {
+    when: ObjectiveDeliveryFailed(job, worker, token, generation, error_message)
+
+    requires: job.status = delivery_pending
+    requires: current_claim_matches(job, worker, token, generation)
+    requires: job.delivery_attempt >= config.max_attempts
+
+    ensures: job.status = delivery_failed
+    ensures: job.error_message = error_message
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
+    ensures: StagedAggregateRetainedForDeliveryRetry(job.conversation_id)
+}
+
+rule UserRetriesFailedDelivery {
+    when: UserRetriesDelivery(user, job)
+
+    requires: job.status = delivery_failed
+    requires: delivery_target_open_and_admissible(job)
+
+    ensures: job.status = delivery_pending
+    ensures: job.delivery_attempt = 1
+    ensures: job.delivery_retry_at = now()
+    ensures: CreationSchedulerWakeRequested(job.delivery_retry_at)
+    ensures: ExistingAggregateAndObjectiveIdentityReused(job.conversation_id, job.request_id)
+}
+
+rule IneligibleDeliveryRetryRejected {
+    when: UserRetriesDelivery(user, job)
+
+    requires: job.status != delivery_failed or not delivery_target_open_and_admissible(job)
+
+    ensures: DeliveryRetryRejectedWithoutMutation(job.request_id)
 }
 
 rule PartialPublicationForbidden {
@@ -265,6 +486,7 @@ rule StaleClaimResultRejected {
         or job.claim_owner != worker
         or job.claim_token != token
         or job.generation != generation
+        or job.lease_until = null
         or job.lease_until <= now()
 
     ensures: ProvisioningResultRejectedAsStale(job, generation)
@@ -279,10 +501,14 @@ rule TransientFailureSchedulesRetry {
     requires: job.claim_owner = worker
     requires: job.claim_token = token
     requires: job.generation = generation
+    requires: job.lease_until != null
     requires: job.lease_until > now()
     requires: job.attempt < config.max_attempts
 
     ensures: job.status = retry_scheduled
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
     ensures: job.next_attempt_at = retry_deadline(job.attempt + 1)
     ensures: CreationSchedulerWakeRequested(job.next_attempt_at)
 }
@@ -297,6 +523,9 @@ rule RetryBudgetExhaustedFailsCreation {
     requires: job.attempt >= config.max_attempts
 
     ensures: job.status = failed
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
     ensures: job.error_message = error_message
 }
 
@@ -309,6 +538,9 @@ rule PermanentFailureFailsCreation {
     requires: job.generation = generation
 
     ensures: job.status = failed
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
     ensures: job.error_message = error_message
 }
 
@@ -316,16 +548,48 @@ rule CreationCancellationRevokesAuthority {
     when: UserCancelsCreation(user, job)
 
     requires: job.status in { accepted, claimed, retry_scheduled }
+        or (job.status = delivery_pending and cancellable_hidden_aggregate(job))
+    requires: not ObjectiveAcceptance.exists(job: job)
 
     ensures: job.generation = job.generation + 1
     ensures: job.status = cancelling
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
     ensures: ResourceReconciliationRequested(job)
+
+    @guidance
+        -- REQ-CCR-007: Recheck durable acceptance under the same write authority
+        -- as objective enqueue, then revoke claims and transfer owned resource
+        -- reservations to the cleanup generation in that transaction.
+}
+
+rule AcceptedObjectiveExcludesCreationCancellation {
+    when: UserCancelsCreation(user, job)
+
+    requires: ObjectiveAcceptance.exists(job: job)
+
+    ensures: CreationCancellationRejectedWithoutMutation(job.request_id)
+}
+
+rule CancelledHiddenAggregateRemoved {
+    when: HiddenAggregateCleanupRequested(job)
+
+    requires: job.status in { cancelling, deletion_pending }
+    requires: StagedAggregate.exists(job: job)
+    requires: safely_owned_hidden_aggregate(job)
+    requires: not ObjectiveAcceptance.exists(job: job)
+
+    ensures: not StagedAggregate.exists(job: job)
+    ensures: HiddenProductTranscriptAndWorkScopeRemovedAtomically(job.conversation_id)
+    ensures: SelectedUnownedWorkingDirectoryPreserved(job.request_id)
 }
 
 rule CancelledCreationPreserved {
     when: ResourceReconciliationCompleted(job)
 
     requires: job.status = cancelling
+    requires: not StagedAggregate.exists(job: job)
 
     ensures: job.status = cancelled
     ensures: CancelledCreationVisible(job.request_id, job.creation_intent)
@@ -338,6 +602,9 @@ rule CreationDeletionHidesImmediately {
 
     ensures: job.generation = job.generation + 1
     ensures: job.status = deletion_pending
+    ensures: job.claim_owner = null
+    ensures: job.claim_token = null
+    ensures: job.lease_until = null
     ensures: CreationHiddenFromNormalSurfaces(job.request_id)
     ensures: ResourceReconciliationRequested(job)
 }
@@ -346,6 +613,7 @@ rule DeletionCompletesAfterReconciliation {
     when: ResourceReconciliationCompleted(job)
 
     requires: job.status = deletion_pending
+    requires: not StagedAggregate.exists(job: job)
 
     ensures: CreationTombstoneDeletionRequested(job)
 }
@@ -370,14 +638,25 @@ surface CreationControls {
 
     exposes:
         job.status
-        job.creation_intent when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed, cleanup_ambiguous }
+        job.creation_intent when job.status in { accepted, claimed, retry_scheduled, delivery_pending, delivery_failed, cancelling, cancelled, failed, cleanup_ambiguous }
+        job.error_message when job.status in { failed, delivery_failed }
 
     provides:
         StructurallyValidCreationRequested(request_id, conversation_id, creation_intent, accepted_handle)
         UserCancelsCreation(user, job)
-            when job.status in { accepted, claimed, retry_scheduled }
+            when job.status in { accepted, claimed, retry_scheduled, delivery_pending }
+        UserRetriesDelivery(user, job)
+            when job.status = delivery_failed and delivery_target_open_and_admissible(job)
         UserDeletesCreation(user, job)
             when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed, cleanup_ambiguous }
+}
+
+surface ReadyConversationNavigation {
+    facing user: CreationUser
+    context job: CreationJob
+
+    exposes:
+        job.conversation_id when job.status = ready
 }
 
 ------------------------------------------------------------
@@ -391,3 +670,24 @@ surface CreationControls {
 -- user-visible fact required for one atomic publication outcome.
 -- StartingPinImmutable(job) asserts that an already-created StartingPin row is
 -- never rewritten by retries, replacement claims, or stale results.
+-- current_claim_matches(job, worker, token, generation) requires non-null
+-- claim fields matching that worker/token/generation and a lease strictly later
+-- than the persistence clock sampled under write authority. It is false for a
+-- cancelled, replaced, released, or expired claim.
+-- hidden_from_normal_surfaces(conversation_id) excludes normal list, route,
+-- transcript, and navigation exposure; exact-request recovery remains visible.
+-- cancellable_hidden_aggregate(job) requires the reserved ProductConversation
+-- and staged transcript identities to agree, one archived user root with no
+-- parent or sibling transcript, ordinary Open lifecycle, and no durable input
+-- acceptance receipt for that transcript. It never treats an empty queue as
+-- absence of acceptance.
+-- safely_owned_hidden_aggregate(job) additionally proves the exact WorkScope
+-- attachment, no other owners/transcripts/children sharing the scope, and no
+-- other scope attachments. Cleanup rechecks this under write authority after
+-- all owned resource reservations are released; mismatch is non-destructive.
+-- delivery_target_open_and_admissible(job) requires the existing ordinary Open
+-- product and no unfinished or close-incomplete Close obligation. A failed
+-- delivery exposes only retry_delivery when this holds, otherwise no action;
+-- it never exposes creation Delete or Start over. Pending delivery exposes
+-- only Cancel; the cancellation transaction rechecks receipt and ownership
+-- eligibility, so advertised Cancel is not authority after acceptance.

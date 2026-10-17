@@ -1,4 +1,4 @@
-# ADR-100: Web history selects original boundary messages
+# ADR-116: Web history selects original boundary messages
 
 - **Status:** Accepted
 - **Date:** 2026-10-12

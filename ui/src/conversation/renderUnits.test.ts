@@ -32,6 +32,7 @@ function assertAgentTurn(u: HistoricalUnit | undefined): AgentTurnUnit {
 
 function userMsg(id: string, text = 'hi'): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 0,
     conversation_id: 'c1',
@@ -43,6 +44,7 @@ function userMsg(id: string, text = 'hi'): Message {
 
 function agentMsg(id: string, blocks: ContentBlock[] = []): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 0,
     conversation_id: 'c1',
@@ -62,6 +64,7 @@ function toolMsg(
   result = 'ok',
 ): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 0,
     conversation_id: 'c1',
@@ -76,6 +79,7 @@ function toolMsg(
 
 function systemMsg(id: string, text?: string): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 0,
     conversation_id: 'c1',
@@ -87,6 +91,7 @@ function systemMsg(id: string, text?: string): Message {
 
 function skillMsg(id: string): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 0,
     conversation_id: 'c1',
@@ -646,6 +651,7 @@ describe('buildRenderUnits', () => {
 
     it('emits typed continuation history visibly', () => {
       const m: Message = {
+        event_presentation: null,
         message_id: 'x1',
         sequence_id: 0,
         conversation_id: 'c1',
@@ -671,6 +677,7 @@ describe('buildRenderUnits', () => {
 
   it('uses the legacy `type` field when `message_type` is absent', () => {
     const m = {
+      event_presentation: null,
       message_id: 'legacy1',
       sequence_id: 0,
       conversation_id: 'c1',

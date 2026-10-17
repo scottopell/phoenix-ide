@@ -1,4 +1,5 @@
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
+import { conversationGroundingContext } from './FileExplorer/groundingContext';
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
 import {
@@ -248,10 +249,13 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
   const routeSlug = slugMatch?.[1] ?? null;
   const productConversationId = productMatch?.[1] ?? routeSlug;
-  const activeSlug = useDesktopRouteOwner(productConversationId, routeSlug, location.search);
+  const ordinaryActiveSlug = useDesktopRouteOwner(productConversationId, routeSlug, location.search);
+  const globalMatch = location.pathname.match(/^\/global\/([^/?#]+)/);
+  const activeSlug = globalMatch?.[1] ?? ordinaryActiveSlug;
   const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
+  const grounding = conversationGroundingContext(activeConversation, globalMatch !== null);
 
   useEffect(() => {
     setActiveNotificationConversationSlug(activeSlug);
@@ -337,6 +341,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             collapsed={fileExplorerPane.collapsed}
             onToggle={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
             rootPath={effectiveCwd}
+            grounding={grounding}
             conversationId={activeConversation?.id}
             showToast={showSuccess}
             showError={showError}

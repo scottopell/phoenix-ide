@@ -3,6 +3,7 @@ import type { MessageListFixtureData, MessageListScenario } from './types';
 
 const baseMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'user-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 1,
@@ -13,6 +14,7 @@ const baseMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'agent-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 2,
@@ -23,6 +25,7 @@ const baseMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'user-2',
     conversation_id: 'fixture-message-list',
     sequence_id: 3,
@@ -33,6 +36,7 @@ const baseMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'agent-2',
     conversation_id: 'fixture-message-list',
     sequence_id: 4,
@@ -45,6 +49,7 @@ const baseMessages: Message[] = [
 ];
 export const compactChronologyInitialMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'chronology-user-1',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 1,
@@ -55,6 +60,7 @@ export const compactChronologyInitialMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'chronology-agent-a',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 2,
@@ -67,6 +73,7 @@ export const compactChronologyInitialMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'chronology-result-a',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 3,
@@ -80,6 +87,7 @@ export const compactChronologyInitialMessages: Message[] = [
 
 export const compactChronologyAppendMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'chronology-agent-bc',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 4,
@@ -96,6 +104,7 @@ export const compactChronologyAppendMessages: Message[] = [
 
 export const compactChronologyCompletionMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'chronology-result-b',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 5,
@@ -106,6 +115,7 @@ export const compactChronologyCompletionMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'chronology-result-c',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 6,
@@ -119,6 +129,7 @@ export const compactChronologyCompletionMessages: Message[] = [
 
 export const compactChronologyFinalMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'chronology-agent-final',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 7,
@@ -132,6 +143,7 @@ export const compactChronologyFinalMessages: Message[] = [
 
 const toolStripMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'user-tool-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 1,
@@ -142,6 +154,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'agent-tool-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 2,
@@ -162,6 +175,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'tool-result-bash',
     conversation_id: 'fixture-message-list',
     sequence_id: 3,
@@ -172,6 +186,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'tool-result-read-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 4,
@@ -182,6 +197,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'tool-result-search-2',
     conversation_id: 'fixture-message-list',
     sequence_id: 5,
@@ -192,6 +208,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'tool-result-read-2',
     conversation_id: 'fixture-message-list',
     sequence_id: 6,
@@ -202,6 +219,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'tool-result-bash',
     conversation_id: 'fixture-message-list',
     sequence_id: 7,
@@ -212,6 +230,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'tool-result-patch',
     conversation_id: 'fixture-message-list',
     sequence_id: 8,
@@ -222,6 +241,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'user-tool-2',
     conversation_id: 'fixture-message-list',
     sequence_id: 9,
@@ -232,6 +252,7 @@ const toolStripMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'agent-tool-2',
     conversation_id: 'fixture-message-list',
     sequence_id: 10,
@@ -247,6 +268,7 @@ const scrollPolicyMessages: Message[] = Array.from({ length: 80 }, (_, index) =>
   const sequenceId = index + 1;
   const isUser = index % 2 === 0;
   return {
+    event_presentation: null,
     message_id: `scroll-policy-${sequenceId}`,
     conversation_id: 'fixture-message-list-scroll-policy',
     sequence_id: sequenceId,
@@ -265,6 +287,7 @@ const scrollPolicyMessages: Message[] = Array.from({ length: 80 }, (_, index) =>
 
 const markdownImageMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'user-image-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 1,
@@ -275,6 +298,7 @@ const markdownImageMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'agent-image-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 2,
@@ -297,6 +321,7 @@ const markdownImageMessages: Message[] = [
 
 const wideMarkdownTableMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'user-wide-table-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 1,
@@ -307,6 +332,7 @@ const wideMarkdownTableMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'agent-wide-table-1',
     conversation_id: 'fixture-message-list',
     sequence_id: 2,
@@ -339,6 +365,7 @@ const continuityParagraphs = Array.from({ length: 28 }, (_, index) => (
 
 const prefixContinuityMessages: Message[] = [
   {
+    event_presentation: null,
     message_id: 'continuity-user-anchor',
     conversation_id: 'fixture-message-list-prefix-continuity',
     sequence_id: 101,
@@ -349,6 +376,7 @@ const prefixContinuityMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'continuity-agent-anchor',
     conversation_id: 'fixture-message-list-prefix-continuity',
     sequence_id: 102,
@@ -359,6 +387,7 @@ const prefixContinuityMessages: Message[] = [
     display_data: {},
   },
   {
+    event_presentation: null,
     message_id: 'continuity-user-tail',
     conversation_id: 'fixture-message-list-prefix-continuity',
     sequence_id: 103,
@@ -371,6 +400,7 @@ const prefixContinuityMessages: Message[] = [
 ];
 
 export const prefixContinuityEarlierMessages: Message[] = Array.from({ length: 18 }, (_, index) => ({
+  event_presentation: null,
   message_id: `continuity-prefix-${index + 1}`,
   conversation_id: 'fixture-message-list-prefix-continuity',
   sequence_id: index + 1,

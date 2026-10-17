@@ -70,7 +70,7 @@ function skill(name: string, source: string, path: string): SkillEntry {
   return { name, description: `${name} description`, source, path };
 }
 
-function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, collapsed = false, executionCapable?: boolean) {
+function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, collapsed = false, executionCapable?: boolean, coordinatorHome = false) {
   return render(
     <MemoryRouter initialEntries={['/c/slug']}>
       <ConversationProvider>
@@ -79,7 +79,8 @@ function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, col
             <FileExplorerPanel
               collapsed={collapsed}
               onToggle={() => {}}
-              rootPath="/repo"
+              rootPath={coordinatorHome ? "/data/coordinator" : "/repo"}
+              grounding={coordinatorHome ? { kind: "coordinator_home", workScopeId: "owned-home" } : { kind: 'ordinary' }}
               conversationId={conversationId}
               showToast={() => {}}
               showError={() => {}}
@@ -339,5 +340,23 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     const skillsHeader = screen.getByRole('button', { name: /Skills/ });
     expect(skillsHeader).toHaveAttribute('aria-expanded', 'false');
     expect(within(skillsHeader).getByText('Skills')).toBeInTheDocument();
+  });
+});
+
+
+describe('Coordinator home grounding', () => {
+  it('shows server home and explicit scope, browses files without project/retirement/Git authority', async () => {
+    renderPanel('global', false, false, false, true);
+    expect(screen.getByText('Coordinator home')).toBeInTheDocument();
+    expect(screen.getByText('/data/coordinator')).toBeInTheDocument();
+    expect(screen.getByText('Scope: owned-home')).toBeInTheDocument();
+    expect(screen.getByTestId('file-tree')).toBeInTheDocument();
+    expect(screen.queryByTestId('work-scope')).not.toBeInTheDocument();
+    expect(screen.queryByText('Tasks')).not.toBeInTheDocument();
+    expect(screen.queryByText('Git')).not.toBeInTheDocument();
+    expect(screen.queryByText('no branch')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh file tree' }));
+    expect(api.getConversationGitStatus).not.toHaveBeenCalled();
+    expect(api.getConversationTaskCount).not.toHaveBeenCalled();
   });
 });

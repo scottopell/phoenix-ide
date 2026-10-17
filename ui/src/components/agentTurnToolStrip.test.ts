@@ -5,6 +5,7 @@ import { isSignificantText, SIGNIFICANCE_THRESHOLD } from '../hooks/useDensity';
 
 function agentMessage(content: unknown): Message {
   return {
+    event_presentation: null,
     message_id: 'm1',
     message_type: 'agent',
     content,
@@ -13,6 +14,7 @@ function agentMessage(content: unknown): Message {
 
 function toolResult(toolUseId: string, opts: { isError?: boolean; content?: string } = {}): Message {
   return {
+    event_presentation: null,
     message_id: `r-${toolUseId}`,
     message_type: 'tool',
     content: {

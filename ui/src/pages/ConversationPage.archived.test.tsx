@@ -73,7 +73,7 @@ function makeConnectionInit(conversation: Conversation): InitPayload {
   return {
     conversation,
     messages: [{ ...historyMessage, conversation_id: conversation.id }],
-    steeringMessages: [],
+    opening: null, steeringMessages: [],
     phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
@@ -218,6 +218,7 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
 }
 
 const historyMessage: Message = {
+  event_presentation: null,
   message_id: 'm1',
   sequence_id: 1,
   conversation_id: conversationId,
@@ -227,6 +228,7 @@ const historyMessage: Message = {
 };
 
 const catchUpMessage: Message = {
+  event_presentation: null,
   message_id: 'm2',
   sequence_id: 2,
   conversation_id: conversationId,

@@ -20,6 +20,7 @@ describe('ConversationNav input provenance', () => {
   it('keeps the latest real prompt navigable across event bursts and reload', () => {
     const units: HistoricalUnit[] = ['human', 'event-1', 'event-2'].map((id, index) => ({
       kind: 'user', key: id, message: {
+        event_presentation: null,
         message_id: id, conversation_id: 'continued-transcript', sequence_id: index + 1,
         message_type: 'user', content: { text: index === 0 ? 'Conversation event quoted by a human' : 'Watch notification' },
         created_at: '', origin: index === 0 ? { kind: 'user_api' } : { kind: 'subscription_event', event_id: id },
@@ -78,7 +79,7 @@ describe('aggregate boundary navigation', () => {
     expect(boundaryJump).toHaveBeenLastCalledWith('exact-continuation');
     const loaded = buildConversationChapters([{ kind: 'continuation', key: 'exact-continuation', message: {
       message_id: 'exact-continuation', conversation_id: 'predecessor', sequence_id: 42,
-      message_type: 'continuation', content: { summary: 'summary stays in the transcript disclosure' }, created_at: '',
+      message_type: 'continuation', content: { summary: 'summary stays in the transcript disclosure' }, created_at: '', event_presentation: null,
     } }]);
     rerender(<ConversationNav chapters={loaded} activeUnitIndex={0} onJump={jump} historyBoundaries={[boundary]} onJumpBoundary={boundaryJump} />);
     expect(screen.getAllByRole('button')).toHaveLength(1);

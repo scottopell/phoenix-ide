@@ -273,23 +273,24 @@ result alone is insufficient. Cap of 5 matches the ring buffer capacity.
 
 ### REQ-TERM-012: Terminal Torn Down with WorkScope
 
-WHEN a conversation or workspace is cleaned up by the resource-cleanup cascade
-AND a terminal session is active for its opaque persisted WorkScope identity
-AND no other live conversation owns that same `work_scope_id`
-THE SYSTEM SHALL close the master fd
-AND the terminal session SHALL be torn down
+WHEN an ordinary transcript becomes ContextExhausted or HandedOff
+THE SYSTEM SHALL retain its persisted WorkScope terminal, PTY, attachment identity and command tracker
+AND SHALL allow its continuation to reclaim that same terminal without a respawn, including Direct/non-Git conversations.
 
-WHEN the active scope is `WorkScope::Global`
-THE SYSTEM SHALL NOT tear the terminal down on any conversation or worktree
-lifecycle event
-AND the terminal SHALL persist for the lifetime of the Phoenix process
+WHEN an individual execution-row cleanup occurs without retiring the ProductConversation
+THE SYSTEM SHALL retain the terminal while another member retains its exact scope under the persisted ownership policy.
 
-**Rationale:** Generalises the original "terminal dies with conversation" rule
-to a per-`WorkScope` lifecycle. Conversation-scoped terminals retain the
-original behaviour; worktree-scoped terminals inherit the tmux preservation
-cascade (REQ-TMUX-WS-002) so continuations keep their REPL state intact;
-global terminals exist outside any conversation and are only torn down by
-explicit user close (REQ-TERM-008) or process exit.
+WHEN a ProductConversation's durable Close/Delete retirement cleans its WorkScope
+THE SYSTEM SHALL close the master fd and retire the terminal through scope-owned cleanup
+AND SHALL NOT allow continuation or subordinate rows belonging to that same aggregate to veto retirement
+AND SHALL preserve only a distinct still-Open aggregate owner's scope, surfacing identity conflicts instead of guessing ownership.
+
+WHEN an unattached conversation fallback terminal has no persisted WorkScope
+THE SYSTEM SHALL apply its conversation lifecycle teardown rather than promote it to a shared ordinary scope.
+
+WHEN the active scope is Global
+THE SYSTEM SHALL NOT tear the terminal down on any conversation or worker-worktree lifecycle event
+AND SHALL retain it for the Phoenix process lifetime unless explicitly closed by its user.
 
 ---
 

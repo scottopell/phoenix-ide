@@ -3,7 +3,7 @@
 --
 -- Tmux Integration: Behavioural Specification
 --
--- Scope: per-conversation tmux server lifecycle, the `tmux` and `tmux_run`
+-- Scope: persisted-WorkScope tmux server lifecycle, the `tmux` and `tmux_run`
 -- agent tools, and the in-app terminal's tmux-attach behaviour when the
 -- binary is available.
 --
@@ -24,16 +24,10 @@
 --     and the direct-PTY fallback. Multi-attach is deferred to a future
 --     revision.
 --
--- Socket-path keying (task 03001):
---   Work, Branch, and managed (top-level) Explore conversations key the
---   socket to the worktree path (wt-{hash(worktree_path)}.sock) so
---   continuations automatically share the same tmux session — the
---   worktree IS the coding environment.
---   Direct-mode conversations key the socket to the conversation_id
---   (conv-{id}.sock) as a fallback (no worktree to anchor to).
---   Sub-agents are excluded from tmux access entirely (task 03001),
---   so the question of socket keying for sub-agent Explore does not
---   arise: ConvMode::Explore.worktree_path is None for sub-agents.
+-- Ordinary socket-path keying uses the opaque persisted WorkScope ID,
+-- including Direct/non-Git transcripts. Continuations retain that exact key.
+-- Unattached fallback, Coordinator and GlobalTerminal identities remain
+-- separate. Sub-agents do not gain tmux capability from their scope attachment.
 --
 -- Requirement traceability: REQ-TMUX-001 through REQ-TMUX-014
 -- Dependencies: specs/bedrock/bedrock.allium
@@ -44,9 +38,9 @@ use "../bedrock/bedrock.allium" as bedrock
 -- Actor Declarations
 ------------------------------------------------------------
 
--- The agent that calls the tmux tool. Identity scoping by conversation
--- mirrors specs/bash/bash.allium: the registry lookup is conversation-
--- keyed, so the agent can only address its own conversation's server.
+-- The requesting transcript identifies the actor. Its attached persisted
+-- WorkScope identifies the ordinary tmux server, shared across continuations;
+-- actor identity alone does not grant a different scope's resource authority.
 actor LlmAgent {
     identified_by: bedrock/Conversation
 }
@@ -71,12 +65,11 @@ external entity TmuxBinary {
         -- equivalent; cached on the registry.
 }
 
--- The Unix-domain socket the tmux server binds. Filesystem path is
--- keyed to the worktree path for Work/Branch/top-level-Explore conversations
--- (~/.phoenix-ide/tmux-sockets/wt-{hash}.sock, task 03001) and to
--- conversation_id for Direct mode (conv-<id>.sock). Phoenix's role is
--- creating the directory, unlinking stale files on detection, and deleting
--- the file on conversation hard-delete.
+-- The Unix-domain socket the tmux server binds. Ordinary socket identity
+-- hashes the persisted WorkScope ID (wt-<digest>.sock), not a worktree path
+-- or transcript ID. Unattached conversation fallback, Coordinator and Global
+-- terminal identities are separate. File removal requires the owning cleanup
+-- authority; a single continued transcript does not own the shared socket.
 external entity TmuxSocketFile {
     path: String
 }
@@ -180,6 +173,7 @@ enum TmuxRunReadinessMode {
 -- registries, task 03001).
 entity TmuxServer {
     conversation: bedrock/Conversation
+    work_scope_id: String
 
     -- Lifecycle state.
     status: ServerStatus
@@ -190,15 +184,8 @@ entity TmuxServer {
         terminal: gone
     }
 
-    -- The socket file path. Keyed to the worktree path for Work, Branch,
-    -- and managed (top-level) Explore conversations
-    -- (wt-{hash(worktree_path)}.sock) so that context-exhaustion
-    -- continuations automatically share the same session.
-    -- Keyed to conversation_id for Direct-mode conversations (no worktree).
-    -- Sub-agent Explore conversations have no worktree (and no tmux access
-    -- per task 03001), so they never produce a TmuxServer entity.
-    -- Computed once at entry creation and stable for the entity's lifetime.
-    -- (task 03001)
+    -- Ordinary servers are keyed by persisted scope identity; the requesting
+    -- conversation is an actor association, not the registry lookup authority.
     socket_path: String
 }
 
@@ -237,12 +224,13 @@ rule ServerSpawnedLazily {
 
     requires: tmux_binary_available()
     requires: probe_socket(conversation) = no_socket
-    requires: not exists TmuxServer{conversation: conversation}
+    requires: not exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
-    let path = socket_path_for(conversation)
+    let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxServer.created(
         conversation: conversation,
+        work_scope_id: attached_work_scope_id(conversation),
         status:       live,
         socket_path:  path
     )
@@ -279,11 +267,12 @@ rule ServerSpawnedAfterStale {
     requires: tmux_binary_available()
     requires: probe_socket(conversation) = dead_socket
 
-    let path = socket_path_for(conversation)
+    let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: SocketFileUnlinked(path)
     ensures: TmuxServer.created(
         conversation: conversation,
+        work_scope_id: attached_work_scope_id(conversation),
         status:       live,
         socket_path:  path
     )
@@ -305,12 +294,13 @@ rule ServerProbedLive {
 
     requires: tmux_binary_available()
     requires: probe_socket(conversation) = live
-    requires: not exists TmuxServer{conversation: conversation}
+    requires: not exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
-    let path = socket_path_for(conversation)
+    let path = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxServer.created(
         conversation: conversation,
+        work_scope_id: attached_work_scope_id(conversation),
         status:       live,
         socket_path:  path
     )
@@ -351,8 +341,8 @@ rule TmuxToolCalled {
     ensures: TmuxOperationRequested(conversation)
         -- Triggers the lifecycle rules; one of them ensures status=live
         -- by the time TmuxSubprocessSpawned fires below.
-    ensures: TmuxSubprocessSpawned(socket_path_for(conversation), args, wait_seconds)
-    ensures: TmuxToolResponseShaped(conversation, socket_path_for(conversation), args)
+    ensures: TmuxSubprocessSpawned(socket_path_for_scope(attached_work_scope_id(conversation)), args, wait_seconds)
+    ensures: TmuxToolResponseShaped(conversation, socket_path_for_scope(attached_work_scope_id(conversation)), args)
 
     @guidance
         -- Phoenix prepends `-S <sock>` before `args`. Tmux's CLI parser
@@ -443,7 +433,7 @@ rule TmuxRunToolCalled {
     requires: readiness_mode = return_immediately or readiness_mode = wait_for_text
 
     let file_root = effective_file_root_for(conversation)
-    let socket = socket_path_for(conversation)
+    let socket = socket_path_for_scope(attached_work_scope_id(conversation))
 
     ensures: TmuxOperationRequested(conversation)
     ensures: TmuxRunWindowCreated(
@@ -652,13 +642,13 @@ rule ServerKilledByConversationDelete {
     let work_scope = resolve_work_scope(conversation)
 
     requires: inheritor_scope != Some(work_scope)
-    requires: exists TmuxServer{conversation: conversation}
-    let server = TmuxServer{conversation: conversation}
+    requires: exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
+    let server = TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
     requires: server.status != gone
 
     ensures: TmuxServerKilled(server.socket_path)
     ensures: SocketFileUnlinked(server.socket_path)
-    ensures: not exists TmuxServer{conversation: conversation}
+    ensures: not exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
     @guidance
         -- Runs synchronously in the conversation hard-delete handler,
@@ -683,13 +673,13 @@ rule ServerPreservedForLiveOwner {
     let work_scope = resolve_work_scope(conversation)
 
     requires: inheritor_scope = Some(work_scope)
-    requires: exists TmuxServer{conversation: conversation}
-    let server = TmuxServer{conversation: conversation}
+    requires: exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
+    let server = TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
     ensures: not TmuxServerKilled(server.socket_path)
         -- The server keeps running for the surviving owner; the socket file
         -- is not unlinked.
-    ensures: exists TmuxServer{conversation: conversation}
+    ensures: exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
         -- The shared registry entry is left intact. The work-scope inventory
         -- must keep reporting the still-live server — dropping the entry would
         -- show "no tmux server" for a running session until a later
@@ -716,23 +706,17 @@ rule ServerPreservedForLiveOwner {
 -- Invariants
 ------------------------------------------------------------
 
--- REQ-TMUX-001
+-- REQ-TMUX-001: ordinary resource identity is the persisted scope, not the
+-- environment path, mode or transcript. Unattached/Coordinator/global resource
+-- identities use their separate routing contracts, not this ordinary scope rule.
 invariant SocketPathDeterministic {
     for s in TmuxServer:
-        -- Owns a worktree (Work/Branch/top-level Explore):
-        --   socket_path = wt-{hash(worktree_path)}.sock
-        -- No own worktree (Direct, sub-agent Explore):
-        --   socket_path = conv-{conversation_id}.sock
-        -- The split is on the persisted ConvMode.worktree_path(), not on
-        -- "managed vs Direct": a sub-agent Explore is managed but has no
-        -- worktree of its own, so it keys to its conversation scope.
-        s.socket_path = socket_path_for(s.conversation)
+        s.socket_path = socket_path_for_scope(s.work_scope_id)
 }
 
--- REQ-TMUX-001
-invariant OneServerPerConversation {
-    for c in bedrock/Conversation:
-        count(TmuxServer{conversation: c, status: live}) <= 1
+invariant OneServerPerWorkScope {
+    for server in TmuxServer:
+        count(TmuxServer{work_scope_id: server.work_scope_id, status: live}) <= 1
 }
 
 -- REQ-TMUX-007
@@ -769,9 +753,9 @@ surface AgentTmuxAccess {
             and (readiness_mode = return_immediately or readiness_mode = wait_for_text)
 
     @guarantee SocketIsolation
-        -- The agent's tmux invocations cannot reach another conversation's
-        -- tmux server, the user's host tmux server, or any other tmux
-        -- instance not owned by Phoenix. Mechanism: `-S <conv-sock>` is
+        -- Ordinary continuation transcripts retaining a scope share its server.
+        -- The selected scope cannot reach another scope's tmux server or the
+        -- user's host tmux server. Mechanism: `-S <scope-sock>` is
         -- prepended by Phoenix and the kernel-level Unix-socket boundary
         -- prevents reaching foreign tmux servers regardless of the agent's
         -- arguments. An agent's stray `-L` or `-S` triggers a tmux usage
@@ -885,3 +869,15 @@ deferred TmuxSocketRelocation    -- see: src/tools/tmux/registry.rs
 --     `Result<Arc<RwLock<TmuxServer>>, TmuxError>` matching the existing
 --     `ctx.browser()` and the `ctx.bash_handles()` defined in
 --     specs/bash/.
+
+
+-- Black-box identity helpers used by ordinary tmux lifecycle rules:
+-- attached_work_scope_id(conversation) -> String is the exact persisted
+-- attachment on the selected ordinary execution transcript. It is not selected
+-- from an unordered product ownership set and is not derived from cwd or mode.
+-- socket_path_for_scope(work_scope_id) -> String joins the configured socket
+-- directory with wt-<digest>.sock, digest = first eight SHA-256 bytes of the
+-- opaque scope ID as sixteen lowercase hex digits. Pure and deterministic;
+-- it performs no filesystem discovery, migration, fallback or ownership grant.
+-- Unattached conversation, Coordinator and Global terminal routing are outside
+-- these ordinary identity helpers and retain their separate scope contracts.
