@@ -92,6 +92,29 @@ advance `4894426888d175d4fd65095647bede65bb09718e` is composed without changing
 production code; the composed source still owes joint whole-head qualification.
 All diagnostic and negative tests are retained.
 
+### Composed native and full-Rust qualification
+
+Shared candidate `b2fd54fa83194d13bfa407cc61b23c16859c9024`, pinned to app
+`aff5126e1e82cc72ef7a1bd567c57c0d3c487c4e` and main
+`4894426888d175d4fd65095647bede65bb09718e`, completed all jobs.
+[macOS run 39048480300](https://github.com/scottopell/phoenix-ide/actions/runs/39048480300)
+passed native ownership/actual-Chrome qualification and the application build.
+[Linux run 39048480354](https://github.com/scottopell/phoenix-ide/actions/runs/39048480354)
+passed native ownership/actual-Chrome qualification, full Rust tests, E2E, tasks,
+worker-budget, and qualification-plan checks. Rebuilt artifact `12107545384`
+retains the six-report/six-export witness and successful normal owned drain.
+These are actual runtime results, not inferred from the earlier pure tests.
+
+That Linux run remained **failed overall** on two test-source issues: a missing
+statement semicolon in the exit-observation test and a synchronous canonical-URL
+assertion after an intermediate Coordinator render. Source children `8301cb58e`
+and `4749e0d0d` respectively correct those issues without changing production
+behavior, expected URL, lifecycle assertions, or timeouts. The UI failure did
+not reproduce locally; the focused two cases and owning 18-test module passed
+both before and after the awaited-URL correction. The successor source still
+owes one fresh whole-head qualification. No full-acceptance, overhead-clearance,
+escaped-helper coverage, or native-resume claim follows from these results.
+
 ## Verification
 
 Lifecycle and installed-command coverage live in `crates/phoenix-tools/tests/browser_cli.rs`. Browser-free preflight and operation-catalog parity live in `browser::access_tests`; profiling validation and methodology retain their existing unit coverage. Engine snapshot and console tests use actual Chrome for document replacement, native input, artifacts, source-event capture, and iframe diagnostics.

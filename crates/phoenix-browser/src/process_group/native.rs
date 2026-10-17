@@ -373,7 +373,7 @@ exit 0
                 match group.observe_root(&mut root) {
                     Ok(RootObservation::Exited) => break,
                     Ok(RootObservation::Live | RootObservation::ExitPending) => {
-                        tokio::task::yield_now().await
+                        tokio::task::yield_now().await;
                     }
                     Err(error) => {
                         #[cfg(target_os = "macos")]
