@@ -179,6 +179,49 @@ describe('ViewJourneyLifecycle', () => {
     expect(payload(1).reporter_id).toBe(first.reporter_id);
   });
 
+  it.each(['ordinary', 'global'] as const)('keeps captured additional requests in the original ready %s report', async route => {
+    const {root, controller} = view(route);
+    const originalId = controller.openId;
+    const owner = controller.captureRequestOwner();
+    const ids = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+    const observations = ids.map(id => owner(id)!);
+    observations.forEach((observation, index) => observation.response({size_bucket: '0-10k', trace_id: String(index + 1).repeat(32)}));
+    hydrate(root, controller);
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload()).toMatchObject({open_id: originalId, route, outcome: 'ready'});
+    expect(payload().correlations.filter((c: {kind: string}) => c.kind === 'request').map((c: {id: string}) => c.id)).toEqual(ids);
+    expect(owner(crypto.randomUUID())).toBeUndefined();
+    expect(controller.captureRequestOwner()(crypto.randomUUID())).toBeUndefined();
+    const frozen = JSON.stringify(payload());
+    observations.forEach(observation => {observation.response({size_bucket: '1m+', trace_id: 'f'.repeat(32)}); observation.failed();});
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(payload())).toBe(frozen);
+  });
+
+  it('does not let an old pagination owner register recovery requests or responses in a resumed attempt', async () => {
+    const {root, controller} = view();
+    const owner = controller.captureRequestOwner();
+    const oldId = crypto.randomUUID();
+    const stale = owner(oldId)!;
+    hydrate(root, controller);
+    controller.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload().correlations).toContainEqual({kind: 'request', id: oldId});
+    expect(owner(crypto.randomUUID())).toBeUndefined();
+    stale.response({size_bucket: '1m+', trace_id: 'f'.repeat(32)});
+    stale.failed();
+    enable(root);
+    controller.tailAnchorSettled();
+    controller.inspect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payload(1)).toMatchObject({outcome: 'ready', correlations: [], response_size_bucket: 'unknown'});
+  });
+
   it('does not attach a pre-resume request completion or failure to a fresh resume journey', async () => {
     const { root, controller } = view();
     const oldRequest = controller.requestStarted(crypto.randomUUID())!;
