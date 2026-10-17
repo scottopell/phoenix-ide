@@ -3309,3 +3309,33 @@ new shared head; prior1e04/26d,713c/52ec and PR908 evidence are not relabeled.
 The orphaned optional keepalive workflow retirement is published in this
 cohesive failure response rather than left indefinitely local. Separate reusable
 observation benchmark development is not imported into the history packet.
+
+## Native candidate compile and macOS exited-child correction
+
+Sharedbcd8 finished both Linux and macOS qualification terminal failure before
+any new actual Chrome layout/six-context witness could execute. The collected
+causes were the missing direct IDE browser dependency, two server-test Cargo
+binary identifier typos, two Clippy style diagnostics, unpinned macOS Actions,
+and a real macOS native fixture failure reading exited-root birth identity.
+All original assertions and failed receipts are retained.
+
+Appa236ea6eba432d278739f6ec3d6cd144108c1173,
+tree5ccd80b271a48cbfe40006abeeb17455f521b9d2, incorporates only those causal
+source fixes. Cargo metadata generated the one required lockfile dependency
+edge offline without a compiler, network or version update. The exited-root
+repair binds every observation/signal/drain to the exclusive actual Tokio
+Child handle and original PID; WNOWAIT precedes unavailable zombie proc info,
+while live roots still require birth and isolated-group identity. Tests retain
+repeated WNOWAIT observations and reject different/reaped child authority;
+Drop never signals a numeric group without the child. This does not claim
+protection from an external raw-libc reaper stealing an exclusively owned child,
+nor does group drain establish escaped-descendant closure.
+
+Independent exact-child source review found no established blocker, not an
+execution pass. Parent reran81 Python lifecycle/69 joint guards/desktop Actions
+security regressions successfully, plus YAML/shell/diff checks. All Actions
+added to macOS qualification are pinned to resolved full commit SHAs. Source,
+tree and all provenance pins move atomically to a236/5ccd; main0f054 remains
+the base. Exactly one fresh causal full Linux/native/macOS qualification follows
+after both preceding runs are terminal, with no ignored test, weakened assertion,
+cleanup retry, synthetic lifecycle event, threshold or acceptance waiver.

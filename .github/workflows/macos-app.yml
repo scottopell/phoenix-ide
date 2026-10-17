@@ -158,21 +158,21 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CHROME_QUALIFICATION_OUTPUT: ${{ github.workspace }}/owned-chrome-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '26'
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: owned-chrome-macos
       - name: Admit exact app sources, build existing UI embed and install owned Chromium
         run: |
-          git diff --exit-code 7906d436de340ea12e5e57bfb0b7459ec77d866d HEAD -- crates
+          git diff --exit-code a236ea6eba432d278739f6ec3d6cd144108c1173 HEAD -- crates
           cd ui
           npm install -g corepack@latest
           corepack enable
@@ -185,7 +185,7 @@ jobs:
           bash scripts/qualify-owned-chrome-teardown.sh
       - name: Retain actual native test/layout evidence even on failure
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: owned-chrome-macos-${{ github.event.pull_request.head.sha }}
           path: owned-chrome-macos/
