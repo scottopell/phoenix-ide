@@ -594,6 +594,17 @@ mod tests {
                 "browser.presentation_evidence",
                 value["presentation_evidence"].clone(),
             ),
+        ]
+        .into_iter()
+        .chain(capacity_expected_marks(value))
+        .chain(capacity_expected_observations(value))
+        .collect()
+    }
+
+    fn capacity_expected_observations(
+        value: &serde_json::Value,
+    ) -> [(&'static str, serde_json::Value); 14] {
+        [
             ("browser.total_ms", value["total_ms"].clone()),
             ("browser.background_ms", value["background_ms"].clone()),
             (
@@ -633,9 +644,28 @@ mod tests {
                 value["transport_failed_count"].clone(),
             ),
         ]
-        .into_iter()
-        .chain(capacity_expected_marks(value))
-        .collect()
+    }
+
+    fn print_capacity_encoded_budget(
+        cap: u32,
+        view: &opentelemetry_sdk::trace::SpanData,
+        expected: &std::collections::BTreeMap<&str, serde_json::Value>,
+    ) {
+        use prost::Message as _;
+        let proto: opentelemetry_proto::tonic::trace::v1::Span = view.clone().into();
+        let semantic_bytes: usize = proto
+            .attributes
+            .iter()
+            .filter(|attribute| expected.contains_key(attribute.key.as_str()))
+            .map(prost::Message::encoded_len)
+            .sum();
+        let metadata_bytes: usize = proto
+            .attributes
+            .iter()
+            .filter(|attribute| !expected.contains_key(attribute.key.as_str()))
+            .map(prost::Message::encoded_len)
+            .sum();
+        println!("collector_capacity cap={cap} attributes={} dropped={} otlp_span_bytes={} semantic_kv_bytes={semantic_bytes} sdk_kv_bytes={metadata_bytes}", view.attributes.len(), view.dropped_attributes_count, proto.encoded_len());
     }
 
     fn assert_capacity_ready_spans(
@@ -735,7 +765,6 @@ mod tests {
     async fn production_attribute_capacity_preserves_complete_ready_collector_schema() {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-        use prost::Message as _;
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
         let state = collector_test_state().await;
@@ -779,20 +808,7 @@ mod tests {
                 .find(|span| span.name == "browser.conversation_view")
                 .unwrap();
             assert!(view.events.is_empty());
-            let proto: opentelemetry_proto::tonic::trace::v1::Span = view.clone().into();
-            let semantic_bytes: usize = proto
-                .attributes
-                .iter()
-                .filter(|attribute| expected.contains_key(attribute.key.as_str()))
-                .map(prost::Message::encoded_len)
-                .sum();
-            let metadata_bytes: usize = proto
-                .attributes
-                .iter()
-                .filter(|attribute| !expected.contains_key(attribute.key.as_str()))
-                .map(prost::Message::encoded_len)
-                .sum();
-            println!("collector_capacity cap={cap} attributes={} dropped={} otlp_span_bytes={} semantic_kv_bytes={semantic_bytes} sdk_kv_bytes={metadata_bytes}", view.attributes.len(), view.dropped_attributes_count, proto.encoded_len());
+            print_capacity_encoded_budget(cap, view, &expected);
             let required = [
                 "browser.meaningful_transcript_ms",
                 "browser.breadcrumb_presented_ms",

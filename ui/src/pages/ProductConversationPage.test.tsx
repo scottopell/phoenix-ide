@@ -2463,10 +2463,14 @@ describe('ProductConversationPage', () => {
       .toHaveTextContent('Closed — cleanup needs attention');
     expect(screen.getByTestId('product-conversation-close-live-update-owner')).not.toBeVisible();
     expect(embeddedConversationPageSpy).not.toHaveBeenCalled();
-    const stream = FakeCloseEventSource.instances.at(-1);
-    expect(stream?.url).toContain('/api/conversations/row-2/stream');
+    const stream = await waitFor(() => {
+      const attached = FakeCloseEventSource.instances.at(-1);
+      if (!attached) throw new Error('Close conversation stream has not attached');
+      expect(attached.url).toContain('/api/conversations/row-2/stream');
+      return attached;
+    });
 
-    act(() => stream?.emit('conversation_update', {
+    act(() => stream.emit('conversation_update', {
       sequence_id: 1,
       conversation: { archived: true },
     }));
