@@ -1011,6 +1011,11 @@ exit 0
     #[test]
     fn escaped_writer_fixture() {
         use std::io::{BufRead as _, Write as _};
+        enum Event {
+            Ready(String),
+            Release,
+            Cancel,
+        }
         let Ok(role) = std::env::var("PHOENIX_GROUP_TEST_ROLE") else {
             return;
         };
@@ -1062,11 +1067,6 @@ exit 0
         println!("writer-spawned:{}", writer.0.id());
         std::io::stdout().flush().unwrap();
         let stdout = std::io::BufReader::new(writer.0.stdout.take().unwrap());
-        enum Event {
-            Ready(String),
-            Release,
-            Cancel,
-        }
         let (events, receiver) = std::sync::mpsc::channel();
         let readiness = events.clone();
         std::thread::spawn(move || {
