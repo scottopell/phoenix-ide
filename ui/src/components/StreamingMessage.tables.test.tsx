@@ -109,6 +109,18 @@ it('preserves the actual ACL reply through cumulative partial table tokens and f
     '/Users/scottopell/.phoenix-ide/prod.log',
     'Allow this specific Agent account to search/traverse this directory.',
   ]);
+  const fenceShells = (container: HTMLElement) => [...container.querySelectorAll('code.language-text')].map(code => {
+    const ancestors: string[] = [];
+    for (let parent = code.parentElement; parent && !parent.classList.contains('message-content'); parent = parent.parentElement) {
+      ancestors.push(parent.tagName);
+    }
+    expect(ancestors.filter(tag => tag === 'PRE')).toHaveLength(1);
+    expect(code.parentElement?.parentElement?.tagName).toBe('PRE');
+    return [code.parentElement?.parentElement?.tagName, code.parentElement?.tagName, code.textContent];
+  });
+  expect(live.container.querySelectorAll('code.language-text')).toHaveLength(2);
+  expect(fenceShells(live.container)).toEqual(fenceShells(saved.container));
+  expect(live.container.querySelector('pre pre')).toBeNull();
   expect(live.container).toHaveTextContent('No ACL has been changed yet.');
   expect(saved.container.querySelector('.agent-text-fragment')).not.toBeNull();
   expect(tableMarkup(live.container)).toEqual(tableMarkup(saved.container));

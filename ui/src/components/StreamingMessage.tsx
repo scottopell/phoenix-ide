@@ -234,6 +234,10 @@ const StreamingCode = memo(function StreamingCode({ content, lang, complete }: {
 }) {
   const { theme } = useTheme();
   if (!complete) return <pre className="streaming-code-pre"><code className="streaming-code">{content}</code></pre>;
-  if (lang?.toLowerCase() === 'mermaid') return <MemoMermaid code={content} />;
-  return <SyntaxHighlighter style={theme === 'light' ? oneLight : oneDark} language={lang || 'text'} PreTag="div">{content}</SyntaxHighlighter>;
+  if (lang?.toLowerCase() === 'mermaid') return <pre><MemoMermaid code={content} /></pre>;
+  if (!lang) {
+    const children = content ? `${content}\n` : '';
+    return <pre><code data-token-kind={inlineCodeTokenKind(children)}>{children}</code></pre>;
+  }
+  return <pre><SyntaxHighlighter style={theme === 'light' ? oneLight : oneDark} language={lang} PreTag="div">{content}</SyntaxHighlighter></pre>;
 });

@@ -44,6 +44,7 @@ function measure() {
         paragraphs: [...content.querySelectorAll('p')].map(node => ({ text: node.textContent, ...rect(node) })),
         markup: content.innerHTML,
         codeBlocks: [...content.querySelectorAll('code.language-text, pre code')].map(node => node.textContent.trim()),
+        codeShells: [...content.querySelectorAll('pre')].map(node => ({ text: node.textContent, ...rect(node) })),
         headings: [...content.querySelectorAll('h1,h2,h3,h4,h5,h6')].map(node => node.textContent),
         tables: [...content.querySelectorAll('.markdown-table-scroll')].map(wrapper => {
           const table = wrapper.querySelector('table');
@@ -97,6 +98,11 @@ function validate(sample, complete) {
   if (!baseline && subject.tables.length === 1 && reference.tables.length === 1) {
     const a = subject.tables[0];
     const b = reference.tables[0];
+    check(near(a.wrapper.top - subject.content.top, b.wrapper.top - reference.content.top), `${label}: table position inside prose differs`);
+    subject.paragraphs.forEach((paragraph, index) => {
+      const other = reference.paragraphs[index];
+      check(other && near(paragraph.top - subject.content.top, other.top - reference.content.top), `${label}: paragraph ${index} position differs`);
+    });
     for (const key of ['left', 'width', 'height']) check(near(a.wrapper[key], b.wrapper[key]), `${label}: wrapper ${key} differs from finalized same-prefix reference`);
     check(a.markup === b.markup, `${label}: table markup differs from finalized reference`);
     a.cells.forEach((cell, index) => {
@@ -142,7 +148,7 @@ try {
       if (!baseline) {
         const a = before.cases.subject.tables[0]?.wrapper;
         const b = after.cases.subject.tables[0]?.wrapper;
-        for (const key of ['left', 'width', 'height']) check(a && b && near(a[key], b[key]), `${stem}: ${key} changed during finalization`);
+        for (const key of ['left', 'top', 'width', 'height']) check(a && b && near(a[key], b[key]), `${stem}: ${key} changed during finalization`);
       }
       await page.screenshot({ path: path.join(out, `${stem}-after.png`), fullPage: true });
       await page.locator('[data-table-case="subject"] .markdown-table-scroll').screenshot({ path: path.join(out, `${stem}-table-after.png`) });
