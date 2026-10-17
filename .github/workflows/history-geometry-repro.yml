@@ -1,7 +1,7 @@
 name: Bounded artifact geometry reproduction
 on:
   push:
-    branches: [qualification/history-geometry-once]
+    branches: [qualification/history-geometry-once, qualification/history-shared-snapshot-tests]
 permissions:
   contents: read
   actions: read
@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   geometry:
+    if: github.ref == 'refs/heads/qualification/history-geometry-once'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -72,3 +73,58 @@ jobs:
             geometry-evidence/driver-exit.json
             geometry-evidence/github-artifact.json
             geometry-evidence/server-completion.json
+
+  shared-snapshot-regressions:
+    if: github.ref == 'refs/heads/qualification/history-shared-snapshot-tests'
+    name: Exact compiled shared snapshot regressions, artifact reuse only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Admit the exact already-built repaired application test executable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir retained shared-snapshot-evidence
+          gh api repos/scottopell/phoenix-ide/actions/artifacts/12103236321 > shared-snapshot-evidence/artifact.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a=json.loads(Path('shared-snapshot-evidence/artifact.json').read_text())
+          assert a['id']==12103236321 and a['workflow_run']['id']==39037454470
+          assert a['name']=='opening-codegen-713c74a7d5ec34899df3408638d9e8d544515ea1-1'
+          assert a['size_in_bytes']==97901460 and not a['expired']
+          PY
+          gh run download 39037454470 --repo scottopell/phoenix-ide --name opening-codegen-713c74a7d5ec34899df3408638d9e8d544515ea1-1 --dir retained
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          r=json.loads(Path('retained/opening-instrumented-receipt.json').read_text())
+          assert r['app_source']=='52ec18b65bcf757ff40d8e5c0ed74982b2512afb'
+          assert r['app_tree']=='cdd9297ef0f5ed0577014b0b8c2f9a09b409ee51'
+          assert r['harness_source']=='713c74a7d5ec34899df3408638d9e8d544515ea1'
+          digest=hashlib.sha256(Path('retained/opening-instrumented-libtest').read_bytes()).hexdigest()
+          assert digest==r['executable_sha256']
+          Path('shared-snapshot-evidence/provenance.json').write_text(json.dumps({'app_source':r['app_source'],'app_tree':r['app_tree'],'harness_source':r['harness_source'],'executable_sha256':digest,'artifact':12103236321,'scope':'three_previously_unexecuted_rust_regressions_not_full_suite_retry','full_acceptance':False}))
+          PY
+      - name: List and run exactly three genuine persisted race regressions
+        run: |
+          set -o pipefail
+          chmod 700 retained/opening-instrumented-libtest
+          export HOME="$RUNNER_TEMP/shared-snapshot-owned-home"
+          mkdir -m 700 "$HOME"
+          prefix=api::handlers::shared_stream_snapshot_tests::
+          retained/opening-instrumented-libtest "$prefix" --list --format terse | tee shared-snapshot-evidence/test-list.log
+          test "$(grep -c ': test$' shared-snapshot-evidence/test-list.log)" -eq 3
+          for name in shared_stream_retries_append_between_messages_and_opening shared_stream_retries_mutation_between_messages_and_opening opening_snapshot_retry_is_bounded; do
+            grep -Fx "${prefix}${name}: test" shared-snapshot-evidence/test-list.log
+            timeout --signal=TERM --kill-after=5s 30s retained/opening-instrumented-libtest "${prefix}${name}" --exact --test-threads=1 --nocapture 2>&1 | tee "shared-snapshot-evidence/${name}.log"
+            grep -F 'test result: ok. 1 passed; 0 failed;' "shared-snapshot-evidence/${name}.log"
+          done
+      - name: Retain bounded test and identity receipts only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-shared-snapshot-regressions
+          path: shared-snapshot-evidence/
+          retention-days: 7
+          if-no-files-found: warn
