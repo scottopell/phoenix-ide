@@ -2930,3 +2930,8 @@ frozen Command::Stop/ack protocol, receiver lifetime and strict exit/cleanup
 checks. Existing138 browser selftests and immutable app35f source are unchanged.
 No local native/browser/build, raised timeout, fabricated drain or unchanged
 qualification rerun was used. Next push waits for the entire current run.
+
+Run `38996536868` is fully terminal **failure**: witness timed out waiting for
+unsignaled normal stop; Rust and every standard lane succeeded. The acknowledged
+normal-stop candidate is published only after this complete result. App35f,
+six-scenario browser driver, raw semantic validators and deadlines are unchanged.
