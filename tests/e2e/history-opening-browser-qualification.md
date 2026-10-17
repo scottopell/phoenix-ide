@@ -2832,3 +2832,8 @@ red with AssertionError; fixed null check passes green. The replay prints only
 static labels, not private IDs/URLs/bodies. Evidence and code remain under the
 local evidence directory. All138 shared Node regressions pass; diff check passes.
 No additional native/browser/build/runner was used to establish this causal fix.
+
+Run `38993749887` is fully terminal **failure**: isolated witness failed; Rust
+and all standard lanes succeeded. One causal normal qualification of the exact
+retained-report-proven null correction follows this complete state, with app35f
+unchanged. Stock baseline/resume/overhead/full acceptance constraints remain.
