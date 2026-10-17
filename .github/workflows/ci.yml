@@ -191,10 +191,10 @@ jobs:
         run: ./dev.py check --lanes e2e
 
   qualify-history-realserver:
-    name: qualify pinned app realserver history (harness only)
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qualification/continuous-history-realserver' }}
+    name: typed codegen and isolated instrumented opening witness (not shipping)
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qualification/continuation-opening-codegen' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     env:
       APP_ROOT: ${{ github.workspace }}/pinned-app
       APP_BUILD_RECEIPT: ${{ github.workspace }}/history-build.json
@@ -211,8 +211,9 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: d4c2772a95aa46da608b356c8fe7be074de1b7aa
+          ref: 35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f
           path: pinned-app
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -238,35 +239,265 @@ jobs:
           uv run tests/e2e/history_browser.test.py
           node --test ui/scripts/qualify-history-realserver.selftest.mjs
           node --check ui/scripts/qualify-history-realserver.mjs
-      - name: Build matching pinned UI and install pinned Chromium
+      - name: Build separate stock and controlled UI artifacts (not runtime qualification)
         working-directory: pinned-app/ui
         run: |
           pnpm install --frozen-lockfile
-          pnpm run build
-          pnpm exec playwright install --with-deps chromium
-      - name: Build pinned real server through existing E2E lane
+          node node_modules/vite/bin/vite.js build
+          node node_modules/vite/bin/vite.js build --config vite.controlled-functional.config.ts --mode controlled-functional
+          python3 - <<'PY'
+          import importlib.util,json
+          from pathlib import Path
+          root=Path.cwd().parent
+          spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
+          import sys
+          module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
+          source='35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f'; tree='a548be3b0ad35596434018068e297bf3f5066af5'
+          for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
+              module.admit_artifact(root, root/'ui'/name, source, tree, mode)
+          (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
+              'ui_artifacts':module.build_owner_binding(root), 'scope':'hosted exact-source two-build attestation; not runtime acceptance'},indent=2))
+          PY
+      - name: Genuine typed-contract codegen through existing dev.py
+        shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = d4c2772a95aa46da608b356c8fe7be074de1b7aa
+          test "$(git rev-parse HEAD)" = 35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f
+          test "$(git rev-parse HEAD^{tree})" = a548be3b0ad35596434018068e297bf3f5066af5
+          test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
-          ./dev.py check --lanes e2e
-      - name: Bind application source and artifacts to harness receipt
+          ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
+          git diff --exit-code -- Cargo.lock ui/pnpm-lock.yaml
+          python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          files = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in sorted((root / 'ui/src/generated').glob('*.ts'))}
+          telemetry = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                       for path in [root/'ui/scripts/qualify-view-telemetry.mjs',
+                                    root/'ui/scripts/view-telemetry-diagnostics.mjs',
+                                    root/'tests/e2e/view_telemetry_sink.py',
+                                    root/'tests/e2e/assert_view_telemetry.py']}
+          pathlib.Path('../opening-codegen-receipt.json').write_text(json.dumps({
+              'app_source': subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+              'app_tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),
+              'app_base': subprocess.check_output(['git','merge-base','HEAD','7af06a4004b97b534d468b6ca2f42c145c8d4fb9'],text=True).strip(),
+              'telemetry_modules': telemetry,
+              'harness_source': '${{ github.event.pull_request.head.sha }}',
+              'rustc': subprocess.check_output(['rustc','--version'],text=True).strip(),
+              'cargo_lock_sha256': hashlib.sha256((root/'Cargo.lock').read_bytes()).hexdigest(),
+              'codegen_command': './dev.py codegen', 'generated_files': files}, indent=2))
+          PY
+      - name: Execute owned Coordinator continuation admission fixture
+        shell: bash
+        working-directory: pinned-app
         run: |
-          uv run harness/tests/e2e/history_browser.py --build-receipt "$APP_BUILD_RECEIPT"
-      - name: Real HTTP SSE browser history qualification
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+          command=['cargo','test','-p','phoenix-db','coordinator_continuation_commit_admits_automatic_work','--','--nocapture','--test-threads=1']
+          out=Path.cwd().parent
+          git=lambda *args:subprocess.check_output(['git',*args],text=True).strip()
+          try:
+              completed=subprocess.run(command,capture_output=True,text=True,timeout=900)
+          except subprocess.TimeoutExpired as error:
+              text=lambda value:value.decode('utf-8','replace') if isinstance(value,bytes) else (value or '')
+              (out/'opening-coordinator-home-fixture.log').write_text(text(error.stdout)+text(error.stderr))
+              (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
+                  'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
+                  'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+                  'command':command,'exit_status':None,'timed_out':True,'timeout_seconds':900,
+                  'scope':'failed actual DB fixture timeout, not qualification'},indent=2))
+              raise
+          (out/'opening-coordinator-home-fixture.log').write_text(completed.stdout+completed.stderr)
+          (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
+              'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
+              'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+              'command':command,'exit_status':completed.returncode,
+              'scope':'actual DB owned-home continuation admission test, not app/browser qualification'},indent=2))
+          assert completed.returncode == 0, 'owned Coordinator fixture failed; see retained log'
+          assert '1 passed; 0 failed' in completed.stdout, completed.stdout
+          PY
+      - name: Verify and retain instrumented libtest executable (not shipping runtime)
+        shell: bash
+        working-directory: pinned-app
         run: |
-          uv run harness/tests/e2e/history_browser.py --output "$GITHUB_WORKSPACE/history-evidence" --timeout 900
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re, shutil, subprocess
+          root = pathlib.Path.cwd()
+          selector = ['cargo', 'test', '--no-run', '--message-format=json']
+          try:
+              selected = subprocess.run(selector, capture_output=True, text=True, timeout=900)
+          except subprocess.TimeoutExpired as error:
+              (root.parent/'opening-instrumented-selector.log').write_bytes((error.stdout or b'')+(error.stderr or b''))
+              raise
+          (root.parent/'opening-instrumented-selector.log').write_text(selected.stdout+selected.stderr)
+          assert selected.returncode == 0, 'libtest artifact metadata selection failed'
+          artifacts = [json.loads(line) for line in selected.stdout.splitlines() if line.startswith('{')]
+          candidates = [pathlib.Path(artifact['executable']) for artifact in artifacts
+                        if artifact.get('reason') == 'compiler-artifact'
+                        and artifact.get('target',{}).get('name') == 'phoenix_ide'
+                        and 'lib' in artifact.get('target',{}).get('kind',[])
+                        and artifact.get('profile',{}).get('test') is True
+                        and artifact.get('executable')]
+          assert len(candidates) == 1, f'ambiguous instrumented libtest candidates: {candidates}'
+          executable = candidates[0]
+          assert executable.resolve().is_relative_to((root/'target').resolve())
+          listed = subprocess.run([str(executable), '--list'], capture_output=True, text=True, timeout=10)
+          assert listed.returncode == 0 and 'opening_qualifier::actual_server_opening_qualifier: test' in listed.stdout
+          destination = root.parent/'opening-instrumented-libtest'
+          shutil.copyfile(executable, destination)
+          destination.chmod(0o700)
+          command = [str(destination), 'opening_qualifier::', '--nocapture', '--test-threads=1']
+          completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+          (root.parent/'opening-instrumented-unit.log').write_text(completed.stdout+completed.stderr)
+          receipt = json.loads((root.parent/'opening-codegen-receipt.json').read_text())
+          ui_owner = json.loads((root.parent/'opening-ui-build-owner.json').read_text())
+          assert ui_owner['app_source'] == receipt['app_source'] and ui_owner['app_tree'] == receipt['app_tree']
+          receipt['ui_artifacts'] = ui_owner['ui_artifacts']
+          receipt.update({'evidence_class':'instrumented_cfg_test_library_not_shipping_runtime',
+                          'executable_sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),
+                          'compiled_executable_path':str(executable.relative_to(root)),
+                          'compiler_artifact_selector':selector,
+                          'ui_lock_sha256':hashlib.sha256((root/'ui/pnpm-lock.yaml').read_bytes()).hexdigest(),
+                          'ui_files':{str(path.relative_to(root/'ui/dist')):hashlib.sha256(path.read_bytes()).hexdigest()
+                                      for path in sorted((root/'ui/dist').rglob('*'))
+                                      if path.is_file() and path.name != '.gitkeep'},
+                          'focused_test_command':command[1:], 'focused_test_exit':completed.returncode,
+                          'ignored_driver':'opening_qualifier::actual_server_opening_qualifier'})
+          (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          assert completed.returncode == 0, 'instrumentation guard tests failed; see retained log'
+          assert '11 passed; 0 failed; 1 ignored' in completed.stdout, completed.stdout
+          witness_name = 'api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance'
+          assert witness_name + ': test' in listed.stdout
+          witness_command = [str(destination), witness_name, '--exact', '--nocapture', '--test-threads=1']
+          witness = subprocess.run(witness_command, capture_output=True, text=True, timeout=120)
+          (root.parent/'opening-collector-witness-unit.log').write_text(witness.stdout+witness.stderr)
+          receipt.update({'collector_witness_command':witness_command[1:],
+                          'collector_witness_exit':witness.returncode})
+          (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          assert witness.returncode == 0, 'real collector witness regression failed; see retained log'
+          assert '1 passed; 0 failed;' in witness.stdout, witness.stdout
+          sdk_name = 'api::view_journey::tests::pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields'
+          assert sdk_name + ': test' in listed.stdout
+          sdk_command = [str(destination), sdk_name, '--exact', '--nocapture', '--test-threads=1']
+          sdk = subprocess.run(sdk_command, capture_output=True, text=True, timeout=120)
+          (root.parent/'opening-sdk-metadata-unit.log').write_text(sdk.stdout+sdk.stderr)
+          sdk_passed = int('1 passed; 0 failed;' in sdk.stdout)
+          receipt.update({'sdk_metadata_command':sdk_command[1:], 'sdk_metadata_exit':sdk.returncode,
+                          'sdk_metadata_passed':sdk_passed})
+          (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          assert sdk.returncode == 0 and sdk_passed == 1, 'real default SDK layer regression failed or ran zero tests; see retained log'
+          production_tests = [
+              'api::view_journey::tests::production_attribute_capacity_preserves_complete_ready_collector_schema',
+              'logging::tests::otel_limits_are_conservative_and_event_free',
+              'logging::tests::otel_filter_is_a_spans_only_allowlist',
+          ]
+          receipt['production_capacity_tests'] = []
+          (root.parent/'opening-production-capacity-unit.log').write_text('')
+          for name in production_tests:
+              assert name + ': test' in listed.stdout
+              command = [str(destination), name, '--exact', '--nocapture', '--test-threads=1']
+              outcome = subprocess.run(command, capture_output=True, text=True, timeout=120)
+              for metric in re.findall(r'collector_capacity cap=\d+ attributes=\d+ dropped=\d+ otlp_span_bytes=\d+ semantic_kv_bytes=\d+ sdk_kv_bytes=\d+', outcome.stdout):
+                  print(metric, flush=True)
+              with (root.parent/'opening-production-capacity-unit.log').open('a') as log:
+                  log.write(outcome.stdout+outcome.stderr)
+              passed = int('1 passed; 0 failed;' in outcome.stdout)
+              receipt['production_capacity_tests'].append({'command':command[1:], 'exit':outcome.returncode, 'passed':passed})
+              (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+              assert outcome.returncode == 0 and passed == 1, 'production capacity/privacy guard failed or ran zero tests; see retained log'
+          PY
+      - name: Compiler-free instrumented harness regressions
+        working-directory: harness
+        run: |
+          uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.test.py
+          uv run tests/e2e/history_controlled_artifact.test.py
+          node --test ui/scripts/history-controlled-functional.selftest.mjs
+          node --check ui/scripts/qualify-history-controlled-functional.mjs
+          node --test ui/scripts/qualify-history-opening-realserver.selftest.mjs
+          node --test ui/scripts/history-joint-telemetry.selftest.mjs
+          test -f ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
+          node --check ../pinned-app/ui/scripts/qualify-view-telemetry.mjs
+          node --check ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
+          cd ../pinned-app/ui
+          pnpm exec vitest run scripts/qualify-view-telemetry.test.mjs scripts/view-telemetry-diagnostics.test.mjs src/hooks/conversationViewDiagnostics.test.ts src/hooks/conversationViewJourney.test.ts src/hooks/conversationViewTelemetry.test.ts src/hooks/conversationViewLifecycle.test.ts src/hooks/useConversationViewJourney.test.tsx qualification/viewReporterBuild.test.ts qualification/viewReporterManifest.test.ts --maxWorkers=2
+          cd ../../harness
+          node --check ui/scripts/qualify-history-opening-realserver.mjs
+      - name: Full UI source qualification at exact pinned app (no filtered retry)
+        shell: bash
+        working-directory: pinned-app
+        run: |
+          set -o pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          root=Path.cwd(); out=root.parent
+          sha=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
+          git=lambda *args:subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
+          receipt={'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
+                   'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+                   'harness_source':subprocess.check_output(['git','-C',str(out/'harness'),'rev-parse','HEAD'],text=True).strip(),
+                   'command':'PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest',
+                   'vitest_config_sha256':sha(root/'ui/vitest.config.ts'),
+                   'ui_lock_sha256':sha(root/'ui/pnpm-lock.yaml'),
+                   'scope':'full pinned app UI source/tests (tsc,eslint,all Vitest); not ancillary spec/ast-grep group; no filtering/retry/runtime/overhead clearance'}
+          (out/'pinned-app-full-ui-receipt.json').write_text(json.dumps(receipt,indent=2))
+          PY
+          set +e
+          PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest 2>&1 | tee "$GITHUB_WORKSPACE/pinned-app-full-ui.log"
+          ui_status=${PIPESTATUS[0]}
+          set -e
+          python3 - "$ui_status" <<'PY'
+          import json,sys
+          from pathlib import Path
+          path=Path.cwd().parent/'pinned-app-full-ui-receipt.json'
+          receipt=json.loads(path.read_text()); receipt['exit_status']=int(sys.argv[1])
+          receipt['result_counts_authority']='retained full console log, not inferred or fabricated'
+          path.write_text(json.dumps(receipt,indent=2))
+          PY
+          exit "$ui_status"
+      - name: Prepare owned Chromium for instrumented actual-server witness
+        working-directory: pinned-app/ui
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Controlled-functional six-report witness (separate from immutable stock baseline)
+        working-directory: harness
+        run: |
+          chmod 700 ../opening-instrumented-libtest
+          uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.py \
+            --joint-telemetry --controlled-functional \
+            --app-root "$GITHUB_WORKSPACE/pinned-app" \
+            --instrumented-exe "$GITHUB_WORKSPACE/opening-instrumented-libtest" \
+            --instrumented-receipt "$GITHUB_WORKSPACE/opening-instrumented-receipt.json" \
+            --output "$GITHUB_WORKSPACE/opening-browser-evidence" --timeout 300
       - name: Retain receipts on success or failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: history-app-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          name: opening-codegen-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: warn
           path: |
-            history-build.json
-            history-evidence/
+            opening-codegen-receipt.json
+            opening-codegen.log
+            opening-coordinator-home-fixture.log
+            opening-coordinator-home-fixture-receipt.json
+            pinned-app/ui/src/generated/
+            opening-instrumented-libtest
+            opening-instrumented-receipt.json
+            opening-ui-build-owner.json
+            pinned-app/ui/stock-natural-build.json
+            pinned-app/ui/controlled-functional-build.json
+            pinned-app/ui/dist-controlled-functional/
+            opening-instrumented-unit.log
+            opening-collector-witness-unit.log
+            opening-sdk-metadata-unit.log
+            opening-production-capacity-unit.log
+            opening-instrumented-selector.log
+            opening-browser-evidence/
+            pinned-app-full-ui.log
+            pinned-app-full-ui-receipt.json
 
   check-ui:
     name: check (ui/specs)
