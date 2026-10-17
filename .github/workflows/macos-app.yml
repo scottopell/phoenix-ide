@@ -317,7 +317,27 @@ jobs:
             cargo test -p phoenix-db --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
           done
-          grep -E '^bound_snapshot_ceiling_sqlite_version=[0-9]+\.[0-9]+\.[0-9]+$' "$output/message_page_materializes_bound_snapshot_ceiling_once_with_result_parity.log" > "$output/sqlite-engine-version.txt"
+          python3 - "$output/message_page_materializes_bound_snapshot_ceiling_once_with_result_parity.log" "$output/sqlite-engine-version.txt" <<'PY'
+          import re,sys
+          from pathlib import Path
+          def receipt(text):
+              tokens=re.findall(r'(?<!\S)bound_snapshot_ceiling_sqlite_version=\S*',text)
+              if len(tokens)!=1 or re.fullmatch(r'bound_snapshot_ceiling_sqlite_version=[0-9]+\.[0-9]+\.[0-9]+',tokens[0]) is None:
+                  raise ValueError('expected exactly one complete SQLite engine-version receipt')
+              return tokens[0]
+          valid='bound_snapshot_ceiling_sqlite_version=3.51.3'
+          prefix='test product_conversation_read::tests::message_page_materializes_bound_snapshot_ceiling_once_with_result_parity ... '
+          assert receipt(valid+'\n')==valid
+          assert receipt(prefix+valid+'\nok\n')==valid
+          for invalid in ['',valid+'\n'+valid,valid+'.4',valid+'suffix',valid+'-beta',valid.replace('3.51.3','3.51'),valid.replace('3.51.3',''),valid.replace('3.51.3','٣.51.3'),'prefix'+valid]:
+              try:
+                  receipt(invalid)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(f'accepted invalid receipt: {invalid!r}')
+          Path(sys.argv[2]).write_text(receipt(Path(sys.argv[1]).read_text())+'\n')
+          PY
       - name: Require focused current UI contracts and exact source parity
         working-directory: ui
         run: |
