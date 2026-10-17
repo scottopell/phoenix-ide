@@ -33,8 +33,8 @@ from urllib.parse import urlparse, urlencode, quote
 import history_browser as shipping
 import history_controlled_artifact as artifact_admission
 
-PIN = "a57b23bcd53163efa4782e21b1214a3963006dd2"
-TREE_PIN = "718cbba72ca615733902a4d0c6166a7cb9ac06d2"
+PIN = "9ee218d4a33ebd4b94ea547d60caa62134edb960"
+TREE_PIN = "4c578821bbc18acd4e9e711acd98dcc749a210f8"
 BASE_PIN = "92986f0481df5b1ae9e29bde382670e60f369588"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"

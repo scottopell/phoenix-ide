@@ -3422,3 +3422,22 @@ WNOWAIT signal/drain authority and escaped-helper limitations are unchanged.
 Fresh exact-head Linux/macOS hosted qualification is required; prior2fb695 green
 and completed narrow performance experiments do not qualify this successor or
 establish whole-history neutrality, overhead, native resume or landing clearance.
+
+
+## Successful Linux PGID-zero classification successor
+
+App `9ee218d4a33ebd4b94ea547d60caa62134edb960`, tree
+`4c578821bbc18acd4e9e711acd98dcc749a210f8`, keeps base92986 and all UI bytes
+identical to a57. The 8fe150060 successor failed Linux Rust and native admission
+with `invalid process group` in the real descendant-drain/escaped-writer tests;
+its three injected guards passed. Both macOS39058473717 jobs passed. These
+outcomes are preserved and do not qualify this correction.
+
+Linux `do_getpgid`/`pid_vnr` permits successful zero PGIDs; success zero proves
+nonmembership in the positive owned launch group and must not require stat
+access. The correction uses checked signed-to-unsigned conversion, retaining
+negative-value, unknown-error and unreadable-owned-candidate failure. The same
+three injected tests include initial zero and missing-stat reclassification to
+zero. No exact failing PID or kernel-thread identity was logged, so neither is
+claimed as the observed cause. Root authority, timeouts and assertions remain.
+No local Rust execution is claimed; fresh whole-head qualification is required.
