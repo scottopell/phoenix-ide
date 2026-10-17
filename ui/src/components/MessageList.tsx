@@ -678,8 +678,14 @@ function MessageListImpl({
     [conversationId],
   );
   const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
-  const sourceToolId = sourceCallTarget?.toolUseId ?? null;
   const sourceMessageId = sourceCallTarget?.messageId ?? null;
+  const requestedSourceToolId = sourceCallTarget?.toolUseId ?? null;
+  const sourceToolId = useMemo(() => {
+    if (!sourceMessageId || !requestedSourceToolId) return null;
+    const owner = historicalUnits.flatMap(agentTurnsInHistoricalUnit).find(turn => turn.agent.message_id === sourceMessageId)?.agent;
+    return Array.isArray(owner?.content) && owner.content.some(block => block.type === 'tool_use' && block.id === requestedSourceToolId && block.name !== 'think')
+      ? requestedSourceToolId : null;
+  }, [historicalUnits, requestedSourceToolId, sourceMessageId]);
   const sourceRevealRequest = useMemo<AgentTextRevealRequest | null>(() => {
     const sourceUnit = sourceMessageId ? findHistoricalUnitLocationByMessageId(historicalUnits, sourceMessageId) : null;
     return sourceUnit && sourceToolId ? {
@@ -1475,6 +1481,7 @@ function MessageListImpl({
   }, []);
 
   const scrollToMessageId = useCallback((messageId: string) => {
+    if (messageId === sourceMessageId && requestedSourceToolId && !sourceToolId) return false;
     const location = findHistoricalUnitLocationByMessageId(historicalUnits, messageId);
     if (!location) return false;
     const unit = historicalUnits[location.unitIndex];
@@ -1482,10 +1489,10 @@ function MessageListImpl({
     scrollToUnitIndex(
       location.unitIndex,
       grouped ? location.memberMessageId : undefined,
-      sourceToolId ?? (grouped ? location.toolUseId : undefined),
+      (messageId === sourceMessageId ? sourceToolId : null) ?? (grouped ? location.toolUseId : undefined),
     );
     return true;
-  }, [historicalUnits, scrollToUnitIndex, sourceToolId]);
+  }, [historicalUnits, requestedSourceToolId, scrollToUnitIndex, sourceMessageId, sourceToolId]);
 
   const revealedSourceRef = useRef<string | null>(null);
   useEffect(() => {
@@ -1613,7 +1620,7 @@ function MessageListImpl({
           viewAnchorCommandOwnerRef.current = viewAnchorIntentRef.current ? { key: effect.commandKey, scope: viewAnchorIntentRef.current.scope } : null;
           const targetIndex = findUnitIndexByMessageId(effect.targetMessageId);
           dispatchTranscriptPositioningRef.current(
-            targetIndex < 0
+            targetIndex < 0 || (effect.targetMessageId === sourceMessageId && requestedSourceToolId !== null && sourceToolId === null)
               ? { type: 'target_missing', commandKey: effect.commandKey }
               : { type: 'target_resolved', commandKey: effect.commandKey, targetIndex },
           );
@@ -1621,6 +1628,7 @@ function MessageListImpl({
         }
         case 'position': {
           const command = effect.command;
+          const selectedToolId = command.kind === 'jump_to_message' && command.targetMessageId === sourceMessageId ? sourceToolId : null;
           if (command.kind === 'jump_to_message') {
             const unit = historicalUnits[effect.targetIndex];
             if (unit) {
@@ -1633,13 +1641,13 @@ function MessageListImpl({
                 ...(unit.kind === 'tool_only_agent_turn_group' && location
                   ? { memberMessageId: location.memberMessageId }
                   : {}),
-                ...((sourceToolId || (unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId))
-                  ? { toolUseId: sourceToolId ?? location!.toolUseId }
+                ...((selectedToolId || (unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId))
+                  ? { toolUseId: selectedToolId ?? location!.toolUseId }
                   : {}),
               };
               const grouped = unit.kind === 'tool_only_agent_turn_group';
-              const targetSelector = sourceToolId || (grouped && location?.toolUseId)
-                ? `[data-tool-id="${CSS.escape(sourceToolId ?? location!.toolUseId!)}"]`
+              const targetSelector = selectedToolId || (grouped && location?.toolUseId)
+                ? `[data-tool-id="${CSS.escape(selectedToolId ?? location!.toolUseId!)}"]`
                 : grouped && location
                   ? `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`
                   : undefined;
@@ -1677,7 +1685,7 @@ function MessageListImpl({
                   effect.command.targetMessageId,
                 );
                 const unit = historicalUnits[effect.targetIndex];
-                if (sourceToolId) return `[data-tool-id="${CSS.escape(sourceToolId)}"]`;
+                if (selectedToolId) return `[data-tool-id="${CSS.escape(selectedToolId)}"]`;
                 if (unit?.kind !== 'tool_only_agent_turn_group' || !location) return undefined;
                 return location.toolUseId
                   ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
@@ -1722,7 +1730,7 @@ function MessageListImpl({
           break;
       }
     }
-  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted, sourceToolId]);
+  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted, requestedSourceToolId, sourceMessageId, sourceToolId]);
 
   const dispatchTranscriptPositioning = useCallback((event: TranscriptPositioningEvent) => {
     if (event.type === 'user_interrupted' || event.type === 'executor_detached') transcriptRef.current?.interruptPosition();

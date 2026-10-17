@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import { PillStrip } from './PillStrip';
 import type { PillItem } from './PillStrip';
 import type { Chapter } from '../conversation/conversationChapters';
@@ -15,6 +15,7 @@ interface ConversationNavProps {
   chapters: Chapter[];
   historyBoundaries?: ConversationHistoryBoundaryView[] | undefined;
   onJumpBoundary?: ((messageId: string) => void) | undefined;
+  onChaptersReady?: ((count: number) => void) | undefined;
   /** `unitIndex` of the chapter currently in view (scroll-spy), or null when
    *  none is resolved. Applies the active pill styling. */
   activeUnitIndex: number | null;
@@ -28,7 +29,7 @@ interface ConversationNavProps {
  * jumps the virtualized message list to that unit, and the scroll-spy
  * highlights the chapter currently in view.
  */
-export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoundaries, onJumpBoundary }: ConversationNavProps) {
+export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoundaries, onJumpBoundary, onChaptersReady }: ConversationNavProps) {
   // Memoize on the chapter list + active index so the mapped `items` array is
   // referentially stable across the parent's unrelated re-renders (streaming
   // token churn, heartbeat) — this avoids rebuilding the pill list and
@@ -74,6 +75,8 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump, historyBoun
     ].sort((left, right) => (orderByKey.get(left.key) ?? Number.MAX_SAFE_INTEGER) - (orderByKey.get(right.key) ?? Number.MAX_SAFE_INTEGER)),
     [chapters, activeUnitIndex, onJump, historyBoundaries, onJumpBoundary, orderByKey],
   );
+
+  useEffect(() => { onChaptersReady?.(items.length); }, [items.length, onChaptersReady]);
 
   if (items.length === 0) {
     return null;
