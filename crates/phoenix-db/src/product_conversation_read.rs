@@ -386,7 +386,7 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
      AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
      UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
      WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = (SELECT CASE kind WHEN 'coordinator' THEN 'coordinator' ELSE 'user' END FROM product_conversations WHERE id = ?1) AND successor.parent_conversation_id IS NULL
- ), snapshot_ceiling AS (
+ ), snapshot_ceiling AS MATERIALIZED (
      SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
             json_extract(value, '$.tail_message_id') AS tail_message_id
@@ -2539,6 +2539,169 @@ mod tests {
         .await
         .unwrap();
         assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_page_materializes_bound_snapshot_ceiling_once_with_result_parity() {
+        let (db, root) = bound_ceiling_fixture().await;
+        let mut connection = db.pool.acquire().await.unwrap();
+        let all = full_message_page_rows(
+            &mut connection,
+            PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+            root.product_conversation_id.as_str(),
+            None,
+            None,
+            100,
+        )
+        .await;
+        let ceilings: Vec<_> = all
+            .iter()
+            .filter(|row| row["message_id"].as_str().unwrap().ends_with("-2"))
+            .map(|row| ProductConversationSegmentCeiling {
+                transcript_row_id: row["conversation_id"].as_str().unwrap().to_owned(),
+                tail_sequence_id: 2,
+                tail_message_id: Some(row["message_id"].as_str().unwrap().to_owned()),
+            })
+            .collect();
+        assert_eq!(ceilings.len(), 3);
+        assert_eq!(all.len(), 12);
+        let ceiling = serde_json::to_string(&ceilings).unwrap();
+        let previous = PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL.replacen(
+            "snapshot_ceiling AS MATERIALIZED (",
+            "snapshot_ceiling AS (",
+            1,
+        );
+        assert_ne!(previous, PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL);
+        for boundary in [None, Some(ceiling.as_str()), Some("[]")] {
+            let mut cursor = None;
+            let mut pages = 0;
+            let mut rows = 0;
+            loop {
+                let actual = full_message_page_rows(
+                    &mut connection,
+                    PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                    root.product_conversation_id.as_str(),
+                    cursor.as_ref(),
+                    boundary,
+                    2,
+                )
+                .await;
+                let expected = full_message_page_rows(
+                    &mut connection,
+                    &previous,
+                    root.product_conversation_id.as_str(),
+                    cursor.as_ref(),
+                    boundary,
+                    2,
+                )
+                .await;
+                assert_eq!(actual, expected);
+                rows += actual.len();
+                let Some(last) = actual.last() else {
+                    break;
+                };
+                cursor = Some((
+                    last["ordinal"].as_i64().unwrap(),
+                    last["sequence_id"].as_i64().unwrap(),
+                    last["message_id"].as_str().unwrap().to_owned(),
+                ));
+                pages += 1;
+                assert!(pages <= all.len(), "cursor must advance to exhaustion");
+            }
+            assert_eq!(
+                rows,
+                match boundary {
+                    None => all.len(),
+                    Some("[]") => 0,
+                    Some(_) => 6,
+                }
+            );
+        }
+        assert_materialized_ceiling_plan(
+            &mut connection,
+            root.product_conversation_id.as_str(),
+            &ceiling,
+        )
+        .await;
+    }
+
+    async fn bound_ceiling_fixture() -> (Database, crate::Conversation) {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("ceiling-plan", "ceiling-plan", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut member = root.id.clone();
+        for ordinal in 0..3 {
+            if ordinal > 0 {
+                member = db
+                    .continue_conversation(&member)
+                    .await
+                    .unwrap()
+                    .conversation
+                    .id;
+            }
+            for sequence in 1..=4_i64 {
+                let message = crate::Message::new_user(
+                    format!("perf-{ordinal}-{sequence}"),
+                    member.clone(),
+                    sequence,
+                    "ceiling fixture".into(),
+                );
+                db.save_message(&message, None).await.unwrap();
+            }
+        }
+        (db, root)
+    }
+
+    async fn assert_materialized_ceiling_plan(
+        connection: &mut SqliteConnection,
+        product_id: &str,
+        ceiling: &str,
+    ) {
+        let explain = format!("EXPLAIN QUERY PLAN {PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL}");
+        let plan = sqlx::query(sqlx::AssertSqlSafe(explain.as_str()))
+            .bind(product_id)
+            .bind(ceiling)
+            .bind(2_i64)
+            .bind(2_i64)
+            .bind("perf-2-3")
+            .bind(2_i64)
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap();
+        let details: Vec<String> = plan
+            .iter()
+            .map(|row| row.try_get("detail").unwrap())
+            .collect();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("MATERIALIZE snapshot_ceiling"))
+                .count(),
+            1,
+            "{details:?}"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("json_each VIRTUAL TABLE"))
+                .count(),
+            1,
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("MATERIALIZE selected")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("messages_conversation_sequence")),
+            "{details:?}"
+        );
     }
 
     #[tokio::test]
