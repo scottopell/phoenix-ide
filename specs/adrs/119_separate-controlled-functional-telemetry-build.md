@@ -22,7 +22,7 @@ Only the cfgtest loopback preview may admit the controlled artifact after indepe
 
 Native resume remains unsupported until an actual standalone PWA foreground or persisted BFCache lane is available. Plain desktop tab foregrounding does not satisfy the hook's resume preconditions. Synthetic events, standalone overrides, fabricated BFCache or forced readiness/outcomes are prohibited. No overhead numeric budget is adopted by this decision.
 
-## Alternatives
+## Options considered
 
 - Fixed random sequence: adds unnecessary sequence identity/state and misleading quarter-rate semantics; rejected.
 - Public/runtime switch or global Math.random patch: leaks a control plane into normal operation; rejected.
