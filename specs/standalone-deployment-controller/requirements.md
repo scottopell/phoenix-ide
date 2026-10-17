@@ -538,3 +538,37 @@ THE SYSTEM SHALL report deterministic in-process qualification separately from n
 process-death/reconnect qualification. Passing either SHALL NOT constitute production
 adoption, installer integration, deployment authorization, or proof of exactly-once
 execution across crash.
+
+---
+
+### REQ-SDC-021: Exact Native Owned-Root Enumeration
+
+WHEN resource admission produces a child-enumeration obligation for the harmless
+supervised workload
+THE runner SHALL durably issue the exact committed `ListChildren` effect before
+native submission, and the guardian SHALL independently verify the current session,
+revision, key, deadline, parent identity, durable issue, and exact guardian-owned
+root slot before one bounded enumeration. A caller-provided PID/birth pair, wire DTO,
+label, socket path, or persisted binding row alone SHALL NOT authorize enumeration.
+
+WHEN native child enumeration completes
+THE runner SHALL correlate the exact retained typed result, preserve its complete
+received PID order as durable evidence, and atomically apply its canonicalized PID set
+through the same policy loop before acknowledgement. The controller store SHALL retain
+normalized issue, application, ordered result-child,
+and acknowledgement evidence without a result blob or duplicate deadline. Failed,
+malformed, stale, ambiguous, mismatched, or expired results SHALL remain retained or
+fail stopped without advancing ownership policy or authorizing acknowledgement.
+
+WHEN successful enumeration returns no child PIDs
+THE SYSTEM MAY complete that root's ownership-discovery scan and enter owned-tree
+cleanup, but SHALL NOT treat emptiness as proof that the root is absent, clean, or
+ready for disruption. A listed PID remains discovery evidence until a birth token is
+acquired and exact identity observation adopts it into the owned tree.
+
+WHEN a runner dies after child-list application but before acknowledgement
+A same-live replacement session MAY acknowledge the exact retained result after
+re-reading durable application evidence without re-enumerating or reapplying it.
+Establishing that fresh session interrupts the ownership checkpoint; acknowledgement
+alone SHALL NOT reconstruct a policy loop, resume cleanup, authorize identity
+observation, or claim readiness for disruption.

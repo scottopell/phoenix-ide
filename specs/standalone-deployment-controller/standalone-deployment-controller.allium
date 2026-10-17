@@ -26,6 +26,7 @@
 -- REQ-SDC-018: NativeGuardianPersistenceBoundary and NativeGuardianReconnectBoundary
 -- REQ-SDC-019: NativeSameBuildBoundary
 -- REQ-SDC-020: NativeGuardianQualificationBoundary
+-- REQ-SDC-021: NativeDispatchAdmissionBoundary, NativeGuardianPersistenceBoundary, NativeGuardianQualificationBoundary
 
 value ProcessIdentity {
     pid: Integer
@@ -978,6 +979,14 @@ contract NativeDispatchAdmissionBoundary {
         -- Unknown, spent, fenced, wrong-instance/session/key/effect tokens execute
         -- nothing. Duplicate or uncertain delivery never automatically replays.
 
+    @invariant ExactOwnedRootEnumeration
+        -- A native ListChildren admission consumes the exact committed pending
+        -- effect and independently rereads its durable issue. The live guardian
+        -- accepts only the current session, key, revision, deadline, parent identity,
+        -- and its sole exact owned root slot. A PID/birth DTO, persisted binding,
+        -- label, or socket path alone cannot authorize enumeration. The complete
+        -- child vector is bounded before allocation and retained as one typed result.
+
     @invariant CapacityBeforeFirstMutation
         -- Reserve result custody for the complete mutation round before its first
         -- effect. Reservation or admission refusal before execution emits no partial
@@ -1011,6 +1020,27 @@ contract NativeGuardianPersistenceBoundary {
         -- same-instance reattachment and proof of durable application, even while
         -- fresh reconciliation is incomplete. ACK cannot restore mutation authority.
         -- Lost ACK allows repeat evidence retrieval/ACK, not application/effect replay.
+
+    @invariant NormalizedChildListApplication
+        -- Native child-list issue, application, ordered result-child, and ACK
+        -- evidence occupy normalized rows. No result blob or second deadline
+        -- represents the same fact. Successful application consumes the original
+        -- affine ticket and verified completion through the same policy loop in the
+        -- checkpoint transaction before ACK. Result-child rows preserve received
+        -- order while policy canonicalizes PID hints before discovery. Query failure,
+        -- malformed rows, stale
+        -- evidence, mismatch, ambiguity, and deadline expiry grant no ACK or policy
+        -- advance. Empty success closes only that pending scan; it is neither root
+        -- absence nor cleanup verification, and listed PIDs still require birth-token
+        -- acquisition before they can become owned process identities.
+
+    @invariant ChildListAckRecoveryIsNotCleanupRecovery
+        -- A same-live fresh session may ACK an earlier successful child-list result
+        -- only from exact durable application evidence. It does not re-enumerate,
+        -- reapply, reconstruct a ticket or policy loop, observe identity, or restore
+        -- cleanup authority. Establishing the replacement session interrupts the
+        -- ownership checkpoint, so ACK-only recovery remains interrupted and
+        -- cleanup progress requires the separate identity-reconciliation barrier.
 
     @invariant RecoveredSampleApplicationIsNotDispatch
         -- A fresh reconciling session may combine the sole durable pending issue with
@@ -1083,6 +1113,13 @@ contract NativeGuardianQualificationBoundary {
         -- refusal without partial mutation. In-process results do not prove IPC
         -- or survival; neither qualification authorizes production adoption,
         -- installer integration, helper invocation, or exactly-once crash claims.
+        -- One bounded journey continues a successful resource sample into the exact
+        -- guardian-owned root ListChildren successor, applies an empty result, ACKs,
+        -- and reaches owned-tree cleanup without dispatching identity observation.
+        -- Another kills the runner after durable child-list application and proves
+        -- same-live ACK recovery without re-enumeration or reapplication; because
+        -- fresh session establishment interrupts ownership, that journey remains
+        -- interrupted rather than claiming cleanup or readiness.
 }
 
 -- Helper meanings
