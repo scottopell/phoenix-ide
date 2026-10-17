@@ -1,6 +1,28 @@
-use super::*;
+use super::{
+    console, delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch,
+    profile_marker_path, user_data_dir_for_key, write_profile_marker_atomic, BrowserError,
+    BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch, BrowserRetirementFenceKey,
+    BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
+    BrowserSessionLifecycleSink, BrowserSessionLookup, BrowserSessionManager,
+    BrowserSessionRegistryState, ProfileDeletionProof, ProfilingState, MAX_CONSOLE_LOGS,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_group::OwnedChromeGroup;
+use chromiumoxide::{
+    browser::Browser,
+    fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
+    Page,
+};
+use futures::StreamExt;
+use phoenix_core::process_identity::current_process_identity;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
+use tokio::sync::{Notify, RwLock};
+use tokio::task::JoinHandle;
 
 #[derive(Clone, Copy, Default)]
 pub(super) enum ProfilePolicy {
@@ -214,7 +236,7 @@ impl LaunchSlot {
         }
     }
 
-    async fn initialize(&self, state: &mut LaunchState) -> Result<(), BrowserError> {
+    fn prepare_existing_profile(&self) -> Result<(), BrowserError> {
         if self.profile.exists() {
             if self.profile
                 != user_data_dir_for_key(
@@ -231,6 +253,11 @@ impl LaunchSlot {
                 &self.key,
             )?;
         }
+        Ok(())
+    }
+
+    async fn initialize(&self, state: &mut LaunchState) -> Result<(), BrowserError> {
+        self.prepare_existing_profile()?;
         #[cfg(test)]
         let fault = self.fault.lock().unwrap().clone();
         #[cfg(test)]
@@ -506,7 +533,6 @@ impl PendingBrowser {
                 InitialAuthority::RootOnly => None,
                 InitialAuthority::Unadopted => unreachable!(),
             },
-            chrome_pid: self.identity.chrome_process.map(|process| process.pid),
             chrome_process: self.identity.chrome_process,
             launch_identity: self.identity,
             browser: self.browser,
@@ -559,7 +585,9 @@ async fn select_executable() -> Result<PathBuf, BrowserError> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use crate::session::{session_key, BrowserRetirementOutcome, ScopedSession};
+    use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     pub(in crate::session) struct LaunchFault {
         pub(super) opaque: bool,
@@ -912,7 +940,9 @@ pub(super) mod tests {
             tokio::spawn(async move {
                 let mut state = slot.state.write().await;
                 entered.notify_one();
-                release.notified().await;
+                tokio::time::timeout(std::time::Duration::from_secs(20), release.notified())
+                    .await
+                    .expect("launch release event");
                 *state = LaunchState::UnobservableAttempt(
                     "injected timeout after caller cancellation".into(),
                 );
@@ -920,7 +950,9 @@ pub(super) mod tests {
             })
         };
         *slot.driver.lock().unwrap() = Some(driver);
-        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(20), entered.notified())
+            .await
+            .expect("launch entered event");
         let waiter = {
             let slot = slot.clone();
             tokio::spawn(async move { slot.wait_ready().await })

@@ -1,7 +1,8 @@
 # ADR-123: Retain pre-session browser authority and distinguish CLI profile lifetimes
 
-Status: Accepted
-Affects: browser session lifecycle; standalone browser CLI
+- **Status:** Accepted
+- **Date:** 2026-10-17
+- **Affects:** browser session lifecycle; standalone browser CLI
 
 ## Context
 
