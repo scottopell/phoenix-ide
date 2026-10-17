@@ -4342,7 +4342,7 @@ mod native_evidence_tests {
                 panic!("identity attempt must checkpoint interruption")
             };
             let interruption_revision = (*interruption)
-                .persist(&mut store)
+                .persist(&mut *store)
                 .unwrap()
                 .checkpoint()
                 .persistence_revision()
@@ -4376,7 +4376,6 @@ mod native_evidence_tests {
         };
         let expected = Response::RecoveredNativeIdentityObservation {
             key,
-            target: root.into(),
             observation: WireIdentityObservation::ExactIdentityAbsent,
         };
         assert_eq!(fixture.server.handle(request.clone()), expected);
