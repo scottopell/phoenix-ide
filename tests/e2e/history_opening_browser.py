@@ -5,7 +5,7 @@
 # ///
 """INSTRUMENTED runtime qualification, never shipping proof; never builds/installs.
 
-Inputs are a clean independent ea2d362 checkout, independently built ignored
+Inputs are a clean independent checkout matching PIN/TREE_PIN, independently built ignored
 libtest executable and its CI receipt. Receipt extends opening-instrumented-
 receipt.json with UI and telemetry-module hashes measured AFTER the UI build.
 Opt-in hosted joint mode runtime-imports four hash-attested telemetry harness
@@ -33,9 +33,9 @@ from urllib.parse import urlparse, urlencode, quote
 import history_browser as shipping
 import history_controlled_artifact as artifact_admission
 
-PIN = "35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f"
-TREE_PIN = "a548be3b0ad35596434018068e297bf3f5066af5"
-BASE_PIN = "7af06a4004b97b534d468b6ca2f42c145c8d4fb9"
+PIN = "1adc16f50e29969bfdc5c58537278c7494b9a228"
+TREE_PIN = "73cc921325e86d899dd357696679c1d05c06f01f"
+BASE_PIN = "d07417325246d1ad1787af468b168bdae397c067"
 DRIVER = "opening_qualifier::actual_server_opening_qualifier"
 COLLECTOR_TEST = "api::view_journey::tests::collector_witness_requires_real_auth_and_validation_and_counts_each_acceptance"
 SDK_METADATA_TEST = "api::view_journey::tests::pinned_default_layer_emits_typed_sdk_metadata_separately_from_journey_fields"

@@ -1283,7 +1283,8 @@ class FixtureSettlementTests(unittest.TestCase):
             migrations = subprocess.check_output([
                 "git", "-C", str(Path(os.environ.get("APP_ROOT", str(opening.ROOT / "target/history-hidden-geometry-repair"))).resolve()),
                 "show", f"{opening.PIN}:crates/phoenix-db/src/migrations.rs"], text=True)
-            product_schema = migrations.rsplit("CREATE TABLE product_creation_jobs (", 1)[1]
+            migration = migrations.split('const MIGRATION_091: &str = r"', 1)[1].split('\n";', 1)[0]
+            product_schema = migration.split("CREATE TABLE product_creation_jobs (", 1)[1]
             product_schema = product_schema.split("CREATE INDEX product_creation_jobs_claim_order", 1)[0]
             db.executescript("CREATE TABLE product_creation_jobs (" + product_schema)
             db.execute("INSERT INTO instance_identity VALUES(1, ?)", (self.instance,))

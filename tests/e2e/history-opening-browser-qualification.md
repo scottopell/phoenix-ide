@@ -2935,3 +2935,60 @@ Run `38996536868` is fully terminal **failure**: witness timed out waiting for
 unsignaled normal stop; Rust and every standard lane succeeded. The acknowledged
 normal-stop candidate is published only after this complete result. App35f,
 six-scenario browser driver, raw semantic validators and deadlines are unchanged.
+
+### Current-main landing successor: preserved baseline, stronger executable gates
+
+The exact green baseline remains immutable: PR908 sharededac/app35f, whole run
+38997749429, with durable accepted evidence in PR comment6229102693. It is not
+replaced, rebased or retrospectively reclassified by the landing work.
+
+A separate integration/v013-history-current-main successor incorporates pinned
+main d07417325246d1ad1787af468b168bdae397c067. Live PR898 is the common product
+source (3a7ea), PR908 targets its older qualification base8a273; the successor
+will target main rather than pretending the old stack is directly mergeable.
+The product writer composed original-boundary/coordinator semantics with main's
+unpublished-creation filter, MATERIALIZED selected IDs, async event presentation,
+SSE and typed wire/schema contracts. Independent backend/UI static reviews found
+no demonstrated composition blockers; hosted Rust/codegen remain owed.
+
+ADR namespace repair preserves every main ADR100–114 byte-for-byte, keeps115,
+and assigns history116/pagehide117/span-schema118/controlled-build119. The merge
+recognizes the old shared history100 as the same renamed116, leaving no duplicate
+numeric prefixes. The source integration and baseline are separate evidence.
+
+Current review-thread triage also identified real shared-oracle gaps. Successor
+changes require all older GETs to complete successfully, await independently
+signaled producer ownership, observe an actual successful composer POST to the
+latest owner (guarding wrong/duplicate writes before dispatch), reject opacity0
+on target/ancestors, require contiguous reconnect replay and exact acknowledged
+chat authority, and restrict stock detail joins to successful completed fixture
+GETs. Pending nonready requests remain intentionally pending; no positive oracle
+was weakened. Red-first mutation tests preceded these changes. Independent
+source-only shared review found no blocking defect; the successful baseline does
+not claim this stronger new probe had already run.
+
+Stop ownership is now explicit: controlled Python requests stop; stock's browser
+already owns its stop and Python only awaits exit, avoiding a second socket
+command during teardown. Standalone Cargo/Rayon/Rust worker caps are2, missing
+physical/navigation Node tests are scheduled, phase bounds compose under a
+90-minute job with cleanup/upload reserve, and outer witness420s contains the
+230s browser bound +2s stop +65s exit +60s auxiliary reserve. The existing65s
+normal drain bound is not increased. Frozen geometry reproduction now checks out
+its exact191dac harness bundle alongside its original302a app/artifact98718;
+it no longer imports moving source identity from the landing harness.
+
+Parent independent cached validation at initial product integration1adc:
+genuine composite tsc-b,689 tests18 app files,310 shared tests passing with2
+existing optional-fixture skips. Python79 initially exposed9 errors:8 came from
+its schema test's rsplit selecting a newly added Rust test string instead of the
+actual migration; the fixture now extracts MIGRATION_091 explicitly. The ninth
+was a real product-source preservation gate: donor b17 and independently
+qualified35f are not byte-identical (10 file differences), and donor's cfg(test)
+opening helper lacks the qualified password/home-permission packet. The product
+writer is composing the entire qualified35f delta into the current-main source
+before any hosted qualification. This is not papered over by changing the auth
+assertion or inheriting green35f qualification for a different tree.
+
+No successor hosted runner, local native/browser/build, production action or
+merge has occurred at this entry. Overhead and native/device resume remain
+separate unadopted decisions, not blockers to executable source integration.

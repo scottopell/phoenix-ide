@@ -214,7 +214,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f
+          ref: 1adc16f50e29969bfdc5c58537278c7494b9a228
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -256,7 +256,7 @@ jobs:
           spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
           import sys
           module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
-          source='35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f'; tree='a548be3b0ad35596434018068e297bf3f5066af5'
+          source='1adc16f50e29969bfdc5c58537278c7494b9a228'; tree='73cc921325e86d899dd357696679c1d05c06f01f'
           for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
               module.admit_artifact(root, root/'ui'/name, source, tree, mode)
           (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
@@ -267,9 +267,9 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = 35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f
-          test "$(git rev-parse HEAD^{tree})" = a548be3b0ad35596434018068e297bf3f5066af5
-          test "$(git merge-base HEAD 7af06a4004b97b534d468b6ca2f42c145c8d4fb9)" = 7af06a4004b97b534d468b6ca2f42c145c8d4fb9
+          test "$(git rev-parse HEAD)" = 1adc16f50e29969bfdc5c58537278c7494b9a228
+          test "$(git rev-parse HEAD^{tree})" = 73cc921325e86d899dd357696679c1d05c06f01f
+          test "$(git merge-base HEAD d07417325246d1ad1787af468b168bdae397c067)" = d07417325246d1ad1787af468b168bdae397c067
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
           ./dev.py codegen 2>&1 | tee "$GITHUB_WORKSPACE/opening-codegen.log"
@@ -287,7 +287,7 @@ jobs:
           pathlib.Path('../opening-codegen-receipt.json').write_text(json.dumps({
               'app_source': subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
               'app_tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),
-              'app_base': subprocess.check_output(['git','merge-base','HEAD','7af06a4004b97b534d468b6ca2f42c145c8d4fb9'],text=True).strip(),
+              'app_base': subprocess.check_output(['git','merge-base','HEAD','d07417325246d1ad1787af468b168bdae397c067'],text=True).strip(),
               'telemetry_modules': telemetry,
               'harness_source': '${{ github.event.pull_request.head.sha }}',
               'rustc': subprocess.check_output(['rustc','--version'],text=True).strip(),
@@ -311,14 +311,14 @@ jobs:
               (out/'opening-coordinator-home-fixture.log').write_text(text(error.stdout)+text(error.stderr))
               (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
                   'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
-                  'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+                  'app_base':'d07417325246d1ad1787af468b168bdae397c067',
                   'command':command,'exit_status':None,'timed_out':True,'timeout_seconds':900,
                   'scope':'failed actual DB fixture timeout, not qualification'},indent=2))
               raise
           (out/'opening-coordinator-home-fixture.log').write_text(completed.stdout+completed.stderr)
           (out/'opening-coordinator-home-fixture-receipt.json').write_text(json.dumps({
               'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
-              'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+              'app_base':'d07417325246d1ad1787af468b168bdae397c067',
               'command':command,'exit_status':completed.returncode,
               'scope':'actual DB owned-home continuation admission test, not app/browser qualification'},indent=2))
           assert completed.returncode == 0, 'owned Coordinator fixture failed; see retained log'
@@ -445,7 +445,7 @@ jobs:
           sha=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
           git=lambda *args:subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
           receipt={'app_source':git('rev-parse','HEAD'),'app_tree':git('rev-parse','HEAD^{tree}'),
-                   'app_base':'7af06a4004b97b534d468b6ca2f42c145c8d4fb9',
+                   'app_base':'d07417325246d1ad1787af468b168bdae397c067',
                    'harness_source':subprocess.check_output(['git','-C',str(out/'harness'),'rev-parse','HEAD'],text=True).strip(),
                    'command':'PHOENIX_CHECK_ALL=1 PHOENIX_CHECK_WORKERS=2 ./dev.py check --lanes tsc,ui-lint,vitest',
                    'vitest_config_sha256':sha(root/'ui/vitest.config.ts'),
