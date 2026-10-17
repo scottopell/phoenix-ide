@@ -218,7 +218,12 @@ mod tests {
             phoenix_core::llm_language::LlmLanguage::PhoenixNative,
             Some(temp.path()),
         );
-        assert!(prompt.contains("Documented Phoenix API operations through scoped Bash"));
+        assert!(prompt.contains("Supported public Phoenix API operations through scoped Bash"));
+        assert!(prompt.contains("non-exhaustive, not an endpoint allowlist"));
+        assert!(prompt.contains("inspected current deployment/source contracts and user authority"));
+        assert!(prompt.contains("immutable targets and endpoint-specific retry rules"));
+        assert!(prompt.contains("freshly read state and verify results"));
+        assert!(!prompt.contains("Documented Phoenix API operations"));
         assert!(prompt.contains("phoenix-api"));
         assert!(!prompt.contains("cannot create conversations"));
         assert!(!prompt.contains("NEVER call Phoenix HTTP API through Bash"));

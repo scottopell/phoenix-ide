@@ -538,6 +538,7 @@ for identity_path in [
     'crates/phoenix-ide/Cargo.toml',
     'scripts/verify-published-release.sh',
     'scripts/test-verify-published-release.sh',
+    'scripts/sign-notarize-browser-cli.sh',
 ]:
     if macos_workflow.count(f'"{identity_path}"') != 2:
         raise SystemExit(f'macOS workflow must trigger on {identity_path} for pull requests and pushes')
@@ -563,5 +564,134 @@ if '[0-9a-f]{40}(-dirty)?' not in sidecar_script:
 
 if '"$version" "$full_commit"' not in macos_workflow or 'short_commit' in macos_workflow:
     raise SystemExit('real unsigned macOS workflow fixture must embed the full Git commit')
+
+
+# Source capability is evaluated against the immutable release commit, so a
+# retry of a pre-CLI tag keeps its original eight-payload asset contract.
+capability = workflow.split('      - name: Resolve browser CLI from immutable source\n', 1)[1].split('\n  tag-release:', 1)[0]
+capability_shell = capability.split('        run: |\n', 1)[1]
+capability_shell = '\n'.join(line[10:] for line in capability_shell.splitlines())
+with tempfile.TemporaryDirectory() as temporary:
+    repo = Path(temporary)
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    git_env = dict(os.environ, GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.com',
+                   GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.com')
+    (repo / 'README').write_text('historical source')
+    subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'historical'], cwd=repo, env=git_env, check=True)
+    old = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+    entrypoint = repo / 'crates/phoenix-tools/src/bin/phoenix-browser.rs'
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text('fn main() {}')
+    subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'browser entrypoint'], cwd=repo, env=git_env, check=True)
+    new = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+    for commit, release, expected in [(old, 'true', 'false'), (new, 'true', 'true'),
+                                       (new, 'false', 'false')]:
+        output = repo / 'outputs'
+        output.unlink(missing_ok=True)
+        subprocess.run(['bash', '-euo', 'pipefail', '-c', capability_shell], cwd=repo,
+                       env=dict(os.environ, SOURCE_COMMIT=commit, RELEASE=release,
+                                GITHUB_OUTPUT=str(output)), check=True)
+        assert output.read_text() == f'browser_cli={expected}\n'
+
+linux_job = job_sections['build-linux']
+for section, step in [(linux_job, 'Build and smoke native Linux browser CLI'),
+                      (build_macos_job, 'Build native macOS browser CLI')]:
+    browser_step = section.split('      - name: ' + step + '\n', 1)[1].split('      - ', 1)[0]
+    assert "needs.gate.outputs.browser_cli == 'true'" in browser_step
+    assert 'cargo build --locked -p phoenix-tools --bin phoenix-browser --profile release-min --target' in browser_step
+    assert '--release ' not in browser_step
+assert "if: needs.gate.outputs.release == 'true' && needs.gate.outputs.browser_cli == 'true'" in build_macos_job
+assert 'if [[ "${{ needs.gate.outputs.release }}" == true && "${{ needs.gate.outputs.browser_cli }}" == true ]]; then\n            bash scripts/sign-notarize-browser-cli.sh' in build_macos_job
+assert 'rm -rf "$RUNNER_TEMP"/phoenix-browser-notary.* || cleanup_failed=1' in build_macos_job
+assert '${{ runner.temp }}/release-assets/phoenix-browser-${{ matrix.target }}' in release_upload
+assert 'phoenix-browser-${{ matrix.target }}' in linux_job
+assert 'phoenix-browser-' not in build_macos_job.split('          name: desktop-preparation-', 1)[1]
+required_shell = publish_job.split('          required=(\n', 1)[1].split('          for asset in', 1)[0]
+assert 'if [[ "${{ needs.gate.outputs.browser_cli }}" == true ]]; then' in required_shell
+for target in ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl',
+               'x86_64-apple-darwin', 'aarch64-apple-darwin']:
+    assert f'phoenix-browser-{target}\n' in required_shell
+assert required_shell.count('phoenix-browser-') == 4
+for capability, expected_count in [('false', 8), ('true', 12)]:
+    shell = 'required=(\n' + required_shell
+    shell = shell.replace('${{ needs.gate.outputs.browser_cli }}', capability)
+    shell = shell.replace('${{ needs.gate.outputs.tag }}', 'v0.13.0-rc.3')
+    shell += '\nprintf "%s\\n" "${required[@]}"\n'
+    payloads = subprocess.check_output(['bash', '-euo', 'pipefail', '-c', shell], text=True).splitlines()
+    assert len(payloads) == len(set(payloads)) == expected_count
+    assert sum(name.startswith('phoenix-browser-') for name in payloads) == expected_count - 8
+    assert not any(name.startswith('phoenix-browser-') and name.endswith('-debug') for name in payloads)
+
+# Exercise the real signing/notarization helper with external tools replaced.
+# No Apple credentials, network requests, Chrome, or Phoenix server are used.
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    tool = base / 'tool'
+    tool.write_text(r"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+name = Path(sys.argv[0]).name
+with Path(os.environ['CALLS']).open('a') as log:
+    log.write(json.dumps([name] + sys.argv[1:]) + '\n')
+if name == 'lipo':
+    print(os.environ['ARCH'])
+elif name == 'codesign' and '--verify' in sys.argv and os.environ.get('VERIFY_FAIL') == 'yes':
+    raise SystemExit(1)
+elif name == 'codesign' and '--display' in sys.argv:
+    print('Authority=' + os.environ.get('AUTHORITY', 'Developer ID Application: Fixture'))
+    print('TeamIdentifier=' + os.environ.get('TEAM', 'ABCDEFGHIJ'))
+    print('CodeDirectory v=20500 flags=' + os.environ.get('FLAGS', '0x10000(runtime)'))
+    if os.environ.get('TIMESTAMP', 'yes') == 'yes':
+        print('Timestamp=Fixture timestamp')
+elif name == 'ditto':
+    Path(sys.argv[-1]).write_bytes(b'notary zip')
+elif name == 'xcrun':
+    if os.environ.get('SUBMIT_FAIL') == 'yes':
+        raise SystemExit(1)
+    print(json.dumps({'status': os.environ.get('NOTARY_STATUS', 'Accepted')}))
+elif name == 'browser':
+    if os.environ.get('SMOKE_FAIL') == 'yes':
+        raise SystemExit(1)
+""")
+    tool.chmod(0o755)
+    for name in ['lipo', 'codesign', 'ditto', 'xcrun', 'browser']:
+        (base / name).symlink_to(tool)
+    key = base / 'key.p8'
+    key.write_text('fixture')
+    common = dict(os.environ, MACOS_SIGNING_IDENTITY='fixture identity', APPLE_TEAM_ID='ABCDEFGHIJ',
+                  APP_STORE_CONNECT_API_KEY_PATH=str(key), APP_STORE_CONNECT_KEY_ID='KLMNOPQRST',
+                  APP_STORE_CONNECT_ISSUER_ID='fixture issuer', RUNNER_TEMP=str(base),
+                  CODESIGN=str(base / 'codesign'), LIPO=str(base / 'lipo'),
+                  DITTO=str(base / 'ditto'), XCRUN=str(base / 'xcrun'),
+                  PYTHON3=sys.executable, CALLS=str(base / 'calls'))
+    cases = [({}, True), ({'ARCH': 'x86_64', 'TARGET': 'x86_64-apple-darwin'}, True),
+             ({'ARCH': 'x86_64'}, False), ({'TEAM': 'ABCDEFGHIJextra'}, False),
+             ({'AUTHORITY': 'ad hoc'}, False), ({'FLAGS': '0x0'}, False),
+             ({'TIMESTAMP': 'no'}, False), ({'NOTARY_STATUS': 'Invalid'}, False),
+             ({'VERIFY_FAIL': 'yes'}, False), ({'SUBMIT_FAIL': 'yes'}, False),
+             ({'SMOKE_FAIL': 'yes'}, False)]
+    for overrides, success in cases:
+        calls = base / 'calls'
+        calls.unlink(missing_ok=True)
+        env = dict(common, ARCH='arm64')
+        env.update(overrides)
+        result = subprocess.run(['bash', 'scripts/sign-notarize-browser-cli.sh', str(base / 'browser'),
+                                 overrides.get('TARGET', 'aarch64-apple-darwin')],
+                                env=env, capture_output=True, text=True)
+        assert (result.returncode == 0) == success, (overrides, result.stderr)
+        commands = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert not list(base.glob('phoenix-browser-notary.*')), overrides
+        if success:
+            sign = next(command for command in commands if command[:2] == ['codesign', '--force'])
+            assert sign[1:-1] == ['--force', '--sign', 'fixture identity', '--options', 'runtime', '--timestamp']
+            submit = next(command for command in commands if command[0] == 'xcrun')
+            assert submit[1:3] == ['notarytool', 'submit']
+            assert submit[-3:] == ['--wait', '--output-format', 'json']
+            smoke = [command[1:] for command in commands if command[0] == 'browser']
+            assert smoke == [['--help'], ['--json', 'schema', 'snapshot']]
+        elif 'SMOKE_FAIL' not in overrides:
+            assert not any(command[0] == 'browser' for command in commands)
 
 print('desktop release workflow regression checks passed')

@@ -20,7 +20,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Parse duration from string like "15s", "1m", "500ms"
-pub(super) fn parse_duration(s: &str) -> Option<Duration> {
+#[must_use]
+pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if let Some(ms) = s.strip_suffix("ms") {
         ms.trim().parse().ok().map(Duration::from_millis)
@@ -30,7 +31,8 @@ pub(super) fn parse_duration(s: &str) -> Option<Duration> {
         m.trim()
             .parse::<u64>()
             .ok()
-            .map(|m| Duration::from_secs(m * 60))
+            .and_then(|m| m.checked_mul(60))
+            .map(Duration::from_secs)
     } else {
         s.parse().ok().map(Duration::from_secs)
     }
@@ -118,6 +120,15 @@ impl Tool for BrowserNavigateTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserNavigateTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: NavigateInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -130,7 +141,7 @@ impl Tool for BrowserNavigateTool {
             .unwrap_or(DEFAULT_TIMEOUT);
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -225,6 +236,15 @@ impl Tool for BrowserEvalTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserEvalTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: EvalInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -237,7 +257,7 @@ impl Tool for BrowserEvalTool {
             .unwrap_or(DEFAULT_TIMEOUT);
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -302,6 +322,7 @@ impl Tool for BrowserEvalTool {
                         return ToolOutput::error(format!("Failed to write large output: {e}"));
                     }
                     ToolOutput::success(format!("Output written to {path} (use `cat` to view)"))
+                        .with_display(json!({"artifact_path": path}))
                 } else {
                     ToolOutput::success(format!(
                         "<javascript_result>{json_str}</javascript_result>"
@@ -360,6 +381,15 @@ impl Tool for BrowserTakeScreenshotTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserTakeScreenshotTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: ScreenshotInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -372,7 +402,7 @@ impl Tool for BrowserTakeScreenshotTool {
             .unwrap_or(DEFAULT_TIMEOUT);
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -425,12 +455,12 @@ impl Tool for BrowserTakeScreenshotTool {
                 let base64_data =
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
 
-                ToolOutput::success(format!("Screenshot taken (saved as {path})")).with_images(
-                    vec![crate::ToolImage {
+                ToolOutput::success(format!("Screenshot taken (saved as {path})"))
+                    .with_display(json!({"artifact_path": path}))
+                    .with_images(vec![crate::ToolImage {
                         media_type: "image/png".to_string(),
                         data: base64_data,
-                    }],
-                )
+                    }])
             }
             Ok(Err(e)) => ToolOutput::error(format!("Screenshot failed: {e}")),
             Err(_) => ToolOutput::error(format!("Timeout after {timeout:?}")),
@@ -487,13 +517,22 @@ impl Tool for BrowserRecentConsoleLogsTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserRecentConsoleLogsTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: ConsoleLogsInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -538,6 +577,7 @@ impl Tool for BrowserRecentConsoleLogsTool {
                 return ToolOutput::error(format!("Failed to write logs: {e}"));
             }
             ToolOutput::success(format!("Logs written to {path} (use `cat` to view)"))
+                .with_display(json!({"artifact_path": path}))
         } else {
             ToolOutput::success(json_str)
         }
@@ -567,9 +607,18 @@ impl Tool for BrowserClearConsoleLogsTool {
         })
     }
 
-    async fn run(&self, _input: Value, ctx: ToolContext) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserClearConsoleLogsTool {
+    pub(super) async fn run_browser(
+        _input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -632,6 +681,15 @@ impl Tool for BrowserResizeTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserResizeTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 
         let input: ResizeInput = match serde_json::from_value(input) {
@@ -650,7 +708,7 @@ impl Tool for BrowserResizeTool {
             .unwrap_or(DEFAULT_TIMEOUT);
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -737,6 +795,15 @@ impl Tool for BrowserWaitForSelectorTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserWaitForSelectorTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: WaitForSelectorInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -749,7 +816,7 @@ impl Tool for BrowserWaitForSelectorTool {
             .unwrap_or(Duration::from_secs(30));
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -889,6 +956,15 @@ impl Tool for BrowserClickTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserClickTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: ClickInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -901,7 +977,7 @@ impl Tool for BrowserClickTool {
             .unwrap_or(Duration::from_secs(30));
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -917,12 +993,13 @@ impl Tool for BrowserClickTool {
                     Ok(Ok(())) => ToolOutput::success(format!("Clicked {reference}")),
                     Ok(Err(error)) => ToolOutput::error(error.to_string()),
                     Err(_) => ToolOutput::error(format!(
-                        "Reference click timed out after {timeout:?}; take a new browser_snapshot"
+                        "Reference click timed out after {timeout:?}; the click may already have happened. Inspect page state before retrying; do not blindly replay the click. Take a new browser_snapshot for fresh refs."
                     )),
                 };
             }
         };
 
+        let _input = guard.lock_native_input().await;
         // Optionally wait for element
         if input.wait {
             let check_script = format!(
@@ -1071,6 +1148,15 @@ impl Tool for BrowserTypeTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserTypeTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: TypeInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -1083,7 +1169,7 @@ impl Tool for BrowserTypeTool {
             .unwrap_or(Duration::from_secs(30));
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -1106,11 +1192,12 @@ impl Tool for BrowserTypeTool {
                     )),
                     Ok(Err(error)) => ToolOutput::error(error.to_string()),
                     Err(_) => ToolOutput::error(format!(
-                        "Reference typing timed out after {timeout:?}; take a new browser_snapshot"
+                        "Reference typing timed out after {timeout:?}; focus, clearing, and partial text insertion may already have happened. Inspect the actual field value before retrying; do not append the full text blindly. Take a new browser_snapshot for fresh refs."
                     )),
                 };
             }
         };
+        let _input = guard.lock_native_input().await;
         type_selector(&guard.page, selector, &input.text, input.clear, timeout).await
     }
 }
@@ -1354,6 +1441,15 @@ impl Tool for BrowserKeyPressTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserKeyPressTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: KeyPressInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -1379,12 +1475,13 @@ impl Tool for BrowserKeyPressTool {
             None
         };
 
-        let session = match ctx.browser().await {
+        let session = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
         let guard = session.read().await;
 
+        let _input = guard.lock_native_input().await;
         let chord = if input.modifiers.is_empty() {
             input.key.clone()
         } else {

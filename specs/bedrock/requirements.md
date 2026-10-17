@@ -1223,8 +1223,14 @@ THE SYSTEM SHALL create a new transcript row that explicitly belongs to the same
   - every unconsumed steering entry, preserving its immutable acceptance identity, exact payload, attachments, and FIFO order without retaining a second pending copy on the predecessor
   - deferred continuation work, including tool calls rejected at the context threshold, without executing it before the successor owns the handoff
 
+WHEN an ordinary conversation creates a continuation
+THE SYSTEM SHALL keep the selected parent's exact attached `WorkScope`, environment and resource ownership atomically in a single database transaction while keeping the durable ProductConversation identity unchanged
+AND SHALL apply this rule to Direct/non-Git and worktree-backed conversations alike
+AND SHALL create no replacement scope or select a different scope from the ProductConversation's historical ownership set
+AND SHALL retain the same identity under concurrent requests and idempotent replay.
+
 WHEN the current execution row has a worktree
-THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single database transaction while keeping the durable ProductConversation identity unchanged:
+THE SYSTEM SHALL also preserve its filesystem state:
   - the parent retains its `worktree_path` field as a read-only reference for history navigation
   - the continuation's `worktree_path` is set to the same value
   - the continuation inherits the same `work_scope_id`
@@ -1254,9 +1260,11 @@ ceremony or a separate auto-stash feature. Keeping the same attached `WorkScope`
 and filesystem path across continuation, rather than destroying and recreating,
 is the only shape that preserves uncommitted work structurally without a separate
 auto-stash mechanism. Single-continuation policy keeps execution topology
-unambiguous: at any moment, continuation identifies the latest execution row for
-one product conversation while that conversation keeps one attached `WorkScope`
-and therefore one inherited worktree.
+unambiguous: continuation identifies the latest execution row for one product
+conversation. The selected row inherits its parent's exact attached WorkScope
+and environment. The product's historical ownership set may contain other
+scopes; those are neither substituted for the selected attachment nor coalesced
+by cwd, and aggregate retirement accounts for every historically owned scope.
 
 **Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 

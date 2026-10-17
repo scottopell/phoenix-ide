@@ -3,7 +3,7 @@
 --
 -- Scope: exact-tag gating, paired architecture-specific helper/app builds,
 -- Developer ID signing, notarization, and private publication preparation.
--- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010.
+-- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010/011.
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }
@@ -223,8 +223,12 @@ surface DesktopReleaseWorkflow {
 --   candidate.apple_silicon_pair.native_acceptance = passed and
 --   candidate.intel_pair.native_acceptance = passed.
 -- exact_inaccessible_assets_and_digests(publication) -> Boolean
---   consumer-inaccessible publication work contains exactly the eight required
---   non-manifest assets and SHA256SUMS, whose entries and reported digests match.
+--   consumer-inaccessible publication work contains exactly the six server,
+--   four browser CLI, and two desktop assets plus SHA256SUMS, whose entries and
+--   reported digests match. Historical tagged sources without the browser CLI
+--   entrypoint require only the six server and two desktop assets.
+--   Browser CLI assets pass native browser-free discovery; macOS browser bytes
+--   pass configured Developer ID/team verification and accepted notarization.
 -- required_architecture_pairs_validated(publication) -> Boolean
 --   publication.apple_silicon_pair and publication.intel_pair have distinct
 --   targets, matching release identities, verified helper/app artifacts, and

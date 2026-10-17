@@ -179,6 +179,86 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn direct_continuation_preserves_work_resource_authority_and_environment() {
+        use crate::db::ContinueOutcome;
+        use phoenix_core::domain::sm_state::ConvState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation_with_project(
+                "direct-resource-owner",
+                "direct-resource-owner",
+                cwd,
+                true,
+                None,
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let scope = root.attached_work_scope_id.clone().unwrap();
+        let original = resolve_resource_authority(&db, &root).await.unwrap();
+        assert_eq!(original.scope, ResourceScopeKey::Work(scope));
+        assert_eq!(original.authority, ResourceAuthority::Work);
+        assert_eq!(original.lifecycle, Some(WorkScopeLifecycle::Active));
+        assert_eq!(
+            original.environment,
+            Some(EnvironmentContext::UnownedCwd { cwd: cwd.into() })
+        );
+        assert_eq!(original.actor.conversation_id(), root.id);
+
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "Keep the original Direct resources".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ContinueOutcome::Created(successor) = db.continue_conversation(&root.id).await.unwrap()
+        else {
+            panic!("expected a new Direct continuation");
+        };
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::HandedOff {
+                successor_conv_id: successor.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let persisted = db.get_conversation(&successor.id).await.unwrap();
+        let continued = resolve_resource_authority(&db, &persisted).await.unwrap();
+        assert_eq!(
+            persisted.product_conversation_id,
+            root.product_conversation_id
+        );
+        assert_eq!(
+            persisted.attached_work_scope_id,
+            root.attached_work_scope_id
+        );
+        assert_eq!(continued.scope, original.scope);
+        assert_eq!(continued.authority, original.authority);
+        assert_eq!(continued.lifecycle, original.lifecycle);
+        assert_eq!(continued.environment, original.environment);
+        assert_eq!(continued.runtime_role, original.runtime_role);
+        assert_ne!(
+            continued.actor.conversation_id(),
+            original.actor.conversation_id()
+        );
+        assert_eq!(continued.actor.conversation_id(), persisted.id);
+        assert_eq!(continued.actor.authority(), original.actor.authority());
+        assert!(continued.actor.can_control(&root.id, original.authority));
+    }
+
+    #[tokio::test]
     async fn unattached_subagent_authority_is_resolved_at_the_shared_boundary() {
         let db = Database::open_in_memory().await.unwrap();
         let parent = db

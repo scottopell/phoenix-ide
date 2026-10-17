@@ -108,6 +108,12 @@ The `browser_recent_console_logs` tool SHALL retrieve recent captured log entrie
 
 The `browser_clear_console_logs` tool SHALL discard all captured log entries, resetting the buffer
 
+THE SYSTEM SHALL bound each incoming frame and message on the console-capture CDP connection to 8 MiB before deserialization
+
+WHEN console context ownership cannot be established or the console listener fails
+THE SYSTEM SHALL expose the failure to navigation capture and log the listener or ownership failure
+AND SHALL NOT represent unavailable navigation capture as an empty successful capture.
+
 WHEN output from `browser_recent_console_logs` exceeds 4096 bytes
 `browser_recent_console_logs` SHALL write the full output to a temp file and return the file path
 
@@ -221,7 +227,8 @@ WHEN `interactive` is true (default: false)
 
 THE SYSTEM SHALL exclude iframe documents and SHALL include shadow-tree content to the extent Chrome exposes it in the main document's accessibility tree
 
-THE SYSTEM SHALL provide opaque references for supported interactive nodes with a backing DOM node, including supported shadow-tree nodes
+THE SYSTEM SHALL provide opaque references for supported interactive DOM elements, including supported shadow-tree nodes
+AND SHALL NOT issue interaction references for document or web-area roots
 
 THE SYSTEM SHALL bind every reference to the originating browser instance, main document, and exact DOM node, rather than an accessible name, selector, or position
 
@@ -240,7 +247,14 @@ THE SYSTEM SHALL retain that reference until a new snapshot attempt or browser t
 THE SYSTEM SHALL bound snapshot output to 2000 displayed nodes and 256 KiB of text, explicitly report truncation, and issue references only for nodes included in the output
 
 WHEN formatted snapshot output exceeds 4096 bytes
-THE SYSTEM SHALL write the bounded output to a temporary file and return its path with any truncation notice
+THE SYSTEM SHALL write the bounded output to an owner-only temporary file in an owner-only directory and return its path with any truncation notice
+AND SHALL retire that owned artifact when the references are invalidated or the browser is torn down
+
+THE SYSTEM SHALL cap the complete incoming snapshot CDP message and individual frame at 8 MiB before deserializing the accessibility tree
+AND SHALL report oversized collection responses as visible failures
+
+WHEN a reference interaction times out after browser-side input may have begun
+THE SYSTEM SHALL report that the action may have partially executed and instruct the caller to inspect page state before retrying
 
 WHEN collection fails or exceeds its timeout (default: 15 seconds)
 `browser_snapshot` SHALL return a visible error rather than an empty successful snapshot
@@ -457,27 +471,25 @@ THE SYSTEM SHALL derive `browser_session_active` from `is_active(&WorkScope)` of
 
 ### REQ-BROWSER-WS-003: Cascade Integration
 
-WHEN the resource-cleanup cascade runs (archive / abandon / mark-merged / hard-delete)
-THE SYSTEM SHALL invoke `cascade_browser_on_delete(manager, &WorkScope, inheritor_scope)`
-AND `inheritor_scope` SHALL be `Some(work_scope)` iff a live conversation other than the one being deleted resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope — and `None` otherwise, where a live conversation is one that is BOTH non-terminal in state AND not `archived` according to the persisted conversation rows in the DATABASE, NOT merely one that holds a live runtime handle (a non-terminal conversation with no runtime handle, after a server restart or runtime eviction, is still a live owner)
-AND the deleted conversation SHALL be excluded from that live-owner enumeration, because the cascade runs before its terminal-state write so it still reads non-terminal
-AND an `archived` conversation SHALL NOT count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs
-AND failures of the per-resource kills SHALL log WARN and continue
-    (consistent with the bash / tmux / projects cascade error policy)
+WHEN an individual execution-row cleanup occurs without retiring its ProductConversation
+THE SYSTEM SHALL preserve the scope's browser session while another non-terminal, non-archived member retains that exact persisted scope
+AND SHALL determine retention from persisted rows rather than process-local runtime handles
+AND SHALL exclude the row being cleaned from that enumeration.
 
-WHEN the live-owner enumeration itself cannot be answered because the database is unreadable
-THE SYSTEM SHALL refuse the cascade and surface the error to the caller, rather than derive `inheritor_scope` from an assumed-live answer
-    (assuming "live" would skip every resource + worktree teardown while the row is archived/deleted, orphaning resources with no retry; refusing lets the caller retry once the DB is healthy, and the refusal precedes every side effect so it leaves no partial state)
+WHEN a ProductConversation is retired through Close/Delete or equivalent aggregate cleanup
+THE SYSTEM SHALL use aggregate retirement authority rather than execution-row liveness
+AND SHALL NOT let continuations or subordinate execution rows belonging to that same aggregate veto its resource retirement
+AND SHALL preserve a scope only for a distinct still-Open aggregate owner
+AND SHALL surface unresolved identity conflicts instead of guessing ownership.
 
-WHEN `inheritor_scope == Some(work_scope)` (the scope is still owned by a live conversation other than the deleted one)
-THE SYSTEM SHALL skip the session kill
-    (the surviving owner is still driving the same Chrome window)
+WHEN the applicable ownership enumeration cannot be answered
+THE SYSTEM SHALL refuse cleanup and surface the error before side effects rather than assume a retaining owner.
 
-WHEN `inheritor_scope` is `None`
-THE SYSTEM SHALL tear the session down
-    (the deleted conversation was the last live owner — excluding it from the enumeration is what makes this reachable)
+WHEN there is no retaining owner under the applicable lifecycle boundary
+THE SYSTEM SHALL tear down the browser session
+AND failures of per-resource kills SHALL be logged and handled by the owning cascade or durable retirement lifecycle.
 
-**Rationale:** Before this requirement, archive/abandon killed bash + tmux but leaked Chrome until Phoenix restart. The preservation signal is correct by construction — it asks "are my resources still owned by someone live other than me?" rather than relying on the implicit invariant "Worktree continuations always inherit the same worktree." Continuation is one way a scope outlives a conversation; a live sibling such as a Work-mode sub-agent sharing its parent's scope is another. The same shape applies to tmux (REQ-TMUX-WS-002) and the terminal (REQ-TERM-WS-001).
+The execution-row cascade rules in `browser-lifecycle.allium` describe the first boundary. Aggregate retirement is governed by `specs/bedrock/requirements.md` and its durable Close lifecycle; same-aggregate row preservation is not an aggregate retirement exemption.
 
 **User Stories:** US-2, US-3
 

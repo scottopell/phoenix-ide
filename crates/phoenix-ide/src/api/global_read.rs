@@ -123,7 +123,10 @@ impl std::fmt::Display for GlobalMessageTargetError {
             Self::MissingId => write!(f, "message target is missing an id"),
             Self::UnsupportedSyntax => write!(f, "unsupported message target syntax"),
             Self::CoordinatorChainRejected => {
-                write!(f, "the Coordinator chain cannot receive cross-conversation messages")
+                write!(
+                    f,
+                    "the Coordinator chain cannot receive cross-conversation messages"
+                )
             }
             Self::ConversationNotFound(id) => write!(f, "conversation not found: {id}"),
             Self::SubAgentRejected => write!(
@@ -1348,12 +1351,7 @@ async fn read_conversation_around_message(
     );
     let mut out = format!(
         "{stable_header}exact evidence: @transcript:{} — {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
-        conv.id,
-        title,
-        conv.updated_at,
-        message_id,
-        has_more_before,
-        has_more_after,
+        conv.id, title, conv.updated_at, message_id, has_more_before, has_more_after,
     );
     let mut sender_kinds = std::collections::HashMap::new();
     for message in messages {
@@ -4176,6 +4174,97 @@ mod tests {
                 service.resolve_message_target(rejected).await.is_err(),
                 "{rejected}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_continuation_keeps_original_bash_scope_live_across_two_handoffs() {
+        use crate::db::{ContinueOutcome, ConvMode};
+        use phoenix_core::domain::sm_state::ConvState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let cwd = work.join("..").join("work");
+        let canonical = work.canonicalize().unwrap();
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation_with_project(
+                "direct-scope-owner",
+                "direct-scope-owner",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let scope = root.attached_work_scope_id.clone().unwrap();
+        let product = root.product_conversation_id.clone();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let original = service
+            .resolve_active_work_scope_bash_target(scope.as_str())
+            .await
+            .unwrap();
+        assert_eq!(original.path, canonical);
+        assert_eq!(original.work_scope_id, scope);
+        assert_eq!(
+            original.owner_product_conversation_id.as_deref(),
+            Some(product.as_str())
+        );
+
+        let mut current = root;
+        for hop in 1..=2 {
+            db.update_conversation_state(
+                &current.id,
+                &ConvState::ContextExhausted {
+                    summary: format!("Continue Direct work, hop {hop}"),
+                },
+            )
+            .await
+            .unwrap();
+            let ContinueOutcome::Created(successor) =
+                db.continue_conversation(&current.id).await.unwrap()
+            else {
+                panic!("expected a new Direct continuation at hop {hop}");
+            };
+            db.update_conversation_state(
+                &current.id,
+                &ConvState::HandedOff {
+                    successor_conv_id: successor.id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let predecessor = db.get_conversation(&current.id).await.unwrap();
+            assert_eq!(
+                predecessor.continued_in_conv_id.as_deref(),
+                Some(successor.id.as_str())
+            );
+            assert!(matches!(predecessor.state, ConvState::HandedOff { .. }));
+            let persisted = db.get_conversation(&successor.id).await.unwrap();
+            assert!(matches!(persisted.conv_mode, ConvMode::Direct));
+            assert_eq!(persisted.attached_work_scope_id.as_ref(), Some(&scope));
+            assert_eq!(persisted.product_conversation_id, product);
+            assert_eq!(persisted.cwd, cwd.to_str().unwrap());
+            let binding = service
+                .resolve_active_work_scope_bash_target(scope.as_str())
+                .await
+                .unwrap();
+            assert_eq!(binding.path, canonical);
+            assert_eq!(binding.work_scope_id, scope);
+            assert_eq!(
+                binding.owner_product_conversation_id.as_deref(),
+                Some(product.as_str())
+            );
+            assert_eq!(binding.owner_name, original.owner_name);
+            current = persisted;
         }
     }
 

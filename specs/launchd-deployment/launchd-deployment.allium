@@ -1,8 +1,8 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
 -- Requirement traceability: REQ-LDD-001 through REQ-LDD-024
--- REQ-LDD-019–023 use only the exact 123 -> 128 qualification from ADR-105
--- (../adrs/105_qualify-migration-128-for-bounded-current-schema-activation.md).
+-- REQ-LDD-019–022 admit prepared sources at exact 123 or exact 128 with
+-- exact target 128; REQ-LDD-023 admits ordinary activation only at exact 123.
 
 config {
     transition_timeout_seconds: Integer = 30
@@ -299,7 +299,8 @@ external entity TargetService {
 --   prepared_artifact mode with exact canonical DB path shared by predecessor
 --   and candidate, retained controller helper path/SHA-256 and candidate migration
 --   registry path/SHA-256 bound to the immutable transaction. The source ledger
---   equals the complete qualified ordered ledger through 123, not merely MAX=123.
+--   equals either the complete qualified ordered ledger through 123 or the complete
+--   target registry through 128; a highest-version comparison is insufficient.
 --   The complete candidate registry ends at 128 and names 126 as
 --   retire_wake_feature_preserving_history, 127 as coordinator_owned_work_scope_home,
 --   and 128 as product_creation_provisioning_stage. The complete registry and
@@ -312,13 +313,13 @@ external entity TargetService {
 --   Proof matches the retained preflight and transaction. Offline exclusive
 --   DB/WAL/SHM ownership follows service stop; SQLite backup
 --   API snapshot in a private directory has verified hash, logical source contents
---   and durable proof bound to source 123 and target 128 ledgers, path, exact
+--   and durable proof bound to the admitted source and target 128 ledgers, path, exact
 --   controller/helper/candidate/predecessor identities and transaction ID.
 --   No candidate migration or startup precedes this proof.
 -- current_schema_source_unchanged(transaction) -> Boolean
 --   After confirmed target stop and renewed exclusive DB/WAL/SHM ownership,
---   immediately before replay, re-read the exact source 123 ledger and logical
---   contents and compare them to the bound snapshot proof. Stale preflight or
+--   immediately before replay, re-read the exact transaction-bound source ledger
+--   and logical contents and compare them to the bound snapshot proof. Stale preflight or
 --   snapshot observations and ambiguous contents do not satisfy this check.
 -- current_schema_recovery_verified(transaction) -> Boolean
 --   Matching snapshot and source ledger/logical contents, predecessor binary,

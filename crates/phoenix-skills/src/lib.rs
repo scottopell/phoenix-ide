@@ -1347,7 +1347,7 @@ mod tests {
             SkillAudience::GlobalCoordinator,
         );
         assert_eq!(tampered.len(), 1);
-        assert_eq!(tampered[0].description, "Use supported Phoenix HTTP APIs for user-authorized Global Coordinator lifecycle actions.");
+        assert_eq!(tampered[0].description, "Use supported Phoenix HTTP APIs for user-authorized Global Coordinator actions with non-exhaustive best-practice recipes.");
 
         let authenticated = AuthenticatedCoordinatorSkillCatalog::discover(Some(&extract_dir))
             .expect("authenticated coordinator catalog");
@@ -1384,7 +1384,8 @@ mod tests {
             "creation_cwd_b64=",
             "leading/trailing-whitespace WorkScope path is unsupported",
             "objective.trim()",
-            "Reject larger text objectives before UUID generation",
+            "Stop this recipe for larger text objectives before UUID generation",
+            "verified supported alternative transport requires separate contract inspection and user authority",
             "INTENT_B64",
             "HTTP 202 proves durable acceptance",
             "repeat the step-3 POST at most once",

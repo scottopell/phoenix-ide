@@ -7,6 +7,7 @@
 //! phoenix-tools, which depends on this crate. See `specs/browser-tool/` for
 //! the behavioural contract.
 
+mod cdp;
 pub mod react;
 pub mod screencast;
 pub mod session;
