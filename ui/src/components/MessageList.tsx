@@ -1620,7 +1620,7 @@ function MessageListImpl({
           viewAnchorCommandOwnerRef.current = viewAnchorIntentRef.current ? { key: effect.commandKey, scope: viewAnchorIntentRef.current.scope } : null;
           const targetIndex = findUnitIndexByMessageId(effect.targetMessageId);
           dispatchTranscriptPositioningRef.current(
-            targetIndex < 0 || (effect.targetMessageId === sourceMessageId && requestedSourceToolId !== null && sourceToolId === null)
+            targetIndex < 0 || (effect.command.kind === 'jump_to_message' && effect.targetMessageId === sourceMessageId && requestedSourceToolId !== null && sourceToolId === null)
               ? { type: 'target_missing', commandKey: effect.commandKey }
               : { type: 'target_resolved', commandKey: effect.commandKey, targetIndex },
           );

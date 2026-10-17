@@ -131,7 +131,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     rowSlug: string;
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
-  const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
+  const [resolvedProduct, setResolvedProduct] = useState<{ id: string; admittedJourney: ReturnType<typeof useConversationViewJourney> } | null>(null);
   const [validatedSelection, setValidatedSelection] = useState<string | null>(null);
   const [pinFailure, setPinFailure] = useState<{ selectionKey: string; message: string } | null>(null);
   const [retryToken, setRetryToken] = useState(0);
@@ -188,7 +188,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
               throw new Error('Transcript is not a member of this conversation');
             }
             if (!cancelled) {
-              setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+              setResolvedProduct({ id: snapshot.product_conversation_id, admittedJourney: requestJourney });
               setValidatedSelection(selectionKey);
             }
             return;
@@ -196,13 +196,12 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
           if (!locationRef.current.pathname.startsWith('/product-conversations/') &&
               snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id
               && (locationRef.current.state as { chapterSelection?: unknown } | null)?.chapterSelection !== 'pending') {
-            setResolvedProduct({ reference, id: snapshot.product_conversation_id });
             const query = new URLSearchParams(locationRef.current.search);
             query.set('source_transcript', reference);
             navigate({ pathname: locationRef.current.pathname, search: query.toString(), hash: locationRef.current.hash }, { replace: true, state: locationRef.current.state });
             return;
           }
-          setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+          setResolvedProduct({ id: snapshot.product_conversation_id, admittedJourney: requestJourney });
           setValidatedSelection(selectionKey);
           if (locationRef.current.pathname !== snapshot.canonical_route) {
             navigate({
@@ -233,11 +232,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     if (pinError || activeFallback) journey.finish('failed');
   }, [journey, pinError, activeFallback]);
 
-  if (resolvedProduct && (resolvedProduct.reference === reference || resolvedProduct.id === reference) && !activeFallback) {
+  if (resolvedProduct && !activeFallback) {
     return <>
       {pinError && <main ref={journey.attach}><div role="alert">{pinError}</div></main>}
       <div ref={journey.attach} hidden={!!pinError || validatedSelection !== selectionKey} style={{ height: '100%' }}>
-        <ProductConversationPage productId={resolvedProduct.id} journey={journey} />
+        <ProductConversationPage productId={resolvedProduct.id} journey={validatedSelection === selectionKey ? journey : resolvedProduct.admittedJourney} />
       </div>
     </>;
   }

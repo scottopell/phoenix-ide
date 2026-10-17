@@ -1200,6 +1200,17 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
   });
 
+  it('restores a valid reader anchor despite a stale source-tool refinement in the URL', () => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[makeMessage(1), makeMessage(2)]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      sourceCallTarget={{ messageId: 'msg-2', toolUseId: 'stale' }}
+      transcriptPositioning={transcriptPositioningForCommand(command)} onHistoryScrollCommandHandled={handled} />));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
+    expect(handled).not.toHaveBeenCalledWith(expect.objectContaining({ result: 'target_missing' }));
+  });
+
   it('reports the full owning key and truthful missing result when no render unit owns the target', () => {
     const command = makeJumpToMessageCommand({ targetMessageId: 'orphan-message' });
     const handled = vi.fn();
