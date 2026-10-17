@@ -167,7 +167,7 @@ class InstalledTlsReadabilityTests(unittest.TestCase):
 
     @staticmethod
     def metadata_for(mode, uid, gid):
-        return os.stat_result((mode, 0, 0, uid, gid, 0, 0, 0, 0, 0))
+        return os.stat_result((mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
 
     def test_owner_primary_supplementary_and_other_read_permission(self):
         for path in (self.tls.cert_path, self.tls.key_path):
@@ -176,14 +176,12 @@ class InstalledTlsReadabilityTests(unittest.TestCase):
                     (2001, 100, 0o040, 0o004),
                     (2001, 200, 0o040, 0o004),
                     (2001, 300, 0o004, 0o440)):
-                with self.subTest(path=path, uid=uid, gid=gid):
-                    original = self.metadata[path]
+                with self.subTest(path=path, uid=uid, gid=gid), mock.patch.dict(self.metadata):
                     self.metadata[path] = self.metadata_for(stat.S_IFREG | readable, uid, gid)
                     helper.validate_installed_tls(self.tls, "fixture-service")
                     self.metadata[path] = self.metadata_for(stat.S_IFREG | unreadable, uid, gid)
                     with self.assertRaisesRegex(helper.ValidationError, "not readable"):
                         helper.validate_installed_tls(self.tls, "fixture-service")
-                    self.metadata[path] = original
         self.accounts.assert_called_with("fixture-service")
         self.groups.assert_called_with("fixture-service", 100)
 
@@ -194,14 +192,12 @@ class InstalledTlsReadabilityTests(unittest.TestCase):
                     (2001, 100, 0o010, 0o001),
                     (2001, 200, 0o010, 0o001),
                     (2001, 300, 0o001, 0o110)):
-                with self.subTest(path=path, uid=uid, gid=gid):
-                    original = self.metadata[path]
+                with self.subTest(path=path, uid=uid, gid=gid), mock.patch.dict(self.metadata):
                     self.metadata[path] = self.metadata_for(stat.S_IFDIR | traversable, uid, gid)
                     helper.validate_installed_tls(self.tls, "fixture-service")
                     self.metadata[path] = self.metadata_for(stat.S_IFDIR | blocked, uid, gid)
                     with self.assertRaisesRegex(helper.ValidationError, "not traversable"):
                         helper.validate_installed_tls(self.tls, "fixture-service")
-                    self.metadata[path] = original
 
     def test_root_service_user_can_read_mode_zero_regular_files(self):
         self.account.pw_uid = 0
@@ -401,7 +397,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         return path
 
     def staging_policy(self):
-        staging = self.base / "root-deploy"
+        staging = self.base.resolve() / "root-deploy"
         return helper.ValidationPolicy(
             transaction_root=staging / "transactions",
             unit_name=self.policy.unit_name,
@@ -477,6 +473,10 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         source_env = self.base / "source-candidate.env"
         source_env.write_text("PHOENIX_TLS=auto\nPHOENIX_PORT=9999\n")
         sources.append({"name": "candidate.env", "source": str(source_env), "sha256": digest(source_env)})
+        for name, source in (("helper.py", ROOT / "scripts/systemd_deploy_helper.py"),
+                             ("migrations.rs", ROOT / "crates/phoenix-db/src/migrations.rs")):
+            sources = [item for item in sources if item["name"] != name]
+            sources.append({"name": name, "source": str(source), "sha256": digest(source)})
         raw = dict(self.raw, mode=helper.PROTECTED_MODE)
         transaction = policy.transaction_root / self.transaction_id
         raw["candidate"] = {
@@ -484,13 +484,27 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
             for field, name in (("binary", "candidate-binary"), ("service", "candidate.service"),
                                 ("socket", "candidate.socket"), ("environment", "candidate.env"))
         }
+        raw.update(
+            manifest_version=helper.PROTECTED_HANDOFF_PROTOCOL_VERSION,
+            source_kind="published_release", source_commit=helper.PROTECTED_RELEASE_COMMIT,
+            release_tag=helper.PROTECTED_RELEASE_TAG, release_commit=helper.PROTECTED_RELEASE_COMMIT,
+            expected={"version": helper.PROTECTED_RELEASE_VERSION, "git_sha": helper.PROTECTED_RELEASE_COMMIT},
+            controller_source_commit="c" * 40,
+            release_asset_name=helper.PROTECTED_ASSET_NAME,
+            release_asset_sha256=raw["candidate"]["binary"]["sha256"],
+            database_path=str(Path(policy.targets.deployed_sha).parent / "prod.db"),
+        )
+        for field, name in (("controller_helper", "helper.py"), ("registry", "migrations.rs")):
+            raw[field] = {"path": str(transaction / name),
+                          "sha256": next(item["sha256"] for item in sources if item["name"] == name)}
         for field in ("status_path", "active_path", "activation_lock_path", "claim_lock_path"):
             raw[field] = str(getattr(policy, field))
         source_manifest = self.base / "protected-endpoint-manifest.json"
         source_manifest.write_text(json.dumps(raw))
         sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
         for target, text in ((policy.targets.binary, "predecessor"),
-                             (policy.targets.service, f"[Service]\nUser={self.user}\n{service_environment}"),
+                             (policy.targets.service, f"[Service]\nUser={self.user}\n{service_environment}"
+                              f"ExecStart={policy.targets.binary}\nEnvironmentFile={policy.targets.environment}\n"),
                              (policy.targets.socket, socket_text), (policy.targets.environment, environment)):
             path = Path(target)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -515,10 +529,21 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
             with self.subTest(listener=listener):
                 policy = self.staging_policy()
                 bundle = self.protected_endpoint_bundle(policy, environment, f"[Socket]\nListenStream={listener}\n", service_environment)
+                # Match the protected transaction tests' inert candidate and host pins;
+                # manifest ownership, checksum and provenance checks remain real.
                 with mock.patch.object(helper, "copy_handoff_file", side_effect=copy_file), \
                      mock.patch.object(helper, "installed_runtime_identity", return_value=helper.Identity("1.0.0", "a" * 12)), \
-                     mock.patch.object(helper, "validate_manifest"), mock.patch.object(helper, "database_preflight"):
-                    manifest = helper.Manifest.load(helper.stage_handoff(bundle, os.getuid(), policy))
+                     mock.patch.object(helper, "PROTECTED_ASSET_SHA256", digest(self.base / "source-candidate-binary")), \
+                     mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", digest(ROOT / "crates/phoenix-db/src/migrations.rs")), \
+                     mock.patch.object(helper.sys, "platform", "linux"), \
+                     mock.patch("platform.machine", return_value="x86_64"), \
+                     mock.patch.object(helper, "database_preflight") as database_preflight:
+                    manifest_path = helper.stage_handoff(bundle, os.getuid(), policy)
+                    manifest = helper.Manifest.load(manifest_path)
+                    helper.validate_manifest(manifest_path, manifest, policy)
+                    database_preflight.assert_called_once_with(manifest)
+                self.assertEqual(helper.transaction_context(manifest)["manifest_sha256"],
+                                 json.loads(policy.status_path.read_text())["manifest_sha256"])
                 url = f"{scheme}://{host}:9443/api/version"
                 self.assertEqual(url, manifest.expected_health_url)
                 self.assertEqual(url, manifest.previous_health_url)
@@ -1151,7 +1176,11 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                    f"Environment=PHOENIX_DB_PATH={self.raw['database_path']}\n"
                    f"EnvironmentFile={self.targets.environment}\n")
         environment = f"SECRET=installed\nPHOENIX_DB_PATH={self.raw['database_path']}\n"
-        for name, content in (("service", service), ("socket", "installed socket"), ("environment", environment)):
+        socket = ("[Unit]\nDescription=Phoenix IDE Socket\n"
+                  "Documentation=https://github.com/phoenix-ide/phoenix-ide\n"
+                  "[Socket]\nListenStream=127.0.0.1:49151\nNoDelay=true\nBacklog=128\n"
+                  "[Install]\nWantedBy=sockets.target\n")
+        for name, content in (("service", service), ("socket", socket), ("environment", environment)):
             Path(getattr(self.targets, name)).write_text(content)
             self.raw["candidate"][name] = self.artifact("candidate-" + name, content)
             self.raw["rollback"][name] = self.artifact("rollback-" + name, content)
@@ -2196,6 +2225,8 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.assertEqual(0o400, staged_path.stat().st_mode & 0o777)
         self.assertEqual(os.getuid(), staged_path.stat().st_uid)
         self.assertEqual(manifest.previous, staged.previous)
+        self.assertEqual("http://127.0.0.1:49151/api/version", staged.previous_health_url)
+        self.assertEqual(staged.previous_health_url, staged.expected_health_url)
         for field in ("service", "socket", "environment"):
             artifact = getattr(staged.candidate, field)
             self.assertEqual(Path(getattr(self.targets, field)).read_bytes(), Path(artifact.path).read_bytes())
