@@ -94,10 +94,20 @@ def main():
                     transport = scripts / "qualify-history-opening-realserver.mjs"
                     config = work / "preview.mjs"
                     config.write_text("import {previewTransport} from " + json.dumps(transport.as_uri()) + ";const c=" + json.dumps({"root": str(app / "ui"), "build": {"outDir": str(ui)}, "preview": {"host": "127.0.0.1", "port": preview_port, "strictPort": True}}) + ";c.preview.proxy=previewTransport(" + json.dumps(base) + "," + json.dumps(str(fault)) + "," + json.dumps(str(work / "transport.jsonl")) + ");export default c;")
-                    node_env = os.environ | {"HOME": str(work), "HISTORY_BASE_URL": f"http://127.0.0.1:{preview_port}", "HISTORY_AUTH_HOME": startup["home"], "HISTORY_AUTH_CREDENTIAL_FILE": startup["credential_file"], "PROBE_INPUT": str(input_path)}
+                    node_env = os.environ | {"HOME": str(work), "HISTORY_BASE_URL": f"http://127.0.0.1:{preview_port}", "HISTORY_AUTH_HOME": startup["home"], "HISTORY_AUTH_CREDENTIAL_FILE": startup["credential_file"], "PROBE_INPUT": str(input_path), "DEBUG": "pw:browser"}
                     with s.owned_process(["node", str(app / "ui/node_modules/vite/bin/vite.js"), "preview", "--config", str(config)], work, node_env, out / "private-preview.log") as preview:
                         opening.readiness(preview, node_env["HISTORY_BASE_URL"])
-                        completed = subprocess.run(["node", str(scripts / "history-bfcache-probe.mjs")], env=node_env, cwd=work, timeout=80)
+                        launch_log = work / "private-browser-launch.log"
+                        with launch_log.open("w") as log:
+                            completed = subprocess.run(["node", str(scripts / "history-bfcache-probe.mjs")], env=node_env, cwd=work, timeout=80, stdout=log, stderr=log)
+                        lines = [line for line in launch_log.read_text().splitlines() if "<launching>" in line]
+                        assert len(lines) == 1, "exactly one actual browser launch required"
+                        assert "--disable-back-forward-cache" not in lines[0]
+                        capability_path = out / "native-capability.json"
+                        capability = json.loads(capability_path.read_text())
+                        capability["effective_bfcache_disable_present"] = False
+                        capability["launch_verification"] = "actual_pw_browser_launch_line_exactly_one"
+                        s.write_json(capability_path, capability)
                         s.write_json(out / "driver-exit.json", {"returncode": completed.returncode, "acceptance": False})
                 finally:
                     signal.alarm(85)

@@ -14,19 +14,18 @@ const result={scope:'separate_desktop_native_bfcache_probe_controlled_artifact_n
   full_acceptance:false,overhead_clearance:false,status:'failed',reports:[],rejections:[],
   launch:{headless:true,ignoreDefaultArgs:['--disable-back-forward-cache']}};
 let browser,context,page,parseErrors=0;
+result.stage='launch';
 const save=()=>writeFileSync(out,JSON.stringify(result,null,2));
 const watchdog=setTimeout(()=>{result.failure='absolute_probe_deadline';save();void browser?.close();},65000);
 const physical=async()=>page.evaluate(({oracle,input})=>(0,eval)('('+oracle+')')({known:[{persistedMessageID:input.id,sourceRow:input.source}]}),{oracle:observePhysicalHistoricalRow.toString(),input});
 try {
   browser=await chromium.launch({...result.launch,timeout:10000});
   result.browser_version=browser.version();
-  const session=await browser.newBrowserCDPSession();
-  const command=await session.send('Browser.getBrowserCommandLine');
-  result.effective_bfcache_disable_present=command.arguments.includes('--disable-back-forward-cache');
-  result.effective_launch_switches=command.arguments.filter(arg=>arg.startsWith('--')&&!arg.startsWith('--user-data-dir'));
-  assert.equal(result.effective_bfcache_disable_present,false);
-  await session.detach();
+  result.stage='browser_launched';
+  // Browser.getBrowserCommandLine requires --enable-automation, absent in this pinned launch.
+  // The parent validates the actual pw:browser launch line without changing browser flags.
   context=await browser.newContext({viewport:{width:1360,height:900}});
+  result.stage='owned_authentication';
   await authenticateOwnedContext(context,base);
   page=await context.newPage();
   const diagnostics=await context.newCDPSession(page);
@@ -47,6 +46,7 @@ try {
       try {accepted.add(JSON.parse(response.request().postData()).open_id);}catch {parseErrors++;}
     }
   });
+  result.stage='initial_navigation';
   await page.goto(base+input.route,{waitUntil:'domcontentloaded',timeout:20000});
   await page.waitForFunction(()=>document.visibilityState==='visible'&&document.querySelector('#messages')&&document.querySelector('textarea#message-input'),undefined,{timeout:15000});
   const initialDeadline=Date.now()+15000;
@@ -58,6 +58,7 @@ try {
   assert.equal(initial.standalone,false);
   assert.equal(initial.sample_rate,1);
   result.initial_report_id=initial.open_id;
+  result.stage='native_round_trip';
   result.witness=await runBFCacheRoundTrip(page,base);save();
   if(result.witness.status==='actual_bfcache_restore_observed'){
     const end=Date.now()+10000;
