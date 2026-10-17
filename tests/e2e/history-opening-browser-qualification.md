@@ -2893,3 +2893,40 @@ controlled receipt write, Rust and all standard lanes succeeded. The single-
 receipt correction receives one causal normal qualification after this complete
 result; app35f and the six-scenario driver are unchanged. No fabricated drain or
 unchanged full run is used to promote the preceding partial evidence.
+
+### Normal app drain requires the owned stop command before waiting
+
+Run `38996536868`, sharedc4ea/app35f, witness `117290100319`, passed all6 browser
+scenarios and the pre-drain collector join, then failed normal server completion
+with the existing65-second timeout. Original artifact `12087702470`
+(96,479,038 bytes) retains status timeout/returncode null and owned home/socket
+not yet removed; app_stopped=false, receiver_stopped=true after forced cleanup.
+Bounded receipt/result/drain read83,650 bytes and runtime log read153,586 bytes
+were retained. No normal-drain acceptance is claimed. Rust `117290170705` was
+still running at this entry.
+
+Exact shared source inspection identified the omission: normal_server_completion
+only called server.wait. The owned libtest does not exit until its gate receives
+`{"command":"stop"}`. Only forced_server_shutdown sent that command, after the
+normal wait had already failed. Runtime logging shows real shutdown beginning
+then. The successful earlier artifact-reuse diagnostics explicitly sent stop
+and received its acknowledgement before waiting, on this same source protocol.
+This is a missing lifecycle transition, not evidence that65 seconds is too low.
+
+Normal completion now sends the owned AF_UNIX stop request while the receiver
+is still live, requires the compiled protocol's exact acknowledged stopped
+response, then performs the **unchanged65-second** wait, exit0 and owned
+home/socket-removal checks. Control exchange uses one absolute2-second budget,
+bounded4096-byte framing, partial-read support and no raw acknowledgement/error
+publication. Failure remains primary and cannot claim app stopped/drain success.
+Already-exited processes still undergo the same exit/cleanup validation; forced
+cleanup remains unchanged and classified separately.
+
+All76 Python lifecycle tests pass. New tests mock sockets entirely (no local
+server): exact/fragmented acknowledgement, malformed/missing/oversized replies,
+one absolute deadline, stop-before-wait order and sanitized primary failure.
+Independent scoped source-only review found no blockers and verified the exact
+frozen Command::Stop/ack protocol, receiver lifetime and strict exit/cleanup
+checks. Existing138 browser selftests and immutable app35f source are unchanged.
+No local native/browser/build, raised timeout, fabricated drain or unchanged
+qualification rerun was used. Next push waits for the entire current run.

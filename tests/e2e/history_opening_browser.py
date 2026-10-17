@@ -804,12 +804,43 @@ def forced_server_shutdown(server, case, control, failures):
         shipping.write_json(case / "forced-server-shutdown.json", receipt)
 
 
+def request_normal_server_stop(control):
+    deadline = time.monotonic() + 2
+    with socket.socket(socket.AF_UNIX) as client:
+        def budget():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('normal control stop deadline')
+            client.settimeout(remaining)
+        budget()
+        client.connect(str(control))
+        budget()
+        client.sendall(b'{"command":"stop"}\n')
+        response = bytearray()
+        while not response.endswith(b'\n'):
+            budget()
+            chunk = client.recv(4096 - len(response))
+            if not chunk:
+                raise RuntimeError('normal control stop acknowledgement missing')
+            response.extend(chunk)
+            if len(response) >= 4096:
+                raise RuntimeError('normal control stop acknowledgement overflow')
+        if json.loads(response) != {'ok': True, 'result': {'state': 'stopped'}}:
+            raise RuntimeError('normal control stop acknowledgement rejected')
+
+
 def normal_server_completion(server, case, startup, control, failures):
     """Called before owned_process's forced process-group cleanup."""
     primary_error = None
     receipt = {"status": "failed", "normal_wait_timeout_seconds": SERVER_COMPLETION_TIMEOUT,
-               "owned_home": startup["home"], "control": str(control), "returncode": None}
+               "owned_home": startup["home"], "control": str(control), "returncode": None,
+               "stop": "already_exited"}
     try:
+        if server.poll() is None:
+            receipt['status'] = 'stop_request_failed'
+            receipt['stop'] = 'failed'
+            request_normal_server_stop(control)
+            receipt['stop'] = 'acknowledged'
         try:
             server.wait(timeout=SERVER_COMPLETION_TIMEOUT)
         except shipping.subprocess.TimeoutExpired:

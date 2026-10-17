@@ -663,6 +663,65 @@ class OpeningQualificationTests(unittest.TestCase):
             self.assertIs(type(caught.exception), TimeoutError if code is None else RuntimeError)
             self.assertEqual(failures.receipt()["cleanup"][0]["stage"], "normal_completion_receipt")
 
+    def test_normal_stop_requires_exact_bounded_acknowledgement_without_real_socket(self):
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.recv.side_effect = [b'{"ok":true,', b'"result":{"state":"stopped"}}\n']
+        with patch.object(opening.socket, 'socket') as factory:
+            factory.return_value.__enter__.return_value = client
+            opening.request_normal_server_stop(self.root / 'owned.sock')
+        client.connect.assert_called_once_with(str(self.root / 'owned.sock'))
+        client.sendall.assert_called_once_with(b'{"command":"stop"}\n')
+        self.assertTrue(all(0 < call.args[0] <= 2 for call in client.settimeout.call_args_list))
+        for response in (b'', b'{}\n', b'{"ok":false}\n', b'not-json\n', b'x' * 4096):
+            client = MagicMock()
+            client.recv.return_value = response
+            with self.subTest(response_length=len(response)), patch.object(opening.socket, 'socket') as factory:
+                factory.return_value.__enter__.return_value = client
+                with self.assertRaises((RuntimeError, ValueError)):
+                    opening.request_normal_server_stop(self.root / 'owned.sock')
+
+    def test_normal_stop_uses_one_absolute_control_deadline(self):
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        with patch.object(opening.socket, 'socket') as factory, patch.object(opening.time, 'monotonic', side_effect=[0, 0, 0, 3]):
+            factory.return_value.__enter__.return_value = client
+            with self.assertRaises(TimeoutError):
+                opening.request_normal_server_stop(self.root / 'owned.sock')
+        client.recv.assert_not_called()
+
+    def test_normal_completion_requests_acknowledged_stop_before_wait(self):
+        from unittest.mock import Mock
+        events = []
+        server = Mock(returncode=None)
+        server.poll.return_value = None
+        def wait(**kwargs):
+            events.append('wait')
+            server.returncode = 0
+        server.wait.side_effect = wait
+        with patch.object(opening, 'request_normal_server_stop', side_effect=lambda control: events.append('stop')):
+            receipt = opening.normal_server_completion(server, self.root, {'home': str(self.root / 'removed-home')}, self.root / 'removed.sock', opening.LifecycleFailures())
+        self.assertEqual(events, ['stop', 'wait'])
+        self.assertEqual(receipt['stop'], 'acknowledged')
+        self.assertEqual(receipt['status'], 'success')
+        server.wait.assert_called_once_with(timeout=65)
+
+    def test_normal_stop_failure_is_primary_and_cannot_claim_wait_or_drain(self):
+        from unittest.mock import Mock
+        server = Mock(returncode=None)
+        server.poll.return_value = None
+        primary = RuntimeError('private control failure')
+        failures = opening.LifecycleFailures()
+        with patch.object(opening, 'request_normal_server_stop', side_effect=primary):
+            with self.assertRaises(RuntimeError) as caught:
+                opening.normal_server_completion(server, self.root, {'home': str(self.root / 'home')}, self.root / 'owned.sock', failures)
+        self.assertIs(caught.exception, primary)
+        server.wait.assert_not_called()
+        receipt = json.loads((self.root / 'server-completion.json').read_text())
+        self.assertEqual(receipt['status'], 'stop_request_failed')
+        self.assertEqual(receipt['stop'], 'failed')
+        self.assertNotIn('private control failure', json.dumps(receipt))
+
     def test_normal_server_completion_requires_zero_and_owned_cleanup(self):
         from unittest.mock import Mock
         home = self.root / "removed-driver-home"
