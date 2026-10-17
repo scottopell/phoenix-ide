@@ -55,6 +55,7 @@ vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
 });
 
 const openingCommits: Message[][] = [];
+let onHistoryLayoutCommit: (() => void) | null = null;
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
 const viewerSpy = vi.fn();
@@ -114,7 +115,7 @@ vi.mock('../components/ConversationNavStack', async () => {
   return {
   ConversationNavStack: (props: Record<string, unknown>) => {
     conversationNavStackSpy(props);
-    useLayoutEffect(() => { openingCommits.push(props['messages'] as Message[]); });
+    useLayoutEffect(() => { openingCommits.push(props['messages'] as Message[]); onHistoryLayoutCommit?.(); });
     if (actualHistory.enabled) {
       const typed = props as React.ComponentProps<typeof actual.ConversationNavStack>;
       return <FocusScopeProvider><actual.ConversationNavStack {...typed} onHistoryScrollCommandHandled={(...args) => {
@@ -497,6 +498,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
 }
 
 beforeEach(() => {
+  onHistoryLayoutCommit = null;
   conversationStore = new ConversationStore();
   actualHistory.enabled = false;
   openingCommits.length = 0;
@@ -2666,6 +2668,37 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByTestId('message-order')).not.toHaveTextContent('stale-message'));
     expect(screen.getByTestId('message-order')).toHaveTextContent('m-3,m-4');
+  });
+
+  it('handles one Close stream notification at the active snapshot layout commit before passive resubscription', async () => {
+    const { api } = await import('../api');
+    renderPage();
+    await waitForPageReady();
+    vi.mocked(api.getProductConversationHistorySnapshot).mockReset();
+    const notifications = await import('../notifications');
+    const subscribe = vi.spyOn(notifications, 'subscribeCloseSnapshotChanged');
+    const activeClose = { attempt_id: 'layout-close', phase: 'settling_active_work', outcome: null, run_ordinal: '1', run_status: 'running', failure: null, confirmation_snapshot: null, inspections: [], losses: [], residuals: [] } satisfies ProductConversationCloseView;
+    let resolveInitial!: (snapshot: ProductConversationSnapshotView) => void;
+    const initial = new Promise<ProductConversationSnapshotView>(resolve => { resolveInitial = resolve; });
+    vi.mocked(api.getProductConversationHistorySnapshot).mockReturnValueOnce(initial)
+      .mockResolvedValueOnce(makeSnapshot({ close: { ...activeClose, phase: 'awaiting_retirement_inspection' }, segments: [] }));
+    act(() => notifyCloseSnapshotChanged('pc-1', 'close'));
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(1));
+    const registrationsBeforeSnapshot = subscribe.mock.calls.length;
+    let notificationsSent = 0;
+    let registrationsAtLayout = -1;
+    onHistoryLayoutCommit = () => {
+      onHistoryLayoutCommit = null;
+      registrationsAtLayout = subscribe.mock.calls.length;
+      notificationsSent += 1;
+      notifyCloseSnapshotChanged('pc-1', 'stream');
+    };
+    await act(async () => resolveInitial(makeSnapshot({ close: activeClose })));
+    expect(notificationsSent).toBe(1);
+    expect(registrationsAtLayout).toBe(registrationsBeforeSnapshot);
+    await waitFor(() => expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId('message-count')).toHaveTextContent('0'));
+    subscribe.mockRestore();
   });
 
   it('does not preserve stale cached segments when the refreshed tail is empty', async () => {

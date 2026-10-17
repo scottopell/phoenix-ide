@@ -8,10 +8,12 @@ on `bench/current-task-observation-attribution`. The exact exception blobs,
 diffs and production-function inventory are in
 [`conversation-observation-attribution.json`](conversation-observation-attribution.json).
 This supplements the earlier composition packet. The deterministic-diff portability
-follow-up preserves checkpoint `d5700c84f` and all its Rust/runtime sources. All
+follow-up preserved checkpoint `d5700c84f` and all its Rust/runtime sources. The
+explicit private e34 backport atop `963307eb834fee0568fb8f991164d842d0ec68c2`
+adds only the two approved ProductConversationPage runtime/test patches. All other
 2702 UI bytes remain exact except the explicitly manifested source-parity guard;
-its composition documentation and UI exception manifest are separately enumerated
-attribution exceptions, not renderer changes.
+composition documentation and UI exception metadata are separately enumerated.
+Historical product identity remains 9ee, not e34 whole-UI parity.
 
 **This source is UNCOMPILED. Its Rust tests are authored, UNRUN.** No Cargo,
 build, codegen, installation, child/server executable, fixture/SQL operation,
@@ -216,8 +218,9 @@ SQL string tokens retain byte-for-byte whitespace. Query/helper/wrapper changes
 and changed auth admission/denial/terminal sequences are negative test cases.
 The exact helper code and all other exceptions remain pinned separately by
 whole-file blobs/diffs. Live auth and all source outside the observation auth
-branch remain byte-exact. Main/logging, schemas, generated types and UI code are
-unchanged; only the enumerated source-parity test changes.
+branch remain byte-exact. Main/logging, schemas and generated types are
+unchanged. UI exceptions are the enumerated source-parity guard and the two exact
+approved e34-on-963 page patches; there are no observation-gate or event changes.
 
 Authored Rust regressions (all **UNRUN**):
 
@@ -286,3 +289,67 @@ The Rust tree has no delta from d570; no rustfmt or Rust validation is needed fo
 this follow-up. These commands are not authorization for build, Cargo, install,
 network, services, browser, SQL or hosted dispatch. Roadmap #806 remains unverified
 under the no-network constraint. This source-only checkpoint requires independent review before any further hosted dispatch.
+
+## Private e34 backport validation
+
+Authorized source scope is only upstream
+`e34ff8b85148bdb79f8c4164c5a7b067c930421a`'s two page-file patches applied to clean
+`963307eb834fee0568fb8f991164d842d0ec68c2`, plus this documentation, exact manifests
+and their guards. The product callback reads current owned Close state when the
+notification arrives. The 35-line test-file delta adds a forced layout-commit
+notification before passive resubscription, including its fixture hook; the
+original empty-tail test is byte-unchanged. No b778 cursor/citation or other
+later product changes are included. MessageList, ConversationNavStack,
+ConversationNav, VirtualTranscript and other renderer files stay exact 9ee.
+Observation capability gates and all Rust/SQL/completion-event sources stay exact
+963. This is an explicit tiny new runtime exception to historical 9ee, **not a
+whole-UI parity claim**.
+
+The UI manifest retains historical `product = 9ee` and adds `approved_backport`
+with immutable 963/e34/two-path identities. It includes exact historical-product
+diffs for both page exceptions, including the bounded new test exception. The
+attribution manifest retains its separate **2702 baseline**, extends `FUNCTIONS`
+to both page diffs, and pins their complete bytes/diffs. Each source guard applies
+the canonical exact upstream patch to 963 page bytes in scratch directories and
+compares the entire result to current bytes. It rejects reverted, appended and
+body-mutated candidates independently of manifest regeneration. This is not a
+filename waiver. Canonical diff arguments and hostile-config regressions remain
+in force; no Git configuration is changed.
+
+The new genuine forced-window regression is distinct evidence from the unchanged
+empty-tail test. Neither it nor source proof establishes the cause or repair of
+the separately measured 963 failure. Existing failed logs remain retained and
+must not be relabeled as passes or merged into the separate 2702 baseline.
+
+Cached source-only reproduction from the repository root (no install/build):
+
+```sh
+python3 tests/devpy/test_observation_attribution_source.py --regenerate-manifests
+python3 -m unittest discover -s tests/devpy -p test_observation_attribution_source.py -v
+python3 -m unittest discover -s tests/devpy -p test_observe.py -v
+(cd ui && ./node_modules/.bin/vitest run tests/observationSourceParity.test.ts src/pages/PersistedObservation.test.tsx src/App.alias.test.tsx src/App.markdownNavigation.test.tsx src/components/ConversationNavStack.test.tsx src/components/ConversationNavStack.readiness.test.tsx src/components/MessageList.test.tsx src/pages/CoordinatorPage.test.tsx src/pages/ProductConversationPage.test.tsx src/hooks/conversationViewLifecycle.test.ts src/hooks/useConversationViewJourney.test.tsx --maxWorkers=1)
+(cd ui && ./node_modules/.bin/tsc -b --noEmit)
+(cd ui && ./node_modules/.bin/eslint src/pages/ProductConversationPage.tsx src/pages/ProductConversationPage.test.tsx tests/observationSourceParity.test.ts --report-unused-disable-directives --max-warnings 0)
+git diff --exit-code 963307eb834fee0568fb8f991164d842d0ec68c2 -- crates
+git diff --check
+```
+
+Executed cached results: **428 UI tests passed across the exact 11 hosted suites**,
+including the new forced-window regression and the existing provenance tests;
+**11 Python attribution guards + 8 mocked launcher/source guards passed**.
+`tsc -b --noEmit`, strict ESLint on both page files and the parity guard, empty
+963-to-current `crates` diff, and `git diff --check` all passed. Passing UI fixtures
+still emitted the previously recorded React act/render-update warnings and
+`cacheDB.init is not a function`; these are not browser acceptance. An earlier worker
+run used the finalization suite instead of ConversationNavStack.test; it passed
+433 tests but was not the exact workflow inventory. The owner subsequently ran
+the exact unchanged hosted inventory above: all 428 tests passed.
+
+
+These commands bypass environment/bootstrap setup intentionally and use cached
+binaries directly under the source-only authorization. Rust remains
+uncompiled/unqualified by this backport; no install/build/Cargo, service, browser,
+product GET, SQL operation, production action or hosted dispatch was performed.
+No measured runtime/event or installed-artifact success is claimed. Roadmap #806
+was read using `gh` per repository orientation guidance; that external metadata
+read is not a product GET or qualification.

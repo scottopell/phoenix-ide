@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const root = resolve(import.meta.dirname, '../..');
@@ -11,6 +11,7 @@ const manifest = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observ
   product: string;
   diff_args: string[];
   files: Array<{ path: string; base_blob: string | null; product_blob: string | null; actual_blob: string | null; exception?: { reason: string; diff: string } }>;
+  approved_backport: { base: string; upstream: string; paths: string[] };
 };
 const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 const attribution = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observation-attribution.json'), 'utf8')) as {
@@ -19,6 +20,8 @@ const attribution = JSON.parse(readFileSync(resolve(root, 'docs/conversation-obs
   files: Array<{ path: string; base_blob: string | null; actual_blob: string; diff: string; changed_functions: string[] }>;
 };
 const attributionPaths = [
+  'ui/src/pages/ProductConversationPage.tsx',
+  'ui/src/pages/ProductConversationPage.test.tsx',
   'crates/phoenix-db/src/product_conversation_read.rs',
   'crates/phoenix-ide/src/api/auth.rs',
   'crates/phoenix-ide/src/api/observation.rs',
@@ -59,6 +62,26 @@ function exactDiff(path: string, productBlob: string | null, env = process.env, 
     const diff = spawnSync('git', [...exactDiffArgs, '--', product, actual], { cwd: root, env, encoding: 'utf8' });
     if (diff.status !== 1) throw new Error(`Expected an exception diff for ${path}: ${diff.stderr}`);
     return diff.stdout.replaceAll(product.slice(1), path).replaceAll(actual.slice(1), path);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+const approvedBackport = {
+  base: '963307eb834fee0568fb8f991164d842d0ec68c2',
+  upstream: 'e34ff8b85148bdb79f8c4164c5a7b067c930421a',
+  paths: ['ui/src/pages/ProductConversationPage.tsx', 'ui/src/pages/ProductConversationPage.test.tsx'],
+};
+function appliedBackport(): Map<string, Buffer> {
+  const patch = git(...exactDiffArgs.slice(0, -1), `${approvedBackport.upstream}^`, approvedBackport.upstream, '--', ...approvedBackport.paths);
+  const scratch = mkdtempSync(resolve(tmpdir(), 'observation-approved-backport-'));
+  try {
+    for (const path of approvedBackport.paths) {
+      const destination = resolve(scratch, path);
+      mkdirSync(dirname(destination), { recursive: true });
+      writeFileSync(destination, execFileSync('git', ['show', `${approvedBackport.base}:${path}`], { cwd: root }));
+    }
+    execFileSync('git', ['apply', '--whitespace=error-all', '-'], { cwd: scratch, input: patch });
+    return new Map(approvedBackport.paths.map(path => [path, readFileSync(resolve(scratch, path))]));
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -141,7 +164,16 @@ describe('observation composition source identity', () => {
     }
   });
 
-  it('bounds attribution to exact reviewed diffs and preserves all other 2702 UI bytes', () => {
+  it('bounds attribution and the exact e34-on-963 backport, preserving all other 2702 UI bytes', () => {
+    expect(manifest.approved_backport).toEqual(approvedBackport);
+    const approved = appliedBackport();
+    for (const [path, body] of approved) {
+      expect(readFileSync(resolve(root, path)).equals(body), path).toBe(true);
+      const baseline = execFileSync('git', ['show', `${approvedBackport.base}:${path}`], { cwd: root });
+      for (const mutation of [baseline, Buffer.concat([body, Buffer.from('\n')]), Buffer.from(body.toString().replace('close', 'unapproved_close'))]) {
+        expect(mutation.equals(body), path).toBe(false);
+      }
+    }
     expect(attribution.base).toBe('2702d8389c2fc78ac2e528c876c35a1a7040d692');
     expect(attribution.diff_args).toEqual(exactDiffArgs);
     expect(attribution.files.map(file => file.path)).toEqual([...attributionPaths].sort());
@@ -155,7 +187,9 @@ describe('observation composition source identity', () => {
     const currentUI = git('ls-files', '--cached', '--others', '--exclude-standard', '--', 'ui').trim().split('\n').filter(Boolean).sort();
     expect(currentUI).toEqual([...pinnedUI.keys()].sort());
     for (const [path, blob] of pinnedUI) {
-      if (path !== 'ui/tests/observationSourceParity.test.ts') expect(actualBlob(path), path).toBe(blob);
+      if (path === 'ui/tests/observationSourceParity.test.ts') continue;
+      if (approved.has(path)) expect(readFileSync(resolve(root, path)).equals(approved.get(path)!), path).toBe(true);
+      else expect(actualBlob(path), path).toBe(blob);
     }
     const changed = new Set([
       ...git('diff', '--name-only', attribution.base).trim().split('\n').filter(Boolean),
@@ -164,7 +198,7 @@ describe('observation composition source identity', () => {
     expect([...changed].sort()).toEqual([...attributionPaths, 'docs/conversation-observation-attribution.json'].sort());
   });
 
-  it('permits only the enumerated existing capability adapters, never algorithm substitutions', () => {
+  it('permits only enumerated capability adapters and the exact approved product/test backport', () => {
     const adapters = [
       'ui/src/App.markdownNavigation.test.tsx', 'ui/src/App.tsx',
       'ui/src/components/ChainWorkIdentityBlock.tsx',
@@ -174,9 +208,10 @@ describe('observation composition source identity', () => {
       'ui/src/hooks/conversationViewLifecycle.ts', 'ui/src/hooks/useConversationViewJourney.ts',
       'ui/src/pages/PersistedObservation.test.tsx', 'ui/src/pages/PersistedObservation.tsx',
       'ui/src/pages/ProductConversationPage.tsx',
+      'ui/src/pages/ProductConversationPage.test.tsx',
     ];
     expect(manifest.files.filter(file => file.exception && file.path.startsWith('ui/src/')).map(file => file.path)).toEqual(adapters.sort());
-    for (const path of adapters.filter(path => !['ui/src/App.tsx', 'ui/src/pages/PersistedObservation.test.tsx'].includes(path))) {
+    for (const path of adapters.filter(path => !['ui/src/App.tsx', 'ui/src/pages/PersistedObservation.test.tsx', ...approvedBackport.paths].includes(path))) {
       const file = manifest.files.find(file => file.path === path)!;
       expect(file.actual_blob, path).toBe(file.base_blob);
     }

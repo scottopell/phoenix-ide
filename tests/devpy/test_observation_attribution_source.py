@@ -15,6 +15,13 @@ ROOT = Path(__file__).resolve().parents[2]
 BASE = "2702d8389c2fc78ac2e528c876c35a1a7040d692"
 PACKET = "docs/conversation-observation-attribution.json"
 UI_PACKET = "docs/conversation-observation-source-parity.json"
+BACKPORT_BASE = "963307eb834fee0568fb8f991164d842d0ec68c2"
+BACKPORT_UPSTREAM = "e34ff8b85148bdb79f8c4164c5a7b067c930421a"
+BACKPORT_PATHS = (
+    "ui/src/pages/ProductConversationPage.tsx",
+    "ui/src/pages/ProductConversationPage.test.tsx",
+)
+BACKPORT = {"base": BACKPORT_BASE, "upstream": BACKPORT_UPSTREAM, "paths": list(BACKPORT_PATHS)}
 EXACT_DIFF_ARGS = (
     "-c", "diff.suppressBlankEmpty=false", "diff",
     "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=3", "--inter-hunk-context=0",
@@ -37,6 +44,8 @@ FUNCTIONS = {
     UI_PACKET: [],
     "tests/devpy/test_observation_attribution_source.py": [],
     "ui/tests/observationSourceParity.test.ts": [],
+    BACKPORT_PATHS[0]: ["ProductConversationPageInner: Close snapshot notification refresh callback"],
+    BACKPORT_PATHS[1]: ["ConversationNavStack mock layout effect", "beforeEach", "ProductConversationPage: handles one Close stream notification at the active snapshot layout commit before passive resubscription"],
 }
 WRAPPERS = {
     DB: {f"observation.db.{name}": 2 for name in
@@ -189,6 +198,18 @@ def exact_diff(path, blob, *, env=None):
 
 def blob_hash(body):
     return hashlib.sha1(f"blob {len(body)}\0".encode() + body).hexdigest()
+
+
+def approved_backport():
+    patch = git(*EXACT_DIFF_ARGS[:-1], f"{BACKPORT_UPSTREAM}^", BACKPORT_UPSTREAM, "--", *BACKPORT_PATHS)
+    with tempfile.TemporaryDirectory(prefix="observation-approved-backport-") as directory:
+        for path in BACKPORT_PATHS:
+            destination = Path(directory) / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(subprocess.check_output(["git", "show", f"{BACKPORT_BASE}:{path}"], cwd=ROOT))
+        subprocess.run(["git", "apply", "--whitespace=error-all", "-"], cwd=directory,
+                       input=patch, text=True, capture_output=True, check=True)
+        return {path: (Path(directory) / path).read_bytes() for path in BACKPORT_PATHS}
 
 
 def regenerate_manifests():
@@ -366,7 +387,15 @@ class AttributionSourceTests(unittest.TestCase):
         for forbidden in ["sleep(", "yield_now(", "TcpListener", "open_read_only", "standalone_path", "set_global_default", 'record["span"]["name"] == "observation.request"']:
             self.assertNotIn(forbidden, source)
 
-    def test_all_ui_bytes_except_exactly_manifested_guard_are_pinned(self):
+    def test_all_ui_bytes_except_guard_and_exact_upstream_backport_are_pinned(self):
+        self.assertEqual(json.loads((ROOT / UI_PACKET).read_text())["approved_backport"], BACKPORT)
+        approved = approved_backport()
+        for path, body in approved.items():
+            self.assertEqual((ROOT / path).read_bytes(), body, path)
+            baseline = subprocess.check_output(["git", "show", f"{BACKPORT_BASE}:{path}"], cwd=ROOT)
+            self.assertNotEqual(body, baseline, path)
+            for mutation in [baseline, body + b"\n", body.replace(b"close", b"unapproved_close", 1)]:
+                self.assertNotEqual(mutation, body, path)
         tree = git("ls-tree", "-r", BASE, "--", "ui").splitlines()
         expected = set()
         for line in tree:
@@ -375,7 +404,10 @@ class AttributionSourceTests(unittest.TestCase):
             if path == "ui/tests/observationSourceParity.test.ts":
                 continue
             body = (ROOT / path).read_bytes()
-            self.assertEqual(hashlib.sha1(f"blob {len(body)}\0".encode() + body).hexdigest(), metadata.split()[2], path)
+            if path in approved:
+                self.assertEqual(body, approved[path], path)
+            else:
+                self.assertEqual(blob_hash(body), metadata.split()[2], path)
         self.assertEqual(set(git("ls-files", "--cached", "--others", "--exclude-standard", "--", "ui").splitlines()), expected)
 
 
