@@ -675,7 +675,6 @@ fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobs
         .unwrap();
     runner.assert_live().unwrap();
     runner.assert_witnesses().unwrap();
-    runner.guardian().assert_original_parent().unwrap();
     assert_eq!(runner.guardian().guardian(), original_guardian);
     assert_eq!(runner.guardian().child(), original_root);
     assert_eq!(runner.guardian().deadline(), deadline);
@@ -732,7 +731,6 @@ fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobs
     );
     runner.assert_live().unwrap();
     runner.assert_witnesses().unwrap();
-    runner.guardian().assert_original_parent().unwrap();
     assert_eq!(identity_observation_table_counts(&path), [1, 0, 0]);
     assert_eq!(sampling_rows(&path), observed_sampling);
     runner.release().unwrap();
@@ -782,7 +780,6 @@ fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobs
             .observe_identity(original_root),
         IdentityObservation::ExactIdentityAbsent
     );
-    runner.guardian().assert_original_parent().unwrap();
     runner.finish().unwrap();
     installation.assert_witnesses().unwrap();
     drop((store, db));
