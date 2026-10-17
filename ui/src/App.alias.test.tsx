@@ -1,7 +1,7 @@
 import { Suspense, useState } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProductConversationAliasRedirect } from './App';
 import { api, ApiResponseError } from './api';
 
@@ -33,7 +33,8 @@ function Location() {
   const location = useLocation();
   const navigate = useNavigate();
   return <><div data-testid="location">{location.pathname}{location.search}{location.hash}</div>
-    <button type="button" onClick={() => navigate({ pathname: location.pathname, search: '?viewer=file', hash: '#message-m-1' })}>Open viewer</button></>;
+    <button type="button" onClick={() => navigate({ pathname: location.pathname, search: '?viewer=file', hash: '#message-m-1' })}>Open viewer</button>
+    <button type="button" onClick={() => navigate(location.pathname, { state: { chapterSelection: 'pending' } })}>Select pending prompt</button></>;
 }
 
 function RoutedAlias() {
@@ -59,8 +60,29 @@ function renderAlias(reference: string, entry = `/c/${reference}`) {
 describe('ProductConversationAliasRedirect', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
+    vi.spyOn(Math, 'random').mockReturnValue(0);
     vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: null });
   vi.spyOn(api, 'getConversation').mockImplementation(async (id) => ({ conversation: { id } } as never));
+  });
+
+  afterEach(async () => {
+    cleanup();
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('reports a failed admission before any product page mounts without leaking the exact pin', async () => {
+    renderAlias('private-reference', '/c/private-reference?source_transcript=private-pin&source_transcript=another-private-pin');
+    await screen.findByRole('alert');
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    const call = vi.mocked(fetch).mock.calls.find(([url]) => url === '/api/telemetry/conversation-view');
+    expect(call).toBeDefined();
+    const report = JSON.parse(call![1]!.body as string);
+    expect(report).toMatchObject({ route: 'ordinary', outcome: 'failed', marks: { meaningful_transcript: null, anchor_settled: null } });
+    expect(call![1]!.body).not.toMatch(/private-reference|private-pin|source_transcript/);
+    expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
   });
 
   it('routes a historical Global member before ordinary snapshot lookup and retains its anchor', async () => {
@@ -129,11 +151,12 @@ describe('ProductConversationAliasRedirect', () => {
     } as never));
     const entry = '/c/product-1?source_transcript=old-member#message-old%3Amessage';
     const first = renderAlias('product-1', entry);
-    await screen.findByTestId('embedded-fallback');
+    await screen.findByTestId('product-page');
     first.unmount();
     renderAlias('product-1', entry);
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'old-member' }));
+    await screen.findByTestId('product-page');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('old-member', expect.objectContaining({ message_limit: 1, open_id: expect.any(String), onTelemetry: expect.any(Function) }));
+    expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.getByTestId('location')).toHaveTextContent(entry);
   });
 
@@ -164,9 +187,22 @@ describe('ProductConversationAliasRedirect', () => {
       latest_transcript_row_id: 'successor', writable_transcript_row_id: 'successor', requested_transcript_row_id: 'historical',
     } as never);
     renderAlias('historical', '/c/historical?source_transcript=historical&source_tool=send#message-source');
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'historical', suppressCanonicalization: true, mutationEnabled: false }));
-    expect(screen.queryByTestId('product-page')).toBeNull();
+    await screen.findByTestId('product-page');
+    expect(embeddedSpy).not.toHaveBeenCalled();
+    expect(screen.getByTestId('location')).toHaveTextContent('/c/historical?source_transcript=historical&source_tool=send#message-source');
+  });
+
+  it('does not restore an exact historical alias pin after explicit pending prompt selection', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async reference => ({
+      product_conversation_id: 'product-1', canonical_route: '/c/product-1', ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'successor', writable_transcript_row_id: 'successor', requested_transcript_row_id: reference,
+    } as never));
+    renderAlias('historical', '/c/historical?source_transcript=historical#message-old');
+    const owner = await screen.findByTestId('product-page');
+    fireEvent.click(screen.getByRole('button', { name: 'Select pending prompt' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/c/product-1'));
+    expect(screen.getByTestId('location')).not.toHaveTextContent('source_transcript');
+    expect(screen.getByTestId('product-page')).toBe(owner);
   });
 
   it('keeps an open current member live while direct messages are temporarily blocked', async () => {
@@ -175,10 +211,8 @@ describe('ProductConversationAliasRedirect', () => {
       latest_transcript_row_id: 'current-member', writable_transcript_row_id: null, requested_transcript_row_id: 'current-member',
     } as never);
     renderAlias('current-member', '/c/current-member?source_transcript=current-member');
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({
-      slug: 'current-member', aggregateLifecycleOpen: true, mutationEnabled: false,
-    }));
+    await screen.findByTestId('product-page');
+    expect(embeddedSpy).not.toHaveBeenCalled();
   });
 
   it.each(['/c/product-1', '/product-conversations/product-1', '/c/legacy-slug'])('honors an encoded predecessor pin on %s', async (path) => {
@@ -187,8 +221,8 @@ describe('ProductConversationAliasRedirect', () => {
       requested_transcript_row_id: reference === 'old:member' ? 'old:member' : 'root', latest_transcript_row_id: 'successor',
     } as never));
     renderAlias(path.split('/').at(-1)!, `${path}?source_transcript=old%3Amember&viewer=inspect#message-old%3Amsg`);
-    await screen.findByTestId('embedded-fallback');
-    expect(embeddedSpy.mock.lastCall?.[0]).toEqual(expect.objectContaining({ slug: 'old:member' }));
+    await screen.findByTestId('product-page');
+    expect(embeddedSpy).not.toHaveBeenCalled();
     expect(screen.getByTestId('location')).toHaveTextContent('source_transcript=old%3Amember&viewer=inspect#message-old%3Amsg');
   });
 

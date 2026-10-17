@@ -9,6 +9,7 @@
 
 mod cdp;
 mod navigation;
+pub mod process_group;
 pub mod react;
 pub mod screencast;
 pub mod session;

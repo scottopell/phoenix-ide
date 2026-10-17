@@ -6265,7 +6265,7 @@ where
                         let _ = self
                             .broadcast_tx
                             .admitted_publication(&mut materialization_owner)
-                            .persisted_message(*message);
+                            .persisted_opening_message(&self.storage, *message).await?;
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
@@ -6354,7 +6354,8 @@ where
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
-                    .persisted_message(msg);
+                    .persisted_opening_message(&self.storage, msg)
+                    .await?;
                 Ok(None)
             }
 
@@ -8554,6 +8555,7 @@ where
         let display_for_broadcast = serde_json::Value::Object(patch);
 
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: seq,
             message_id: assistant_message_id.clone(),
             transcript_generation: None,
@@ -9291,6 +9293,7 @@ where
                 .broadcast_tx
                 .admitted_publication(admitted)
                 .event(|seq| SseEvent::MessageUpdated {
+                    opening: None,
                     sequence_id: seq,
                     message_id: message_id.clone(),
                     transcript_generation: Some(transcript_generation),
@@ -14103,7 +14106,7 @@ mod authoritative_user_message_effect_tests {
         .unwrap();
 
         let event = rx.try_recv().expect("persisted message broadcast");
-        let SseEvent::Message { message } = event else {
+        let SseEvent::Message { message, .. } = event else {
             panic!("expected message event")
         };
         assert_eq!(message.message_id, "msg-direct");
@@ -14803,7 +14806,7 @@ mod authoritative_user_message_effect_tests {
                 && matches!(&message.content, crate::db::MessageContent::Agent(blocks)
                     if blocks == &vec![ContentBlock::text("response")])
         }));
-        let SseEvent::Message { message } = rx.try_recv().expect("retained response broadcast")
+        let SseEvent::Message { message, .. } = rx.try_recv().expect("retained response broadcast")
         else {
             panic!("expected retained response before recovery state")
         };
@@ -16196,7 +16199,7 @@ mod authoritative_user_message_effect_tests {
         );
         assert!(matches!(
             broadcast_rx.try_recv(),
-            Ok(SseEvent::Message { message }) if message.message_id == "msg-direct"
+            Ok(SseEvent::Message { message, .. }) if message.message_id == "msg-direct"
         ));
         assert!(matches!(
             broadcast_rx.try_recv(),
@@ -21867,7 +21870,7 @@ mod steer_drain_detector_tests {
         result.expect("admitted message write completes");
         assert!(matches!(
             receiver.try_recv(),
-            Ok(SseEvent::Message { message }) if message.message_id == "admitted-nonterminal"
+            Ok(SseEvent::Message { message, .. }) if message.message_id == "admitted-nonterminal"
         ));
         assert_eq!(fence.owner_count(), 0);
     }
@@ -22804,7 +22807,7 @@ mod steer_drain_detector_tests {
         let mut saw_duration_update = false;
         loop {
             match rx.try_recv() {
-                Ok(SseEvent::Message { message }) => {
+                Ok(SseEvent::Message { message, .. }) => {
                     if message.message_id == tool_row.message_id {
                         saw_tool_message = true;
                     }

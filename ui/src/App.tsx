@@ -1,4 +1,6 @@
-import { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import { useConversationViewJourney } from './hooks/useConversationViewJourney';
+import { generateUUID } from './utils/uuid';
 import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
@@ -60,8 +62,8 @@ const MobileConversationListFixturePage = import.meta.env.DEV
   : null;
 
 /** Route loading fallback — blank div sized to the viewport to avoid CLS. */
-function RouteFallback() {
-  return <div style={{ minHeight: '100vh' }} />;
+function RouteFallback({ viewRef }: { viewRef?: ((root: HTMLDivElement | null) => void) | undefined }) {
+  return <div ref={viewRef} style={{ minHeight: '100vh' }} />;
 }
 
 type AuthState =
@@ -119,6 +121,9 @@ function AppRoutes() {
 }
 
 export function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
+  const journey = useConversationViewJourney('ordinary');
+  const journeyRef = useRef(journey);
+  useLayoutEffect(() => { journeyRef.current = journey; }, [journey]);
   const navigate = useNavigate();
   const location = useLocation();
   const [fallbackSnapshot, setFallbackSnapshot] = useState<{
@@ -127,7 +132,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
   const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
-  const [exactMember, setExactMember] = useState<{ reference: string; transcript: string; lifecycleOpen: boolean; mutationEnabled: boolean } | null>(null);
+  const [validatedSelection, setValidatedSelection] = useState<string | null>(null);
   const [pinError, setPinError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const locationRef = useRef(location);
@@ -136,14 +141,14 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   const pinned = sourcePins[0];
   const invalidPin = sourcePins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned));
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
+  const selectionKey = JSON.stringify([reference, sourcePins, location.pathname]);
 
   useEffect(() => {
     if (!reference) {
       setFallbackSnapshot(null);
       return;
     }
-    setExactMember(null);
-    setResolvedProduct(null);
+    setValidatedSelection(null);
     setFallbackSnapshot(null);
     setPinError(null);
     if (invalidPin) {
@@ -151,6 +156,15 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       return;
     }
     let cancelled = false;
+    const requestJourney = journeyRef.current;
+    const peek = (id: string) => {
+      const openId = generateUUID();
+      const observation = requestJourney.requestStarted(openId);
+      return api.getProductConversationSnapshot(id, {
+        message_limit: 1,
+        ...(observation ? { open_id: openId, onTelemetry: observation.response } : {}),
+      });
+    };
     api.resolveCoordinatorRoute(reference)
       .then(async ({ coordinator_id }) => {
         if (cancelled) return null;
@@ -162,35 +176,33 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
           if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: locationRef.current.search, hash: locationRef.current.hash }, { replace: true });
           return null;
         }
-        return api.getProductConversationSnapshot(reference, { message_limit: 1 });
+        return peek(reference);
       })
       .then(async (snapshot) => {
         if (!snapshot) return;
         if (!cancelled) {
           if (pinned !== undefined) {
-            const source = await api.getProductConversationSnapshot(pinned, { message_limit: 1 });
+            const source = await peek(pinned);
             if (source.product_conversation_id !== snapshot.product_conversation_id || source.requested_transcript_row_id !== pinned) {
               throw new Error('Transcript is not a member of this conversation');
             }
-            if (!cancelled) setExactMember({
-              reference,
-              transcript: pinned,
-              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
-              mutationEnabled: pinned === snapshot.writable_transcript_row_id,
-            });
+            if (!cancelled) {
+              setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+              setValidatedSelection(selectionKey);
+            }
             return;
           }
           if (!locationRef.current.pathname.startsWith('/product-conversations/') &&
-              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id) {
-            setExactMember({
-              reference,
-              transcript: reference,
-              lifecycleOpen: snapshot.ordinary_lifecycle === 'open',
-              mutationEnabled: reference === snapshot.writable_transcript_row_id,
-            });
+              snapshot.requested_transcript_row_id === reference && reference !== snapshot.product_conversation_id
+              && (locationRef.current.state as { chapterSelection?: unknown } | null)?.chapterSelection !== 'pending') {
+            setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+            const query = new URLSearchParams(locationRef.current.search);
+            query.set('source_transcript', reference);
+            navigate({ pathname: locationRef.current.pathname, search: query.toString(), hash: locationRef.current.hash }, { replace: true, state: locationRef.current.state });
             return;
           }
           setResolvedProduct({ reference, id: snapshot.product_conversation_id });
+          setValidatedSelection(selectionKey);
           if (locationRef.current.pathname !== snapshot.canonical_route) {
             navigate({
               pathname: snapshot.canonical_route,
@@ -214,22 +226,25 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
         }
       });
     return () => { cancelled = true; };
-  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken]);
+  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken, selectionKey]);
 
-  if (pinError) return <main><div role="alert">{pinError}</div></main>;
+  useEffect(() => {
+    if (pinError || activeFallback) journey.finish('failed');
+  }, [journey, pinError, activeFallback]);
 
-  if (exactMember && exactMember.reference === reference) {
-    return <EmbeddedConversationPage slug={exactMember.transcript} suppressCanonicalization routePrefix="/c"
-      aggregateLifecycleOpen={exactMember.lifecycleOpen} mutationEnabled={exactMember.mutationEnabled} />;
+  if (resolvedProduct && !activeFallback) {
+    return <>
+      {pinError && <main ref={journey.attach}><div role="alert">{pinError}</div></main>}
+      <div ref={journey.attach} hidden={!!pinError || validatedSelection !== selectionKey} style={{ height: '100%' }}>
+        <ProductConversationPage productId={resolvedProduct.id} journey={journey} />
+      </div>
+    </>;
   }
-
-  if (resolvedProduct && resolvedProduct.reference === reference && !activeFallback) {
-    return <ProductConversationPage productId={resolvedProduct.id} />;
-  }
+  if (pinError) return <main ref={journey.attach}><div role="alert">{pinError}</div></main>;
 
   if (activeFallback) {
     return (
-      <main className="conversation-alias-fallback">
+      <main ref={journey.attach} className="conversation-alias-fallback">
         <div role="alert" className="conversation-alias-fallback__status">
           Conversation route unavailable.
           <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
@@ -246,7 +261,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       </main>
     );
   }
-  return <RouteFallback />;
+  return <RouteFallback viewRef={journey.attach} />;
 }
 
 function ConversationRouteRedirect() {

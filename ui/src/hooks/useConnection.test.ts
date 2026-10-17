@@ -150,7 +150,7 @@ function makeInitPayload(convId: string, slug: string) {
     context_window_size: 0,
     project_name: null,
     pending_anchor_sequence_id: 0,
-    pending_events: [] as unknown[],
+    opening: null, pending_events: [] as unknown[],
     pending_truncated: false,
   };
 }
@@ -416,11 +416,11 @@ describe('useConnection epoch stamping (task 08683)', () => {
     act(() => {
       es.emit('init', makeInitPayload('conv-A', 'slug-A'));
       es.emit('steer_message_queued', {
-        sequence_id: 1,
+        opening: null, sequence_id: 1,
         message: { message_id: 'external-1', origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'coordinator', transcript_id: 'coordinator-transcript' }, text: 'from coordinator', images: [], files: [] },
         queue_position: 0,
       });
-      es.emit('steer_message_cancelled', { sequence_id: 2, message_id: 'external-1' });
+      es.emit('steer_message_cancelled', { opening: null, sequence_id: 2, message_id: 'external-1' });
       es.emit('rate_limit_snapshot', {
         sequence_id: 3,
         snapshot: {
@@ -521,7 +521,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
     const messagesBefore = atomBAfterInit.messages.length;
     act(() => {
       esA.emit('message', {
-        sequence_id: 999,
+        opening: null, sequence_id: 999,
         message: {
           event_presentation: null,
           message_id: 'leaked-msg-from-A',
@@ -637,7 +637,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
         writable_transcript_row_id: null, updated_at: '2024-06-01T00:00:00Z',
         presentation: { kind: 'state' as const, display_name: 'A', presentation_mode: 'idle' },
         work_identity: null, source: null, chain_qa_compatibility: null,
-        segments: [], before: null, has_older: false,
+        segments: [], latest_opening: { status: 'none' }, before: null, has_older: false,
       };
       store.observeProductConversationSnapshot(snapshot);
       store.observeProductConversationSnapshot({ ...snapshot, ordinary_lifecycle: 'open' });

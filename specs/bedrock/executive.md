@@ -66,6 +66,10 @@ REQ-BED-021's atomic pending-intent consumption is enforced for live opening ins
 
 REQ-BED-046 is implemented by atomic approved-objective/state/message/obligation persistence and runtime capability publication, with actor reconstruction after post-mutation failures. Focused migration and approval retry tests cover provenance and promoted task paths. Full exact-head qualification is recorded on PR #765. Task66007 restores trusted unsandboxed Git-backed Work children under ADR-068; parent approval remains independent.
 
+## Typed opening read repair
+
+REQ-BED-030 opening read authority is implemented in source as `ContinuationOpeningRead` (None/Pending/Accepted), using existing dispatch intents and completed receipts without a schema migration. Exact raw/canonical trigger identity, authority, topology, boundary, accepted content presentation, rollback, conflicting-intent, and snapshot-tail regressions are authored in `product_conversation_read`. Runtime opening publication reads the committed receipt under the admitted publication owner. Rust execution, Clippy, hosted codegen, and deployment qualification have not been run for this unit.
+
 
 ### Direct/non-Git continuation ownership
 

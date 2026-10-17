@@ -29,6 +29,136 @@ The lifecycle contract is specified in `browser-cli.allium`; browser operation s
 
 **Progress:** 12 of 12 implemented and covered. PR review and final CI qualification are tracked in [PR #925](https://github.com/scottopell/phoenix-ide/pull/925).
 
+## Native teardown qualification candidate
+
+The source candidate isolates Chrome through the existing CLI/server executable's
+native re-exec entry, without changing chromiumoxide or rebuilding its argument
+list. Linux/macOS launch-group ownership retains the exact root as an unreaped
+child (`waitid(WNOWAIT)`), observes status without `try_wait`, and bounds TERM →
+KILL → group drain before root reap and profile deletion. Binaries explicitly
+install the shim capability; libtest/other embedders do not infer it from
+`current_exe`. Other platforms retain the direct-launch path and cannot install
+the Unix capability.
+
+**Not an acceptance or all-descendants claim:** the barrier covers members of the
+launch group, not a helper that calls `setsid`/`setpgid`. A deterministic escaped
+writer negative demonstrates that limitation. The real lost-Chrome regression
+records bounded profile/ancestry-selected process layout and rejects observed
+escaped helpers before qualifying cleanup. Exact Linux and macOS compiled tests
+and actual Chrome layout remain required; source formatting is not runtime proof.
+A supplementary retained macOS binary observation is not exact-candidate evidence.
+
+Launch failures before chromiumoxide returns a child handle preserve the
+unmarked profile because the dependency may already have reaped the root.
+Group-marked profiles without retained drain authority are also preserved and
+refused for reuse. This is fail-closed, with an explicit availability limitation;
+there is no new automatic epoch allocation, recovery, or downgrade guarantee.
+Existing cleanup assertions are not weakened and deletion is never retried.
+
+### Darwin exit-transition evidence
+
+The original post-release failure was initially misattributed to adoption.
+Exact-source line mapping corrected it to the exit-observation loop; the
+readiness-only fixture change did not repair that failure. The immutable
+`07302e161` and `e94a3887b` negatives retain this history.
+
+Diagnostic source `8b4b2ff0b`, executed in
+[run 39046690493](https://github.com/scottopell/phoenix-ide/actions/runs/39046690493),
+returned a non-ready `waitid` while `proc_pidinfo` and `getpgid` returned ESRCH.
+The immediately following sample, retaining the same unreaped child, returned
+`SIGCHLD` / `CLD_EXITED` and the original PID from `waitid`. `SA_NOCLDWAIT` was not
+set. The diagnostic test unconditionally failed after capture; it did not turn
+that observation into success. Artifact `12106521163` retains the raw syscall
+receipt.
+
+The typed fix distinguishes `Live`, `ExitPending`, and `Exited`. On macOS only,
+the observed unavailable-metadata/non-ready-wait combination is pending, not
+live or exited. Pending authorizes neither group signalling nor drain completion;
+the existing absolute teardown deadline bounds kernel observation. The exclusive
+Tokio child remains retained, and wrong/reaped-child and birth-identity negatives
+remain errors. Group drain completion still requires proven exit and no live
+group members; this does not extend authority to escaped helpers.
+
+Exact source `17a8f5952b742c192d61f437a61f5286863e24ac`, via qualifier
+`7dfbfaa94c3e39f60f034649c8048499fcbd82a5`, passed both exact pure tests in
+[macOS run 39047567616](https://github.com/scottopell/phoenix-ide/actions/runs/39047567616):
+`exited_root_drains_stderr_closed_writer_before_profile_removal` (1 passed,
+0 failed, 0.27 s) and `pending_exit_authorizes_neither_signal_nor_completion`
+(1 passed, 0 failed). Job `117439269875`, artifact `12105519932`, retains both
+zero-test-guarded receipts. This closes the narrow pure Darwin failure, **not**
+actual Chrome, whole macOS, whole Linux, or final-head acceptance. Earlier Linux
+native/full-Rust success belongs to the earlier `a236` source. The task-only main
+advance `4894426888d175d4fd65095647bede65bb09718e` is composed without changing
+production code; the composed source still owes joint whole-head qualification.
+All diagnostic and negative tests are retained.
+
+### Composed native and full-Rust qualification
+
+Shared candidate `b2fd54fa83194d13bfa407cc61b23c16859c9024`, pinned to app
+`aff5126e1e82cc72ef7a1bd567c57c0d3c487c4e` and main
+`4894426888d175d4fd65095647bede65bb09718e`, completed all jobs.
+[macOS run 39048480300](https://github.com/scottopell/phoenix-ide/actions/runs/39048480300)
+passed native ownership/actual-Chrome qualification and the application build.
+[Linux run 39048480354](https://github.com/scottopell/phoenix-ide/actions/runs/39048480354)
+passed native ownership/actual-Chrome qualification, full Rust tests, E2E, tasks,
+worker-budget, and qualification-plan checks. Rebuilt artifact `12107545384`
+retains the six-report/six-export witness and successful normal owned drain.
+These are actual runtime results, not inferred from the earlier pure tests.
+
+That Linux run remained **failed overall** on two test-source issues: a missing
+statement semicolon in the exit-observation test and a synchronous canonical-URL
+assertion after an intermediate Coordinator render. Source children `8301cb58e`
+and `4749e0d0d` respectively correct those issues without changing production
+behavior, expected URL, lifecycle assertions, or timeouts. The UI failure did
+not reproduce locally; the focused two cases and owning 18-test module passed
+both before and after the awaited-URL correction. The successor source still
+owes one fresh whole-head qualification. No full-acceptance, overhead-clearance,
+escaped-helper coverage, or native-resume claim follows from these results.
+
+### Darwin group-query contract and scoped verification
+
+The macOS native failure on shared `35a10aeca` had no captured query return
+values. The diagnostic-only `b8723941a` escaped-writer execution passed without
+reproducing it; that negative remains unresolved as a specific causal trace.
+
+The Apple XNU source audit, pinned to
+[`f6217f891ac0bb64f3d375211650a4c1ff8ca1ea`](https://github.com/apple-oss-distributions/xnu/tree/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea),
+found that `libsyscall/wrappers/libproc/libproc.c::proc_listpids` maps syscall
+failure to zero while preserving errno, and successful kernel enumeration in
+`bsd/kern/proc_info.c::proc_listpids` can return zero matching PID bytes.
+Successful calls do not clear errno. The typed query wrapper therefore clears
+and captures thread-local errno immediately around each call. The decoder accepts
+zero only with zero errno and a valid capacity; errors, negative/non-PID-sized
+counts, and full or over-capacity results remain fail-closed. Empty decoding does
+not grant ownership: drain requires the exclusive retained child and proven exit
+both before enumeration and after an empty observation.
+
+[Run 39051330381](https://github.com/scottopell/phoenix-ide/actions/runs/39051330381)
+executed exact `5bcfca51f` contract and escaped-writer tests successfully. Its raw
+receipt showed four PID bytes/errno zero before root reap and zero bytes/errno
+zero **after reap**. This proves successful empty enumeration only in that
+post-reap observation, not zero results under retained-root authority, and does
+not establish the earlier `35a10` failure's return values or cause. Post-reap
+signal authority remains explicitly rejected.
+
+Exact source `06c7512b1b8cbfd5ecc416cf606d27f502a6fb32`, via qualifier
+`75dbbbeebe295d25748b4ebeb67bb8364691bcc8`, passed the complete seven-test native
+module (0 failed, 0.29 s) and browser library/tests Clippy (2 min 14 s) in
+[macOS run 39051966895](https://github.com/scottopell/phoenix-ide/actions/runs/39051966895).
+Artifact `12107518333` retains the receipt. All Linux lanes on the older shared
+`35a10` candidate also passed, including full Rust; its macOS native failure is
+not erased or relabelled. The decoder successor still owes actual Chrome and
+whole-head Linux/macOS qualification. No escaped-helper, overhead, native-resume,
+or full-acceptance guarantee is added.
+
+The source freshness check found main advanced from `489442688` to
+`ea5df4b473ebd62ee8edd59daad9e43a119e9630` (published schema-114 launchd activation).
+That deployment/harness/spec delta is composed in this source packet, with no
+Rust, Cargo, or UI byte changes from the scoped `06c7512b1` proof. The published
+activation ADR retains main's ID 115; the donor geometry ADR is remapped to 120.
+Integration must refresh base/source/tree pins before whole-head qualification;
+the scoped native proof is not relabelled as qualification of the merged main.
+
 ## Verification
 
 Lifecycle and installed-command coverage live in `crates/phoenix-tools/tests/browser_cli.rs`. Browser-free preflight and operation-catalog parity live in `browser::access_tests`; profiling validation and methodology retain their existing unit coverage. Engine snapshot and console tests use actual Chrome for document replacement, native input, artifacts, source-event capture, and iframe diagnostics.

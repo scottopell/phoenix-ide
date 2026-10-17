@@ -215,6 +215,12 @@ fn prepare_profile_dir_for_launch(
             session_key
         )));
     }
+    if marker.process_boundary == ProfileProcessBoundary::LaunchGroup {
+        return Err(BrowserError::ProfileReuseRefused(format!(
+            "browser profile {} has no retained launch-group drain authority; preserving profile",
+            profile.display()
+        )));
+    }
     match exact_process_state(marker.chrome_process_identity()) {
         ExactProcessState::Live => Err(BrowserError::ProfileReuseRefused(format!(
             "browser profile {} is still owned by live Chrome {}",
@@ -237,6 +243,7 @@ fn delete_profile_if_owned_and_stopped(
     profile: &Path,
     session_key: &str,
     expected: &BrowserLaunchIdentity,
+    proof: ProfileDeletionProof,
 ) -> Result<(), BrowserError> {
     let Some(expected_marker) = BrowserProfileMarker::from_launch(session_key, expected) else {
         return Err(BrowserError::OperationFailed(format!(
@@ -250,6 +257,13 @@ fn delete_profile_if_owned_and_stopped(
             profile.display()
         )));
     };
+    if actual_marker.process_boundary == ProfileProcessBoundary::LaunchGroup
+        && !matches!(proof, ProfileDeletionProof::DrainedGroup)
+    {
+        return Err(BrowserError::OperationFailed(
+            "Chrome group drain not proven; preserving profile".into(),
+        ));
+    }
     if actual_marker != expected_marker {
         return Err(BrowserError::OperationFailed(format!(
             "browser profile {} marker no longer matches session launch identity {}; preserving residual profile",
@@ -579,12 +593,28 @@ impl From<BrowserProfileProcessIdentity> for ProcessIdentity {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+enum ProfileProcessBoundary {
+    #[default]
+    RootOnly,
+    LaunchGroup,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProfileDeletionProof {
+    RootOnly,
+    DrainedGroup,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct BrowserProfileMarker {
     version: u32,
     session_key: String,
     launch_uuid: String,
     chrome_process: BrowserProfileProcessIdentity,
+    // owned: pre-group markers described root-only launches.
+    #[serde(default)]
+    process_boundary: ProfileProcessBoundary,
 }
 
 impl BrowserProfileMarker {
@@ -594,6 +624,11 @@ impl BrowserProfileMarker {
             session_key: session_key.to_string(),
             launch_uuid: launch_identity.launch_uuid.clone(),
             chrome_process: launch_identity.chrome_process?.into(),
+            process_boundary: if crate::process_group::ChromeExecShim::registered().is_some() {
+                ProfileProcessBoundary::LaunchGroup
+            } else {
+                ProfileProcessBoundary::RootOnly
+            },
         })
     }
 
@@ -623,6 +658,8 @@ impl BrowserLaunchIdentity {
 
 /// Per-conversation browser instance
 pub struct BrowserSession {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    owned_group: Option<crate::process_group::OwnedChromeGroup>,
     pub(crate) snapshot: crate::snapshot::SnapshotState,
     pub(crate) reference_guard_available: bool,
     pub(crate) reference_input_lock: Arc<tokio::sync::Mutex<()>>,
@@ -815,10 +852,28 @@ impl BrowserSession {
                 has_touch: false,
             });
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(shim) = crate::process_group::ChromeExecShim::registered() {
+            let target = match executable {
+                Some(path) => path.to_path_buf(),
+                None => chromiumoxide::detection::default_executable(
+                    chromiumoxide::detection::DetectionOptions::default(),
+                )
+                .map_err(BrowserError::LaunchFailed)?,
+            };
+            let target = std::fs::canonicalize(target)
+                .map_err(|error| BrowserError::LaunchFailed(error.to_string()))?;
+            builder = builder.chrome_executable(shim.executable()).env(
+                crate::process_group::ChromeExecShim::environment_key(),
+                crate::process_group::ChromeExecShim::encoded_target(&target),
+            );
+        } else if let Some(path) = executable {
+            builder = builder.chrome_executable(path);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         if let Some(path) = executable {
             builder = builder.chrome_executable(path);
         }
-
         builder
             .build()
             .map_err(|e| BrowserError::LaunchFailed(e.clone()))
@@ -827,7 +882,6 @@ impl BrowserSession {
     async fn first_page(
         browser: &mut Browser,
         handler_task: &JoinHandle<()>,
-        user_data_dir: &Path,
     ) -> Result<Page, BrowserError> {
         match init_phase(
             SessionInitPhase::FirstPage,
@@ -839,16 +893,46 @@ impl BrowserSession {
             Ok(Ok(page)) => Ok(page),
             Ok(Err(error)) => {
                 handler_task.abort();
-                let _ = browser.kill().await;
-                let _ = std::fs::remove_dir_all(user_data_dir);
                 Err(BrowserError::LaunchFailed(error.to_string()))
             }
             Err(error) => {
                 handler_task.abort();
-                let _ = browser.kill().await;
-                let _ = std::fs::remove_dir_all(user_data_dir);
                 Err(error)
             }
+        }
+    }
+
+    async fn stop_initial_browser(
+        browser: &mut Browser,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] group: Option<
+            &mut crate::process_group::OwnedChromeGroup,
+        >,
+    ) -> Result<ProfileDeletionProof, BrowserError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(group) = group {
+            let child = browser.get_mut_child().ok_or_else(|| {
+                BrowserError::LaunchFailed("owned Chrome child missing before drain".into())
+            })?;
+            group
+                .drain(child.as_mut_inner(), SESSION_INIT_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    BrowserError::LaunchFailed(format!(
+                        "initial Chrome group drain failed: {error}"
+                    ))
+                })?;
+            browser
+                .wait()
+                .await
+                .map_err(|error| BrowserError::LaunchFailed(error.to_string()))?;
+            return Ok(ProfileDeletionProof::DrainedGroup);
+        }
+        match browser.kill().await {
+            Some(Ok(())) => Ok(ProfileDeletionProof::RootOnly),
+            Some(Err(error)) => Err(BrowserError::LaunchFailed(error.to_string())),
+            None => Err(BrowserError::LaunchFailed(
+                "initial Chrome child is missing".into(),
+            )),
         }
     }
 
@@ -878,78 +962,7 @@ impl BrowserSession {
         }
     }
 
-    /// Launch browser and create a session
-    async fn launch_and_init(
-        tmp_root: &Path,
-        scope_key: &str,
-        launch_uuid: &str,
-        executable: Option<&Path>,
-    ) -> Result<Self, BrowserError> {
-        let user_data_dir = prepare_profile_dir_for_launch(tmp_root, scope_key)?;
-        let cleanup_unmarked_profile = || {
-            if !profile_marker_path(&user_data_dir).exists() {
-                let _ = std::fs::remove_dir_all(&user_data_dir);
-            }
-        };
-        let config = match Self::browser_config(&user_data_dir, executable) {
-            Ok(config) => config,
-            Err(error) => {
-                cleanup_unmarked_profile();
-                return Err(error);
-            }
-        };
-
-        // Browser::launch can hang on a wedged chromium subprocess. Bound it.
-        // If launch itself times out there is no browser handle to clean up.
-        let (mut browser, mut handler) = match init_phase(
-            SessionInitPhase::Launch,
-            SESSION_INIT_TIMEOUT,
-            Browser::launch(config),
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => {
-                cleanup_unmarked_profile();
-                return Err(BrowserError::LaunchFailed(e.to_string()));
-            }
-            Err(error) => {
-                cleanup_unmarked_profile();
-                return Err(error);
-            }
-        };
-        let chrome_pid = browser
-            .get_mut_child()
-            .and_then(|child| child.as_mut_inner().id());
-        let Some(chrome_process) = chrome_pid.and_then(current_process_identity) else {
-            let _ = browser.kill().await;
-            let _ = std::fs::remove_dir_all(&user_data_dir);
-            return Err(BrowserError::LaunchFailed(
-                "could not capture Chrome process identity".to_string(),
-            ));
-        };
-        let launch_identity = BrowserLaunchIdentity {
-            launch_uuid: launch_uuid.to_string(),
-            chrome_process: Some(chrome_process),
-        };
-        let marker = BrowserProfileMarker::from_launch(scope_key, &launch_identity)
-            .expect("launch identity contains a proven Chrome process");
-        if let Err(error) = write_profile_marker_atomic(&user_data_dir, &marker) {
-            let _ = browser.kill().await;
-            let _ = std::fs::remove_dir_all(&user_data_dir);
-            return Err(error);
-        }
-
-        let handler_task = tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if let Err(e) = event {
-                    tracing::warn!("CDP handler error: {e}");
-                }
-            }
-        });
-
-        let page = Self::first_page(&mut browser, &handler_task, &user_data_dir).await?;
-
+    async fn inject_react_helper(page: &Page) {
         // Auto-inject the __phoenix React helper into every future document.
         // Runs before page JS, so React registers its fiber roots into our hook
         // at startup. Harmless on non-React pages. See react.rs for full docs.
@@ -970,10 +983,134 @@ impl BrowserSession {
             Ok(Err(e)) => tracing::warn!("Failed to auto-inject React helper: {e}"),
             Err(error) => tracing::warn!(%error, "Auto-inject React helper timed out"),
         }
+    }
+
+    async fn launch_browser(
+        user_data_dir: &Path,
+        executable: Option<&Path>,
+    ) -> Result<(Browser, chromiumoxide::Handler), BrowserError> {
+        let config = match Self::browser_config(user_data_dir, executable) {
+            Ok(config) => config,
+            Err(error) => {
+                if !profile_marker_path(user_data_dir).exists() {
+                    let _ = std::fs::remove_dir_all(user_data_dir);
+                }
+                return Err(error);
+            }
+        };
+        match init_phase(
+            SessionInitPhase::Launch,
+            SESSION_INIT_TIMEOUT,
+            Browser::launch(config),
+        )
+        .await?
+        {
+            Ok(pair) => Ok(pair),
+            Err(error) => Err(BrowserError::LaunchFailed(error.to_string())),
+        }
+    }
+
+    async fn reject_unadopted_browser(browser: &mut Browser, reason: &str) -> BrowserError {
+        let cleanup = match tokio::time::timeout(SESSION_INIT_TIMEOUT, browser.kill()).await {
+            Ok(Some(Ok(()))) => "owned root stopped; descendant closure unproven".to_string(),
+            Ok(Some(Err(error))) => format!("owned root stop failed: {error}"),
+            Ok(None) => "owned root handle missing".to_string(),
+            Err(_) => "owned root stop deadline expired".to_string(),
+        };
+        BrowserError::LaunchFailed(format!("{reason}; {cleanup}; unmarked profile retained"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn adopt_launch_group(
+        browser: &mut Browser,
+        identity: ProcessIdentity,
+    ) -> Result<Option<crate::process_group::OwnedChromeGroup>, BrowserError> {
+        if crate::process_group::ChromeExecShim::registered().is_none() {
+            return Ok(None);
+        }
+        let child = browser.get_mut_child().ok_or_else(|| {
+            BrowserError::LaunchFailed("owned Chrome child missing before adoption".into())
+        })?;
+        match crate::process_group::OwnedChromeGroup::adopt(identity, child.as_mut_inner()) {
+            Ok(group) => Ok(Some(group)),
+            Err(error) => Err(Self::reject_unadopted_browser(browser, &error.to_string()).await),
+        }
+    }
+
+    /// Launch browser and create a session
+    async fn launch_and_init(
+        tmp_root: &Path,
+        scope_key: &str,
+        launch_uuid: &str,
+        executable: Option<&Path>,
+    ) -> Result<Self, BrowserError> {
+        let user_data_dir = prepare_profile_dir_for_launch(tmp_root, scope_key)?;
+        let (mut browser, mut handler) = Self::launch_browser(&user_data_dir, executable).await?;
+        let chrome_pid = browser
+            .get_mut_child()
+            .and_then(|child| child.as_mut_inner().id());
+        let Some(chrome_process) = chrome_pid.and_then(current_process_identity) else {
+            return Err(Self::reject_unadopted_browser(
+                &mut browser,
+                "could not capture Chrome process identity",
+            )
+            .await);
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let mut owned_group = Self::adopt_launch_group(&mut browser, chrome_process).await?;
+        let launch_identity = BrowserLaunchIdentity {
+            launch_uuid: launch_uuid.to_string(),
+            chrome_process: Some(chrome_process),
+        };
+        let marker = BrowserProfileMarker::from_launch(scope_key, &launch_identity)
+            .expect("launch identity contains a proven Chrome process");
+        if let Err(error) = write_profile_marker_atomic(&user_data_dir, &marker) {
+            Self::stop_initial_browser(
+                &mut browser,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                owned_group.as_mut(),
+            )
+            .await?;
+            if !profile_marker_path(&user_data_dir).exists() {
+                let _ = std::fs::remove_dir_all(&user_data_dir);
+            }
+            return Err(error);
+        }
+
+        let handler_task = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if let Err(e) = event {
+                    tracing::warn!("CDP handler error: {e}");
+                }
+            }
+        });
+
+        let page = match Self::first_page(&mut browser, &handler_task).await {
+            Ok(page) => page,
+            Err(error) => {
+                let proof = Self::stop_initial_browser(
+                    &mut browser,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    owned_group.as_mut(),
+                )
+                .await?;
+                delete_profile_if_owned_and_stopped(
+                    &user_data_dir,
+                    scope_key,
+                    &launch_identity,
+                    proof,
+                )?;
+                return Err(error);
+            }
+        };
+
+        Self::inject_react_helper(&page).await;
 
         let reference_guard_available = Self::install_reference_guard(&page).await;
 
         Ok(Self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            owned_group,
             browser,
             chrome_pid,
             chrome_process: Some(chrome_process),
@@ -1090,12 +1227,36 @@ impl BrowserSession {
         self.chrome_process
     }
 
+    fn profile_deletion_proof(&self) -> Result<ProfileDeletionProof, BrowserError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(group) = &self.owned_group {
+            return if group.is_drained() {
+                Ok(ProfileDeletionProof::DrainedGroup)
+            } else {
+                Err(BrowserError::OperationFailed(
+                    "Chrome group drain not complete".into(),
+                ))
+            };
+        }
+        Ok(ProfileDeletionProof::RootOnly)
+    }
+
     /// Check the owned Chrome child without sending a CDP request.
     ///
     /// # Errors
     /// Returns an error when child status cannot be read and no exact process
     /// identity establishes whether this browser is still running.
     pub fn is_running(&mut self) -> Result<bool, BrowserError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(group) = &self.owned_group {
+            let child = self.browser.get_mut_child().ok_or_else(|| {
+                BrowserError::OperationFailed("owned Chrome child missing before status".into())
+            })?;
+            return group
+                .observe_root(child.as_mut_inner())
+                .map(|observation| observation != crate::process_group::RootObservation::Exited)
+                .map_err(|error| BrowserError::OperationFailed(error.to_string()));
+        }
         if let Some(child) = self.browser.get_mut_child() {
             return owned_child_is_running(child.as_mut_inner());
         }
@@ -1275,6 +1436,27 @@ impl BrowserSession {
             t.abort();
         }
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(group) = self.owned_group.as_mut() {
+            let child = self.browser.get_mut_child().ok_or_else(|| {
+                BrowserTerminationError::KillFailed(
+                    "owned Chrome child missing before drain".into(),
+                )
+            })?;
+            group
+                .drain(child.as_mut_inner(), SESSION_INIT_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    BrowserTerminationError::KillFailed(format!(
+                        "owned Chrome group drain failed: {error}"
+                    ))
+                })?;
+            self.browser.wait().await.map_err(|error| {
+                BrowserTerminationError::KillFailed(format!("owned Chrome reap failed: {error}"))
+            })?;
+            self.handler_task.abort();
+            return Ok(());
+        }
         match self.is_running() {
             Ok(false) => {
                 self.handler_task.abort();
@@ -2562,13 +2744,14 @@ impl BrowserSessionManager {
         user_data_dir: &Path,
         session_key: &str,
         expected: &BrowserLaunchIdentity,
+        proof: ProfileDeletionProof,
     ) -> Result<(), BrowserError> {
         let user_data_dir = user_data_dir.to_path_buf();
         let profile_for_delete = user_data_dir.clone();
         let session_key = session_key.to_string();
         let expected = expected.clone();
         let failure = match tokio::task::spawn_blocking(move || {
-            delete_profile_if_owned_and_stopped(&profile_for_delete, &session_key, &expected)
+            delete_profile_if_owned_and_stopped(&profile_for_delete, &session_key, &expected, proof)
         })
         .await
         {
@@ -2673,15 +2856,22 @@ impl BrowserSessionManager {
 
                 let termination = {
                     let mut session_guard = session.write().await;
-                    session_guard.terminate().await
+                    session_guard
+                        .terminate()
+                        .await
+                        .map_err(|error| BrowserError::OperationFailed(error.to_string()))
+                        .and_then(|()| session_guard.profile_deletion_proof())
                 };
-                if let Err(error) = termination {
-                    tracing::warn!(work_scope = %requested_scope, %error, "browser termination failed; retaining tracked session");
-                    manager
-                        .complete_kill_failure(&key, &task_attempt, error.to_string())
-                        .await;
-                    return Err(BrowserError::OperationFailed(error.to_string()));
-                }
+                let proof = match termination {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        tracing::warn!(work_scope = %requested_scope, %error, "browser termination failed; retaining tracked session");
+                        manager
+                            .complete_kill_failure(&key, &task_attempt, error.to_string())
+                            .await;
+                        return Err(BrowserError::OperationFailed(error.to_string()));
+                    }
+                };
 
                 let Some((user_data_key, launch_identity)) = ({
                     let state = manager.state.read().await;
@@ -2707,6 +2897,7 @@ impl BrowserSessionManager {
                         &user_data_dir,
                         &user_data_key,
                         &launch_identity,
+                        proof,
                     )
                     .await?;
 
@@ -3235,18 +3426,56 @@ mod profile_marker_tests {
         std::fs::create_dir_all(&profile).expect("create profile");
         write_profile_marker_atomic(&profile, &marker(session_key, &launched))
             .expect("write marker");
-        delete_profile_if_owned_and_stopped(&profile, session_key, &launched)
-            .expect("delete exact dead profile");
+        delete_profile_if_owned_and_stopped(
+            &profile,
+            session_key,
+            &launched,
+            super::ProfileDeletionProof::RootOnly,
+        )
+        .expect("delete exact dead profile");
         assert!(!profile.exists());
 
         std::fs::create_dir_all(&profile).expect("recreate profile");
         write_profile_marker_atomic(&profile, &marker(session_key, &launched))
             .expect("write marker again");
         let replacement = launch_identity(999_997, 3, "replacement-uuid");
-        let err = delete_profile_if_owned_and_stopped(&profile, session_key, &replacement)
-            .expect_err("mismatched replacement refused");
+        let err = delete_profile_if_owned_and_stopped(
+            &profile,
+            session_key,
+            &replacement,
+            super::ProfileDeletionProof::RootOnly,
+        )
+        .expect_err("mismatched replacement refused");
         assert!(err.to_string().contains("marker no longer matches"));
         assert!(profile.exists(), "mismatched delete must preserve profile");
+    }
+
+    #[test]
+    fn launch_group_profile_requires_retained_group_drain_authority() {
+        let root = tempfile::tempdir().expect("profile root");
+        let key = "group-profile";
+        let profile = prepare_profile_dir_for_launch(root.path(), key).unwrap();
+        let identity = launch_identity(999_998, 2, "group-launch");
+        let mut owned = marker(key, &identity);
+        owned.process_boundary = super::ProfileProcessBoundary::LaunchGroup;
+        write_profile_marker_atomic(&profile, &owned).unwrap();
+        let error = delete_profile_if_owned_and_stopped(
+            &profile,
+            key,
+            &identity,
+            super::ProfileDeletionProof::RootOnly,
+        )
+        .expect_err("root exit is not launch-group drain");
+        assert!(error.to_string().contains("group drain not proven"));
+        assert!(profile_marker_path(&profile).exists());
+        assert!(profile.exists());
+        let error = prepare_profile_dir_for_launch(root.path(), key)
+            .expect_err("stale group marker cannot synthesize drain authority");
+        assert!(error
+            .to_string()
+            .contains("no retained launch-group drain authority"));
+        assert!(profile_marker_path(&profile).exists());
+        assert!(profile.exists());
     }
 
     #[test]

@@ -1270,6 +1270,10 @@ by cwd, and aggregate retirement accounts for every historically owned scope.
 
 ---
 
+Opening read authority SHALL be a typed sum of no opening evidence, an exact pending dispatch intent, or an accepted completed handoff. Pending authority SHALL retain the persisted nonempty `ClientTurnKey` unchanged, the durable opening authority, and the same-aggregate predecessor, successor, and persisted continuation boundary identities. Its candidate persisted message identities SHALL be exactly the key itself or `successor_transcript_row_id + ":" + key`, matching the persistence trigger; prefix stripping, trimming, content matching alone, and a successful dispatch response SHALL NOT establish acceptance.
+
+Accepted read authority SHALL require the exact completed handoff receipt and its persisted predecessor boundary and successor message. It SHALL retain the actual accepted message identity and durable authority. Generated predecessor context SHALL be represented by the boundary only while its actual persisted content equals the predecessor summary under the handoff content contract; user-authorized instructions and edited openings SHALL remain separate messages. Presentation SHALL be recomputed from persisted content on subsequent reads and content-update observations without changing accepted execution authority or copying summary text into the authority projection. A consistent completed receipt SHALL take precedence over a matching residual intent; conflicting or unreadable persisted evidence SHALL surface a read error rather than absence.
+
 ### REQ-BED-030A: ProductConversation Owns Aggregate Identity and Lifecycle
 
 EACH ProductConversation SHALL have a typed durable identity whose domain is independent of every transcript-row identity

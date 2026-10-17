@@ -433,6 +433,9 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "conversation.stream.init"),
     ("phoenix_ide::otel", "browser.conversation_open"),
     ("phoenix_ide::otel", "browser.product_conversation_open"),
+    ("phoenix_ide::otel", "browser.conversation_view"),
+    ("phoenix_ide::otel", "browser.view_correlation"),
+    ("phoenix_ide::otel", "coordinator.history_open"),
     ("phoenix_ide::otel", "product_conversation.detail_get"),
     (
         "phoenix_ide::otel",
@@ -566,10 +569,10 @@ fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
     meta.is_span() && OTEL_SPANS.contains(&(meta.target(), meta.name()))
 }
 
-fn phoenix_span_limits() -> SpanLimits {
+pub(crate) fn phoenix_span_limits() -> SpanLimits {
     SpanLimits {
         max_events_per_span: 0,
-        max_attributes_per_span: 32,
+        max_attributes_per_span: 52,
         max_links_per_span: 4,
         max_attributes_per_event: 0,
         max_attributes_per_link: 4,
@@ -1154,8 +1157,9 @@ mod tests {
         let limits = phoenix_span_limits();
         assert_eq!(limits.max_events_per_span, 0);
         assert_eq!(limits.max_attributes_per_event, 0);
-        assert!(limits.max_attributes_per_span <= 32);
-        assert!(limits.max_links_per_span <= 4);
+        assert_eq!(limits.max_attributes_per_span, 44 + 8);
+        assert_eq!(limits.max_links_per_span, 4);
+        assert_eq!(limits.max_attributes_per_link, 4);
     }
 
     #[test]

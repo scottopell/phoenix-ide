@@ -301,10 +301,12 @@ WHEN the browser successfully completes an initial ProductConversation detail op
 THE SYSTEM SHALL assign an opaque per-open identifier and pass it with the detail request
 AND SHALL emit content-free server stage telemetry for pool wait, read-transaction start, reference resolution, aggregate hydration, bounded message-page hydration, read rollback, post-snapshot projection, and total detail handling
 AND SHALL correlate the detail request's server stages by the opaque open identifier and server-resolved durable product reference
-AND SHALL correlate the browser snapshot receipt, committed store readiness, and—when the open starts visible—first-paint timing to that detail request by the opaque open identifier
-AND SHALL record hidden-at-start opens without fabricating a first-paint duration
+AND SHALL correlate the browser snapshot receipt, committed store readiness, and—when the open starts visible—a frame-based presentation estimate to that detail request by the opaque open identifier
+AND SHALL treat the `first_paint_ms` field as a scheduling estimate, not proof of compositor paint
+AND SHALL record hidden-at-start opens without fabricating a presentation duration
 AND SHALL validate that reported browser durations are finite, non-negative, ordered, and no greater than five minutes
-AND SHALL permit only the opaque open identifier and server-resolved durable product reference as high-cardinality trace correlation attributes
+AND SHALL permit only the opaque open identifier and server-resolved durable product reference as high-cardinality trace correlation attributes for this detail-open report
+AND SHALL apply the separately bounded conversation-view correlation contract in `specs/conversation-view-telemetry/requirements.md` to journey reports
 AND SHALL NOT emit message content, SQL text, credentials, filesystem paths, caller-defined trace attributes, or dynamic metric labels in this telemetry.
 
 WHEN the browser loads older ProductConversation pages or performs a background refresh
@@ -322,3 +324,43 @@ AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, 
 AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
 
 **Rationale:** Automatic continuation configuration is aggregate-scoped so a continuation cannot silently replace the configured identity, and its write response does not claim that existing exhausted work was scheduled.
+
+
+### REQ-API-030: Bounded Global Aggregate History
+
+WHEN an owner requests `GET /api/global/coordinator/history/:reference`
+THE SYSTEM SHALL resolve the reference only within Coordinator aggregate membership
+AND SHALL read reference resolution, ordered topology, message-page contents, and cursor watermarks from one database snapshot
+AND SHALL reuse the aggregate cursor's message limits, deterministic ordering, ceiling fencing, and generation validation
+AND SHALL return original continuation message records with their exact identity and transcript-local coordinates
+AND SHALL return content-free boundary navigation metadata for the aggregate, including boundaries outside the acquired page
+AND SHALL identify the exact accepted successor opening already represented by each original boundary, or explicitly report no represented opening, so live hydration cannot restore a duplicate summary
+AND SHALL suppress a represented opening only when persisted opening authority identifies generated predecessor context
+AND SHALL retain every user-authorized accepted opening, including unchanged summary text, and messages with distinct identities even when their text matches a boundary summary
+AND SHALL identify the newest writable Coordinator member independently of the requested historical member
+AND SHALL NOT create a Coordinator, admit a turn, or expose ordinary lifecycle, Close, or work actions as a side effect of the read
+
+WHEN an ordinary aggregate, sub-agent, or nonmember reference is supplied to this endpoint
+THE SYSTEM SHALL reject it rather than substituting the current Coordinator.
+
+Ordinary aggregate reads SHALL retain their ordinary lifecycle and mutation boundaries.
+
+WHEN an ordinary aggregate read selects `boundary_representation=original_messages`
+THE SYSTEM SHALL return original continuation messages and content-free boundary navigation metadata using the same history representation as the Global read
+AND SHALL omit handoff-summary metadata from those history segments.
+
+WHEN an ordinary aggregate read omits `boundary_representation` or selects `handoff_metadata`
+THE SYSTEM SHALL return handoff-summary metadata and exclude the represented continuation messages from segment message arrays
+AND SHALL omit the boundary navigation roster.
+
+THE SYSTEM SHALL reject unknown boundary representations.
+
+WHEN a caller requests Coordinator route membership for an exact row ID or member slug
+THE SYSTEM SHALL return the immutable Coordinator root identity for a member rather than its changing newest member identity
+AND SHALL return no Coordinator identity for a nonmember
+AND SHALL preserve that membership identity across continuation so independent exact-source validations compare the same aggregate.
+
+THE SYSTEM SHALL keep the newest transcript identity distinct from write readiness
+AND SHALL NOT advertise a reserved successor as writable before its continuation opening is accepted.
+
+Web consumption is specified by `specs/conversation-ui` REQ-CONV-023 and REQ-CONV-026.

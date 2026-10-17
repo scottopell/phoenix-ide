@@ -1,9 +1,16 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
 import { COORDINATOR_BRIEFING_PROMPT } from './coordinatorBriefing';
 import type { Conversation } from '../api';
+
+vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
+  const actual = await importOriginal<typeof import('../hooks/conversationViewTelemetry')>();
+  return { ...actual, ViewJourneyReporter: class extends actual.ViewJourneyReporter {
+    constructor() { super({ sampleRate: 1, send: async () => new Response(null, { status: 204 }) }); }
+  } };
+});
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
@@ -23,26 +30,27 @@ vi.mock('../api', async () => {
   return { ...actual, api: apiMock };
 });
 
-vi.mock('./ConversationPage', () => ({
-  ConversationPage: ({
-    routePrefix,
-    composerQuickAction,
-    stateBarExtension,
+vi.mock('./ProductConversationPage', () => ({
+  ProductConversationPage: ({
+    productId,
+    globalShell,
   }: {
-    routePrefix?: string;
-    composerQuickAction?: { label: string; compactLabel: string; prompt: string };
-    stateBarExtension?: { summary: React.ReactNode; details: React.ReactNode };
+    productId?: string;
+    globalShell?: {
+      composerQuickAction?: { label: string; compactLabel: string; prompt: string };
+      stateBarExtension?: { summary: React.ReactNode; details: React.ReactNode };
+    };
   }) => (
     <div>
-      Shared conversation runtime {routePrefix}
+      Shared conversation runtime /global <span data-testid="history-reference">{productId}</span>
       <div data-testid="mock-statebar">
-        {stateBarExtension?.summary}
-        {stateBarExtension?.details}
+        {globalShell?.stateBarExtension?.summary}
+        {globalShell?.stateBarExtension?.details}
       </div>
-      {composerQuickAction && (
-        <button type="button" data-prompt={composerQuickAction.prompt}>
-          {composerQuickAction.compactLabel}
-          <span className="sr-only">{composerQuickAction.label}</span>
+      {globalShell?.composerQuickAction && (
+        <button type="button" data-prompt={globalShell.composerQuickAction.prompt}>
+          {globalShell.composerQuickAction.compactLabel}
+          <span className="sr-only">{globalShell.composerQuickAction.label}</span>
         </button>
       )}
     </div>
@@ -149,7 +157,28 @@ describe('CoordinatorPage', () => {
       handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,
     }]);
 
-    renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
+    let validationReleased = false;
+    const pendingValidations: Array<(value: { conversation: { id: string } }) => void> = [];
+    apiMock.getConversation
+      .mockResolvedValueOnce({ conversation: { id: 'source-1' } })
+      .mockImplementation((id: string) => validationReleased
+        ? Promise.resolve({ conversation: { id } })
+        : new Promise(resolve => { pendingValidations.push(resolve); }));
+    render(<MemoryRouter initialEntries={['/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source']}><Routes>
+      <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+    </Routes></MemoryRouter>);
+
+    await screen.findByText('/global/source-1?source_transcript=source-1&source_tool=tool-1#message-source');
+    await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
+    await waitFor(() => expect(screen.getByText('UI tests').closest('.coordinator-conversation')).toHaveAttribute('hidden'));
+    expect(pendingValidations.length).toBeGreaterThan(0);
+    expect(screen.getByText('output →')).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    expect(screen.queryByRole('link', { name: 'output →' })).not.toBeInTheDocument();
+    await act(async () => {
+      validationReleased = true;
+      for (const release of pendingValidations) release({ conversation: { id: 'source-1' } });
+    });
+    const output = await screen.findByRole('link', { name: 'output →' });
 
     await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
     const running = await screen.findByRole('region', { name: 'Running commands' });
@@ -161,7 +190,7 @@ describe('CoordinatorPage', () => {
     fireEvent.click(commandDetails!.querySelector('summary')!);
     expect(running).toHaveTextContent('/repo/ui');
     expect(running).toHaveTextContent('b-live');
-    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    expect(output).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     fireEvent.click(screen.getByRole('button', { name: 'stop' }));
     await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
@@ -253,7 +282,29 @@ describe('CoordinatorPage', () => {
     </Routes></MemoryRouter>);
     await screen.findByText('Shared conversation runtime /global');
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
-    expect(screen.getByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+    expect(await screen.findByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+  });
+
+  it('retains the same acquired-history owner while a different valid source pin is validated', async () => {
+    function SelectOtherSource() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/global/old-member?source_transcript=conv-coordinator#message-new')}>select other member</button>;
+    }
+    render(<MemoryRouter initialEntries={['/global/old-member?source_transcript=old-member#message-old']}><Routes>
+      <Route path="/global/:slug" element={<><CoordinatorPage /><SelectOtherSource /><CurrentPath /></>} />
+    </Routes></MemoryRouter>);
+    const owner = await screen.findByTestId('history-reference');
+    expect(owner).toHaveTextContent('old-member');
+    let release!: (value: { conversation: { id: string } }) => void;
+    apiMock.getConversation.mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    fireEvent.click(screen.getByRole('button', { name: 'select other member' }));
+    expect(screen.getByTestId('history-reference')).toBe(owner);
+    await waitFor(() => expect(apiMock.getConversation).toHaveBeenCalledWith('conv-coordinator'));
+    await act(async () => release({ conversation: { id: 'conv-coordinator' } }));
+    await waitFor(() => expect(owner.closest('section')).not.toHaveAttribute('hidden'));
+    expect(screen.getByTestId('history-reference')).toBe(owner);
+    expect(owner).toHaveTextContent('old-member');
+    expect(screen.getByText('/global/old-member?source_transcript=conv-coordinator#message-new')).toBeInTheDocument();
   });
 
   it('rejects a slug pin even when it belongs to the Global domain', async () => {
