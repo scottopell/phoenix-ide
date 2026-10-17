@@ -167,7 +167,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir owned-child-diagnostic
-          git diff --exit-code e94a3887b45d2e7d98484bae7a0dcb7196a4c333 HEAD -- crates Cargo.toml Cargo.lock
+          git diff --exit-code 8b4b2ff0bb02e49414cf7a8109d6836d2376af35 HEAD -- crates Cargo.toml Cargo.lock
           cargo test -p phoenix-browser --lib process_group::native::tests::exited_root_drains_stderr_closed_writer_before_profile_removal -- --exact --nocapture --test-threads=1 2>&1 | tee owned-child-diagnostic/native.log
           grep -F 'test result: ok. 1 passed; 0 failed;' owned-child-diagnostic/native.log
       - name: Preserve exact success or bounded identity diagnostic
