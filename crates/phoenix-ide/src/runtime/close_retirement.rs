@@ -7257,9 +7257,8 @@ mod tests {
             BashRetirementOutcome::Retired(report.clone()),
             BashRetirementOutcome::AbsenceVerified(report),
         ] {
-            let error = super::require_absent(outcome)
-                .err()
-                .expect("scope uncertainty must block Close");
+            let error =
+                super::require_absent(outcome).expect_err("scope uncertainty must block Close");
             assert!(error.contains("0 process-group failure(s)"));
             assert!(error.contains("UnregisteredLaunch"));
         }
