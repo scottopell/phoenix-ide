@@ -196,11 +196,13 @@ class Fixture:
         self.completion = completion
         self.client = httpx.Client(base_url=base, timeout=10, trust_env=False)
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, *, expected_status=None):
         response = self.client.request(method, path, json=body)
         append(self.out / "setup-api.jsonl", {"method": method, "path": path,
             "status": response.status_code, "request": body, "response": response.text})
         response.raise_for_status()
+        if expected_status is not None:
+            assert response.status_code == expected_status, (response.status_code, response.text)
         return response.json()
 
     def wait(self, row, exhausted=False, message_id=None):
@@ -249,11 +251,37 @@ class Fixture:
         assert before["conversation"]["continued_in_conv_id"] == successor
         return successor
 
+    def wait_for_publication(self, request_id, accepted):
+        assert accepted.get("request_id") == request_id, accepted
+        product_id = accepted.get("product_conversation_id")
+        assert isinstance(product_id, str) and product_id, accepted
+        deadline = time.monotonic() + 20
+        while True:
+            creation = self.request("GET", f"/api/product-conversations/creation/{request_id}")
+            assert creation.get("request_id") == request_id, creation
+            assert creation.get("product_conversation_id") == product_id, creation
+            kind = creation.get("kind")
+            if kind == "published":
+                assert creation.get("canonical_route") == f"/c/{product_id}", creation
+                row = creation.get("transcript_row_id")
+                assert isinstance(row, str) and row, creation
+                return creation
+            assert kind not in {"failed", "cancelled"}, f"product creation did not publish: {creation!r}"
+            assert kind == "pending" and creation.get("status") in {
+                "accepted", "claimed", "retry_scheduled", "cancelling", "deletion_pending", "delivery_pending"
+            }, f"unexpected product creation status: {creation!r}"
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for product publication: {creation!r}")
+            time.sleep(.05)
+
     def build(self, kind, cwd):
         if kind == "ordinary":
-            created = self.request("POST", "/api/product-conversations/new", {
+            request_id = str(uuid.uuid4())
+            accepted = self.request("POST", "/api/product-conversations/new", {
                 "cwd": str(cwd), "model": self.h._default_model(self.base),
-                "objective": FAST + " qualification ordinary", "images": [], "request_id": str(uuid.uuid4())})
+                "objective": FAST + " qualification ordinary", "images": [], "request_id": request_id},
+                expected_status=202)
+            created = self.wait_for_publication(request_id, accepted)
             row = created["transcript_row_id"]
             route = created["canonical_route"]
             endpoint = f'/api/product-conversations/{created["product_conversation_id"]}'

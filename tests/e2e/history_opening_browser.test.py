@@ -1388,24 +1388,35 @@ class FixtureSettlementTests(unittest.TestCase):
         self.product_job(request_id="key")
         self.correlation = "key"
         self.data["messages"][0]["message_id"] = "key"
-        gets, creations = [], []
+        gets, creations, observations = [], [], []
         harness = types.SimpleNamespace(_terminal_event=lambda *a: True,
             _context_exhausted_event=lambda *a: True, _wait_for_sse_signal=lambda *a: None,
             _state_str=lambda state: state["type"], _default_model=lambda *a: "mock")
         fixture = opening.shipping.Fixture(harness, "http://127.0.0.1:1", self.root,
                                           completion=self.observer)
         self.addCleanup(fixture.client.close)
-        def request(method, path, body=None):
+        def request(method, path, body=None, *, expected_status=None):
             if method == "POST":
                 self.assertEqual(path, "/api/product-conversations/new")
+                self.assertEqual(expected_status, 202)
                 self.assertEqual(body["request_id"], "key")
                 self.assertIn("qualification ordinary", body["objective"])
                 self.assertNotIn("text", body)
                 creations.append(body)
-                return {"transcript_row_id": "row", "product_conversation_id": "product",
-                        "canonical_route": "/c/product"}
+                return {"request_id": "key", "product_conversation_id": "product"}
+            if path == "/api/product-conversations/creation/key":
+                self.assertEqual(method, "GET")
+                observations.append(path)
+                if len(observations) == 1:
+                    return {"kind": "pending", "request_id": "key",
+                            "product_conversation_id": "product", "status": "delivery_pending"}
+                self.publish_job()
+                return {"kind": "published", "request_id": "key", "transcript_row_id": "row",
+                        "product_conversation_id": "product", "canonical_route": "/c/product"}
             if method == "PUT":
                 return {"auto_continue_on_context_exhaustion": False}
+            self.assertEqual(path, "/api/conversations/row")
+            self.assertEqual(len(observations), 2)
             gets.append(path)
             if len(gets) == 2:
                 self.publish_job()
@@ -1422,6 +1433,7 @@ class FixtureSettlementTests(unittest.TestCase):
                 patch.object(opening.shipping.time, "sleep"), self.assertRaises(OpeningObserved):
             fixture.build("ordinary", self.root)
         self.assertEqual(len(creations), 1)
+        self.assertEqual(len(observations), 2)
         self.assertEqual(len(gets), 5)
         fixture.send.assert_called_once()
 

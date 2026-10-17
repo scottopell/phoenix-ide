@@ -203,6 +203,77 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(fixture.request.call_count, 2)
         self.assertTrue((fixture.out / "setup-sse.jsonl").exists())
 
+    def creation_fixture(self, observations, accepted=None, acceptance_status=202):
+        import httpx
+        calls = []
+        observations = iter(observations)
+        def respond(request):
+            calls.append((request.method, request.url.path))
+            if request.method == "POST":
+                self.assertEqual(json.loads(request.content)["request_id"], "key")
+                return httpx.Response(acceptance_status, json=accepted if accepted is not None else {
+                    "request_id": "key", "product_conversation_id": "product"})
+            self.assertEqual(request.url.path, "/api/product-conversations/creation/key")
+            return httpx.Response(200, json=next(observations))
+        fixture = hb.Fixture(types.SimpleNamespace(_default_model=lambda base: "mock"),
+                             "http://127.0.0.1:1", Path(self.temp.name))
+        fixture.client.close()
+        fixture.client = httpx.Client(base_url=fixture.base, transport=httpx.MockTransport(respond))
+        self.addCleanup(fixture.client.close)
+        fixture.wait = MagicMock(side_effect=InterruptedError("published row reached"))
+        return fixture, calls
+
+    def published(self, **changes):
+        return {"kind": "published", "request_id": "key", "product_conversation_id": "product",
+                "transcript_row_id": "server-row", "canonical_route": "/c/product", **changes}
+
+    def test_creation_acceptance_polls_exact_request_before_using_published_row(self):
+        pending = {"kind": "pending", "request_id": "key", "product_conversation_id": "product",
+                   "status": "delivery_pending"}
+        fixture, calls = self.creation_fixture([pending, self.published()])
+        with patch.object(hb.uuid, "uuid4", return_value="key"), patch.object(hb.time, "sleep"), \
+                self.assertRaisesRegex(InterruptedError, "published row reached"):
+            fixture.build("ordinary", self.app)
+        fixture.wait.assert_called_once_with("server-row")
+        self.assertEqual(calls, [("POST", "/api/product-conversations/new"),
+                                ("GET", "/api/product-conversations/creation/key"),
+                                ("GET", "/api/product-conversations/creation/key")])
+
+    def test_creation_rejects_terminal_failure_and_invalid_receipts_before_row_access(self):
+        bad = [self.published(kind="failed", status="delivery_failed", error="delivery broken"),
+               self.published(kind="cancelled"), self.published(kind="unknown"),
+               self.published(request_id="foreign"), self.published(product_conversation_id="foreign"),
+               self.published(canonical_route="/c/foreign"), self.published(transcript_row_id=""),
+               self.published(kind="pending", status="published"),
+               {"kind": "pending", "status": "accepted", "request_id": "foreign",
+                "product_conversation_id": "product"}]
+        for receipt in bad:
+            with self.subTest(receipt=receipt):
+                fixture, _ = self.creation_fixture([receipt])
+                with patch.object(hb.uuid, "uuid4", return_value="key"), self.assertRaises(AssertionError):
+                    fixture.build("ordinary", self.app)
+                fixture.wait.assert_not_called()
+        for accepted, status in [({"request_id": "foreign", "product_conversation_id": "product"}, 202),
+                                 ({"request_id": "key", "product_conversation_id": ""}, 202),
+                                 ({"request_id": "key", "product_conversation_id": "product"}, 200)]:
+            with self.subTest(accepted=accepted, status=status):
+                fixture, calls = self.creation_fixture([], accepted, status)
+                with patch.object(hb.uuid, "uuid4", return_value="key"), self.assertRaises(AssertionError):
+                    fixture.build("ordinary", self.app)
+                self.assertEqual(len(calls), 1)
+                fixture.wait.assert_not_called()
+
+    def test_creation_pending_times_out_without_detail_or_row_access(self):
+        pending = {"kind": "pending", "request_id": "key", "product_conversation_id": "product",
+                   "status": "accepted"}
+        fixture, calls = self.creation_fixture([pending])
+        with patch.object(hb.uuid, "uuid4", return_value="key"), \
+                patch.object(hb.time, "monotonic", side_effect=[0, 21]), \
+                self.assertRaisesRegex(TimeoutError, "publication.*accepted"):
+            fixture.build("ordinary", self.app)
+        self.assertEqual(len(calls), 2)
+        fixture.wait.assert_not_called()
+
     def test_process_cleanup_covers_exited_driver_descendants(self):
         proc = MagicMock(pid=99999)
         proc.poll.return_value = 1

@@ -3119,3 +3119,30 @@ shared pins select this exact clean tree; the composed CLI accepts the workflow'
 420s outer bound under actual parser tests. One changed-candidate hosted run is
 prepared after the previous whole terminal, with no duplicate runner, native
 local build or expansion of overhead/device acceptance.
+
+### Third successor run: current-main async creation and remaining source gates
+
+At b934/aac4, run39007594676 passed the prior SQL-lint compilation/codegen gates
+but witness117323187731 failed before browser with KeyError transcript_row_id.
+The current-main create API returns HTTP202 acceptance, not a synchronous
+published transcript. Shared Fixture.build had still indexed the acceptance as
+an old published receipt. It now requires202, validates request/product identity,
+polls the actual creation observation endpoint under a20s bound, accepts only
+the server's published transcript/canonical route, and then retains the existing
+runtime completion/persistence checks. Failed/cancelled/unknown or mismatched
+observations fail closed; no transcript identity is synthesized. The main E2E
+scenario uses the same contract; no additional observation mutation is required.
+
+Nineteen compiler-free fixture tests and79 lifecycle tests pass, covering
+acceptance→pending→publication, wrong identities/routes/rows/status, terminal
+failure/cancellation and timeout. The tests use in-memory HTTP mocks, not a local
+service. This fixes a concrete API composition error rather than weakening the
+witness or retrying its unchanged candidate.
+
+Other completed jobs exposed two remaining capacity assertion helpers over100
+lines and a mounted conversation-stream test asserting its fake EventSource
+before attachment. These source gates are commissioned separately. Rust is
+still in progress at this entry; no next candidate is published until its whole
+terminal state is established. Artifact12090904686 is96,845,740 bytes; bounded
+native result/browser selections and completed-job logs are retained. No
+browser scenario progress or source acceptance is claimed for this run yet.
