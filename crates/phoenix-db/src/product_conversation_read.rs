@@ -785,6 +785,7 @@ impl Database {
                     WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')")
                 .bind(product_conversation_id.as_str())
                 .fetch_optional(&self.pool)
+                .instrument(tracing::info_span!("observation.db.product"))
                 .await?;
         let Some(product) = product else {
             return Err(DbError::ConversationNotFound(
@@ -851,13 +852,17 @@ impl Database {
         )
         .bind(product_conversation_id.as_str())
         .fetch_all(&self.pool)
+        .instrument(tracing::info_span!("observation.db.topology"))
         .await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.try_get("id")?;
             let ordinal: i64 = row.try_get("ordinal")?;
             transcript_rows.push(ProductConversationTranscriptRow {
-                conversation: self.get_conversation(&id).await?,
+                conversation: self
+                    .get_conversation(&id)
+                    .instrument(tracing::info_span!("observation.db.read_member"))
+                    .await?,
                 segment_ordinal: ordinal,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
@@ -878,6 +883,7 @@ impl Database {
                         &transcript_row.conversation.id,
                         successor_transcript_row_id,
                     )
+                    .instrument(tracing::info_span!("observation.db.handoff"))
                     .await?
                 }
                 None => None,
@@ -899,6 +905,7 @@ impl Database {
             })?;
         let source = self
             .product_conversation_source(product_conversation_id)
+            .instrument(tracing::info_span!("observation.db.source"))
             .await?;
         Ok(ProductConversationAggregate {
             product_conversation: ProductConversation::ordinary(
@@ -1106,6 +1113,7 @@ impl Database {
                     WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')")
                 .bind(product_conversation_id.as_str())
                 .fetch_optional(&mut *connection)
+                .instrument(tracing::info_span!("observation.db.product"))
                 .await?;
         let Some(product) = product else {
             return Err(DbError::ConversationNotFound(
@@ -1164,12 +1172,15 @@ impl Database {
              LEFT JOIN conversation_approved_task_objectives objective
                ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
-        ).bind(product_conversation_id.as_str()).bind(runtime_role).fetch_all(&mut *connection).await?;
+        ).bind(product_conversation_id.as_str()).bind(runtime_role).fetch_all(&mut *connection)
+        .instrument(tracing::info_span!("observation.db.topology")).await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.try_get("id")?;
             transcript_rows.push(ProductConversationTranscriptRow {
-                conversation: Self::get_conversation_on(connection, &id).await?,
+                conversation: Self::get_conversation_on(connection, &id)
+                    .instrument(tracing::info_span!("observation.db.read_member"))
+                    .await?,
                 segment_ordinal: row.try_get("ordinal")?,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
@@ -1190,6 +1201,7 @@ impl Database {
                         &transcript_row.conversation.id,
                         successor,
                     )
+                    .instrument(tracing::info_span!("observation.db.handoff"))
                     .await?
                 }
                 None => None,
@@ -1209,8 +1221,9 @@ impl Database {
             .ok_or_else(|| {
                 DbError::Serialization("aggregate has no updated timestamp".to_string())
             })?;
-        let source =
-            Self::product_conversation_source_on(connection, product_conversation_id).await?;
+        let source = Self::product_conversation_source_on(connection, product_conversation_id)
+            .instrument(tracing::info_span!("observation.db.source"))
+            .await?;
         Ok(ProductConversationAggregate {
             product_conversation,
             root,

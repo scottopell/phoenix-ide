@@ -449,6 +449,23 @@ fn is_exempt_path(path: &str) -> bool {
     false
 }
 
+pub(crate) fn observation_request_span(req: &Request<Body>) -> tracing::Span {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or("unmatched", axum::extract::MatchedPath::as_str);
+    tracing::info_span!(
+        parent: None,
+        "observation.request",
+        request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        route,
+        status = tracing::field::Empty,
+        response_ready = false,
+    )
+}
+
 /// Axum middleware that enforces password auth when `PHOENIX_PASSWORD` is set.
 pub async fn auth_middleware(
     State(application): State<ApplicationState>,
@@ -458,10 +475,23 @@ pub async fn auth_middleware(
     let state = match &application {
         ApplicationState::Live(state) => state,
         ApplicationState::Observation(application) => {
-            if let Err(error) = application.admit_peer(peer_from_extensions(&req), req.headers()) {
-                return error.into_response();
+            use tracing::Instrument;
+            let span = observation_request_span(&req);
+            return async {
+                let admitted =
+                    async { application.admit_peer(peer_from_extensions(&req), req.headers()) }
+                        .instrument(tracing::info_span!("observation.authorization"))
+                        .await;
+                let response = match admitted {
+                    Ok(()) => next.run(req).await,
+                    Err(error) => error.into_response(),
+                };
+                tracing::Span::current().record("status", response.status().as_u16());
+                tracing::Span::current().record("response_ready", true);
+                response
             }
-            return next.run(req).await;
+            .instrument(span)
+            .await;
         }
     };
     // No password configured — pass through as the owner channel.

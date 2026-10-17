@@ -15,6 +15,7 @@ use super::types::{
 use crate::db::{Database, DbError};
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use serde::Serialize;
+use tracing::Instrument;
 
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[serde(tag = "kind", content = "conversation", rename_all = "snake_case")]
@@ -83,6 +84,7 @@ impl ConversationRouteObservations {
         let mut resolved = self
             .db
             .resolve_ordinary_product_conversation(reference)
+            .instrument(tracing::info_span!("observation.resolve_ordinary"))
             .await?;
         if let RouteScope::Product(target) = &self.scope {
             if &resolved.product_conversation_id != target {
@@ -92,6 +94,7 @@ impl ConversationRouteObservations {
                 resolved.requested_transcript_row_id = self
                     .db
                     .get_ordinary_product_conversation(target)
+                    .instrument(tracing::info_span!("observation.get_aggregate"))
                     .await?
                     .root
                     .conversation
@@ -103,6 +106,7 @@ impl ConversationRouteObservations {
         Ok(resolved)
     }
 
+    #[tracing::instrument(name = "observation.require_member", skip_all)]
     pub(crate) async fn require_member(&self, id: &str) -> Result<(), DbError> {
         if let RouteScope::Coordinator(target) = &self.scope {
             let snapshot = self
@@ -117,11 +121,19 @@ impl ConversationRouteObservations {
         let RouteScope::Product(target) = &self.scope else {
             return Ok(());
         };
-        let resolved = self.db.resolve_ordinary_product_conversation(id).await?;
+        let resolved = self
+            .db
+            .resolve_ordinary_product_conversation(id)
+            .instrument(tracing::info_span!("observation.member.resolve_ordinary"))
+            .await?;
         if &resolved.product_conversation_id != target {
             return Err(DbError::ConversationNotFound(id.to_owned()));
         }
-        let aggregate = self.db.get_ordinary_product_conversation(target).await?;
+        let aggregate = self
+            .db
+            .get_ordinary_product_conversation(target)
+            .instrument(tracing::info_span!("observation.member.get_aggregate"))
+            .await?;
         let mut next = Some(aggregate.root.conversation.id.as_str());
         for _ in 0..aggregate.segments.len() {
             let Some(member) = next.and_then(|next| {

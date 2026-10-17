@@ -12,6 +12,20 @@ const manifest = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observ
   files: Array<{ path: string; base_blob: string | null; product_blob: string | null; actual_blob: string | null; exception?: { reason: string; diff: string } }>;
 };
 const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+const attribution = JSON.parse(readFileSync(resolve(root, 'docs/conversation-observation-attribution.json'), 'utf8')) as {
+  base: string;
+  files: Array<{ path: string; base_blob: string | null; actual_blob: string; diff: string; changed_functions: string[] }>;
+};
+const attributionPaths = [
+  'crates/phoenix-db/src/product_conversation_read.rs',
+  'crates/phoenix-ide/src/api/auth.rs',
+  'crates/phoenix-ide/src/api/observation.rs',
+  'crates/phoenix-ide/src/observation_startup.rs',
+  'crates/phoenix-ide/src/observation_startup/attribution_tests.rs',
+  'docs/conversation-observation-attribution.md',
+  'tests/devpy/test_observation_attribution_source.py',
+  'ui/tests/observationSourceParity.test.ts',
+];
 function tree(ref: string): Map<string, string> {
   return new Map(git('ls-tree', '-r', ref, '--', 'ui').trim().split('\n').filter(Boolean).map(line => {
     const [metadata, path] = line.split('\t');
@@ -68,11 +82,33 @@ describe('observation composition source identity', () => {
     }
   });
 
-  it('preserves the immutable backend, generated observation types and existing rig support', () => {
-    expect(git('diff', '--name-only', manifest.base, '--', '.', ':(exclude)ui/src', ':(exclude)ui/tests/observationSourceParity.test.ts', ':(exclude)docs/conversation-observation-source-parity.json', ':(exclude)docs/conversation-observation-composition.md').trim()).toBe('');
+  it('preserves the backend outside exact attribution diffs, generated types and rig support', () => {
+    expect(git('diff', '--name-only', manifest.base, '--', '.', ':(exclude)ui/src', ':(exclude)ui/tests/observationSourceParity.test.ts', ':(exclude)docs/conversation-observation-source-parity.json', ':(exclude)docs/conversation-observation-composition.md', ':(exclude)docs/conversation-observation-attribution.json', ...attributionPaths.map(path => `:(exclude)${path}`)).trim()).toBe('');
     for (const file of manifest.files.filter(file => file.path.startsWith('ui/src/generated/') || file.path.startsWith('ui/scripts/'))) {
       expect(file.actual_blob, file.path).toBe(file.base_blob);
     }
+  });
+
+  it('bounds attribution to exact reviewed diffs and preserves all other 2702 UI bytes', () => {
+    expect(attribution.base).toBe('2702d8389c2fc78ac2e528c876c35a1a7040d692');
+    expect(attribution.files.map(file => file.path)).toEqual([...attributionPaths].sort());
+    for (const file of attribution.files) {
+      const entry = git('ls-tree', attribution.base, '--', file.path).trim();
+      expect(file.base_blob, file.path).toBe(entry ? entry.split(/\s+/)[2] : null);
+      expect(actualBlob(file.path), file.path).toBe(file.actual_blob);
+      expect(exactDiff(file.path, file.base_blob), file.path).toBe(file.diff);
+    }
+    const pinnedUI = tree(attribution.base);
+    const currentUI = git('ls-files', '--cached', '--others', '--exclude-standard', '--', 'ui').trim().split('\n').filter(Boolean).sort();
+    expect(currentUI).toEqual([...pinnedUI.keys()].sort());
+    for (const [path, blob] of pinnedUI) {
+      if (path !== 'ui/tests/observationSourceParity.test.ts') expect(actualBlob(path), path).toBe(blob);
+    }
+    const changed = new Set([
+      ...git('diff', '--name-only', attribution.base).trim().split('\n').filter(Boolean),
+      ...git('ls-files', '--others', '--exclude-standard').trim().split('\n').filter(Boolean),
+    ]);
+    expect([...changed].sort()).toEqual([...attributionPaths, 'docs/conversation-observation-attribution.json'].sort());
   });
 
   it('permits only the enumerated existing capability adapters, never algorithm substitutions', () => {
