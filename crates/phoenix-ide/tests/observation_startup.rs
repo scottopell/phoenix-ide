@@ -722,7 +722,7 @@ async fn portable_ui_serves_exact_built_entry_assets_from_private_cwd() {
 
     let fixture = Fixture::new().await;
     assert!(!fixture.dir.path().join("ui/dist").exists());
-    let sentinel = listener();
+    let sentinel = sentinel();
     let mut server = Server(
         fixture
             .command(&sentinel)
@@ -732,7 +732,22 @@ async fn portable_ui_serves_exact_built_entry_assets_from_private_cwd() {
             .spawn()
             .unwrap(),
     );
-    let address = server.ready();
+    let stdout = server.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line);
+        let _ = send.send((result, line));
+    });
+    let (result, line) = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+    result.unwrap();
+    let url = line
+        .trim()
+        .strip_prefix("Observation listening on ")
+        .unwrap();
+    let address: SocketAddr = url.strip_prefix("http://").unwrap().parse().unwrap();
+    assert!(address.ip().is_loopback());
+    assert_ne!(address.port(), sentinel.local_addr().unwrap().port());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .no_proxy()
@@ -769,9 +784,7 @@ async fn portable_ui_serves_exact_built_entry_assets_from_private_cwd() {
         !entries.is_empty(),
         "built HTML must reference a module entry"
     );
-    let mut manifest = serde_json::json!({
-        "index.html": format!("{:x}", Sha256::digest(&expected_html)),
-    });
+    let mut manifest = serde_json::json!({ "index.html": portable_sha256(&expected_html) });
     for entry in entries {
         let filename = entry.strip_prefix("/assets/").unwrap();
         assert!(!filename.contains('/'));
@@ -790,12 +803,29 @@ async fn portable_ui_serves_exact_built_entry_assets_from_private_cwd() {
         let bytes = response.bytes().await.unwrap();
         assert!(!bytes.is_empty());
         let expected = std::fs::read(dist.join(entry.trim_start_matches('/'))).unwrap();
-        let digest = format!("{:x}", Sha256::digest(&bytes));
-        assert_eq!(digest, format!("{:x}", Sha256::digest(&expected)));
+        let digest = portable_sha256(&bytes);
+        assert_eq!(digest, portable_sha256(&expected));
         manifest[entry] = serde_json::Value::String(digest);
     }
     println!("portable_ui_asset_manifest={manifest}");
-    terminate(&server.0);
+    kill(
+        Pid::from_raw(i32::try_from(server.0.id()).unwrap()),
+        Signal::SIGTERM,
+    )
+    .unwrap();
     server.wait(true);
     fixture.assert_isolated(&sentinel);
+}
+
+#[cfg(feature = "portable-ui")]
+fn portable_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        })
 }
