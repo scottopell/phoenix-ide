@@ -4,7 +4,7 @@
 
 Base: `2702d8389c2fc78ac2e528c876c35a1a7040d692`. Branch:
 `bench/current-task-observation-attribution`, separate worktree
-`.phoenix/current-task-attribution`. Changes are uncommitted for parent review.
+`.phoenix/current-task-attribution`. Source checkpoint `35e6c30f619cc898cff825516997a3b7484d6ace` is preserved; its follow-up changes only the synthetic test sample emission and this exact manifest/documentation, not runtime instrumentation.
 This packet supplements, not rewrites, the prior composition packet. Its only
 non-UI exceptions are the exact attribution changes in the separate
 [`conversation-observation-attribution.json`](conversation-observation-attribution.json).
@@ -93,6 +93,8 @@ duration. Stderr backpressure can therefore affect parent timings and residuals.
 Observer bookkeeping also has cost. Unattributed residual time is **not pure
 application cost**, nor a precise serialization/enrichment estimate; this packet
 does not subtract or benchmark observer overhead.
+
+The actual-router synthetic test emits one `observation_attribution_sample=` JSON record array only after privacy and request/child correlation assertions pass. It contains already-captured synthetic span metadata, not fixture bodies. This demonstrates layer shape, not fixture latency or performance.
 
 ## Static semantic proof and regression evidence
 

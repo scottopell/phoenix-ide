@@ -226,6 +226,7 @@ async fn startup_dispatch_captures_actual_product_detail_without_inheriting_defa
         .unwrap();
     let existing = Capture::default();
     for outer in [tracing::Dispatch::none(), existing.dispatch()] {
+        let emit_sample = outer.is_none();
         let capture = Capture::default();
         let app = with_attribution_dispatch(
             crate::api::create_router(
@@ -334,6 +335,12 @@ async fn startup_dispatch_captures_actual_product_detail_without_inheriting_defa
             target.product_conversation_id.as_str()
         );
         assert_eq!(capture.records().len(), records.len());
+        if emit_sample {
+            println!(
+                "observation_attribution_sample={}",
+                serde_json::to_string(&records).unwrap()
+            );
+        }
     }
     let records = existing.records();
     assert_private(&records);
