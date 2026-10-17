@@ -165,14 +165,14 @@ jobs:
           output="$RUNNER_TEMP/observation-qualification/candidate"
           mkdir -p "$output/bin"
           git rev-parse HEAD HEAD^{tree} > "$output/qualifier-source.txt"
-          candidate=d5700c84f2bc0e6fcb0833ad9ae4b3ba55828420
+          candidate=963307eb834fee0568fb8f991164d842d0ec68c2
           attribution_base=2702d8389c2fc78ac2e528c876c35a1a7040d692
           base=f3893088b3cb224be9403f600173d5216e3a2f6b
           product=9ee218d4a33ebd4b94ea547d60caa62134edb960
           git fetch origin "$candidate" "$attribution_base" "$base" "$product"
           git checkout --detach "$candidate"
           test "$(git rev-parse HEAD)" = "$candidate"
-          test "$(git rev-parse HEAD^{tree})" = 7fe2db41aa04c4cb1a6bc6a4877cb45733022e6b
+          test "$(git rev-parse HEAD^{tree})" = d1b1a06e9438ac3d3c39fb067d54094b6c603cf7
           git rev-parse HEAD HEAD^{tree} > "$output/source.txt"
           git rev-parse "$base" "$base^{tree}" "$product" "$product^{tree}" "$attribution_base" "$attribution_base^{tree}" > "$output/parity-authorities.txt"
           cp docs/conversation-observation-source-parity.json docs/conversation-observation-composition.md docs/conversation-observation-attribution.md docs/conversation-observation-attribution.json "$output/"
@@ -245,7 +245,7 @@ jobs:
           set -euo pipefail
           output="$RUNNER_TEMP/observation-qualification/candidate"
           python3 tests/devpy/test_observation_attribution_source.py -v 2>&1 | tee "$output/attribution-source-guards.log"
-          grep -E '^Ran 7 tests in ' "$output/attribution-source-guards.log"
+          grep -E '^Ran 11 tests in ' "$output/attribution-source-guards.log"
           grep -Fx 'OK' "$output/attribution-source-guards.log"
           python3 tests/devpy/test_observe.py -v 2>&1 | tee "$output/observation-mock-contracts.log"
           grep -E '^Ran 8 tests in ' "$output/observation-mock-contracts.log"
@@ -352,7 +352,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: current-task-observation-attribution-events-d570-portable
+          name: current-task-observation-attribution-events-963-portable
           path: ${{ runner.temp }}/observation-qualification/
           if-no-files-found: warn
           retention-days: 7
