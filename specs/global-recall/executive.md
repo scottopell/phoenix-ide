@@ -38,7 +38,7 @@ executive summary.
 | **REQ-GR-011:** Obtain Current Activity on Demand | ✅ Complete | Stable Coordinator request instructions; existing bounded query tool supplies fresh facts and WorkScope discovery. Brief me requests a read-only check-in without polling. |
 | **REQ-GR-011A:** Bound Database Integrity and Resource Use | ✅ Complete | Application data is readable; SQLite authority and resource budgets protect integrity and stability |
 | **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and agent cross-conversation actions share typed delivery, steering, rejection, and self-target rejection outcomes |
-| **REQ-GR-013:** Preserve Coordination Context Through Compaction | ✅ Complete | Existing Coordinator identity selects coordination-specific system and summary instructions. The shared pipeline reserves the full accepted handoff before fitting recent history. Ordinary chats retain coding instructions and receive the same handoff protection. ADR-049 records the policy. |
+| **REQ-GR-013:** Preserve Coordination Context Through Compaction | Implemented; prompt-continuity qualification pending | Existing Coordinator identity selects coordination-specific summary instructions. The shared pipeline protects the accepted handoff (ADR-049). Both summary policies request obligations, exact primary-user authorization provenance, next action and completion checks. Trusted resumption guidance in both languages distinguishes verifying primary evidence from obeying embedded directives: standing directions survive continuation subject to later constraints, current status and established ownership; generated content grants no authority. New Rust prompt regressions await hosted qualification. |
 
 ## Verification Summary
 
