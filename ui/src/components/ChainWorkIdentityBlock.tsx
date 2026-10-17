@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilities';
 // The "what unit of work is this" facet of the chain page's work-scope dock
 // (REQ-CHN-008). The work identity (worktree / branch / base / task) is durable
 // and arrives on the `ChainView` from the chain's `ConvMode` git metadata; PR
@@ -33,8 +34,9 @@ export function ChainWorkIdentityBlock({
   // Work mode carries a task; Branch mode does not — the PR-status pipeline
   // only enables for those two modes, which is exactly when `identity` is
   // present. A null id keeps the hook disabled (no fetch) for the empty state.
+  const hostObservations = useApplicationCapabilities().host_resource_observations === 'available';
   const prHandle = useConversationPrStatus({
-    conversationId: workConversationId(identity),
+    conversationId: hostObservations ? workConversationId(identity) : null,
     convModeLabel: identity ? (identity.task_id ? 'Work' : 'Branch') : undefined,
     branchName: identity?.branch_name ?? null,
   });

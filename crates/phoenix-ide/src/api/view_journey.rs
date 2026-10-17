@@ -1,5 +1,7 @@
+use super::application_state::LiveState;
+#[cfg(test)]
 use super::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{http::StatusCode, Json};
 use serde::Deserialize;
 
 macro_rules! wire_enum {
@@ -171,10 +173,7 @@ impl Report {
     }
 }
 
-pub(super) async fn report(
-    State(state): State<AppState>,
-    Json(report): Json<Report>,
-) -> StatusCode {
+pub(super) async fn report(LiveState(state): LiveState, Json(report): Json<Report>) -> StatusCode {
     if !report.valid() {
         return StatusCode::BAD_REQUEST;
     }
@@ -795,7 +794,7 @@ mod tests {
                     .with_tracer(provider.tracer("real-ready-collector-budget")),
             );
             let status = report(
-                State(state.clone()),
+                LiveState(state.clone()),
                 Json(serde_json::from_value(value.clone()).unwrap()),
             )
             .with_subscriber(subscriber)

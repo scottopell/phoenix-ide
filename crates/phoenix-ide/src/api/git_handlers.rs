@@ -2,6 +2,7 @@
 //! Git-related HTTP handlers: branch listing, search, conflict detection,
 //! per-conversation diff snapshots.
 
+use super::application_state::LiveState;
 use super::handlers::AppError;
 use super::types::{
     ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
@@ -18,7 +19,7 @@ use crate::git_ops::{capture_branch_diff, run_git};
 
 use axum::http::StatusCode;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query},
     Json,
 };
 use std::fmt::Write as _;
@@ -798,7 +799,7 @@ async fn active_selection_target_for_scope(
 }
 
 pub(crate) async fn list_git_branches(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(params): Query<GitBranchesQuery>,
 ) -> Result<Json<GitBranchesResponse>, AppError> {
     let cwd = PathBuf::from(&params.cwd);
@@ -1329,7 +1330,7 @@ fn effective_feedback_status_for_cache(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn get_conversation_pr_status(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<PrStatusResponse>, AppError> {
     let conv = state
@@ -1773,7 +1774,7 @@ async fn attach_pr_feedback_freshness(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn create_pr_auto_fix_context(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<PrAutoFixContextResponse>, AppError> {
     let conv = state
@@ -1995,7 +1996,7 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
 }
 
 pub(crate) async fn pin_associated_pr(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
     Json(request): Json<PinAssociatedPrRequest>,
 ) -> Result<(StatusCode, Json<ActivePrSelectionMutationResponse>), AppError> {
@@ -2040,7 +2041,7 @@ pub(crate) async fn pin_associated_pr(
 }
 
 pub(crate) async fn resume_associated_pr_inference(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<ActivePrSelectionMutationResponse>), AppError> {
     let conv = state
@@ -2101,7 +2102,7 @@ pub(crate) async fn resume_associated_pr_inference(
 /// in the conversation's worktree, compared against the explicit active PR's
 /// actual base branch. Read-only; used by the PR-specific diff action.
 pub(crate) async fn get_active_pr_diff(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationDiffResponse>, AppError> {
     const MAX_DIFF_BYTES: usize = 256 * 1024;
@@ -2172,7 +2173,7 @@ pub(crate) async fn get_active_pr_diff(
 /// Each diff section is capped at 256KiB; truncation metadata is returned
 /// alongside so the UI can show a "(truncated, X KiB total)" hint.
 pub(crate) async fn get_conversation_diff(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationDiffResponse>, AppError> {
     const MAX_DIFF_BYTES: usize = 256 * 1024;
@@ -2241,7 +2242,7 @@ pub(crate) async fn get_conversation_diff(
 }
 
 pub(crate) async fn get_conversation_git_status(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationGitStatusResponse>, AppError> {
     let conv = state

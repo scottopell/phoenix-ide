@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::db::CloseProjection;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query},
     routing::get,
     Json, Router,
 };
@@ -16,6 +16,7 @@ use phoenix_core::domain::product_conversation::{
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
+use super::application_state::{ApplicationState, ConversationRouteObservations, LiveState};
 use super::handlers::AppError;
 use super::types::{
     AutomaticContinuationAdmissionPhaseView, AutomaticContinuationAdmissionView,
@@ -96,7 +97,7 @@ fn should_retry_aggregate_close(attempt: usize, error_type: &str) -> bool {
 }
 
 pub async fn close_product_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
 ) -> Result<Json<super::types::SuccessResponse>, AppError> {
     for attempt in 0..2 {
@@ -122,7 +123,7 @@ pub async fn close_product_conversation(
 }
 
 pub async fn rename_product_conversation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
     Json(req): Json<RenameProductConversationRequest>,
 ) -> Result<Json<ProductConversationListRow>, AppError> {
@@ -183,8 +184,9 @@ struct AggregateSegmentCeiling {
     tail_message_id: Option<String>,
 }
 
-pub fn automatic_continuation_routes() -> Router<AppState> {
+pub fn automatic_continuation_routes() -> Router<ApplicationState> {
     Router::new()
+        .route("/api/observation/target", get(get_observation_target))
         .route(
             "/api/global/coordinator/history/:reference",
             get(get_coordinator_history),
@@ -200,8 +202,14 @@ pub fn automatic_continuation_routes() -> Router<AppState> {
         )
 }
 
+async fn get_observation_target(
+    observations: ConversationRouteObservations,
+) -> Result<Json<super::observation::ObservationTargetResponse>, AppError> {
+    observations.target().await.map(Json)
+}
+
 pub async fn get_product_conversation_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
     let product_conversation_id = reference
@@ -218,7 +226,7 @@ pub async fn get_product_conversation_automatic_continuation(
 }
 
 pub async fn put_product_conversation_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(reference): Path<String>,
     Json(request): Json<UpdateAutomaticContinuationRequest>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
@@ -244,7 +252,7 @@ pub async fn put_product_conversation_automatic_continuation(
 }
 
 pub async fn get_coordinator_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
     coordinator_automatic_continuation_view(&state)
         .await
@@ -252,7 +260,7 @@ pub async fn get_coordinator_automatic_continuation(
 }
 
 pub async fn put_coordinator_automatic_continuation(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(request): Json<UpdateAutomaticContinuationRequest>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
     let coordinator_id = coordinator_conversation_id(&state).await?;
@@ -404,14 +412,23 @@ fn admission_phase_view(
 }
 
 pub async fn list_product_conversations(
-    State(state): State<AppState>,
+    observations: ConversationRouteObservations,
 ) -> Result<Json<ProductConversationListResponse>, AppError> {
-    let rows = state
-        .db
+    observations.list_product_conversations().await
+}
+
+pub(super) async fn read_scoped_product_conversation_list(
+    db: &crate::db::Database,
+    target: Option<&ProductConversationId>,
+) -> Result<Json<ProductConversationListResponse>, AppError> {
+    let rows = db
         .list_ordinary_product_conversation_projections()
         .await
         .map_err(db_to_app)?
         .iter()
+        .filter(|projection| {
+            target.is_none_or(|target| &projection.product_conversation_id == target)
+        })
         .map(list_row)
         .collect();
     Ok(Json(ProductConversationListResponse {
@@ -426,7 +443,7 @@ pub struct ProductCreationRecoveryQuery {
 }
 
 pub async fn list_product_conversation_creations(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Query(query): Query<ProductCreationRecoveryQuery>,
 ) -> Result<Json<ProductConversationCreationRecoveryResponse>, AppError> {
     let cursor = query
@@ -469,7 +486,7 @@ pub async fn list_product_conversation_creations(
 }
 
 pub async fn get_coordinator_history(
-    State(state): State<AppState>,
+    observations: ConversationRouteObservations,
     Path(reference): Path<String>,
     Query(query): Query<CoordinatorHistoryQuery>,
 ) -> Result<Json<CoordinatorConversationSnapshotView>, AppError> {
@@ -480,7 +497,8 @@ pub async fn get_coordinator_history(
     } else {
         tracing::Span::none()
     };
-    read_coordinator_history(&state.db, reference, query)
+    observations
+        .read_coordinator_history(reference, query)
         .instrument(span)
         .await
 }
@@ -601,11 +619,13 @@ fn history_boundaries(
 }
 
 pub async fn get_product_conversation(
-    State(state): State<AppState>,
+    observations: ConversationRouteObservations,
     Path(reference): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<OrdinarySnapshotResponse>, AppError> {
-    read_product_conversation(&state.db, reference, query).await
+    observations
+        .read_product_conversation(reference, query)
+        .await
 }
 
 pub(super) async fn read_product_conversation(
@@ -1926,6 +1946,45 @@ mod tests {
             serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(snapshot["ordinary_lifecycle"], expected);
+    }
+
+    #[tokio::test]
+    async fn scoped_product_list_uses_current_projection_without_fallback() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let selected = db
+            .create_conversation("selected", "selected", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("other", "other", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let all = read_scoped_product_conversation_list(&db, None)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(all.product_conversations.len(), 2);
+        let selected_list =
+            read_scoped_product_conversation_list(&db, Some(&selected.product_conversation_id))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(selected_list.product_conversations.len(), 1);
+        let expected = all
+            .product_conversations
+            .iter()
+            .find(|row| row.product_conversation_id == selected.product_conversation_id.as_str())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&selected_list.product_conversations[0]).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        let absent = ProductConversationId::parse("absent-product").unwrap();
+        assert!(read_scoped_product_conversation_list(&db, Some(&absent))
+            .await
+            .unwrap()
+            .0
+            .product_conversations
+            .is_empty());
     }
 
     #[tokio::test]

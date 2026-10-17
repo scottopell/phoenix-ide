@@ -1,7 +1,8 @@
+use super::application_state::LiveState;
 use super::AppState;
 use crate::db::MessageContent;
 use crate::db::{Conversation, DbError, MessageType, RetrievalRequest, RetrievalScope};
-use axum::{extract::State, Json};
+use axum::Json;
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -1157,7 +1158,7 @@ impl GlobalReadService {
 }
 
 pub async fn resolve_reference(
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(req): Json<ResolveGlobalReferenceRequest>,
 ) -> Result<Json<ResolveGlobalReferenceResponse>, AppError> {
     Ok(Json(

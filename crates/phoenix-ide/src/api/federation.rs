@@ -1,5 +1,6 @@
+use super::application_state::LiveState;
 use axum::{
-    extract::{Path, State},
+    extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -178,7 +179,7 @@ fn random_peer_token() -> String {
 
 pub async fn query_database(
     peer: PeerAuthenticated,
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(request): Json<RemoteQueryDatabaseRequest>,
 ) -> Response {
     query_database_with_admission(peer, state, request, &QUERY_ADMISSION).await
@@ -255,7 +256,7 @@ where
 
 pub async fn issue_enrollment(
     _owner: OwnerAuthenticated,
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(request): Json<IssueEnrollmentRequest>,
 ) -> Response {
     let local_id = match state.db.instance_id().await {
@@ -298,7 +299,7 @@ pub async fn issue_enrollment(
 
 pub async fn import_peer_connection(
     _owner: OwnerAuthenticated,
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Json(request): Json<ImportPeerConnectionRequest>,
 ) -> Response {
     let local_id = match state.db.instance_id().await {
@@ -348,7 +349,7 @@ pub async fn import_peer_connection(
 
 pub async fn revoke_enrollment(
     _owner: OwnerAuthenticated,
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
     Path(caller_instance_id): Path<InstanceId>,
 ) -> Response {
     match state
@@ -382,7 +383,7 @@ mod tests {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let response = import_peer_connection(
             OwnerAuthenticated,
-            State(state),
+            LiveState(state),
             Json(ImportPeerConnectionRequest {
                 peer_display_name: "peer".to_string(),
                 base_url: "https://peer.example".to_string(),

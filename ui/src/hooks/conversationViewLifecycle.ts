@@ -54,7 +54,7 @@ export class ViewJourneyLifecycle {
   private readonly clock: () => number;
   private identity: ViewIdentity;
 
-  constructor(identity: ViewIdentity, reporter: ViewJourneyReporter, clock = () => performance.now()) {
+  constructor(identity: ViewIdentity, reporter: ViewJourneyReporter, clock = () => performance.now(), private readonly enabled = true) {
     this.identity = identity;
     this.reporter = reporter;
     this.clock = clock;
@@ -65,6 +65,7 @@ export class ViewJourneyLifecycle {
   }
 
   private ensure(): SampledViewJourney | null {
+    if (!this.enabled) return null;
     if (this.attempt === undefined && !this.finished) {
       this.attempt = this.reporter.begin(this.identity, this.clock);
       if (this.attempt) this.deadline = setTimeout(() => this.finish('incomplete'), 300_000);

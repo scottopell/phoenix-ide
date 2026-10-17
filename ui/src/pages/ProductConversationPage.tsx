@@ -1,3 +1,4 @@
+import { hasLiveApplication, useApplicationCapabilities } from '../contexts/ApplicationCapabilities';
 import { Suspense, lazy, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
@@ -826,6 +827,7 @@ function ProductConversationHeader({
   messages: Message[];
   recallDisabled: boolean;
 }) {
+  const liveApplication = hasLiveApplication(useApplicationCapabilities());
   const source = snapshot.source;
   return (
     <header className="product-conversation-page__header">
@@ -846,7 +848,7 @@ function ProductConversationHeader({
             {sourceRelationLabel(source)} source unavailable or deleted
           </span>
         )}
-        {snapshot.chain_qa_compatibility && (
+        {liveApplication && snapshot.chain_qa_compatibility && (
           <RecallDisclosure
             key={productConversationId}
             snapshot={snapshot}
@@ -855,9 +857,9 @@ function ProductConversationHeader({
             disabled={recallDisabled}
           />
         )}
-        <AutomaticContinuationControl
+        {liveApplication && <AutomaticContinuationControl
           scope={{ kind: 'ordinary', reference: snapshot.product_conversation_id }}
-        />
+        />}
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
             <summary>Work</summary>
@@ -874,6 +876,9 @@ export function ProductConversationPage(props: HistoryPageProps = {}) {
 }
 
 function ProductConversationPageInner({ productId, globalShell, journey: inheritedJourney }: HistoryPageProps) {
+  const capabilities = useApplicationCapabilities();
+  const liveApplication = hasLiveApplication(capabilities);
+  const telemetryEnabled = capabilities.telemetry === 'available';
   const coordinator = globalShell !== undefined;
   const journey = useConversationViewJourney(coordinator ? 'global' : 'ordinary', inheritedJourney);
   const journeyRef = useRef(journey);
@@ -927,7 +932,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const pendingAuthoritativeIdentitiesRef = useRef<ReadonlySet<string> | null>(null);
   const openMeasurementRef = useRef<ProductConversationOpenMeasurement | null>(null);
   if (coordinator || openMeasurementRef.current?.routeReference !== productConversationId) {
-    openMeasurementRef.current = !coordinator && productConversationId ? {
+    openMeasurementRef.current = telemetryEnabled && !coordinator && productConversationId ? {
       openId: generateUUID(),
       routeReference: productConversationId,
       request: undefined,
@@ -938,7 +943,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   }
   const paginationRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
-  const transcriptAuthority = useConversationTranscriptAuthority(baseSnapshot?.latest_transcript_row_id ?? null);
+  const transcriptAuthority = useConversationTranscriptAuthority(liveApplication ? baseSnapshot?.latest_transcript_row_id ?? null : null);
   const currentLatestProjection = baseSnapshot
     && transcriptAuthority?.kind === 'live'
     && latestProjection?.conversationId === baseSnapshot.latest_transcript_row_id
@@ -946,7 +951,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     : null;
   const isOpen = !!baseSnapshot && (!baseOrdinarySnapshot || baseOrdinarySnapshot.ordinary_lifecycle === 'open');
   const closeIncomplete = baseOrdinarySnapshot?.close?.outcome === 'close_incomplete';
-  const liveTranscriptRowId = isOpen && !closeIncomplete && transcriptAuthority?.kind === 'live'
+  const liveTranscriptRowId = liveApplication && isOpen && !closeIncomplete && transcriptAuthority?.kind === 'live'
     ? baseSnapshot.latest_transcript_row_id : null;
   const memberTranscript = useConversationTranscriptView(liveTranscriptRowId);
   const currentMemberTranscript = liveTranscriptRowId && memberTranscript?.conversationId === liveTranscriptRowId
@@ -1370,7 +1375,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
 
   const messages = aggregateMessages;
   const cleanupAttention = ordinarySnapshot?.close?.outcome === 'archived_cleanup_attention';
-  const closeNeedsLiveUpdateOwner = closeIncomplete || cleanupAttention;
+  const closeNeedsLiveUpdateOwner = liveApplication && (closeIncomplete || cleanupAttention);
   const closeInProgress = ordinarySnapshot?.close != null && (ordinarySnapshot.close.phase !== 'completed' || closeIncomplete);
   const convState = useMemo(
     () => ordinarySnapshot?.ordinary_lifecycle === 'history' || closeInProgress
@@ -1459,7 +1464,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     && jumpCompletion?.commandKey === desiredPositioningKey
     ? { kind: 'idle', view: transcriptView }
     : desiredPositioning;
-  const liveControlsEnabled = isOpen && !closeInProgress && snapshot?.latest_opening.status !== 'pending';
+  const liveControlsEnabled = liveApplication && isOpen && !closeInProgress && snapshot?.latest_opening.status !== 'pending';
   const initialSnapshotReady = snapshot !== null;
   useLayoutEffect(() => {
     journey.expectTarget(!!hashTargetMessageId || readerSelection.kind !== 'latest' || awaitingRouteTopology, positioningTargetMessageId ?? null);
@@ -1520,7 +1525,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       <main className="product-conversation-page" ref={coordinator || inheritedJourney ? undefined : journey.attach}>
         <div role="alert">{error ?? 'Unable to open this product conversation.'} Showing cached row if available.</div>
         <button className="btn-secondary" type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry</button>
-        {fallbackSlug && (
+        {liveApplication && fallbackSlug && (
           <EmbeddedConversationPage
             slug={fallbackSlug}
             routePrefix={coordinator ? "/global" : "/c"}
@@ -1626,7 +1631,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
         />
       </section>
-      {transcriptAuthority?.kind === 'awaiting_init' && (
+      {liveApplication && transcriptAuthority?.kind === 'awaiting_init' && (
         <RetryTranscriptHydrationOwner
           key={snapshot.latest_transcript_row_id}
           conversationId={snapshot.latest_transcript_row_id}
@@ -1660,7 +1665,8 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           <CloseLiveUpdateOwner conversationId={snapshot.latest_transcript_row_id} />
         </div>
       )}
-      {(!isOpen || closeIncomplete) && (
+      {!liveApplication && <div className="product-conversation-page__composer-placeholder" role="status">Persisted history — live updates and conversation controls unavailable. Input is read-only.</div>}
+      {liveApplication && (!isOpen || closeIncomplete) && (
         <div className="product-conversation-page__composer-placeholder" data-testid={closeIncomplete ? 'product-conversation-close-incomplete' : 'product-conversation-history'}>
           {closeIncomplete ? 'Conversation controls are disabled until shutdown is resolved.' : 'History is read-only.'}
         </div>

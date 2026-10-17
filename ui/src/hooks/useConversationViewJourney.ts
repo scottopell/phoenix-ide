@@ -1,3 +1,4 @@
+import { useApplicationCapabilities } from '../contexts/ApplicationCapabilities';
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { useLocation, useNavigationType } from 'react-router-dom';
 import type { ViewJourneyReporter } from './conversationViewTelemetry';
@@ -10,6 +11,7 @@ function tabReporter(): ViewJourneyReporter {
 }
 
 export function useConversationViewJourney(route: 'global' | 'ordinary', inherited?: ViewJourneyLifecycle): ViewJourneyLifecycle {
+  const telemetryEnabled = useApplicationCapabilities().telemetry === 'available';
   const location = useLocation();
   const navigationType = useNavigationType();
   const first = useRef(true);
@@ -18,8 +20,8 @@ export function useConversationViewJourney(route: 'global' | 'ordinary', inherit
     const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
     const trigger = first.current && navigation?.type === 'reload' ? 'reload'
       : navigationType === 'POP' && (!first.current || navigation?.type === 'back_forward') ? 'back_forward' : 'navigation';
-    return { navigationKey: location.key, lifecycle: inherited ?? new ViewJourneyLifecycle(defaultViewIdentity(route, trigger), tabReporter()) };
-  }, [inherited, location.key, navigationType, route]);
+    return { navigationKey: location.key, lifecycle: inherited ?? new ViewJourneyLifecycle(defaultViewIdentity(route, trigger), tabReporter(), undefined, telemetryEnabled) };
+  }, [inherited, location.key, navigationType, route, telemetryEnabled]);
   const lifecycle = admission.lifecycle;
   const currentAdmission = useRef(admission);
   useLayoutEffect(() => { currentAdmission.current = admission; }, [admission]);

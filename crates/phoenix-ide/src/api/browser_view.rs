@@ -16,11 +16,12 @@
 //! are observed, but any non-Close payload is ignored. Future input support
 //! would add a fourth byte tag.
 
+use super::application_state::LiveState;
 use super::AppState;
 use crate::tools::browser::screencast::ScreencastEvent;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{Path, WebSocketUpgrade},
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
@@ -38,7 +39,7 @@ const TAG_STATUS: u8 = 0x02;
 pub async fn browser_view_ws_handler(
     ws: WebSocketUpgrade,
     Path(conversation_id): Path<String>,
-    State(state): State<AppState>,
+    LiveState(state): LiveState,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, conversation_id, state))
 }

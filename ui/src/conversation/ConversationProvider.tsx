@@ -17,7 +17,7 @@ import { useConversationsRefreshDriver } from './useConversationsRefresh';
  * store so keystroke mutations don't invalidate the conversation atom's
  * whole-snapshot subscriptions.
  */
-export function ConversationProvider({ children }: { children: React.ReactNode }) {
+export function ConversationProvider({ children, refreshEnabled = true }: { children: React.ReactNode; refreshEnabled?: boolean }) {
   // Single store instances for the app. Refs are fine here because the stores
   // are mutable externally and subscriptions run through `useSyncExternalStore`.
   const storeRef = useRef<ConversationStore | null>(null);
@@ -35,7 +35,7 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
     <ConversationContext.Provider value={storeRef.current}>
       <DraftContext.Provider value={draftStoreRef.current}>
         <InlineReactionContext.Provider value={reactionStoreRef.current}>
-          <ConversationsRefreshDriver />
+          {refreshEnabled && <ConversationsRefreshDriver />}
           {children}
         </InlineReactionContext.Provider>
       </DraftContext.Provider>

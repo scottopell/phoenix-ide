@@ -1,3 +1,4 @@
+import { liveCapabilities } from './contexts/ApplicationCapabilities';
 import type { ReactNode } from 'react';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useLocation } from 'react-router-dom';
@@ -62,6 +63,10 @@ describe('App Markdown alias navigation', () => {
       const scenario = getProductConversationScenario('mobile-open');
       const snapshot = { ...scenario.snapshot!, canonical_route: '/c/product-alpha', product_conversation_id: 'product-alpha' };
       restoreFixture = installProductConversationFixtureApi({ ...scenario, snapshot });
+      const originalFetch = globalThis.fetch;
+      vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => String(input) === '/api/capabilities'
+        ? Promise.resolve(new Response(JSON.stringify(liveCapabilities)))
+        : originalFetch(input, init));
       vi.spyOn(api, 'authStatus').mockResolvedValue({ auth_required: false, authenticated: true });
       const lookup = vi.spyOn(api, 'getProductConversationSnapshot');
       route.destination = `${alias}${suffix}`;

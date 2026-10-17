@@ -1,3 +1,4 @@
+import { ApplicationCapabilitiesProvider, hasLiveApplication, useApplicationCapabilities } from './contexts/ApplicationCapabilities';
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { useConversationViewJourney } from './hooks/useConversationViewJourney';
 import { generateUUID } from './utils/uuid';
@@ -274,7 +275,7 @@ function ChainRouteRedirect() {
   return <ProductConversationAliasRedirect reference={rootConvId} />;
 }
 
-function App() {
+function LiveApp() {
   const [authState, setAuthState] = useState<AuthState>({ status: 'checking' });
 
   useEffect(() => {
@@ -336,6 +337,23 @@ function App() {
       </DensityProvider>
     </ThemeProvider>
   );
+}
+
+const PersistedObservation = lazy(() => import('./pages/PersistedObservation').then(m => ({ default: m.PersistedObservation })));
+
+function CapabilitySelectedApp() {
+  const capabilities = useApplicationCapabilities();
+  if (hasLiveApplication(capabilities)) return <LiveApp />;
+  if (capabilities.persisted_member_read !== 'available') return <div role="alert">Persisted conversation reads unavailable.</div>;
+  return <ThemeProvider><DensityProvider><BrowserRouter><FocusScopeProvider>
+    <ConversationProvider refreshEnabled={false}><ChainProvider><ConversationReadinessProvider>
+      <Suspense fallback={<RouteFallback />}><PersistedObservation /></Suspense>
+    </ConversationReadinessProvider></ChainProvider></ConversationProvider>
+  </FocusScopeProvider></BrowserRouter></DensityProvider></ThemeProvider>;
+}
+
+function App() {
+  return <ApplicationCapabilitiesProvider><CapabilitySelectedApp /></ApplicationCapabilitiesProvider>;
 }
 
 export default App;
