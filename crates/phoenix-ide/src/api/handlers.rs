@@ -15256,7 +15256,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let mut events = state.runtime.subscribe_aggregate_events();
 
         let response = crate::api::chains::delete_chain_handler(
-            axum::extract::LiveState(state.clone()),
+            crate::api::application_state::LiveState(state.clone()),
             axum::extract::Path("cd-a".to_string()),
         )
         .await
@@ -15306,13 +15306,13 @@ pub(crate) mod hard_delete_cascade_tests {
         mark_chain_history(&state, "retry-a").await;
 
         let _ = crate::api::chains::delete_chain_handler(
-            axum::extract::LiveState(state.clone()),
+            crate::api::application_state::LiveState(state.clone()),
             axum::extract::Path("retry-a".to_string()),
         )
         .await
         .expect("first delete");
         let retry = crate::api::chains::delete_chain_handler(
-            axum::extract::LiveState(state),
+            crate::api::application_state::LiveState(state),
             axum::extract::Path("retry-a".to_string()),
         )
         .await
@@ -15340,7 +15340,7 @@ pub(crate) mod hard_delete_cascade_tests {
             let state = state.clone();
             tokio::spawn(async move {
                 crate::api::chains::delete_chain_handler(
-                    axum::extract::LiveState(state),
+                    crate::api::application_state::LiveState(state),
                     axum::extract::Path("overlap-a".to_string()),
                 )
                 .await
@@ -15351,7 +15351,7 @@ pub(crate) mod hard_delete_cascade_tests {
             let state = state.clone();
             tokio::spawn(async move {
                 crate::api::chains::delete_chain_handler(
-                    axum::extract::LiveState(state),
+                    crate::api::application_state::LiveState(state),
                     axum::extract::Path("overlap-a".to_string()),
                 )
                 .await
@@ -15386,7 +15386,7 @@ pub(crate) mod hard_delete_cascade_tests {
         state.db.pool().close().await;
 
         let error = crate::api::chains::delete_chain_handler(
-            axum::extract::LiveState(state),
+            crate::api::application_state::LiveState(state),
             axum::extract::Path("unreadable-root".to_string()),
         )
         .await
@@ -15405,7 +15405,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("corrupt persisted state");
 
         let error = crate::api::chains::delete_chain_handler(
-            axum::extract::LiveState(state),
+            crate::api::application_state::LiveState(state),
             axum::extract::Path("decode-a".to_string()),
         )
         .await
@@ -15452,7 +15452,7 @@ pub(crate) mod hard_delete_cascade_tests {
             }
 
             let error = crate::api::chains::delete_chain_handler(
-                axum::extract::LiveState(state.clone()),
+                crate::api::application_state::LiveState(state.clone()),
                 axum::extract::Path(root_id.clone()),
             )
             .await
@@ -15517,7 +15517,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("set busy");
 
         let err = crate::api::chains::delete_chain_handler(
-            axum::extract::LiveState(state.clone()),
+            crate::api::application_state::LiveState(state.clone()),
             axum::extract::Path("cb-a".to_string()),
         )
         .await
@@ -16007,7 +16007,7 @@ pub(crate) mod hard_delete_cascade_tests {
         }
 
         let _ = crate::api::chains::archive_chain_handler(
-            axum::extract::LiveState(state.clone()),
+            crate::api::application_state::LiveState(state.clone()),
             axum::extract::Path("ca-a".to_string()),
         )
         .await
@@ -16071,7 +16071,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("set busy");
 
         let err = crate::api::chains::archive_chain_handler(
-            axum::extract::LiveState(state.clone()),
+            crate::api::application_state::LiveState(state.clone()),
             axum::extract::Path("cab-a".to_string()),
         )
         .await
@@ -16265,7 +16265,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .expect("mark chain history");
 
         let _ = crate::api::chains::delete_chain_handler(
-            axum::extract::LiveState(state.clone()),
+            crate::api::application_state::LiveState(state.clone()),
             axum::extract::Path("dc-a".to_string()),
         )
         .await

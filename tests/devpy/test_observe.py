@@ -128,5 +128,16 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(3, child.wait.call_count)
 
 
+class ObservationExtractorSourceGuard(unittest.TestCase):
+    def test_custom_live_state_is_never_named_in_axum_namespace(self):
+        root = ROOT
+        violations = [
+            str(source.relative_to(root))
+            for source in (root / "crates/phoenix-ide/src").rglob("*.rs")
+            if "axum::extract::" + "LiveState" in source.read_text()
+        ]
+        self.assertEqual(violations, [])
+
+
 if __name__ == "__main__":
     unittest.main()

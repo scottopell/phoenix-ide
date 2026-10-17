@@ -58,6 +58,17 @@ observation invocation; using an arbitrary existing release is not sufficient.
 - Full `./dev.py check`, Rust compilation/tests, binary startup and browser QA
   were deliberately **not run** under the no-build/no-binary-run constraint.
 
+## Failed closure qualification and causal correction
+
+Hosted run 39041380935 at exact source `cf61469e` terminated during library-test
+compilation with 12 E0425 errors: mechanically renamed test calls incorrectly
+qualified the project extractor as `axum::extract::LiveState`. No contract, startup,
+codegen or candidate binary test from that run executed. The UI embed build passed;
+it does not rescue the failed Rust gate. The causal child replaces all 12 calls
+with `crate::api::application_state::LiveState` without changing assertions and adds
+a negative source guard. The corrected child remains uncompiled until its separate
+hosted qualification. Original failure logs remain retained by the integration owner.
+
 ## Next qualification boundary
 
 Integrate the retained server source and this launcher without changing existing

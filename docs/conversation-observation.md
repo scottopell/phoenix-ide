@@ -28,7 +28,7 @@ without the observation flags to work around that failure.
 `Observation listening on http://127.0.0.1:PORT` after admission and binding; use
 that actual URL, not a guessed port. A nonzero `--port` requests that exact port;
 an occupied port is an error, not authority to stop its owner. This command does
-not inspect, stop, reconfigure, or replace the existing stock service on **18043**.
+not inspect, stop, reconfigure, or replace other owned services.
 No dev PID, port, proxy, log, or production service files are managed.
 
 The command runs in the foreground, forwards SIGINT/SIGTERM to its child, and
@@ -61,8 +61,11 @@ construct live runtime services. Unsupported/live capabilities are unavailable;
 do not interpret their errors as permission to enable a provider or full server.
 Loopback access is unauthenticated; the server rejects forwarded requests. Keep the
 port private: do not publish a tunnel or proxy. A local browser or process can read
-admitted data, and the embedded UI may still display controls whose live APIs are
-unavailable. UI usability and endpoint denial need separate qualification.
+admitted data. The matching UI discovers capabilities before mounting ownership
+and selects persisted-only history rather than live streams, activation, provider
+catalogs, host-resource polling or telemetry reporting. Capability discovery fails
+closed. Actual nested-widget requests, UI usability and endpoint denial still need
+separate binary/browser qualification; mocked tests alone do not prove this boundary.
 
 ## Portable fixture manifest, format version 1
 
@@ -124,3 +127,30 @@ and launches with the command above. Record actual server admission, actual URL,
 observed route and UI behavior separately from source tests. Do not copy another
 machine's HOME, port assignment, provider environment or personal file paths.
 No fixture or observation evidence has been produced merely by adding this command.
+
+## Browser measurement protocol
+
+Use the existing `browser_profile.run_scenario` harness; do not create another
+runner or treat this command as a benchmark. First verify the exact binary/UI
+identities, actual ordinary and Global response shapes and denied live endpoints.
+Put a synchronous boolean readiness wait first: the harness excludes setup through
+that first wait from its page-anchored measurement window. An async expression is
+not a readiness boolean; do not rely on Promise coercion. Set reset, CPU throttle,
+warmups and GC explicitly, and preserve raw samples and methodology warnings.
+
+For list-click journeys, a reload after a prior run may begin on the conversation
+route. Return through an actual Home/list control before the first readiness wait,
+or independently reset to the list outside a one-sample invocation. Record which
+setup was used; do not silently substitute reset-disabled SPA results. Verify
+meaningful transcript content, navigation presence, a bounded stable anchor window
+and actual scrolling rather than merely a URL or spinner disappearing.
+
+Separate reload/warm-cache, fresh browser context and explicitly disabled HTTP
+cache experiments. None proves cold SQLite/OS caches. Calibrate same-artifact A/A
+noise before interpreting balanced A/B pairs, and retain failures and outliers.
+Nonsignificance or insufficient power does not establish neutrality. There is no
+numeric regression allowance implied by this runbook. Capture CPU profiles and
+traces in separate attribution runs; long-task sums are not total JS CPU, nested
+trace tasks are not additive CPU, and double-animation-frame marks are presentation
+estimates rather than compositor-paint measurements. An observation composition
+with telemetry unavailable cannot measure collector/export overhead.
