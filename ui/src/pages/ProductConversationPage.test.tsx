@@ -906,6 +906,41 @@ describe('ProductConversationPage', () => {
     expect(currentPositioning().kind).toBe('idle');
   });
 
+  it.each([false, true].flatMap(global => (['advance', 'exhaust', 'replaced', 'already-exhausted'] as const).map(progress => [global, progress] as const)))('settles an in-flight older page against its cursor boundary after refresh (Global=%s, progress=%s)', async (global, progress) => {
+    const { api } = await import('../api');
+    const complete = makeSnapshot();
+    vi.mocked(api.getProductConversationHistorySnapshot).mockReset();
+    vi.mocked(api.getCoordinatorHistory).mockReset();
+    const initial = { ...complete, before: 'requested-boundary', segments: complete.segments.map(segment => segment.transcript_row_id === 'row-1' ? { ...segment, messages: [] } : segment) };
+    const refreshed = { ...initial, updated_at: '2026-01-02T00:00:00Z', before: progress === 'already-exhausted' ? null : progress === 'replaced' ? 'replacement-boundary' : initial.before,
+      has_older: progress !== 'already-exhausted', segments: initial.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [...segment.messages, makeMessage('refresh-committed', 5, 'row-2')] } : segment) };
+    const acquired = { ...complete, before: progress === 'advance' || progress === 'already-exhausted' ? 'advanced-boundary' : null, has_older: progress === 'advance' || progress === 'already-exhausted' };
+    const exhausted = { ...complete, before: null, has_older: false };
+    let resolveOlder!: (snapshot: ProductConversationSnapshotView) => void;
+    const older = new Promise<ProductConversationSnapshotView>(resolve => { resolveOlder = resolve; });
+    if (global) {
+      vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(initial)).mockImplementationOnce(() => older.then(coordinatorSnapshot)).mockResolvedValueOnce(coordinatorSnapshot(refreshed));
+      if (progress === 'advance' || progress === 'replaced') vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(coordinatorSnapshot(exhausted));
+    } else {
+      vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(initial).mockImplementationOnce(() => older).mockResolvedValueOnce(refreshed);
+      if (progress === 'advance' || progress === 'replaced') vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(exhausted);
+    }
+    renderPage(global ? '/global/row-2' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('refresh-committed'));
+    await act(async () => resolveOlder(acquired));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('m-1,m-2'));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(progress !== 'exhaust' && progress !== 'already-exhausted');
+    if (progress !== 'exhaust' && progress !== 'already-exhausted') {
+      fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+      await waitFor(() => expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', expect.objectContaining({ before: progress === 'replaced' ? 'replacement-boundary' : 'advanced-boundary' })));
+      await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
+    }
+  });
+
   it.each([false, true])('retains an advanced cursor through a full empty-prefix topology roster refresh (Global=%s)', async global => {
     const { api } = await import('../api');
     const complete = makeSnapshot();

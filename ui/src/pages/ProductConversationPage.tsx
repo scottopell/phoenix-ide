@@ -1327,7 +1327,9 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         const authoritativeTail = appliesFreshTail
           ? mergeRefreshedTail(current.value, refreshedTail)
           : current.value;
-        const acquiredPage = current.value === snapshot || appliesFreshTail ? older : {
+        const retainsRequestedBoundary = current.value.before === snapshot.before
+          && current.value.has_older === snapshot.has_older;
+        const acquiredPage = retainsRequestedBoundary || appliesFreshTail ? older : {
           ...older, before: current.value.before, has_older: current.value.has_older,
         };
         return { ...current, value: mergeOlderSegments(authoritativeTail, acquiredPage),
