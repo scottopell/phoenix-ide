@@ -3034,3 +3034,31 @@ preparing it. Overhead tolerance/capture and native/device resume remain distinc
 unadopted decisions; full_acceptance/overhead_clearance remain false. The next
 hosted run is one new exact-source causal integration qualification, not a blind
 retry of the immutable baseline or a second concurrent runner.
+
+### First current-main hosted run: typed fixture and ADR-shape composition repair
+
+PR932 initial exact8425dc5/0f6 candidate run39005485369 is fully terminal failure
+before browser execution. Rust/codegen/clippy found one new-main SseEvent::Message
+test initializer missing required opening. UI/specs found the matching outer
+opening omission in3 ConversationEventCard wire fixture cases, plus ADR119's
+legacy Alternatives heading rather than required Options considered. E2E/task/
+worker guards passed. Separate routine macOS run39005485335 succeeded; it is not
+native/device resume acceptance. Artifact12090917594 (6,939,878 bytes) and full
+failed job logs remain available. No unchanged rerun was requested.
+
+Product fixfc39f4403b420d4dde33996c3cf131a96048c157, tree
+2593aac43a5765130bdeabf1a6024d0c0818af0e, is an exact3-file child of0f6. Rust
+fixture explicitly supplies openingNone and verifies null survives both redacted
+and projected event presentation. TS positives use the generated message-wire
+arm via satisfies, assert both opening and event presentation, and retain
+missing-field/malformed negatives. ADR119 changes only the section heading;
+point-in-time rationale is untouched. No runtime schema, generated type, product
+policy, timeout or acceptance check was weakened.
+
+Owner red-first reproduced all3 UI failures, then77 tests and composite tsc pass;
+standalone Rust parse/format and exact source constructor audit are not Rust
+compile evidence. Parent independently passed the same77, genuine composite
+TSc-b,79 lifecycle tests, the actual full spEARS shape validator and diff check.
+The clean immutable source is published qualification/history-joint-source-fc39f4403.
+The shared landing successor composes this fix and atomically repins it for one
+changed-candidate hosted qualification after the complete prior terminal result.
