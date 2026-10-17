@@ -4284,6 +4284,107 @@ mod native_evidence_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_identity_recovery_returns_retained_result_without_reexecution() {
+        let root = identity(42);
+        let mut fixture = identity_fixture(vec![root]);
+        let key = WireKey::try_from(fixture.issue.key()).unwrap();
+        let Response::Admitted { admission } =
+            fixture
+                .server
+                .handle(Request::NativeIdentityObservationAdmit {
+                    session: fixture.session,
+                    key,
+                })
+        else {
+            panic!("admit")
+        };
+        assert_eq!(
+            fixture
+                .server
+                .handle(Request::NativeIdentityObservationSubmit {
+                    session: fixture.session,
+                    admission,
+                    now: 0,
+                }),
+            Response::Submitted { key }
+        );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        fixture.server.fence_connection();
+        let Response::Hello {
+            snapshot: detached, ..
+        } = fixture.server.handle(Request::Hello {
+            build: test_build(),
+        })
+        else {
+            panic!("detached hello")
+        };
+        assert_eq!(detached.state, WireState::DetachedFenced);
+        let (interruption_revision, reconciling_generation) = {
+            let mut store = fixture.store.lock().unwrap();
+            assert_eq!(
+                crate::native_guardian::verify_native_binding(
+                    &mut store,
+                    fixture.issue.key().attempt_id(),
+                    &detached,
+                )
+                .unwrap(),
+                crate::native_guardian::VerifiedBindingStatus::Detached
+            );
+            let loaded = store
+                .load_attempt(fixture.issue.key().attempt_id())
+                .unwrap()
+                .unwrap();
+            let crate::RecoveryDisposition::Checkpoint(interruption) =
+                loaded.prepare_recovery().unwrap()
+            else {
+                panic!("identity attempt must checkpoint interruption")
+            };
+            let interruption_revision = (*interruption)
+                .persist(&mut store)
+                .unwrap()
+                .checkpoint()
+                .persistence_revision()
+                .unwrap();
+            let detached_binding = store
+                .load_native_binding(fixture.issue.key().attempt_id())
+                .unwrap()
+                .unwrap();
+            let reconciling = store
+                .commit_fresh_interruption_binding(&detached_binding, interruption_revision)
+                .unwrap();
+            (
+                interruption_revision,
+                reconciling.current_session().generation.get(),
+            )
+        };
+        let Response::ReconciliationBegun { session } =
+            fixture.server.handle(Request::BeginReconciliation {
+                instance: detached.instance,
+                inventory: detached.slots,
+                interruption_revision: interruption_revision.get(),
+            })
+        else {
+            panic!("begin reconciliation")
+        };
+        assert_eq!(session.generation, reconciling_generation);
+        let request = Request::VerifyRecoveredNativeIdentityObservation {
+            session,
+            key,
+            issuing_session_generation: fixture.issue.session_generation().get(),
+        };
+        let expected = Response::RecoveredNativeIdentityObservation {
+            key,
+            target: root.into(),
+            observation: WireIdentityObservation::ExactIdentityAbsent,
+        };
+        assert_eq!(fixture.server.handle(request.clone()), expected);
+        assert_eq!(fixture.server.handle(request), expected);
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn native_identity_admission_rejects_wrong_key_session_and_slot() {
         let root = identity(42);
         let mut fixture = identity_fixture(vec![root]);

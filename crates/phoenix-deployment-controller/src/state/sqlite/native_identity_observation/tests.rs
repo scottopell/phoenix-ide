@@ -2,8 +2,8 @@ use super::*;
 use crate::{
     CpuContentionBasisPoints, EffectCompletion, ExecutedEffect, GuardianLifetimeNonce,
     LoopProgress, MemoryPressure, NativeChildListCompletion, NativeChildListDispatch,
-    NativeGuardianSlot, NativeSlotLiveness, PolicyLoop, ResourceCapacity, ResourceContention,
-    ResourcePolicy, ResourceSample,
+    NativeGuardianSlot, NativeSlotLiveness, OwnedIdentityStatus, PolicyLoop, ResourceCapacity,
+    ResourceContention, ResourcePolicy, ResourceSample,
 };
 use std::num::NonZeroUsize;
 
@@ -295,6 +295,11 @@ fn recovered_identity_folds_only_the_root_without_activating_cleanup() {
             .unwrap();
         assert_eq!(saved.phase(), Phase::Interrupted);
         assert_ne!(saved.checkpoint, original);
+        let interrupted = saved.checkpoint.interrupted.as_ref().unwrap();
+        assert_eq!(
+            interrupted.resume.owned.identities().get(&issue.target()),
+            Some(&OwnedIdentityStatus::VerifiedAbsent)
+        );
         assert_eq!(
             store
                 .pending_native_identity_observation_ack(issue.key().attempt_id())
