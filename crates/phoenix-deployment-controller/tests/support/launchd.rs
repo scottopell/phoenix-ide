@@ -969,10 +969,8 @@ impl RunnerJobSpec {
                 InstalledRunnerMode::InitialPauseAfterApplication => "initial-sample",
                 InstalledRunnerMode::RecoverAppliedAck => "recover-applied-ack",
                 InstalledRunnerMode::RecoverFinishAndReady => "recover-finish-and-ready",
-                InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication => {
-                    "recover-finish-and-child-list"
-                }
-                InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation => {
+                InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication
+                | InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation => {
                     "recover-finish-and-child-list"
                 }
                 InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification => {
@@ -1937,6 +1935,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn installed_runner_modes_and_plist_are_fixed_shapes() {
         let guardian = JobSpec::new().unwrap();
         let runner = RunnerJobSpec::from_guardian_spec(&guardian);
