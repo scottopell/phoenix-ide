@@ -495,6 +495,32 @@ THE fresh reconciling session MAY acknowledge the exact earlier-session result u
 the ordinary durable-application proof. A crash or lost response before application
 commit SHALL permit fresh verification of retained custody, not effect reexecution;
 a crash after application commit SHALL use acknowledgement-only recovery.
+WHEN the sole exact retained sampling result is an already-durable `ParkedRetained`
+typed observation failure
+THE runner MAY explicitly settle only that failed result after a fresh interruption and
+same-live reconciling session before the original deadline. Settlement authority SHALL
+bind the exact issue, sequence, failure application and applying revision, issuing-session
+provenance retained by the guardian, unchanged guardian identity and slot inventory, and
+a correlated live failure response. The request SHALL NOT accept a caller-selected
+failure, process identity, or effect as authority.
+
+THE settlement SHALL atomically advance only the interrupted checkpoint revision and
+insert normalized immutable settlement evidence after deadline checks under writer
+ownership and immediately before commit. It SHALL preserve the interrupted sampling
+obligation, policy state, owned tree, guardian binding, slots, and original deadline; emit
+no effect; and authorize neither retry, continuation, resource admission, child listing,
+identity observation, signal, cleanup, nor readiness. A settled failure SHALL remain
+unsettled for reconciliation.
+
+WHEN exact failure settlement is durable
+THE guardian MAY release only that retained failed result after independently rereading
+and matching the settlement, retained typed failure, issuing provenance, current same-live
+reconciling session, and original deadline. ACK confirmation SHALL use a distinct
+normalized row rather than successful-sample ACK evidence. A lost ACK response or crash
+after settlement SHALL permit ACK-only replay in the same settling session or a later
+fresh interrupted reconciling session; it SHALL NOT repeat native work or settlement.
+Failed results without durable application and successful terminal samples remain retained.
+
 
 WHEN the same live guardian retains a successful exact-root child enumeration that the
 issuing runner did not durably apply

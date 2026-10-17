@@ -1097,6 +1097,17 @@ contract NativeGuardianPersistenceBoundary {
         -- attempt stays interrupted and no ticket, executable plan, activation,
         -- process mutation, or ACK authority is returned. Failed, terminal, stale,
         -- mismatched, ambiguous, or expired evidence remains retained and unapplied.
+
+    @invariant SettledSamplingFailureIsNotSuccessfulApplication
+        -- The sole exact already-durable ParkedRetained sampling failure may be settled
+        -- only by a fresh same-live reconciling session that proves its issue, sequence,
+        -- failure application, issuing provenance, unchanged custody, and original deadline.
+        -- Settlement advances only the interrupted checkpoint revision and inserts a
+        -- normalized immutable settlement; it preserves every policy obligation and emits
+        -- no effect. Distinct ACK evidence may release only that retained result in the
+        -- settling session or a later fresh interruption. Settlement never satisfies the
+        -- successful-sample barrier, authorizes retry or continuation, or reexecutes work.
+        -- Unapplied failures and successful terminal samples remain retained.
 }
 
 contract NativeGuardianReconnectBoundary {

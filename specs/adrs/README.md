@@ -141,6 +141,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [122](122_owned-root-child-enumeration-is-distinct-native-authority.md) | Owned-root child enumeration is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–021; native `ListChildren`, schema v6, protocol v6 |
 | [123](123_exact-root-identity-observation-is-distinct-native-authority.md) | Exact-root identity observation is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–022; native `ObserveIdentity`, schema v7, protocol v8 |
 | [124](124_retained-exact-root-identity-results-use-application-only-recovery.md) | Retained exact-root identity results use application-only recovery | Accepted | REQ-SDC-018, REQ-SDC-022; completed-before-application native `ObserveIdentity`, schema v7, protocol v9 |
+| [125](125_already-durable-native-sampling-failures-use-explicit-custody-settlement.md) | Already-durable native sampling failures use explicit custody settlement | Accepted | REQ-SDC-018–020; native sampling failure custody, schema v8, protocol v10 |
 
 ## For agents: which decisions bind your task
 
@@ -196,7 +197,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
-| Specifying standalone controller durability, surviving guardian custody, native runner IPC, or retained-result application recovery | 118, 119, 120, 121, 124; 034 for compatibility limits |
+| Specifying standalone controller durability, surviving guardian custody, native runner IPC, retained-result application recovery, or failed-result custody settlement | 118, 119, 120, 121, 124, 125; 034 for compatibility limits |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -257,9 +258,10 @@ ADR-000 (adopt spEARS v2 for new work)
       │       └── ADR-119 (Controller loss detaches and fences the surviving guardian)
       │           └── ADR-120 (Same-build pre-adoption native guardian IPC and runner)
       │               └── ADR-121 (Retained native results use application-only recovery)
-      │                   └── ADR-122 (Owned-root child enumeration is distinct native authority)
-      │                       └── ADR-123 (Exact-root identity observation is distinct native authority)
-      │                           └── ADR-124 (Retained exact-root identity results use application-only recovery)
+      │                   ├── ADR-122 (Owned-root child enumeration is distinct native authority)
+      │                   │   └── ADR-123 (Exact-root identity observation is distinct native authority)
+      │                   │       └── ADR-124 (Retained exact-root identity results use application-only recovery)
+      │                   └── ADR-125 (Already-durable native sampling failures use explicit custody settlement)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)
