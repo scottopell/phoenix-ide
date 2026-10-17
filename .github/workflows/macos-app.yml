@@ -165,14 +165,14 @@ jobs:
           output="$RUNNER_TEMP/observation-qualification/candidate"
           mkdir -p "$output/bin"
           git rev-parse HEAD HEAD^{tree} > "$output/qualifier-source.txt"
-          candidate=963307eb834fee0568fb8f991164d842d0ec68c2
+          candidate=f9477018529420b462c896d83c115dbc318d8ef9
           attribution_base=2702d8389c2fc78ac2e528c876c35a1a7040d692
           base=f3893088b3cb224be9403f600173d5216e3a2f6b
           product=9ee218d4a33ebd4b94ea547d60caa62134edb960
           git fetch origin "$candidate" "$attribution_base" "$base" "$product"
           git checkout --detach "$candidate"
           test "$(git rev-parse HEAD)" = "$candidate"
-          test "$(git rev-parse HEAD^{tree})" = d1b1a06e9438ac3d3c39fb067d54094b6c603cf7
+          test "$(git rev-parse HEAD^{tree})" = 3d8fd0d023adf90f51efd26e91e6e28d755fb5d7
           git rev-parse HEAD HEAD^{tree} > "$output/source.txt"
           git rev-parse "$base" "$base^{tree}" "$product" "$product^{tree}" "$attribution_base" "$attribution_base^{tree}" > "$output/parity-authorities.txt"
           cp docs/conversation-observation-source-parity.json docs/conversation-observation-composition.md docs/conversation-observation-attribution.md docs/conversation-observation-attribution.json "$output/"
@@ -205,41 +205,6 @@ jobs:
           pnpm install --frozen-lockfile 2>&1 | tee "$output/pnpm-install.log"
           pnpm run build 2>&1 | tee "$output/ui-build.log"
           (cd dist && find . -type f -exec shasum -a 256 {} \; | sort) > "$output/ui-dist-sha256.txt"
-      - name: Require focused current UI contracts and exact source parity
-        working-directory: ui
-        run: |
-          set -euo pipefail
-          output="$RUNNER_TEMP/observation-qualification/candidate"
-          tests=(
-            tests/observationSourceParity.test.ts
-            src/pages/PersistedObservation.test.tsx
-            src/App.alias.test.tsx
-            src/App.markdownNavigation.test.tsx
-            src/components/ConversationNavStack.test.tsx
-            src/components/ConversationNavStack.readiness.test.tsx
-            src/components/MessageList.test.tsx
-            src/pages/CoordinatorPage.test.tsx
-            src/pages/ProductConversationPage.test.tsx
-            src/hooks/conversationViewLifecycle.test.ts
-            src/hooks/useConversationViewJourney.test.tsx
-          )
-          set +e
-          pnpm exec vitest run "${tests[@]}" --maxWorkers=1 --reporter=default --reporter=json --outputFile.json="$output/ui-tests.json" 2>&1 | tee "$output/ui-tests.log"
-          test_exit=${PIPESTATUS[0]}
-          set -e
-          export REPORT="$output/ui-tests.json" TEST_EXIT="$test_exit"
-          python3 - <<'PY'
-          import json,os
-          d=json.load(open(os.environ['REPORT']))
-          assert os.environ['TEST_EXIT']=='0' and d['success'] and d['numFailedTests']==0
-          suites=d['testResults'];assert len(suites)==11,suites
-          tests=[test for suite in suites for test in suite['assertionResults']]
-          assert len(tests)==d['numTotalTests']==d['numPassedTests'] and tests
-          assert all(suite['status']=='passed' and not suite.get('testExecError') for suite in suites)
-          assert all(test['status']=='passed' for test in tests)
-          assert not d.get('numPendingTests',0) and not d.get('numTodoTests',0) and not d.get('numRuntimeErrorTestSuites',0)
-          assert not d.get('unhandledErrors') and not d.get('testExecError')
-          PY
       - name: Require exact attribution source guards and existing mock launcher contracts
         run: |
           set -euo pipefail
@@ -331,6 +296,41 @@ jobs:
                   assert set(span)<={'name','request_id','route','status','response_ready','open.id','product.reference'}
           print('synthetic attribution event receipt: privacy, exact completion inventory and request ancestry passed',json.dumps(counts,sort_keys=True))
           PY
+      - name: Require focused current UI contracts and exact source parity
+        working-directory: ui
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/observation-qualification/candidate"
+          tests=(
+            tests/observationSourceParity.test.ts
+            src/pages/PersistedObservation.test.tsx
+            src/App.alias.test.tsx
+            src/App.markdownNavigation.test.tsx
+            src/components/ConversationNavStack.test.tsx
+            src/components/ConversationNavStack.readiness.test.tsx
+            src/components/MessageList.test.tsx
+            src/pages/CoordinatorPage.test.tsx
+            src/pages/ProductConversationPage.test.tsx
+            src/hooks/conversationViewLifecycle.test.ts
+            src/hooks/useConversationViewJourney.test.tsx
+          )
+          set +e
+          pnpm exec vitest run "${tests[@]}" --maxWorkers=1 --reporter=default --reporter=json --outputFile.json="$output/ui-tests.json" 2>&1 | tee "$output/ui-tests.log"
+          test_exit=${PIPESTATUS[0]}
+          set -e
+          export REPORT="$output/ui-tests.json" TEST_EXIT="$test_exit"
+          python3 - <<'PY'
+          import json,os
+          d=json.load(open(os.environ['REPORT']))
+          assert os.environ['TEST_EXIT']=='0' and d['success'] and d['numFailedTests']==0
+          suites=d['testResults'];assert len(suites)==11,suites
+          tests=[test for suite in suites for test in suite['assertionResults']]
+          assert len(tests)==d['numTotalTests']==d['numPassedTests'] and tests
+          assert all(suite['status']=='passed' and not suite.get('testExecError') for suite in suites)
+          assert all(test['status']=='passed' for test in tests)
+          assert not d.get('numPendingTests',0) and not d.get('numTodoTests',0) and not d.get('numRuntimeErrorTestSuites',0)
+          assert not d.get('unhandledErrors') and not d.get('testExecError')
+          PY
       - name: Require real-binary startup and private-cwd portable asset contracts then retain one binary
         run: |
           set -euo pipefail
@@ -352,7 +352,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: current-task-observation-attribution-events-963-portable
+          name: current-task-observation-attribution-events-f947-portable
           path: ${{ runner.temp }}/observation-qualification/
           if-no-files-found: warn
           retention-days: 7
