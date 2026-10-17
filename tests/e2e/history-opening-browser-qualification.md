@@ -2742,3 +2742,9 @@ the unchanged final strict route check and original negative regression. Source
 app remains clean35f; no product edit, local browser/native/build or unchanged
 normal qualification rerun occurred for this diagnosis. Independent scoped
 read-only review found no blockers in the target/identity/diagnostic changes.
+
+Run `38990862125` is now fully terminal **failure**: isolated witness failed;
+Rust and all standard lanes succeeded. The canonical-source/failure-projection
+candidate is committed only after that complete result, with unchanged app35f.
+A single causal normal qualification will exercise the corrected Global entry;
+there was no repeated diagnostic or unchanged full run in this interval.
