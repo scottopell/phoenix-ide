@@ -573,7 +573,7 @@ fn prepare_initial_attempt(
         NonZeroUsize::new(2).expect("fixture constant"),
         0,
         0,
-        CpuContentionBasisPoints::new(0).expect("fixture constant"),
+        CpuContentionBasisPoints::new(10_000).expect("fixture constant"),
         MemoryPressure::Critical,
     );
     DeploymentAttempt::start(config.attempt, *deadline, policy, *root)
