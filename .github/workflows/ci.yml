@@ -214,7 +214,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: b778a86cfc32ff32f68965433829af0dd46d53a4
+          ref: e34ff8b85148bdb79f8c4164c5a7b067c930421a
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -256,7 +256,7 @@ jobs:
           spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
           import sys
           module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
-          source='b778a86cfc32ff32f68965433829af0dd46d53a4'; tree='2fc5a8ea32f3ea0b11d4e3fc37249734a9f84983'
+          source='e34ff8b85148bdb79f8c4164c5a7b067c930421a'; tree='163abe12e3cc1382913c1df9e2938084e901a6e4'
           for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
               module.admit_artifact(root, root/'ui'/name, source, tree, mode)
           (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
@@ -267,8 +267,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = b778a86cfc32ff32f68965433829af0dd46d53a4
-          test "$(git rev-parse HEAD^{tree})" = 2fc5a8ea32f3ea0b11d4e3fc37249734a9f84983
+          test "$(git rev-parse HEAD)" = e34ff8b85148bdb79f8c4164c5a7b067c930421a
+          test "$(git rev-parse HEAD^{tree})" = 163abe12e3cc1382913c1df9e2938084e901a6e4
           test "$(git merge-base HEAD 1f9529c634a074c6ab6ea36eb15ca284770df1a5)" = 1f9529c634a074c6ab6ea36eb15ca284770df1a5
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
