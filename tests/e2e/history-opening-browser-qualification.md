@@ -2537,3 +2537,30 @@ Cached tests: 93 Node tests pass (joint66, controlled23, diagnostic4); Python
 lifecycle70 passes with cached `opentelemetry-proto==1.39.0`. An initial Python
 invocation omitted that dependency and had one import error; the corrected
 cached invocation passes. No local native/browser/build execution occurred.
+
+### Exact-artifact pagination result and whole-run terminal state
+
+Original run `38986752552` is terminal **failure**: isolated controlled witness
+failed, Rust and every other standard lane passed. This is not an incomplete
+Rust check or a successful six-report controlled qualification.
+
+Diagnostic run `38988280900`, job `117264708678`, source
+`191dacb3e7bcd671990298be8896d6cdcdb2015c`, completed successfully. Its diagnostic
+artifact `12083668021` is 87,890 bytes. The exact `98718` retained executable/UI
+and `302a` app source were reused with the writable-latest fixture recipe in a
+**new DB**, not the original run DB. No build or emulation occurred.
+
+Observed actual older-history GETs: **two**, both response **200**, both request
+events **before the report POST**, both **without `open_id`**, both **absent from
+report request correlations**. Diagnostic errors and report-capture errors were
+zero; exactly one report received 204. Strict containment held for all five
+observations; exactly one current composer was connected, visible, enabled and
+not readonly. Normal drain: app exit0, owned home/socket removed, receiver closed.
+
+This proves actual pagination exists before the report in the reproduced recipe,
+but is omitted by the correlated-request observer because the app does not attach
+request ownership. The app-source owner was commissioned to fix that seam, with
+separate ownership per actual GET on the captured original journey, no new
+admission, no mutation after terminal, and no expansion of backend initial-open
+stages. One causal qualification will follow source regression and review; no
+unchanged normal qualification was rerun for this diagnosis.
