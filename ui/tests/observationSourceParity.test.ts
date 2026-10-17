@@ -44,7 +44,8 @@ function actualBlob(path: string): string | null {
   return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
 }
 const exactDiffArgs = [
-  'diff', '--diff-algorithm=myers', '--no-indent-heuristic', '--unified=3',
+  '-c', 'diff.suppressBlankEmpty=false', 'diff',
+  '--diff-algorithm=myers', '--no-indent-heuristic', '--unified=3', '--inter-hunk-context=0',
   '--no-ext-diff', '--no-textconv', '--no-color', '--full-index',
   '--src-prefix=a/', '--dst-prefix=b/', '--no-index',
 ];
@@ -93,6 +94,29 @@ describe('observation composition source identity', () => {
     }
   });
 
+  function assertExactPatchesAndRejectBodyMutation(env: NodeJS.ProcessEnv) {
+    for (const file of manifest.files.filter(file => file.exception)) {
+      expect(exactDiff(file.path, file.product_blob, env), file.path).toBe(file.exception!.diff);
+    }
+    for (const file of attribution.files) {
+      expect(exactDiff(file.path, file.base_blob, env), file.path).toBe(file.diff);
+    }
+    const file = attribution.files.find(file => file.path === 'crates/phoenix-db/src/product_conversation_read.rs')!;
+    const body = Buffer.from(readFileSync(resolve(root, file.path), 'utf8').replace('SELECT kind, ordinary_lifecycle', 'SELECT  kind, ordinary_lifecycle'));
+    const changedBlob = createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
+    expect(changedBlob).not.toBe(file.actual_blob);
+    expect(exactDiff(file.path, file.base_blob, env, body)).not.toBe(file.diff);
+  }
+
+  for (const [key, value] of [['diff.interHunkContext', '1000'], ['diff.suppressBlankEmpty', 'true']]) {
+    it(`pins exact patches under ${key}=${value} and rejects body mutation`, () => {
+      assertExactPatchesAndRejectBodyMutation({
+        ...process.env, GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value,
+      });
+    });
+  }
+
   for (const algorithm of ['histogram', 'myers']) {
     for (const indent of ['true', 'false']) {
       for (const compact of ['true', 'false']) {
@@ -104,17 +128,7 @@ describe('observation composition source identity', () => {
             GIT_CONFIG_KEY_2: 'diff.compactionHeuristic', GIT_CONFIG_VALUE_2: compact,
             GIT_CONFIG_KEY_3: 'diff.context', GIT_CONFIG_VALUE_3: '17',
           };
-          for (const file of manifest.files.filter(file => file.exception)) {
-            expect(exactDiff(file.path, file.product_blob, env), file.path).toBe(file.exception!.diff);
-          }
-          for (const file of attribution.files) {
-            expect(exactDiff(file.path, file.base_blob, env), file.path).toBe(file.diff);
-          }
-          const file = attribution.files.find(file => file.path === 'crates/phoenix-db/src/product_conversation_read.rs')!;
-          const body = Buffer.from(readFileSync(resolve(root, file.path), 'utf8').replace('SELECT kind, ordinary_lifecycle', 'SELECT  kind, ordinary_lifecycle'));
-          const changedBlob = createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
-          expect(changedBlob).not.toBe(file.actual_blob);
-          expect(exactDiff(file.path, file.base_blob, env, body)).not.toBe(file.diff);
+          assertExactPatchesAndRejectBodyMutation(env);
         });
       }
     }

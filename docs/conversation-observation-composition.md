@@ -56,8 +56,8 @@ Only the source-parity guard is an exception inside the 2702 UI tree. A changed
 file cannot pass merely because its name is on the adapter list.
 
 All exception patches use explicit Myers, disabled indent heuristic, three context
-lines, disabled external diff/textconv/color, full index hashes and fixed a/ and b/
-prefixes. The tracked `regenerate_manifests` function in
+lines, zero inter-hunk context, unsuppressed blank context lines, disabled external
+diff/textconv/color, full index hashes and fixed a/ and b/ prefixes. The tracked `regenerate_manifests` function in
 `tests/devpy/test_observation_attribution_source.py` shares Python's exact diff
 arguments; TypeScript's `exactDiff` pins identical arguments. See the attribution
 packet for the complete command, finite manifest dependency order, hostile-config

@@ -5302,10 +5302,13 @@
     }
   ],
   "diff_args": [
+    "-c",
+    "diff.suppressBlankEmpty=false",
     "diff",
     "--diff-algorithm=myers",
     "--no-indent-heuristic",
     "--unified=3",
+    "--inter-hunk-context=0",
     "--no-ext-diff",
     "--no-textconv",
     "--no-color",

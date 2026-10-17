@@ -161,6 +161,13 @@ unpinned Git diff defaults. The runner's defaults/configuration were inferred,
 not measured; this source-only follow-up does not assert a measured runner setting
 or qualify a new runtime sample.
 
+A held-out local source-only check of checkpoint `873e25042` measured two more
+ambient configuration effects: `diff.interHunkContext=1000` changed **13 of 45**
+canonical exception patches; `diff.suppressBlankEmpty=true` changed **10 of 45**.
+These are reproduced local guard portability findings, **not evidence of the
+hosted runner's configuration or the cause of its failure**. No hosted settings
+or new runtime behavior were measured.
+
 ## Deterministic patch producer and consumers
 
 Python `EXACT_DIFF_ARGS` is shared by `exact_diff` and the named
@@ -168,7 +175,7 @@ Python `EXACT_DIFF_ARGS` is shared by `exact_diff` and the named
 TypeScript `exactDiffArgs` pins the same explicit arguments for `exactDiff`:
 
 ```text
-git diff --diff-algorithm=myers --no-indent-heuristic --unified=3 --no-ext-diff --no-textconv --no-color --full-index --src-prefix=a/ --dst-prefix=b/ --no-index -- BEFORE AFTER
+git -c diff.suppressBlankEmpty=false diff --diff-algorithm=myers --no-indent-heuristic --unified=3 --inter-hunk-context=0 --no-ext-diff --no-textconv --no-color --full-index --src-prefix=a/ --dst-prefix=b/ --no-index -- BEFORE AFTER
 ```
 
 Both manifests are regenerated with these arguments, including **every** UI
@@ -189,8 +196,12 @@ compares both serialized outputs byte-for-byte without writing them.
 Both helpers have an eight-case cross-product regression using subprocess-local
 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`: histogram/myers,
 indent heuristic true/false, compaction heuristic true/false, plus hostile context
-17 in every case. Every case requires the same canonical patches for every UI
-exception and every attribution exception. An SQL-literal whitespace mutation
+17 in every case. Two additional independent cases set `diff.interHunkContext=1000`
+and `diff.suppressBlankEmpty=true`. The command-line `-c` precedes the `diff`
+subcommand and overrides ambient blank-context suppression; the explicit
+`--inter-hunk-context=0` prevents ambient hunk merging. Every case requires the
+same canonical patches for every UI exception and every attribution exception.
+An SQL-literal whitespace mutation
 still differs in exact blob and exact patch; Python additionally rejects it through
 the unchanged SQL-preserving token proof. Tests do not edit any SQL or product file.
 
@@ -261,10 +272,11 @@ git diff --exit-code d5700c84f -- crates ui/src
 git diff --check
 ```
 
-Executed follow-up results: **17 Python tests passed** (all **9** attribution
-source guards, including producer idempotence and the eight-configuration matrix,
-plus all **8** mocked observation launcher/source guards); **26 UI tests passed**
-(the previous **18** plus **8** hostile-config cases); strict ESLint **passed**
+Executed follow-up results: **19 Python tests passed** (all **11** attribution
+source guards, including producer idempotence, the eight-configuration matrix,
+and the two additional hostile configurations, plus all **8** mocked observation
+launcher/source guards); **28 UI tests passed** (the previous **18** plus **10**
+hostile-config cases); strict ESLint **passed**
 with zero warnings; both diff checks **passed**. These are cached, source-only
 checks, not a new Rust/event/runtime qualification. The UI exception manifest was
 fully regenerated; its 859 source identities and 34 patch bodies remain identical
@@ -273,4 +285,4 @@ to the checkpoint, with explicit diff-argument metadata added.
 The Rust tree has no delta from d570; no rustfmt or Rust validation is needed for
 this follow-up. These commands are not authorization for build, Cargo, install,
 network, services, browser, SQL or hosted dispatch. Roadmap #806 remains unverified
-under the no-network constraint. The working changes are intentionally uncommitted.
+under the no-network constraint. This source-only checkpoint requires independent review before any further hosted dispatch.

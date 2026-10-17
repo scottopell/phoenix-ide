@@ -16,7 +16,8 @@ BASE = "2702d8389c2fc78ac2e528c876c35a1a7040d692"
 PACKET = "docs/conversation-observation-attribution.json"
 UI_PACKET = "docs/conversation-observation-source-parity.json"
 EXACT_DIFF_ARGS = (
-    "diff", "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=3",
+    "-c", "diff.suppressBlankEmpty=false", "diff",
+    "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=3", "--inter-hunk-context=0",
     "--no-ext-diff", "--no-textconv", "--no-color", "--full-index",
     "--src-prefix=a/", "--dst-prefix=b/", "--no-index",
 )
@@ -241,27 +242,43 @@ class AttributionSourceTests(unittest.TestCase):
         for path, text in writes.items():
             self.assertEqual(text, path.read_text(), str(path))
 
-    def test_exact_diff_ignores_hostile_git_config_and_rejects_body_mutation(self):
+    def _assert_exact_patches_and_reject_body_mutation(self, env):
         packet = json.loads((ROOT / PACKET).read_text())
         ui = json.loads((ROOT / UI_PACKET).read_text())
         entries = [(entry, entry["base_blob"], entry["diff"]) for entry in packet["files"]]
         entries += [(entry, entry["product_blob"], entry["exception"]["diff"])
                     for entry in ui["files"] if "exception" in entry]
+        for entry, base_blob, canonical in entries:
+            with self.subTest(path=entry["path"]):
+                self.assertEqual(exact_diff(entry["path"], base_blob, env=env), canonical)
+        entry = next(entry for entry in packet["files"] if entry["path"] == DB)
+        changed = (ROOT / DB).read_bytes().replace(b"SELECT kind, ordinary_lifecycle", b"SELECT  kind, ordinary_lifecycle", 1)
+        self.assertNotEqual(blob_hash(changed), entry["actual_blob"])
+        with mock.patch.object(Path, "read_bytes", return_value=changed):
+            self.assertNotEqual(exact_diff(DB, entry["base_blob"], env=env), entry["diff"])
+        self.assertNotEqual(tokens(pinned(DB)), without_wrappers(changed.decode(), DB))
+
+    def test_exact_diff_ignores_inter_hunk_context_and_rejects_body_mutation(self):
+        self._assert_exact_patches_and_reject_body_mutation({
+            **os.environ, "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "diff.interHunkContext", "GIT_CONFIG_VALUE_0": "1000",
+        })
+
+    def test_exact_diff_ignores_suppress_blank_empty_and_rejects_body_mutation(self):
+        self._assert_exact_patches_and_reject_body_mutation({
+            **os.environ, "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "diff.suppressBlankEmpty", "GIT_CONFIG_VALUE_0": "true",
+        })
+
+    def test_exact_diff_ignores_hostile_git_config_and_rejects_body_mutation(self):
         for algorithm, indent, compact in product(["histogram", "myers"], ["true", "false"], ["true", "false"]):
             env = {**os.environ, "GIT_CONFIG_COUNT": "4",
                    "GIT_CONFIG_KEY_0": "diff.algorithm", "GIT_CONFIG_VALUE_0": algorithm,
                    "GIT_CONFIG_KEY_1": "diff.indentHeuristic", "GIT_CONFIG_VALUE_1": indent,
                    "GIT_CONFIG_KEY_2": "diff.compactionHeuristic", "GIT_CONFIG_VALUE_2": compact,
                    "GIT_CONFIG_KEY_3": "diff.context", "GIT_CONFIG_VALUE_3": "17"}
-            for entry, base_blob, canonical in entries:
-                with self.subTest(algorithm=algorithm, indent=indent, compact=compact, path=entry["path"]):
-                    self.assertEqual(exact_diff(entry["path"], base_blob, env=env), canonical)
-            entry = next(entry for entry in packet["files"] if entry["path"] == DB)
-            changed = (ROOT / DB).read_bytes().replace(b"SELECT kind, ordinary_lifecycle", b"SELECT  kind, ordinary_lifecycle", 1)
-            self.assertNotEqual(blob_hash(changed), entry["actual_blob"])
-            with mock.patch.object(Path, "read_bytes", return_value=changed):
-                self.assertNotEqual(exact_diff(DB, entry["base_blob"], env=env), entry["diff"])
-            self.assertNotEqual(tokens(pinned(DB)), without_wrappers(changed.decode(), DB))
+            with self.subTest(algorithm=algorithm, indent=indent, compact=compact):
+                self._assert_exact_patches_and_reject_body_mutation(env)
 
     def test_only_exact_instrument_wrappers_change_db_and_admission_tokens(self):
         for path in [DB, ROUTES, "crates/phoenix-ide/src/api/product_conversations.rs"]:
