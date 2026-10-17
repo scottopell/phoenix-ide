@@ -33,6 +33,12 @@ use crate::{
     BirthToken, ProcessId, ProcessIdentity,
 };
 
+mod native_child_list;
+pub use native_child_list::{
+    NativeChildListCompletion, NativeChildListDispatch, NativeChildListIssue,
+    NativeChildListStatus, VerifiedNativeChildListAckConfirmation,
+    VerifiedNativeChildListCompletion,
+};
 mod native_reconciliation;
 pub use native_reconciliation::{
     CommittedNativeReconciliationActivation, NativeReconciliationActivation,
@@ -48,10 +54,10 @@ pub use native_sampling::{
 mod tree;
 
 const SCHEMA: &str = include_str!("sqlite/schema.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// An independent controller database, never a Phoenix application connection.
-/// Only schema version 5 is supported; there is no upgrade/downgrade policy.
+/// Only schema version 6 is supported; there is no upgrade/downgrade policy.
 #[derive(Debug)]
 pub struct ControllerSqliteStore {
     connection: Connection,
@@ -141,7 +147,7 @@ impl ControllerSqliteStore {
         })
     }
 
-    /// Opens an existing schema-v5 store for guardian read-only evidence.
+    /// Opens an existing schema-v6 store for guardian read-only evidence.
     /// # Errors
     /// Rejects missing or incompatible stores.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
@@ -527,6 +533,7 @@ impl ControllerSqliteStore {
         self.persist_checkpoint_with_sample(
             checkpoint,
             application,
+            None,
             reconciliation,
             None,
             &mut native_sampling::native_deadline_now,
@@ -537,6 +544,10 @@ impl ControllerSqliteStore {
         &mut self,
         checkpoint: &DeploymentAttempt,
         application: Option<(&NativeSamplingIssue, &NativeSamplingCompletion)>,
+        child_application: Option<(
+            &native_child_list::NativeChildListIssue,
+            &native_child_list::NativeChildListCompletion,
+        )>,
         reconciliation: Option<(&DeploymentAttempt, &NativeGuardianBinding, MonotonicTick)>,
         recovered_sample: Option<(
             &DeploymentAttempt,
@@ -591,6 +602,15 @@ impl ControllerSqliteStore {
                 return Err(ControllerStoreError::RevisionConflict);
             }
         }
+        if let Some((issue, completion)) = child_application {
+            native_child_list::validate_application(
+                &transaction,
+                durable.as_ref(),
+                checkpoint,
+                issue,
+                completion,
+            )?;
+        }
         let mut next = checkpoint.clone();
         next.set_revision(revision);
         // BEGIN IMMEDIATE holds the writer lock across compare, replace, and commit.
@@ -621,6 +641,9 @@ impl ControllerSqliteStore {
         }
         if let Some((issue, completion)) = application {
             native_sampling::insert_application(&transaction, issue, completion, revision)?;
+        }
+        if let Some((issue, completion)) = child_application {
+            native_child_list::insert_application(&transaction, issue, completion, revision)?;
         }
         if let Some((_, binding, _)) = reconciliation {
             native_reconciliation::insert_completion(&transaction, binding, revision)?;

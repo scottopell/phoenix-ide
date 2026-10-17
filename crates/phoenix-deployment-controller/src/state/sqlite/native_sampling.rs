@@ -635,6 +635,7 @@ impl ControllerSqliteStore {
                 &checkpoint,
                 Some((&issue, &NativeSamplingCompletion::Sample(sample))),
                 None,
+                None,
                 Some((&loaded.checkpoint, &binding, &issue)),
                 &mut clock,
             )?;

@@ -252,4 +252,69 @@ BEGIN SELECT RAISE(ABORT, 'activation is immutable'); END;
 CREATE TRIGGER native_reconciliation_activation_cannot_be_deleted
 BEFORE DELETE ON native_reconciliation_activations
 BEGIN SELECT RAISE(ABORT, 'activation is immutable'); END;
-PRAGMA user_version = 5;
+CREATE TABLE native_child_list_issues (
+    attempt_id BLOB NOT NULL REFERENCES guardian_bindings(attempt_id),
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision)=8 AND dispatch_revision!=zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal=0),
+    session_generation BLOB NOT NULL CHECK(length(session_generation)=8 AND session_generation!=zeroblob(8)),
+    parent_pid INTEGER NOT NULL CHECK(parent_pid BETWEEN 1 AND 4294967295),
+    parent_birth_seconds BLOB NOT NULL CHECK(length(parent_birth_seconds)=8),
+    parent_birth_nanos INTEGER NOT NULL CHECK(parent_birth_nanos BETWEEN 0 AND 999999999),
+    PRIMARY KEY(attempt_id,dispatch_revision,ordinal),
+    FOREIGN KEY(attempt_id,session_generation) REFERENCES guardian_sessions(attempt_id,generation)
+) STRICT;
+CREATE TABLE native_child_list_applications (
+    attempt_id BLOB NOT NULL,
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision)=8 AND dispatch_revision!=zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal=0),
+    applying_revision BLOB NOT NULL CHECK(length(applying_revision)=8 AND applying_revision!=zeroblob(8)),
+    outcome TEXT NOT NULL CHECK(outcome IN ('success','permission_denied','temporarily_unavailable','malformed')),
+    child_count INTEGER CHECK(child_count >= 0),
+    CHECK((outcome='success')=(child_count IS NOT NULL)),
+    PRIMARY KEY(attempt_id,dispatch_revision,ordinal),
+    UNIQUE(attempt_id,dispatch_revision,ordinal,applying_revision),
+    FOREIGN KEY(attempt_id,dispatch_revision,ordinal) REFERENCES native_child_list_issues(attempt_id,dispatch_revision,ordinal)
+) STRICT;
+CREATE TABLE native_child_list_result_children (
+    attempt_id BLOB NOT NULL,
+    dispatch_revision BLOB NOT NULL,
+    issue_ordinal INTEGER NOT NULL CHECK(issue_ordinal=0),
+    child_ordinal INTEGER NOT NULL CHECK(child_ordinal>=0),
+    pid INTEGER NOT NULL CHECK(pid BETWEEN 1 AND 4294967295),
+    PRIMARY KEY(attempt_id,dispatch_revision,issue_ordinal,child_ordinal),
+    UNIQUE(attempt_id,dispatch_revision,issue_ordinal,pid),
+    FOREIGN KEY(attempt_id,dispatch_revision,issue_ordinal) REFERENCES native_child_list_applications(attempt_id,dispatch_revision,ordinal)
+) STRICT;
+CREATE TRIGGER native_child_list_result_children_require_success BEFORE INSERT ON native_child_list_result_children
+WHEN NOT EXISTS (SELECT 1 FROM native_child_list_applications WHERE attempt_id=NEW.attempt_id AND dispatch_revision=NEW.dispatch_revision AND ordinal=NEW.issue_ordinal AND outcome='success')
+BEGIN SELECT RAISE(ABORT,'child rows require successful application'); END;
+CREATE TABLE native_child_list_ack_confirmations (
+    attempt_id BLOB NOT NULL,
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision)=8 AND dispatch_revision!=zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal=0),
+    applying_revision BLOB NOT NULL CHECK(length(applying_revision)=8 AND applying_revision!=zeroblob(8)),
+    confirming_session_generation BLOB NOT NULL CHECK(length(confirming_session_generation)=8 AND confirming_session_generation!=zeroblob(8)),
+    PRIMARY KEY(attempt_id,dispatch_revision,ordinal),
+    FOREIGN KEY(attempt_id,dispatch_revision,ordinal,applying_revision) REFERENCES native_child_list_applications(attempt_id,dispatch_revision,ordinal,applying_revision),
+    FOREIGN KEY(attempt_id,confirming_session_generation) REFERENCES guardian_sessions(attempt_id,generation)
+) STRICT;
+CREATE TRIGGER native_child_list_ack_requires_success BEFORE INSERT ON native_child_list_ack_confirmations
+WHEN NOT EXISTS (SELECT 1 FROM native_child_list_applications WHERE attempt_id=NEW.attempt_id AND dispatch_revision=NEW.dispatch_revision AND ordinal=NEW.ordinal AND applying_revision=NEW.applying_revision AND outcome='success')
+BEGIN SELECT RAISE(ABORT,'child list ACK requires success'); END;
+CREATE TRIGGER native_child_list_issue_immutable BEFORE UPDATE ON native_child_list_issues
+BEGIN SELECT RAISE(ABORT,'child list issue is immutable'); END;
+CREATE TRIGGER native_child_list_issue_no_delete BEFORE DELETE ON native_child_list_issues
+BEGIN SELECT RAISE(ABORT,'child list issue is immutable'); END;
+CREATE TRIGGER native_child_list_application_immutable BEFORE UPDATE ON native_child_list_applications
+BEGIN SELECT RAISE(ABORT,'child list application is immutable'); END;
+CREATE TRIGGER native_child_list_child_immutable BEFORE UPDATE ON native_child_list_result_children
+BEGIN SELECT RAISE(ABORT,'child list child is immutable'); END;
+CREATE TRIGGER native_child_list_ack_immutable BEFORE UPDATE ON native_child_list_ack_confirmations
+BEGIN SELECT RAISE(ABORT,'child list ACK is immutable'); END;
+CREATE TRIGGER native_child_list_application_no_delete BEFORE DELETE ON native_child_list_applications
+BEGIN SELECT RAISE(ABORT,'child list application is immutable'); END;
+CREATE TRIGGER native_child_list_child_no_delete BEFORE DELETE ON native_child_list_result_children
+BEGIN SELECT RAISE(ABORT,'child list child is immutable'); END;
+CREATE TRIGGER native_child_list_ack_no_delete BEFORE DELETE ON native_child_list_ack_confirmations
+BEGIN SELECT RAISE(ABORT,'child list ACK is immutable'); END;
+PRAGMA user_version = 6;

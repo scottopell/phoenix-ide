@@ -1401,6 +1401,17 @@ impl DeploymentAttempt {
         }
     }
 
+    /// The initial root is identifiable only while discovery has exactly one owned identity.
+    pub(crate) fn native_root_scan(&self, parent: ProcessIdentity) -> bool {
+        matches!(self, Self::Active(ActiveAttempt::Ownership(OwnershipAttempt {
+            phase: OwnershipPhase::Discovery, tree, ..
+        })) if tree.identities().len() == 1
+            && tree.identities().contains_key(&parent)
+            && tree.pending_child_scans().len() == 1
+            && tree.pending_child_scans().contains(&parent)
+            && tree.unresolved().is_empty())
+    }
+
     #[must_use]
     pub fn ownership_tree(&self) -> Option<&OwnedProcessTree> {
         match self {

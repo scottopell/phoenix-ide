@@ -267,6 +267,24 @@ impl AttemptStore for NativeSamplingStore<'_> {
     }
 }
 
+struct NativeChildListStore<'a> {
+    store: &'a mut crate::ControllerSqliteStore,
+    issue: crate::NativeChildListIssue,
+    completion: crate::NativeChildListCompletion,
+}
+
+impl AttemptStore for NativeChildListStore<'_> {
+    type Error = crate::ControllerStoreError;
+
+    fn persist(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+    ) -> Result<PersistenceRevision, Self::Error> {
+        self.store
+            .persist_native_child_list(checkpoint, &self.issue, &self.completion)
+    }
+}
+
 enum Receipt {
     Applied,
     Parked(ParkReason),
@@ -543,6 +561,57 @@ impl PolicyLoop {
         let executed =
             ExecutedEffect::from_parts(key, EffectCompletion::SampleResources { sequence, result });
         let mut adapter = NativeSamplingStore {
+            store,
+            issue,
+            completion,
+        };
+        self.apply_retained(&executed, &mut adapter)
+    }
+
+    /// Applies one verified native root `ListChildren` completion atomically with its result rows.
+    /// # Errors
+    /// Unissued, mismatched or already applied evidence fail-stops without ACK authority.
+    pub fn apply_native_child_list(
+        &mut self,
+        verified: crate::VerifiedNativeChildListCompletion,
+        store: &mut crate::ControllerSqliteStore,
+    ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
+        let (ticket, issue, completion) = verified.into_parts();
+        let key = ticket.key();
+        let belongs_to_loop = self.rounds.iter().any(|round| {
+            round
+                .issued
+                .iter()
+                .any(|issued| issued.key == key && issued.effect == *ticket.effect())
+        });
+        if !belongs_to_loop {
+            return Err(LoopError::NotIssued(key));
+        }
+        let OsEffect::ListChildren { parent } = ticket.effect() else {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        };
+        if key != issue.key() || *parent != issue.parent() {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        }
+        let status = store.load_native_child_list_status(key).map_err(|error| {
+            self.status = LoopStatus::FailStopped;
+            LoopError::Persistence(error)
+        })?;
+        if status != Some(crate::NativeChildListStatus::IssuedPendingApplication { issue }) {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        }
+        let parent = *parent;
+        let (key, _) = ticket.into_parts();
+        let result = match &completion {
+            crate::NativeChildListCompletion::Children(children) => Ok(children.clone()),
+            crate::NativeChildListCompletion::Failure(failure) => Err(*failure),
+        };
+        let executed =
+            ExecutedEffect::from_parts(key, EffectCompletion::ListChildren { parent, result });
+        let mut adapter = NativeChildListStore {
             store,
             issue,
             completion,
