@@ -856,8 +856,10 @@ impl BrowserSession {
         if let Some(shim) = crate::process_group::ChromeExecShim::registered() {
             let target = match executable {
                 Some(path) => path.to_path_buf(),
-                None => chromiumoxide::detection::default_executable(Default::default())
-                    .map_err(|error| BrowserError::LaunchFailed(error.to_string()))?,
+                None => chromiumoxide::detection::default_executable(
+                    chromiumoxide::detection::DetectionOptions::default(),
+                )
+                .map_err(BrowserError::LaunchFailed)?,
             };
             let target = std::fs::canonicalize(target)
                 .map_err(|error| BrowserError::LaunchFailed(error.to_string()))?;
