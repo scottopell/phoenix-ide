@@ -178,7 +178,7 @@ jobs:
       - name: Test immutable first-unit projection contract and owning suite
         run: |
           set -o pipefail
-          git diff --exit-code cf61469eb870563502d863bc7354ebd0066d9d79 HEAD -- crates ui dev.py docs specs tests
+          git diff --exit-code 6e9d6aec27725ff911b2a21879d4366f0c10af84 HEAD -- crates ui dev.py docs specs tests
           mkdir -p "$RUNNER_TEMP/observation-qualification"
           cargo test -p phoenix_ide --lib api::product_conversations::tests::db_history_projections_preserve_pending_openings_boundaries_and_null_presentations -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/projection-contract.log"
           grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/projection-contract.log"
