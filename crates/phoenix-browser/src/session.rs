@@ -1253,8 +1253,8 @@ impl BrowserSession {
                 BrowserError::OperationFailed("owned Chrome child missing before status".into())
             })?;
             return group
-                .root_exited(child.as_mut_inner())
-                .map(|exited| !exited)
+                .observe_root(child.as_mut_inner())
+                .map(|observation| observation != crate::process_group::RootObservation::Exited)
                 .map_err(|error| BrowserError::OperationFailed(error.to_string()));
         }
         if let Some(child) = self.browser.get_mut_child() {

@@ -100,4 +100,4 @@ pub fn enter_chrome_exec() -> io::Result<()> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod native;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use native::OwnedChromeGroup;
+pub(crate) use native::{OwnedChromeGroup, RootObservation};
