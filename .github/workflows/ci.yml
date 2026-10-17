@@ -339,7 +339,7 @@ jobs:
 
   notify-main-failure:
     name: Open issue on main CI failure
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-fast]
+    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-finalization-geometry, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(join(needs.*.result, ','), 'failure') }}
     runs-on: ubuntu-latest
     permissions:
@@ -365,7 +365,7 @@ jobs:
 
   close-main-failure:
     name: Close CI-failure issue on green
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-fast]
+    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-finalization-geometry, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') && !contains(join(needs.*.result, ','), 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
