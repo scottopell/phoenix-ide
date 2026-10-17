@@ -3234,3 +3234,30 @@ Two isolated bounded final reviews used exact d074..0d34 and returned No
 exhaustive177-file proof and not external runtime confirmation. Their evidence
 is retained separately; the budget-only successor is a different exact target
 and does not silently inherit an identical-target label.
+
+## Review-driven chapter-owner and shared-stream successor
+
+Two new exact-head review findings supersede the earlier review-ready assessment
+of shared1e042321. App52ec18b65bcf757ff40d8e5c0ed74982b2512afb,
+treecdd9297ef0f5ed0577014b0b8c2f9a09b409ee51, is parent-linked directly to
+qualified26d40cb8. Only NavStack source/tests and shared SSE handlers change.
+Persisted aggregate chapter selections establish source_transcript even from a
+hashless Global member route; unpinned ordinary fallback stays hash-only.
+Shared SSE keeps token validation/subscription outside the existing bounded
+three-attempt stable read, refreshes generation/messages/opening together, and
+maps only the typed snapshot-change error into retry. Real persisted append,
+mutation and three-attempt exhaustion regressions are authored; no runtime is
+created by the share viewer.
+
+The shared owner independently passed216 UI tests, cached tsc,80 Python lifecycle
+checks with the required cached protobuf dependency,69 joint ownership guards,
+YAML parse and diff checks. A first Python invocation without protobuf failed
+its import and is retained separately, not treated as a source failure or pass.
+Independent exact-parent source review found no actionable blocker; it did not
+compile Rust or execute hosted jobs. New Rust regression execution, full CI and
+rebuilt controlled-functional witness remain owed at the successor shared head.
+Workflow/Python/JS app pins move atomically to52ec; earlier green1e04/26d and
+PR908 baselines remain preserved. Separate native-capability artifact reuse and
+read-only performance-fixture investigation do not amend this app packet or
+provide overhead, physical-device or full acceptance. No numeric overhead
+threshold is adopted; improved measurement quality proceeds without one.
