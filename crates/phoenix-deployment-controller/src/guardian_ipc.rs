@@ -3203,6 +3203,83 @@ mod native_evidence_tests {
         assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn native_sampling_admission_refuses_prepared_live_reconciling_even_after_durable_activation() {
+        let mut fixture = native_ack_fixture();
+        let (session, committed) = commit_sampling_reconciliation(&mut fixture);
+        let revision = committed.checkpoint().persistence_revision().unwrap();
+        let mut policy = crate::PolicyLoop::from_committed(committed);
+        let retained = policy.issue_next().unwrap();
+        assert_eq!(
+            fixture.server.handle(Request::FinishReconciliation {
+                session,
+                applied_revision: revision.get(),
+                now: 0,
+            }),
+            Response::ReconciliationPrepared {
+                session,
+                attempt: fixture.attempt.get(),
+                recovery_revision: revision.get(),
+            }
+        );
+        let admit = Request::DispatchAdmit {
+            session,
+            key: WireKey::try_from(retained.key()).unwrap(),
+            effect: WireEffect::SampleResources { sequence: 1 },
+        };
+        assert_eq!(fixture.server.snapshot().state, WireState::Reconciling);
+        assert_eq!(
+            fixture.server.handle(admit.clone()),
+            Response::Refused(WireError::MissingProof)
+        );
+        assert!(fixture.server.native_admissions.is_empty());
+        let binding = fixture
+            .store
+            .load_native_binding(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let (_, _, completion) = fixture
+            .store
+            .read_native_reconciliation_evidence(
+                fixture.attempt,
+                binding.current_session().generation,
+            )
+            .unwrap()
+            .unwrap();
+        let proof = crate::PreparedNativeReconciliation::after_live_prepare(
+            session,
+            fixture.attempt,
+            binding.identity(),
+            binding.deadline(),
+            revision,
+        );
+        let (durable, _, _activation) = fixture
+            .store
+            .commit_native_reconciliation_activation_at(
+                &binding,
+                completion,
+                proof,
+                MonotonicTick::native_now().unwrap(),
+            )
+            .unwrap();
+        let issue = fixture
+            .store
+            .commit_native_sampling_issue(&retained, &durable)
+            .unwrap();
+        assert_eq!(issue.key(), retained.key());
+        assert_eq!(issue.sequence(), 1);
+        assert_eq!(durable.current_session().state, NativeSessionState::Active);
+        assert_eq!(fixture.server.snapshot().state, WireState::Reconciling);
+        assert_eq!(
+            fixture.server.handle(admit),
+            Response::Refused(WireError::MissingProof),
+            "exact durable issue cannot bypass live Reconciling"
+        );
+        assert!(fixture.server.native_admissions.is_empty());
+        assert!(fixture.server.snapshot().retained.is_empty());
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     struct ReconciliationReader(
         Option<(
             crate::LoadedAttempt,

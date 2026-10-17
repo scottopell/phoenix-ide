@@ -543,6 +543,17 @@ impl Transition {
 }
 
 impl CommittedTransition {
+    /// Pure shape check against the checkpoint's exact pending sample sequence.
+    #[must_use]
+    pub fn is_exact_sampling_plan(&self) -> bool {
+        let DeploymentAttempt::Active(ActiveAttempt::ResourceSampling(attempt)) = &self.checkpoint
+        else {
+            return false;
+        };
+        matches!(self.after_persist.as_slice(), [OsEffect::SampleResources { sequence }]
+            if *sequence == attempt.pending_sample_sequence)
+    }
+
     pub(crate) fn is_owned_signal_round(&self) -> bool {
         self.dispatch_purpose == DispatchPurpose::OwnedSignalRound
     }
@@ -1525,4 +1536,55 @@ pub enum TransitionError {
     DeadlineNotReached,
     NoUnresolvedRisk,
     AcceptanceAttemptMismatch,
+}
+
+#[cfg(test)]
+mod sampling_plan_tests {
+    use super::*;
+
+    #[test]
+    fn pure_sampling_plan_validator_rejects_empty_multi_effect_wrong_sequence_and_checkpoint() {
+        let mut store = crate::ControllerSqliteStore::in_memory().unwrap();
+        let root = ProcessIdentity::new(
+            ProcessId::new(std::num::NonZeroU32::new(42).unwrap()),
+            crate::BirthToken::new(1, 0).unwrap(),
+        );
+        let mut committed = DeploymentAttempt::start(
+            AttemptId::new(81),
+            MonotonicTick::new(100),
+            ResourcePolicy::new(
+                std::num::NonZeroUsize::new(2).unwrap(),
+                0,
+                0,
+                crate::CpuContentionBasisPoints::new(0).unwrap(),
+                crate::MemoryPressure::Critical,
+            ),
+            root,
+        )
+        .persist(&mut store)
+        .unwrap();
+        assert!(committed.is_exact_sampling_plan());
+        let checkpoint = committed.checkpoint().clone();
+        for effects in [
+            vec![],
+            vec![
+                OsEffect::SampleResources { sequence: 0 },
+                OsEffect::SampleResources { sequence: 0 },
+            ],
+            vec![OsEffect::SampleResources { sequence: 1 }],
+            vec![OsEffect::ListChildren { parent: root }],
+        ] {
+            committed.after_persist = effects;
+            assert!(!committed.is_exact_sampling_plan());
+            assert_eq!(
+                committed.checkpoint(),
+                &checkpoint,
+                "validation must not mutate checkpoint"
+            );
+        }
+        committed.after_persist = vec![OsEffect::SampleResources { sequence: 0 }];
+        assert!(committed.is_exact_sampling_plan());
+        committed.checkpoint = checkpoint.interrupt().unwrap().checkpoint;
+        assert!(!committed.is_exact_sampling_plan());
+    }
 }

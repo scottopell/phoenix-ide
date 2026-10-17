@@ -517,6 +517,88 @@ impl From<CodecError> for ClientError {
     }
 }
 
+/// Affine proof that this exact ticket was never submitted for execution.
+/// Only the authenticated client's dispatch path can create it.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::native_guardian::UnsubmittedNativeSampling;
+/// fn duplicate(value: UnsubmittedNativeSampling) { let _ = value.clone(); }
+/// ```
+/// ```compile_fail
+/// use phoenix_deployment_controller::{DispatchTicket, NativeSamplingIssue};
+/// use phoenix_deployment_controller::native_guardian::{ClientError, UnsubmittedNativeSampling};
+/// fn fabricate(ticket: DispatchTicket, issue: NativeSamplingIssue, error: ClientError)
+///     -> UnsubmittedNativeSampling {
+///     UnsubmittedNativeSampling { ticket, issue }
+/// }
+/// ```
+/// ```compile_fail
+/// use phoenix_deployment_controller::{NativeSamplingIssue, guardian_ipc::WireError};
+/// use phoenix_deployment_controller::native_guardian::UnsubmittedNativeSampling;
+/// fn fabricate(issue: NativeSamplingIssue, refused: WireError) -> UnsubmittedNativeSampling {
+///     (issue, refused).into()
+/// }
+/// ```
+/// ```compile_fail
+/// use phoenix_deployment_controller::DispatchTicket;
+/// use phoenix_deployment_controller::native_guardian::UnsubmittedNativeSampling;
+/// fn reconstruct(value: UnsubmittedNativeSampling) -> DispatchTicket { value.into() }
+/// ```
+/// ```compile_fail
+/// use phoenix_deployment_controller::ControllerSqliteStore;
+/// use phoenix_deployment_controller::native_guardian::UnsubmittedNativeSampling;
+/// fn replay(store: &mut ControllerSqliteStore, value: UnsubmittedNativeSampling) {
+///     let _ = store.cancel_unsubmitted_native_sampling(value);
+///     let _ = store.cancel_unsubmitted_native_sampling(value);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct UnsubmittedNativeSampling {
+    ticket: crate::DispatchTicket,
+    issue: crate::NativeSamplingIssue,
+}
+
+impl UnsubmittedNativeSampling {
+    pub(crate) fn into_parts(self) -> (crate::DispatchTicket, crate::NativeSamplingIssue) {
+        (self.ticket, self.issue)
+    }
+}
+
+#[derive(Debug)]
+pub enum NativeSamplingDispatchError {
+    KnownUnsubmitted {
+        error: ClientError,
+        unsubmitted: Box<UnsubmittedNativeSampling>,
+    },
+    SubmissionUnknown(ClientError),
+}
+
+// These refusals originate before executor invocation in native_dispatch_submit /
+// submit_bound. InvalidValue and ExecutorCorrelationMismatch can follow execution.
+fn sampling_submit_refusal_is_unsubmitted(error: &ClientError) -> bool {
+    use crate::guardian_ipc::WireGuardianError as G;
+    matches!(
+        error,
+        ClientError::Refused(
+            WireError::UnknownAdmission
+                | WireError::AdmissionMismatch
+                | WireError::MissingProof
+                | WireError::UnsupportedDurableBinding
+                | WireError::Guardian(
+                    G::StaleSession
+                        | G::StaleDispatchRevision
+                        | G::NotActive
+                        | G::SessionFenced
+                        | G::AttemptMismatch
+                        | G::InstanceMismatch
+                        | G::DeadlineExpired
+                        | G::AuthorityLost
+                        | G::RetainedResultCapacityExceeded
+                )
+        )
+    )
+}
+
 fn sampling_snapshot_matches(snapshot: &WireSnapshot, issue: crate::NativeSamplingIssue) -> bool {
     let Some(native) = snapshot.native_binding.as_ref() else {
         return false;
@@ -730,56 +812,83 @@ impl GuardianClient {
     /// Consumes the exact affine ticket for the durable issue and derives the
     /// snapshot, wire effect, and guardian admission internally.
     /// # Errors
-    /// Refuses stale identity/session/deadline or any guardian/transport mismatch.
+    /// Returns affine cancellation custody only for known nonexecution. Any ambiguous
+    /// submission consumes the ticket and retains the durable issue for recovery.
     pub fn dispatch_native_sampling(
         &mut self,
         ticket: crate::DispatchTicket,
         issue: crate::NativeSamplingIssue,
-    ) -> Result<crate::NativeSamplingDispatch, ClientError> {
-        if ticket.key() != issue.key()
-            || !matches!(
-                ticket.effect(),
-                crate::OsEffect::SampleResources { sequence } if *sequence == issue.sequence()
-            )
-            || self.verified_snapshot.is_none()
-        {
-            return Err(ClientError::UnexpectedResponse);
-        }
-        let snapshot = self.snapshot()?;
-        if !sampling_snapshot_matches(&snapshot, issue)
-            || !crate::MonotonicTick::native_now().is_ok_and(|now| now.get() < snapshot.deadline)
-        {
-            return Err(ClientError::UnexpectedResponse);
-        }
-        let key =
-            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
-        let Response::Admitted { admission } = self.exchange(&Request::DispatchAdmit {
-            session: snapshot.session,
-            key,
-            effect: crate::guardian_ipc::WireEffect::SampleResources {
-                sequence: issue.sequence(),
-            },
-        })?
-        else {
-            return Err(ClientError::UnexpectedResponse);
-        };
-        let now =
-            crate::MonotonicTick::native_now().map_err(|_| ClientError::UnexpectedResponse)?;
-        let Response::Submitted { key: returned } = self.exchange_with_slice(
-            &Request::DispatchSubmit {
+    ) -> Result<crate::NativeSamplingDispatch, NativeSamplingDispatchError> {
+        let prepared = (|| {
+            if ticket.key() != issue.key()
+                || !matches!(ticket.effect(), crate::OsEffect::SampleResources { sequence }
+                    if *sequence == issue.sequence())
+                || self.verified_snapshot.is_none()
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let snapshot = self.snapshot()?;
+            if !sampling_snapshot_matches(&snapshot, issue)
+                || !crate::MonotonicTick::native_now()
+                    .is_ok_and(|now| now.get() < snapshot.deadline)
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let key = crate::guardian_ipc::WireKey::try_from(issue.key())
+                .map_err(ClientError::Refused)?;
+            let Response::Admitted { admission } = self.exchange(&Request::DispatchAdmit {
                 session: snapshot.session,
+                key,
+                effect: crate::guardian_ipc::WireEffect::SampleResources {
+                    sequence: issue.sequence(),
+                },
+            })?
+            else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+            let now = crate::MonotonicTick::native_now().map_err(ClientError::Io)?;
+            if now.get() >= snapshot.deadline {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            Ok((snapshot.session, key, admission, now))
+        })();
+        let (session, key, admission, now) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // EOF fences the connection and clears any harmless pre-submit admission.
+                self.stream.take();
+                self.verified_snapshot = None;
+                return Err(NativeSamplingDispatchError::KnownUnsubmitted {
+                    error,
+                    unsubmitted: Box::new(UnsubmittedNativeSampling { ticket, issue }),
+                });
+            }
+        };
+        let result = self.exchange_with_slice(
+            &Request::DispatchSubmit {
+                session,
                 admission,
                 now: now.get(),
             },
             EFFECT_RESPONSE_SLICE,
-        )?
-        else {
-            return Err(ClientError::UnexpectedResponse);
-        };
-        if returned == key {
-            Ok(crate::NativeSamplingDispatch::new(ticket, issue))
-        } else {
-            Err(ClientError::UnexpectedResponse)
+        );
+        match result {
+            Ok(Response::Submitted { key: returned }) if returned == key => {
+                Ok(crate::NativeSamplingDispatch::new(ticket, issue))
+            }
+            result => {
+                let error = result.err().unwrap_or(ClientError::UnexpectedResponse);
+                self.stream.take();
+                self.verified_snapshot = None;
+                if sampling_submit_refusal_is_unsubmitted(&error) {
+                    Err(NativeSamplingDispatchError::KnownUnsubmitted {
+                        error,
+                        unsubmitted: Box::new(UnsubmittedNativeSampling { ticket, issue }),
+                    })
+                } else {
+                    Err(NativeSamplingDispatchError::SubmissionUnknown(error))
+                }
+            }
         }
     }
 
@@ -1432,6 +1541,451 @@ mod native_sampling_snapshot_tests {
         let mut wrong_instance = snapshot;
         wrong_instance.session.instance += 1;
         assert!(!sampling_snapshot_matches(&wrong_instance, issue));
+    }
+
+    fn dispatch_fixture(
+        path: &Path,
+        deadline: MonotonicTick,
+    ) -> (
+        ControllerSqliteStore,
+        PolicyLoop,
+        DispatchTicket,
+        crate::NativeSamplingIssue,
+        WireSnapshot,
+    ) {
+        let mut store = ControllerSqliteStore::open(path).unwrap();
+        let attempt = crate::AttemptId::new(91);
+        let committed = DeploymentAttempt::start(
+            attempt,
+            deadline,
+            ResourcePolicy::new(
+                NonZeroUsize::new(2).unwrap(),
+                0,
+                0,
+                CpuContentionBasisPoints::new(100).unwrap(),
+                MemoryPressure::Critical,
+            ),
+            process(42),
+        )
+        .persist(&mut store)
+        .unwrap();
+        let identity = NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([5; 16]).unwrap(),
+            process: process(100),
+        };
+        let binding = store
+            .commit_initial_binding(
+                attempt,
+                deadline,
+                PersistenceRevision::first(),
+                identity,
+                &[],
+            )
+            .unwrap();
+        let mut policy = PolicyLoop::from_committed(committed);
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_sampling_issue(&ticket, &binding)
+            .unwrap();
+        let snapshot = WireSnapshot {
+            instance: 7,
+            attempt: attempt.get(),
+            deadline: deadline.get(),
+            state: crate::guardian_ipc::WireState::Active,
+            session: crate::guardian_ipc::WireSession {
+                instance: 7,
+                generation: 1,
+            },
+            slots: vec![],
+            retained: vec![],
+            native_binding: Some(crate::guardian_ipc::WireNativeBinding {
+                attempt: attempt.get(),
+                deadline: deadline.get(),
+                nonce: identity.nonce.bytes(),
+                guardian: identity.process.into(),
+                slots: vec![],
+            }),
+        };
+        (store, policy, ticket, issue, snapshot)
+    }
+
+    fn unsubmitted_locally(
+        ticket: DispatchTicket,
+        issue: crate::NativeSamplingIssue,
+    ) -> UnsubmittedNativeSampling {
+        let mut client = GuardianClient {
+            stream: None,
+            build: BuildIdentity::compiled(),
+            verified_snapshot: None,
+        };
+        let NativeSamplingDispatchError::KnownUnsubmitted { unsubmitted, .. } =
+            client.dispatch_native_sampling(ticket, issue).unwrap_err()
+        else {
+            panic!("local validation must preserve cancellation custody")
+        };
+        *unsubmitted
+    }
+
+    fn durable_rows(path: &Path) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        let db = rusqlite::Connection::open(path).unwrap();
+        let tables = db
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut query = db
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = query.column_count();
+                let rows = query
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|i| row.get(i))
+                            .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sqlite_cancel_unsubmitted_is_exact_atomic_and_rejects_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel.sqlite");
+        let deadline = MonotonicTick::new(100);
+        let (mut store, _, ticket, issue, _) = dispatch_fixture(&path, deadline);
+        let cap = unsubmitted_locally(ticket, issue);
+        let mut expected = durable_rows(&path);
+        expected.get_mut("native_sampling_issues").unwrap().clear();
+        store.cancel_unsubmitted_native_sampling(cap).unwrap();
+        assert_eq!(durable_rows(&path), expected);
+        assert_eq!(
+            store.load_native_sampling_status(issue.key()).unwrap(),
+            None
+        );
+        drop(store);
+        let mut reopened = ControllerSqliteStore::open_existing(&path).unwrap();
+        assert_eq!(
+            reopened.load_native_sampling_status(issue.key()).unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened
+                .load_attempt(issue.key().attempt_id())
+                .unwrap()
+                .unwrap()
+                .phase(),
+            crate::Phase::ResourceSampling
+        );
+
+        // Independent affine custody with the same identity cannot cancel an absent row.
+        let (_, _, ticket, same_issue, _) =
+            dispatch_fixture(&dir.path().join("other.sqlite"), deadline);
+        assert_eq!(same_issue, issue);
+        let replay = unsubmitted_locally(ticket, same_issue);
+        assert!(reopened.cancel_unsubmitted_native_sampling(replay).is_err());
+        assert_eq!(durable_rows(&path), expected);
+        assert!(matches!(
+            reopened.load_native_sampling_status(issue.key()),
+            Err(crate::ControllerStoreError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn sqlite_cancel_unsubmitted_rolls_back_delete_failure_and_poisons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic.sqlite");
+        let (mut store, _, ticket, issue, _) = dispatch_fixture(&path, MonotonicTick::new(100));
+        let cap = unsubmitted_locally(ticket, issue);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_cancel AFTER DELETE ON native_sampling_issues BEGIN
+             UPDATE sampling_obligations SET pending_sequence=x'0000000000000009';
+             SELECT RAISE(ABORT, 'cancel fixture'); END;",
+            )
+            .unwrap();
+        let before = durable_rows(&path);
+        assert!(store.cancel_unsubmitted_native_sampling(cap).is_err());
+        assert_eq!(durable_rows(&path), before);
+        assert!(matches!(
+            store.load_native_sampling_status(issue.key()),
+            Err(crate::ControllerStoreError::Poisoned)
+        ));
+        drop(store);
+        assert_eq!(
+            ControllerSqliteStore::open_existing(&path)
+                .unwrap()
+                .load_native_sampling_status(issue.key())
+                .unwrap(),
+            Some(crate::NativeSamplingStatus::IssuedPendingApplication { issue })
+        );
+    }
+
+    #[test]
+    fn sqlite_cancel_unsubmitted_refuses_row_key_sequence_and_identity_mismatches() {
+        for mutation in [
+            "UPDATE native_sampling_issues SET sequence=x'0000000000000007'",
+            "UPDATE guardian_sessions SET generation=x'0000000000000002'; UPDATE native_sampling_issues SET session_generation=x'0000000000000002'",
+            "UPDATE native_sampling_issues SET dispatch_revision=x'0000000000000002'",
+            "UPDATE guardian_bindings SET nonce=x'06060606060606060606060606060606'",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mismatch.sqlite");
+            let (mut store, _, ticket, issue, _) = dispatch_fixture(&path, MonotonicTick::new(100));
+            let cap = unsubmitted_locally(ticket, issue);
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.pragma_update(None, "foreign_keys", false).unwrap();
+            raw.execute_batch(mutation).unwrap();
+            let before = durable_rows(&path);
+            assert!(store.cancel_unsubmitted_native_sampling(cap).is_err());
+            assert_eq!(durable_rows(&path), before, "{mutation}");
+            assert!(matches!(store.load_native_sampling_status(issue.key()), Err(crate::ControllerStoreError::Poisoned)));
+        }
+    }
+
+    #[test]
+    fn sqlite_cancel_unsubmitted_refuses_applied_and_confirmed_issues() {
+        for confirmed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settled.sqlite");
+            let (mut store, mut policy, ticket, issue, _) =
+                dispatch_fixture(&path, MonotonicTick::new(100));
+            // Two independently issued affine tickets model a write winning before cancellation.
+            let (_, _, other_ticket, other_issue, _) =
+                dispatch_fixture(&dir.path().join("other.sqlite"), MonotonicTick::new(100));
+            assert_eq!(issue, other_issue);
+            let cap = unsubmitted_locally(other_ticket, other_issue);
+            let sample = ResourceSample {
+                sequence: issue.sequence(),
+                capacity: ResourceCapacity {
+                    available_memory_bytes: 100,
+                    available_storage_bytes: 100,
+                },
+                contention: ResourceContention {
+                    cpu: CpuContentionBasisPoints::new(0).unwrap(),
+                    memory_pressure: MemoryPressure::Nominal,
+                },
+            };
+            policy
+                .apply_native_sampling(
+                    crate::VerifiedNativeSamplingCompletion::new(
+                        crate::NativeSamplingDispatch::new(ticket, issue),
+                        crate::NativeSamplingCompletion::Sample(sample),
+                    ),
+                    &mut store,
+                )
+                .unwrap();
+            if confirmed {
+                let crate::NativeSamplingStatus::AppliedPendingAck {
+                    applying_revision, ..
+                } = store
+                    .load_native_sampling_status(issue.key())
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("applied")
+                };
+                store
+                    .confirm_native_sampling_ack(crate::VerifiedNativeSamplingAckConfirmation::new(
+                        issue,
+                        sample,
+                        applying_revision,
+                        issue.session_generation(),
+                    ))
+                    .unwrap();
+            }
+            let before = durable_rows(&path);
+            assert!(store.cancel_unsubmitted_native_sampling(cap).is_err());
+            assert_eq!(durable_rows(&path), before);
+            assert!(matches!(
+                store.load_native_sampling_status(issue.key()),
+                Err(crate::ControllerStoreError::Poisoned)
+            ));
+        }
+    }
+
+    #[test]
+    fn client_pre_admit_refusal_returns_cancellable_capability_and_closes_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refused.sqlite");
+        let deadline = MonotonicTick::native_now()
+            .unwrap()
+            .checked_add(Duration::from_secs(120))
+            .unwrap();
+        let (mut store, _, ticket, issue, snapshot) = dispatch_fixture(&path, deadline);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::scope(|scope| {
+            let original = snapshot.clone();
+            scope.spawn(move || {
+                assert_eq!(read_frame::<Request>(&mut peer).unwrap(), Request::Snapshot);
+                write_frame(&mut peer, &Response::Snapshot(snapshot)).unwrap();
+                assert!(matches!(
+                    read_frame::<Request>(&mut peer).unwrap(),
+                    Request::DispatchAdmit { .. }
+                ));
+                write_frame(&mut peer, &Response::Refused(WireError::MissingProof)).unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    io::Read::read(&mut peer, &mut byte).unwrap(),
+                    0,
+                    "no submit; connection fenced by EOF"
+                );
+            });
+            let mut client = GuardianClient {
+                stream: Some(stream),
+                build: BuildIdentity::compiled(),
+                verified_snapshot: Some(original),
+            };
+            let NativeSamplingDispatchError::KnownUnsubmitted {
+                error: ClientError::Refused(WireError::MissingProof),
+                unsubmitted,
+            } = client.dispatch_native_sampling(ticket, issue).unwrap_err()
+            else {
+                panic!("pre-submit refusal")
+            };
+            assert!(client.stream.is_none());
+            store
+                .cancel_unsubmitted_native_sampling(*unsubmitted)
+                .unwrap();
+            assert_eq!(
+                store.load_native_sampling_status(issue.key()).unwrap(),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn client_explicit_preexecution_submit_refusal_returns_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("submit-refused.sqlite");
+        let deadline = MonotonicTick::native_now()
+            .unwrap()
+            .checked_add(Duration::from_secs(120))
+            .unwrap();
+        let (mut store, _, ticket, issue, snapshot) = dispatch_fixture(&path, deadline);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::scope(|scope| {
+            let original = snapshot.clone();
+            scope.spawn(move || {
+                assert_eq!(read_frame::<Request>(&mut peer).unwrap(), Request::Snapshot);
+                write_frame(&mut peer, &Response::Snapshot(snapshot)).unwrap();
+                assert!(matches!(
+                    read_frame::<Request>(&mut peer).unwrap(),
+                    Request::DispatchAdmit { .. }
+                ));
+                write_frame(&mut peer, &Response::Admitted { admission: 1 }).unwrap();
+                assert!(matches!(
+                    read_frame::<Request>(&mut peer).unwrap(),
+                    Request::DispatchSubmit { admission: 1, .. }
+                ));
+                write_frame(
+                    &mut peer,
+                    &Response::Refused(WireError::Guardian(
+                        crate::guardian_ipc::WireGuardianError::DeadlineExpired,
+                    )),
+                )
+                .unwrap();
+                let mut byte = [0];
+                assert_eq!(io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+            });
+            let mut client = GuardianClient {
+                stream: Some(stream),
+                build: BuildIdentity::compiled(),
+                verified_snapshot: Some(original),
+            };
+            let NativeSamplingDispatchError::KnownUnsubmitted { unsubmitted, .. } =
+                client.dispatch_native_sampling(ticket, issue).unwrap_err()
+            else {
+                panic!("explicit pre-execution refusal")
+            };
+            assert!(client.stream.is_none());
+            store
+                .cancel_unsubmitted_native_sampling(*unsubmitted)
+                .unwrap();
+            assert_eq!(
+                store.load_native_sampling_status(issue.key()).unwrap(),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn client_post_submit_transport_or_correlation_ambiguity_never_returns_cancellation() {
+        use crate::guardian_ipc::WireGuardianError;
+        for response in [
+            None,
+            Some(Response::Fenced),
+            Some(Response::Refused(WireError::Guardian(
+                WireGuardianError::ExecutorCorrelationMismatch,
+            ))),
+            Some(Response::Refused(WireError::InvalidValue)),
+            Some(Response::Submitted {
+                key: crate::guardian_ipc::WireKey {
+                    attempt: 92,
+                    revision: 1,
+                    ordinal: 0,
+                },
+            }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ambiguous.sqlite");
+            let deadline = MonotonicTick::native_now()
+                .unwrap()
+                .checked_add(Duration::from_secs(120))
+                .unwrap();
+            let (mut store, _, ticket, issue, snapshot) = dispatch_fixture(&path, deadline);
+            let before = durable_rows(&path);
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            std::thread::scope(|scope| {
+                let original = snapshot.clone();
+                scope.spawn(move || {
+                    assert_eq!(read_frame::<Request>(&mut peer).unwrap(), Request::Snapshot);
+                    write_frame(&mut peer, &Response::Snapshot(snapshot)).unwrap();
+                    assert!(matches!(
+                        read_frame::<Request>(&mut peer).unwrap(),
+                        Request::DispatchAdmit { .. }
+                    ));
+                    write_frame(&mut peer, &Response::Admitted { admission: 1 }).unwrap();
+                    assert!(matches!(
+                        read_frame::<Request>(&mut peer).unwrap(),
+                        Request::DispatchSubmit { admission: 1, .. }
+                    ));
+                    if let Some(response) = response {
+                        write_frame(&mut peer, &response).unwrap();
+                    }
+                });
+                let mut client = GuardianClient {
+                    stream: Some(stream),
+                    build: BuildIdentity::compiled(),
+                    verified_snapshot: Some(original),
+                };
+                assert!(matches!(
+                    client.dispatch_native_sampling(ticket, issue),
+                    Err(NativeSamplingDispatchError::SubmissionUnknown(_))
+                ));
+                assert!(client.stream.is_none());
+            });
+            assert_eq!(durable_rows(&path), before);
+            assert_eq!(
+                store.load_native_sampling_status(issue.key()).unwrap(),
+                Some(crate::NativeSamplingStatus::IssuedPendingApplication { issue })
+            );
+        }
     }
 
     struct SamplingExecutor;

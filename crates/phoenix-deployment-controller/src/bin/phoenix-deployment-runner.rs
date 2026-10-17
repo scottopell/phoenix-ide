@@ -43,6 +43,9 @@ enum RunnerMode {
     RecoverAndFinish {
         fixture: FinishFixture,
     },
+    RecoverFinishAndSample {
+        fixture: SampleFixture,
+    },
 }
 
 #[cfg(unix)]
@@ -54,8 +57,35 @@ enum FinishFixture {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum SampleFixture {
+    Run,
+    ActivationAndSampleBarriers,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum RecoveryRun {
+    Finish(FinishFixture),
+    FinishAndSample(SampleFixture),
+}
+
+#[cfg(unix)]
+impl RecoveryRun {
+    fn activation_fixture(self) -> FinishFixture {
+        match self {
+            Self::Finish(fixture) => fixture,
+            Self::FinishAndSample(SampleFixture::Run) => FinishFixture::Run,
+            Self::FinishAndSample(SampleFixture::ActivationAndSampleBarriers) => {
+                FinishFixture::ActivationBarriers
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-and-finish> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-apply] | --fixture-pause-before-begin (recover-and-finish only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-apply] | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -93,6 +123,16 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
         "recover-and-finish" if args.len() == 9 && args[8] == "--fixture-pause-before-begin" => {
             RunnerMode::RecoverAndFinish {
                 fixture: FinishFixture::PauseBeforeBegin,
+            }
+        }
+        "recover-finish-and-sample" if args.len() == 8 => RunnerMode::RecoverFinishAndSample {
+            fixture: SampleFixture::Run,
+        },
+        "recover-finish-and-sample"
+            if args.len() == 9 && args[8] == "--fixture-activation-and-sample-barriers" =>
+        {
+            RunnerMode::RecoverFinishAndSample {
+                fixture: SampleFixture::ActivationAndSampleBarriers,
             }
         }
         "initial-sample"
@@ -441,8 +481,9 @@ fn run_recover_and_finish(
     attempt: AttemptId,
     original: &WireSnapshot,
     session: phoenix_deployment_controller::guardian_ipc::WireSession,
-    fixture: FinishFixture,
+    run: RecoveryRun,
 ) -> Result<(), String> {
+    let fixture = run.activation_fixture();
     let loaded = store
         .load_attempt(attempt)
         .map_err(|e| e.to_string())?
@@ -455,23 +496,20 @@ fn run_recover_and_finish(
     let committed = store
         .commit_native_sampling_recovery_before_deadline(loaded, &binding)
         .map_err(|e| e.to_string())?;
-    let revision = committed
-        .checkpoint()
-        .persistence_revision()
-        .ok_or("missing recovery revision")?;
+    let revision = interruption
+        .checked_next()
+        .ok_or("recovery revision exhausted")?;
+    if committed.checkpoint().attempt_id() != attempt
+        || committed.checkpoint().persistence_revision() != Some(revision)
+        || committed.checkpoint().deadline() != binding.deadline()
+        || !committed.is_exact_sampling_plan()
+    {
+        return Err("unexpected recovery plan".into());
+    }
     let mut policy = PolicyLoop::from_committed(committed);
     let retained_ticket = policy
         .issue_next()
         .ok_or("missing retained recovery ticket")?;
-    if retained_ticket.key().revision() != revision
-        || !matches!(
-            retained_ticket.effect(),
-            phoenix_deployment_controller::OsEffect::SampleResources { .. }
-        )
-        || policy.issue_next().is_some()
-    {
-        return Err("unexpected recovery plan".into());
-    }
     let (_, prepared_binding, completion) = store
         .read_native_reconciliation_evidence(attempt, binding.current_session().generation)
         .map_err(|e| e.to_string())?
@@ -547,7 +585,70 @@ fn run_recover_and_finish(
         serde_json::to_string(&active).map_err(|e| e.to_string())?
     );
     std::io::stdout().flush().map_err(|e| e.to_string())?;
-    Ok(())
+    let RecoveryRun::FinishAndSample(sample_fixture) = run else {
+        return Ok(());
+    };
+    if matches!(sample_fixture, SampleFixture::ActivationAndSampleBarriers) {
+        println!("post_activation_sample_pending");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        activation_barrier(FinishFixture::ActivationBarriers)?;
+    }
+    let issue = store
+        .commit_native_sampling_issue(&retained_ticket, &active_binding)
+        .map_err(|e| format!("recovered sample issue: {e}"))?;
+    let dispatched = dispatch_sampling(store, client, retained_ticket, issue)?;
+    let verified = client
+        .observe_native_sampling(dispatched)
+        .map_err(|e| format!("recovered sample observe: {e:?}"))?;
+    let progress = policy
+        .apply_native_sampling(verified, store)
+        .map_err(|e| format!("recovered sample apply: {e:?}"))?;
+    if !matches!(progress, LoopProgress::Applied { key, ack: AckDisposition::AcknowledgeNow, .. } if key == issue.key())
+    {
+        return Err(format!(
+            "recovered sample did not produce exact immediate ACK: {progress:?}"
+        ));
+    }
+    let confirmed = recover_native_sampling_ack(store, client, issue.key())
+        .map_err(|e| format!("recovered sample ACK: {e:?}"))?;
+    if !matches!(confirmed, NativeSamplingStatus::SampleAckConfirmed { issue: stored, sample, confirming_session_generation, .. }
+        if stored == issue && sample.sequence == issue.sequence() && confirming_session_generation.get() == session.generation)
+    {
+        return Err("recovered sample ACK confirmation mismatch".into());
+    }
+    println!(
+        "recovered_sample_applied_ack attempt={} revision={} ordinal={} sequence={}",
+        issue.key().attempt_id().get(),
+        issue.key().revision().get(),
+        issue.key().ordinal(),
+        issue.sequence()
+    );
+    std::io::stdout().flush().map_err(|e| e.to_string())
+}
+
+fn dispatch_sampling(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    ticket: phoenix_deployment_controller::DispatchTicket,
+    issue: phoenix_deployment_controller::NativeSamplingIssue,
+) -> Result<phoenix_deployment_controller::NativeSamplingDispatch, String> {
+    use phoenix_deployment_controller::native_guardian::NativeSamplingDispatchError;
+    match client.dispatch_native_sampling(ticket, issue) {
+        Ok(dispatched) => Ok(dispatched),
+        Err(NativeSamplingDispatchError::KnownUnsubmitted { error, unsubmitted }) => {
+            store
+                .cancel_unsubmitted_native_sampling(*unsubmitted)
+                .map_err(|cancel| {
+                    format!("dispatch known unsubmitted: {error:?}; cancellation: {cancel}")
+                })?;
+            Err(format!(
+                "dispatch known unsubmitted (issue cancelled): {error:?}"
+            ))
+        }
+        Err(NativeSamplingDispatchError::SubmissionUnknown(error)) => Err(format!(
+            "dispatch submission unknown (issue retained): {error:?}"
+        )),
+    }
 }
 
 fn run_initial_sample(
@@ -566,9 +667,7 @@ fn run_initial_sample(
     let issue = store
         .commit_native_sampling_issue(&ticket, &binding)
         .map_err(|error| error.to_string())?;
-    let dispatched = client
-        .dispatch_native_sampling(ticket, issue)
-        .map_err(|error| format!("dispatch: {error:?}"))?;
+    let dispatched = dispatch_sampling(store, client, ticket, issue)?;
     let verified = client
         .observe_native_sampling(dispatched)
         .map_err(|error| format!("observe sample: {error:?}"))?;
@@ -624,7 +723,10 @@ fn main() -> Result<(), String> {
     let config = parse_args(&args)?;
     let mut store =
         ControllerSqliteStore::open_existing(&config.store).map_err(|e| e.to_string())?;
-    if matches!(config.mode, RunnerMode::RecoverAndFinish { .. }) {
+    if matches!(
+        config.mode,
+        RunnerMode::RecoverAndFinish { .. } | RunnerMode::RecoverFinishAndSample { .. }
+    ) {
         preflight_recover_and_finish(&mut store, config.attempt)?;
     }
     let pending_recovery_key = if matches!(config.mode, RunnerMode::RecoverAppliedAck) {
@@ -656,7 +758,9 @@ fn main() -> Result<(), String> {
     }
     if matches!(
         config.mode,
-        RunnerMode::RecoverAppliedAck | RunnerMode::RecoverAndFinish { .. }
+        RunnerMode::RecoverAppliedAck
+            | RunnerMode::RecoverAndFinish { .. }
+            | RunnerMode::RecoverFinishAndSample { .. }
     ) && status == VerifiedBindingStatus::InitialActive
     {
         return Err("recovery requires detached guardian".into());
@@ -692,7 +796,8 @@ fn main() -> Result<(), String> {
             &snapshot,
             match config.mode {
                 RunnerMode::RecoverAndFinish { fixture } => fixture,
-                RunnerMode::ObserveOnly { .. }
+                RunnerMode::RecoverFinishAndSample { .. }
+                | RunnerMode::ObserveOnly { .. }
                 | RunnerMode::InitialSample { .. }
                 | RunnerMode::RecoverAppliedAck => FinishFixture::Run,
             },
@@ -708,7 +813,15 @@ fn main() -> Result<(), String> {
             config.attempt,
             &snapshot,
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
-            fixture,
+            RecoveryRun::Finish(fixture),
+        ),
+        RunnerMode::RecoverFinishAndSample { fixture } => run_recover_and_finish(
+            &mut store,
+            &mut client,
+            config.attempt,
+            &snapshot,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
+            RecoveryRun::FinishAndSample(fixture),
         ),
         RunnerMode::RecoverAppliedAck => run_recover_applied_ack(
             &mut store,
@@ -736,6 +849,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn args(mode: &str) -> Vec<OsString> {
         [
@@ -842,6 +956,162 @@ mod tests {
         };
         assert!(prepare_initial_attempt(&config, &snapshot, &mut store).is_err());
         assert!(store.load_attempt(attempt).unwrap().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn initial_dispatch_deadline_and_admission_refusal_cancel_the_unsubmitted_issue() {
+        use phoenix_deployment_controller::{
+            guardian_ipc::{
+                read_frame, write_frame, BuildIdentity, Request, Response, WireError, WireSession,
+            },
+            native_guardian::bind_disposable,
+            NativeGuardianIdentity,
+        };
+        for expired in [true, false] {
+            let directory = tempfile::Builder::new()
+                .prefix("sdc-runner-cancel-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let socket_dir = directory.path().join("sdc-disposable-runner");
+            let listener = bind_disposable(&socket_dir).unwrap();
+            let path = directory.path().join("controller.sqlite");
+            let attempt = AttemptId::new(95);
+            let deadline = if expired {
+                MonotonicTick::new(0)
+            } else {
+                MonotonicTick::native_now()
+                    .unwrap()
+                    .checked_add(Duration::from_secs(120))
+                    .unwrap()
+            };
+            let root = ProcessIdentity::new(
+                ProcessId::new(NonZeroU32::new(42).unwrap()),
+                BirthToken::new(1, 0).unwrap(),
+            );
+            let mut store = ControllerSqliteStore::open(&path).unwrap();
+            let committed = DeploymentAttempt::start(
+                attempt,
+                deadline,
+                ResourcePolicy::new(
+                    NonZeroUsize::new(2).unwrap(),
+                    0,
+                    0,
+                    CpuContentionBasisPoints::new(0).unwrap(),
+                    MemoryPressure::Critical,
+                ),
+                root,
+            )
+            .persist(&mut store)
+            .unwrap();
+            let identity = NativeGuardianIdentity {
+                nonce: GuardianLifetimeNonce::new([5; 16]).unwrap(),
+                process: root,
+            };
+            store
+                .commit_initial_binding(
+                    attempt,
+                    deadline,
+                    PersistenceRevision::first(),
+                    identity,
+                    &[],
+                )
+                .unwrap();
+            let snapshot = WireSnapshot {
+                instance: 1,
+                attempt: attempt.get(),
+                deadline: deadline.get(),
+                state: WireState::Active,
+                session: WireSession {
+                    instance: 1,
+                    generation: 1,
+                },
+                slots: vec![],
+                retained: vec![],
+                native_binding: Some(WireNativeBinding {
+                    attempt: attempt.get(),
+                    deadline: deadline.get(),
+                    nonce: identity.nonce.bytes(),
+                    guardian: identity.process.into(),
+                    slots: vec![],
+                }),
+            };
+            let config = RunnerConfig {
+                socket_dir: socket_dir.clone(),
+                store: path.clone(),
+                attempt,
+                mode: RunnerMode::InitialSample {
+                    deadline,
+                    root,
+                    pause_after_apply: false,
+                },
+            };
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    assert!(matches!(
+                        read_frame::<Request>(&mut stream).unwrap(),
+                        Request::Hello { .. }
+                    ));
+                    write_frame(
+                        &mut stream,
+                        &Response::Hello {
+                            build: BuildIdentity::compiled(),
+                            snapshot: snapshot.clone(),
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        read_frame::<Request>(&mut stream).unwrap(),
+                        Request::Snapshot
+                    );
+                    write_frame(&mut stream, &Response::Snapshot(snapshot)).unwrap();
+                    if !expired {
+                        assert!(matches!(
+                            read_frame::<Request>(&mut stream).unwrap(),
+                            Request::DispatchAdmit { .. }
+                        ));
+                        write_frame(&mut stream, &Response::Refused(WireError::MissingProof))
+                            .unwrap();
+                    }
+                    let mut byte = [0];
+                    assert_eq!(
+                        std::io::Read::read(&mut stream, &mut byte).unwrap(),
+                        0,
+                        "no DispatchSubmit after refusal/deadline"
+                    );
+                });
+                let mut client = GuardianClient::connect(&socket_dir).unwrap();
+                client.hello().unwrap();
+                let error = run_initial_sample(&config, &mut store, &mut client, committed, false)
+                    .unwrap_err();
+                assert!(
+                    error.starts_with("dispatch known unsubmitted (issue cancelled):"),
+                    "{error}"
+                );
+            });
+            let db = rusqlite::Connection::open(&path).unwrap();
+            for table in [
+                "native_sampling_issues",
+                "native_sampling_applications",
+                "native_sampling_ack_confirmations",
+            ] {
+                assert_eq!(
+                    db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            let loaded = store.load_attempt(attempt).unwrap().unwrap();
+            assert_eq!(loaded.phase(), Phase::ResourceSampling);
+            assert_eq!(loaded.persistence_revision(), PersistenceRevision::first());
+        }
     }
 
     #[test]
@@ -983,6 +1253,108 @@ mod tests {
         }
         finish.push("--fixture-pause-after-apply".into());
         assert!(parse_args(&finish).is_err());
+    }
+
+    #[test]
+    fn sample_continuation_and_third_barrier_are_structurally_mode_specific() {
+        assert!(matches!(
+            parse_args(&args("recover-finish-and-sample")),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndSample {
+                    fixture: SampleFixture::Run
+                },
+                ..
+            })
+        ));
+        let mut sample = args("recover-finish-and-sample");
+        sample.push("--fixture-activation-and-sample-barriers".into());
+        assert!(matches!(
+            parse_args(&sample),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndSample {
+                    fixture: SampleFixture::ActivationAndSampleBarriers
+                },
+                ..
+            })
+        ));
+        sample.push("--fixture-activation-and-sample-barriers".into());
+        assert!(parse_args(&sample).is_err(), "duplicate fixture");
+        let mut activation = args("recover-and-finish");
+        activation.push("--fixture-activation-barriers".into());
+        assert!(matches!(
+            parse_args(&activation),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverAndFinish {
+                    fixture: FinishFixture::ActivationBarriers
+                },
+                ..
+            })
+        ));
+        for mode in [
+            "observe-only",
+            "initial-sample",
+            "recover-applied-ack",
+            "recover-and-finish",
+            "recover-finish-and-sample",
+        ] {
+            let mut baseline = args(mode);
+            let options: &[&str] = match mode {
+                "observe-only" => &["--observe-seconds", "5"],
+                "initial-sample" => &[
+                    "--deadline-nanoseconds",
+                    "100",
+                    "--root-pid",
+                    "42",
+                    "--root-birth-seconds",
+                    "1",
+                    "--root-birth-nanos",
+                    "0",
+                ],
+                _ => &[],
+            };
+            baseline.extend(options.iter().map(OsString::from));
+            assert!(parse_args(&baseline).is_ok());
+            for (flag, owner) in [
+                ("--fixture-pause-after-apply", "initial-sample"),
+                ("--fixture-pause-before-begin", "recover-and-finish"),
+                ("--fixture-activation-barriers", "recover-and-finish"),
+                (
+                    "--fixture-activation-and-sample-barriers",
+                    "recover-finish-and-sample",
+                ),
+            ] {
+                let mut candidate = baseline.clone();
+                candidate.push(flag.into());
+                assert_eq!(
+                    parse_args(&candidate).is_ok(),
+                    mode == owner,
+                    "{mode}: {flag}"
+                );
+            }
+        }
+        for options in [
+            vec!["--observe-seconds", "5"],
+            vec![
+                "--deadline-nanoseconds",
+                "100",
+                "--root-pid",
+                "42",
+                "--root-birth-seconds",
+                "1",
+                "--root-birth-nanos",
+                "0",
+            ],
+        ] {
+            let mut invalid = args("recover-finish-and-sample");
+            invalid.extend(options.iter().map(OsString::from));
+            let usage = parse_args(&invalid)
+                .err()
+                .expect("cross-mode flags refused");
+            assert!(usage.contains("recover-finish-and-sample"));
+            assert!(usage.contains(
+                "--fixture-activation-and-sample-barriers (recover-finish-and-sample only)"
+            ));
+        }
     }
 
     #[test]

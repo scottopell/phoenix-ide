@@ -8,11 +8,11 @@ mod native_sampling;
 use launchd::{
     bounded_text, poll_pause, private_file, CleanupFailures, DisposableLaunchdGuardian, ATTEMPT,
 };
-use native_sampling::{sampling_rows, sampling_runner_command};
+use native_sampling::{sampling_rows, sampling_runner_command, settled_sampling_keys};
 use phoenix_deployment_controller::{
     guardian_ipc::{WireSnapshot, WireState},
     native_guardian::{verify_native_binding, GuardianClient, VerifiedBindingStatus},
-    ControllerSqliteStore, MonotonicTick, NativeSamplingStatus, NativeSessionState,
+    ControllerSqliteStore, MonotonicTick, NativeSamplingStatus, NativeSessionState, Phase,
 };
 use std::{
     io::Write,
@@ -202,8 +202,17 @@ fn snapshot(line: &str, prefix: &str) -> WireSnapshot {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn launchd_retains_original_parent_through_three_independent_runners() {
+    launchd_journey(false);
+}
+
+#[test]
+fn launchd_continues_one_sample_through_three_independent_runners() {
+    launchd_journey(true);
+}
+
+#[allow(clippy::too_many_lines)]
+fn launchd_journey(continuation: bool) {
     // Missing gui/<current uid> is a qualification failure with diagnostics, not a skip
     // or permission to fall back to a user/system domain or touch an installed agent.
     let mut guardian = DisposableLaunchdGuardian::start().unwrap();
@@ -296,8 +305,17 @@ fn launchd_retains_original_parent_through_three_independent_runners() {
     assert_eq!(after_ack.session.generation, 2);
     assert!(after_ack.retained.is_empty());
 
-    let mut command = recovery_command(&guardian, "recover-and-finish");
-    command.arg("--fixture-activation-barriers");
+    let settled_keys = settled_sampling_keys(&path);
+    assert_eq!(settled_keys.len(), 1);
+    let command = if continuation {
+        let mut command = recovery_command(&guardian, "recover-finish-and-sample");
+        command.arg("--fixture-activation-and-sample-barriers");
+        command
+    } else {
+        let mut command = recovery_command(&guardian, "recover-and-finish");
+        command.arg("--fixture-activation-barriers");
+        command
+    };
     let mut finish = Runner::start(command, &guardian, "finish");
     assert_ne!(finish.child.id(), initial_pid);
     assert_ne!(finish.child.id(), ack.child.id());
@@ -371,8 +389,87 @@ fn launchd_retains_original_parent_through_three_independent_runners() {
     assert_eq!(active.session, prepared.session);
     assert!(active.retained.is_empty());
     same_custody(&active, &original);
-    finish.success();
+    let expected_final_rows;
+    let expected_final_revision;
+    let expected_final_phase;
+    if continuation {
+        finish.marker("post_activation_sample_pending");
+        assert_eq!(sampling_rows(&path), settled);
+        assert_eq!(settled_sampling_keys(&path), settled_keys);
+        assert_eq!(
+            observed.load_native_binding(attempt).unwrap().unwrap(),
+            active_binding
+        );
+        guardian.assert_original_parent().unwrap();
+        finish.release();
+        assert_eq!(
+            finish.marker("recovered_sample_applied_ack "),
+            format!(
+                "recovered_sample_applied_ack attempt=64 revision={} ordinal=0 sequence=1",
+                activation.completion().recovery_revision().get()
+            )
+        );
+        finish.success();
+        assert!(
+            finish
+                .take_line(&bounded_text(&finish.out).unwrap())
+                .is_none(),
+            "no follow-up runner effect"
+        );
+        let continued = sampling_rows(&path);
+        assert_eq!(
+            (continued.0, continued.1, continued.2, continued.4),
+            (2, 2, 2, 1)
+        );
+        assert_eq!(
+            continued.3,
+            activation
+                .completion()
+                .recovery_revision()
+                .checked_next()
+                .unwrap()
+                .get()
+        );
+        let mut expected_keys = settled_keys;
+        expected_keys.push((
+            activation.completion().recovery_revision().get(),
+            0,
+            1,
+            3,
+            3,
+        ));
+        assert_eq!(settled_sampling_keys(&path), expected_keys);
+        expected_final_rows = continued;
+        expected_final_revision = activation
+            .completion()
+            .recovery_revision()
+            .checked_next()
+            .unwrap();
+        expected_final_phase = Phase::OwnershipDiscovery;
+    } else {
+        finish.success();
+        assert!(
+            finish
+                .take_line(&bounded_text(&finish.out).unwrap())
+                .is_none(),
+            "activation-only runner must never dispatch its retained ticket"
+        );
+        assert_eq!(sampling_rows(&path), settled);
+        assert_eq!((settled.0, settled.1, settled.2, settled.4), (1, 1, 1, 0));
+        assert_eq!(settled_sampling_keys(&path), settled_keys);
+        expected_final_rows = settled;
+        expected_final_revision = activation.completion().recovery_revision();
+        expected_final_phase = Phase::ResourceSampling;
+    }
+    assert!(observed
+        .pending_native_sampling_ack(attempt)
+        .unwrap()
+        .is_none());
     let final_snapshot = detached(&mut guardian);
+    assert!(
+        final_snapshot.retained.is_empty(),
+        "no extra retained native effect"
+    );
     assert_eq!(final_snapshot.session, active.session);
     same_custody(&final_snapshot, &original);
     let mut writable = ControllerSqliteStore::open_existing(&path).unwrap();
@@ -393,17 +490,12 @@ fn launchd_retains_original_parent_through_three_independent_runners() {
         final_binding.dispatch_floor(),
         activation.completion().recovery_revision()
     );
-    assert_eq!(
-        writable
-            .load_attempt(attempt)
-            .unwrap()
-            .unwrap()
-            .persistence_revision(),
-        activation.completion().recovery_revision()
-    );
+    let final_attempt = writable.load_attempt(attempt).unwrap().unwrap();
+    assert_eq!(final_attempt.persistence_revision(), expected_final_revision);
+    assert_eq!(final_attempt.phase(), expected_final_phase);
     assert_eq!(
         sampling_rows(&path),
-        settled,
+        expected_final_rows,
         "no duplicate native execution or reapplication"
     );
     let raw =

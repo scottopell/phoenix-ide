@@ -43,7 +43,7 @@ pub(super) fn sampling_rows(path: &Path) -> (i64, i64, i64, u64, u64) {
         .unwrap()
     };
     let (revision, sequence): (Vec<u8>, Vec<u8>) = db.query_row(
-        "SELECT applying_revision, i.sequence FROM native_sampling_applications a JOIN native_sampling_issues i USING(attempt_id,dispatch_revision,ordinal)",
+        "SELECT applying_revision, i.sequence FROM native_sampling_applications a JOIN native_sampling_issues i USING(attempt_id,dispatch_revision,ordinal) ORDER BY i.dispatch_revision DESC, i.ordinal DESC LIMIT 1",
         [], |row| Ok((row.get(0)?, row.get(1)?)),
     ).unwrap();
     (
@@ -53,4 +53,24 @@ pub(super) fn sampling_rows(path: &Path) -> (i64, i64, i64, u64, u64) {
         u64::from_be_bytes(revision.try_into().unwrap()),
         u64::from_be_bytes(sequence.try_into().unwrap()),
     )
+}
+
+pub(super) fn settled_sampling_keys(path: &Path) -> Vec<(u64, i64, u64, u64, u64)> {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut query = db.prepare(
+        "SELECT i.dispatch_revision, i.ordinal, i.sequence, i.session_generation, c.confirming_session_generation FROM native_sampling_issues i JOIN native_sampling_applications a USING(attempt_id,dispatch_revision,ordinal) JOIN native_sampling_ack_confirmations c USING(attempt_id,dispatch_revision,ordinal) ORDER BY i.dispatch_revision,i.ordinal"
+    ).unwrap();
+    query
+        .query_map([], |row| {
+            let word = |index| -> rusqlite::Result<u64> {
+                let bytes: [u8; 8] = row.get::<_, Vec<u8>>(index)?.try_into().unwrap();
+                Ok(u64::from_be_bytes(bytes))
+            };
+            Ok((word(0)?, row.get(1)?, word(2)?, word(3)?, word(4)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }

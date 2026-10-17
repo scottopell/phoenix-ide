@@ -273,6 +273,46 @@ impl ControllerSqliteStore {
         result
     }
 
+    /// Durably retires only an exact issue proven never submitted by the client.
+    /// No executable authority is returned.
+    /// # Errors
+    /// Mismatch, settled/absent evidence, or storage failure rolls back and poisons the handle.
+    #[cfg(unix)]
+    pub fn cancel_unsubmitted_native_sampling(
+        &mut self,
+        unsubmitted: crate::native_guardian::UnsubmittedNativeSampling,
+    ) -> Result<()> {
+        self.ensure_usable()?;
+        let (ticket, issue) = unsubmitted.into_parts();
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            if ticket.key() != issue.key()
+                || !matches!(ticket.effect(), OsEffect::SampleResources { sequence }
+                    if *sequence == issue.sequence())
+                || read_status(&tx, issue.key())?
+                    != Some(NativeSamplingStatus::IssuedPendingApplication { issue })
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            let (id, revision, ordinal) = issue_params(issue);
+            if tx.execute(
+                "DELETE FROM native_sampling_issues WHERE attempt_id=?1 AND dispatch_revision=?2 AND ordinal=?3 AND session_generation=?4 AND sequence=?5",
+                params![id, revision, ordinal, Word(issue.session_generation().get()), Word(issue.sequence())],
+            )? != 1 || read_status(&tx, issue.key())?.is_some() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     /// Loads normalized, typed sampling evidence without granting native authority.
     /// # Errors
     /// Malformed rows or storage failures poison this handle.
