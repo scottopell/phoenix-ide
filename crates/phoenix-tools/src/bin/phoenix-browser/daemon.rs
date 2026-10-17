@@ -1143,7 +1143,7 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let runtime_env = PhoenixRuntimeEnvironment::detect();
     let image_directory = runtime_env.tmp_root().join("browser-cli-images");
-    let manager = BrowserSessionManager::with_lifecycle_sink_and_runtime_env(None, &runtime_env);
+    let manager = BrowserSessionManager::for_cli(&runtime_env);
     manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
     let lifetime = uuid::Uuid::new_v4().to_string();
     let state = Arc::new(State {

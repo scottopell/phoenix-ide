@@ -48,12 +48,12 @@ escaped helpers before qualifying cleanup. Exact Linux and macOS compiled tests
 and actual Chrome layout remain required; source formatting is not runtime proof.
 A supplementary retained macOS binary observation is not exact-candidate evidence.
 
-Launch failures before chromiumoxide returns a child handle preserve the
-unmarked profile because the dependency may already have reaped the root.
-Group-marked profiles without retained drain authority are also preserved and
-refused for reuse. This is fail-closed, with an explicit availability limitation;
-there is no new automatic epoch allocation, recovery, or downgrade guarantee.
-Existing cleanup assertions are not weakened and deletion is never retried.
+Pre-session retention source candidate (ADR-123, REQ-BCLI-006a): the manager reserves one typed slot before a potentially spawning call and retains returned Browser/handler/group/profile authority across partial initialization and cleanup errors. Close retries that aggregate. Caller cancellation does not own the initialization/listener driver. Retirement captures pending slots by immutable reservation identity rather than interpreting an unavailable PID/read lock as absence.
+
+The standalone CLI explicitly selects fresh profile paths only for genuinely fresh or authoritatively retired lifetimes; IDE/default scope-derived paths remain unchanged. Opaque library launch errors/timeouts still retain an unobservable-attempt barrier and the actual old path, with no fallback, deletion, or replacement authorized. This does not prove retention of a child handle the dependency never returns, nor fix opaque launch-error fallback availability. Known pre-spawn preparation failures may retire without deleting an untrusted profile.
+
+Five model regressions cover explicit profile policy, pre-spawn/opaque failure distinction, retained injected partial-cleanup authority and exact close retry, and canceled-waiter retirement visibility. A sixth deterministic regression drives production reservation/start/initialize with an opaque-launch error injected at the actual launch boundary; its close must remain residual, so removing the unobservable classification changes the oracle. The separately selected `real_chrome_partial_initialization_retains_child_and_retries_exact_close` test requires installed Chrome, isolated exact hosted `--ignored` selection, and `PHOENIX_TEST_CHROME_SHIM_EXECUTABLE` naming the matched actual CLI/server binary (never the unit-test executable). It asserts adopted group authority, injects initialization and cleanup failures around the actual returned Browser, checks exact child/aggregate retention and no second launch, retries authoritative group close, then permits a fresh CLI path only after retirement/reopen. The injected cleanup resource tests registry/retirement behavior, not native Browser/group teardown. Tests are authored but not locally executed; only standalone rustfmt/Allium validation is permitted locally. Exact hosted Rust, native group, and real-Chrome qualification of this candidate remain required. Earlier qualification receipts apply only to their exact earlier candidates.
+Existing cleanup assertions are not weakened. No deletion retry loop is introduced; an explicit Close retry retains the exact stopped launch and rechecks profile ownership.
 
 ### Darwin exit-transition evidence
 
