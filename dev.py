@@ -8280,6 +8280,10 @@ def _systemd_ordinary_database_preflight(prepared: "PreparedCandidate", staging:
     import urllib.parse
     database = Path(environment.get("PHOENIX_DB_PATH", str(SYSTEMD_DB_PATH)))
     if not database.exists():
+        artifacts = (PROD_INSTALL_DIR / "phoenix-ide", SYSTEMD_SERVICE_PATH, SYSTEMD_SOCKET_PATH,
+                     PROD_ENV_FILE, SYSTEMD_DEPLOYED_SHA_PATH)
+        if any(os.path.lexists(path) for path in artifacts) or _systemd_current_identity(environment) is not None:
+            raise SystemExit("installed systemd database missing; refusing handoff (not a first install)")
         return
     def evidence(path: Path) -> tuple[tuple[int, str], ...]:
         with contextlib.closing(sqlite3.connect("file:" + urllib.parse.quote(str(path.resolve()), safe="/") + "?mode=ro", uri=True, timeout=2)) as db:
@@ -12760,8 +12764,13 @@ def main():
     finalize_current_parser.add_argument("transaction_id")
     resume_forward_parser = prod_sub.add_parser("resume-forward", help="Resume only the exact retained forward candidate after predecessor rollback became unsafe")
     resume_forward_parser.add_argument("transaction_id")
-    recover_systemd = prod_sub.add_parser("recover-systemd-current", help="Resume only an exact retained protected systemd candidate")
-    recover_systemd.add_argument("transaction_id")
+    recover_systemd = prod_sub.add_parser(
+        "recover-systemd-current",
+        help="Recover one protected systemd transaction: proven predecessor before marker, exact candidate after marker",
+        description="Explicit retained systemd recovery only. Without a marker, restore the proven unchanged captured predecessor; "
+                    "with a marker, stop both units before validation and recover only the exact candidate. Never replay a database backup.",
+    )
+    recover_systemd.add_argument("transaction_id", help="Exact active protected transaction id (32 lowercase hexadecimal characters)")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(

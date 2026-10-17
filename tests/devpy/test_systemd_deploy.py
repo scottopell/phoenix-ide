@@ -24,6 +24,11 @@ class SystemdDeployCommandTests(unittest.TestCase):
     def setUpClass(cls):
         cls.dev = load_dev()
 
+    def setUp(self):
+        identity = mock.patch.object(self.dev, "_systemd_current_identity", return_value=None)
+        identity.start()
+        self.addCleanup(identity.stop)
+
     def test_env_snapshot_round_trips_newlines_without_exposing_values_in_manifest(self):
         serialized = self.dev._serialize_env_snapshot({"TOKEN": "secret", "HEADERS": "a\nb"})
         self.assertEqual("TOKEN=secret\nHEADERS=a\\nb\n", serialized)
@@ -506,6 +511,43 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 self.dev.native_prod_deploy("v3.0.0", controller=options)
             stage.assert_called_once()
             activate.assert_called_once()
+
+    def test_ordinary_missing_database_requires_no_predecessor_artifact_or_identity(self):
+        import contextlib
+        import sqlite3
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            base = Path(temporary)
+            paths = {"PROD_INSTALL_DIR": base / "install", "SYSTEMD_SERVICE_PATH": base / "service",
+                     "SYSTEMD_SOCKET_PATH": base / "socket", "PROD_ENV_FILE": base / "env",
+                     "SYSTEMD_DEPLOYED_SHA_PATH": base / "deployed.sha"}
+            for name, value in paths.items():
+                stack.enter_context(mock.patch.object(self.dev, name, value))
+            binary = base / "candidate"
+            binary.write_text("candidate")
+            candidate = self.dev.PreparedCandidate(binary, self.dev.ProdSourceKind.LOCAL_HEAD, "a" * 40,
+                                                   self.dev.RuntimeIdentity("1.0.0", "a" * 40))
+            live = base / "live.sqlite"
+            environment = {"PHOENIX_DB_PATH": str(live)}
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=AssertionError("no candidate invocation")):
+                self.dev._systemd_ordinary_database_preflight(candidate, base, environment)
+                artifacts = [paths["PROD_INSTALL_DIR"] / "phoenix-ide", *[paths[name] for name in paths if name != "PROD_INSTALL_DIR"]]
+                for artifact in artifacts:
+                    with self.subTest(artifact=artifact):
+                        artifact.parent.mkdir(exist_ok=True)
+                        artifact.write_text("installed predecessor evidence")
+                        with sqlite3.connect(live) as unlinked:
+                            unlinked.execute("CREATE TABLE data(value)")
+                            unlinked.commit()
+                            live.unlink()
+                            with self.assertRaisesRegex(SystemExit, "not a first install"):
+                                self.dev._systemd_ordinary_database_preflight(candidate, base, environment)
+                            self.assertEqual([], unlinked.execute("SELECT * FROM data").fetchall())
+                        artifact.unlink()
+                with mock.patch.object(self.dev, "_systemd_current_identity", return_value=self.dev.RuntimeIdentity("1.0.0", "b" * 40)):
+                    with self.assertRaisesRegex(SystemExit, "not a first install"):
+                        self.dev._systemd_ordinary_database_preflight(candidate, base, environment)
+                self.dev._systemd_ordinary_database_preflight(candidate, base, environment)
+            self.assertFalse(live.exists())
 
     def test_ordinary_candidate_target_gate_rejects_failed_invalid_or_foreign_key_broken_candidate_databases(self):
         import sqlite3

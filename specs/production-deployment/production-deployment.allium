@@ -913,6 +913,21 @@ rule PreservePreparedRecoveryFailure {
 --   at root staging. Resolve service uid plus primary/supplementary groups;
 --   require mode-based execute on every ancestor and read on both files,
 --   admitting root permission bypass; unresolved identities or denied modes reject.
+--   CA_CERT_PATH has meaning only with the manual pair. If present, its path
+--   must meet the same file/traversal/service-readability rules. load_cert_chain
+--   proves cert/key parsing and matching; load_verify_locations parses the CA;
+--   CA is exactly one PEM certificate within 32 KiB, with CA Basic Constraints
+--   and certificate-signing Key Usage if present. Resolved/probed openssl x509
+--   inspects capabilities; verify -trusted CA -partial_chain -untrusted CERT
+--   -purpose sslserver CERT admits supplied intermediates, never ambient roots.
+--   Missing/unreadable/invalid/unrelated CA or unavailable openssl rejects before
+--   staging completes or inhibit/stop/marker. No alternate CA authority is stored.
+--   Resolve/probe exact executable lsof before inhibit/stop; exclusivity uses
+--   that path, not another PATH lookup. Dependency failure is precondition_failed
+--   without inhibit/stop/claim leak. Persist captured predecessor unit state,
+--   bound to the transaction, before durable activating. A crash before this
+--   publication leaves prepared ownership without inhibit/stop/marker: only
+--   validated prepared abandonment, never guessed restoration, may release it.
 -- systemd_database_admission_valid(transaction) -> Boolean
 --   True for other backends. Protected mode requires its exact source proof;
 --   ordinary mode derives the target by running the exact candidate --migrate-only
@@ -920,7 +935,11 @@ rule PreservePreparedRecoveryFailure {
 --   Successful exit, integrity/FK, nonempty sorted unique full ledger and unchanged
 --   candidate hash are required. Existing production DB must pass integrity/FK
 --   and match that complete target; failure/pending/divergence rejects before
---   handoff. A first install without a DB may proceed without target derivation.
+--   handoff. Missing configured DB plus any installed predecessor binary/env/
+--   service/socket/deployed identity artifact or runtime identity rejects before
+--   handoff, including unavailable mounts and unlinked open DBs. The helper
+--   mirrors this for captured predecessor/rollback artifacts. Only a true first
+--   install with no predecessor evidence may omit DB/target derivation.
 --   This controller-side gate leaves the protocol-v1 ordinary helper manifest
 --   unchanged; REQ-PD-026 does not qualify historical controllers lacking it.
 -- systemd_operation_lock_held(transaction) -> Boolean
@@ -961,11 +980,17 @@ rule PreservePreparedRecoveryFailure {
 --   Live ledger equals the entire exact registry; integrity/FK checks pass;
 --   pristine backup and evidence remain intact, installed configuration preserved.
 -- protected_systemd_unchanged_predecessor_valid(transaction) -> Boolean
---   No irreversible marker, exclusive stopped DB ledger/logical contents equal
---   source proof, and captured runtime/configuration hashes and identity valid.
---   Once a stopped snapshot succeeds, its evidence replaces preflight evidence
---   for this comparison; legitimate writes before shutdown are included, and
---   any ledger/logical-content change after the snapshot forbids restart.
+--   No irreversible marker; exact active protected transaction with durable
+--   activating or activation_failed_rollback_failed, migration_started=false,
+--   intact matching inhibits and transaction-bound captured predecessor unit
+--   state. Retained manifest/controller/helper/rollback hashes and predecessor
+--   identity/config valid. Stop both units; resolve/probe lsof after stop;
+--   unavailable dependency stays stopped/fenced. Exclusive live DB integrity/FK
+--   and exact source-prefix65 are required. Before a stopped snapshot exists,
+--   normal pre-stop data writes are allowed; no stale preflight digest equality.
+--   Any present snapshot evidence must be complete/valid and its logical digest
+--   must equal live data. No snapshot replay. Prepared/no-disruption refuses;
+--   ambiguous/malformed evidence stays fenced. Failed restore retains fence.
 -- protected_systemd_recovery_valid(transaction) -> Boolean
 --   Explicit recover-systemd-current request; exact retained candidate/controller/
 --   helper, matching claim and valid durable marker, intact inhibit and
@@ -986,8 +1011,10 @@ rule PreservePreparedRecoveryFailure {
 --   Operator explicitly requests recover-systemd-current (helper recover-current).
 --   Marker presence selects this path. Both units must be stopped/proven inactive
 --   before detailed manifest/inhibit/marker/evidence/DB validation; then exclusive
---   ownership and protected_systemd_recovery_valid are required. Marker absence
---   refuses forward recovery without stopping the predecessor.
+--   ownership and protected_systemd_recovery_valid are required. Required lsof
+--   is preflighted only after both-unit stop; missing/unusable stays stopped.
+--   Marker absence selects validated pre-marker predecessor recovery under
+--   protected_systemd_unchanged_predecessor_valid, never forward migration.
 -- ProtectedSystemdUnchangedPredecessorObserved(transaction)
 --   Authorized pre-marker unchanged predecessor was restored and verified.
 -- ProtectedSystemdRetained(transaction)
@@ -1017,7 +1044,8 @@ rule ProtectedSystemdBackup {
         -- Install/fsync/reload/verify both persistent unit inhibits before stop;
         -- prove service/socket inactivity and exclusive DB ownership before backup.
         -- Bind exact stopped-source evidence including writes since preflight;
-        -- successful snapshot replaces the preflight recovery comparison authority.
+        -- without a snapshot only exact ledger/integrity/FK governs admission;
+        -- a completed stopped snapshot adds logical equality as recovery authority.
 }
 
 rule ProtectedSystemdRehearsal {
@@ -1061,6 +1089,28 @@ rule ProtectedSystemdVerifyTarget {
     requires: protected_systemd_marker_present(transaction)
     requires: protected_systemd_start_inhibit_valid(transaction)
     ensures: protected_systemd_target_valid(transaction)
+}
+
+rule ProtectedSystemdInterruptedPreMarkerRecovery {
+    when: ProtectedSystemdRecoveryRequested(transaction)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state in { activating, activation_failed_rollback_failed }
+    requires: not protected_systemd_marker_present(transaction)
+    requires: current_claim_matches(transaction)
+    requires: systemd_operation_lock_held(transaction)
+    requires: protected_systemd_unchanged_predecessor_valid(transaction)
+    ensures: exact_previous_restored(transaction)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: not DatabaseRollbackClaimed(transaction)
+    ensures: DurableStatusWritten(transaction)
+    ensures: ClaimReleasedFor(transaction)
+
+    @guidance
+        -- Restore and verify captured predecessor binary/config while inhibited.
+        -- Remove only exact matching inhibits and reload/verify preserved config;
+        -- restore/verify captured active/enabled state and applicable identity.
+        -- Write durable terminal rollback status before releasing exact claim.
+        -- Backup and isolated rehearsal remain evidence, never replay sources.
 }
 
 rule ProtectedSystemdPreMarkerRecovery {

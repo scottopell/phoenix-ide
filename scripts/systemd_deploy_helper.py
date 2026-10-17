@@ -787,9 +787,12 @@ def legacy_override_dir(unit_name: str) -> Path:
     return Path("/etc/systemd/system") / f"{unit_name}.service.d"
 
 
-def prepare_installs(manifest: Manifest, systemctl: Systemctl) -> PreparedInstalls:
+def prepare_installs(manifest: Manifest, systemctl: Systemctl, *, allow_inhibit: bool = False) -> PreparedInstalls:
     override_dir = legacy_override_dir(manifest.unit_name)
-    if override_dir.is_dir() and any(override_dir.glob("*.conf")):
+    if allow_inhibit:
+        verify_start_inhibit_files(manifest)
+    allowed = set(start_inhibit_paths(manifest)) if allow_inhibit else set()
+    if override_dir.is_dir() and any(path not in allowed for path in override_dir.glob("*.conf")):
         raise ActivationError(
             f"legacy systemd overrides exist at {override_dir}; move required values to .phoenix-ide.env and remove the drop-ins"
         )
@@ -903,6 +906,11 @@ def restore(
     else:
         systemctl.daemon_reload()
     systemctl.restore_state(previous_state)
+    if manifest.mode == PROTECTED_MODE:
+        observed = systemctl.inspect()
+        if any(getattr(observed, field) != getattr(previous_state, field)
+               for field in ("service_active", "service_enabled", "socket_active", "socket_enabled")):
+            raise ActivationError("restored predecessor unit state differs from captured state")
     if previous_state.service_active:
         if manifest.previous_health_url is None:
             raise ActivationError("previous health endpoint is unavailable")
@@ -1080,11 +1088,15 @@ def database_preflight(manifest: Manifest) -> Optional[tuple[tuple[tuple[int, st
     path = effective_database(manifest)
     if manifest.previous is not None and Path(manifest.targets.service).is_file():
         installed = effective_database(manifest, installed=True)
-        if installed.exists() and installed != path:
+        if not installed.is_file():
+            raise ActivationError("installed source database missing")
+        if installed != path:
             raise ActivationError("installed database path differs from candidate")
     if not path.exists():
-        if manifest.mode == PROTECTED_MODE:
-            raise ActivationError("protected source database missing")
+        if (manifest.mode == PROTECTED_MODE or manifest.previous is not None
+                or any(getattr(manifest.rollback, name).path is not None
+                       for name in ("binary", "service", "socket", "environment"))):
+            raise ActivationError("installed source database missing")
         return None
     if manifest.previous is None:
         raise ActivationError("existing database without predecessor is not a first install")
@@ -1099,6 +1111,26 @@ def database_preflight(manifest: Manifest) -> Optional[tuple[tuple[tuple[int, st
     return evidence
 
 
+def preflight_executable(name: str, *probe: str, expected: str) -> Path:
+    try:
+        found = shutil.which(name)
+        if found is None:
+            raise ValidationError(f"required {name} executable is unavailable")
+        path = Path(found).resolve(strict=True)
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise ValidationError(f"required {name} executable is not usable")
+        result = subprocess.run([str(path), *probe], check=True, capture_output=True, text=True, timeout=10)
+        if expected not in result.stdout + result.stderr:
+            raise ValidationError(f"required {name} executable failed its probe")
+        return path
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValidationError(f"required {name} executable failed its probe") from exc
+
+
+def preflight_database_exclusivity(controller: Systemctl) -> None:
+    controller.database_lsof = preflight_executable("lsof", "-v", expected="lsof")
+
+
 def assert_database_exclusive(manifest: Manifest, controller: Systemctl) -> None:
     state = controller.inspect()
     if state.service_active or state.socket_active or state.main_pid:
@@ -1109,7 +1141,10 @@ def assert_database_exclusive(manifest: Manifest, controller: Systemctl) -> None
     for path in paths:
         if not path.is_file() or path.is_symlink():
             raise ActivationError("unsafe SQLite sidecar")
-    result = subprocess.run(["lsof", "-nP", "-t", "--", *map(str, paths)], capture_output=True, text=True, timeout=10)
+    lsof = getattr(controller, "database_lsof", None)
+    if lsof is None:
+        raise ActivationError("database exclusivity requires preflighted lsof")
+    result = subprocess.run([str(lsof), "-nP", "-t", "--", *map(str, paths)], capture_output=True, text=True, timeout=10)
     if result.returncode != 1 or result.stdout.strip() or result.stderr.strip():
         raise ActivationError("could not prove exclusive database access")
 
@@ -1321,14 +1356,28 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
                 raise ValidationError("protected activation is not an untouched prepared transaction")
         prepared = None
         try:
-            source_evidence = database_preflight(manifest)
+            database_preflight(manifest)
             if manifest.mode == PROTECTED_MODE:
                 controller.verify_protected_configuration()
+                preflight_database_exclusivity(controller)
+                environment = {}
+                for raw in Path(manifest.targets.service).read_text().splitlines():
+                    if raw.strip().startswith("Environment="):
+                        environment.update(assignment.split("=", 1) for assignment in shlex.split(raw.strip().partition("=")[2]))
+                environment.update(installed_environment(Path(manifest.targets.environment)))
+                validate_installed_tls(installed_tls(environment), manifest.service_user)
             prepared = prepare_installs(manifest, controller)
+            previous_state = controller.inspect()
+            if manifest.mode == PROTECTED_MODE:
+                atomic_write(Path(manifest.candidate.binary.path).parent / "predecessor-state.json",
+                             (json.dumps({**transaction_context(manifest),
+                                          "unit_state": dataclasses.asdict(previous_state)}, sort_keys=True) + "\n").encode())
         except Exception as exc:
+            if prepared is not None:
+                for path in prepared.paths():
+                    path.unlink(missing_ok=True)
             write_status(manifest, "precondition_failed", failure=str(exc))
             raise
-        previous_state = controller.inspect()
         write_status(manifest, "activating")
         inhibit_ready = False
         try:
@@ -1337,7 +1386,7 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
                 inhibit_ready = True
             controller.stop()
             if manifest.mode == PROTECTED_MODE:
-                source_evidence = snapshot_current(manifest, controller)
+                snapshot_current(manifest, controller)
                 rehearse_current_migration(manifest)
             install_candidate(manifest, prepared)
             if manifest.mode == PROTECTED_MODE:
@@ -1379,8 +1428,14 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
             try:
                 if manifest.mode == PROTECTED_MODE:
                     assert_database_exclusive(manifest, controller)
-                    if database_evidence(effective_database(manifest, installed=True)) != source_evidence:
-                        raise ActivationError("source database changed; predecessor restart forbidden")
+                    evidence = database_evidence(effective_database(manifest, installed=True))
+                    if evidence[0] != candidate_registry(manifest)[:65]:
+                        raise ActivationError("source ledger changed; predecessor restart forbidden")
+                    root = Path(manifest.candidate.binary.path).parent
+                    if any((root / name).exists() or (root / name).is_symlink()
+                           for name in ("source.sqlite", "source-proof.json")):
+                        if evidence[1] != verify_snapshot_proof(manifest)["source_digest"]:
+                            raise ActivationError("source database changed; predecessor restart forbidden")
                 cleanup_data_dir = restore(manifest, controller, previous_state, prepared)
                 write_status(manifest, "activation_failed_rolled_back", failure=failure)
                 if cleanup_data_dir is not None:
@@ -1563,6 +1618,7 @@ class InstalledAutoTls:
 class InstalledManualTls:
     cert_path: Path
     key_path: Path
+    ca_path: Optional[Path] = None
 
 
 InstalledTls = InstalledHttp | InstalledAutoTls | InstalledManualTls
@@ -1572,7 +1628,9 @@ def installed_tls(environment: dict[str, str]) -> InstalledTls:
     cert = environment.get("PHOENIX_TLS_CERT_PATH")
     key = environment.get("PHOENIX_TLS_KEY_PATH")
     if cert is not None and key is not None:
-        return InstalledManualTls(Path(cert), Path(key))
+        return InstalledManualTls(Path(cert), Path(key),
+                                  Path(environment["PHOENIX_TLS_CA_CERT_PATH"])
+                                  if "PHOENIX_TLS_CA_CERT_PATH" in environment else None)
     if cert is not None or key is not None:
         raise ValidationError("installed TLS requires both certificate and key paths")
     mode = environment.get("PHOENIX_TLS", "").strip().lower()
@@ -1602,7 +1660,7 @@ def validate_installed_tls(tls: InstalledTls, service_user: str) -> None:
                 bit = owner_bit >> 6
             return bool(metadata.st_mode & bit)
 
-        for path in (tls.cert_path, tls.key_path):
+        for path in (tls.cert_path, tls.key_path, *((tls.ca_path,) if tls.ca_path is not None else ())):
             if ".." in path.parts:
                 raise ValidationError("installed TLS paths must not contain parent traversal")
             try:
@@ -1621,6 +1679,30 @@ def validate_installed_tls(tls: InstalledTls, service_user: str) -> None:
                     raise ValidationError("installed TLS paths are not readable by service user")
             except OSError as exc:
                 raise ValidationError("installed TLS paths cannot be inspected safely") from exc
+
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(tls.cert_path, tls.key_path, password=lambda: b"")
+            if tls.ca_path is not None:
+                ca_bytes = tls.ca_path.read_bytes()
+                ca_pem = ca_bytes.decode("utf-8").strip()
+                if (len(ca_bytes) > 32 * 1024 or not re.fullmatch(
+                        r"-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----", ca_pem)):
+                    raise ValidationError("installed TLS CA must be exactly one PEM certificate within 32 KiB")
+                context.load_verify_locations(cafile=str(tls.ca_path))
+                openssl = preflight_executable("openssl", "version", expected="SSL")
+                details = subprocess.run([str(openssl), "x509", "-in", str(tls.ca_path), "-noout", "-text"],
+                                         check=True, capture_output=True, text=True, timeout=10).stdout
+                constraints = re.findall(r"X509v3 Basic Constraints:[^\n]*\n\s*([^\n]+)", details)
+                usage = re.findall(r"X509v3 Key Usage:[^\n]*\n\s*([^\n]+)", details)
+                if (len(constraints) != 1 or not re.search(r"\bCA:TRUE\b", constraints[0])
+                        or len(usage) > 1 or (usage and "Certificate Sign" not in usage[0])):
+                    raise ValidationError("installed TLS CA lacks certificate-authority capability")
+                subprocess.run([str(openssl), "verify", "-trusted", str(tls.ca_path), "-partial_chain",
+                                "-untrusted", str(tls.cert_path), "-purpose", "sslserver", str(tls.cert_path)],
+                               check=True, capture_output=True, text=True, timeout=10)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValidationError("installed TLS certificate/key/CA or CA chain is invalid") from exc
 
 
 def installed_socket_listener(path: Path) -> tuple[str, int]:
@@ -1892,10 +1974,16 @@ def validate_recovery_request(manifest_path: Path, policy: ValidationPolicy) -> 
             or stat.S_IMODE(claim.st_mode) & 0o022
             or policy.active_path.read_text().strip() != transaction_id):
         raise ValidationError("recovery requires exact owned active claim")
-    try:
-        (manifest_path.parent / "migration_started").lstat()
-    except FileNotFoundError as exc:
-        raise ValidationError("recover-current requires irreversible marker; predecessor left unchanged") from exc
+    if not migration_marker_present(manifest_path.parent):
+        metadata = policy.status_path.lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != policy.owner_uid
+                or stat.S_IMODE(metadata.st_mode) & 0o022):
+            raise ValidationError("unsafe retained pre-marker status")
+        status = json.loads(policy.status_path.read_text())
+        if (not isinstance(status, dict) or status.get("transaction_id") != transaction_id
+                or status.get("mode") != PROTECTED_MODE or status.get("migration_started") is not False
+                or status.get("state") not in {"activating", "activation_failed_rollback_failed"}):
+            raise ValidationError("pre-marker recovery requires disrupted activating status; predecessor left unchanged")
     return transaction_id
 
 
@@ -1924,6 +2012,10 @@ def recover_current_path(manifest_path: Path, policy: ValidationPolicy) -> str:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("activation is still running") from exc
         transaction_id = validate_recovery_request(manifest_path, policy)
+        if not migration_marker_present(manifest_path.parent):
+            manifest = Manifest.load(manifest_path)
+            validate_recovery_authority(manifest_path, manifest, policy)
+            return _recover_pre_marker_locked(manifest, None, policy)
         controller = SystemdUnitControl(policy.unit_name)
         try:
             controller.stop()
@@ -1956,17 +2048,105 @@ def recover_current(manifest: Manifest, controller: Optional[Systemctl] = None,
         return _recover_current_locked(manifest, controller, validation_policy)
 
 
+def _recover_pre_marker_locked(manifest: Manifest, controller: Optional[Systemctl],
+                               policy: Optional[ValidationPolicy]) -> str:
+    root = Path(manifest.candidate.binary.path).parent
+    if policy is not None:
+        validate_recovery_request(root / "manifest.json", policy)
+        validate_manifest(root / "manifest.json", manifest, policy)
+    status = retained_status(manifest)
+    if (manifest.mode != PROTECTED_MODE or migration_marker_present(root)
+            or status["migration_started"] is not False
+            or status["state"] not in {"activating", "activation_failed_rollback_failed"}):
+        raise ValidationError("pre-marker recovery requires disrupted activating status; predecessor left unchanged")
+    verify_start_inhibit_files(manifest)
+    ctl = controller or Systemctl(manifest)
+    prepared = None
+    try:
+        ctl.stop()
+        ctl.assert_inactive()
+        preflight_database_exclusivity(ctl)
+        ctl.verify_protected_configuration()
+        verify_preserved_configuration(manifest)
+        assert_database_exclusive(manifest, ctl)
+        evidence = database_evidence(effective_database(manifest, installed=True))
+        if evidence[0] != candidate_registry(manifest)[:65]:
+            raise ValidationError("pre-marker live database must equal exact source prefix65")
+
+        def retained_json(name: str) -> dict:
+            path = root / name
+            metadata = path.lstat()
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077):
+                raise ValidationError("unsafe pre-marker recovery evidence")
+            value = json.loads(path.read_text())
+            if not isinstance(value, dict) or any(value.get(k) != v for k, v in transaction_context(manifest).items()):
+                raise ValidationError("pre-marker recovery evidence context mismatch")
+            return value
+
+        captured = retained_json("predecessor-state.json").get("unit_state")
+        fields = {"service_active", "service_enabled", "socket_active", "socket_enabled", "main_pid"}
+        if (not isinstance(captured, dict) or set(captured) != fields
+                or any(type(captured[key]) is not bool for key in fields - {"main_pid"})
+                or type(captured["main_pid"]) is not int or captured["main_pid"] < 0):
+            raise ValidationError("invalid captured predecessor unit state")
+        previous_state = UnitState(**captured)
+        if installed_runtime_identity(Path(manifest.rollback.binary.path)) != manifest.previous:
+            raise ValidationError("captured predecessor identity mismatch")
+        if any((root / name).exists() or (root / name).is_symlink()
+               for name in ("source-proof.json", "source.sqlite")):
+            retained_json("source-proof.json")
+            backup = root / "source.sqlite"
+            metadata = backup.lstat()
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077):
+                raise ValidationError("unsafe retained source backup")
+            proof = verify_snapshot_proof(manifest)
+            if evidence[1] != proof["source_digest"]:
+                raise ValidationError("source database changed after stopped snapshot; predecessor restart forbidden")
+        if (root / "rehearsal-proof.json").exists() or (root / "rehearsal-proof.json").is_symlink():
+            rehearsal = retained_json("rehearsal-proof.json")
+            if type(rehearsal.get("success")) is not bool:
+                raise ValidationError("invalid retained rehearsal result")
+            if rehearsal["success"]:
+                verify_rehearsal_proof(manifest)
+        prepared = prepare_installs(manifest, ctl, allow_inhibit=True)
+        if migration_marker_present(root):
+            raise ValidationError("irreversible marker appeared during pre-marker recovery")
+        assert_database_exclusive(manifest, ctl)
+        if database_evidence(effective_database(manifest, installed=True)) != evidence:
+            raise ValidationError("source changed during pre-marker recovery")
+        restore(manifest, ctl, previous_state, prepared)
+        write_status(manifest, "activation_failed_rolled_back", failure="interrupted pre-marker activation recovered")
+        if not release_claim(manifest):
+            raise ValidationError("recovered predecessor but exact claim release failed")
+        return "activation_failed_rolled_back"
+    except Exception as exc:
+        try:
+            retain_failed_start_inhibit(manifest, ctl)
+        except Exception:
+            pass
+        write_status(manifest, "activation_failed_rollback_failed", failure="interrupted pre-marker activation",
+                     rollback_failure=str(exc))
+        return "activation_failed_rollback_failed"
+    finally:
+        if prepared is not None:
+            for path in prepared.paths():
+                path.unlink(missing_ok=True)
+
+
 def _recover_current_locked(manifest: Manifest, controller: Optional[Systemctl],
                             validation_policy: Optional[ValidationPolicy]) -> str:
     root = (validation_policy.transaction_root / manifest.transaction_id if validation_policy
             else Path(manifest.candidate.binary.path).parent)
     marker_path = root / "migration_started"
-    if not marker_path.exists() and not marker_path.is_symlink():
-        raise ValidationError("recover-current requires irreversible marker; predecessor left unchanged")
+    if not migration_marker_present(root):
+        return _recover_pre_marker_locked(manifest, controller, validation_policy)
     ctl = controller or Systemctl(manifest)
     try:
         ctl.stop()
         ctl.assert_inactive()
+        preflight_database_exclusivity(ctl)
         if validation_policy is not None:
             validate_manifest(root / "manifest.json", manifest, validation_policy)
         if manifest.mode != PROTECTED_MODE:
@@ -2028,7 +2208,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--protected-protocol-version", action="store_true")
-    parser.add_argument("action", nargs="?", choices=("activate", "stage", "abandon", "recover-current"))
+    parser.add_argument("action", nargs="?", choices=("activate", "stage", "abandon", "recover-current"),
+                        help="recover-current restores only a proven pre-marker predecessor or resumes the exact post-marker candidate")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--source-uid", type=int)
@@ -2069,12 +2250,12 @@ def main() -> int:
     try:
         if args.action == "recover-current":
             state = recover_current_path(args.manifest, policy)
-            if state == "committed":
+            if state in {"committed", "activation_failed_rolled_back"}:
                 manifest = Manifest.load(args.manifest)
                 if status_is_durable_terminal(manifest):
                     release_claim(manifest)
             print(state, flush=True)
-            return 0 if state == "committed" else 1
+            return 0 if state in {"committed", "activation_failed_rolled_back"} else 1
         manifest = Manifest.load(args.manifest)
         validate_manifest(args.manifest, manifest, policy)
         validated = True

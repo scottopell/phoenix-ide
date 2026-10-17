@@ -33,6 +33,15 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def write_manual_tls_fixture(directory: Path, stem: str = "manual") -> tuple[Path, Path]:
+    cert, key = directory / f"{stem}.crt", directory / f"{stem}.key"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=localhost", "-addext", "basicConstraints=critical,CA:TRUE",
+                    "-keyout", str(key), "-out", str(cert)],
+                   check=True, capture_output=True, text=True, timeout=30)
+    return cert, key
+
+
 class InstalledHealthUrlTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -41,9 +50,7 @@ class InstalledHealthUrlTests(unittest.TestCase):
         self.socket = self.base / "installed.socket"
         self.socket.write_text("[Socket]\nListenStream=8123\n")
         self.user = pwd.getpwuid(os.getuid()).pw_name
-        self.cert, self.key = self.base / "cert", self.base / "key"
-        self.cert.write_text("certificate")
-        self.key.write_text("key")
+        self.cert, self.key = write_manual_tls_fixture(self.base)
 
     def test_tls_modes_match_pinned_candidate(self):
         for value, kind, scheme in (("1", helper.InstalledAutoTls, "https"),
@@ -109,6 +116,35 @@ class InstalledHealthUrlTests(unittest.TestCase):
                     self.assertEqual(f"{scheme}://{host}:8123/api/version", url)
                     helper.validate_health_url(url, "installed")
 
+    def test_ca_is_only_meaningful_with_manual_pair_and_valid_chain(self):
+        ignored = {"PHOENIX_TLS_CA_CERT_PATH": "/missing-ca"}
+        self.assertEqual(helper.InstalledHttp(), helper.installed_tls(ignored))
+        self.assertEqual(helper.InstalledAutoTls(), helper.installed_tls({**ignored, "PHOENIX_TLS": "auto"}))
+        environment = {"PHOENIX_TLS_CERT_PATH": str(self.cert), "PHOENIX_TLS_KEY_PATH": str(self.key),
+                       "PHOENIX_TLS_CA_CERT_PATH": str(self.cert)}
+        self.assertEqual(helper.InstalledManualTls(self.cert, self.key, self.cert), helper.installed_tls(environment))
+        self.assertEqual("https://[::1]:8123/api/version", helper.installed_health_url(environment, self.socket, self.user))
+        with mock.patch.object(helper.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(helper.ValidationError, "openssl"):
+                helper.installed_health_url(environment, self.socket, self.user)
+
+    def test_manual_ca_rejects_bundles_and_non_ca_or_non_signing_certificates(self):
+        ca = self.base / "ca-bundle.pem"
+        ca.write_bytes(self.cert.read_bytes() * 2)
+        tls = helper.InstalledManualTls(self.cert, self.key, ca)
+        with self.assertRaisesRegex(helper.ValidationError, "exactly one PEM"):
+            helper.validate_installed_tls(tls, self.user)
+        ca.write_bytes(self.cert.read_bytes())
+        for details in ("X509v3 Basic Constraints:\n    CA:FALSE\n",
+                        "X509v3 Key Usage:\n    Certificate Sign\n",
+                        "X509v3 Basic Constraints:\n    CA:TRUE\nX509v3 Key Usage:\n    Digital Signature\n"):
+            with self.subTest(details=details), \
+                 mock.patch.object(helper, "preflight_executable", return_value=Path("/usr/bin/openssl")), \
+                 mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, details, "")) as run:
+                with self.assertRaisesRegex(helper.ValidationError, "certificate-authority capability"):
+                    helper.validate_installed_tls(tls, self.user)
+            self.assertEqual(1, run.call_count)
+
     def test_tls_validation_receives_service_user(self):
         environment = {"PHOENIX_TLS_CERT_PATH": str(self.cert), "PHOENIX_TLS_KEY_PATH": str(self.key)}
         with mock.patch.object(helper, "validate_installed_tls") as validate:
@@ -163,11 +199,31 @@ class InstalledTlsReadabilityTests(unittest.TestCase):
         self.accounts = mock.patch.object(helper.pwd, "getpwnam", return_value=self.account).start()
         self.addCleanup(mock.patch.stopall)
         self.groups = mock.patch.object(helper.os, "getgrouplist", return_value=[200]).start()
+        mock.patch.object(helper.ssl, "SSLContext").start()
         mock.patch.object(Path, "lstat", autospec=True, side_effect=lambda path: self.metadata[path]).start()
 
     @staticmethod
     def metadata_for(mode, uid, gid):
         return os.stat_result((mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+
+    def test_ca_requires_service_read_permission_and_nonsymlink_traversable_path(self):
+        ca = Path("/tls/ca")
+        tls = dataclasses.replace(self.tls, ca_path=ca)
+        for mode in (stat.S_IFREG | 0o600, stat.S_IFLNK | 0o777, stat.S_IFDIR | 0o755):
+            with self.subTest(mode=mode):
+                self.metadata[ca] = self.metadata_for(mode, 2001, 300)
+                with self.assertRaises(helper.ValidationError):
+                    helper.validate_installed_tls(tls, "fixture-service")
+        self.metadata[ca] = self.metadata_for(stat.S_IFREG | 0o004, 2001, 300)
+        with mock.patch.object(helper, "preflight_executable", return_value=Path("/usr/bin/openssl")), \
+             mock.patch.object(Path, "read_bytes", return_value=b"-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n"), \
+             mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 0, "X509v3 Basic Constraints: critical\n    CA:TRUE\n", "")) as run:
+            helper.validate_installed_tls(tls, "fixture-service")
+        self.assertEqual("x509", run.call_args_list[0].args[0][1])
+        self.assertEqual(["/usr/bin/openssl", "verify", "-trusted", str(ca), "-partial_chain",
+                          "-untrusted", str(tls.cert_path), "-purpose", "sslserver", str(tls.cert_path)],
+                         run.call_args_list[1].args[0])
 
     def test_owner_primary_supplementary_and_other_read_permission(self):
         for path in (self.tls.cert_path, self.tls.key_path):
@@ -221,7 +277,7 @@ class InstalledTlsReadabilityTests(unittest.TestCase):
 class SystemdManifestValidationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.transactions = self.base / "transactions"
         self.transaction_id = "a" * 32
         self.transaction = self.transactions / self.transaction_id
@@ -512,9 +568,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         return self.bundle(sources)
 
     def test_protected_root_staging_binds_both_urls_to_preserved_socket_and_tls(self):
-        cert, key = self.base.resolve() / "manual-cert", self.base.resolve() / "manual-key"
-        cert.write_text("certificate")
-        key.write_text("key")
+        cert, key = write_manual_tls_fixture(self.base.resolve())
         original_copy = helper.copy_handoff_file
         def copy_file(source, destination, expected_sha, source_uid, mode):
             original_copy(source, destination, expected_sha, os.getuid(), mode)
@@ -549,6 +603,33 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                 self.assertEqual(url, manifest.previous_health_url)
                 self.assertEqual(Path(policy.targets.socket).read_bytes(), Path(manifest.candidate.socket.path).read_bytes())
                 shutil.rmtree(policy.transaction_root.parent)
+
+    def test_protected_staging_rejects_missing_invalid_unrelated_ca_or_mismatched_key(self):
+        cert, key = write_manual_tls_fixture(self.base)
+        unrelated, wrong_key = write_manual_tls_fixture(self.base, "unrelated")
+        invalid = self.base / "invalid-ca"
+        invalid.write_text("not a PEM certificate")
+        link = self.base / "symlink-ca"
+        link.symlink_to(cert)
+        copy = helper.copy_handoff_file
+        for ca, selected_key in ((self.base / "missing-ca", key), (invalid, key), (unrelated, key),
+                                 (link, key), (Path("relative-ca"), key), (cert, wrong_key)):
+            with self.subTest(ca=ca, key=selected_key):
+                policy = self.staging_policy()
+                environment = (f"PHOENIX_TLS_CERT_PATH={cert}\nPHOENIX_TLS_KEY_PATH={selected_key}\n"
+                               f"PHOENIX_TLS_CA_CERT_PATH={ca}\n")
+                bundle = self.protected_endpoint_bundle(policy, environment, "[Socket]\nListenStream=9443\n")
+                with mock.patch.object(helper, "copy_handoff_file", side_effect=lambda s, d, h, u, m: copy(s, d, h, os.getuid(), m)), \
+                     mock.patch.object(helper, "installed_runtime_identity", return_value=helper.Identity("1.0.0", "a" * 12)), \
+                     mock.patch.object(helper, "Systemctl") as controller, \
+                     mock.patch.object(helper, "install_start_inhibit") as inhibit:
+                    with self.assertRaises(helper.ValidationError):
+                        helper.stage_handoff(bundle, os.getuid(), policy)
+                controller.assert_not_called()
+                inhibit.assert_not_called()
+                self.assertFalse(policy.active_path.exists())
+                self.assertFalse(list(policy.transaction_root.rglob("migration_started")))
+                self.assertFalse(list(Path(policy.targets.service).parent.rglob("*.conf")))
 
     def test_protected_root_staging_rejects_tls_and_endpoint_before_disruption(self):
         cert, key = self.base.resolve() / "manual-cert", self.base.resolve() / "manual-key"
@@ -798,7 +879,16 @@ class FakeSystemctl:
 
 
 class SystemdActivationTests(SystemdManifestValidationTests):
-    def install_previous(self):
+    def install_previous(self, *, mock_registry=True):
+        import sqlite3
+        database = Path(self.targets.deployed_sha).parent / "prod.db"
+        with sqlite3.connect(database) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS _migrations(version INTEGER PRIMARY KEY, name TEXT)")
+            db.execute("INSERT OR IGNORE INTO _migrations VALUES (1, 'fixture')")
+        if mock_registry:
+            registry = mock.patch.object(helper, "ordinary_candidate_registry", return_value=((1, "fixture"),))
+            registry.start()
+            self.addCleanup(registry.stop)
         for target, content in (
             (self.targets.binary, "old binary"),
             (self.targets.service, f"[Service]\nUser={pwd.getpwuid(os.getuid()).pw_name}\n"),
@@ -834,6 +924,31 @@ class SystemdActivationTests(SystemdManifestValidationTests):
             with self.assertRaisesRegex(helper.ActivationError, "stop after lock"):
                 helper.activate(manifest, controller)
         self.assertTrue(lock.parent.is_dir())
+
+    def test_ordinary_installed_missing_or_unlinked_database_refuses_before_stop(self):
+        import sqlite3
+        self.install_previous()
+        manifest = self.manifest()
+        database = Path(self.targets.deployed_sha).parent / "prod.db"
+        with sqlite3.connect(database) as still_open:
+            database.unlink()
+            self.assertEqual([(1, "fixture")], still_open.execute("SELECT * FROM _migrations").fetchall())
+            ctl = FakeSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+            with self.assertRaisesRegex(helper.ActivationError, "source database missing"):
+                helper.activate(manifest, ctl)
+            self.assertNotIn("stop", ctl.events)
+            self.assertFalse(database.exists())
+        without_identity = dataclasses.replace(manifest, previous=None)
+        with self.assertRaisesRegex(helper.ActivationError, "source database missing"):
+            helper.database_preflight(without_identity)
+
+    def test_ordinary_true_first_install_without_database_is_admitted(self):
+        manifest = self.manifest()
+        with mock.patch.object(helper, "ordinary_candidate_registry", side_effect=AssertionError("no DB target needed")):
+            self.assertIsNone(helper.database_preflight(manifest))
+        ctl = FakeSystemctl(manifest, helper.UnitState(False, False, False, False, 0))
+        with mock.patch.object(helper, "wait_for_identity"):
+            self.assertEqual("committed", helper.activate(manifest, ctl))
 
     def test_unit_verification_uses_staged_candidate_executable(self):
         manifest = self.manifest()
@@ -1114,6 +1229,12 @@ class SystemdActivationTests(SystemdManifestValidationTests):
 
 
 class ProtectedSystemctl(FakeSystemctl):
+    def restore_state(self, previous):
+        result = super().restore_state(previous)
+        self.previous_state = previous
+        self.disruption_started = False
+        return result
+
     def assert_inactive(self):
         if not self.disruption_started:
             raise helper.ActivationError("not inactive")
@@ -1129,6 +1250,28 @@ class ProtectedSystemctl(FakeSystemctl):
 
 
 class SystemdProtectedCurrentTests(SystemdActivationTests):
+    def setUp(self):
+        super().setUp()
+        lsof = self.base.resolve() / "lsof"
+        lsof.write_text("fixture executable; subprocess is intercepted")
+        lsof.chmod(0o700)
+        self.lsof = str(lsof)
+        original = helper.shutil.which
+        patch = mock.patch.object(helper.shutil, "which", side_effect=lambda name: self.lsof if name == "lsof" else original(name))
+        patch.start()
+        self.addCleanup(patch.stop)
+        run = helper.subprocess.run
+        def with_lsof(command, **kwargs):
+            return self.lsof_result(command) if command[0] == self.lsof else run(command, **kwargs)
+        process = mock.patch.object(helper.subprocess, "run", side_effect=with_lsof)
+        process.start()
+        self.addCleanup(process.stop)
+
+    def lsof_result(self, command):
+        if command[1:] == ["-v"]:
+            return subprocess.CompletedProcess(command, 0, "", "lsof version information")
+        return subprocess.CompletedProcess(command, 1, "", "")
+
     def protected(self):
         import platform
         linux = mock.patch.object(helper.sys, "platform", "linux")
@@ -1137,7 +1280,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         machine.start()
         self.addCleanup(linux.stop)
         self.addCleanup(machine.stop)
-        self.install_previous()
+        self.install_previous(mock_registry=False)
         # macOS /var is a symlink; production evidence requires canonical paths.
         def canonical(value):
             if isinstance(value, dict):
@@ -1189,6 +1332,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.registry = helper.candidate_registry(manifest)
         self.database = Path(manifest.database_path)
         import sqlite3
+        self.database.unlink(missing_ok=True)
         with sqlite3.connect(self.database) as db:
             db.execute("CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             db.executemany("INSERT INTO _migrations VALUES (?, ?)", self.registry[:65])
@@ -1209,8 +1353,8 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
 
     def runtime(self, manifest, failure=None):
         def run(command, **kwargs):
-            if command[0] == "lsof":
-                return subprocess.CompletedProcess(command, 1, "", "")
+            if command[0] == self.lsof:
+                return self.lsof_result(command)
             if command[0] == manifest.candidate.binary.path:
                 self.assertEqual([manifest.candidate.binary.path, "--migrate-only"], command)
                 self.assertFalse((self.transaction / "migration_started").exists())
@@ -1525,12 +1669,202 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                      self.assertRaises(helper.ActivationError):
                     ctl.verify_protected_configuration()
 
+    def interrupt_pre_marker(self, window):
+        import sqlite3
+        manifest = self.protected()
+        ctl = ProtectedSystemctl(manifest, helper.UnitState(True, False, True, True, 41))
+        original_stop = ctl.stop
+        def stop_with_final_write():
+            if not ctl.disruption_started:
+                with sqlite3.connect(self.database) as db:
+                    db.execute("INSERT INTO data VALUES (x'beef')")
+            original_stop()
+        ctl.stop = stop_with_final_write
+        owner = ctl if window == "stop" else helper
+        method = "stop" if window == "stop" else window
+        original = getattr(owner, method)
+        class Interrupted(BaseException):
+            pass
+        def crash_after(*args, **kwargs):
+            original(*args, **kwargs)
+            raise Interrupted()
+        with mock.patch.object(owner, method, side_effect=crash_after):
+            with self.assertRaises(Interrupted):
+                self.execute(manifest, ctl)
+        self.assertFalse(helper.migration_marker_present(self.transaction))
+        self.assertEqual("activating", helper.retained_status(manifest)["state"])
+        helper.verify_start_inhibit_files(manifest)
+        return manifest, ctl
+
+    def assert_pre_marker_crash_recovers(self, window):
+        import sqlite3
+        manifest, ctl = self.interrupt_pre_marker(window)
+        if window == "install_start_inhibit":
+            # The predecessor was still allowed to write before recovery stops it.
+            with sqlite3.connect(self.database) as db:
+                db.execute("INSERT INTO data VALUES (x'abcd')")
+        with mock.patch.object(helper, "Systemctl", return_value=ctl), \
+             mock.patch.object(helper.subprocess, "run", side_effect=self.runtime(manifest)), \
+             mock.patch.object(helper, "installed_runtime_identity", side_effect=lambda path: manifest.previous if str(path) == manifest.rollback.binary.path else manifest.expected), \
+             mock.patch.object(helper, "wait_for_identity") as health, \
+             mock.patch.object(helper, "prepare_data_directory"), \
+             mock.patch.object(helper, "legacy_override_dir", return_value=helper.start_inhibit_paths(manifest)[0].parent), \
+             mock.patch.object(helper, "install_candidate", side_effect=AssertionError("recovery cannot install candidate")), \
+             mock.patch.object(helper, "run_current_migration", side_effect=AssertionError("no live invocation")), \
+             mock.patch.object(helper, "snapshot_current", side_effect=AssertionError("no snapshot replay")):
+            self.assertEqual("activation_failed_rolled_back", helper.recover_current_path(self.manifest_path, self.policy))
+        self.assertEqual("old binary", Path(manifest.targets.binary).read_text())
+        self.assertIn(("restore_state", ctl.previous_state), ctl.events)
+        health.assert_called_once_with(manifest, manifest.previous, manifest.previous_health_url)
+        self.assertFalse(Path(manifest.active_path).exists())
+        self.assertEqual("activation_failed_rolled_back", json.loads(Path(manifest.status_path).read_text())["state"])
+        self.assertFalse(helper.migration_marker_present(self.transaction))
+        self.assertTrue(all(not path.exists() for path in helper.start_inhibit_paths(manifest)))
+        with sqlite3.connect(self.database) as db:
+            values = db.execute("SELECT value FROM data ORDER BY rowid").fetchall()
+        self.assertIn((b"\xbe\xef",), values)
+        if window == "install_start_inhibit":
+            self.assertIn((b"\xab\xcd",), values)
+        if window in {"snapshot_current", "rehearse_current_migration", "install_candidate"}:
+            self.assertEqual(helper.database_evidence(self.database), helper.database_evidence(self.transaction / "source.sqlite"))
+
+    def test_crash_before_predecessor_state_publication_is_prepared_and_abandonable(self):
+        manifest = self.protected()
+        ctl = ProtectedSystemctl(manifest, helper.UnitState(True, False, True, True, 41))
+        original = helper.atomic_write
+        class Interrupted(BaseException):
+            pass
+        def write(path, *args, **kwargs):
+            if path.name == "predecessor-state.json":
+                raise Interrupted()
+            return original(path, *args, **kwargs)
+        with mock.patch.object(helper, "atomic_write", side_effect=write), self.assertRaises(Interrupted):
+            self.execute(manifest, ctl)
+        self.assertEqual("prepared", helper.retained_status(manifest)["state"])
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assertFalse((self.transaction / "predecessor-state.json").exists())
+        self.assertFalse(helper.migration_marker_present(self.transaction))
+        self.assertFalse(any(path.exists() for path in helper.start_inhibit_paths(manifest)))
+        self.assertNotIn("stop", ctl.events)
+        with self.assertRaises(helper.ValidationError):
+            helper.recover_current(manifest, ctl, self.policy)
+        helper.abandon(manifest)
+        self.assertFalse(Path(manifest.active_path).exists())
+        self.assertEqual("old binary", Path(manifest.targets.binary).read_text())
+
+    def test_missing_predecessor_state_in_disrupted_recovery_stays_fenced(self):
+        manifest, ctl = self.interrupt_pre_marker("stop")
+        (self.transaction / "predecessor-state.json").unlink()
+        with mock.patch.object(helper, "restore") as restore:
+            self.assertEqual("activation_failed_rollback_failed", helper.recover_current(manifest, ctl, self.policy))
+        restore.assert_not_called()
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assert_reboot_inhibited(manifest)
+
+    def test_partial_snapshot_evidence_cannot_authorize_pre_marker_restore(self):
+        manifest, ctl = self.interrupt_pre_marker("snapshot_current")
+        (self.transaction / "source-proof.json").unlink()
+        with mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.previous), \
+             mock.patch.object(helper, "restore") as restore:
+            self.assertEqual("activation_failed_rollback_failed", helper.recover_current(manifest, ctl, self.policy))
+        restore.assert_not_called()
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assert_reboot_inhibited(manifest)
+
+    def test_pre_marker_restore_state_failure_reinstalls_inhibits_and_retains_claim(self):
+        manifest, ctl = self.interrupt_pre_marker("stop")
+        with mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.previous), \
+             mock.patch.object(helper, "legacy_override_dir", return_value=helper.start_inhibit_paths(manifest)[0].parent), \
+             mock.patch.object(helper, "prepare_data_directory"), \
+             mock.patch.object(ctl, "restore_state", return_value=0), \
+             mock.patch.object(helper, "wait_for_identity") as health:
+            self.assertEqual("activation_failed_rollback_failed", helper.recover_current(manifest, ctl, self.policy))
+        health.assert_not_called()
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assert_reboot_inhibited(manifest)
+
+    def test_explicit_pre_marker_recovery_after_inhibit(self):
+        self.assert_pre_marker_crash_recovers("install_start_inhibit")
+
+    def test_explicit_pre_marker_recovery_after_stop(self):
+        self.assert_pre_marker_crash_recovers("stop")
+
+    def test_explicit_pre_marker_recovery_after_snapshot(self):
+        self.assert_pre_marker_crash_recovers("snapshot_current")
+
+    def test_explicit_pre_marker_recovery_after_rehearsal(self):
+        self.assert_pre_marker_crash_recovers("rehearse_current_migration")
+
+    def test_explicit_pre_marker_recovery_after_candidate_replacement(self):
+        self.assert_pre_marker_crash_recovers("install_candidate")
+
+    def test_pre_marker_recovery_rejects_post_snapshot_mutation_without_replay(self):
+        import sqlite3
+        manifest, ctl = self.interrupt_pre_marker("snapshot_current")
+        with sqlite3.connect(self.database) as db:
+            db.execute("INSERT INTO data VALUES (x'dead')")
+        evidence = helper.database_evidence(self.database)
+        with mock.patch.object(helper.subprocess, "run", side_effect=self.runtime(manifest)), \
+             mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.previous), \
+             mock.patch.object(helper, "restore", side_effect=AssertionError("source changed")) as restore:
+            self.assertEqual("activation_failed_rollback_failed", helper.recover_current(manifest, ctl, self.policy))
+        restore.assert_not_called()
+        self.assertEqual(evidence, helper.database_evidence(self.database))
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assert_reboot_inhibited(manifest)
+
+    def test_missing_or_unusable_lsof_is_precondition_failure_without_inhibit_stop_or_claim_leak(self):
+        manifest = self.protected()
+        ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        for failure in ("missing", "probe"):
+            helper.write_status(manifest, "prepared")
+            Path(manifest.active_path).write_text(manifest.transaction_id + "\n")
+            result = subprocess.CompletedProcess([], 1, "", "broken lsof")
+            with self.subTest(failure=failure), \
+                 mock.patch.object(helper.shutil, "which", return_value=None if failure == "missing" else self.lsof), \
+                 mock.patch.object(helper.subprocess, "run", side_effect=subprocess.CalledProcessError(1, []) if failure == "probe" else None, return_value=result), \
+                 mock.patch.object(helper, "Systemctl", return_value=ctl), \
+                 mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
+                 mock.patch.object(helper.os, "geteuid", return_value=0), \
+                 mock.patch.object(helper, "validate_manifest"), \
+                 mock.patch.object(sys, "argv", ["helper", "activate", "--manifest", str(self.manifest_path)]), \
+                 mock.patch.object(helper, "install_start_inhibit") as inhibit:
+                self.assertEqual(1, helper.main())
+            inhibit.assert_not_called()
+            self.assertNotIn("stop", ctl.events)
+            self.assertFalse(Path(manifest.active_path).exists())
+            self.assertEqual("precondition_failed", json.loads(Path(manifest.status_path).read_text())["state"])
+
+    def test_pre_marker_missing_lsof_recovery_stops_and_remains_fenced(self):
+        manifest, ctl = self.interrupt_pre_marker("install_start_inhibit")
+        ctl.events.clear()
+        with mock.patch.object(helper.shutil, "which", return_value=None), \
+             mock.patch.object(helper, "restore") as restore:
+            self.assertEqual("activation_failed_rollback_failed", helper.recover_current(manifest, ctl, self.policy))
+        self.assertEqual("stop", ctl.events[0])
+        restore.assert_not_called()
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assert_reboot_inhibited(manifest)
+
+    def test_post_marker_missing_lsof_recovery_stops_before_dependency_failure(self):
+        manifest = self.protected()
+        ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        self.assertEqual("current_forward_failed", self.execute(manifest, ctl, "partial"))
+        ctl.events.clear()
+        with mock.patch.object(helper.shutil, "which", return_value=None), \
+             mock.patch.object(helper, "validate_manifest", side_effect=AssertionError("dependency check follows stop")) as validate:
+            self.assertEqual("current_forward_failed", helper.recover_current(manifest, ctl, self.policy))
+        self.assertEqual("stop", ctl.events[0])
+        validate.assert_not_called()
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assert_reboot_inhibited(manifest)
+
     def test_no_marker_recovery_does_not_stop_predecessor_even_with_bad_status(self):
         manifest = self.protected()
         ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
         for status in (Path(manifest.status_path).read_bytes(), b"invalid"):
             Path(manifest.status_path).write_bytes(status)
-            with self.assertRaisesRegex(helper.ValidationError, "requires irreversible marker"):
+            with self.assertRaises((helper.ValidationError, json.JSONDecodeError)):
                 helper.recover_current(manifest, ctl)
             self.assertEqual([], ctl.events)
 
@@ -1596,8 +1930,8 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         before = helper.database_evidence(self.database)
         ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
         def run(command, **kwargs):
-            if command[0] == "lsof":
-                return subprocess.CompletedProcess(command, 1, "", "")
+            if command[0] == self.lsof:
+                return self.lsof_result(command)
             self.assertEqual([manifest.candidate.binary.path, "--migrate-only"], command)
             self.assertIn("stop", ctl.events)
             self.assertFalse((self.transaction / "migration_started").exists())
@@ -1984,6 +2318,8 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                 helper.assert_database_exclusive(manifest, ctl)
             run.assert_not_called()
         ctl.stop()
+        helper.preflight_database_exclusivity(ctl)
+        self.assertEqual(Path(self.lsof), ctl.database_lsof)
         for result in (subprocess.CompletedProcess([], 0, "100\n", ""), subprocess.CompletedProcess([], 1, "", "warning")):
             with mock.patch.object(helper.subprocess, "run", return_value=result):
                 with self.assertRaisesRegex(helper.ActivationError, "exclusive"):
