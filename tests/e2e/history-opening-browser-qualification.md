@@ -3169,3 +3169,32 @@ regressions retain strict publication/identity/normal drain semantics. One next
 changed-candidate normal qualification follows the complete preceding terminal
 state; no unchanged/parallel witness is launched. Baselineedac/35f and all scope
 boundaries remain unchanged.
+
+### Stronger current-main witness passes; whole run blocked only by three semicolons
+
+Run39009309679 at0873/ec710 is fully terminal failure **only in clippy** for
+three trailing assertion semicolons. Actual Rust, UI/specs, E2E/tasks/workers,
+routine macOS and the full isolated witness passed. Artifact12092068190 is
+97,808,406 bytes; selected native/browser/drain/delivery receipts used90,737
+range bytes, not a full local artifact download.
+
+The actual stronger current-main witness passed all6 scenarios: ordinary/Global
+history ready, pagehide incomplete, cancellation canceled. Both histories retain
+2 successful completed older GETs under the original owner, strict physical
+containment/four frames/source/canonical route, and actual latest-owner composer
+POSTs with200 (not merely expected owner labels or independent streams).
+Exactly6 browser reports=6 collector admissions=6 semantic exports; negative401
+has no extra admissions/exports. Normal drain is true: acknowledged owned stop,
+app exit0, owned home/socket removal before receiver close; drain errors empty.
+This is successor controlled-functional proof, not full acceptance/overhead or
+shipping/device proof. Original baseline remains unchanged and separate.
+
+Product26d40cb8d61f3e0fe80fb520ad5a3e1af49abe84, tree
+7d8eb4c05f1c50d39f0b90d76783f007101a7f34, is an exact one-file3-line child ofec710:
+only String/I64/F64 assertion semicolons at the reported locations, with no
+assertion/value/JSON/behavior change. Parent inspected the complete immutable
+diff; standalone rustfmt and diff check pass,79 Python tests pass at its pin.
+The source branch qualification/history-joint-source-26d40cb8d is clean/published.
+The shared candidate receives one causal final normal qualification after the
+entire preceding run, rather than treating the previous near-green as full green
+or skipping Clippy. No duplicate/unchanged runner, local native/build or merge.
