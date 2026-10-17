@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    CpuContentionBasisPoints, EffectCompletion, ExecutedEffect, GuardianLifetimeNonce,
-    LoopProgress, MemoryPressure, NativeChildListCompletion, NativeChildListDispatch,
-    NativeGuardianSlot, NativeSlotLiveness, OwnedIdentityStatus, PolicyLoop, ResourceCapacity,
-    ResourceContention, ResourcePolicy, ResourceSample,
+    ActiveAttempt, CpuContentionBasisPoints, EffectCompletion, ExecutedEffect,
+    GuardianLifetimeNonce, LoopProgress, MemoryPressure, NativeChildListCompletion,
+    NativeChildListDispatch, NativeGuardianSlot, NativeSlotLiveness, OwnedIdentityStatus,
+    PolicyLoop, ResourceCapacity, ResourceContention, ResourcePolicy, ResourceSample,
 };
 use std::num::NonZeroUsize;
 
@@ -298,8 +298,11 @@ fn recovered_identity_folds_only_the_root_without_activating_cleanup() {
         let DeploymentAttempt::Interrupted(interrupted) = &saved.checkpoint else {
             panic!("recovered identity application must remain interrupted")
         };
+        let ActiveAttempt::Ownership(resume) = &interrupted.resume else {
+            panic!("identity recovery must resume owned-tree cleanup")
+        };
         assert_eq!(
-            interrupted.resume.owned.identities().get(&issue.target()),
+            resume.tree.identities().get(&issue.target()),
             Some(&OwnedIdentityStatus::VerifiedAbsent)
         );
         assert_eq!(
