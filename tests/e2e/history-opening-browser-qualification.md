@@ -2605,3 +2605,39 @@ nor arbitrary values are retained. SSE still requires its existing `open_id`.
 Cached shared131 Node tests pass, including exclusive recovery-key and query
 privacy regressions. This is shared integration preparation; the app repair
 packet has not yet been imported or qualified at this entry.
+
+### Original-journey pagination repair admitted for causal qualification
+
+Imported donor `a25ac59bc0b15403871115ac5d4f2df06a7cf29b` as the exact eight-file
+delta atop app `302a`, producing clean app
+`2ad41de0b681528d65d8a534b251c82d53a4df04`, tree
+`c6822541c58a7d1db7fe7c442c107a44e3e200ab`. No donor ancestry rebase occurred.
+The clean source is published as `qualification/history-joint-source-2ad41de0b`.
+
+The load-older operation captures the original lifecycle **attempt**, not just
+its mutable lifecycle object. Each actual older/recovery/retry GET registers a
+fresh UUID synchronously before dispatch. Terminal or replaced/resumed attempts
+admit no subsequent recovery registration or response observation. The typed
+API excludes simultaneous `open_id` and `request_id`; actual cursor reads keep
+`open_id`, fresh-tail recovery uses `request_id` without `open_id`, preserving
+backend initial-open stage scope. No Rust/backend/collector/schema/capacity or
+sampling change is included. Normative REQ-CVT-003 and executive coverage match.
+
+Parent independently verified source hashes, genuine composite `tsc -b --noEmit`,
+**553 focused tests across12 app files**, shared **131 Node**, lifecycle **70
+Python**, artifact admission **8 Python**, workflow YAML parsing and diff check.
+Read-only independent exact-commit review found no blockers; a separate shared
+follow-up review found no remaining concrete issues. Owner reported an existing
+alias-delete test transient failure, isolated pass and final full553 pass; the
+parent full553 run also passed. Existing fixture warnings remain in logs.
+
+Source/spec preflight reviewed the exact API query names, mutually exclusive TS
+shape, unchanged backend initial span predicate, current requirements/executive
+agreement and timeless requirement text. No Allium file or generated wire type
+changed. Local native/browser/build execution was not performed.
+
+Workflow/native/browser source pins and source-tree admission are updated
+atomically for **one causal normal qualification**. The dedicated diagnostic
+branch remains frozen at `191dac` and its original artifact/app pins; it is not
+pushed or rerun by this candidate. Controlled six-report acceptance, stock
+comparison, overhead and full acceptance remain unproven until actual results.
