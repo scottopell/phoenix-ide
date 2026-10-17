@@ -65,6 +65,10 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        capacity = shutil.disk_usage(self.root)._replace(free=100 * 1024**3)
+        disk_usage = mock.patch.object(helper.shutil, "disk_usage", return_value=capacity)
+        disk_usage.start()
+        self.addCleanup(disk_usage.stop)
 
     def database(self, *, through: int = 123) -> Path:
         path = self.root / f"schema-{through}.sqlite3"
@@ -1455,10 +1459,14 @@ connection.close()
         self.assertTrue(helper._capacity_observation_path(reservation).exists())
         self.assertEqual(status["prepared_mode"], "current_schema")
 
-    def test_controller_policy_checks_actual_ledgers_independently_of_release_helper(self) -> None:
+    def test_standalone_controller_policy_uses_staged_helper_and_actual_ledgers(self) -> None:
         import runpy
 
-        preflight = runpy.run_path(str(ROOT / "dev.py"))["_preflight_ordinary_launchd_policy"]
+        standalone = self.root / "standalone-controller"
+        standalone.mkdir()
+        shutil.copy2(ROOT / "dev.py", standalone / "dev.py")
+        self.assertFalse((standalone / "scripts").exists())
+        preflight = runpy.run_path(str(standalone / "dev.py"))["_preflight_ordinary_launchd_policy"]
         for through in (114, 123, 128):
             for source_kind in ("local_head", "published_release"):
                 with self.subTest(through=through, source_kind=source_kind):
@@ -1467,9 +1475,25 @@ connection.close()
                     manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
                     if through == 114:
                         with self.assertRaisesRegex(RuntimeError, "pending migration interval is not qualified"):
-                            preflight(manifest_path)
+                            preflight(manifest_path, Path(manifest.ordinary_forward_migration.helper_path))
                     else:
-                        preflight(manifest_path)
+                        preflight(manifest_path, Path(manifest.ordinary_forward_migration.helper_path))
+
+    def test_controller_policy_verifies_helper_binding_before_execution(self) -> None:
+        import runpy
+
+        preflight = runpy.run_path(str(ROOT / "dev.py"))["_preflight_ordinary_launchd_policy"]
+        manifest = self.ordinary_manifest(self.database())
+        manifest_path = self.root / "manifest.json"
+        manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
+        staged_helper = Path(manifest.ordinary_forward_migration.helper_path)
+        replacement = self.root / "unbound-helper.py"
+        replacement.write_text("raise AssertionError('unbound helper executed')")
+        with self.assertRaisesRegex(SystemExit, "helper does not match"):
+            preflight(manifest_path, replacement)
+        staged_helper.write_text("raise AssertionError('tampered helper executed')")
+        with self.assertRaisesRegex(SystemExit, "helper does not match"):
+            preflight(manifest_path, staged_helper)
 
     def test_ordinary_114_rejected_before_stop_for_release_and_local_sources(self) -> None:
         for source_kind in ("local_head", "published_release"):
@@ -1720,10 +1744,14 @@ connection.close()
         manifest = self.manifest(database)
         claim = Path(manifest.active_path)
         claim.write_text(manifest.transaction_id + "\n")
-        with mock.patch.object(helper, "fsync_dir", side_effect=OSError("fsync failed")):
-            with self.assertRaisesRegex(OSError, "fsync failed"):
-                helper.release_claim(manifest)
-        self.assertEqual(claim.read_text().strip(), manifest.transaction_id)
+        for restored_fsync in (None, OSError("restored claim fsync failed")):
+            with self.subTest(restored_fsync=restored_fsync), mock.patch.object(
+                helper, "fsync_dir", side_effect=[OSError("fsync failed"), restored_fsync]
+            ) as fsync_dir:
+                with self.assertRaisesRegex(OSError, "restored claim fsync failed" if restored_fsync else "fsync failed"):
+                    helper.release_claim(manifest)
+            self.assertEqual(fsync_dir.call_args_list, [mock.call(claim.parent)] * 2)
+            self.assertEqual(claim.read_text(), manifest.transaction_id + "\n")
 
     def test_current_recovery_rechecks_unchanged_source_after_teardown(self) -> None:
         database = self.database()
@@ -2417,6 +2445,34 @@ connection.close()
         status = json.loads(Path(manifest.status_path).read_text())
         self.assertEqual(status["state"], "precondition_cleanup_pending")
         self.assertIn("fsync still uncertain", status["cleanup_failure"])
+
+    def test_cleanup_enumeration_failure_retains_pending_state_and_claim(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        self.write_current_status(
+            manifest,
+            "precondition_cleanup_pending",
+            failure="reservation failed",
+        )
+
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper.os, "scandir", side_effect=PermissionError("enumeration denied")
+        ), mock.patch.object(helper, "Launchctl") as launchctl:
+            with self.assertRaisesRegex(
+                helper.DatabaseCapacityCleanupFailure,
+                "could not enumerate atomic evidence temporaries.*enumeration denied",
+            ):
+                helper.cleanup_precondition_capacity(manifest, current_schema=True)
+
+        launchctl.assert_not_called()
+        self.assertEqual(claim.read_text(), manifest.transaction_id)
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_cleanup_pending")
+        self.assertIn("enumeration denied", status["cleanup_failure"])
 
     def test_cleanup_main_preserves_original_failure_when_retry_fails(self) -> None:
         database = self.database()

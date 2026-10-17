@@ -1156,6 +1156,21 @@ def _remove_capacity_files(*paths: Path) -> None:
         raise DatabaseCapacityCleanupFailure("; ".join(failures))
 
 
+def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:
+    prefix = f".{evidence.name}."
+    try:
+        with os.scandir(evidence.parent) as entries:
+            return tuple(
+                evidence.parent / entry.name
+                for entry in entries
+                if entry.name.startswith(prefix)
+            )
+    except OSError as exc:
+        raise DatabaseCapacityCleanupFailure(
+            f"{evidence.parent}: could not enumerate atomic evidence temporaries: {exc}"
+        ) from exc
+
+
 def _owned_capacity_cleanup_paths(
     manifest: Manifest,
     reservation: DatabaseCapacityReservation,
@@ -1171,7 +1186,7 @@ def _owned_capacity_cleanup_paths(
         capacity,
     }
     for evidence in (capacity, proof):
-        paths.update(evidence.parent.glob(f".{evidence.name}.*"))
+        paths.update(_atomic_write_temporary_paths(evidence))
     for allocation in (reservation.backup_path, reservation.restore_path):
         paths.update(
             allocation.with_name(allocation.name + suffix)
@@ -1741,6 +1756,7 @@ def release_claim(manifest: Manifest) -> bool:
                         os.fsync(fd)
                     finally:
                         os.close(fd)
+                    fsync_dir(claim.parent)
                 raise
             return True
         except FileNotFoundError:

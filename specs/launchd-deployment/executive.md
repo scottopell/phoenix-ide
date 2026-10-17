@@ -88,13 +88,15 @@ It is qualified locally/CI only; no healthy production finalization was executed
 | REQ-LDD-016 | `launchd_restart_helper.wait_for_identity`, restart status; restart requires an installed full-SHA identity and does not reuse the predecessor-only 12-character rollback allowance |
 | REQ-LDD-017 | `_prepare_prepared_artifact`, paired structural manifest, SQLite backup API, legacy ledger/table preflight, and fail-closed proof validation; focused helper tests cover ordinary activation regression |
 
+Ordinary pre-handoff admission uses the manifest-bound staged helper path and SHA-256, including a standalone controller directory without `scripts/`. Registry/policy evidence is staged only for an existing candidate database, including an existing database on first install. A switch to a nonexistent candidate database retains ordinary artifact rollback through the predecessor's captured configuration and old database; it does not restore database contents. Focused regressions cover both local and release path switches, candidate failure, and predecessor restoration.
+
 ## Operator surfaces
 
 - `./dev.py prod deploy` — checked local `HEAD` build.
 - `./dev.py prod deploy --release vX.Y.Z` — exact published release.
 - `./dev.py prod deploy --release latest` — latest stable release resolved once.
 - `./dev.py prod deploy --prepared-artifact DIR --expected-full-commit SHA --current-schema-upgrade` — exact migration-123 or migration-128 prepared source to the exact migration-128 candidate registry under ADR-105 and ADR-114 (128-to-128 admission authored; hosted CI qualification pending).
-- `./dev.py prod deploy --release TAG --expected-full-commit RELEASE_SHA --controller-source-commit CONTROLLER_SHA --current-schema-upgrade` — ADR-115 exact-114-to-128 protected release transition, separate full controller pin and retained helper hash; no `latest` or other baseline. Documentation authored; qualification pending.
+- `./dev.py prod deploy --release TAG --expected-full-commit CANDIDATE_SHA --controller-source-commit CONTROLLER_SHA --current-schema-upgrade` — ADR-115 exact-114-to-128 protected release transition on macOS launchd. Requires an exact non-alias tag and distinct full lowercase candidate/controller SHAs; excludes prepared and paired modes. No hidden controller flags are required: backend and host asset/checksum use normal release selection, candidate/registry remain release-sourced, and retained helper path/hash come from the controller commit. Hidden controller-mode invocations retain exact tag/backend/asset bindings. Local regression coverage includes public parsing/dispatch and retained provenance; hosted/runtime qualification remains separate.
 - `./dev.py prod recover-current TXN` / `finalize-current TXN` — mode-matched unchanged-source recovery or committed-candidate finalization.
 - `./dev.py prod resume-forward TXN` — explicitly resume only the retained ordinary forward candidate after predecessor rollback becomes unsafe.
 - `./dev.py prod status` — launchd PID/runtime identity and durable transaction result.

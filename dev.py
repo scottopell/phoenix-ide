@@ -9525,14 +9525,28 @@ class ProdDeployControllerOptions:
                 raise SystemExit("--controller-source-commit must be a full 40-character lowercase git SHA")
             if self.controller_source_commit == self.expected_full_commit:
                 raise SystemExit("--controller-source-commit must differ from the candidate release commit")
-            if not protected_release or not self.enabled or self.paired_database_upgrade:
-                raise SystemExit("--controller-source-commit requires controller-mode published release with --current-schema-upgrade")
+            if not protected_release or self.paired_database_upgrade:
+                raise SystemExit("--controller-source-commit requires published release with --current-schema-upgrade")
         if protected_release:
-            if not self.enabled or self.controller_source_commit is None:
-                raise SystemExit("published release --current-schema-upgrade requires --controller-mode and --controller-source-commit")
-            self.require_exact_release(release)
-            if sys.platform != "darwin" or self.backend != "launchd":
+            if self.controller_source_commit is None:
+                raise SystemExit("published release --current-schema-upgrade requires --controller-source-commit")
+            _parse_supported_release_tag(release)
+            if self.enabled:
+                self.require_exact_release(release)
+            elif re.fullmatch(r"[0-9a-f]{40}", self.expected_full_commit or "") is None:
+                raise SystemExit("--expected-full-commit must be a full 40-character lowercase git SHA")
+            if (
+                sys.platform != "darwin"
+                or self.backend not in (None, "launchd")
+                or self.require_backend() != "launchd"
+            ):
                 raise SystemExit("published release current-schema upgrade is supported only by macOS launchd")
+            if not self.enabled and any(value is not None for value in (
+                self.exact_release_tag, self.backend, self.expected_asset_name, self.expected_asset_sha256,
+            )):
+                raise SystemExit("hidden controller bindings require --controller-mode")
+        elif self.current_schema_upgrade and release is not None:
+            raise SystemExit("prepared artifact upgrade excludes --release")
 
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
@@ -10440,6 +10454,7 @@ def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
                     os.fsync(fd)
                 finally:
                     os.close(fd)
+                _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
             raise
         return True
     except FileNotFoundError:
@@ -10834,15 +10849,21 @@ def _materialize_source_file(
     destination.chmod(0o700)
 
 
-def _preflight_ordinary_launchd_policy(manifest_path: Path) -> None:
-    """Checkout-local admission veto for ordinary fallback only, before handoff.
-
-    Protected current-schema releases never load this checkout policy: their
-    registry and helper are fetched from the two explicitly pinned commits.
-    """
+def _preflight_ordinary_launchd_policy(manifest_path: Path, helper: Path) -> None:
+    """Run the immutable ordinary transaction's staged policy before handoff."""
     import runpy
 
-    policy = runpy.run_path(str(ROOT / "scripts/launchd_deploy_helper.py"))
+    payload = json.loads(manifest_path.read_text())
+    ordinary = payload.get("ordinary_forward_migration")
+    if (
+        not isinstance(ordinary, dict)
+        or ordinary.get("helper_path") != str(helper)
+        or helper.is_symlink()
+        or not helper.is_file()
+        or ordinary.get("helper_sha256") != _file_sha256(helper)
+    ):
+        raise SystemExit("ordinary policy helper does not match retained transaction evidence")
+    policy = runpy.run_path(str(helper))
     policy["ordinary_forward_policy_applies"](policy["Manifest"].load(manifest_path))
 
 
@@ -11061,6 +11082,16 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
 
 
+def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:
+    prefix = f".{evidence.name}."
+    with os.scandir(evidence.parent) as entries:
+        return tuple(
+            evidence.parent / entry.name
+            for entry in entries
+            if entry.name.startswith(prefix)
+        )
+
+
 def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False) -> None:
     mode_name = "current-schema" if current_schema else "paired"
     mode_key = "current_schema_upgrade" if current_schema else "paired_database_upgrade"
@@ -11163,15 +11194,15 @@ def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False
                     if backup.parent != staging or proof.parent != staging or proof.exists() or proof.is_symlink():
                         raise SystemExit("abandonment allocation context is ambiguous")
                     capacity_evidence = staging / "capacity.json"
-                    cleanup_paths = {backup, reserve, capacity_evidence}
-                    for evidence in (capacity_evidence, proof):
-                        cleanup_paths.update(evidence.parent.glob(f".{evidence.name}.*"))
-                    for allocation in (backup, reserve):
-                        cleanup_paths.update(
-                            allocation.with_name(allocation.name + suffix)
-                            for suffix in ("-journal", "-wal", "-shm")
-                        )
                     try:
+                        cleanup_paths = {backup, reserve, capacity_evidence}
+                        for evidence in (capacity_evidence, proof):
+                            cleanup_paths.update(_atomic_write_temporary_paths(evidence))
+                        for allocation in (backup, reserve):
+                            cleanup_paths.update(
+                                allocation.with_name(allocation.name + suffix)
+                                for suffix in ("-journal", "-wal", "-shm")
+                            )
                         for allocation in cleanup_paths:
                             if allocation.is_symlink():
                                 raise OSError("abandonment allocation is symlink")
@@ -11483,7 +11514,7 @@ def launchd_prod_deploy(
         ordinary_forward_migration = (
             prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT
             and not controller.current_schema_upgrade
-            and (previous_identity is not None or Path(candidate_database_path).exists())
+            and Path(candidate_database_path).exists()
         )
         if controller.current_schema_upgrade or ordinary_forward_migration:
             migration_registry = staging / "migrations.rs"
@@ -11592,7 +11623,7 @@ def launchd_prod_deploy(
         _write_json_atomic(staging / "manifest.json", manifest)
         (staging / "manifest.json").chmod(0o400)
         if ordinary_forward_migration:
-            _preflight_ordinary_launchd_policy(staging / "manifest.json")
+            _preflight_ordinary_launchd_policy(staging / "manifest.json", helper)
         retained_artifacts = [
             candidate_binary, candidate_plist, helper, helper_plist, staging / "manifest.json",
         ]
@@ -12220,7 +12251,7 @@ def cmd_prod_deploy(
         print()
 
     if env == "launchd":
-        if controller.enabled or controller.prepared_artifact is not None:
+        if controller.enabled or controller.prepared_artifact is not None or controller.current_schema_upgrade:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(
@@ -12569,7 +12600,10 @@ def main():
     deploy_parser = prod_sub.add_parser(
         "deploy",
         help="Deploy local HEAD, or use --release TAG|latest for a published macOS release",
-        epilog="Positional versions were removed; use --release vX.Y.Z (there is no local build-from-tag mode).",
+        epilog=("Positional versions were removed; use --release vX.Y.Z (there is no local build-from-tag mode). "
+                "Protected macOS launchd release upgrade: --release TAG --expected-full-commit CANDIDATE_SHA "
+                "--controller-source-commit CONTROLLER_SHA --current-schema-upgrade. "
+                "Use an exact tag and distinct full lowercase SHAs; no controller-mode flags are required."),
     )
     deploy_parser.add_argument(
         "--release", metavar="TAG|latest",
@@ -12593,7 +12627,7 @@ def main():
     deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
-    deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
+    deploy_parser.add_argument("--expected-full-commit", help="Exact full lowercase candidate SHA for --prepared-artifact or protected --release upgrade")
     upgrade_group = deploy_parser.add_mutually_exclusive_group()
     upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
     upgrade_group.add_argument("--current-schema-upgrade", action="store_true", help="Explicit protected current-schema database upgrade")

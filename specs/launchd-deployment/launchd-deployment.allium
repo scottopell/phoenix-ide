@@ -371,11 +371,15 @@ external entity TargetService {
 --   registry with the named 126/127/128 entries defined by current_schema_preflight_is_valid.
 --   The complete registry and SHA-256 digest are immutable evidence bound to the
 --   candidate identity/configuration and helper, re-verified before activation
---   and forward recovery. Different, missing or newer registries reject.
+--   and forward recovery. Pre-handoff admission executes the hash/path-bound
+--   staged helper, never an ambient checkout. Different, missing or newer registries reject.
 --   No standalone database backup is required.
 -- ordinary_pending_migrations_admitted(transaction) -> Boolean
---   True for protected transactions or no pending migrations. Ordinary pending
---   migrations require ordinary_forward_boundary_qualified (exact 123 -> 128).
+--   True for protected transactions, an absent candidate database path, or no
+--   pending migrations. An absent path includes a switch from a predecessor's
+--   different database: captured predecessor configuration still governs ordinary
+--   artifact rollback. An existing database is guarded even on first install.
+--   Ordinary pending migrations require ordinary_forward_boundary_qualified (exact 123 -> 128).
 --   Protected exact 114 -> 128 admission does not qualify an ordinary interval.
 --   Unknown or unqualified pending intervals reject before runtime disruption.
 -- OrdinaryPendingMigrationsRejected(transaction)

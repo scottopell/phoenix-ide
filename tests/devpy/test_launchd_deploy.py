@@ -1964,7 +1964,7 @@ class PreparationTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "source_kind": "prepared_artifact",
-                                manifest_key: {},
+                                manifest_key: mode_evidence(transaction, manifest_key),
                             }
                         )
                     )
@@ -3200,11 +3200,21 @@ class PreparationTests(unittest.TestCase):
             ), mock.patch.object(
                 self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
             ), mock.patch.object(
-                self.dev, "_fsync_directory", side_effect=OSError("fsync failed")
-            ):
+                self.dev, "_fsync_directory",
+                side_effect=[OSError("fsync failed"), None],
+            ) as fsync_directory:
                 with self.assertRaisesRegex(OSError, "fsync failed"):
                     self.dev._release_launchd_deploy_claim("owner")
-            self.assertEqual(active.read_text().strip(), "owner")
+            self.assertEqual(fsync_directory.call_args_list, [mock.call(active.parent)] * 2)
+            self.assertEqual(active.read_text(), "owner\n")
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(
+                self.dev, "_fsync_directory",
+                side_effect=[OSError("unlink fsync failed"), OSError("restored claim fsync failed")],
+            ) as fsync_directory:
+                with self.assertRaisesRegex(OSError, "restored claim fsync failed"):
+                    self.dev._release_launchd_deploy_claim_unlocked("owner")
+            self.assertEqual(fsync_directory.call_args_list, [mock.call(active.parent)] * 2)
+            self.assertEqual(active.read_text(), "owner\n")
 
     def test_symlinked_manifest_is_unknown_and_retained_by_pruning(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4772,12 +4782,25 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
     def test_classifier_rejects_empty_missing_and_wrong_type_mode_fields(self):
         for mode, source, kind in (
             ("paired_database_upgrade", "prepared_artifact", self.dev.DeployManifestKind.PAIRED),
+            ("current_schema_upgrade", "prepared_artifact", self.dev.DeployManifestKind.CURRENT_SCHEMA),
             ("current_schema_upgrade", "published_release", self.dev.DeployManifestKind.CURRENT_SCHEMA),
             ("ordinary_forward_migration", "published_release", self.dev.DeployManifestKind.ORDINARY_FORWARD),
         ):
             complete = mode_evidence(self.staging, mode)
             self.manifest.write_text(json.dumps({"source_kind": source, mode: complete}))
             self.assertIs(self.dev._deploy_manifest_kind(self.staging), kind)
+            loadable = self.staging / "loadable.json"
+            loadable.write_text(json.dumps(dataclasses.asdict(make_manifest(self.staging)) | {
+                "source_kind": source, mode: complete,
+            }))
+            loaded = helper.Manifest.load(loadable)
+            self.assertEqual(dataclasses.asdict(getattr(loaded, mode)), complete)
+            self.write_status("committed", source_kind=source, prepared_mode=(
+                kind.value if kind in {self.dev.DeployManifestKind.PAIRED, self.dev.DeployManifestKind.CURRENT_SCHEMA} else None
+            ))
+            self.assertTrue(self.dev._status_is_terminal_for_owner(
+                self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES,
+            ))
             malformed = [{}, [], "", False, 0]
             for field in complete:
                 malformed.append({key: value for key, value in complete.items() if key != field})
@@ -4788,6 +4811,15 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
                     self.manifest.write_text(json.dumps({"source_kind": source, mode: value}))
                     self.assertIs(self.dev._deploy_manifest_kind(self.staging), self.dev.DeployManifestKind.UNKNOWN)
                     self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+                    self.assertFalse(self.dev._status_is_terminal_for_owner(
+                        self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES,
+                    ))
+                    for admission in (self.dev._claim_launchd_deploy, self.dev._claim_launchd_restart):
+                        with mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", self.root / "restart"), mock.patch.object(
+                            self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", self.root / "restart-active",
+                        ), self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                            admission("new-operation")
+                        self.assertEqual(self.active.read_text(), "protected\n")
 
     def test_controller_admission_rejects_status_source_mode_cross_matrix(self):
         for mode in ("paired_database_upgrade", "current_schema_upgrade"):
@@ -4905,6 +4937,40 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
                 self.assertTrue(all(not path.exists() for path in allocations))
                 self.assertTrue(self.dev._status_is_terminal_for_owner(self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES))
 
+    def test_pre_handoff_cleanup_enumeration_failure_retains_claim(self):
+        for mode, source in (
+            ("paired_database_upgrade", "prepared_artifact"),
+            ("current_schema_upgrade", "prepared_artifact"),
+            ("current_schema_upgrade", "published_release"),
+        ):
+            with self.subTest(mode=mode, source=source):
+                current_schema = mode == "current_schema_upgrade"
+                upgrade = mode_evidence(self.staging, mode)
+                self.manifest.write_text(json.dumps({
+                    "transaction_id": "protected", "helper_label": self.payload["helper_label"],
+                    "source_kind": source, mode: upgrade,
+                }))
+                self.write_status("prepared", source_kind=source,
+                                  prepared_mode="current_schema" if current_schema else "paired",
+                                  preparing_pid=123)
+                backup = Path(upgrade["backup_path"])
+                backup.write_bytes(b"allocation")
+                with mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(
+                    self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ) as run, mock.patch.object(
+                    self.dev.os, "scandir", side_effect=PermissionError("enumeration denied"),
+                ):
+                    with self.assertRaisesRegex(SystemExit, "cleanup is incomplete"):
+                        self.dev.cmd_prod_recover_paired("protected", current_schema=current_schema)
+                self.assertEqual(run.call_count, 1)
+                self.assertIn("--probe-service-absence", run.call_args.args[0])
+                self.assertEqual(self.active.read_text(), "protected\n")
+                self.assertTrue(backup.exists())
+                pending = json.loads(self.status.read_text())
+                self.assertEqual(pending["state"], "precondition_cleanup_pending")
+                self.assertFalse(pending["precondition_cleanup_completed"])
+                self.assertIn("enumeration denied", pending["cleanup_failure"])
+
     def test_pre_handoff_release_cleanup_failure_retains_claim_and_cleanup_only_guidance(self):
         self.write_status("prepared", preparing_pid=123)
         reserve = self.root / ".prod.db.restore-protected"
@@ -4995,7 +5061,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_controller_durability_test")
 
     @contextlib.contextmanager
-    def deployment(self, *, paired=True, current=False, release=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False):
+    def deployment(self, *, paired=True, current=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             root = Path(td)
             deploy = root / "deploy"
@@ -5008,6 +5074,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             env = {"PATH": "/test", "PHOENIX_PASSWORD": "test-only"}
             plist = plistlib.dumps({"EnvironmentVariables": env})
             if predecessor:
+                (root / "prod.db").touch()
                 (installed / "phoenix-ide").write_bytes(b"previous")
                 target_plist.write_bytes(plist)
             identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
@@ -5027,7 +5094,8 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             )
             if release:
                 controller = dataclasses.replace(
-                    controller, enabled=True, backend="launchd", exact_release_tag="v2.0.0",
+                    controller, enabled=not public, backend=None if public else "launchd",
+                    exact_release_tag=None if public else "v2.0.0",
                     expected_full_commit=identity.git_sha,
                     controller_source_commit="c" * 40 if current else None,
                 )
@@ -5106,7 +5174,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 "_prepare_prepared_artifact": {"return_value": prepared},
                 "_prepare_local_candidate": {"return_value": prepared},
                 "_prepare_release_candidate": {"return_value": prepared},
-                "_preflight_ordinary_launchd_policy": {"side_effect": lambda path: events.append(("ordinary_policy", path))},
+                "_preflight_ordinary_launchd_policy": {"side_effect": lambda path, staged_helper: events.append(("ordinary_policy", path, staged_helper))},
                 "_binary_identity": {"return_value": identity},
                 "_resolve_rollback_identity": {"return_value": (previous, "http://localhost:8031/api/version", False, True)},
                 "_materialize_helper": {"side_effect": lambda _commit, path, _kind: path.write_text("# retained helper\n")},
@@ -5124,9 +5192,9 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(self.dev.subprocess, "run", side_effect=run))
             yield staging, controller, events
 
-    def test_release_current_schema_fetches_distinct_pinned_helper_and_release_registry(self):
+    def test_release_current_schema_fetches_distinct_pinned_helper_and_release_registry(self, public=False):
         materialize = self.dev._materialize_helper
-        with self.deployment(paired=False, current=True, release=True, dirty=True) as (staging, controller, events), \
+        with self.deployment(paired=False, current=True, release=True, public=public, dirty=True) as (staging, controller, events), \
              mock.patch.object(self.dev.sys, "platform", "darwin"), \
              mock.patch.object(self.dev, "_materialize_helper", side_effect=materialize), \
              mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=AssertionError("dirty checkout policy must not run")) as policy, \
@@ -5152,6 +5220,9 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             ])
             self.assertFalse(any(event[0] == "command" and event[1][0] == "git" for event in events))
 
+    def test_public_release_current_schema_preserves_distinct_helper_and_release_provenance(self):
+        self.test_release_current_schema_fetches_distinct_pinned_helper_and_release_registry(public=True)
+
     def test_ordinary_controller_preflight_failure_prevents_handoff_for_all_sources(self):
         for release in (False, True):
             with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events), \
@@ -5159,7 +5230,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=RuntimeError("unqualified interval")) as policy:
                 with self.assertRaisesRegex(RuntimeError, "unqualified interval"):
                     self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
-                policy.assert_called_once_with(staging / "manifest.json")
+                policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
                 self.assertIn(("status", "precondition_failed"), events)
                 self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
 
@@ -5186,12 +5257,13 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 with mock.patch.object(self.dev.sys, "platform", "darwin"), \
                      mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(env, None)), \
                      mock.patch.object(self.dev, "generate_launchd_plist", return_value=plist), \
+                     mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_bytes(Path(helper.__file__).read_bytes())), \
                      mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
                      mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=preflight) as policy:
                     with self.assertRaisesRegex(RuntimeError, "ordinary pending migration interval is not qualified"):
                         self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
 
-                policy.assert_called_once_with(staging / "manifest.json")
+                policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
                 manifest = json.loads((staging / "manifest.json").read_text())
                 self.assertEqual(manifest["source_kind"], "published_release" if release else "local_head")
                 self.assertIsNone(manifest["previous"])
@@ -5207,6 +5279,50 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 self.assertIn(("status", "precondition_failed"), events)
                 self.assertNotIn(("status", "prepared"), events)
                 self.assertFalse(any(event[0] == "command" and event[1][0] == "launchctl" for event in events))
+
+    def test_fresh_database_path_switch_preserves_predecessor_rollback(self):
+        for release in (False, True):
+            with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events):
+                old_database = self.dev.PROD_DB_PATH
+                old_database.write_bytes(b"predecessor data")
+                new_database = old_database.with_name("fresh.db")
+                old_env = {"PATH": "/test", "PHOENIX_DB_PATH": str(old_database)}
+                self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": old_env}))
+                new_env = old_env | {"PHOENIX_DB_PATH": str(new_database)}
+                with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(new_env, None)), \
+                     mock.patch.object(self.dev, "generate_launchd_plist", return_value=plistlib.dumps({"EnvironmentVariables": new_env}).decode()), \
+                     mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=AssertionError("fresh DB has no migration interval")) as policy:
+                    self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+                policy.assert_not_called()
+                manifest = helper.Manifest.load(staging / "manifest.json")
+                self.assertIsNone(manifest.ordinary_forward_migration)
+                self.assertFalse((staging / "migrations.rs").exists())
+                self.assertFalse(new_database.exists())
+                self.assertIsNotNone(manifest.previous)
+
+                def health(manifest_arg, expected, **_kwargs):
+                    if expected == manifest.expected:
+                        new_database.write_bytes(b"candidate data")
+                        raise helper.ActivationError("candidate health failed")
+                    self.assertEqual(expected, manifest.previous)
+                    restored = plistlib.loads(Path(manifest_arg.target_plist).read_bytes())
+                    self.assertEqual(restored["EnvironmentVariables"]["PHOENIX_DB_PATH"], str(old_database))
+                    self.assertEqual(old_database.read_bytes(), b"predecessor data")
+
+                with mock.patch.object(helper, "validate_manifest_identities"), \
+                     mock.patch.object(helper, "Launchctl") as launchctl, \
+                     mock.patch.object(helper, "wait_for_identity", side_effect=health):
+                    launchctl.return_value.stop.return_value = 123
+                    state = helper.activate(manifest)
+                self.assertEqual(state, "activation_failed_rolled_back")
+                self.assertEqual(launchctl.return_value.start.call_count, 2)
+                self.assertEqual(Path(manifest.target_binary).read_bytes(), b"previous")
+                self.assertEqual(new_database.read_bytes(), b"candidate data")
+                self.assertEqual(old_database.read_bytes(), b"predecessor data")
+                self.assertTrue(helper.status_is_durable_terminal(manifest))
+                self.assertTrue(helper.release_durable_terminal_claim(manifest))
+                self.assertFalse(Path(manifest.active_path).exists())
 
     def test_empty_first_install_skips_migration_policy_for_local_and_release(self):
         for release in (False, True):
@@ -5526,6 +5642,65 @@ class PreparedArtifactTests(unittest.TestCase):
         deploy.assert_called_once_with(None, controller=controller)
         check.assert_not_called()
 
+    def test_public_current_schema_release_command_parses_and_dispatches_without_hidden_flags(self):
+        argv = ["dev.py", "prod", "deploy", "--release", "v2.0.0",
+                "--expected-full-commit", "a" * 40,
+                "--controller-source-commit", "c" * 40, "--current-schema-upgrade"]
+        with mock.patch.object(self.dev.sys, "argv", argv), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check, \
+             mock.patch.object(self.dev.sys.stdout, "reconfigure"), \
+             mock.patch.object(self.dev.sys.stderr, "reconfigure"):
+            self.dev.main()
+        options = deploy.call_args.kwargs["controller"]
+        self.assertEqual(deploy.call_args.args, ("v2.0.0",))
+        self.assertFalse(options.enabled)
+        self.assertIsNone(options.backend)
+        self.assertIsNone(options.exact_release_tag)
+        self.assertIsNone(options.expected_asset_name)
+        self.assertIsNone(options.expected_asset_sha256)
+        self.assertEqual(options.expected_full_commit, "a" * 40)
+        self.assertEqual(options.controller_source_commit, "c" * 40)
+        self.assertTrue(options.current_schema_upgrade)
+        check.assert_not_called()
+
+    def test_public_protected_release_option_matrix(self):
+        valid = self.dev.ProdDeployControllerOptions(
+            expected_full_commit="a" * 40, controller_source_commit="c" * 40,
+            current_schema_upgrade=True,
+        )
+        invalid = [
+            (None, valid), ("latest", valid), ("stable", valid), ("v2", valid),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit=None)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="c" * 12)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="C" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="a" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, expected_full_commit=None)),
+            ("v2.0.0", dataclasses.replace(valid, expected_full_commit="a" * 12)),
+            ("v2.0.0", dataclasses.replace(valid, expected_full_commit="A" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, current_schema_upgrade=False)),
+            ("v2.0.0", dataclasses.replace(valid, paired_database_upgrade=True)),
+            ("v2.0.0", dataclasses.replace(valid, prepared_artifact=Path("prepared"))),
+        ]
+        for release, options in invalid:
+            for entry in (self.dev.cmd_prod_deploy, self.dev.launchd_prod_deploy):
+                with self.subTest(release=release, options=options, entry=entry.__name__), \
+                     mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+                     mock.patch.object(self.dev, "cmd_check") as check, self.assertRaises(SystemExit):
+                    entry(release, controller=options)
+                claim.assert_not_called()
+                check.assert_not_called()
+        for platform, backend in (("linux", "native"), ("darwin", "daemon")):
+            with self.subTest(platform=platform, backend=backend), \
+                 mock.patch.object(self.dev.sys, "platform", platform), \
+                 mock.patch.object(self.dev, "detect_prod_env", return_value=backend), \
+                 mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+                 self.assertRaisesRegex(SystemExit, "only by macOS launchd"):
+                self.dev.cmd_prod_deploy("v2.0.0", controller=valid)
+            claim.assert_not_called()
+
     def test_protected_release_controller_option_matrix(self):
         valid = self.dev.ProdDeployControllerOptions(
             enabled=True, backend="launchd", exact_release_tag="v2.0.0",
@@ -5540,7 +5715,7 @@ class PreparedArtifactTests(unittest.TestCase):
             check.assert_not_called()
         invalid = (
             (None, valid),
-            ("v2.0.0", dataclasses.replace(valid, enabled=False)),
+            ("v2.0.0", dataclasses.replace(valid, enabled=False)),  # hidden bindings without controller mode
             ("v2.0.0", dataclasses.replace(valid, controller_source_commit=None)),
             ("v2.0.0", dataclasses.replace(valid, controller_source_commit="c" * 12)),
             ("v2.0.0", dataclasses.replace(valid, controller_source_commit="C" * 40)),
