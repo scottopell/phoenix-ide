@@ -2,7 +2,7 @@
 
 ## Scope
 
-Safe replacement of Phoenix's native macOS production LaunchAgent from exact checked local `HEAD`, an immutable published GitHub release, or the explicitly selected protected prepared-artifact paired upgrade under REQ-LDD-017. Linux deployment modes are outside this specification.
+Safe replacement of Phoenix's native macOS production LaunchAgent from exact checked local `HEAD`, an immutable published GitHub release, or an explicitly selected protected upgrade: prepared-artifact paired under REQ-LDD-017 or current-schema under REQ-LDD-019. Linux deployment modes are outside this specification.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ While an activation or unresolved transaction owns the host deployment claim, th
 
 ### REQ-LDD-004 — Immutable, secret-safe handoff
 
-For ordinary sources, the activation helper shall be sourced from the selected immutable commit. For prepared-artifact paired sources, it shall be sourced from the separately recorded verified clean controller commit, which may differ from the candidate commit. The helper shall consume only stable host-resident files and a manifest containing source identity, candidate and previous runtime identities and endpoints, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
+For ordinary sources, the activation helper shall be sourced from the selected immutable commit. For prepared-artifact paired/current-schema sources, it shall be sourced from the separately recorded verified clean controller commit, which may differ from the candidate commit. For the protected published-release current-schema transition under REQ-LDD-019, it SHALL instead be sourced from the explicitly pinned full controller commit, not the candidate release commit; the retained helper path, bytes and SHA-256 SHALL be immutable transaction evidence. The helper shall consume only stable host-resident files and a manifest containing source identity, candidate and previous runtime identities and endpoints, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
 
 ### REQ-LDD-005 — Atomic artifact replacement
 
@@ -35,6 +35,8 @@ When changing the target job state, the system shall check launchctl exit status
 A deployment shall succeed only when the target job is running with a new PID and the credential-free `/api/version` endpoint reports both the expected package version and complete 40-character lowercase embedded git SHA. The candidate SHA shall equal the selected full source commit exactly; a matching prefix shall not establish candidate identity.
 
 ### REQ-LDD-008 — Verified rollback
+
+Protected current-schema transactions, including published-release source kind, SHALL obey REQ-LDD-021–022's pre-invocation-only predecessor recovery boundary. Qualified ordinary migration activation SHALL obey REQ-LDD-023's candidate-start boundary. The artifact-rollback rules below SHALL NOT override those restrictions.
 
 For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. The unconditional artifact-rollback attempt below applies to ordinary sources.
 
@@ -56,7 +58,7 @@ When status or deployment encounters a stale nonterminal transaction, the system
 
 The local command shall deploy exact local `HEAD` after checks and compilation and require the candidate to embed that complete 40-character lowercase commit SHA. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry, and require its complete 40-character lowercase embedded git SHA to equal that commit exactly; it shall not run repository checks, dependency installation, worktree mutation, or compilation.
 
-The explicitly selected prepared-artifact source SHALL be admitted only under REQ-LDD-017, without local rebuild or ad-hoc resigning; it SHALL NOT expand ordinary local/release rollback guarantees. Retained mode evidence SHALL use an exact source kind: paired/current-schema modes require `prepared_artifact`, while ordinary-forward mode requires `local_head` or `published_release`; missing or unknown source kinds SHALL fail closed.
+The explicitly selected prepared-artifact source SHALL be admitted only under REQ-LDD-017, without local rebuild or ad-hoc resigning; it SHALL NOT expand ordinary local/release rollback guarantees. Retained mode evidence SHALL use an exact source kind: paired mode requires `prepared_artifact`; current-schema mode requires `prepared_artifact` for the prepared admissions or `published_release` only for the exact-114 transition under REQ-LDD-019; ordinary-forward mode requires `local_head` or `published_release`. Source kind and mode SHALL remain coherent in manifests, status, cleanup, finalization and recovery; missing, unknown, or contradictory evidence SHALL fail closed.
 
 WHEN `latest` is requested,
 THE release command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
@@ -66,7 +68,7 @@ THE release command SHALL require the tag, GitHub prerelease metadata, full embe
 
 ### REQ-LDD-012 — Unambiguous command surface
 
-The deployment command shall accept `prod deploy` for local `HEAD`, `prod deploy --release TAG|latest` for published releases, and the complete three-option prepared-artifact paired command under REQ-LDD-017, and shall reject positional versions with migration guidance rather than building a local source tag.
+The deployment command shall accept `prod deploy` for local `HEAD`, `prod deploy --release TAG|latest` for ordinary published releases, the complete three-option prepared-artifact paired command under REQ-LDD-017, and explicit protected current-schema selection under REQ-LDD-019, and shall reject positional versions with migration guidance rather than building a local source tag.
 
 ### REQ-LDD-013 — Disposable integration safety
 
@@ -108,18 +110,23 @@ A failure limited to plist publication or deployed-identity durability after pre
 ### REQ-LDD-018 — Committed paired finalization without runtime or database mutation
 
 WHEN the operator invokes `prod finalize-paired TXN` for interrupted committed paired finalization,
-THE SYSTEM SHALL use only the retained byte-bound helper and immutable transaction under mutual exclusion, require its matching ownership claim and confirmed activation-helper absence, and verify the currently running exact committed candidate binary, identity and private loaded configuration before any mutation.
+THE SYSTEM SHALL use only the retained byte-bound helper and immutable transaction under mutual exclusion, require its matching ownership claim and confirmed activation-helper absence, and verify the running exact committed candidate binary, identity and private loaded configuration before any mutation.
 
 THE SYSTEM SHALL retry only atomic publication of that captured candidate plist and removal/fsync of the transaction-owned temporary restore reservation, retain authoritative audit backup/proof, and persist pending status/claim through interruption or error. It SHALL clear pending and release only the owned claim after durable completion. An already completed rerun SHALL verify that same candidate/configuration and produce an idempotent result without applying ambient configuration.
 
 THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an older runtime, or generalize this operation into downgrade or cross-version recovery. Unknown, stale, mismatched, or absent evidence SHALL refuse without releasing ownership.
 
-### REQ-LDD-019: Explicit current-schema prepared-artifact mode
+### REQ-LDD-019: Explicit protected current-schema mode
 
 **Condition:** When an authorized operator selects a prepared artifact to replace a production database whose complete ordered ledger is either the qualified migration-123 baseline or exactly equal to the qualified migration-128 candidate registry,
-**System:** the deployment controller SHALL require an explicit current-schema mode distinct from paired legacy upgrade, preserve every prepared-artifact receipt/signature/identity check, bind the retained controller helper and candidate migration registry by exact path and SHA-256, reject release and runtime-only sources, and fail closed for a missing, partial, unknown, mismatched, or newer migration ledger.
+**System:** the deployment controller SHALL require an explicit current-schema mode distinct from paired legacy upgrade, preserve every prepared-artifact receipt/signature/identity check, bind the retained controller helper and candidate migration registry by exact path and SHA-256, reject release sources except for the exact protected published-release admission below, reject runtime-only sources, and fail closed for a missing, partial, unknown, mismatched, or newer migration ledger.
 
 **Rationale:** Relaxing the legacy eligibility gate would make incompatible database families indistinguishable and would weaken the signed-artifact handoff.
+
+**Condition:** When an authorized operator explicitly selects a published release in protected current-schema mode,
+**System:** the controller SHALL admit exactly a source database whose complete ordered ledger equals the candidate registry's complete prefix through migration 114, with no missing, extra, or differently named entries, and exactly the migration-128 target registry qualified by REQ-COMP-012. It SHALL reject prepared/local sources for this admission, release aliases such as `latest`, first install, database path changes, any other source baseline, and any different or newer target registry before disruption.
+
+The controller SHALL require an exact release tag, expected full release commit, full embedded version and SHA, host-target asset and published checksum to agree; source kind SHALL remain `published_release`. The candidate binary and complete migration registry SHALL come from that release commit. The activation helper SHALL come from a separately explicit full controller commit, not the candidate release commit or ambient checkout; its retained path, bytes, SHA-256 and controller commit SHALL be bound independently in the immutable handoff and re-verified before migration, activation and recovery. This admission SHALL preserve captured installed configuration and the same canonical database path and SHALL traverse REQ-LDD-020–022 and REQ-LDD-024 without a weaker release-specific lifecycle. Prepared exact-123/exact-target admissions and ordinary exact-123-to-128 qualification SHALL remain unchanged; no source range or generic release compatibility is authorized.
 
 ### REQ-LDD-020: Current-schema snapshot and capacity proof
 
@@ -152,6 +159,9 @@ THE SYSTEM SHALL NOT stop, bootstrap, restart, touch the database, restore an ol
 **Rationale:** Current-schema committed-state finalization needs a compatible candidate runtime, whereas paired legacy finalization remains publication-only and never bootstraps a runtime.
 
 ### REQ-LDD-023: Ordinary forward activation failure boundary
+
+**Condition:** When ordinary launchd deployment detects pending migrations outside an explicitly qualified ordinary interval,
+**System:** the controller SHALL reject deployment before disrupting the runtime. It SHALL NOT silently fall back to unqualified runtime-artifact rollback or treat the protected published-release exact-114 transition as ordinary qualification.
 
 **Condition:** When ordinary in-place launchd deployment detects the exact migration-123 baseline and exact migration-128 candidate registry defined by REQ-COMP-012,
 **System:** the controller SHALL retain the complete candidate registry and its SHA-256 digest as immutable transaction evidence bound to the exact candidate and helper without requiring a standalone database backup; SHALL re-verify that evidence before activation; SHALL reject any different, missing, or newer registry; and the helper SHALL preserve ordinary predecessor rollback only for failures before candidate startup is attempted.
