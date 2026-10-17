@@ -167,3 +167,18 @@ Conflict resolutions preserve both authorities rather than selecting one side:
 Local bounded verification: genuine composite TypeScript check and 689 focused tests across 18 UI files passed; resolved-owner ESLint passed. Standalone `rustfmt` parsed/formatted the affected Rust files without compiling. A bounded in-memory SQLite check demonstrated main's ordinary-only optimized query returning zero coordinator rows, then the merged optimized query matching the full-row oracle with both coordinator segments. Rust source regressions compose opening preparation with authenticated/shared event projection and compare coordinator optimized/oracle pages.
 
 Not executed locally: Rust compilation/tests, generated-type regeneration, full UI suite, actual app builds, native browser capture, collector/export qualification, or server startup. These remain hosted successor gates. Existing fixture warnings are retained; one source-fixture timing assertion failed in an early combined run, then passed isolated and in the final owning/full focused runs. No shared workflow, harness, or diagnostic changes are part of this packet.
+
+### Qualified-app provenance closure
+
+The next product successor also merges exact qualified app `35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f` into integration `1adc16f50e29969bfdc5c58537278c7494b9a228`. The donor and independently qualified app are not identical: their ten-path difference must be reconciled explicitly.
+
+- `phoenix-db/src/lib.rs`: preserve the qualified test call's string-path argument to coordinator-scope initialization.
+- `phoenix-ide/src/opening_qualifier_tests.rs`: retain private `0700` qualification home, fresh UUID password, create-new `0600` credential file, server password environment, and credential-file receipt. This closes a genuine omission from the first current-main integration.
+- `phoenix-ide/src/runtime/close_retirement.rs`: current main already contains the qualified writer-probe injection and its fail-closed external-writer tests; retain main unchanged.
+- `phoenix-tools/src/bash.rs` and `bash/operations.rs`: current main already contains the qualified injected child-exit/drain transition test seams; retain main unchanged.
+- The qualified deletion of `ui/scripts/probe-view-keepalive.mjs` and `ui/scripts/probe-view-keepalive.test.mjs` is retained. Both main and qualified app omit them; they remained in the donor integration until this provenance audit explicitly removed them.
+- `tests/e2e/run.py`: current main already retains the qualified canonical worker-root and restart-CWD assertions; retain it unchanged, with no new harness edits.
+- `MessageComponents.test.tsx`: retain the qualified synchronous Mermaid disclosure assertion against the existing synchronous test mock.
+- `productConversation/renderFixture.test.tsx`: retain the qualified async reaction-return click, actual historical-row admission, and animation-frame settlement before focus assertions, alongside the integrated current-main event fixtures.
+
+The qualified merge resurrects old-numbered ADR copies through common ancestry; only those exact duplicate copies are removed, retaining canonical 117–119 and main's existing 107–109. The current-main documentation resolutions and 116/115 records remain intact. No previously qualified commit, branch, failed receipt, or artifact is rewritten. The resulting candidate still requires fresh hosted Rust/codegen/build/browser qualification; parentage is provenance, not inherited execution clearance.

@@ -3948,7 +3948,7 @@ describe('conversation disclosure integration', () => {
     expect(details.open).toBe(true);
   });
 
-  it('reveals only the active Mermaid disclosure and preserves a manual close on updates', async () => {
+  it('reveals only the active Mermaid disclosure and preserves a manual close on updates', () => {
     const disclosure = (title: string, language: string) => `<details><summary>${title}</summary>\n\n\`\`\`${language}\ngraph TD; A[target] --> B[target]\n\`\`\`\n\n</details>`;
     const text = [disclosure('First target', 'mermaid'), disclosure('Second', 'mermaid'), disclosure('Ordinary', 'ts')].join('\n\n');
     const blocks: ContentBlock[] = [{ type: 'text', text }, { type: 'text', text }];
@@ -3969,7 +3969,7 @@ describe('conversation disclosure integration', () => {
     expect(wrapper).not.toBeNull();
     expect(wrapper.closest('details')).toHaveAttribute('open');
     expect(wrapper).toBeVisible();
-    await waitFor(() => expect(wrapper.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull());
+    expect(wrapper.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull();
     expect(wrapper.textContent).not.toContain('[object Object]');
     details[0]!.open = false;
     rerender(view(start));
