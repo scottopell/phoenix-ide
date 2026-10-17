@@ -165,14 +165,14 @@ jobs:
           output="$RUNNER_TEMP/observation-qualification/candidate"
           mkdir -p "$output/bin"
           git rev-parse HEAD HEAD^{tree} > "$output/qualifier-source.txt"
-          candidate=dfcd8b477468b4d94c9ec2830a1e92bf5bcdb62b
+          candidate=d5700c84f2bc0e6fcb0833ad9ae4b3ba55828420
           attribution_base=2702d8389c2fc78ac2e528c876c35a1a7040d692
           base=f3893088b3cb224be9403f600173d5216e3a2f6b
           product=9ee218d4a33ebd4b94ea547d60caa62134edb960
           git fetch origin "$candidate" "$attribution_base" "$base" "$product"
           git checkout --detach "$candidate"
           test "$(git rev-parse HEAD)" = "$candidate"
-          test "$(git rev-parse HEAD^{tree})" = 245214c690262e51f3fa561a4eb5531558db1284
+          test "$(git rev-parse HEAD^{tree})" = 7fe2db41aa04c4cb1a6bc6a4877cb45733022e6b
           git rev-parse HEAD HEAD^{tree} > "$output/source.txt"
           git rev-parse "$base" "$base^{tree}" "$product" "$product^{tree}" "$attribution_base" "$attribution_base^{tree}" > "$output/parity-authorities.txt"
           cp docs/conversation-observation-source-parity.json docs/conversation-observation-composition.md docs/conversation-observation-attribution.md docs/conversation-observation-attribution.json "$output/"
@@ -250,16 +250,17 @@ jobs:
           python3 tests/devpy/test_observe.py -v 2>&1 | tee "$output/observation-mock-contracts.log"
           grep -E '^Ran 8 tests in ' "$output/observation-mock-contracts.log"
           grep -Fx 'OK' "$output/observation-mock-contracts.log"
-      - name: Require eight exact attribution and observation authority lib contracts
+      - name: Require ten exact IDE event and admission contracts plus one DB completion contract
         run: |
           set -euo pipefail
           output="$RUNNER_TEMP/observation-qualification/candidate"
           tests=(
-            observation_startup::attribution_tests::closes_associated_success_error_and_denial_before_body_drain
-            observation_startup::attribution_tests::cancellation_closes_request_and_child_without_claiming_response_ready
-            observation_startup::attribution_tests::dropping_pending_request_restores_dispatch_and_closes_parent_references
-            observation_startup::attribution_tests::startup_dispatch_captures_actual_product_detail_without_inheriting_default
-            observation_startup::attribution_tests::scoped_subscriber_does_not_replace_existing_default_or_log_unmatched_path
+            observation_startup::attribution_tests::actual_router_completes_success_error_and_denial_before_response_handoff
+            observation_startup::attribution_tests::actual_router_admission_error_completes_only_started_stages
+            observation_startup::attribution_tests::request_terminal_is_available_with_root_span_still_retained
+            observation_startup::attribution_tests::pending_drop_emits_one_cancel_per_started_stage_under_owner_not_ambient
+            observation_startup::attribution_tests::abort_is_observed_at_await_drop_not_a_sqlite_worker_completion
+            observation_startup::attribution_tests::private_filter_rejects_unrelated_events_and_unmatched_path_data
             api::application_state::tests::observation_requires_direct_loopback_even_for_public_routes
             api::application_state::tests::observation_cannot_extract_live_authority
             api::application_state::tests::shared_route_lookup_is_target_scoped
@@ -268,17 +269,35 @@ jobs:
           for selector in "${tests[@]}"; do
             log="$output/${selector##*::}.log"
             cargo test -p phoenix_ide --lib --features portable-ui "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
-            grep -F 'test result: ok. 1 passed; 0 failed;' "$log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
           done
-          grep -o 'observation_attribution_sample=.*' "$output/startup_dispatch_captures_actual_product_detail_without_inheriting_default.log" > "$output/synthetic-attribution-sample.txt"
-          python3 - "$output/synthetic-attribution-sample.txt" <<'PY'
+          selector=product_conversation_read::completion_tests::read_completion_reports_actual_result_or_await_drop_once_under_owner
+          log="$output/${selector##*::}.log"
+          cargo test -p phoenix-db --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
+          grep -o 'observation_attribution_sample=.*' "$output/actual_router_completes_success_error_and_denial_before_response_handoff.log" > "$output/synthetic-attribution-sample.txt"
+          python3 - "$output/synthetic-attribution-sample.txt" <<'PY' 2>&1 | tee "$output/synthetic-attribution-validation.log"
           import collections,json,sys
           from pathlib import Path
           lines=Path(sys.argv[1]).read_text().splitlines()
           assert len(lines)==1
           records=json.loads(lines[0].removeprefix('observation_attribution_sample='))
           assert isinstance(records,list) and records and 'SECRET' not in json.dumps(records)
-          expected={
+          # The source Capture predicate uses target; event metadata names are not JSON fields.
+          events=[record for record in records if record.get('target')=='phoenix::observation::completion']
+          terminals=[event for event in events if event['fields']['stage']=='observation.request']
+          assert len(terminals)==1 and events[-1]==terminals[0]
+          terminal=terminals[0]; fields=terminal['fields']; root=terminal['span']
+          assert set(fields)=={'stage','request_id','outcome','elapsed_us','status','response_ready'}
+          request_id=fields['request_id']
+          assert type(request_id) is int and 0<request_id<=2**64-1
+          assert fields['status']==200 and type(fields['status']) is int
+          assert fields['outcome']=='success' and fields['response_ready'] is True
+          assert root['name']=='observation.request' and root['request_id']==request_id
+          assert root['route']=='/api/product-conversations/:reference'
+          assert root['status']==200 and root['response_ready'] is True
+          # Actual-router success asserts 30 completions: one terminal and 29 stage events.
+          expected={stage:1 for stage in [
               'observation.request','observation.authorization','replay.admission',
               'observation.resolve_ordinary','observation.get_aggregate','observation.require_member',
               'observation.member.resolve_ordinary','observation.member.get_aggregate',
@@ -287,23 +306,30 @@ jobs:
               'product_conversation.resolve','product_conversation.aggregate',
               'product_conversation.close','product_conversation.message_page',
               'product_conversation.snapshot_read','product_conversation.rollback_read',
-              'observation.db.product','observation.db.topology',
-              'observation.db.read_member','observation.db.source',
-          }
-          counts=collections.Counter(record['span']['name'] for record in records)
-          assert set(counts)==expected and counts['observation.request']==1
-          root=next(record['span'] for record in records if record['span']['name']=='observation.request')
-          assert root['route']=='/api/product-conversations/:reference'
-          assert root['status']==200 and root['response_ready'] is True and type(root['request_id']) is int
+          ]}
+          expected.update({f'observation.db.{stage}':3 for stage in ['product','topology','read_member','source']})
+          counts=collections.Counter(event['fields']['stage'] for event in events)
+          assert len(events)==sum(expected.values())==30 and counts==expected
+          for event in events:
+              fields=event['fields']
+              assert fields['outcome']=='success'
+              assert type(fields['elapsed_us']) is int and 0<=fields['elapsed_us']<=2**64-1
+              if event is not terminal:
+                  assert set(fields)=={'stage','outcome','elapsed_us'}
+              roots=[span for span in event['spans'] if span.get('name')=='observation.request']
+              assert len(roots)==1 and roots[0]['request_id']==request_id
+              assert roots[0]['route']==root['route']
+          for stage in ['product','topology','read_member','source']:
+              assert any(event['fields']['stage']==f'observation.db.{stage}' and
+                         any(span.get('name')=='product_conversation.aggregate' for span in event['spans'])
+                         for event in events)
+          # CLOSE records remain privacy-checked diagnostics, never count/readiness authority.
           for record in records:
-              assert record['fields']['message']=='close'
-              assert isinstance(record['timestamp'],str)
-              assert all(isinstance(record['fields'][key],str) for key in ['time.busy','time.idle'])
+              if record not in events:
+                  assert record['fields']['message']=='close'
               for span in [record['span'],*record.get('spans',[])]:
                   assert set(span)<={'name','request_id','route','status','response_ready','open.id','product.reference'}
-              if record['span']['name']!='observation.request':
-                  assert any(span.get('name')=='observation.request' and span.get('request_id')==root['request_id'] for span in record['spans'])
-          print('synthetic attribution receipt: privacy, names, counts and request ancestry passed',json.dumps(counts,sort_keys=True))
+          print('synthetic attribution event receipt: privacy, exact completion inventory and request ancestry passed',json.dumps(counts,sort_keys=True))
           PY
       - name: Require real-binary startup and private-cwd portable asset contracts then retain one binary
         run: |
@@ -326,7 +352,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: current-task-observation-attribution-dfcd-portable
+          name: current-task-observation-attribution-events-d570-portable
           path: ${{ runner.temp }}/observation-qualification/
           if-no-files-found: warn
           retention-days: 7
