@@ -777,7 +777,9 @@ async fn portable_ui_serves_exact_built_entry_assets_from_private_cwd() {
                 return None;
             }
             let asset = tag.split("src=\"").nth(1)?.split('"').next()?;
-            (asset.starts_with("/assets/") && asset.ends_with(".js")).then_some(asset)
+            (asset.starts_with("/assets/")
+                && Path::new(asset).extension() == Some(std::ffi::OsStr::new("js")))
+            .then_some(asset)
         })
         .collect();
     assert!(
