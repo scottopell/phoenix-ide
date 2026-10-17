@@ -8253,6 +8253,60 @@ def _launch_systemd_activation(
         raise SystemExit("systemd transient activation unit did not start; staged claim released")
 
 
+def cmd_prod_recover_systemd_current(transaction_id: str) -> None:
+    if sys.platform != "linux" or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        raise SystemExit("systemd current recovery requires Linux and an exact transaction id")
+    _require_noninteractive_sudo_ready()
+    manifest = SYSTEMD_TRANSACTION_ROOT / transaction_id / "manifest.json"
+    subprocess.run([
+        *_noninteractive_sudo_prefix(), "systemd-run", "--collect", "--no-block",
+        "--unit", f"phoenix-deploy-recover-{transaction_id}",
+        "--property=Type=oneshot", "python3", str(manifest.parent / "helper.py"),
+        "recover-current", "--manifest", str(manifest),
+    ], check=True)
+
+
+SYSTEMD_PROTECTED_TAG = "v0.13.0-rc.4"
+SYSTEMD_PROTECTED_COMMIT = "3f0ba4602faa71ebad5088e1ffc856f4c7d511d9"
+SYSTEMD_PROTECTED_VERSION = "0.13.0-rc.4"
+SYSTEMD_PROTECTED_ASSET = "phoenix_ide-x86_64-unknown-linux-musl"
+SYSTEMD_PROTECTED_ASSET_SHA256 = "bcb74d565c828843596e5109ea9034a2b0e505aab4ba6c18c5cca8e116f5677e"
+SYSTEMD_PROTECTED_REGISTRY_SHA256 = "700162dd8e41305546cf2acd2763bad5603c642840f5be851fb788353879a36a"
+SYSTEMD_PROTECTED_PROTOCOL = 2
+
+
+def _systemd_ordinary_database_preflight(prepared: "PreparedCandidate", staging: Path, environment: dict[str, str]) -> None:
+    import sqlite3
+    import urllib.parse
+    database = Path(environment.get("PHOENIX_DB_PATH", str(SYSTEMD_DB_PATH)))
+    if not database.exists():
+        return
+    def evidence(path: Path) -> tuple[tuple[int, str], ...]:
+        with contextlib.closing(sqlite3.connect("file:" + urllib.parse.quote(str(path.resolve()), safe="/") + "?mode=ro", uri=True, timeout=2)) as db:
+            if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)] or db.execute("PRAGMA foreign_key_check").fetchall():
+                raise SystemExit("ordinary systemd database integrity/foreign-key check failed")
+            ledger = tuple(db.execute("SELECT version,name FROM _migrations ORDER BY version"))
+            if (not ledger or any(type(v) is not int or v < 1 or not isinstance(n, str) or not n for v, n in ledger)
+                    or tuple(v for v, _ in ledger) != tuple(sorted({v for v, _ in ledger}))):
+                raise SystemExit("ordinary candidate ledger must be nonempty, sorted and unique")
+            return ledger
+    try:
+        candidate_hash = _file_sha256(prepared.binary)
+        with tempfile.TemporaryDirectory(prefix="ordinary-candidate-target-", dir=staging) as temporary:
+            target = Path(temporary) / "fresh.sqlite"
+            subprocess.run([str(prepared.binary), "--migrate-only"], cwd="/",
+                           env={"PATH": "/usr/bin:/bin", "HOME": temporary, "PHOENIX_DB_PATH": str(target)},
+                           check=True, capture_output=True, text=True, timeout=900)
+            entries = evidence(target)
+        if _file_sha256(prepared.binary) != candidate_hash:
+            raise SystemExit("ordinary candidate changed during target derivation")
+        ledger = evidence(database)
+    except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        raise SystemExit("cannot derive/verify ordinary systemd candidate database target") from exc
+    if ledger != entries:
+        raise SystemExit("ordinary systemd pending migration interval is not qualified; use the explicit protected mode for the reviewed release")
+
+
 def native_prod_deploy(
     release: str | None = None,
     *,
@@ -8264,6 +8318,7 @@ def native_prod_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
+    controller.require_systemd_current(release)
     if controller.enabled:
         release, _expected_full_commit = controller.require_exact_release(release)
         _require_noninteractive_sudo_ready()
@@ -8321,17 +8376,31 @@ def native_prod_deploy(
 
         helper = staging / "helper.py"
         _materialize_source_file(
-            prepared.source_commit,
+            controller.controller_source_commit or prepared.source_commit,
             "scripts/systemd_deploy_helper.py",
             helper,
-            prepared.source_kind.value,
+            "published_release" if controller.systemd_current_schema_upgrade else prepared.source_kind.value,
         )
+        registry = None
+        if controller.systemd_current_schema_upgrade:
+            if (prepared.release_tag != SYSTEMD_PROTECTED_TAG or prepared.release_commit != SYSTEMD_PROTECTED_COMMIT
+                    or prepared.source_commit != SYSTEMD_PROTECTED_COMMIT
+                    or prepared.identity != RuntimeIdentity(SYSTEMD_PROTECTED_VERSION, SYSTEMD_PROTECTED_COMMIT)
+                    or _file_sha256(candidate_binary) != SYSTEMD_PROTECTED_ASSET_SHA256):
+                raise SystemExit("protected systemd candidate is not the reviewed release")
+            registry = staging / "migrations.rs"
+            _materialize_source_file(prepared.source_commit, "crates/phoenix-db/src/migrations.rs", registry, prepared.source_kind.value)
+            if _file_sha256(registry) != SYSTEMD_PROTECTED_REGISTRY_SHA256:
+                raise SystemExit("protected systemd registry hash is not the reviewed release")
+        else:
+            _systemd_ordinary_database_preflight(dataclasses.replace(prepared, binary=candidate_binary), staging, env_snapshot)
+        expected_protocol = SYSTEMD_PROTECTED_PROTOCOL if controller.systemd_current_schema_upgrade else SYSTEMD_HANDOFF_PROTOCOL_VERSION
         protocol = subprocess.run(
-            [sys.executable, str(helper), "--protocol-version"],
+            [sys.executable, str(helper), "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        if protocol != str(SYSTEMD_HANDOFF_PROTOCOL_VERSION):
-            raise SystemExit(f"systemd helper protocol mismatch: expected {SYSTEMD_HANDOFF_PROTOCOL_VERSION}, got {protocol!r}")
+        if protocol != str(expected_protocol):
+            raise SystemExit(f"systemd helper protocol mismatch: expected {expected_protocol}, got {protocol!r}")
 
         root_transaction = SYSTEMD_TRANSACTION_ROOT / transaction_id
         root_paths = {name: root_transaction / name for name in (
@@ -8339,7 +8408,16 @@ def native_prod_deploy(
             "rollback-binary", "rollback.service", "rollback.socket", "rollback.env", "helper.py",
         )}
         manifest = {
-            "manifest_version": SYSTEMD_HANDOFF_PROTOCOL_VERSION,
+            "manifest_version": expected_protocol,
+            **({
+                "mode": "systemd_schema65_to128",
+                "registry": _systemd_artifact(root_transaction / "migrations.rs", registry),
+                "database_path": env_snapshot.get("PHOENIX_DB_PATH", str(SYSTEMD_DB_PATH)),
+                "controller_source_commit": controller.controller_source_commit,
+                "controller_helper": _systemd_artifact(root_paths["helper.py"], helper),
+                "release_asset_name": controller.expected_asset_name,
+                "release_asset_sha256": controller.expected_asset_sha256,
+            } if controller.systemd_current_schema_upgrade else {}),
             "transaction_id": transaction_id,
             "unit_name": PROD_SERVICE_NAME,
             "service_user": service_user,
@@ -8386,6 +8464,8 @@ def native_prod_deploy(
             ("helper.py", helper),
             ("manifest.json", local_manifest),
         ]
+        if registry is not None:
+            files.append(("migrations.rs", registry))
         if env_snapshot:
             files.append(("candidate.env", candidate_env))
         root_manifest = _stage_systemd_root_handoff(
@@ -8936,6 +9016,8 @@ def prod_daemon_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
+    if controller.systemd_current_schema_upgrade or controller.controller_source_commit is not None:
+        raise SystemExit("protected systemd current-schema mode cannot use this backend")
     if controller.enabled:
         release, _expected_full_commit = controller.require_exact_release(release)
     layout = _bare_layout()
@@ -9513,9 +9595,13 @@ class ProdDeployControllerOptions:
     prepared_artifact: Path | None = None
     paired_database_upgrade: bool = False
     current_schema_upgrade: bool = False
+    systemd_current_schema_upgrade: bool = False
     controller_source_commit: str | None = None
 
     def require_controller_source(self, release: str | None) -> None:
+        if self.systemd_current_schema_upgrade:
+            self.require_systemd_current(release)
+            return
         protected_release = (
             self.current_schema_upgrade and release is not None
             and self.prepared_artifact is None
@@ -9548,6 +9634,24 @@ class ProdDeployControllerOptions:
         elif self.current_schema_upgrade and release is not None:
             raise SystemExit("prepared artifact upgrade excludes --release")
 
+    def require_systemd_current(self, release: str | None) -> None:
+        if not self.systemd_current_schema_upgrade:
+            if self.controller_source_commit is not None:
+                raise SystemExit("--controller-source-commit requires --systemd-current-schema-upgrade")
+            return
+        import platform
+        if (not self.enabled or self.backend != "systemd" or sys.platform != "linux"
+                or platform.machine().lower() not in {"x86_64", "amd64"}
+                or self.prepared_artifact is not None or self.current_schema_upgrade or self.paired_database_upgrade):
+            raise SystemExit("--systemd-current-schema-upgrade requires Linux x86_64 systemd exact-release controller mode only")
+        self.require_exact_release(release)
+        if (release != SYSTEMD_PROTECTED_TAG or self.exact_release_tag != SYSTEMD_PROTECTED_TAG
+                or self.expected_full_commit != SYSTEMD_PROTECTED_COMMIT
+                or self.expected_asset_name != SYSTEMD_PROTECTED_ASSET
+                or self.expected_asset_sha256 != SYSTEMD_PROTECTED_ASSET_SHA256
+                or re.fullmatch(r"[0-9a-f]{40}", self.controller_source_commit or "") is None
+                or self.controller_source_commit == self.expected_full_commit):
+            raise SystemExit("protected systemd requires exact tag/commit/asset/SHA pins and a separate lowercase --controller-source-commit")
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -11335,6 +11439,8 @@ def launchd_prod_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
+    if controller.systemd_current_schema_upgrade:
+        raise SystemExit("protected systemd current-schema mode cannot use this backend")
     controller.require_controller_source(release)
     if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
@@ -12633,6 +12739,7 @@ def main():
     upgrade_group = deploy_parser.add_mutually_exclusive_group()
     upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
     upgrade_group.add_argument("--current-schema-upgrade", action="store_true", help="Explicit protected current-schema database upgrade")
+    upgrade_group.add_argument("--systemd-current-schema-upgrade", action="store_true", help="Protected exact-schema65 to release128 systemd controller upgrade")
     cleanup_parser = prod_sub.add_parser(
         "cleanup-paired",
         help="Finish retained pre-stop paired capacity cleanup without runtime/database action",
@@ -12653,6 +12760,8 @@ def main():
     finalize_current_parser.add_argument("transaction_id")
     resume_forward_parser = prod_sub.add_parser("resume-forward", help="Resume only the exact retained forward candidate after predecessor rollback became unsafe")
     resume_forward_parser.add_argument("transaction_id")
+    recover_systemd = prod_sub.add_parser("recover-systemd-current", help="Resume only an exact retained protected systemd candidate")
+    recover_systemd.add_argument("transaction_id")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
@@ -12829,6 +12938,7 @@ def main():
                     prepared_artifact=args.prepared_artifact,
                     paired_database_upgrade=args.paired_database_upgrade,
                     current_schema_upgrade=args.current_schema_upgrade,
+                    systemd_current_schema_upgrade=args.systemd_current_schema_upgrade,
                     backend=args.controller_backend,
                 ),
             )
@@ -12840,6 +12950,8 @@ def main():
             cmd_prod_recover_paired(args.transaction_id)
         elif args.prod_command == "finalize-paired":
             cmd_prod_finalize_paired(args.transaction_id)
+        elif args.prod_command == "recover-systemd-current":
+            cmd_prod_recover_systemd_current(args.transaction_id)
         elif args.prod_command == "recover-current":
             cmd_prod_recover_paired(args.transaction_id, current_schema=True)
         elif args.prod_command == "finalize-current":

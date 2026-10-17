@@ -2,7 +2,7 @@
 
 ## Scope
 
-Safe replacement and operation of native Phoenix production runtimes on macOS launchd, Linux systemd, and Linux hosts without systemd. The deployment source is exact checked local `HEAD`, an immutable published release, or the explicit launchd-only prepared-artifact paired source under REQ-PD-018. This specification owns shared cross-platform guarantees and the release assets required to satisfy them. `specs/launchd-deployment/requirements.md` cumulatively refines launchd-specific mechanics; it does not redefine the shared guarantees.
+Safe replacement and operation of native Phoenix production runtimes on macOS launchd, Linux systemd, and Linux hosts without systemd. The deployment source is exact checked local `HEAD`, an immutable published release, or the explicit launchd-only prepared-artifact paired source under REQ-PD-018. The protected systemd published-release exception is limited to REQ-PD-023–027. This specification owns shared cross-platform guarantees and the release assets required to satisfy them. `specs/launchd-deployment/requirements.md` cumulatively refines launchd-specific mechanics; it does not redefine the shared guarantees.
 
 ## Requirements
 
@@ -24,9 +24,9 @@ THE release deployment command SHALL require the tag, GitHub prerelease metadata
 
 ### REQ-PD-003 — Complete preparation before disruption
 
-For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to unprotected local/published sources. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path.
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. For protected systemd published-release activation under REQ-PD-023, the captured installed environment, service and socket SHALL be preserved instead; `.phoenix-ide.env` SHALL NOT replace them. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path. The ordinary environment-snapshot rules below apply only to unprotected local/published sources.
 
-Before disrupting a running runtime, the system shall stage and validate the candidate, backend configuration, exact `.phoenix-ide.env` snapshot, rollback inputs, runtime identities and endpoints, destination-space reservations, artifact hashes, backend activation program, immutable handoff, and initial durable transaction status.
+Before disrupting a running runtime, the system shall stage and validate the candidate, backend configuration, source-specific environment snapshot, rollback inputs, runtime identities and endpoints, destination-space reservations, artifact hashes, backend activation program, immutable handoff, and initial durable transaction status.
 
 ### REQ-PD-004 — Backend-owned activation
 
@@ -56,7 +56,7 @@ A deployment shall commit only after observing a new backend-owned runtime proce
 
 Protected current-schema launchd transactions SHALL obey the pre-invocation-only predecessor recovery boundary in REQ-LDD-021–022. Qualified ordinary launchd migration activation SHALL obey REQ-LDD-023's candidate-start boundary; the runtime-artifact rollback rules below SHALL NOT override either boundary.
 
-For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. The unconditional artifact-rollback attempt below applies to ordinary sources.
+For prepared-artifact paired transactions, predecessor startup/rollback is conditional on the verified recovery authorization under REQ-LDD-017. If database, ownership, snapshot or captured runtime/configuration proof fails, the system SHALL instead attempt teardown, retain a stopped service and unresolved claim, and report recovery failure; it SHALL NOT bootstrap an unproven predecessor. Protected systemd activation follows the stricter pre-marker unchanged-predecessor and post-marker candidate-only boundary in REQ-PD-025. The artifact-rollback attempt below applies to other sources subject to their explicitly qualified compatibility boundaries.
 
 If activation fails after disruption, the activation owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment snapshot, and service state, verify the captured previous runtime identity at its previous endpoint, restore the previous deployed SHA, and durably distinguish successful runtime-artifact rollback from rollback failure.
 
@@ -70,9 +70,9 @@ After exact verification, the system shall write `deployed.sha` from the selecte
 
 ### REQ-PD-012 — Configuration source of truth
 
-For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. The ordinary environment-snapshot rules below apply only to unprotected local/published sources. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path.
+For the prepared-artifact paired source under REQ-PD-018, the captured installed launchd plist environment and PATH SHALL be the sole configuration authority; `.phoenix-ide.env` SHALL NOT replace credentials, models, paths or network configuration. For protected systemd published-release activation under REQ-PD-023, the captured installed environment, service and socket SHALL be preserved instead; `.phoenix-ide.env` SHALL NOT replace them. Protected published-release current-schema activation under REQ-PD-021 SHALL preserve the captured installed launchd configuration and database path. The ordinary environment-snapshot rules below apply only to unprotected local/published sources.
 
-Modern deployment shall load `.phoenix-ide.env` once and use that exact snapshot for preflight, installation, and candidate endpoint selection. Runtime status shall inspect installed configuration, rollback shall use the previous installed snapshot, and modern operation shall ignore rather than migrate or consult a legacy launchd override store, systemd drop-in, or inferred detached-daemon environment.
+Ordinary local/published deployment outside the protected modes above shall load `.phoenix-ide.env` once and use that exact snapshot for preflight, installation, and candidate endpoint selection. Runtime status shall inspect installed configuration, rollback shall use the previous installed snapshot, and modern operation shall ignore rather than migrate or consult a legacy launchd override store, systemd drop-in, or inferred detached-daemon environment.
 
 ### REQ-PD-013 — Consistent operator surface
 
@@ -111,7 +111,7 @@ THE SYSTEM SHALL NOT generalize this feature-scoped pair into automatic database
 
 ### REQ-PD-019 — Feature-scoped prepared paired upgrade
 
-THE shared production deployment contract SHALL treat the macOS launchd prepared-artifact/ProductConversation database upgrade as an explicit feature-scoped guarantee, not as a general snapshot or downgrade facility. Other backends and ordinary runtime-only deployment retain their existing database behavior.
+THE shared production deployment contract SHALL treat the macOS launchd prepared-artifact/ProductConversation database upgrade as an explicit feature-scoped guarantee, not as a general snapshot or downgrade facility. The separate systemd exception in REQ-PD-023–027 does not inherit the launchd paired rollback guarantee. Other deployment paths retain their separately specified database behavior.
 
 ### REQ-PD-020 — Narrow committed paired finalization
 
@@ -133,3 +133,52 @@ When ordinary launchd deployment has pending migrations outside an explicitly qu
 
 **Condition:** When ordinary launchd activation crosses the qualified candidate-start boundary and does not verify candidate health,
 **System:** the production interface SHALL report that predecessor rollback is forbidden, retain the deployment claim and exact candidate evidence, and expose only explicit `prod resume-forward TXN` recovery for that transaction. It SHALL NOT require or imply a standalone backup for the normal in-place route.
+
+### REQ-PD-023 — Exact protected systemd published-release admission
+
+WHEN the explicit `--systemd-current-schema-upgrade` published-release mode is selected,
+THE SYSTEM SHALL admit only Linux x86_64 systemd activation with all of these immutable candidate identities:
+
+| Evidence | Exact value |
+| --- | --- |
+| Published tag | `v0.13.0-rc.4` |
+| Full candidate commit | `3f0ba4602faa71ebad5088e1ffc856f4c7d511d9` |
+| Embedded version | `0.13.0-rc.4` |
+| Asset | `phoenix_ide-x86_64-unknown-linux-musl` |
+| Asset SHA-256 | `bcb74d565c828843596e5109ea9034a2b0e505aab4ba6c18c5cca8e116f5677e` |
+| Candidate `crates/phoenix-db/src/migrations.rs` SHA-256 | `700162dd8e41305546cf2acd2763bad5603c642840f5be851fb788353879a36a` |
+| Target | Complete ordered registry from those exact source bytes, ending at migration 128 |
+
+THE SYSTEM SHALL require the source database's complete ordered `(version, name)` ledger to equal that registry's exact prefix through migration 65, not merely a maximum version or count. It SHALL bind and validate the complete registry and all candidate evidence before disruption, and re-verify retained evidence before migration, activation, or recovery.
+
+THE SYSTEM SHALL require a separately explicit full controller source commit different from the candidate commit and a retained helper hash verified against that controller source. It SHALL bind both identities independently of the release identity. It SHALL require an existing installed predecessor and preserve the installed environment, service unit, socket unit, and canonical `/var/lib/phoenix-ide/prod.db` path without configuration replacement from ambient files.
+
+THE SYSTEM SHALL reject this mode for `latest`, other releases, other source ledgers or targets, local/prepared sources, launchd, and bare Linux. It SHALL NOT offer a generic baseline/target selection mechanism or infer future release support from this qualification.
+
+### REQ-PD-024 — Offline pristine backup and rehearsal before live migration
+
+For the protected systemd transition, THE SYSTEM SHALL validate all immutable source, controller/helper, configuration, predecessor and candidate evidence before disruption. Before stopping either unit, it SHALL install and fsync transaction-bound persistent systemd start-inhibit drop-ins for both service and socket, reload systemd, and verify the files and effective loaded configuration. The inhibit SHALL prevent manual, dependency/socket and reboot activation throughout disrupted pre-marker and unresolved post-marker states. Missing, altered, unsafe or foreign inhibit evidence SHALL fail closed, not authorize startup or blind removal. It SHALL stop both service and socket, prove both inactive and the canonical database exclusively owned, and re-verify the exact stopped source ledger and logical contents. It SHALL create, fsync, integrity-check, and bind a persistent pristine SQLite backup and its hash to that transaction before invoking the candidate on the live database. The stopped snapshot SHALL include legitimate predecessor writes made after preflight and before shutdown. Once that snapshot succeeds, its exact stopped-source evidence SHALL replace preflight evidence as the unchanged-source comparison authority for pre-marker recovery; any subsequent ledger or logical-content change SHALL forbid predecessor restart.
+
+THE SYSTEM SHALL run the exact candidate's `--migrate-only` operation against an isolated copy of that backup, not against the pristine backup or live database, and durably verify successful exit, exact complete target ledger, SQLite integrity and foreign-key checks, and unchanged pristine backup before permitting the live irreversible marker. Rehearsal proof SHALL bind the candidate, registry, backup and transaction evidence and SHALL be re-verified before live invocation or recovery.
+
+Backup or rehearsal capacity failure, failed rehearsal, or failed verification SHALL remain pre-marker failures and MAY recover only the verified unchanged predecessor under REQ-PD-025. This systemd contract SHALL NOT impose the launchd capacity policy or its 20 GiB free-space floor. The exact pristine backup and its proof SHALL remain after success; the rehearsal copy SHALL NOT replace them.
+
+### REQ-PD-025 — Durable irreversible marker and exact-candidate-only recovery
+
+For protected systemd activation, THE SYSTEM SHALL durably write transaction-bound `migration_started` immediately before the first live candidate `--migrate-only` invocation, after successful backup/rehearsal verification. Durable status SHALL remain `activating` across this boundary, with the marker file and `migration_started` boolean recording it; `migration_started` SHALL NOT be a separate transaction state. Before that marker, recovery MAY restore captured runtime artifacts and resume the predecessor only after proving exclusive offline ownership, unchanged source ledger and logical contents, and captured predecessor/configuration identity; it SHALL NOT replay the backup to manufacture unchanged-source proof. The inhibit MAY be removed only after that pre-marker unchanged-predecessor runtime restoration is authorized and completed, before predecessor restart, or immediately before verified exact-target candidate startup. Removal SHALL verify the transaction-bound inhibit and effective configuration, durably remove only those drop-ins, reload systemd and verify the resulting preserved configuration. Unproven or failed pre-marker rollback SHALL retain the claim/inhibit and report `activation_failed_rollback_failed`, not the ordinary-mode failure state.
+
+At or after that marker, including failed invocation, interruption, partial commits, or uncertain writes, THE SYSTEM SHALL NOT restore any database backup, restore predecessor runtime artifacts, or start the old binary. Failure SHALL attempt to stop service and socket, retain the exact candidate, claim, backup and immutable evidence, and report forward-only recovery rather than rollback success.
+
+Explicit `prod recover-systemd-current TXN` (the retained helper's `recover-current` action) SHALL select the post-marker path by marker presence, including unsafe marker evidence, rather than by a status state named `migration_started`. An absent marker SHALL refuse this forward-recovery path without stopping the predecessor. Once selected, recovery SHALL stop both service and socket and prove inactivity before detailed post-marker manifest, inhibit, marker, evidence or database validation; validation failure SHALL NOT leave an old running service/socket untouched. It SHALL then prove exclusive database ownership and use only the transaction's exact retained candidate/controller/helper, matching claim and valid marker, intact backup/rehearsal proofs and preserved configuration. It MAY rerun that candidate's `--migrate-only` only when the entire ledger equals a prefix of the same exact registry from migration 65 through 128; a different, missing, renamed, reordered or newer entry SHALL fail closed. After successful detailed retained-evidence and stopped-ledger admission, recovery SHALL durably write status `activating` with `migration_started=true` before either a partial-prefix migration rerun or exact-target candidate startup authorization. An exact-target ledger MAY proceed to candidate finalization without rerunning migration. Recovery SHALL NOT substitute another candidate, helper or configuration.
+
+Activation or recovery SHALL verify the exact complete target ledger, SQLite integrity and foreign-key checks before candidate startup, then verify the exact backend-owned candidate identity before publishing `deployed.sha`, durable `committed`, and matching claim release. Unresolved recovery SHALL retain the fence; success SHALL retain the pristine backup and evidence.
+
+### REQ-PD-026 — Ordinary systemd pending migrations fail before handoff
+
+For ordinary systemd deployment through a controller enforcing this contract, WHEN an existing production database is present, preflight SHALL derive the target ledger by executing the exact candidate's `--migrate-only` on an isolated empty database with isolated HOME and DB path, not by parsing a migration registry from source. It SHALL verify successful exit, target integrity/foreign keys, a nonempty sorted unique complete `(version, name)` ledger, and unchanged candidate hash across derivation. WHEN the existing production database fails integrity/foreign-key checks or its complete ledger differs from that derived target (including pending migrations), THE SYSTEM SHALL reject before activation handoff or runtime disruption. Failure to derive or verify the target SHALL fail closed. A first install without an existing database MAY proceed. It SHALL NOT silently route that interval through ordinary runtime-artifact rollback. Exact-target/no-pending ordinary activation remains supported. This guarantee SHALL NOT be attributed to historical controllers without this preflight gate and SHALL NOT expand to launchd or bare Linux. This controller-side preflight SHALL leave the protocol-v1 ordinary helper manifest unchanged; it SHALL NOT require a registry field or retrofit the protected protocol into old helpers.
+
+### REQ-PD-027 — Retire only positively identified partial systemd staging
+
+THE SYSTEM SHALL serialize systemd staging, activation and recovery with the global deployment operation lock, and persist matching `staging` status with `migration_started = false` before publishing the staging claim. Under that lock, it MAY retire an interrupted partial staging transaction only with exact staging-status shape, matching owner/claim (or no claim), and absent irreversible marker, before any prepared handoff. Retirement SHALL remove only that transaction's partial inputs and matching staging ownership, fsync affected directories, and leave production unchanged.
+
+Ambiguous evidence, a prepared transaction, a post-marker transaction, or an active competing operation SHALL remain fenced rather than be treated as abandoned staging. Missing or unreadable status SHALL NOT authorize clearing an extant claim.

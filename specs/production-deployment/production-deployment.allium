@@ -5,7 +5,7 @@
 -- and bare Linux, with backend-specific activation ownership.
 -- This module owns shared guarantees. Platform-specific launchd mechanics
 -- are cumulative refinements in specs/launchd-deployment/launchd-deployment.allium.
--- Requirement traceability: REQ-PD-001 through REQ-PD-019. Runtime lifecycle
+-- Requirement traceability: REQ-PD-001 through REQ-PD-027. Runtime lifecycle
 -- rules model REQ-PD-002 through REQ-PD-014; backend selection, operator
 -- syntax, bare-Linux reboot integration, disposable test isolation, and
 -- release asset publication are interface/build obligations in requirements.md.
@@ -23,7 +23,7 @@ enum BackendKind { launchd | systemd | bare_linux }
 enum TransactionState {
     preparing | prepared | handed_off | precondition_cleanup_pending | activating | committed
     | precondition_failed | activation_failed_rolled_back
-    | activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | rejected_concurrent
+    | activation_failed_rollback_failed | ordinary_activation_failed_rollback_failed | current_forward_failed | rejected_concurrent
 }
 
 value RuntimeIdentity {
@@ -73,6 +73,7 @@ entity DeployTransaction {
     id: String
     backend: BackendKind
     kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment
+        | ProtectedSystemdReleaseDeployment
     source_commit: String
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
@@ -104,6 +105,9 @@ entity DeployTransaction {
         activating -> committed
         activating -> activation_failed_rolled_back
         activating -> activation_failed_rollback_failed
+        activating -> current_forward_failed
+        current_forward_failed -> activating
+        current_forward_failed -> current_forward_failed
         activating -> ordinary_activation_failed_rollback_failed
         activation_failed_rollback_failed -> activation_failed_rolled_back
         activation_failed_rollback_failed -> activation_failed_rollback_failed
@@ -116,6 +120,14 @@ variant LocalHeadDeployment : DeployTransaction {}
 
 variant PublishedReleaseDeployment : DeployTransaction {
     release_tag: String
+}
+
+-- REQ-PD-023–025 / REQ-COMP-014: a separate published-release mode, not prepared.
+variant ProtectedSystemdReleaseDeployment : DeployTransaction {
+    release_tag: String
+    controller_source_commit: String
+    controller_helper_hash: String
+    database_path: String
 }
 
 variant PreparedArtifactDeployment : DeployTransaction {
@@ -193,9 +205,12 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   Emitted after quiesce and paired snapshot proof verification, before
 --   candidate install/start; ordinary sources use their prepared inputs.
 -- candidate_startup_proof_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, paired_database_proof_is_valid
+--   True for unprotected ordinary sources. For prepared_artifact, paired_database_proof_is_valid
 --   holds and the verified predecessor snapshot follows exclusive offline proof
---   before candidate startup.
+--   before candidate startup. Protected systemd additionally requires a durable
+--   live marker, protected_systemd_target_valid, intact backup/rehearsal evidence
+--   and preserved configuration; inhibit removal immediately precedes exact
+--   candidate start, only after exclusive stopped target/candidate verification.
 -- paired_predecessor_start_order_is_valid(transaction) -> Boolean
 --   True for ordinary sources. For prepared_artifact, the matching database is
 --   restored and integrity-checked before predecessor startup, or no snapshot
@@ -203,7 +218,9 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   an unchanged predecessor. The latter path claims no database restoration.
 -- predecessor_start_authorized(transaction) -> Boolean
 --   Startup requires matched snapshot restoration or verified unchanged legacy
---   database/runtime/configuration with exclusive offline ownership.
+--   database/runtime/configuration with exclusive offline ownership. Protected
+--   systemd never replays its backup: only pre-marker unchanged-source recovery
+--   can authorize predecessor startup.
 -- candidate_teardown_attempted(transaction) -> Boolean
 --   Failed activation or recovery records an attempt to tear down the candidate;
 --   this does not claim an operating-system failure made teardown complete.
@@ -236,6 +253,8 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   activation program, immutable handoff, and initial status are valid and
 --   host-resident before disruption. Ordinary helper comes from selected source;
 --   paired helper comes from the separately verified clean controller commit.
+--   Protected systemd uses its separately explicit different controller commit;
+--   all immutable evidence and the exact source ledger pass REQ-PD-023 before stop.
 -- claim_available(transaction) -> Boolean
 --   No active or unresolved transaction owns the host deployment claim. A
 --   markerless status is resolved only when it positively names a nonempty
@@ -328,7 +347,9 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- installed_environment_is_snapshot(transaction) -> Boolean
 --   The installed environment is the single snapshot used by preflight and
 --   endpoint selection, not a competing override layer. Prepared source uses
---   captured installed plist/PATH; ordinary sources use the source env snapshot.
+--   captured installed plist/PATH; protected systemd preserves installed env,
+--   service/socket and canonical DB path; other ordinary sources use the source
+--   env snapshot.
 
 -- paired_snapshot_restored(transaction) -> Boolean
 --   A context-bound snapshot was restored and integrity-checked offline.
@@ -373,6 +394,8 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   PairedFinalizationFailed and retain pending.
 -- DurablePreparingStatusWritten(transaction)
 --   Matching preparation identity/PID is durable before ownership publication.
+--   Systemd persists exact staging status with migration_started = false before
+--   publishing its claim, under the global operation lock (REQ-PD-027).
 
 -- paired_precommit_autoload_safe(transaction) -> Boolean
 --   While preparing, only captured predecessor may be auto-loaded. After helper
@@ -388,6 +411,7 @@ rule AcquirePreparationClaim {
     requires: claim_available(transaction)
     requires: selected_supervisor_artifact_matches_running(transaction)
     requires: transaction.kind != PreparedArtifactDeployment or transaction.backend = launchd
+    requires: systemd_operation_lock_held(transaction)
     ensures: DurablePreparingStatusWritten(transaction)
     ensures: DeploymentClaim.created(
         transaction: transaction,
@@ -411,6 +435,8 @@ rule PrepareCandidate {
     requires: controller_identity_is_independently_bound(transaction)
     requires: previous_rollback_identity_is_valid(transaction)
     requires: transaction.kind != PreparedArtifactDeployment or transaction.previous != null
+    requires: protected_systemd_preflight_valid(transaction)
+    requires: systemd_database_admission_valid(transaction)
     requires: selected_supervisor_artifact_matches_running(transaction)
     ensures: transaction.state = prepared
     ensures: preparation_complete(transaction)
@@ -454,6 +480,7 @@ rule SystemdActivationHandedOff {
     requires: transaction.backend = systemd
     requires: preparation_complete(transaction)
     requires: PrivilegedHandoffValidated(transaction)
+    requires: systemd_database_admission_valid(transaction)
     ensures: SystemdHandoff.created(
         transaction: transaction,
         manifest_hash: PreparedManifestHash(transaction),
@@ -622,6 +649,7 @@ rule VerifyOrdinaryAbandonedPreparation {
     requires: transaction.kind != PreparedArtifactDeployment
     requires: transaction.state = preparing
     requires: ordinary_preparation_abandonment_verified(transaction)
+    requires: transaction.backend != systemd
     ensures: transaction.state = precondition_failed
     ensures: DurableStatusWritten(transaction)
 
@@ -657,6 +685,7 @@ rule CommitVerifiedCandidate {
     requires: atomic_install_complete(transaction)
     ensures: transaction.state = committed
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.finalization = pending
+    ensures: transaction.kind = ProtectedSystemdReleaseDeployment implies ProtectedSystemdRetained(transaction)
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
 
@@ -739,6 +768,7 @@ rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, failure)
     requires: transaction.state = activating
     requires: transaction.kind != PreparedArtifactDeployment
+    requires: transaction.kind != ProtectedSystemdReleaseDeployment
     requires: current_claim_matches(transaction)
     requires: exact_previous_restored(transaction)
     ensures: transaction.state = activation_failed_rolled_back
@@ -820,6 +850,7 @@ rule RollBackFailedPreparedPairedActivation {
 rule PreserveRollbackFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state = activating
+    requires: transaction.kind != ProtectedSystemdReleaseDeployment
     requires: current_claim_matches(transaction)
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.state = activation_failed_rollback_failed
     ensures: transaction.kind != PreparedArtifactDeployment implies transaction.state = ordinary_activation_failed_rollback_failed
@@ -858,6 +889,285 @@ rule PreservePreparedRecoveryFailure {
     ensures: active_claim_retained(transaction)
 }
 
+-- Protected systemd helpers (REQ-PD-023–027 / REQ-COMP-014)
+-- protected_systemd_preflight_valid(transaction) -> Boolean
+--   True for other kinds. ProtectedSystemdReleaseDeployment requires systemd on
+--   Linux x86_64, the exact tag/version/full commit/asset/hash/registry bytes in
+--   REQ-PD-023, complete ordered registry prefix through65, existing predecessor,
+--   preserved installed env/service/socket/canonical DB path, absent live marker,
+--   and independently bound explicit different controller commit/helper hash.
+-- systemd_database_admission_valid(transaction) -> Boolean
+--   True for other backends. Protected mode requires its exact source proof;
+--   ordinary mode derives the target by running the exact candidate --migrate-only
+--   on an isolated empty DB with isolated HOME/DB path, not by parsing source.
+--   Successful exit, integrity/FK, nonempty sorted unique full ledger and unchanged
+--   candidate hash are required. Existing production DB must pass integrity/FK
+--   and match that complete target; failure/pending/divergence rejects before
+--   handoff. A first install without a DB may proceed without target derivation.
+--   This controller-side gate leaves the protocol-v1 ordinary helper manifest
+--   unchanged; REQ-PD-026 does not qualify historical controllers lacking it.
+-- systemd_operation_lock_held(transaction) -> Boolean
+--   True for other backends. Systemd holds the global operation lock across
+--   staging, activation or recovery; a competing operation cannot mutate state.
+-- protected_systemd_start_inhibit_valid(transaction) -> Boolean
+--   Transaction-bound persistent service AND socket drop-ins are fsynced,
+--   systemd reloaded, file ownership/mode/content/paths and effective loaded
+--   configuration verified before either unit is stopped. Manual, dependency,
+--   socket and reboot activation remain inhibited through disrupted pre-marker
+--   and unresolved post-marker states. Tamper/foreign/unsafe evidence fails closed.
+-- protected_systemd_inhibit_disposition_valid(transaction) -> Boolean
+--   Before disruption, no inhibit is required; once disruption begins, the
+--   inhibit remains intact, or its verified transaction-owned drop-ins were
+--   durably removed with reload/config verification only after authorized
+--   pre-marker unchanged-predecessor artifact restoration and before restart,
+--   or immediately before exclusively verified exact-target candidate start.
+--   Unsafe/missing/foreign inhibit evidence never authorizes removal/start;
+--   unresolved failure retains the claim and attempts inhibit retention/
+--   reinstallation and both-unit stop rather than claiming confirmed safety.
+-- protected_systemd_marker_present(transaction) -> Boolean
+--   Transaction live migration_started marker exists, including unsafe/symlink
+--   evidence or uncertain marker durability; presence selects the forward path,
+--   not permission to trust its contents. No separate migration_started state.
+-- protected_systemd_backup_valid(transaction) -> Boolean
+--   Persistent fsynced pristine SQLite backup has verified integrity/FK, hash and
+--   transaction-bound proof of the exclusive stopped source ledger/logical contents
+--   after both units were inactive and no DB/WAL/SHM users remained.
+-- protected_systemd_rehearsal_valid(transaction) -> Boolean
+--   Exact candidate --migrate-only succeeded against an isolated backup copy;
+--   exact complete target ledger, integrity/FK, and unchanged pristine backup
+--   verified with durable transaction/candidate/registry/backup-bound proof.
+-- protected_systemd_live_ready(transaction) -> Boolean
+--   No live marker; backup/rehearsal proofs, start inhibit and immutable evidence
+--   re-verified, installed exact candidate and preserved config verified,
+--   both units inactive and stopped exclusive source unchanged.
+-- protected_systemd_target_valid(transaction) -> Boolean
+--   Live ledger equals the entire exact registry; integrity/FK checks pass;
+--   pristine backup and evidence remain intact, installed configuration preserved.
+-- protected_systemd_unchanged_predecessor_valid(transaction) -> Boolean
+--   No irreversible marker, exclusive stopped DB ledger/logical contents equal
+--   source proof, and captured runtime/configuration hashes and identity valid.
+--   Once a stopped snapshot succeeds, its evidence replaces preflight evidence
+--   for this comparison; legitimate writes before shutdown are included, and
+--   any ledger/logical-content change after the snapshot forbids restart.
+-- protected_systemd_recovery_valid(transaction) -> Boolean
+--   Explicit recover-systemd-current request; exact retained candidate/controller/
+--   helper, matching claim and valid durable marker, intact inhibit and
+--   backup/rehearsal proofs, preserved configuration, exclusive inactive
+--   service/socket with no DB/WAL/SHM users, complete ledger
+--   exactly a same-registry prefix through65..128. No substitutions or restore.
+-- systemd_staging_retirement_valid(transaction) -> Boolean
+--   Global lock excludes a live stager/activator; exact staging status shape has
+--   migration_started=false, exact owner/claim or no claim, absent irreversible
+--   marker, no prepared handoff. Ambiguous/prepared/post-marker stays fenced.
+-- ProtectedSystemdBackupVerified(transaction), ProtectedSystemdRehearsalVerified(transaction)
+--   Corresponding offline proof has been durably verified by the independent owner.
+-- ProtectedSystemdLiveMigrationRequested(transaction)
+--   Independent owner is ready to cross the live migration boundary.
+-- ProtectedSystemdTargetVerified(transaction)
+--   Exact live target ledger and integrity/FK verified before candidate startup.
+-- ProtectedSystemdRecoveryRequested(transaction)
+--   Operator explicitly requests recover-systemd-current (helper recover-current).
+--   Marker presence selects this path. Both units must be stopped/proven inactive
+--   before detailed manifest/inhibit/marker/evidence/DB validation; then exclusive
+--   ownership and protected_systemd_recovery_valid are required. Marker absence
+--   refuses forward recovery without stopping the predecessor.
+-- ProtectedSystemdUnchangedPredecessorObserved(transaction)
+--   Authorized pre-marker unchanged predecessor was restored and verified.
+-- ProtectedSystemdRetained(transaction)
+--   Exact candidate, backup and proofs retained; no backup or predecessor replay.
+-- ProtectedSystemdMarkerPersisted(transaction)
+--   Transaction-bound migration_started file fsynced before live invocation;
+--   durable status remains activating with migration_started boolean true.
+-- ProtectedSystemdCandidateMigrationInvoked(transaction)
+--   Only the exact installed candidate runs --migrate-only against the live DB.
+-- SystemdPartialStagingRetirementRequested(transaction)
+--   Stale partial staging disposition requested under the global operation lock.
+-- SystemdPartialStagingRetired(transaction)
+--   Only matching partial inputs/ownership removed, affected directories fsynced;
+--   no production mutation. This is not prepared or post-marker abandonment.
+
+rule ProtectedSystemdBackup {
+    when: ProtectedSystemdBackupVerified(transaction)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state = activating
+    requires: not protected_systemd_marker_present(transaction)
+    requires: protected_systemd_start_inhibit_valid(transaction)
+    requires: current_claim_matches(transaction)
+    requires: systemd_operation_lock_held(transaction)
+    ensures: protected_systemd_backup_valid(transaction)
+
+    @guidance
+        -- Install/fsync/reload/verify both persistent unit inhibits before stop;
+        -- prove service/socket inactivity and exclusive DB ownership before backup.
+        -- Bind exact stopped-source evidence including writes since preflight;
+        -- successful snapshot replaces the preflight recovery comparison authority.
+}
+
+rule ProtectedSystemdRehearsal {
+    when: ProtectedSystemdRehearsalVerified(transaction)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state = activating
+    requires: not protected_systemd_marker_present(transaction)
+    requires: protected_systemd_start_inhibit_valid(transaction)
+    requires: protected_systemd_backup_valid(transaction)
+    requires: current_claim_matches(transaction)
+    requires: systemd_operation_lock_held(transaction)
+    ensures: protected_systemd_rehearsal_valid(transaction)
+}
+
+rule ProtectedSystemdCrossLiveBoundary {
+    when: ProtectedSystemdLiveMigrationRequested(transaction)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state = activating
+    requires: not protected_systemd_marker_present(transaction)
+    requires: protected_systemd_start_inhibit_valid(transaction)
+    requires: protected_systemd_backup_valid(transaction)
+    requires: protected_systemd_rehearsal_valid(transaction)
+    requires: current_claim_matches(transaction)
+    requires: systemd_operation_lock_held(transaction)
+    requires: protected_systemd_live_ready(transaction)
+    ensures: transaction.state = activating
+    ensures: protected_systemd_marker_present(transaction)
+    ensures: ProtectedSystemdMarkerPersisted(transaction)
+    ensures: ProtectedSystemdCandidateMigrationInvoked(transaction)
+
+    @guidance
+        -- Persist/fsync migration_started immediately before first LIVE candidate
+        -- invocation. Rehearsal never crosses this boundary. Marker durability
+        -- uncertainty cannot authorize predecessor recovery or backup replay.
+}
+
+rule ProtectedSystemdVerifyTarget {
+    when: ProtectedSystemdTargetVerified(transaction)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state = activating
+    requires: protected_systemd_marker_present(transaction)
+    requires: protected_systemd_start_inhibit_valid(transaction)
+    ensures: protected_systemd_target_valid(transaction)
+}
+
+rule ProtectedSystemdPreMarkerRecovery {
+    when: ProtectedSystemdUnchangedPredecessorObserved(transaction)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state = activating
+    requires: not protected_systemd_marker_present(transaction)
+    requires: current_claim_matches(transaction)
+    requires: systemd_operation_lock_held(transaction)
+    requires: protected_systemd_unchanged_predecessor_valid(transaction)
+    requires: exact_previous_restored(transaction)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: not DatabaseRollbackClaimed(transaction)
+    ensures: DurableStatusWritten(transaction)
+
+    @guidance
+        -- Backup/rehearsal capacity or verification failures stay pre-marker;
+        -- restore runtime artifacts only after unchanged-source proof. Never
+        -- replay backup to obtain that proof. Verify/remove only the matching
+        -- persistent inhibits after artifact restoration and before predecessor
+        -- restart; reload systemd and verify preserved configuration. Inhibit
+        -- tamper fails closed. No launchd 20 GiB floor applies.
+}
+
+rule ProtectedSystemdUnprovenPreMarkerRecovery {
+    when: RollbackFailed(transaction, failure, rollback_failure)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state = activating
+    requires: not protected_systemd_marker_present(transaction)
+    requires: current_claim_matches(transaction)
+    ensures: transaction.state = activation_failed_rollback_failed
+    ensures: transaction.failure = failure
+    ensures: transaction.rollback_failure = rollback_failure
+    ensures: candidate_teardown_attempted(transaction)
+    ensures: protected_systemd_inhibit_disposition_valid(transaction)
+    ensures: active_claim_retained(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule ProtectedSystemdPostMarkerFailure {
+    when: ActivationFailed(transaction, failure)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state = activating
+    requires: protected_systemd_marker_present(transaction)
+    requires: current_claim_matches(transaction)
+    ensures: transaction.state = current_forward_failed
+    ensures: transaction.failure = failure
+    ensures: candidate_teardown_attempted(transaction)
+    ensures: ProtectedSystemdRetained(transaction)
+    ensures: active_claim_retained(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule ProtectedSystemdForwardRecovery {
+    when: ProtectedSystemdRecoveryRequested(transaction)
+    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: transaction.state in { activating, current_forward_failed }
+    requires: protected_systemd_marker_present(transaction)
+    requires: current_claim_matches(transaction)
+    requires: systemd_operation_lock_held(transaction)
+    requires: protected_systemd_recovery_valid(transaction)
+    ensures: transaction.state = activating
+    ensures: protected_systemd_marker_present(transaction)
+    ensures: DurableStatusWritten(transaction)
+    ensures: ProtectedSystemdRetained(transaction)
+
+    @guidance
+        -- Select by marker presence; stop BOTH units and prove inactivity before
+        -- detailed post-marker validation, even if retained evidence is invalid.
+        -- Then verify inhibit/evidence and exclusive DB ownership. Validation
+        -- failure attempts persistent inhibit retention/reinstallation and stop.
+        -- After detailed retained-evidence and stopped-ledger admission, durably
+        -- write activating with migration_started=true before either migration
+        -- rerun or exact-target candidate startup authorization.
+        -- Rerun only the exact retained candidate on a same-registry prefix
+        -- through65..128; at exact target, skip rerun and verify target. Then
+        -- Remove matching persistent inhibits only immediately before exclusively
+        -- verified exact-target candidate startup; reload and verify config.
+        -- Then candidate-only startup, exact identity, durable publication/commit.
+        -- Any unresolved failure keeps claim/evidence/backup and attempts stop
+        -- of BOTH service and socket. Never restore or start predecessor.
+}
+
+rule RetireSystemdPartialStaging {
+    when: SystemdPartialStagingRetirementRequested(transaction)
+    requires: transaction.backend = systemd
+    requires: transaction.state = preparing
+    requires: systemd_operation_lock_held(transaction)
+    requires: systemd_staging_retirement_valid(transaction)
+    ensures: SystemdPartialStagingRetired(transaction)
+    ensures: ProductionStateUnchanged(transaction)
+}
+
+invariant ProtectedSystemdIsOneExactTransition {
+    for transaction in DeployTransactions:
+        transaction.kind = ProtectedSystemdReleaseDeployment
+        and transaction.state not in { preparing, precondition_failed, rejected_concurrent } implies
+            transaction.backend = systemd and transaction.previous != null
+}
+
+invariant ProtectedSystemdMarkerForbidsRollback {
+    for transaction in DeployTransactions:
+        transaction.kind = ProtectedSystemdReleaseDeployment
+        and protected_systemd_marker_present(transaction) implies
+            not DatabaseRollbackCompleted(transaction)
+            and not RuntimeArtifactRollbackRecorded(transaction)
+            and not transaction.state = activation_failed_rolled_back
+}
+
+invariant ProtectedSystemdPersistentInhibit {
+    for transaction in DeployTransactions:
+        transaction.kind = ProtectedSystemdReleaseDeployment implies
+            protected_systemd_inhibit_disposition_valid(transaction)
+}
+
+invariant ProtectedSystemdCommitRetainsPristineBackup {
+    for transaction in DeployTransactions:
+        transaction.kind = ProtectedSystemdReleaseDeployment
+        and transaction.state = committed implies
+            protected_systemd_marker_present(transaction)
+            and protected_systemd_target_valid(transaction)
+            and ProtectedSystemdRetained(transaction)
+}
+
 rule MatchingTerminalClaimReleased {
     when: TerminalStatusPersisted(transaction, claim)
     requires: claim.active
@@ -886,7 +1196,7 @@ rule StaleClaimReleaseRejected {
 
 rule InterruptedTransactionRemainsActionable {
     when: DeploymentStatusRequested(transaction)
-    requires: transaction.state in { preparing, prepared, handed_off, precondition_cleanup_pending, activating }
+    requires: transaction.state in { preparing, prepared, handed_off, precondition_cleanup_pending, activating, current_forward_failed }
     requires: now() - transaction.updated_at > config.stale_after
     ensures: RecoveryGuidanceShown(transaction)
     ensures: not transaction.state = committed
@@ -1024,7 +1334,7 @@ invariant DisruptionRequiresPreparedIndependentOwner {
         RuntimeDisruptionStarted(transaction) implies
             preparation_complete(transaction)
             and transaction.state in { handed_off, activating, committed,
-                activation_failed_rolled_back, activation_failed_rollback_failed }
+                activation_failed_rolled_back, activation_failed_rollback_failed, current_forward_failed }
 }
 
 invariant ClaimReleaseRequiresMatchingDurableTerminalStatus {
