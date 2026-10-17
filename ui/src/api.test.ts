@@ -631,10 +631,23 @@ describe('conversation-view response transport', () => {
     expect(JSON.stringify(debug.mock.calls)).not.toContain('private observer');
     debug.mockRestore();
   });
-  it('does not turn a Global older-page read into another correlated initial-open server span', async () => {
+  it.each(['ordinary', 'global'] as const)('uses request-only correlation for a %s fresh-tail recovery without initial-open attribution', async route => {
+    const send = vi.fn().mockResolvedValue(new Response(JSON.stringify({latest_opening: {status: 'none'}})));
+    vi.stubGlobal('fetch', send);
+    const observed = vi.fn();
+    await (route === 'global' ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot)('root', {request_id: open, onTelemetry: observed});
+    const url = new URL(send.mock.calls[0]![0] as string, 'http://localhost');
+    expect(url.searchParams.get('request_id')).toBe(open);
+    expect(url.searchParams.has('open_id')).toBe(false);
+    expect(url.searchParams.has('before')).toBe(false);
+    expect(observed).toHaveBeenCalledTimes(1);
+  });
+  it('forwards an explicitly owned Global older-page request ID without claiming an initial-open server span', async () => {
     const send = vi.fn().mockResolvedValue(new Response(JSON.stringify({ latest_opening: { status: 'none' } })));
     vi.stubGlobal('fetch', send);
     await api.getCoordinatorHistory('root', { before: 'opaque-cursor', open_id: open, onTelemetry: vi.fn() });
-    expect(send.mock.calls[0]![0]).not.toContain('open_id');
+    const url = new URL(send.mock.calls[0]![0] as string, 'http://localhost');
+    expect(url.searchParams.get('before')).toBe('opaque-cursor');
+    expect(url.searchParams.get('open_id')).toBe(open);
   });
 });

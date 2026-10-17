@@ -108,22 +108,25 @@ async function fetchOlderSnapshotWithFreshCursor(
   before: string,
   coordinator: boolean,
   onFreshTailRequest: () => void,
+  requestOptions: (purpose: 'older' | 'recovery') => HistoryOptions,
 ): Promise<{ older: HistorySnapshot; refreshedTail?: HistorySnapshot }> {
   try {
     return { older: await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, {
       message_limit: PAGE_SIZE,
       before,
+      ...requestOptions('older'),
     }) };
   } catch (error) {
     if (!(error instanceof ApiResponseError) || error.status !== 400) throw error;
     onFreshTailRequest();
-    const refreshed = await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, { message_limit: PAGE_SIZE });
+    const refreshed = await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, { message_limit: PAGE_SIZE, ...requestOptions('recovery') });
     if (!refreshed.has_older || !refreshed.before) throw error;
     return {
       refreshedTail: refreshed,
       older: await (coordinator ? fetchCoordinatorSnapshot : fetchOrdinarySnapshot)(productConversationId, {
         message_limit: PAGE_SIZE,
         before: refreshed.before,
+        ...requestOptions('older'),
       }),
     };
   }
@@ -1279,6 +1282,15 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     if (!productConversationId || !snapshot?.has_older || !snapshot.before || loadingOlder) return;
     const ownerId = productConversationId;
     let freshTailOwner: HistorySnapshot | null = null;
+    const requestOwner = journeyRef.current.captureRequestOwner();
+    const requestOptions = (purpose: 'older' | 'recovery'): HistoryOptions => {
+      const requestId = generateUUID();
+      const observation = requestOwner(requestId);
+      if (!observation) return {};
+      return purpose === 'recovery'
+        ? { request_id: requestId, onTelemetry: observation.response }
+        : { open_id: requestId, onTelemetry: observation.response };
+    };
     let freshTailOpenings = new Map<string, ContinuationOpeningView | null>();
     const routeGeneration = routeGenerationRef.current;
     const requestGeneration = ++paginationRequestRef.current;
@@ -1299,7 +1311,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         freshTailOpenings = new Map(conversationStore.listSnapshots().map(conversation => [
           conversation.id, conversationStore.getSnapshot(conversation.id).opening,
         ]));
-      });
+      }, requestOptions);
       const requestObservation: OpeningObservation | null = refreshedTail && freshTailOpenings.has(refreshedTail.latest_transcript_row_id) ? {
         transcriptRowId: refreshedTail.latest_transcript_row_id,
         opening: freshTailOpenings.get(refreshedTail.latest_transcript_row_id) ?? null,

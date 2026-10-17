@@ -96,6 +96,13 @@ export class ViewJourneyLifecycle {
     this.targetMessageId = messageId;
   }
 
+  captureRequestOwner(): (requestId: string) => ViewRequestObservation | undefined {
+    const attempt = this.ensure();
+    return requestId => attempt && this.attempt === attempt && !this.finished
+      ? this.requestStarted(requestId)
+      : undefined;
+  }
+
   requestStarted(requestId: string): ViewRequestObservation | undefined {
     const attempt = this.ensure();
     if (!attempt || this.finished) return undefined;

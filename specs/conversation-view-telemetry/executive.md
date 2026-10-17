@@ -11,6 +11,10 @@ Task 32005 is user-commissioned, independently owned telemetry work. Global reta
 - Bounded request/SSE identities, finite response header buckets, message/chapter buckets, frontend source and dirty status, and authoritative backend instance/source identity are threaded through the existing pipeline. No response body is read for telemetry.
 - `view_journey::report`: authenticated existing API routing, eight-KiB body limit, fixed schema/enums/UUIDs and duration validation, allowlisted `browser.conversation_view`, `browser.view_correlation`, and `coordinator.history_open` exporter spans.
 
+### Additional-history ownership
+
+Pagination captures the original `ViewJourneyLifecycle` attempt at admission. Every actual GET in the older/fresh-tail/retry helper independently registers a request UUID and finite response callback; finished or replaced attempts admit none. The Global API adapter forwards explicit cursor-request identities while backend initial-open stage scope is unchanged. A mutually exclusive typed `request_id` option carries recovery-tail identity without `open_id`; this prevents a no-cursor recovery from entering the backend's initial-open span predicate. Cursor requests retain `open_id`. API controls verify both recovery URLs omit `open_id` while retaining response observations. Page regressions cover both routes, three distinct retry IDs, original report membership, and recovery after resume; lifecycle controls cover original ready reports, stale callbacks, and terminal immutability. The shared retained candidate diagnostic observed two pre-report older GETs without correlation, motivating this source correction. Actual corrected-artifact qualification remains pending; this does not establish six-report collector/export/drain acceptance or overhead clearance.
+
 ## Verification and remaining qualification
 
 | Requirement | Evidence | Remaining |

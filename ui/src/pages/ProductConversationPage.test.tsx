@@ -3,6 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { StrictMode, useEffect, useLayoutEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
+import { ViewJourneyLifecycle, defaultViewIdentity } from '../hooks/conversationViewLifecycle';
+import { ViewJourneyReporter } from '../hooks/conversationViewTelemetry';
 import { ProductConversationAliasRedirect } from '../App';
 import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { transcriptPositioningCommandKey, type TranscriptPositioningCompletion, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
@@ -424,7 +426,7 @@ function coordinatorSnapshot(snapshot: ProductConversationSnapshotView) {
 
 let conversationStore: ConversationStore;
 
-function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false, strict = false) {
+function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false, strict = false, journey?: ViewJourneyLifecycle) {
   const content = (
     <ConversationContext.Provider value={conversationStore}>
     <ConversationReadinessProvider>
@@ -437,8 +439,8 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
             <HistoryRouteControls />
             <Routes>
               <Route path="/c/:slug" element={<ProductConversationAliasRedirect reference="pc-1" />} />
-              <Route path="/global/:slug" element={<ProductConversationPage productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: undefined }} />} />
-              <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
+              <Route path="/global/:slug" element={<ProductConversationPage journey={journey} productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: undefined }} />} />
+              <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage journey={journey} />} />
             </Routes>
             </FileExplorerProvider>
           </ChainProvider>
@@ -628,7 +630,7 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getCoordinatorHistory).mockResolvedValueOnce(tail).mockResolvedValueOnce(complete);
     renderPage('/global/row-1?source_transcript=row-1#message-cont-1');
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.transcriptPositioning).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'cont-1' } }));
-    expect(api.getCoordinatorHistory).toHaveBeenNthCalledWith(2, 'row-1', { message_limit: 100, before: 'global-before' });
+    expect(api.getCoordinatorHistory).toHaveBeenNthCalledWith(2, 'row-1', expect.objectContaining({ message_limit: 100, before: 'global-before', open_id: expect.any(String), onTelemetry: expect.any(Function) }));
     expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).filter((message) => message.message_id === 'cont-1')).toHaveLength(1);
     expect(screen.getByTestId('history-location')).toHaveTextContent('?source_transcript=row-1#message-cont-1');
   });
@@ -922,7 +924,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(3));
     fireEvent.click(screen.getByRole('button', { name: 'load older' }));
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
-    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', { message_limit: 100, before: 'advanced-cursor' });
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', expect.objectContaining({ message_limit: 100, before: 'advanced-cursor', open_id: expect.any(String), onTelemetry: expect.any(Function) }));
     expect(screen.getByTestId('message-order').textContent).toBe('m-1,m-2,cont-1,m-3,m-4');
     expect(currentPositioning().kind).toBe('idle');
   });
@@ -968,7 +970,7 @@ describe('ProductConversationPage', () => {
     expect(currentPositioning().kind).toBe('idle');
     act(() => { void (conversationNavStackSpy.mock.lastCall?.[0]?.onLoadOlderMessages as (basis: unknown) => Promise<void>)({ kind: 'reader_anchor', messageId: 'anchor-11', viewportStartOffset: 7 }); });
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
-    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', { message_limit: 100, before: refreshed.before });
+    expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', expect.objectContaining({ message_limit: 100, before: refreshed.before, open_id: expect.any(String), onTelemetry: expect.any(Function) }));
     expect(screen.getByTestId('message-order')).toHaveTextContent('anchor-1,anchor-2');
     expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { kind: 'restore_after_prefix_expansion', messageId: 'anchor-11', viewportStartOffset: 7 } });
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe(change === 'continuation' ? 'row-3' : 'row-2');
@@ -1138,8 +1140,8 @@ describe('ProductConversationPage', () => {
     const loader = global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot;
     expect(loader).toHaveBeenCalledTimes(lazy ? 3 : 1);
     if (lazy) {
-      expect(loader).toHaveBeenNthCalledWith(2, global ? 'row-1' : 'pc-1', { message_limit: 100, before: 'opening-before' });
-      expect(loader).toHaveBeenNthCalledWith(3, global ? 'row-1' : 'pc-1', { message_limit: 100, before: 'boundary-before' });
+      expect(loader).toHaveBeenNthCalledWith(2, global ? 'row-1' : 'pc-1', expect.objectContaining({ message_limit: 100, before: 'opening-before', open_id: expect.any(String), onTelemetry: expect.any(Function) }));
+      expect(loader).toHaveBeenNthCalledWith(3, global ? 'row-1' : 'pc-1', expect.objectContaining({ message_limit: 100, before: 'boundary-before', open_id: expect.any(String), onTelemetry: expect.any(Function) }));
     }
   });
 
@@ -1320,7 +1322,7 @@ describe('ProductConversationPage', () => {
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: 'load older' }));
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(false));
-    expect((global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot)).toHaveBeenLastCalledWith(expect.any(String), { before: 'fresh-ceiling', message_limit: 100 });
+    expect((global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot)).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({ before: 'fresh-ceiling', message_limit: 100, open_id: expect.any(String), onTelemetry: expect.any(Function) }));
     expect((conversationNavStackSpy.mock.lastCall?.[0]?.messages as Message[]).map(message => message.message_id)).toEqual([...rows.map(message => message.message_id), 'newest-message']);
   });
 
@@ -2905,6 +2907,72 @@ describe('ProductConversationPage', () => {
     expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(4);
   });
 
+  it.each([false, true])('correlates every older/recovery GET with its original unfinished journey (Global=%s)', async global => {
+    const {api} = await import('../api');
+    const reporter = new ViewJourneyReporter();
+    let result: import('../hooks/conversationViewJourney').JourneyReport | null = null;
+    const report = vi.spyOn(ViewJourneyReporter.prototype, 'report').mockImplementation((attempt, outcome) => { result = attempt.measurement.finish(outcome); });
+    const journey = new ViewJourneyLifecycle(defaultViewIdentity(global ? 'global' : 'ordinary', 'navigation'), reporter);
+    const originalId = journey.openId;
+    const initial = makeSnapshot();
+    const older = makeSnapshot({segments: [{...initial.segments[0]!, messages: [makeMessage('owned-prefix', 0, 'row-1')]}], before: null, has_older: false});
+    const fetchSnapshot = vi.mocked(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot);
+    const shape = (value: ProductConversationSnapshotView) => global ? coordinatorSnapshot(value) : value;
+    fetchSnapshot.mockResolvedValueOnce(shape(initial)).mockRejectedValueOnce(new ApiResponseError('stale cursor', 400))
+      .mockResolvedValueOnce(shape(makeSnapshot({before: 'fresh-owned'}))).mockResolvedValueOnce(shape(older));
+    renderPage(global ? '/global/row-1' : '/product-conversations/pc-1', false, false, journey);
+    await waitForPageReady();
+    expect(report).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', {name: 'load older'}));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('owned-prefix'));
+    const attempts = fetchSnapshot.mock.calls.slice(1, 4).map(call => call[1]);
+    expect(attempts).toHaveLength(3);
+    attempts.forEach((options, index) => {
+      expect(options).toMatchObject({[index === 1 ? 'request_id' : 'open_id']: expect.any(String), onTelemetry: expect.any(Function)});
+      expect(options).not.toHaveProperty(index === 1 ? 'open_id' : 'request_id');
+    });
+    const ids = attempts.map(options => (options!.open_id ?? options!.request_id)!);
+    expect(new Set(ids).size).toBe(3);
+    expect(ids).not.toContain(originalId);
+    attempts.forEach((options, index) => options!.onTelemetry!({size_bucket: '0-10k', trace_id: String(index + 1).repeat(32)}));
+    journey.finish('incomplete');
+    expect(report).toHaveBeenCalledTimes(1);
+    const attempt = report.mock.calls[0]![0];
+    expect(attempt.openId).toBe(originalId);
+    expect((result as import('../hooks/conversationViewJourney').JourneyReport | null)?.correlations.filter(c => c.kind === 'request').map(c => c.id)).toEqual(expect.arrayContaining(ids));
+    report.mockRestore();
+  });
+
+  it.each([false, true])('does not rebind pending older recovery to a successor journey (Global=%s)', async global => {
+    const {api} = await import('../api');
+    const journey = new ViewJourneyLifecycle(defaultViewIdentity(global ? 'global' : 'ordinary', 'navigation'), new ViewJourneyReporter());
+    let rejectOlder!: (error: Error) => void;
+    const pending = new Promise<never>((_resolve, reject) => {rejectOlder = reject;});
+    const initial = makeSnapshot();
+    const shape = (value: ProductConversationSnapshotView) => global ? coordinatorSnapshot(value) : value;
+    const fetchSnapshot = vi.mocked(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot);
+    fetchSnapshot.mockResolvedValueOnce(shape(initial)).mockReturnValueOnce(pending)
+      .mockResolvedValueOnce(shape(makeSnapshot({before: 'resumed-cursor'})))
+      .mockResolvedValueOnce(shape(makeSnapshot({has_older: false, before: null})));
+    const register = vi.spyOn(journey, 'requestStarted');
+    renderPage(global ? '/global/row-1' : '/product-conversations/pc-1', false, false, journey);
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', {name: 'load older'}));
+    expect(fetchSnapshot.mock.calls[1]![1]).toMatchObject({open_id: expect.any(String), onTelemetry: expect.any(Function)});
+    const registeredBeforeResume = register.mock.calls.length;
+    journey.resume();
+    await act(async () => {rejectOlder(new ApiResponseError('stale cursor', 400));});
+    await waitFor(() => expect(fetchSnapshot).toHaveBeenCalledTimes(4));
+    for (const [, options] of fetchSnapshot.mock.calls.slice(2, 4)) {
+      expect(options).not.toHaveProperty('open_id');
+      expect(options).not.toHaveProperty('onTelemetry');
+      expect(options).not.toHaveProperty('request_id');
+    }
+    expect(register).toHaveBeenCalledTimes(registeredBeforeResume);
+    journey.finish('incomplete');
+    register.mockRestore();
+  });
+
   it('retries older-page fetch once with a fresh tail cursor after a stale 400 cursor error', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationHistorySnapshot)
@@ -2923,9 +2991,9 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,cont-1,m-3,m-4'));
     expect(vi.mocked(api.getProductConversationHistorySnapshot).mock.calls.slice(1, 4)).toEqual([
-      ['pc-1', { message_limit: 100, before: 'cursor-1' }],
-      ['pc-1', { message_limit: 100 }],
-      ['pc-1', { message_limit: 100, before: 'cursor-2' }],
+      ['pc-1', expect.objectContaining({ message_limit: 100, before: 'cursor-1', open_id: expect.any(String), onTelemetry: expect.any(Function) })],
+      ['pc-1', expect.objectContaining({ message_limit: 100, request_id: expect.any(String), onTelemetry: expect.any(Function) })],
+      ['pc-1', expect.objectContaining({ message_limit: 100, before: 'cursor-2', open_id: expect.any(String), onTelemetry: expect.any(Function) })],
     ]);
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({
       kind: 'positioning',
