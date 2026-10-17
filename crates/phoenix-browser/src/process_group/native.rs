@@ -284,7 +284,10 @@ fn linux_process_is_live_member(
     }
     let stat = match read_stat() {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
             return if is_member()? { Err(error) } else { Ok(false) };
         }
         Err(error) => return Err(error),
@@ -486,6 +489,56 @@ mod tests {
                 || Err(io::Error::from(io::ErrorKind::NotFound)),
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn linux_scan_reclassifies_stat_esrch_without_assuming_exit() {
+        for after in [
+            Ok(0),
+            Ok(99),
+            Err(io::Error::from_raw_os_error(libc::ESRCH)),
+        ] {
+            let mut observations = [Ok(42), after].into_iter();
+            assert!(!linux_process_is_live_member(
+                42,
+                42,
+                |_| observations.next().unwrap(),
+                || Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            )
+            .unwrap());
+            assert!(observations.next().is_none());
+        }
+        for (after, expected_errno) in [
+            (Ok(42), libc::ESRCH),
+            (Err(io::Error::from_raw_os_error(libc::EPERM)), libc::EPERM),
+            (Err(io::Error::from_raw_os_error(libc::EIO)), libc::EIO),
+        ] {
+            let mut observations = [Ok(42), after].into_iter();
+            let error = linux_process_is_live_member(
+                42,
+                42,
+                |_| observations.next().unwrap(),
+                || Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(expected_errno));
+            assert!(observations.next().is_none());
+        }
+        for errno in [libc::EPERM, libc::EIO] {
+            let mut observations = [Ok(42), Ok(99)].into_iter();
+            let error = linux_process_is_live_member(
+                42,
+                42,
+                |_| observations.next().unwrap(),
+                || Err(io::Error::from_raw_os_error(errno)),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert!(
+                observations.next().is_some(),
+                "unknown stat error must not reclassify"
+            );
         }
     }
 
