@@ -305,7 +305,7 @@ pub enum SseWireEvent {
         /// validated against `MessageSchema` and transformed to the UI's
         /// `Message` type at the valibot boundary.
         #[ts(type = "unknown")]
-        message: EnrichedMessage,
+        message: Box<EnrichedMessage>,
         opening: Option<super::types::ContinuationOpeningView>,
     },
     /// In-place mutation of an existing message's mutable fields.
@@ -550,7 +550,7 @@ impl SseWireEvent {
                 let sequence_id = message.sequence_id;
                 SseWireEvent::Message {
                     sequence_id,
-                    message: presentations.enrich(&message),
+                    message: Box::new(presentations.enrich(&message)),
                     opening,
                 }
             }

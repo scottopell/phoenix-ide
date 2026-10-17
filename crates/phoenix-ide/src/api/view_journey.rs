@@ -475,15 +475,7 @@ mod tests {
         assert_eq!(child.span_context.trace_id(), view.span_context.trace_id());
     }
 
-    #[tokio::test]
-    async fn production_attribute_capacity_preserves_complete_ready_collector_schema() {
-        use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-        use prost::Message as _;
-        use tracing::instrument::WithSubscriber;
-        use tracing_subscriber::prelude::*;
-        let state = collector_test_state().await;
-        let instance = state.db.instance_id().await.unwrap().to_string();
+    fn capacity_ready_payload() -> serde_json::Value {
         let mut value = payload();
         value["frontend_source"] = "f".repeat(40).into();
         for key in [
@@ -512,7 +504,50 @@ mod tests {
         value["marks"]["anchor_settled"] = 75.into();
         let parsed: Report = serde_json::from_value(value.clone()).unwrap();
         assert!(parsed.valid());
-        let expected: std::collections::BTreeMap<&str, serde_json::Value> = [
+        value
+    }
+
+    fn capacity_expected_marks(
+        value: &serde_json::Value,
+    ) -> [(&'static str, serde_json::Value); 8] {
+        [
+            ("browser.shell_ms", value["marks"]["shell"].clone()),
+            (
+                "browser.snapshot_received_ms",
+                value["marks"]["snapshot_received"].clone(),
+            ),
+            (
+                "browser.hydration_ready_ms",
+                value["marks"]["hydration_ready"].clone(),
+            ),
+            (
+                "browser.meaningful_transcript_ms",
+                value["marks"]["meaningful_transcript"].clone(),
+            ),
+            (
+                "browser.chapter_data_ready_ms",
+                value["marks"]["chapter_data_ready"].clone(),
+            ),
+            (
+                "browser.breadcrumb_presented_ms",
+                value["marks"]["breadcrumb_presented"].clone(),
+            ),
+            (
+                "browser.breadcrumb_enabled_ms",
+                value["marks"]["breadcrumb_enabled"].clone(),
+            ),
+            (
+                "browser.anchor_settled_ms",
+                value["marks"]["anchor_settled"].clone(),
+            ),
+        ]
+    }
+
+    fn capacity_expected_attributes(
+        value: &serde_json::Value,
+        instance: &str,
+    ) -> std::collections::BTreeMap<&'static str, serde_json::Value> {
+        [
             ("open.id", value["open_id"].clone()),
             ("browser.reporter_id", value["reporter_id"].clone()),
             (
@@ -578,35 +613,6 @@ mod tests {
                 "browser.timeline_saturated",
                 value["timeline_saturated"].clone(),
             ),
-            ("browser.shell_ms", value["marks"]["shell"].clone()),
-            (
-                "browser.snapshot_received_ms",
-                value["marks"]["snapshot_received"].clone(),
-            ),
-            (
-                "browser.hydration_ready_ms",
-                value["marks"]["hydration_ready"].clone(),
-            ),
-            (
-                "browser.meaningful_transcript_ms",
-                value["marks"]["meaningful_transcript"].clone(),
-            ),
-            (
-                "browser.chapter_data_ready_ms",
-                value["marks"]["chapter_data_ready"].clone(),
-            ),
-            (
-                "browser.breadcrumb_presented_ms",
-                value["marks"]["breadcrumb_presented"].clone(),
-            ),
-            (
-                "browser.breadcrumb_enabled_ms",
-                value["marks"]["breadcrumb_enabled"].clone(),
-            ),
-            (
-                "browser.anchor_settled_ms",
-                value["marks"]["anchor_settled"].clone(),
-            ),
             (
                 "browser.breadcrumb_ready_minus_meaningful_ms",
                 value["breadcrumb_ready_minus_meaningful_ms"].clone(),
@@ -628,7 +634,114 @@ mod tests {
             ),
         ]
         .into_iter()
-        .collect();
+        .chain(capacity_expected_marks(value))
+        .collect()
+    }
+
+    fn assert_capacity_ready_spans(
+        view: &opentelemetry_sdk::trace::SpanData,
+        spans: &[opentelemetry_sdk::trace::SpanData],
+        value: &serde_json::Value,
+        expected: &std::collections::BTreeMap<&str, serde_json::Value>,
+        required: [&str; 5],
+    ) {
+        assert_eq!(view.dropped_attributes_count, 0);
+        for key in required {
+            assert!(
+                view.attributes
+                    .iter()
+                    .any(|attribute| attribute.key.as_str() == key
+                        && matches!(attribute.value, opentelemetry::Value::F64(_))),
+                "missing typed mark {key}"
+            );
+        }
+        assert!(view.attributes.len() <= 52);
+        for (key, expected_value) in expected {
+            let attribute = view
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == *key)
+                .unwrap_or_else(|| panic!("missing field {key}"));
+            match (&attribute.value, expected_value) {
+                (opentelemetry::Value::String(actual), serde_json::Value::String(expected)) => {
+                    assert_eq!(actual.as_str(), expected.as_str())
+                }
+                (opentelemetry::Value::Bool(actual), serde_json::Value::Bool(expected)) => {
+                    assert_eq!(actual, expected);
+                }
+                (opentelemetry::Value::I64(actual), serde_json::Value::Number(expected)) => {
+                    assert_eq!(Some(*actual), expected.as_i64())
+                }
+                (opentelemetry::Value::F64(actual), serde_json::Value::Number(expected)) => {
+                    assert_eq!(Some(*actual), expected.as_f64())
+                }
+                _ => panic!("wrong type {key}"),
+            }
+        }
+        for key in [
+            "browser.reconnect_count",
+            "browser.background_interval_count",
+            "browser.observer_inspection_count",
+            "browser.admitted_count",
+            "browser.sampled_count",
+            "browser.dropped_correlations",
+            "browser.transport_dropped_count",
+            "browser.transport_failed_count",
+        ] {
+            assert!(
+                view.attributes
+                    .iter()
+                    .any(|attribute| attribute.key.as_str() == key
+                        && matches!(attribute.value, opentelemetry::Value::I64(10_000))),
+                "counter must export as signed integer {key}"
+            );
+        }
+        let metadata = [
+            "code.file.path",
+            "code.module.name",
+            "code.line.number",
+            "thread.id",
+            "thread.name",
+            "target",
+            "busy_ns",
+            "idle_ns",
+        ];
+        assert!(view
+            .attributes
+            .iter()
+            .all(|attribute| expected.contains_key(attribute.key.as_str())
+                || metadata.contains(&attribute.key.as_str())));
+        assert_eq!(spans.len(), 2);
+        let child = spans
+            .iter()
+            .find(|span| span.name == "browser.view_correlation")
+            .unwrap();
+        assert_eq!(child.parent_span_id, view.span_context.span_id());
+        assert_eq!(child.span_context.trace_id(), view.span_context.trace_id());
+        assert_eq!(child.dropped_attributes_count, 0);
+        for (key, expected) in [
+            ("open.id", value["open_id"].as_str().unwrap()),
+            ("correlation.kind", "request"),
+            (
+                "correlation.id",
+                value["correlations"][0]["id"].as_str().unwrap(),
+            ),
+        ] {
+            assert!(child.attributes.iter().any(|attribute| attribute.key.as_str() == key && matches!(&attribute.value, opentelemetry::Value::String(actual) if actual.as_str() == expected)));
+        }
+    }
+
+    #[tokio::test]
+    async fn production_attribute_capacity_preserves_complete_ready_collector_schema() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use prost::Message as _;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let state = collector_test_state().await;
+        let instance = state.db.instance_id().await.unwrap().to_string();
+        let value = capacity_ready_payload();
+        let expected = capacity_expected_attributes(&value, &instance);
         assert_eq!(expected.len(), 44);
         assert_eq!(expected.keys().map(|key| key.len()).sum::<usize>(), 1030);
         assert_eq!(
@@ -671,13 +784,13 @@ mod tests {
                 .attributes
                 .iter()
                 .filter(|attribute| expected.contains_key(attribute.key.as_str()))
-                .map(|attribute| attribute.encoded_len())
+                .map(prost::Message::encoded_len)
                 .sum();
             let metadata_bytes: usize = proto
                 .attributes
                 .iter()
                 .filter(|attribute| !expected.contains_key(attribute.key.as_str()))
-                .map(|attribute| attribute.encoded_len())
+                .map(prost::Message::encoded_len)
                 .sum();
             println!("collector_capacity cap={cap} attributes={} dropped={} otlp_span_bytes={} semantic_kv_bytes={semantic_bytes} sdk_kv_bytes={metadata_bytes}", view.attributes.len(), view.dropped_attributes_count, proto.encoded_len());
             let required = [
@@ -694,93 +807,7 @@ mod tests {
                     .iter()
                     .any(|attribute| attribute.key.as_str() == *key)));
             } else {
-                assert_eq!(view.dropped_attributes_count, 0);
-                for key in required {
-                    assert!(
-                        view.attributes
-                            .iter()
-                            .any(|attribute| attribute.key.as_str() == key
-                                && matches!(attribute.value, opentelemetry::Value::F64(_))),
-                        "missing typed mark {key}"
-                    );
-                }
-                assert!(view.attributes.len() <= 52);
-                for (key, expected_value) in &expected {
-                    let attribute = view
-                        .attributes
-                        .iter()
-                        .find(|attribute| attribute.key.as_str() == *key)
-                        .unwrap_or_else(|| panic!("missing field {key}"));
-                    match (&attribute.value, expected_value) {
-                        (
-                            opentelemetry::Value::String(actual),
-                            serde_json::Value::String(expected),
-                        ) => assert_eq!(actual.as_str(), expected.as_str()),
-                        (opentelemetry::Value::Bool(actual), serde_json::Value::Bool(expected)) => {
-                            assert_eq!(actual, expected)
-                        }
-                        (
-                            opentelemetry::Value::I64(actual),
-                            serde_json::Value::Number(expected),
-                        ) => assert_eq!(Some(*actual), expected.as_i64()),
-                        (
-                            opentelemetry::Value::F64(actual),
-                            serde_json::Value::Number(expected),
-                        ) => assert_eq!(Some(*actual), expected.as_f64()),
-                        _ => panic!("wrong type {key}"),
-                    }
-                }
-                for key in [
-                    "browser.reconnect_count",
-                    "browser.background_interval_count",
-                    "browser.observer_inspection_count",
-                    "browser.admitted_count",
-                    "browser.sampled_count",
-                    "browser.dropped_correlations",
-                    "browser.transport_dropped_count",
-                    "browser.transport_failed_count",
-                ] {
-                    assert!(
-                        view.attributes
-                            .iter()
-                            .any(|attribute| attribute.key.as_str() == key
-                                && matches!(attribute.value, opentelemetry::Value::I64(10_000))),
-                        "counter must export as signed integer {key}"
-                    );
-                }
-                let metadata = [
-                    "code.file.path",
-                    "code.module.name",
-                    "code.line.number",
-                    "thread.id",
-                    "thread.name",
-                    "target",
-                    "busy_ns",
-                    "idle_ns",
-                ];
-                assert!(view
-                    .attributes
-                    .iter()
-                    .all(|attribute| expected.contains_key(attribute.key.as_str())
-                        || metadata.contains(&attribute.key.as_str())));
-                assert_eq!(spans.len(), 2);
-                let child = spans
-                    .iter()
-                    .find(|span| span.name == "browser.view_correlation")
-                    .unwrap();
-                assert_eq!(child.parent_span_id, view.span_context.span_id());
-                assert_eq!(child.span_context.trace_id(), view.span_context.trace_id());
-                assert_eq!(child.dropped_attributes_count, 0);
-                for (key, expected) in [
-                    ("open.id", value["open_id"].as_str().unwrap()),
-                    ("correlation.kind", "request"),
-                    (
-                        "correlation.id",
-                        value["correlations"][0]["id"].as_str().unwrap(),
-                    ),
-                ] {
-                    assert!(child.attributes.iter().any(|attribute| attribute.key.as_str() == key && matches!(&attribute.value, opentelemetry::Value::String(actual) if actual.as_str() == expected)));
-                }
+                assert_capacity_ready_spans(view, &spans, &value, &expected, required);
             }
         }
     }

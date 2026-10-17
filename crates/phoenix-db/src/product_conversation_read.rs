@@ -1854,7 +1854,13 @@ mod tests {
         let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
         // This isolated SQL fixture permits sequence ties without weakening the production schema.
         sqlx::raw_sql(
-            "CREATE TABLE conversations (
+            "CREATE TABLE product_conversations (
+                id TEXT PRIMARY KEY NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator'))
+             );
+             INSERT INTO product_conversations VALUES
+                ('product', 'ordinary'), ('empty-product', 'ordinary'), ('other-product', 'ordinary');
+             CREATE TABLE conversations (
                 id TEXT PRIMARY KEY, product_conversation_id TEXT NOT NULL,
                 runtime_role TEXT NOT NULL, parent_conversation_id TEXT, continued_in_conv_id TEXT
              );
@@ -1945,32 +1951,41 @@ mod tests {
             Some(serde_json::to_string(&partial_ceilings).unwrap()),
             Some(serde_json::to_string(&null_tail_ceiling).unwrap()),
         ];
-        for product in ["product", "empty-product", "missing-product"] {
-            for cursor in &cursors {
-                for ceiling in &ceilings {
-                    for limit in [0, 1, 2, 5, 51] {
-                        let expected = full_message_page_rows(
-                            &mut connection,
-                            ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
-                            product,
-                            cursor.as_ref(),
-                            ceiling.as_deref(),
-                            limit,
-                        )
-                        .await;
-                        let actual = full_message_page_rows(
-                            &mut connection,
-                            PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
-                            product,
-                            cursor.as_ref(),
-                            ceiling.as_deref(),
-                            limit,
-                        )
-                        .await;
-                        assert_eq!(
-                            actual, expected,
-                            "product={product} cursor={cursor:?} ceiling={ceiling:?} limit={limit}"
-                        );
+        for (kind, role) in [("ordinary", "user"), ("coordinator", "coordinator")] {
+            sqlx::query("UPDATE product_conversations SET kind = ?1")
+                .bind(kind)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE conversations SET runtime_role = ?1 WHERE runtime_role IN ('user', 'coordinator')")
+                .bind(role).execute(&mut connection).await.unwrap();
+            for product in ["product", "empty-product", "missing-product"] {
+                for cursor in &cursors {
+                    for ceiling in &ceilings {
+                        for limit in [0, 1, 2, 5, 51] {
+                            let expected = full_message_page_rows(
+                                &mut connection,
+                                ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                                product,
+                                cursor.as_ref(),
+                                ceiling.as_deref(),
+                                limit,
+                            )
+                            .await;
+                            let actual = full_message_page_rows(
+                                &mut connection,
+                                PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                                product,
+                                cursor.as_ref(),
+                                ceiling.as_deref(),
+                                limit,
+                            )
+                            .await;
+                            assert_eq!(
+                                actual, expected,
+                                "kind={kind} product={product} cursor={cursor:?} ceiling={ceiling:?} limit={limit}"
+                            );
+                        }
                     }
                 }
             }
@@ -2977,13 +2992,10 @@ mod tests {
         assert_eq!(pending, 0);
     }
 
-    #[tokio::test]
-    async fn coordinator_history_pages_across_three_members_without_ordinary_lifecycle() {
-        let db = Database::open_in_memory().await.unwrap();
-        let root = db
-            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
-            .await
-            .unwrap();
+    async fn populate_coordinator_history(
+        db: &Database,
+        root: &crate::Conversation,
+    ) -> (Vec<String>, crate::Conversation) {
         let mut member = root.clone();
         let mut expected = Vec::new();
         for ordinal in 0..3 {
@@ -3033,6 +3045,17 @@ mod tests {
                 };
             }
         }
+        (expected, member)
+    }
+
+    #[tokio::test]
+    async fn coordinator_history_pages_across_three_members_without_ordinary_lifecycle() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let (expected, member) = populate_coordinator_history(&db, &root).await;
         let mut connection = db.pool.acquire().await.unwrap();
         let optimized = full_message_page_rows(
             &mut connection,

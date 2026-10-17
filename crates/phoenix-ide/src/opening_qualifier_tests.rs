@@ -1,5 +1,7 @@
 //! Explicit, isolated actual-server opening qualification. Never linked in shipping builds.
 #![allow(clippy::too_many_lines)]
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 
 use std::ffi::{OsStr, OsString};
 use std::sync::{Arc, OnceLock};
@@ -535,8 +537,6 @@ async fn actual_server_opening_qualifier() {
     std::env::set_var("PHOENIX_TLS", "off");
     std::env::set_var("PHOENIX_ENABLE_MOCK_MODEL", "1");
     std::env::set_var("PHOENIX_LOG_STDOUT", "1");
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let password = uuid::Uuid::new_v4().to_string();
     let credential = home.path().join("qualification-password");
     let mut credential_file = std::fs::OpenOptions::new()
