@@ -84,8 +84,8 @@ function fakeRuntime(options={}){
       if(outcome==='ready'&&!options.omitHistoryRequest&&!options.omitHistoryCorrelation)report.correlations.push({kind:'request',id:this.request_id+'-older'});
       if(options.missingGlobalIdentity&&this.fixture.kind==='global')delete report.product_conversation_id;
       if(options.unsafeReport)report.unrecognized_private_field='PRIVATE-never-retained';
-      if(options.unresolvedPendingGlobal&&this.fixture.kind==='global'&&outcome!=='ready')delete report.product_conversation_id;
-      if(options.unresolvedPending&&outcome!=='ready')delete report.product_conversation_id;
+      if(options.unresolvedPendingGlobal&&this.fixture.kind==='global'&&outcome!=='ready')report.product_conversation_id=null;
+      if(options.unresolvedPending&&outcome!=='ready')report.product_conversation_id=null;
       if(options.wrongPendingGlobalIdentity&&this.fixture.kind==='global'&&outcome!=='ready')report.product_conversation_id='UNIT-foreign-product';
       const req=this.request('/api/telemetry/conversation-view','POST',JSON.stringify(report));
       if(outcome!=='incomplete')this.emit('response',{request:()=>req,status:()=>204});
@@ -154,11 +154,12 @@ test('UNIT invalid Global fixture identity cannot mask scenario failure or prior
   assert.equal(failure.controlledReceipt.diagnostic_reports.invalid_report_count,0);
   assert.equal(Object.hasOwn(failure.controlledReceipt.diagnostic_reports.reports[0],'product_conversation_id'),false);
 });
-test('UNIT unresolved pending Global reports omit product identity without fabricating it',async()=>{
+test('UNIT unresolved pending Global reports serialize null product identity without fabricating it',async()=>{
   const runtime=fakeRuntime({unresolvedPendingGlobal:true});
   const result=await runControlledFunctional(runtime.input,runtime.UNIT);
   for(const t of result.trials.filter(t=>t.route==='global'&&t.kind!=='history')){
-    assert.equal(Object.hasOwn(t.reports[0],'product_conversation_id'),false);
+    assert.equal(Object.hasOwn(t.reports[0],'product_conversation_id'),true);
+    assert.equal(t.reports[0].product_conversation_id,null);
     assert.ok(t.primaryRequestOpenIds.length>0);
   }
   assert.equal(result.trials.find(t=>t.route==='global'&&t.kind==='history').reports[0].product_conversation_id,'UNIT-global');
@@ -170,11 +171,12 @@ test('UNIT a supplied pending Global product identity must still match the indep
   assert.equal(failure.controlledReceipt.failure_location.kind,'pagehide');
   assert.equal(failure.controlledReceipt.diagnostic_reports.reports[0].product_conversation_id,'UNIT-foreign-product');
 });
-test('UNIT both routes may truthfully omit unresolved pending identity while keeping exact finite ownership',async()=>{
+test('UNIT both routes serialize unresolved pending identity as null while keeping exact finite ownership',async()=>{
   const runtime=fakeRuntime({unresolvedPending:true});
   const result=await runControlledFunctional(runtime.input,runtime.UNIT);
   for(const t of result.trials.filter(t=>t.kind!=='history')){
-    assert.equal(Object.hasOwn(t.reports[0],'product_conversation_id'),false);
+    assert.equal(Object.hasOwn(t.reports[0],'product_conversation_id'),true);
+    assert.equal(t.reports[0].product_conversation_id,null);
     assert.ok(t.primaryRequestOpenIds.some(id=>t.reports[0].correlations.some(c=>c.kind==='request'&&c.id===id)));
   }
   assert.equal(result.trials.filter(t=>t.kind==='history'&&t.reports[0].product_conversation_id).length,2);
@@ -192,6 +194,9 @@ test('UNIT actual pinned report parser filters invalid failure bodies but retain
   const {resolve}=await import('node:path'),{pathToFileURL}=await import('node:url');
   const app=resolve(process.env.APP_ROOT??'target/history-hidden-geometry-repair');
   const {captureReport}=await import(pathToFileURL(resolve(app,'ui/scripts/qualify-view-telemetry.mjs')).href);
+  const pending=fakeRuntime({unresolvedPending:true});pending.input.module.captureReport=captureReport;
+  const actualSchemaResult=await runControlledFunctional(pending.input,pending.UNIT);
+  assert.equal(actualSchemaResult.trials.filter(t=>t.kind!=='history'&&t.reports[0].product_conversation_id===null).length,4);
   for(const unsafe of [false,true]){
     const runtime=fakeRuntime(unsafe?{unsafeReport:true}:{missingGlobalIdentity:true});
     runtime.input.module.captureReport=captureReport;

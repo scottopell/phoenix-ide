@@ -2798,3 +2798,37 @@ Run `38992494875` is now fully terminal **failure**: isolated witness failed at
 ordinary pagehide; Rust and every standard lane succeeded. App35f remains clean
 and unchanged. The changed pending-identity/root-reference candidate may now
 receive one causal normal qualification; no unchanged run was retried.
+
+### Exact nullable field correction, replayed against retained report
+
+Run `38993749887`, shared3d97/app35f, witness `117281557850`, retains both history
+ready trials but fails at the same ordinary/pagehide report-wait phase. Artifact
+`12086502244` is96,402,250 bytes; bounded receipt/log fetch78,429 bytes. Rust
+`117281628754` was still running at this entry. This is not an unchanged rerun:
+the candidate changed pending identity handling/root entry, but its nullable
+field interpretation was wrong.
+
+**Correction to earlier prose:** the actual incomplete reports in both90ad and
+3d97 do **not** omit `product_conversation_id`; the key is present with explicit
+JSON **null**. Earlier summaries used Python `.get(...) is not None` as a
+presence proxy and incorrectly described null as omission. The pinned app type
+is `string | null`, with total serialization. The source emits null until the
+snapshot enriches identity. Frontend source matches the historical ready report.
+The preceding patch tested undefined instead of null, so it still asserted
+`null == fixture ID` and failed. This was a shared boundary/test-fixture bug,
+not a product data-loss or transport failure.
+
+The check now accepts **explicit null only** for the expected pending terminal
+outcome; absent/undefined is not treated as an alternative encoding. Ready and
+any nonnull supplied identity remain exact fixture matches. Positive unit
+reports serialize the same explicit null; the actual pinned parser is exercised
+through a complete six-scenario fake transport with four null pending reports.
+No ID, response or acceptance evidence is fabricated.
+
+An independent compiler-free replay extracts the actual controlledObserver
+function via the cached TypeScript AST, imports the actual pinned captureReport
+parser, and feeds the **exact retained3d97 report**: old undefined check fails
+red with AssertionError; fixed null check passes green. The replay prints only
+static labels, not private IDs/URLs/bodies. Evidence and code remain under the
+local evidence directory. All138 shared Node regressions pass; diff check passes.
+No additional native/browser/build/runner was used to establish this causal fix.

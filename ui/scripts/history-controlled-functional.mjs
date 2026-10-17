@@ -103,7 +103,7 @@ function controlledObserver(page, network, module, identity, fixture, ownership,
   };
   const getReports = () => network.snapshot().reports.map(raw => {
     const report = module.captureReport(JSON.stringify(raw), []);
-    if (kind === 'history' || report.product_conversation_id !== undefined) {
+    if (kind === 'history' || report.product_conversation_id !== null) {
       assert.equal(report.product_conversation_id, fixture.product_conversation_id);
     } else {
       assert.equal(report.outcome, kind === 'pagehide' ? 'incomplete' : 'canceled', 'unresolved identity belongs only to the expected pending terminal report');
