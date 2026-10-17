@@ -88,6 +88,277 @@ fn root_slot() -> NativeGuardianSlot {
     }
 }
 
+fn recovery_fixture() -> (
+    ControllerSqliteStore,
+    LoadedAttempt,
+    NativeGuardianBinding,
+    NativeChildListIssue,
+) {
+    let (mut store, mut policy, binding) =
+        setup_with_deadline(&[root_slot()], MonotonicTick::new(500));
+    let ticket = policy.issue_next().unwrap();
+    let issue = store
+        .commit_native_child_list_issue_at(&ticket, &binding, MonotonicTick::new(499))
+        .unwrap();
+    let checkpoint = store
+        .load_attempt(issue.key().attempt_id())
+        .unwrap()
+        .unwrap()
+        .checkpoint;
+    let detached = store
+        .commit_detached_binding(&binding, &[root_slot()])
+        .unwrap();
+    let interrupted = checkpoint.interrupt().unwrap().persist(&mut store).unwrap();
+    let binding = store
+        .commit_fresh_interruption_binding(
+            &detached,
+            interrupted.checkpoint().persistence_revision().unwrap(),
+        )
+        .unwrap();
+    let loaded = store
+        .load_attempt(issue.key().attempt_id())
+        .unwrap()
+        .unwrap();
+    (store, loaded, binding, issue)
+}
+
+#[test]
+fn recovered_child_list_folds_without_effects_and_preserves_ordered_evidence() {
+    for children in [
+        vec![],
+        vec![
+            ProcessId::new(NonZeroU32::new(32).unwrap()),
+            ProcessId::new(NonZeroU32::new(31).unwrap()),
+        ],
+    ] {
+        let (mut store, loaded, binding, issue) = recovery_fixture();
+        let original = loaded.checkpoint.clone();
+        let folded = original
+            .clone()
+            .fold_interrupted_child_list(issue.parent(), children.clone())
+            .unwrap();
+        assert_eq!(folded.phase(), Phase::Interrupted);
+        assert!(!folded.native_root_scan(issue.parent()));
+        let mut canonical = children.clone();
+        canonical.sort_unstable();
+        assert_eq!(
+            folded.ownership_tree().unwrap().unresolved().len(),
+            canonical.len()
+        );
+        assert_eq!(
+            original
+                .ownership_tree()
+                .unwrap()
+                .pending_child_scans()
+                .len(),
+            1
+        );
+        let candidate = store
+            .prepare_native_child_list_recovery_at(loaded, MonotonicTick::new(499))
+            .unwrap();
+        assert_eq!(candidate.issue(), issue);
+        assert_eq!(candidate.binding(), &binding);
+        let status = store
+            .apply_recovered_native_child_list_at(
+                VerifiedRecoveredNativeChildList::after_live_verification(
+                    candidate,
+                    children.clone(),
+                ),
+                MonotonicTick::new(499),
+            )
+            .unwrap();
+        assert!(
+            matches!(&status, NativeChildListStatus::AppliedPendingAck { children: saved, .. } if saved == &children)
+        );
+        assert_eq!(
+            store.load_native_child_list_status(issue.key()).unwrap(),
+            Some(status)
+        );
+        let loaded = store
+            .load_attempt(issue.key().attempt_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.checkpoint, {
+            let mut expected = folded;
+            expected.set_revision(loaded.checkpoint.persistence_revision().unwrap());
+            expected
+        });
+        assert_eq!(loaded.phase(), Phase::Interrupted);
+        assert_eq!(
+            store
+                .pending_native_child_list_ack(issue.key().attempt_id())
+                .unwrap()
+                .unwrap()
+                .0,
+            issue.key()
+        );
+    }
+}
+
+#[test]
+fn interrupted_fold_rejects_other_phase_and_parent() {
+    let (mut store, loaded, _, issue) = recovery_fixture();
+    let interrupted = loaded.checkpoint;
+    assert!(interrupted
+        .clone()
+        .fold_interrupted_child_list(identity(87), vec![])
+        .is_none());
+    let active = store
+        .load_attempt(issue.key().attempt_id())
+        .unwrap()
+        .unwrap()
+        .checkpoint
+        .recover()
+        .unwrap()
+        .checkpoint;
+    assert!(active
+        .fold_interrupted_child_list(issue.parent(), vec![])
+        .is_none());
+}
+
+#[test]
+fn recovery_rejects_expired_deadline_without_application() {
+    let (mut store, loaded, _, issue) = recovery_fixture();
+    let original = loaded.checkpoint.clone();
+    assert!(matches!(
+        store.prepare_native_child_list_recovery_at(loaded, MonotonicTick::new(500)),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+    assert_eq!(
+        read_attempt(&store.connection, issue.key().attempt_id()).unwrap(),
+        Some(original)
+    );
+    assert!(matches!(
+        store.load_attempt(issue.key().attempt_id()),
+        Err(ControllerStoreError::Poisoned)
+    ));
+
+    let (mut store, loaded, _, issue) = recovery_fixture();
+    let original = loaded.checkpoint.clone();
+    let candidate = store
+        .prepare_native_child_list_recovery_at(loaded, MonotonicTick::new(499))
+        .unwrap();
+    let mut ticks = [
+        MonotonicTick::new(499),
+        MonotonicTick::new(499),
+        MonotonicTick::new(499),
+        MonotonicTick::new(500),
+    ]
+    .into_iter();
+    assert!(matches!(
+        store.apply_recovered_native_child_list_with_clock(
+            VerifiedRecoveredNativeChildList::after_live_verification(candidate, vec![]),
+            || Ok(ticks.next().unwrap_or(MonotonicTick::new(500))),
+        ),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+    assert_eq!(
+        read_attempt(&store.connection, issue.key().attempt_id()).unwrap(),
+        Some(original)
+    );
+    let applications: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM native_child_list_applications",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(applications, 0);
+    assert!(matches!(
+        store.load_attempt(issue.key().attempt_id()),
+        Err(ControllerStoreError::Poisoned)
+    ));
+}
+
+#[test]
+fn recovery_requires_sole_pending_issue_and_reconciling_binding() {
+    let (mut store, loaded, _, issue) = recovery_fixture();
+    store
+        .connection
+        .execute_batch("DROP TRIGGER native_child_list_issue_no_delete")
+        .unwrap();
+    let (id, revision, ordinal) = parts(issue);
+    store.connection.execute(
+        "DELETE FROM native_child_list_issues WHERE attempt_id=?1 AND dispatch_revision=?2 AND ordinal=?3",
+        params![id, revision, ordinal],
+    ).unwrap();
+    assert!(matches!(
+        store.prepare_native_child_list_recovery_at(loaded, MonotonicTick::new(499)),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+    assert!(matches!(
+        store.load_attempt(issue.key().attempt_id()),
+        Err(ControllerStoreError::Poisoned)
+    ));
+
+    let (mut store, loaded, binding, _) = recovery_fixture();
+    store
+        .commit_detached_binding(&binding, &[root_slot()])
+        .unwrap();
+    assert!(matches!(
+        store.prepare_native_child_list_recovery_at(loaded, MonotonicTick::new(499)),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+}
+
+#[test]
+fn recovery_revalidates_binding_after_live_verification() {
+    let (mut store, loaded, binding, issue) = recovery_fixture();
+    let original = loaded.checkpoint.clone();
+    let candidate = store
+        .prepare_native_child_list_recovery_at(loaded, MonotonicTick::new(499))
+        .unwrap();
+    store
+        .commit_detached_binding(&binding, &[root_slot()])
+        .unwrap();
+    assert!(matches!(
+        store.apply_recovered_native_child_list_at(
+            VerifiedRecoveredNativeChildList::after_live_verification(candidate, vec![]),
+            MonotonicTick::new(499)
+        ),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+    assert_eq!(
+        read_attempt(&store.connection, issue.key().attempt_id()).unwrap(),
+        Some(original)
+    );
+    assert!(matches!(
+        store.load_attempt(issue.key().attempt_id()),
+        Err(ControllerStoreError::Poisoned)
+    ));
+}
+
+#[test]
+fn recovery_rejects_stale_loaded_checkpoint_and_duplicate_application() {
+    let (mut store, loaded, _, issue) = recovery_fixture();
+    let stale = store
+        .load_attempt(issue.key().attempt_id())
+        .unwrap()
+        .unwrap();
+    let candidate = store
+        .prepare_native_child_list_recovery_at(loaded, MonotonicTick::new(499))
+        .unwrap();
+    let result = store
+        .apply_recovered_native_child_list_at(
+            VerifiedRecoveredNativeChildList::after_live_verification(candidate, vec![]),
+            MonotonicTick::new(499),
+        )
+        .unwrap();
+    assert!(matches!(
+        result,
+        NativeChildListStatus::AppliedPendingAck { .. }
+    ));
+    assert!(matches!(
+        store.prepare_native_child_list_recovery_at(stale, MonotonicTick::new(499)),
+        Err(ControllerStoreError::RevisionConflict)
+    ));
+    assert!(matches!(
+        store.load_native_child_list_status(issue.key()),
+        Err(ControllerStoreError::Poisoned)
+    ));
+}
+
 #[allow(clippy::too_many_lines)]
 #[test]
 fn complete_empty_and_nonempty_result_ack_and_replay() {

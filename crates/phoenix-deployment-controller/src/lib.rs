@@ -71,11 +71,12 @@ pub use runtime::{
 pub use state::sqlite::{
     CommittedNativeReconciliationActivation, ControllerSqliteStore, ControllerStoreError,
     NativeChildListCompletion, NativeChildListDispatch, NativeChildListIssue,
-    NativeChildListStatus, NativeReconciliationActivation, NativeReconciliationCompletion,
-    NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingIssue,
-    NativeSamplingRecoveryCandidate, NativeSamplingStatus, PreparedNativeReconciliation,
-    VerifiedNativeChildListAckConfirmation, VerifiedNativeChildListCompletion,
-    VerifiedNativeSamplingAckConfirmation, VerifiedNativeSamplingCompletion,
+    NativeChildListRecoveryCandidate, NativeChildListStatus, NativeReconciliationActivation,
+    NativeReconciliationCompletion, NativeSamplingCompletion, NativeSamplingDispatch,
+    NativeSamplingIssue, NativeSamplingRecoveryCandidate, NativeSamplingStatus,
+    PreparedNativeReconciliation, VerifiedNativeChildListAckConfirmation,
+    VerifiedNativeChildListCompletion, VerifiedNativeSamplingAckConfirmation,
+    VerifiedNativeSamplingCompletion, VerifiedRecoveredNativeChildList,
     VerifiedRecoveredNativeSampling,
 };
 pub use state::{

@@ -36,8 +36,9 @@ use crate::{
 mod native_child_list;
 pub use native_child_list::{
     NativeChildListCompletion, NativeChildListDispatch, NativeChildListIssue,
-    NativeChildListStatus, VerifiedNativeChildListAckConfirmation,
-    VerifiedNativeChildListCompletion,
+    NativeChildListRecoveryCandidate, NativeChildListStatus,
+    VerifiedNativeChildListAckConfirmation, VerifiedNativeChildListCompletion,
+    VerifiedRecoveredNativeChildList,
 };
 mod native_reconciliation;
 pub use native_reconciliation::{
@@ -540,8 +541,32 @@ impl ControllerSqliteStore {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn persist_checkpoint_with_sample(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+        application: Option<(&NativeSamplingIssue, &NativeSamplingCompletion)>,
+        child_application: Option<(&NativeChildListIssue, &NativeChildListCompletion)>,
+        reconciliation: Option<(&DeploymentAttempt, &NativeGuardianBinding, MonotonicTick)>,
+        recovered_sample: Option<(
+            &DeploymentAttempt,
+            &NativeGuardianBinding,
+            &NativeSamplingIssue,
+        )>,
+        clock: &mut (impl FnMut() -> Result<MonotonicTick> + ?Sized),
+    ) -> Result<PersistenceRevision> {
+        self.persist_checkpoint_with_recovery(
+            checkpoint,
+            application,
+            child_application,
+            reconciliation,
+            recovered_sample,
+            None,
+            clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn persist_checkpoint_with_recovery(
         &mut self,
         checkpoint: &DeploymentAttempt,
         application: Option<(&NativeSamplingIssue, &NativeSamplingCompletion)>,
@@ -554,6 +579,11 @@ impl ControllerSqliteStore {
             &DeploymentAttempt,
             &NativeGuardianBinding,
             &NativeSamplingIssue,
+        )>,
+        recovered_child_list: Option<(
+            &DeploymentAttempt,
+            &NativeGuardianBinding,
+            &NativeChildListIssue,
         )>,
         clock: &mut (impl FnMut() -> Result<MonotonicTick> + ?Sized),
     ) -> Result<PersistenceRevision> {
@@ -603,20 +633,38 @@ impl ControllerSqliteStore {
                 return Err(ControllerStoreError::RevisionConflict);
             }
         }
+        if let Some((interrupted, binding, issue)) = recovered_child_list {
+            native_child_list::validate_recovery_candidate(
+                &transaction,
+                interrupted,
+                binding,
+                *issue,
+                clock()?,
+            )?;
+            if durable.as_ref() != Some(interrupted)
+                || !matches!(child_application, Some((applied_issue, NativeChildListCompletion::Children(children)))
+                    if applied_issue == issue
+                    && interrupted.clone().fold_interrupted_child_list(issue.parent(), children.clone()).as_ref() == Some(checkpoint))
+            {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+        }
         if child_application.is_some()
             && clock()?
                 >= required(durable.as_ref(), "missing native child list checkpoint")?.deadline()
         {
             return Err(ControllerStoreError::RevisionConflict);
         }
-        if let Some((issue, completion)) = child_application {
-            native_child_list::validate_application(
-                &transaction,
-                durable.as_ref(),
-                checkpoint,
-                issue,
-                completion,
-            )?;
+        if recovered_child_list.is_none() {
+            if let Some((issue, completion)) = child_application {
+                native_child_list::validate_application(
+                    &transaction,
+                    durable.as_ref(),
+                    checkpoint,
+                    issue,
+                    completion,
+                )?;
+            }
         }
         let mut next = checkpoint.clone();
         next.set_revision(revision);
@@ -659,6 +707,11 @@ impl ControllerSqliteStore {
             return Err(ControllerStoreError::RevisionConflict);
         }
         if let Some((interrupted, _, _)) = recovered_sample {
+            if clock()? >= interrupted.deadline() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+        }
+        if let Some((interrupted, _, _)) = recovered_child_list {
             if clock()? >= interrupted.deadline() {
                 return Err(ControllerStoreError::RevisionConflict);
             }

@@ -134,6 +134,52 @@ impl VerifiedNativeChildListAckConfirmation {
     }
 }
 
+/// Store-validated, one-use interrupted child-list evidence; no dispatch or ACK authority.
+/// ```compile_fail
+/// use phoenix_deployment_controller::NativeChildListRecoveryCandidate;
+/// fn duplicate(candidate: NativeChildListRecoveryCandidate) { let _ = candidate.clone(); }
+/// ```
+#[derive(Debug)]
+pub struct NativeChildListRecoveryCandidate {
+    loaded: LoadedAttempt,
+    binding: NativeGuardianBinding,
+    issue: NativeChildListIssue,
+}
+impl NativeChildListRecoveryCandidate {
+    #[must_use]
+    pub const fn issue(&self) -> NativeChildListIssue {
+        self.issue
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &NativeGuardianBinding {
+        &self.binding
+    }
+}
+
+/// Positive same-guardian live observation, consumed once by durable application.
+/// ```compile_fail
+/// use phoenix_deployment_controller::VerifiedRecoveredNativeChildList;
+/// fn duplicate(proof: VerifiedRecoveredNativeChildList) { let _ = proof.clone(); }
+/// ```
+#[derive(Debug)]
+pub struct VerifiedRecoveredNativeChildList {
+    candidate: NativeChildListRecoveryCandidate,
+    children: Vec<NativePid>,
+}
+impl VerifiedRecoveredNativeChildList {
+    #[allow(dead_code)]
+    pub(crate) fn after_live_verification(
+        candidate: NativeChildListRecoveryCandidate,
+        children: Vec<NativePid>,
+    ) -> Self {
+        Self {
+            candidate,
+            children,
+        }
+    }
+}
+
 /// Loaded result evidence never grants a native execution or ACK capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeChildListStatus {
@@ -476,6 +522,194 @@ impl ControllerSqliteStore {
             None,
             clock,
         );
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+}
+
+fn unique_recovery_issue(
+    tx: &rusqlite::Transaction<'_>,
+    attempt: crate::AttemptId,
+) -> Result<NativeChildListIssue> {
+    let mut statement = tx.prepare(
+        "SELECT dispatch_revision, ordinal FROM native_child_list_issues WHERE attempt_id=?1",
+    )?;
+    let rows = statement.query_map([key(attempt)], |row| {
+        Ok((row.get::<_, Word>(0)?.0, row.get::<_, i64>(1)?))
+    })?;
+    let mut candidate = None;
+    for row in rows {
+        let (revision, ordinal) = row?;
+        let dispatch = DispatchKey::from_committed_parts(
+            attempt,
+            binding_revision(revision)?,
+            usize::try_from(ordinal)
+                .map_err(|_| ControllerStoreError::Malformed("invalid child issue ordinal"))?,
+        );
+        match read_status(tx, dispatch)? {
+            Some(NativeChildListStatus::IssuedPendingApplication { issue }) => {
+                if candidate.replace(issue).is_some() {
+                    return Err(ControllerStoreError::RevisionConflict);
+                }
+            }
+            Some(NativeChildListStatus::ChildrenAckConfirmed { .. }) => {}
+            _ => return Err(ControllerStoreError::RevisionConflict),
+        }
+    }
+    candidate.ok_or(ControllerStoreError::RevisionConflict)
+}
+
+pub(super) fn validate_recovery_candidate(
+    tx: &rusqlite::Transaction<'_>,
+    interrupted: &DeploymentAttempt,
+    expected: &NativeGuardianBinding,
+    issue: NativeChildListIssue,
+    now: MonotonicTick,
+) -> Result<()> {
+    let session = expected.current_session();
+    if now >= interrupted.deadline()
+        || unique_recovery_issue(tx, interrupted.attempt_id())? != issue
+        || interrupted.attempt_id() != issue.key().attempt_id()
+        || interrupted.persistence_revision() != Some(session.interruption_revision)
+        || !matches!(interrupted.phase(), Phase::Interrupted)
+        || !interrupted.native_root_scan(issue.parent())
+        || interrupted.deadline() != expected.deadline()
+        || expected.attempt_id() != issue.key().attempt_id()
+        || expected.identity() != issue.guardian_identity()
+        || expected.slots().len() != 1
+        || expected.slots()[0].process != issue.parent()
+        || session.state != NativeSessionState::Reconciling
+        || issue.session_generation() >= session.generation
+        || issue.key().revision() >= session.interruption_revision
+        || expected.dispatch_floor() != session.interruption_revision
+        || read_attempt(tx, issue.key().attempt_id())?.as_ref() != Some(interrupted)
+        || read_binding(tx, issue.key().attempt_id())?.as_ref() != Some(expected)
+        || read_status(tx, issue.key())?
+            != Some(NativeChildListStatus::IssuedPendingApplication { issue })
+    {
+        return Err(ControllerStoreError::RevisionConflict);
+    }
+    Ok(())
+}
+
+impl ControllerSqliteStore {
+    /// Consumes an exact interrupted checkpoint, reconciling binding, and sole pending issue.
+    /// # Errors
+    /// Rejected or malformed durable evidence poisons this store handle.
+    pub fn prepare_native_child_list_recovery(
+        &mut self,
+        loaded: LoadedAttempt,
+    ) -> Result<NativeChildListRecoveryCandidate> {
+        self.prepare_native_child_list_recovery_with_clock(
+            loaded,
+            super::native_sampling::native_deadline_now,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_native_child_list_recovery_at(
+        &mut self,
+        loaded: LoadedAttempt,
+        now: MonotonicTick,
+    ) -> Result<NativeChildListRecoveryCandidate> {
+        self.prepare_native_child_list_recovery_with_clock(loaded, || Ok(now))
+    }
+
+    fn prepare_native_child_list_recovery_with_clock(
+        &mut self,
+        loaded: LoadedAttempt,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeChildListRecoveryCandidate> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_authority(&tx)?;
+            let id = loaded.checkpoint.attempt_id();
+            let binding = required(read_binding(&tx, id)?, "missing native binding")?;
+            let issue = unique_recovery_issue(&tx, id)?;
+            validate_recovery_candidate(&tx, &loaded.checkpoint, &binding, issue, clock()?)?;
+            if clock()? >= loaded.checkpoint.deadline() {
+                return Err(ControllerStoreError::RevisionConflict);
+            }
+            tx.commit()?;
+            Ok(NativeChildListRecoveryCandidate {
+                loaded,
+                binding,
+                issue,
+            })
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Atomically checkpoints the interrupted fold and ordered application evidence.
+    /// Returns diagnostics only; no executable effect or ACK permit.
+    /// # Errors
+    /// Stale, expired, duplicate, or malformed evidence poisons this store handle.
+    pub fn apply_recovered_native_child_list(
+        &mut self,
+        verified: VerifiedRecoveredNativeChildList,
+    ) -> Result<NativeChildListStatus> {
+        self.apply_recovered_native_child_list_with_clock(
+            verified,
+            super::native_sampling::native_deadline_now,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_recovered_native_child_list_at(
+        &mut self,
+        verified: VerifiedRecoveredNativeChildList,
+        now: MonotonicTick,
+    ) -> Result<NativeChildListStatus> {
+        self.apply_recovered_native_child_list_with_clock(verified, || Ok(now))
+    }
+
+    fn apply_recovered_native_child_list_with_clock(
+        &mut self,
+        verified: VerifiedRecoveredNativeChildList,
+        mut clock: impl FnMut() -> Result<MonotonicTick>,
+    ) -> Result<NativeChildListStatus> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let VerifiedRecoveredNativeChildList {
+                candidate,
+                children,
+            } = verified;
+            let NativeChildListRecoveryCandidate {
+                loaded,
+                binding,
+                issue,
+            } = candidate;
+            let checkpoint = loaded
+                .checkpoint
+                .clone()
+                .fold_interrupted_child_list(issue.parent(), children.clone())
+                .ok_or(ControllerStoreError::RevisionConflict)?;
+            let revision = self.persist_checkpoint_with_recovery(
+                &checkpoint,
+                None,
+                Some((
+                    &issue,
+                    &NativeChildListCompletion::Children(children.clone()),
+                )),
+                None,
+                None,
+                Some((&loaded.checkpoint, &binding, &issue)),
+                &mut clock,
+            )?;
+            Ok(NativeChildListStatus::AppliedPendingAck {
+                issue,
+                children,
+                applying_revision: revision,
+            })
+        })();
         if result.is_err() {
             self.poisoned = true;
         }

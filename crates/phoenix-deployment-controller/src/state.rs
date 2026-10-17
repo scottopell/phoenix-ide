@@ -719,6 +719,36 @@ impl DeploymentAttempt {
         Some(Self::Interrupted(interrupted))
     }
 
+    pub(crate) fn fold_interrupted_child_list(
+        self,
+        parent: ProcessIdentity,
+        mut pids: Vec<ProcessId>,
+    ) -> Option<Self> {
+        if !self.native_root_scan(parent) || !matches!(&self, Self::Interrupted(_)) {
+            return None;
+        }
+        let Self::Interrupted(mut interrupted) = self else {
+            return None;
+        };
+        let ActiveAttempt::Ownership(ref mut ownership) = interrupted.resume else {
+            return None;
+        };
+        pids.sort_unstable();
+        pids.dedup();
+        let count = u64::try_from(pids.len()).ok()?;
+        ownership.tree.next_discovery().checked_add(count)?;
+        for pid in pids {
+            ownership.tree.discover_child(parent, pid).ok()?;
+        }
+        ownership.tree.complete_child_scan(parent).ok()?;
+        ownership.phase = if ownership.tree.unresolved().is_empty() {
+            OwnershipPhase::Discovery
+        } else {
+            OwnershipPhase::AwaitingBirthEvidence
+        };
+        Some(Self::Interrupted(interrupted))
+    }
+
     /// # Errors
     /// Returns an error outside resource sampling or for a non-increasing sample sequence.
     pub fn record_resource_sample(
@@ -1403,13 +1433,28 @@ impl DeploymentAttempt {
 
     /// The initial root is identifiable only while discovery has exactly one owned identity.
     pub(crate) fn native_root_scan(&self, parent: ProcessIdentity) -> bool {
-        matches!(self, Self::Active(ActiveAttempt::Ownership(OwnershipAttempt {
-            phase: OwnershipPhase::Discovery, tree, ..
-        })) if tree.identities().len() == 1
+        let tree = match self {
+            Self::Active(ActiveAttempt::Ownership(OwnershipAttempt {
+                phase: OwnershipPhase::Discovery,
+                tree,
+                ..
+            }))
+            | Self::Interrupted(InterruptedAttempt {
+                resume:
+                    ActiveAttempt::Ownership(OwnershipAttempt {
+                        phase: OwnershipPhase::Discovery,
+                        tree,
+                        ..
+                    }),
+                ..
+            }) => tree,
+            _ => return false,
+        };
+        tree.identities().len() == 1
             && tree.identities().contains_key(&parent)
             && tree.pending_child_scans().len() == 1
             && tree.pending_child_scans().contains(&parent)
-            && tree.unresolved().is_empty())
+            && tree.unresolved().is_empty()
     }
 
     #[must_use]
