@@ -149,7 +149,8 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const sourcePins = sourceQuery.getAll('source_transcript');
   const sourceSelectionKey = JSON.stringify([slug, sourcePins, sourcePins.length === 0 && sourceQuery.has('source_tool')]);
   const [resolvedSourceSelectionKey, setResolvedSourceSelectionKey] = useState(sourceSelectionKey);
-  const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<{ selectionKey: string; message: string } | null>(null);
+  const error = failure?.selectionKey === sourceSelectionKey ? failure.message : null;
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [topologyRevision, setTopologyRevision] = useState(0);
@@ -169,7 +170,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     if (fixtureData) return;
     setLoading(true);
     let cancelled = false;
-    setError(null);
+    setFailure(null);
     api.ensureGlobalCoordinator()
       .then(async (coordinator) => {
         if (cancelled) return;
@@ -182,7 +183,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         if (pins.length > 0) {
           const pin = pins[0];
           if (pins.length !== 1 || !pin || pin.trim() !== pin) {
-            setError('Original source conversation unavailable');
+            setFailure({ selectionKey: sourceSelectionKey, message: 'Original source conversation unavailable' });
             return;
           }
           const [owner, selected, exact] = await Promise.all([
@@ -192,7 +193,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           ]);
           if (cancelled) return;
           if (exact.conversation.id !== pin || !owner.coordinator_id || owner.coordinator_id !== selected.coordinator_id) {
-            setError('Original source conversation unavailable');
+            setFailure({ selectionKey: sourceSelectionKey, message: 'Original source conversation unavailable' });
             return;
           }
           setResolvedSourceSelectionKey(sourceSelectionKey);
@@ -214,20 +215,20 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
                 setResolvedSourceSelectionKey(sourceSelectionKey);
                 setResolvedCoordinatorId(current => current ?? slug);
               } else if (pinnedSource) {
-                setError("Original source conversation unavailable");
+                setFailure({ selectionKey: sourceSelectionKey, message: "Original source conversation unavailable" });
               } else {
                 navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
               }
             })
             .catch(() => {
-              if (!cancelled && pinnedSource) setError("Original source conversation unavailable");
+              if (!cancelled && pinnedSource) setFailure({ selectionKey: sourceSelectionKey, message: "Original source conversation unavailable" });
               else if (!cancelled) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
             });
         }
-        setError(null);
+        setFailure(null);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setFailure({ selectionKey: sourceSelectionKey, message: e instanceof Error ? e.message : String(e) });
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

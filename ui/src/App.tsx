@@ -127,21 +127,22 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   const navigate = useNavigate();
   const location = useLocation();
   const [fallbackSnapshot, setFallbackSnapshot] = useState<{
-    reference: string;
+    selectionKey: string;
     rowSlug: string;
     aggregateResolutionUnavailable: boolean;
   } | null>(null);
   const [resolvedProduct, setResolvedProduct] = useState<{ reference: string; id: string } | null>(null);
   const [validatedSelection, setValidatedSelection] = useState<string | null>(null);
-  const [pinError, setPinError] = useState<string | null>(null);
+  const [pinFailure, setPinFailure] = useState<{ selectionKey: string; message: string } | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const locationRef = useRef(location);
   locationRef.current = location;
   const sourcePins = new URLSearchParams(location.search).getAll('source_transcript');
   const pinned = sourcePins[0];
   const invalidPin = sourcePins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned));
-  const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
   const selectionKey = JSON.stringify([reference, sourcePins, location.pathname]);
+  const activeFallback = fallbackSnapshot?.selectionKey === selectionKey ? fallbackSnapshot : null;
+  const pinError = pinFailure?.selectionKey === selectionKey ? pinFailure.message : null;
 
   useEffect(() => {
     if (!reference) {
@@ -150,9 +151,9 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     }
     setValidatedSelection(null);
     setFallbackSnapshot(null);
-    setPinError(null);
+    setPinFailure(null);
     if (invalidPin) {
-      setPinError('Invalid exact transcript reference.');
+      setPinFailure({ selectionKey, message: 'Invalid exact transcript reference.' });
       return;
     }
     let cancelled = false;
@@ -215,11 +216,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
       .catch((error: unknown) => {
         if (!cancelled) {
           if (pinned !== undefined) {
-            setPinError('Exact transcript unavailable or not a member of this conversation.');
+            setPinFailure({ selectionKey, message: 'Exact transcript unavailable or not a member of this conversation.' });
             return;
           }
           setFallbackSnapshot({
-            reference,
+            selectionKey,
             rowSlug: reference,
             aggregateResolutionUnavailable: !(error instanceof ApiResponseError && error.status === 404),
           });
@@ -232,7 +233,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
     if (pinError || activeFallback) journey.finish('failed');
   }, [journey, pinError, activeFallback]);
 
-  if (resolvedProduct && !activeFallback) {
+  if (resolvedProduct && (resolvedProduct.reference === reference || resolvedProduct.id === reference) && !activeFallback) {
     return <>
       {pinError && <main ref={journey.attach}><div role="alert">{pinError}</div></main>}
       <div ref={journey.attach} hidden={!!pinError || validatedSelection !== selectionKey} style={{ height: '100%' }}>

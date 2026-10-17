@@ -4,6 +4,12 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate, useParams } from
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProductConversationAliasRedirect } from './App';
 import { api, ApiResponseError } from './api';
+import { ViewJourneyLifecycle } from './hooks/conversationViewLifecycle';
+
+function ReplaceRoute({ target }: { target: string }) {
+  const navigate = useNavigate();
+  return <button onClick={() => navigate(target)}>Replace route</button>;
+}
 
 const embeddedSpy = vi.fn();
 
@@ -83,6 +89,38 @@ describe('ProductConversationAliasRedirect', () => {
     expect(report).toMatchObject({ route: 'ordinary', outcome: 'failed', marks: { meaningful_transcript: null, anchor_settled: null } });
     expect(call![1]!.body).not.toMatch(/private-reference|private-pin|source_transcript/);
     expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('detaches the preceding product while its replacement admission is pending', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({ product_conversation_id: 'a', canonical_route: '/c/a' } as never);
+    render(<MemoryRouter initialEntries={['/c/a']}><ReplaceRoute target="/c/b" /><Suspense fallback={null}><Routes><Route path="/c/:slug" element={<RoutedAlias />} /></Routes></Suspense></MemoryRouter>);
+    await screen.findByTestId('product-page');
+    let release!: (value: { coordinator_id: null }) => void;
+    vi.mocked(api.resolveCoordinatorRoute).mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    fireEvent.click(screen.getByText('Replace route'));
+    expect(screen.queryByTestId('product-page')).not.toBeInTheDocument();
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({ product_conversation_id: 'b', canonical_route: '/c/b' } as never);
+    await act(async () => release({ coordinator_id: null }));
+    expect(await screen.findByTestId('product-page')).toHaveTextContent('b');
+  });
+
+  it.each(['pin', 'fallback'])('does not fail a replacement journey with the preceding %s error', async kind => {
+    const finish = vi.spyOn(ViewJourneyLifecycle.prototype, 'finish');
+    vi.mocked(api.getProductConversationSnapshot).mockRejectedValue(new Error('offline'));
+    const initial = kind === 'pin' ? '/c/a?source_transcript=bad&source_transcript=other' : '/c/a';
+    render(<MemoryRouter initialEntries={[initial]}><ReplaceRoute target="/c/a?source_transcript=valid" /><Suspense fallback={null}><Routes><Route path="/c/:slug" element={<RoutedAlias />} /></Routes></Suspense></MemoryRouter>);
+    await screen.findByRole('alert');
+    expect(finish.mock.calls.filter(([outcome]) => outcome === 'failed')).toHaveLength(1);
+    finish.mockClear();
+    let release!: (value: { coordinator_id: null }) => void;
+    vi.mocked(api.resolveCoordinatorRoute).mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    fireEvent.click(screen.getByText('Replace route'));
+    expect(finish.mock.calls.filter(([outcome]) => outcome === 'failed')).toHaveLength(0);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async id => ({ product_conversation_id: 'a', canonical_route: '/c/a', requested_transcript_row_id: id } as never));
+    await act(async () => release({ coordinator_id: null }));
+    await screen.findByTestId('product-page');
+    expect(finish.mock.calls.filter(([outcome]) => outcome === 'failed')).toHaveLength(0);
   });
 
   it('routes a historical Global member before ordinary snapshot lookup and retains its anchor', async () => {
