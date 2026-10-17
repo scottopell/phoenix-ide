@@ -3395,3 +3395,30 @@ empty-group contract exact guard runs onlyDarwin. No signal authority arises
 from post-reap enumeration, and escaped-writer limits remain explicit.
 Previous35a10 Linux all8jobsSUCCESS, but macOS native failed enumeration;
 those results do not qualify this successor. Fresh whole Linux/macOS required.
+
+
+## Selection-owned history and Linux procfs successor
+
+App `a57b23bcd53163efa4782e21b1214a3963006dd2`, tree
+`718cbba72ca615733902a4d0c6166a7cb9ac06d2`, includes main
+`92986f0481df5b1ae9e29bde382670e60f369588`. Published deployment ADRs116/117
+remain byte-identical; donor history and departing-document decisions move to
+121/122. Application crates, UI source and Cargo files match this source.
+
+The five review repairs cover selection-owned route hydration/errors, strict
+canonical source-tool target admission, rendered boundary/chapter union counts,
+and kernel classification before Linux procfs reads. Additional falsification
+caught same-product member-alias reader destruction and invalid source-tool
+selection poisoning prefix restoration; both have regression coverage. Parent
+independently executed all six focused UI files:176 tests passed. TypeScript
+and ESLint passed in the source owner. No local native execution is claimed.
+
+The shared native qualifier adds all three `linux_scan_*` injected guards while
+retaining every prior native and real-Chrome assertion. The Linux classifier
+skips stat reads only after kernel-proven nonmembership/disappearance, fails
+closed for unknown membership or unreadable owned candidates, reclassifies a
+missing candidate stat and rechecks readable stat group identity. Retained-root
+WNOWAIT signal/drain authority and escaped-helper limitations are unchanged.
+Fresh exact-head Linux/macOS hosted qualification is required; prior2fb695 green
+and completed narrow performance experiments do not qualify this successor or
+establish whole-history neutrality, overhead, native resume or landing clearance.
