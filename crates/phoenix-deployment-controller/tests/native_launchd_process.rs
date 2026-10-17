@@ -204,11 +204,9 @@ fn snapshot(line: &str, prefix: &str) -> WireSnapshot {
 
 fn sampling_table_counts(path: &std::path::Path) -> [i64; 5] {
     let counts = || {
-        let db = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let db =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         [
             "native_sampling_issues",
             "native_sampling_applications",
@@ -247,7 +245,7 @@ fn assert_initial_applied_ack(
     assert_eq!(runner.guardian().deadline(), deadline);
     assert!(MonotonicTick::native_now().unwrap() < deadline);
     runner.assert_witnesses().unwrap();
-    let mut store = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let mut store = ControllerSqliteStore::open_read_only(path).unwrap();
     let (key, pending) = store.pending_native_sampling_ack(ATTEMPT).unwrap().unwrap();
     assert_eq!(
         applied_marker,
