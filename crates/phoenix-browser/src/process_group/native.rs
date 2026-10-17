@@ -9,12 +9,25 @@ pub(crate) struct OwnedChromeGroup {
 }
 
 impl OwnedChromeGroup {
-    pub(crate) fn adopt(root: ProcessIdentity) -> io::Result<Self> {
+    pub(crate) fn adopt(
+        root: ProcessIdentity,
+        child: &mut tokio::process::Child,
+    ) -> io::Result<Self> {
+        if !process_identity_matches(root) {
+            return Err(io::Error::other(
+                "Chrome launch birth identity is not proven",
+            ));
+        }
+        let pid = libc::pid_t::try_from(root.pid).map_err(io::Error::other)?;
+        // SAFETY: this is the exact live birth identity supplied by the owner.
+        if unsafe { libc::getpgid(pid) } != pid {
+            return Err(io::Error::other("Chrome launch did not isolate its group"));
+        }
         let owned = Self {
             root,
             drained: false,
         };
-        owned.root_exited()?;
+        owned.root_exited(child)?;
         Ok(owned)
     }
 
@@ -22,20 +35,8 @@ impl OwnedChromeGroup {
         self.drained
     }
 
-    pub(crate) fn root_exited(&self) -> io::Result<bool> {
+    fn waitable_exit(&self) -> io::Result<bool> {
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
-        if !process_identity_matches(self.root) {
-            return Err(io::Error::other(
-                "Chrome root identity lost before group drain",
-            ));
-        }
-        // SAFETY: getpgid observes the exact identity checked above; waitid below
-        // additionally proves the root is still our unreaped child.
-        if unsafe { libc::getpgid(pid) } != pid {
-            return Err(io::Error::other(
-                "Chrome root no longer anchors its launch group",
-            ));
-        }
         let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: status is writable and WNOWAIT retains the child/PID anchor.
         let result = unsafe {
@@ -53,8 +54,35 @@ impl OwnedChromeGroup {
         Ok(unsafe { status.si_pid() } == pid)
     }
 
-    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
-        self.root_exited()?;
+    pub(crate) fn root_exited(&self, child: &mut tokio::process::Child) -> io::Result<bool> {
+        if child.id() != Some(self.root.pid) {
+            return Err(io::Error::other(
+                "owned Chrome child was reaped or replaced",
+            ));
+        }
+        if self.waitable_exit()? {
+            // A waitable, unreaped child still reserves its PID even when macOS
+            // no longer supplies PROC_PIDTBSDINFO for that zombie.
+            return Ok(true);
+        }
+        let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
+        // SAFETY: getpgid only observes this candidate process; no signal here.
+        let live_matches =
+            process_identity_matches(self.root) && unsafe { libc::getpgid(pid) } == pid;
+        if live_matches {
+            return Ok(false);
+        }
+        // Exit can occur between waitid's live observation and proc_pidinfo.
+        if self.waitable_exit()? {
+            return Ok(true);
+        }
+        Err(io::Error::other(
+            "live Chrome root birth identity or launch group changed",
+        ))
+    }
+
+    fn signal(&self, child: &mut tokio::process::Child, signal: libc::c_int) -> io::Result<()> {
+        self.root_exited(child)?;
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
         // SAFETY: the unreaped owned child anchors this isolated launch group.
         if unsafe { libc::kill(-pid, signal) } != 0 {
@@ -63,17 +91,21 @@ impl OwnedChromeGroup {
         Ok(())
     }
 
-    pub(crate) async fn drain(&mut self, budget: Duration) -> io::Result<()> {
+    pub(crate) async fn drain(
+        &mut self,
+        child: &mut tokio::process::Child,
+        budget: Duration,
+    ) -> io::Result<()> {
         if self.drained {
             return Ok(());
         }
         let started = Instant::now();
         let deadline = started + budget;
         let escalate = started + budget.min(Duration::from_millis(250));
-        self.signal(libc::SIGTERM)?;
+        self.signal(child, libc::SIGTERM)?;
         let mut killed = false;
         loop {
-            let exited = self.root_exited()?;
+            let exited = self.root_exited(child)?;
             if exited && !group_has_live_members(self.root.pid)? {
                 self.drained = true;
                 return Ok(());
@@ -86,7 +118,7 @@ impl OwnedChromeGroup {
                 ));
             }
             if !killed && now >= escalate {
-                self.signal(libc::SIGKILL)?;
+                self.signal(child, libc::SIGKILL)?;
                 killed = true;
             }
             // This observes kernel process completion, never retries deletion.
@@ -98,9 +130,9 @@ impl OwnedChromeGroup {
 impl Drop for OwnedChromeGroup {
     fn drop(&mut self) {
         if !self.drained {
-            if let Err(error) = self.signal(libc::SIGKILL) {
-                tracing::warn!(%error, "Chrome group drop could not prove signal authority; profile retained");
-            }
+            tracing::warn!(
+                "Chrome group dropped without retained child drain authority; profile retained"
+            );
         }
     }
 }
@@ -224,7 +256,7 @@ exit 0
             .spawn()
             .unwrap();
         let identity = current_process_identity(root.id().unwrap()).unwrap();
-        let mut group = OwnedChromeGroup::adopt(identity).unwrap();
+        let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         let mut stdout = tokio::io::BufReader::new(root.stdout.take().unwrap());
         let mut ready = String::new();
         tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut ready))
@@ -239,19 +271,30 @@ exit 0
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !group.root_exited().unwrap() {
+            while !group.root_exited(&mut root).unwrap() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+        assert!(
+            group.root_exited(&mut root).unwrap(),
+            "WNOWAIT must retain the same exited-child anchor"
+        );
+        assert!(
+            group.root_exited(&mut root).unwrap(),
+            "observing exit must not reap the root"
+        );
         assert!(path.join("writer").exists());
         assert!(
             group_has_live_members(identity.pid).unwrap(),
             "root exit must not imply writer completion"
         );
         assert!(unrelated.try_wait().unwrap().is_none());
-        group.drain(Duration::from_secs(5)).await.unwrap();
+        group
+            .drain(&mut root, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(group.is_drained());
         assert!(!group_has_live_members(identity.pid).unwrap());
         assert!(
@@ -338,15 +381,21 @@ exit 0
         .await
         .unwrap();
         let writer_identity = current_process_identity(writer_pid).unwrap();
-        let mut group =
-            OwnedChromeGroup::adopt(current_process_identity(root.id().unwrap()).unwrap()).unwrap();
+        let mut group = OwnedChromeGroup::adopt(
+            current_process_identity(root.id().unwrap()).unwrap(),
+            &mut root,
+        )
+        .unwrap();
         root.stdin
             .take()
             .unwrap()
             .write_all(b"release\n")
             .await
             .unwrap();
-        group.drain(Duration::from_secs(5)).await.unwrap();
+        group
+            .drain(&mut root, Duration::from_secs(5))
+            .await
+            .unwrap();
         root.wait().await.unwrap();
         assert!(
             process_identity_matches(writer_identity),
@@ -384,7 +433,13 @@ exit 0
             .spawn()
             .unwrap();
         let identity = current_process_identity(root.id().unwrap()).unwrap();
-        let mut group = OwnedChromeGroup::adopt(identity).unwrap();
+        let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
+        assert!(
+            group.root_exited(&mut unrelated).is_err(),
+            "a different child handle cannot authorize this group"
+        );
+        assert!(group.signal(&mut unrelated, libc::SIGTERM).is_err());
+        assert!(unrelated.try_wait().unwrap().is_none());
         root.stdin
             .take()
             .unwrap()
@@ -392,12 +447,19 @@ exit 0
             .await
             .unwrap();
         root.wait().await.unwrap();
-        assert!(group.drain(Duration::from_secs(1)).await.is_err());
+        assert!(
+            group.root_exited(&mut root).is_err(),
+            "reaped root must lose wait authority"
+        );
+        assert!(group
+            .drain(&mut root, Duration::from_secs(1))
+            .await
+            .is_err());
         assert!(!group.is_drained());
         assert!(profile.path().exists());
         let mut reused = current_process_identity(unrelated.id().unwrap()).unwrap();
         reused.start_time += 1;
-        assert!(OwnedChromeGroup::adopt(reused).is_err());
+        assert!(OwnedChromeGroup::adopt(reused, &mut unrelated).is_err());
         assert!(unrelated.try_wait().unwrap().is_none());
         unrelated.kill().await.unwrap();
     }
