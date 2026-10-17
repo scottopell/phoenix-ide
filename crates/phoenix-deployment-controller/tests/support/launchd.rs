@@ -1461,9 +1461,22 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
     }
 
     pub(super) fn recover_applied_ack(&mut self) -> io::Result<()> {
-        self.bootout()?;
-        self.archive_generation(1)?;
+        self.bootout().map_err(|error| {
+            io::Error::new(error.kind(), format!("runner bootout failed: {error}"))
+        })?;
+        self.archive_generation(1).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("runner evidence archive failed: {error}"),
+            )
+        })?;
         self.bootstrap(InstalledRunnerMode::RecoverAppliedAck)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("replacement runner bootstrap failed: {error}"),
+                )
+            })
     }
 
     pub(super) fn recover_finish_and_ready(&mut self) -> io::Result<()> {
