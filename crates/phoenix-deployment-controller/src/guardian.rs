@@ -315,6 +315,18 @@ pub struct ReconciledSessionPermit {
     revision: PersistenceRevision,
 }
 
+/// Affine live preparation. Only the guardian can construct this capability.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::guardian::PreparedReconciliationActivation;
+/// fn duplicate(p: PreparedReconciliationActivation) { let _ = p.clone(); }
+/// ```
+#[derive(Debug)]
+pub struct PreparedReconciliationActivation {
+    permit: ReconciledSessionPermit,
+    floor: PersistenceRevision,
+}
+
 impl ReconciledSessionPermit {
     /// Runtime integration calls this only after committing interruption and a
     /// complete fresh reconciliation, without extending the original deadline.
@@ -1040,26 +1052,69 @@ impl<E: GuardianExecutor> Guardian<E> {
     pub fn finish_reconciliation(
         &mut self,
         session: ControllerSession,
-        ReconciledSessionPermit {
-            session: permit_session,
-            attempt,
-            deadline,
-            revision,
-        }: ReconciledSessionPermit,
+        permit: ReconciledSessionPermit,
+        now: MonotonicTick,
+    ) -> Result<(), GuardianError> {
+        let prepared = self.prepare_reconciliation(session, permit, now)?;
+        self.activate_reconciliation(session, prepared, now)
+    }
+
+    /// Checks reconciliation without installing dispatch authority.
+    /// # Errors
+    /// Refuses a stale session, state, proof, floor, or expired original deadline.
+    pub(crate) fn prepare_reconciliation(
+        &mut self,
+        session: ControllerSession,
+        permit: ReconciledSessionPermit,
+        now: MonotonicTick,
+    ) -> Result<PreparedReconciliationActivation, GuardianError> {
+        self.validate_reconciliation(session, &permit, now)?;
+        Ok(PreparedReconciliationActivation {
+            permit,
+            floor: self
+                .reconciliation_floor
+                .ok_or(GuardianError::PermitMismatch)?,
+        })
+    }
+
+    fn validate_reconciliation(
+        &mut self,
+        session: ControllerSession,
+        permit: &ReconciledSessionPermit,
         now: MonotonicTick,
     ) -> Result<(), GuardianError> {
         self.require_session(session)?;
         self.require_state(GuardianState::Reconciling, GuardianError::NotReconciling)?;
-        if permit_session != session || attempt != self.attempt || deadline != self.deadline {
+        if permit.session != session
+            || permit.attempt != self.attempt
+            || permit.deadline != self.deadline
+        {
             return Err(GuardianError::PermitMismatch);
         }
         let floor = self
             .reconciliation_floor
             .ok_or(GuardianError::PermitMismatch)?;
-        if revision < floor {
+        if permit.revision < floor {
             return Err(GuardianError::StaleDispatchRevision);
         }
-        self.require_deadline(now)?;
+        self.require_deadline(now)
+    }
+
+    /// Consumes live preparation only after the caller has durable activation evidence.
+    /// # Errors
+    /// Rechecks exact session/state/proof and the original deadline.
+    pub(crate) fn activate_reconciliation(
+        &mut self,
+        session: ControllerSession,
+        prepared: PreparedReconciliationActivation,
+        now: MonotonicTick,
+    ) -> Result<(), GuardianError> {
+        let PreparedReconciliationActivation { permit, floor } = prepared;
+        if self.reconciliation_floor != Some(floor) {
+            return Err(GuardianError::PermitMismatch);
+        }
+        self.validate_reconciliation(session, &permit, now)?;
+        let revision = permit.revision;
         self.minimum_dispatch_revision = Some(
             self.minimum_dispatch_revision
                 .map_or(revision, |minimum| minimum.max(revision)),
@@ -2138,6 +2193,58 @@ mod tests {
             assert_eq!(error, GuardianError::AuthorityLost);
             assert!(audit.executions.borrow().is_empty());
             assert_eq!(audit.signals.get(), 0);
+            assert_no_cleanup(&audit);
+        }
+    }
+
+    #[test]
+    fn preparation_installs_no_authority_and_activation_rechecks_deadline_and_fence() {
+        for change in ["activate", "deadline", "fence", "floor"] {
+            let attempt = AttemptId::new(60);
+            let (mut guardian, old, audit) = fixture(attempt, tick(100));
+            let current = reconnect(&mut guardian, old);
+            let floor = guardian.reconciliation_floor;
+            let minimum = guardian.minimum_dispatch_revision;
+            let proof = permit(&guardian, current, PersistenceRevision::first());
+            let prepared = guardian
+                .prepare_reconciliation(current, proof, tick(99))
+                .unwrap();
+            assert_eq!(guardian.state(), GuardianState::Reconciling);
+            assert_eq!(guardian.reconciliation_floor, floor);
+            assert_eq!(guardian.minimum_dispatch_revision, minimum);
+            match change {
+                "deadline" => {
+                    assert_eq!(
+                        guardian.activate_reconciliation(current, prepared, tick(100)),
+                        Err(GuardianError::DeadlineExpired)
+                    );
+                }
+                "fence" => {
+                    guardian.controller_lost(current).unwrap();
+                    assert!(guardian
+                        .activate_reconciliation(current, prepared, tick(99))
+                        .is_err());
+                }
+                "floor" => {
+                    guardian.reconciliation_floor =
+                        Some(PersistenceRevision::first().checked_next().unwrap());
+                    assert!(guardian
+                        .activate_reconciliation(current, prepared, tick(99))
+                        .is_err());
+                }
+                "activate" => {
+                    guardian
+                        .activate_reconciliation(current, prepared, tick(99))
+                        .unwrap();
+                    assert_eq!(guardian.state(), GuardianState::Active);
+                    assert_eq!(guardian.reconciliation_floor, None);
+                }
+                _ => unreachable!(),
+            }
+            if change != "activate" {
+                assert_ne!(guardian.state(), GuardianState::Active);
+            }
+            assert!(audit.executions.borrow().is_empty());
             assert_no_cleanup(&audit);
         }
     }

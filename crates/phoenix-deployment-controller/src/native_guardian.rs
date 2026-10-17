@@ -17,6 +17,17 @@ use std::{
 };
 
 /// Pinned read-only exact-schema reader; it cannot commit controller transitions.
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::guardian_ipc::NativeEvidenceReader;
+/// ```
+///
+/// ```compile_fail
+/// use phoenix_deployment_controller::{guardian_ipc::GuardianServer, native_guardian::SqliteNativeEvidenceReader, GuardianExecutor};
+/// fn inject<E: GuardianExecutor>(server: &mut GuardianServer<E>, reader: SqliteNativeEvidenceReader) {
+///     server.stage_native_reader(Box::new(reader));
+/// }
+/// ```
 pub struct SqliteNativeEvidenceReader {
     attempt: crate::AttemptId,
     store: crate::ControllerSqliteStore,
@@ -31,9 +42,57 @@ impl SqliteNativeEvidenceReader {
         let store = crate::ControllerSqliteStore::open_read_only(path)?;
         Ok(Self { attempt, store })
     }
-}
-impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
-    fn read(
+
+    /// Reads exact prepared evidence for diagnostics, never a live permit.
+    /// # Errors
+    /// Refuses another attempt or invalid durable evidence.
+    pub fn reconciliation_evidence(
+        &mut self,
+        attempt: crate::AttemptId,
+        generation: std::num::NonZeroU64,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeReconciliationCompletion,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        if attempt != self.attempt {
+            return Err(NativeEvidenceReadError);
+        }
+        self.store
+            .read_native_reconciliation_evidence(attempt, generation)
+            .map_err(|_| NativeEvidenceReadError)
+    }
+
+    /// Reads exact durable activation diagnostics, never a live capability.
+    /// # Errors
+    /// Refuses another attempt or stale/contradictory evidence.
+    pub fn activation_evidence(
+        &mut self,
+        attempt: crate::AttemptId,
+        generation: std::num::NonZeroU64,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeReconciliationActivation,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        if attempt != self.attempt {
+            return Err(NativeEvidenceReadError);
+        }
+        self.store
+            .read_native_reconciliation_activation_evidence(attempt, generation)
+            .map_err(|_| NativeEvidenceReadError)
+    }
+
+    /// Reads checkpoint and binding diagnostics in one snapshot.
+    /// # Errors
+    /// Refuses another attempt or invalid durable evidence.
+    pub fn read(
         &mut self,
         attempt: crate::AttemptId,
     ) -> Result<Option<(crate::LoadedAttempt, crate::NativeGuardianBinding)>, NativeEvidenceReadError>
@@ -45,7 +104,10 @@ impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
             .read_native_evidence(attempt)
             .map_err(|_| NativeEvidenceReadError)
     }
-    fn sampling_evidence(
+    /// Reads sampling diagnostics without constructing executable authority.
+    /// # Errors
+    /// Refuses another attempt or invalid durable evidence.
+    pub fn sampling_evidence(
         &mut self,
         key: crate::DispatchKey,
     ) -> Result<
@@ -62,6 +124,57 @@ impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
         self.store
             .read_native_sampling_evidence(key)
             .map_err(|_| NativeEvidenceReadError)
+    }
+}
+
+impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
+    fn activation_evidence(
+        &mut self,
+        attempt: crate::AttemptId,
+        generation: std::num::NonZeroU64,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeReconciliationActivation,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        Self::activation_evidence(self, attempt, generation)
+    }
+    fn read(
+        &mut self,
+        attempt: crate::AttemptId,
+    ) -> Result<Option<(crate::LoadedAttempt, crate::NativeGuardianBinding)>, NativeEvidenceReadError>
+    {
+        Self::read(self, attempt)
+    }
+    fn sampling_evidence(
+        &mut self,
+        key: crate::DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeSamplingStatus,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        Self::sampling_evidence(self, key)
+    }
+    fn reconciliation_evidence(
+        &mut self,
+        attempt: crate::AttemptId,
+        generation: std::num::NonZeroU64,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeReconciliationCompletion,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        Self::reconciliation_evidence(self, attempt, generation)
     }
 }
 
@@ -476,6 +589,7 @@ impl GuardianClient {
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -503,6 +617,7 @@ impl GuardianClient {
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -533,6 +648,7 @@ impl GuardianClient {
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -556,6 +672,7 @@ impl GuardianClient {
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -577,6 +694,7 @@ impl GuardianClient {
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::SlotObserved(_)
             | Response::Retained(_)
@@ -597,6 +715,7 @@ impl GuardianClient {
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::Retained(_)
@@ -688,6 +807,7 @@ impl GuardianClient {
             | Response::Fenced
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -834,6 +954,7 @@ impl GuardianClient {
             | Response::Snapshot(_)
             | Response::ReconciliationBegun { .. }
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -844,6 +965,78 @@ impl GuardianClient {
             | Response::Submitted { .. }
             | Response::Refused(_) => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Prepares live activation using locators, without making the guardian Active.
+    /// # Errors
+    /// Refuses stale/missing evidence, wrong response, deadline expiry, or transport failure.
+    pub fn finish_reconciliation(
+        &mut self,
+        session: crate::guardian_ipc::WireSession,
+        revision: crate::PersistenceRevision,
+    ) -> Result<crate::PreparedNativeReconciliation, ClientError> {
+        let snapshot = self.snapshot()?;
+        let native = snapshot
+            .native_binding
+            .as_ref()
+            .ok_or(ClientError::UnexpectedResponse)?;
+        if snapshot.session != session
+            || snapshot.state != crate::guardian_ipc::WireState::Reconciling
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let identity = crate::NativeGuardianIdentity {
+            nonce: crate::GuardianLifetimeNonce::new(native.nonce)
+                .ok_or(ClientError::UnexpectedResponse)?,
+            process: native
+                .guardian
+                .try_into()
+                .map_err(|_| ClientError::UnexpectedResponse)?,
+        };
+        let now = crate::MonotonicTick::native_now().map_err(ClientError::Io)?;
+        let response = self.exchange(&Request::FinishReconciliation {
+            session,
+            applied_revision: revision.get(),
+            now: now.get(),
+        })?;
+        if response
+            != (Response::ReconciliationPrepared {
+                session,
+                attempt: snapshot.attempt,
+                recovery_revision: revision.get(),
+            })
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        self.verified_snapshot = None;
+        Ok(crate::PreparedNativeReconciliation::after_live_prepare(
+            session,
+            crate::AttemptId::new(snapshot.attempt),
+            identity,
+            crate::MonotonicTick::new(snapshot.deadline),
+            revision,
+        ))
+    }
+
+    /// Consumes proof of durable activation; only locator fields cross the wire.
+    /// # Errors
+    /// Refuses a missing/mismatched staged capability, expired deadline, fence, or replay.
+    pub fn activate_reconciliation(
+        &mut self,
+        committed: crate::CommittedNativeReconciliationActivation,
+    ) -> Result<(), ClientError> {
+        let (session, attempt, recovery_revision, binding_revision) = committed.into_locator();
+        let response = self.exchange(&Request::ActivateReconciliation {
+            session,
+            attempt: attempt.get(),
+            recovery_revision: recovery_revision.get(),
+            binding_revision: binding_revision.get(),
+        })?;
+        if response != Response::ReconciliationFinished {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        self.verified_snapshot = None;
+        Ok(())
     }
 
     /// # Errors
@@ -863,6 +1056,7 @@ impl GuardianClient {
             | Response::Snapshot(_)
             | Response::Fenced
             | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
             | Response::ReconciliationFinished
             | Response::Inventory(_)
             | Response::SlotObserved(_)
@@ -1292,6 +1486,90 @@ mod native_sampling_snapshot_tests {
     }
 
     #[test]
+    fn client_accepts_only_exact_prepared_response_not_finished_or_mismatched_dtos() {
+        use crate::guardian_ipc::{WireNativeBinding, WireSession, WireState};
+        let session = WireSession {
+            instance: 1,
+            generation: 2,
+        };
+        let revision = PersistenceRevision::first().checked_next().unwrap();
+        for response in [
+            Response::ReconciliationPrepared {
+                session,
+                attempt: 10,
+                recovery_revision: revision.get(),
+            },
+            Response::ReconciliationFinished,
+            Response::ReconciliationPrepared {
+                session: WireSession {
+                    generation: 3,
+                    ..session
+                },
+                attempt: 10,
+                recovery_revision: revision.get(),
+            },
+            Response::ReconciliationPrepared {
+                session,
+                attempt: 11,
+                recovery_revision: revision.get(),
+            },
+            Response::ReconciliationPrepared {
+                session,
+                attempt: 10,
+                recovery_revision: revision.get() + 1,
+            },
+        ] {
+            let exact = response
+                == (Response::ReconciliationPrepared {
+                    session,
+                    attempt: 10,
+                    recovery_revision: revision.get(),
+                });
+            let deadline = MonotonicTick::native_now()
+                .unwrap()
+                .checked_add(Duration::from_secs(120))
+                .unwrap();
+            let snapshot = WireSnapshot {
+                instance: 1,
+                attempt: 10,
+                deadline: deadline.get(),
+                state: WireState::Reconciling,
+                session,
+                slots: vec![],
+                retained: vec![],
+                native_binding: Some(WireNativeBinding {
+                    attempt: 10,
+                    deadline: deadline.get(),
+                    nonce: [7; 16],
+                    guardian: process(44).into(),
+                    slots: vec![],
+                }),
+            };
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    assert_eq!(read_frame::<Request>(&mut peer).unwrap(), Request::Snapshot);
+                    write_frame(&mut peer, &Response::Snapshot(snapshot)).unwrap();
+                    assert!(matches!(read_frame::<Request>(&mut peer).unwrap(), Request::FinishReconciliation { session: requested, applied_revision, .. } if requested == session && applied_revision == revision.get()));
+                    write_frame(&mut peer, &response).unwrap();
+                });
+                let mut client = GuardianClient {
+                    stream: Some(stream),
+                    build: BuildIdentity::compiled(),
+                    verified_snapshot: None,
+                };
+                assert_eq!(
+                    client.finish_reconciliation(session, revision).is_ok(),
+                    exact
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn native_client_dispatch_observation_and_policy_application_are_exact() {
         let parent = tempfile::Builder::new()
             .prefix("sdc-sampling-")
@@ -1353,7 +1631,7 @@ mod native_sampling_snapshot_tests {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                for _ in 0..8 {
+                for _ in 0..17 {
                     crate::guardian_ipc::serve_once(&mut stream, &mut server).unwrap();
                 }
             });
@@ -1384,6 +1662,60 @@ mod native_sampling_snapshot_tests {
                 crate::NativeSamplingStatus::SampleAckConfirmed { issue: stored, .. }
                     if stored == issue
             ));
+            client.fence(snapshot.session).unwrap();
+            let detached_binding = store
+                .commit_detached_binding(&binding, binding.slots())
+                .unwrap();
+            let loaded = store.load_attempt(attempt).unwrap().unwrap();
+            let crate::RecoveryDisposition::Checkpoint(interrupted) =
+                loaded.prepare_recovery().unwrap()
+            else {
+                panic!("interruption")
+            };
+            let interrupted = interrupted.persist(&mut store).unwrap();
+            let revision = interrupted.checkpoint().persistence_revision().unwrap();
+            let binding = store
+                .commit_fresh_interruption_binding(&detached_binding, revision)
+                .unwrap();
+            let detached = client.snapshot().unwrap();
+            let session = client.begin_reconciliation(&detached, revision).unwrap();
+            let loaded = store.load_attempt(attempt).unwrap().unwrap();
+            let retained_plan = store
+                .commit_native_sampling_recovery_at(
+                    loaded,
+                    &binding,
+                    MonotonicTick::native_now().unwrap(),
+                )
+                .unwrap();
+            let revision = retained_plan.checkpoint().persistence_revision().unwrap();
+            let (_, _, completion) = store
+                .read_native_reconciliation_evidence(attempt, binding.current_session().generation)
+                .unwrap()
+                .unwrap();
+            let prepared = client.finish_reconciliation(session, revision).unwrap();
+            assert_eq!(
+                client.snapshot().unwrap().state,
+                crate::guardian_ipc::WireState::Reconciling
+            );
+            let (_, _, committed) = store
+                .commit_native_reconciliation_activation_at(
+                    &binding,
+                    completion,
+                    prepared,
+                    MonotonicTick::native_now().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                client.snapshot().unwrap().state,
+                crate::guardian_ipc::WireState::Reconciling
+            );
+            client.activate_reconciliation(committed).unwrap();
+            let active = client.snapshot().unwrap();
+            assert_eq!(active.state, crate::guardian_ipc::WireState::Active);
+            assert_eq!(active.instance, snapshot.instance);
+            assert_eq!(active.deadline, snapshot.deadline);
+            assert_eq!(active.slots, snapshot.slots);
+            drop(retained_plan);
         });
         assert!(matches!(
             store.load_native_sampling_status(issue.key()).unwrap(),

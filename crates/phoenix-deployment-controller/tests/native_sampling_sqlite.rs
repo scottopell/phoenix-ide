@@ -48,7 +48,7 @@ fn setup(path: &std::path::Path) -> (ControllerSqliteStore, PolicyLoop) {
 }
 
 #[test]
-fn schema_v4_is_empty_and_v3_is_rejected_without_mutating_it() {
+fn schema_v5_is_empty_and_older_versions_are_rejected_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fresh.sqlite");
     let store = ControllerSqliteStore::open(&path).unwrap();
@@ -57,9 +57,11 @@ fn schema_v4_is_empty_and_v3_is_rejected_without_mutating_it() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     for table in [
+        "native_reconciliation_activations",
+        "native_reconciliation_completions",
         "native_sampling_issues",
         "native_sampling_applications",
         "native_sampling_ack_confirmations",
@@ -104,15 +106,101 @@ fn schema_v4_is_empty_and_v3_is_rejected_without_mutating_it() {
             .unwrap(),
         3
     );
+}
+
+#[test]
+fn exact_prior_schema_v4_and_representative_rows_survive_both_open_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let prior = dir.path().join("prior.sqlite");
+    let raw = Connection::open(&prior).unwrap();
+    raw.execute_batch(include_str!("fixtures/controller_v4.sql"))
+        .unwrap();
+    // Seed representative normalized rows through a fresh supported store, then copy
+    // the tables shared by the exact prior schema without changing that schema.
+    let representative = dir.path().join("representative.sqlite");
+    let (store, policy) = setup(&representative);
+    drop(policy);
+    drop(store);
+    raw.execute(
+        "ATTACH DATABASE ?1 AS representative",
+        [representative.to_str().unwrap()],
+    )
+    .unwrap();
+    let tables: Vec<String> = raw
+        .prepare("SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for table in &tables {
+        raw.execute_batch(&format!(
+            "INSERT INTO main.{table} SELECT * FROM representative.{table}"
+        ))
+        .unwrap();
+    }
+    raw.execute_batch("DETACH DATABASE representative").unwrap();
     assert_eq!(
-        raw.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name='native_sampling_ack_confirmations'",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
+        raw.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap(),
         0
     );
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM attempts", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM guardian_sessions", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let snapshot = || {
+        let schema: Vec<(String, String)> = raw
+            .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let rows: Vec<Vec<Vec<rusqlite::types::Value>>> = tables
+            .iter()
+            .map(|table| {
+                let mut statement = raw
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = statement.column_count();
+                let values = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get(column))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap();
+                values.collect::<Result<Vec<_>, _>>().unwrap()
+            })
+            .collect();
+        let version = raw
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap();
+        (schema, rows, version)
+    };
+    let before = snapshot();
+    assert_eq!(before.2, 4);
+    assert!(matches!(
+        ControllerSqliteStore::open(&prior),
+        Err(ControllerStoreError::UnsupportedSchema(4))
+    ));
+    assert_eq!(snapshot(), before);
+    assert!(matches!(
+        ControllerSqliteStore::open_existing(&prior),
+        Err(ControllerStoreError::UnsupportedSchema(4))
+    ));
+    assert_eq!(snapshot(), before);
 }
 
 #[test]

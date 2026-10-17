@@ -8,7 +8,7 @@ use phoenix_deployment_controller::{
 };
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -437,7 +437,7 @@ fn sampling_rows(path: &Path) -> (i64, i64, i64, u64, u64) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn sample_death_and_recover(lost_response: bool) {
+fn sample_death_and_recover(lost_response: bool, finish_reconciliation: bool) {
     use std::{io::Read, net::Shutdown, os::unix::net::UnixStream};
     let parent = tempfile::Builder::new()
         .prefix("sdc-")
@@ -619,16 +619,318 @@ fn sample_death_and_recover(lost_response: bool) {
         }) if confirmed == sample && revision == applying_revision && confirming_session_generation.get() == 2));
     assert!(guardian.try_wait().unwrap().is_none());
     assert_guardian_is_parent(child_pid, guardian.id());
+    if finish_reconciliation {
+        let before_finish = observed.load_native_binding(attempt).unwrap().unwrap();
+        let mut pending = GuardedRunner::new(
+            Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
+                .args([
+                    "--mode",
+                    "recover-and-finish",
+                    "--socket-dir",
+                    dir.to_str().unwrap(),
+                    "--store",
+                    path.to_str().unwrap(),
+                    "--attempt",
+                    "64",
+                    "--fixture-pause-before-begin",
+                ])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut pending_output = BufReader::new(pending.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                pending_output.read_line(&mut line).unwrap(),
+                0,
+                "pending runner exited before its barrier"
+            );
+            if line.starts_with("pending_begin generation=3 interruption=") {
+                break;
+            }
+        }
+        let pending_binding = observed.load_native_binding(attempt).unwrap().unwrap();
+        assert_eq!(pending_binding.current_session().generation.get(), 3);
+        assert_eq!(
+            pending_binding.current_session().state,
+            NativeSessionState::Reconciling
+        );
+        assert!(
+            pending_binding.current_session().interruption_revision
+                > before_finish.current_session().interruption_revision
+        );
+        assert_eq!(pending_binding.identity(), binding.identity());
+        assert_eq!(pending_binding.deadline(), deadline);
+        assert_eq!(sampling_rows(&path), after);
+        assert!(observed
+            .read_native_reconciliation_evidence(
+                attempt,
+                pending_binding.current_session().generation
+            )
+            .unwrap()
+            .is_none());
+        assert!(observed
+            .load_native_reconciliation_activation(
+                attempt,
+                pending_binding.current_session().generation
+            )
+            .unwrap()
+            .is_none());
+        pending.kill().unwrap();
+        assert!(!pending.wait().unwrap().success());
+        let pending_detached = wait_for_detached(&dir);
+        assert_eq!(
+            pending_detached.session.generation, 2,
+            "guardian never accepted pending generation"
+        );
+        assert_eq!(pending_detached.instance, detached.instance);
+        assert_eq!(pending_detached.deadline, deadline.get());
+        assert_eq!(pending_detached.slots, detached.slots);
+        assert!(guardian.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0);
+        assert_guardian_is_parent(child_pid, guardian.id());
+        let mut finisher = GuardedRunner::new(
+            Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
+                .args([
+                    "--mode",
+                    "recover-and-finish",
+                    "--socket-dir",
+                    dir.to_str().unwrap(),
+                    "--store",
+                    path.to_str().unwrap(),
+                    "--attempt",
+                    "64",
+                    "--fixture-activation-barriers",
+                ])
+                .stdout(Stdio::piped())
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = BufReader::new(finisher.stdout.take().unwrap());
+        let mut pending_status_seen = false;
+        let mut abandoned_fenced = false;
+        let mut prepared_seen = false;
+        let mut durable_seen = false;
+        let mut marker_seen = false;
+        let active = loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "finisher exited without Active evidence"
+            );
+            if line.starts_with("verified binding: PendingBegin") {
+                pending_status_seen = true;
+            }
+            if line.trim() == "pending_begin_fenced generation=3" {
+                assert!(pending_status_seen);
+                abandoned_fenced = true;
+            }
+            if let Some(json) = line.strip_prefix("prepared_snapshot=") {
+                assert!(abandoned_fenced);
+                let prepared: WireSnapshot = serde_json::from_str(json.trim()).unwrap();
+                assert_eq!(prepared.state, WireState::Reconciling);
+                assert_eq!(prepared.session.generation, 4);
+                assert_eq!(prepared.instance, detached.instance);
+                assert_eq!(prepared.deadline, deadline.get());
+                assert_eq!(prepared.slots, detached.slots);
+                let binding = observed.load_native_binding(attempt).unwrap().unwrap();
+                assert_eq!(
+                    binding.current_session().state,
+                    NativeSessionState::Reconciling
+                );
+                assert!(observed
+                    .read_native_reconciliation_evidence(
+                        attempt,
+                        binding.current_session().generation
+                    )
+                    .unwrap()
+                    .is_some());
+                assert!(observed
+                    .load_native_reconciliation_activation(
+                        attempt,
+                        binding.current_session().generation
+                    )
+                    .unwrap()
+                    .is_none());
+                assert_eq!(sampling_rows(&path), after);
+                assert_guardian_is_parent(child_pid, guardian.id());
+                prepared_seen = true;
+                finisher.stdin.as_mut().unwrap().write_all(b"!").unwrap();
+            }
+            if let Some(json) = line.strip_prefix("durable_activation_snapshot=") {
+                assert!(prepared_seen);
+                let durable: WireSnapshot = serde_json::from_str(json.trim()).unwrap();
+                assert_eq!(durable.state, WireState::Reconciling);
+                assert_eq!(durable.session.generation, 4);
+                assert_eq!(durable.instance, detached.instance);
+                assert_eq!(durable.deadline, deadline.get());
+                assert_eq!(durable.slots, detached.slots);
+                let binding = observed.load_native_binding(attempt).unwrap().unwrap();
+                assert_eq!(binding.current_session().state, NativeSessionState::Active);
+                let activation = observed
+                    .load_native_reconciliation_activation(
+                        attempt,
+                        binding.current_session().generation,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(activation.binding_revision(), binding.revision());
+                assert_eq!(
+                    binding.dispatch_floor(),
+                    activation.completion().recovery_revision()
+                );
+                assert_eq!(sampling_rows(&path), after);
+                assert_guardian_is_parent(child_pid, guardian.id());
+                durable_seen = true;
+                finisher.stdin.as_mut().unwrap().write_all(b"!").unwrap();
+            }
+            if line.starts_with("reconciliation_active generation=4 interruption=") {
+                assert!(
+                    abandoned_fenced && prepared_seen && durable_seen,
+                    "catch-up, prepare, and durable activation must precede live Active"
+                );
+                let activation = observed
+                    .load_native_reconciliation_activation(
+                        attempt,
+                        std::num::NonZeroU64::new(4).unwrap(),
+                    )
+                    .unwrap()
+                    .expect("Active marker follows durable activation");
+                assert_eq!(activation.completion().session_generation().get(), 4);
+                assert_eq!(
+                    observed
+                        .load_native_binding(attempt)
+                        .unwrap()
+                        .unwrap()
+                        .current_session()
+                        .state,
+                    NativeSessionState::Active
+                );
+                marker_seen = true;
+            }
+            if let Some(json) = line.strip_prefix("active_snapshot=") {
+                assert!(marker_seen, "Active snapshot follows the finish marker");
+                break serde_json::from_str::<WireSnapshot>(json.trim()).unwrap();
+            }
+        };
+        assert_eq!(active.state, WireState::Active);
+        assert_eq!(active.session.generation, 4);
+        assert!(active.session.generation > pending_binding.current_session().generation.get());
+        assert_eq!(active.instance, detached.instance);
+        assert_eq!(active.deadline, deadline.get());
+        assert_eq!(active.slots, detached.slots);
+        let native = active.native_binding.as_ref().unwrap();
+        assert_eq!(native.nonce, binding.identity().nonce.bytes());
+        assert_eq!(native.guardian, binding.identity().process.into());
+        assert_eq!(native.slots[0].identity, binding.slots()[0].process.into());
+        assert!(active.retained.is_empty());
+        assert!(finisher.wait().unwrap().success());
+        let activation = observed
+            .load_native_reconciliation_activation(attempt, std::num::NonZeroU64::new(4).unwrap())
+            .unwrap()
+            .unwrap();
+        let completion = activation.completion();
+        let checkpoint = observed.load_attempt(attempt).unwrap().unwrap();
+        let completed_binding = observed.load_native_binding(attempt).unwrap().unwrap();
+        assert_eq!(
+            completed_binding.current_session().state,
+            NativeSessionState::Active
+        );
+        assert_eq!(completed_binding.revision(), activation.binding_revision());
+        assert_eq!(
+            completed_binding.dispatch_floor(),
+            completion.recovery_revision()
+        );
+        assert_eq!(
+            completed_binding.sessions()[2].state,
+            NativeSessionState::Detached
+        );
+        assert_eq!(
+            completed_binding.sessions()[2].interruption_revision,
+            pending_binding.current_session().interruption_revision
+        );
+        assert_eq!(
+            completed_binding.sessions()[3].state,
+            NativeSessionState::Active
+        );
+        assert!(
+            completion.interruption_revision()
+                > before_finish.current_session().interruption_revision
+        );
+        assert!(completion.recovery_revision() > completion.interruption_revision());
+        assert_eq!(
+            checkpoint.persistence_revision(),
+            completion.recovery_revision()
+        );
+        assert_eq!(completed_binding.identity(), binding.identity());
+        assert_eq!(sampling_rows(&path), after);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        for table in [
+            "native_reconciliation_completions",
+            "native_reconciliation_activations",
+        ] {
+            assert_eq!(
+                raw.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        let final_detached = wait_for_detached(&dir);
+        assert_eq!(final_detached.state, WireState::DetachedFenced);
+        assert_eq!(final_detached.session, active.session);
+        assert_eq!(final_detached.instance, active.instance);
+        assert_eq!(final_detached.deadline, active.deadline);
+        let mut writable = ControllerSqliteStore::open_existing(&path).unwrap();
+        assert_eq!(
+            phoenix_deployment_controller::native_guardian::verify_native_binding(
+                &mut writable,
+                attempt,
+                &final_detached
+            )
+            .unwrap(),
+            phoenix_deployment_controller::native_guardian::VerifiedBindingStatus::Detached
+        );
+        let detached_binding = writable.load_native_binding(attempt).unwrap().unwrap();
+        assert_eq!(
+            detached_binding.current_session().state,
+            NativeSessionState::Detached
+        );
+        assert_eq!(
+            detached_binding.current_session().generation,
+            completed_binding.current_session().generation
+        );
+        assert_eq!(
+            detached_binding.revision(),
+            completed_binding.revision().checked_next().unwrap()
+        );
+        assert_eq!(
+            detached_binding.dispatch_floor(),
+            completion.recovery_revision()
+        );
+        assert_eq!(sampling_rows(&path), after);
+        assert!(guardian.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0);
+        assert_guardian_is_parent(child_pid, guardian.id());
+    }
     guardian.finish();
     wait_process_gone(child_pid, Duration::from_secs(5));
 }
 
 #[test]
 fn application_commit_survives_runner_death_before_ack() {
-    sample_death_and_recover(false);
+    sample_death_and_recover(false, false);
 }
 
 #[test]
 fn guardian_ack_receipt_survives_lost_response_and_runner_death() {
-    sample_death_and_recover(true);
+    sample_death_and_recover(true, false);
+}
+
+#[test]
+fn fresh_runner_finishes_reconciliation_after_death_and_ack_recovery() {
+    sample_death_and_recover(false, true);
 }

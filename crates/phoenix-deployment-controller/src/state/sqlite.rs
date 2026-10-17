@@ -33,6 +33,11 @@ use crate::{
     BirthToken, ProcessId, ProcessIdentity,
 };
 
+mod native_reconciliation;
+pub use native_reconciliation::{
+    CommittedNativeReconciliationActivation, NativeReconciliationActivation,
+    NativeReconciliationCompletion, PreparedNativeReconciliation,
+};
 mod native_sampling;
 mod resources;
 pub use native_sampling::{
@@ -42,10 +47,10 @@ pub use native_sampling::{
 mod tree;
 
 const SCHEMA: &str = include_str!("sqlite/schema.sql");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// An independent controller database, never a Phoenix application connection.
-/// Only schema version 4 is supported; there is no upgrade/downgrade policy.
+/// Only schema version 5 is supported; there is no upgrade/downgrade policy.
 #[derive(Debug)]
 pub struct ControllerSqliteStore {
     connection: Connection,
@@ -135,7 +140,7 @@ impl ControllerSqliteStore {
         })
     }
 
-    /// Opens an existing schema-v4 store for guardian read-only evidence.
+    /// Opens an existing schema-v5 store for guardian read-only evidence.
     /// # Errors
     /// Rejects missing or incompatible stores.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
@@ -516,6 +521,7 @@ impl ControllerSqliteStore {
         &mut self,
         checkpoint: &DeploymentAttempt,
         application: Option<(&NativeSamplingIssue, &NativeSamplingCompletion)>,
+        reconciliation: Option<(&DeploymentAttempt, &NativeGuardianBinding, MonotonicTick)>,
     ) -> Result<PersistenceRevision> {
         let transaction = self
             .connection
@@ -537,6 +543,16 @@ impl ControllerSqliteStore {
                 .checked_next()
                 .ok_or(ControllerStoreError::RevisionExhausted)?,
         };
+        if let Some((interrupted, binding, now)) = reconciliation {
+            native_reconciliation::validate_recovery(
+                &transaction,
+                durable.as_ref(),
+                interrupted,
+                checkpoint,
+                binding,
+                now,
+            )?;
+        }
         let mut next = checkpoint.clone();
         next.set_revision(revision);
         // BEGIN IMMEDIATE holds the writer lock across compare, replace, and commit.
@@ -568,6 +584,9 @@ impl ControllerSqliteStore {
         if let Some((issue, completion)) = application {
             native_sampling::insert_application(&transaction, issue, completion, revision)?;
         }
+        if let Some((_, binding, _)) = reconciliation {
+            native_reconciliation::insert_completion(&transaction, binding, revision)?;
+        }
         transaction.commit()?;
         Ok(revision)
     }
@@ -578,7 +597,7 @@ impl AttemptStore for ControllerSqliteStore {
 
     fn persist(&mut self, checkpoint: &DeploymentAttempt) -> Result<PersistenceRevision> {
         self.ensure_usable()?;
-        let result = self.persist_checkpoint(checkpoint, None);
+        let result = self.persist_checkpoint(checkpoint, None, None);
         if result.is_err() {
             // This also covers errors from commit or an unobserved rollback failure.
             self.poisoned = true;
@@ -686,7 +705,14 @@ fn read_binding_sessions(
             _ => return malformed("unknown guardian session state"),
         };
         if !sessions.is_empty() && state == NativeSessionState::Active {
-            return malformed("active session after first generation");
+            let activated: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM native_reconciliation_activations a JOIN native_reconciliation_completions c USING(attempt_id,session_generation) JOIN guardian_bindings b USING(attempt_id) WHERE a.attempt_id=?1 AND a.session_generation=?2 AND c.interruption_revision=?3 AND c.recovery_revision=?4 AND b.revision=a.binding_revision)",
+                params![id, Word(generation.get()), Word(interruption_revision.get()), Word(dispatch_floor.get())],
+                |row| row.get(0),
+            )?;
+            if !activated {
+                return malformed("active recovered session lacks exact activation");
+            }
         }
         if sessions
             .last()

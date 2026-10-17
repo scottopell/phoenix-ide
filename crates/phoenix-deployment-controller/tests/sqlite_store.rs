@@ -1000,6 +1000,8 @@ fn schema_is_normalized_and_unknown_versions_and_unversioned_contents_are_reject
             "guardian_bindings",
             "guardian_sessions",
             "guardian_slots",
+            "native_reconciliation_activations",
+            "native_reconciliation_completions",
             "native_sampling_ack_confirmations",
             "native_sampling_applications",
             "native_sampling_issues",
@@ -1047,17 +1049,17 @@ fn schema_is_normalized_and_unknown_versions_and_unversioned_contents_are_reject
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
-    raw.pragma_update(None, "user_version", 5).unwrap();
+    raw.pragma_update(None, "user_version", 6).unwrap();
     assert!(matches!(
         store.load_attempt(AttemptId::new(8)),
-        Err(ControllerStoreError::UnsupportedSchema(5))
+        Err(ControllerStoreError::UnsupportedSchema(6))
     ));
     drop(store);
     assert!(matches!(
         ControllerSqliteStore::open(&path),
-        Err(ControllerStoreError::UnsupportedSchema(5))
+        Err(ControllerStoreError::UnsupportedSchema(6))
     ));
     let other = directory.path().join("unversioned.sqlite");
     Connection::open(&other)

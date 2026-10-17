@@ -233,9 +233,7 @@ fn pending_begin_crash_refreshes_interruption_and_advances_durable_generation() 
 
 #[test]
 fn pinned_native_reader_observes_committed_rows_only_for_selected_attempt() {
-    use phoenix_deployment_controller::{
-        guardian_ipc::NativeEvidenceReader, native_guardian::SqliteNativeEvidenceReader,
-    };
+    use phoenix_deployment_controller::native_guardian::SqliteNativeEvidenceReader;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("controller.sqlite");
     let mut store = ControllerSqliteStore::open(&path).unwrap();

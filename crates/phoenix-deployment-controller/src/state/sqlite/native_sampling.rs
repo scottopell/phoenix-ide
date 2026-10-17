@@ -439,7 +439,7 @@ impl ControllerSqliteStore {
         completion: &NativeSamplingCompletion,
     ) -> Result<PersistenceRevision> {
         self.ensure_usable()?;
-        let result = self.persist_checkpoint(checkpoint, Some((issue, completion)));
+        let result = self.persist_checkpoint(checkpoint, Some((issue, completion)), None);
         if result.is_err() {
             self.poisoned = true;
         }
@@ -504,7 +504,7 @@ pub(super) fn insert_application(
 }
 
 #[allow(clippy::too_many_lines)]
-fn read_status(
+pub(super) fn read_status(
     connection: &rusqlite::Connection,
     dispatch: DispatchKey,
 ) -> Result<Option<NativeSamplingStatus>> {

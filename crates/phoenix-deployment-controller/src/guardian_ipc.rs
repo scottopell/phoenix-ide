@@ -19,13 +19,39 @@ use std::{
 pub struct NativeEvidenceReadError;
 
 /// Trusted, pinned read-only store view; wire revisions are never proof.
-pub trait NativeEvidenceReader: Send {
+pub(crate) trait NativeEvidenceReader: Send {
     /// # Errors
     /// Returns an error when the pinned store cannot establish strict typed evidence.
     fn read(
         &mut self,
         attempt: crate::AttemptId,
     ) -> Result<Option<(crate::LoadedAttempt, crate::NativeGuardianBinding)>, NativeEvidenceReadError>;
+    /// # Errors
+    /// Refuses unreadable or malformed exact reconciliation completion evidence.
+    fn reconciliation_evidence(
+        &mut self,
+        attempt: crate::AttemptId,
+        generation: NonZeroU64,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeReconciliationCompletion,
+        )>,
+        NativeEvidenceReadError,
+    >;
+    fn activation_evidence(
+        &mut self,
+        attempt: crate::AttemptId,
+        generation: NonZeroU64,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeReconciliationActivation,
+        )>,
+        NativeEvidenceReadError,
+    >;
     /// # Errors
     /// Refuses unreadable or malformed exact native sampling evidence.
     fn sampling_evidence(
@@ -47,6 +73,17 @@ pub trait NativeInitialGate: Send {
     /// # Errors
     /// An unsuccessful write never grants permission to retry the consumed gate.
     fn release(self: Box<Self>) -> io::Result<()>;
+}
+
+fn native_reconciliation_now() -> Result<MonotonicTick, WireError> {
+    #[cfg(unix)]
+    {
+        MonotonicTick::native_now().map_err(|_| WireError::MissingProof)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(WireError::MissingProof)
+    }
 }
 
 fn before_native_deadline(deadline: u64) -> bool {
@@ -128,7 +165,7 @@ impl<'de> Deserialize<'de> for BuildIdentity {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -597,6 +634,12 @@ pub enum Request {
         applied_revision: u64,
         now: u64,
     },
+    ActivateReconciliation {
+        session: WireSession,
+        attempt: u128,
+        recovery_revision: u64,
+        binding_revision: u64,
+    },
     ReleaseInitial {
         session: WireSession,
         attempt: u128,
@@ -632,7 +675,12 @@ pub enum Request {
     },
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", content = "data", rename_all = "snake_case")]
+#[serde(
+    tag = "op",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Response {
     Hello {
         build: BuildIdentity,
@@ -645,6 +693,11 @@ pub enum Response {
     },
     InitialReleased {
         session: WireSession,
+    },
+    ReconciliationPrepared {
+        session: WireSession,
+        attempt: u128,
+        recovery_revision: u64,
     },
     ReconciliationFinished,
     Inventory(Vec<WireSlot>),
@@ -771,6 +824,10 @@ pub struct GuardianServer<E: GuardianExecutor> {
     hello_verified: bool,
     interruption: Option<PersistenceRevision>,
     finish_proof: Option<(PersistenceRevision, crate::ReconciledSessionPermit)>,
+    prepared_activation: Option<(
+        crate::NativeReconciliationCompletion,
+        crate::guardian::PreparedReconciliationActivation,
+    )>,
     ack_proofs: Vec<(DispatchKey, PersistenceRevision, crate::AppliedResultAck)>,
     native_ack_receipts: Vec<(
         crate::NativeSamplingIssue,
@@ -810,6 +867,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             hello_verified: false,
             interruption: None,
             finish_proof: None,
+            prepared_activation: None,
             ack_proofs: Vec::new(),
             native_ack_receipts: Vec::new(),
             staged: Vec::new(),
@@ -837,7 +895,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
     }
 
     /// Pins the trusted native evidence reader for this guardian lifetime.
-    pub fn stage_native_reader(&mut self, reader: Box<dyn NativeEvidenceReader>) {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn stage_native_reader(&mut self, reader: Box<dyn NativeEvidenceReader>) {
         self.native_reader = Some(reader);
     }
 
@@ -1059,6 +1118,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         self.native_admissions.clear();
         self.interruption = None;
         self.finish_proof = None;
+        self.prepared_activation = None;
         self.ack_proofs.clear();
     }
     pub fn handle(&mut self, request: Request) -> Response {
@@ -1081,6 +1141,8 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                     | Request::ObserveRetained { .. }
                     | Request::Fence { .. }
                     | Request::BeginReconciliation { .. }
+                    | Request::FinishReconciliation { .. }
+                    | Request::ActivateReconciliation { .. }
                     | Request::ReleaseInitial { .. }
                     | Request::DispatchAdmit { .. }
                     | Request::DispatchSubmit { .. }
@@ -1175,6 +1237,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             self.admissions.clear();
             self.native_admissions.clear();
             self.finish_proof = None;
+            self.prepared_activation = None;
             self.ack_proofs.clear();
             Response::ReconciliationBegun {
                 session: session.into(),
@@ -1190,6 +1253,9 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         Ok({
             let session = self.resolve_session(session)?;
             let revision = revision(applied_revision)?;
+            if self.native_unbound {
+                return self.finish_native_reconciliation(session, revision);
+            }
             if self.finish_proof.as_ref().map(|(stored, _)| *stored) != Some(revision) {
                 return Err(WireError::MissingProof);
             }
@@ -1199,6 +1265,154 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 .map_err(WireError::from)?;
             Response::ReconciliationFinished
         })
+    }
+    fn finish_native_reconciliation(
+        &mut self,
+        session: ControllerSession,
+        revision: PersistenceRevision,
+    ) -> Result<Response, WireError> {
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        if live.state != WireState::Reconciling || self.prepared_activation.is_some() {
+            return Err(WireError::MissingProof);
+        }
+        let generation = NonZeroU64::new(session.generation()).ok_or(WireError::InvalidValue)?;
+        let (checkpoint, binding, completion) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .reconciliation_evidence(self.guardian.attempt_id(), generation)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let current = binding.current_session();
+        if checkpoint.attempt_id() != self.guardian.attempt_id()
+            || checkpoint.phase() != crate::Phase::ResourceSampling
+            || checkpoint.persistence_revision() != revision
+            || checkpoint.deadline() != self.guardian.original_deadline()
+            || completion.attempt_id() != self.guardian.attempt_id()
+            || completion.session_generation() != generation
+            || completion.recovery_revision() != revision
+            || completion.interruption_revision().checked_next() != Some(revision)
+            || completion.binding_revision() != binding.revision()
+            || binding.attempt_id() != self.guardian.attempt_id()
+            || binding.identity().nonce.bytes() != wire.nonce
+            || WireIdentity::from(binding.identity().process) != wire.guardian
+            || binding.deadline() != self.guardian.original_deadline()
+            || wire.deadline != binding.deadline().get()
+            || wire.attempt != self.guardian.attempt_id().get()
+            || current.generation != generation
+            || current.state != crate::NativeSessionState::Reconciling
+            || current.interruption_revision != completion.interruption_revision()
+            || self.guardian.reconciliation_floor() != Some(completion.interruption_revision())
+            || binding.dispatch_floor() != completion.interruption_revision()
+            || binding.slots().len() != wire.slots.len()
+            || binding
+                .slots()
+                .iter()
+                .zip(&wire.slots)
+                .any(|(stored, live)| WireIdentity::from(stored.process) != live.identity)
+        {
+            return Err(WireError::MissingProof);
+        }
+        // Native time, not the wire's claimed `now`, owns deadline admission.
+        let now = native_reconciliation_now()?;
+        if now >= self.guardian.original_deadline() {
+            return Err(WireError::MissingProof);
+        }
+        let permit = crate::ReconciledSessionPermit::after_committed_reconciliation(
+            session,
+            self.guardian.attempt_id(),
+            binding.deadline(),
+            revision,
+        );
+        let prepared = self
+            .guardian
+            .prepare_reconciliation(session, permit, now)
+            .map_err(WireError::from)?;
+        self.prepared_activation = Some((completion, prepared));
+        Ok(Response::ReconciliationPrepared {
+            session: session.into(),
+            attempt: self.guardian.attempt_id().get(),
+            recovery_revision: revision.get(),
+        })
+    }
+
+    fn activate_native_reconciliation(
+        &mut self,
+        session: WireSession,
+        attempt: u128,
+        recovery_revision: u64,
+        binding_revision: u64,
+    ) -> Result<Response, WireError> {
+        if !self.native_unbound {
+            return Err(WireError::UnsupportedDurableBinding);
+        }
+        let session = self.resolve_session(session)?;
+        let generation = NonZeroU64::new(session.generation()).ok_or(WireError::InvalidValue)?;
+        let live = self.snapshot();
+        let wire = live
+            .native_binding
+            .as_ref()
+            .ok_or(WireError::MissingProof)?;
+        let staged = self
+            .prepared_activation
+            .as_ref()
+            .ok_or(WireError::MissingProof)?
+            .0;
+        if live.state != WireState::Reconciling
+            || attempt != self.guardian.attempt_id().get()
+            || recovery_revision != staged.recovery_revision().get()
+            || staged.session_generation() != generation
+        {
+            return Err(WireError::MissingProof);
+        }
+        let (checkpoint, binding, activation) = self
+            .native_reader
+            .as_mut()
+            .ok_or(WireError::UnsupportedDurableBinding)?
+            .activation_evidence(self.guardian.attempt_id(), generation)
+            .map_err(|NativeEvidenceReadError| WireError::MissingProof)?
+            .ok_or(WireError::MissingProof)?;
+        let current = binding.current_session();
+        if activation.completion() != staged
+            || activation.binding_revision().get() != binding_revision
+            || staged.binding_revision().checked_next() != Some(activation.binding_revision())
+            || binding.revision() != activation.binding_revision()
+            || binding.dispatch_floor() != staged.recovery_revision()
+            || checkpoint.attempt_id() != self.guardian.attempt_id()
+            || checkpoint.phase() != crate::Phase::ResourceSampling
+            || checkpoint.persistence_revision() != staged.recovery_revision()
+            || checkpoint.deadline() != self.guardian.original_deadline()
+            || binding.attempt_id() != self.guardian.attempt_id()
+            || binding.identity().nonce.bytes() != wire.nonce
+            || WireIdentity::from(binding.identity().process) != wire.guardian
+            || binding.deadline() != self.guardian.original_deadline()
+            || wire.deadline != binding.deadline().get()
+            || wire.attempt != attempt
+            || current.generation != generation
+            || current.interruption_revision != staged.interruption_revision()
+            || current.state != crate::NativeSessionState::Active
+            || self.guardian.reconciliation_floor() != Some(staged.interruption_revision())
+            || binding.slots().len() != wire.slots.len()
+            || binding
+                .slots()
+                .iter()
+                .zip(&wire.slots)
+                .any(|(stored, live)| WireIdentity::from(stored.process) != live.identity)
+        {
+            return Err(WireError::MissingProof);
+        }
+        let (_, prepared) = self
+            .prepared_activation
+            .take()
+            .ok_or(WireError::MissingProof)?;
+        self.guardian
+            .activate_reconciliation(session, prepared, native_reconciliation_now()?)
+            .map_err(WireError::from)?;
+        Ok(Response::ReconciliationFinished)
     }
     fn ack_after_applied_revision(
         &mut self,
@@ -1399,7 +1613,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         {
             return Err(WireError::AdmissionReplayed);
         }
-        let now = MonotonicTick::native_now().map_err(|_| WireError::MissingProof)?;
+        let now = native_reconciliation_now()?;
         self.guardian
             .validate_native_sampling_admission(session, key, sequence, now)
             .map_err(WireError::from)?;
@@ -1430,7 +1644,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             return Err(WireError::AdmissionMismatch);
         }
         self.validate_native_sampling_evidence(session, admission.key(), admission.sequence())?;
-        let now = MonotonicTick::native_now().map_err(|_| WireError::MissingProof)?;
+        let now = native_reconciliation_now()?;
         match self.guardian.submit_native_sampling(admission, now) {
             Ok(key) => Ok(Response::Submitted {
                 key: key.try_into()?,
@@ -1523,6 +1737,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
             }
         })
     }
+    #[allow(clippy::too_many_lines)]
     fn try_handle(&mut self, request: Request) -> Result<Response, WireError> {
         Ok(match request {
             Request::Hello { .. } => Response::Hello {
@@ -1551,6 +1766,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 self.native_admissions.clear();
                 self.interruption = None;
                 self.finish_proof = None;
+                self.prepared_activation = None;
                 self.ack_proofs.clear();
                 Response::Fenced
             }
@@ -1564,6 +1780,17 @@ impl<E: GuardianExecutor> GuardianServer<E> {
                 applied_revision,
                 now,
             } => self.finish_reconciliation(session, applied_revision, now)?,
+            Request::ActivateReconciliation {
+                session,
+                attempt,
+                recovery_revision,
+                binding_revision,
+            } => self.activate_native_reconciliation(
+                session,
+                attempt,
+                recovery_revision,
+                binding_revision,
+            )?,
             Request::ObserveSlot { slot } => {
                 let slot = self.slot(slot)?;
                 Response::SlotObserved(
@@ -1879,6 +2106,18 @@ mod tests {
         assert!(matches!(
             read_frame::<Request>(&mut Cursor::new(unknown)),
             Err(CodecError::UnsupportedVersion(version)) if version == unsupported
+        ));
+        assert_eq!(PROTOCOL_VERSION, 4);
+        let old = serde_json::to_vec(&Envelope {
+            version: 3,
+            body: Request::Snapshot,
+        })
+        .unwrap();
+        let mut old_frame = u32::try_from(old.len()).unwrap().to_be_bytes().to_vec();
+        old_frame.extend(old);
+        assert!(matches!(
+            read_frame::<Request>(&mut Cursor::new(old_frame)),
+            Err(CodecError::UnsupportedVersion(3))
         ));
         let mut unknown_op = Vec::new();
         let bytes =
@@ -2265,6 +2504,34 @@ mod native_evidence_tests {
     }
     struct Reader(Option<(crate::LoadedAttempt, NativeGuardianBinding)>);
     impl NativeEvidenceReader for Reader {
+        fn activation_evidence(
+            &mut self,
+            _: crate::AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                crate::NativeGuardianBinding,
+                crate::NativeReconciliationActivation,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+        fn reconciliation_evidence(
+            &mut self,
+            _: AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeReconciliationCompletion,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Ok(None)
+        }
         fn read(
             &mut self,
             _: AttemptId,
@@ -2291,6 +2558,36 @@ mod native_evidence_tests {
         status: std::sync::Arc<std::sync::Mutex<Option<crate::NativeSamplingStatus>>>,
     }
     impl NativeEvidenceReader for SamplingReader {
+        fn activation_evidence(
+            &mut self,
+            _: crate::AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                crate::NativeGuardianBinding,
+                crate::NativeReconciliationActivation,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+        fn reconciliation_evidence(
+            &mut self,
+            attempt: AttemptId,
+            generation: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeReconciliationCompletion,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            self.store
+                .read_native_reconciliation_evidence(attempt, generation)
+                .map_err(|_| NativeEvidenceReadError)
+        }
         fn read(
             &mut self,
             attempt: AttemptId,
@@ -2711,6 +3008,661 @@ mod native_evidence_tests {
             replacement.handle(request),
             Response::Refused(WireError::Guardian(WireGuardianError::InstanceMismatch))
         );
+    }
+
+    fn commit_sampling_reconciliation(
+        fixture: &mut NativeAckFixture,
+    ) -> (WireSession, crate::CommittedTransition) {
+        let status = dispatch_and_apply_native_sample(fixture);
+        let session = reconnect_ack_session(fixture);
+        let crate::NativeSamplingStatus::AppliedPendingAck {
+            issue,
+            sample,
+            applying_revision,
+        } = status
+        else {
+            panic!("sample")
+        };
+        assert_eq!(
+            fixture.server.handle(Request::AckAfterAppliedRevision {
+                session,
+                key: fixture.key,
+                applied_revision: applying_revision.get(),
+            }),
+            Response::Acked {
+                key: fixture.key,
+                applied_revision: applying_revision.get()
+            }
+        );
+        fixture
+            .store
+            .confirm_native_sampling_ack(crate::VerifiedNativeSamplingAckConfirmation::new(
+                issue,
+                sample,
+                applying_revision,
+                NonZeroU64::new(session.generation).unwrap(),
+            ))
+            .unwrap();
+        let loaded = fixture
+            .store
+            .load_attempt(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let binding = fixture
+            .store
+            .load_native_binding(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let committed = fixture
+            .store
+            .commit_native_sampling_recovery_at(loaded, &binding, crate::MonotonicTick::new(0))
+            .unwrap();
+        (session, committed)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_finish_reads_atomic_completion_and_never_dispatches_retained_plan() {
+        let mut fixture = native_ack_fixture();
+        let (session, committed) = commit_sampling_reconciliation(&mut fixture);
+        let revision = committed.checkpoint().persistence_revision().unwrap();
+        let finish = |session, revision| Request::FinishReconciliation {
+            session,
+            applied_revision: revision,
+            now: 0,
+        };
+        assert!(matches!(
+            fixture
+                .server
+                .handle(finish(fixture.active_session, revision.get())),
+            Response::Refused(_)
+        ));
+        assert!(matches!(
+            fixture.server.handle(finish(session, revision.get() + 1)),
+            Response::Refused(_)
+        ));
+        assert_eq!(fixture.server.snapshot().state, WireState::Reconciling);
+        let original = fixture.server.snapshot();
+        let mut policy = crate::PolicyLoop::from_committed(committed);
+        let retained = policy.issue_next().unwrap();
+        assert_eq!(
+            *retained.effect(),
+            OsEffect::SampleResources { sequence: 1 }
+        );
+        assert_eq!(
+            fixture.server.handle(finish(session, revision.get())),
+            Response::ReconciliationPrepared {
+                session,
+                attempt: fixture.attempt.get(),
+                recovery_revision: revision.get()
+            }
+        );
+        assert_eq!(fixture.server.snapshot().state, WireState::Reconciling);
+        let floor = fixture.server.guardian.reconciliation_floor();
+        assert!(floor.is_some());
+        let binding = fixture
+            .store
+            .load_native_binding(fixture.attempt)
+            .unwrap()
+            .unwrap();
+        let (_, _, completion) = fixture
+            .store
+            .read_native_reconciliation_evidence(
+                fixture.attempt,
+                binding.current_session().generation,
+            )
+            .unwrap()
+            .unwrap();
+        let activate = Request::ActivateReconciliation {
+            session,
+            attempt: fixture.attempt.get(),
+            recovery_revision: revision.get(),
+            binding_revision: binding.revision().checked_next().unwrap().get(),
+        };
+        // No durable activation yet, even though a server-local prepared capability exists.
+        assert!(matches!(
+            fixture.server.handle(activate.clone()),
+            Response::Refused(_)
+        ));
+        assert_eq!(fixture.server.snapshot().state, WireState::Reconciling);
+        assert!(matches!(
+            fixture.server.handle(finish(session, revision.get())),
+            Response::Refused(_)
+        ));
+        let proof = crate::PreparedNativeReconciliation::after_live_prepare(
+            session,
+            fixture.attempt,
+            binding.identity(),
+            binding.deadline(),
+            revision,
+        );
+        let (durable, activation, committed) = fixture
+            .store
+            .commit_native_reconciliation_activation_at(
+                &binding,
+                completion,
+                proof,
+                MonotonicTick::native_now().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(durable.current_session().state, NativeSessionState::Active);
+        assert_eq!(activation.completion(), completion);
+        assert_eq!(fixture.server.snapshot().state, WireState::Reconciling);
+        assert_eq!(fixture.server.guardian.reconciliation_floor(), floor);
+        let (exact_session, attempt, recovery_revision, binding_revision) =
+            committed.into_locator();
+        assert_eq!(
+            activate,
+            Request::ActivateReconciliation {
+                session: exact_session,
+                attempt: attempt.get(),
+                recovery_revision: recovery_revision.get(),
+                binding_revision: binding_revision.get()
+            }
+        );
+        let mut wrong = activate.clone();
+        if let Request::ActivateReconciliation {
+            binding_revision, ..
+        } = &mut wrong
+        {
+            *binding_revision += 1;
+        }
+        assert!(matches!(fixture.server.handle(wrong), Response::Refused(_)));
+        assert_eq!(
+            fixture.server.handle(activate.clone()),
+            Response::ReconciliationFinished
+        );
+        assert!(matches!(
+            fixture.server.handle(activate.clone()),
+            Response::Refused(_)
+        ));
+        let active = fixture.server.snapshot();
+        assert_eq!(active.state, WireState::Active);
+        assert_eq!(active.instance, original.instance);
+        assert_eq!(active.deadline, original.deadline);
+        assert_eq!(active.native_binding, original.native_binding);
+        assert_eq!(fixture.server.guardian.reconciliation_floor(), None);
+        assert!(matches!(
+            fixture.server.handle(finish(session, revision.get())),
+            Response::Refused(_)
+        ));
+        fixture.server.fence_connection();
+        fixture.server.handle(Request::Hello {
+            build: test_build(),
+        });
+        assert!(matches!(
+            fixture.server.handle(finish(session, revision.get())),
+            Response::Refused(_)
+        ));
+        assert_eq!(fixture.server.snapshot().state, WireState::DetachedFenced);
+        assert!(fixture.server.prepared_activation.is_none());
+        assert!(matches!(
+            fixture.server.handle(activate),
+            Response::Refused(_)
+        ));
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct ReconciliationReader(
+        Option<(
+            crate::LoadedAttempt,
+            NativeGuardianBinding,
+            crate::NativeReconciliationCompletion,
+        )>,
+    );
+    impl NativeEvidenceReader for ReconciliationReader {
+        fn activation_evidence(
+            &mut self,
+            _: crate::AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                crate::NativeGuardianBinding,
+                crate::NativeReconciliationActivation,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+        fn read(
+            &mut self,
+            _: AttemptId,
+        ) -> Result<Option<(crate::LoadedAttempt, NativeGuardianBinding)>, NativeEvidenceReadError>
+        {
+            Ok(None)
+        }
+        fn sampling_evidence(
+            &mut self,
+            _: DispatchKey,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeSamplingStatus,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Ok(None)
+        }
+        fn reconciliation_evidence(
+            &mut self,
+            _: AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeReconciliationCompletion,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Ok(self.0.take())
+        }
+    }
+
+    struct ActivationReader(
+        Option<(
+            crate::LoadedAttempt,
+            NativeGuardianBinding,
+            crate::NativeReconciliationActivation,
+        )>,
+    );
+    impl NativeEvidenceReader for ActivationReader {
+        fn read(
+            &mut self,
+            _: AttemptId,
+        ) -> Result<Option<(crate::LoadedAttempt, NativeGuardianBinding)>, NativeEvidenceReadError>
+        {
+            Err(NativeEvidenceReadError)
+        }
+        fn reconciliation_evidence(
+            &mut self,
+            _: AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeReconciliationCompletion,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+        fn sampling_evidence(
+            &mut self,
+            _: DispatchKey,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeSamplingStatus,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Err(NativeEvidenceReadError)
+        }
+        fn activation_evidence(
+            &mut self,
+            _: AttemptId,
+            _: NonZeroU64,
+        ) -> Result<
+            Option<(
+                crate::LoadedAttempt,
+                NativeGuardianBinding,
+                crate::NativeReconciliationActivation,
+            )>,
+            NativeEvidenceReadError,
+        > {
+            Ok(self.0.take())
+        }
+    }
+
+    #[test]
+    fn activation_refuses_missing_staged_capability_fence_and_mismatched_durable_evidence() {
+        for change in 0..12 {
+            let mut fixture = native_ack_fixture();
+            let (session, committed) = commit_sampling_reconciliation(&mut fixture);
+            let revision = committed.checkpoint().persistence_revision().unwrap();
+            assert!(matches!(
+                fixture.server.handle(Request::FinishReconciliation {
+                    session,
+                    applied_revision: revision.get(),
+                    now: 0
+                }),
+                Response::ReconciliationPrepared { .. }
+            ));
+            let binding = fixture
+                .store
+                .load_native_binding(fixture.attempt)
+                .unwrap()
+                .unwrap();
+            let (_, _, completion) = fixture
+                .store
+                .read_native_reconciliation_evidence(
+                    fixture.attempt,
+                    binding.current_session().generation,
+                )
+                .unwrap()
+                .unwrap();
+            let proof = crate::PreparedNativeReconciliation::after_live_prepare(
+                session,
+                fixture.attempt,
+                binding.identity(),
+                binding.deadline(),
+                revision,
+            );
+            let (_, _, committed) = fixture
+                .store
+                .commit_native_reconciliation_activation_at(
+                    &binding,
+                    completion,
+                    proof,
+                    MonotonicTick::native_now().unwrap(),
+                )
+                .unwrap();
+            let (session, attempt, recovery, binding_revision) = committed.into_locator();
+            let (loaded, mut binding, activation) = fixture
+                .store
+                .read_native_reconciliation_activation_evidence(
+                    attempt,
+                    binding.current_session().generation,
+                )
+                .unwrap()
+                .unwrap();
+            match change {
+                0 => {
+                    fixture.server.prepared_activation.take();
+                }
+                1 => {
+                    fixture.server.fence_connection();
+                    fixture.server.handle(Request::Hello {
+                        build: test_build(),
+                    });
+                }
+                2 => binding.identity.nonce = GuardianLifetimeNonce::new([9; 16]).unwrap(),
+                3 => binding.identity.process = identity(99),
+                4 => binding.slots.clear(),
+                5 => binding.slots[0].process = identity(99),
+                6 => binding.deadline = MonotonicTick::new(1),
+                7 => binding.revision = PersistenceRevision::first(),
+                8 => binding.dispatch_floor = PersistenceRevision::first(),
+                9 => binding.sessions.last_mut().unwrap().state = NativeSessionState::Detached,
+                10 => {
+                    binding.sessions.last_mut().unwrap().generation = NonZeroU64::new(99).unwrap();
+                }
+                11 => {}
+                _ => unreachable!(),
+            }
+            fixture
+                .server
+                .stage_native_reader(Box::new(ActivationReader(if change == 11 {
+                    None
+                } else {
+                    Some((loaded, binding, activation))
+                })));
+            assert!(
+                matches!(
+                    fixture.server.handle(Request::ActivateReconciliation {
+                        session,
+                        attempt: attempt.get(),
+                        recovery_revision: recovery.get(),
+                        binding_revision: binding_revision.get()
+                    }),
+                    Response::Refused(_)
+                ),
+                "case {change}"
+            );
+            assert_ne!(fixture.server.snapshot().state, WireState::Active);
+            assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn native_finish_refuses_missing_mismatched_and_historical_completion_evidence() {
+        for change in 0..12 {
+            let mut fixture = native_ack_fixture();
+            let (session, _committed) = commit_sampling_reconciliation(&mut fixture);
+            let (loaded, mut binding, mut completion) = fixture
+                .store
+                .read_native_reconciliation_evidence(
+                    fixture.attempt,
+                    NonZeroU64::new(session.generation).unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            let revision = completion.recovery_revision().get();
+            match change {
+                0 => {
+                    completion = crate::NativeReconciliationCompletion::new(
+                        AttemptId::new(1),
+                        completion.session_generation(),
+                        completion.interruption_revision(),
+                        completion.recovery_revision(),
+                        completion.binding_revision(),
+                    );
+                }
+                1 => {
+                    completion = crate::NativeReconciliationCompletion::new(
+                        completion.attempt_id(),
+                        NonZeroU64::new(1).unwrap(),
+                        completion.interruption_revision(),
+                        completion.recovery_revision(),
+                        completion.binding_revision(),
+                    );
+                }
+                2 => {
+                    completion = crate::NativeReconciliationCompletion::new(
+                        completion.attempt_id(),
+                        completion.session_generation(),
+                        PersistenceRevision::first(),
+                        completion.recovery_revision(),
+                        completion.binding_revision(),
+                    );
+                }
+                3 => {
+                    completion = crate::NativeReconciliationCompletion::new(
+                        completion.attempt_id(),
+                        completion.session_generation(),
+                        completion.interruption_revision(),
+                        PersistenceRevision::first(),
+                        completion.binding_revision(),
+                    );
+                }
+                4 => {
+                    completion = crate::NativeReconciliationCompletion::new(
+                        completion.attempt_id(),
+                        completion.session_generation(),
+                        completion.interruption_revision(),
+                        completion.recovery_revision(),
+                        PersistenceRevision::first(),
+                    );
+                }
+                5 => binding.identity.nonce = GuardianLifetimeNonce::new([7; 16]).unwrap(),
+                6 => binding.identity.process = identity(99),
+                7 => binding.slots[0].process = identity(99),
+                8 => binding.slots.clear(),
+                9 => binding.sessions.last_mut().unwrap().state = NativeSessionState::Detached,
+                10 => binding.deadline = MonotonicTick::new(1),
+                11 => {}
+                _ => unreachable!(),
+            }
+            fixture
+                .server
+                .stage_native_reader(Box::new(ReconciliationReader(if change == 11 {
+                    None
+                } else {
+                    Some((loaded, binding, completion))
+                })));
+            assert!(
+                matches!(
+                    fixture.server.handle(Request::FinishReconciliation {
+                        session,
+                        applied_revision: revision,
+                        now: 0
+                    }),
+                    Response::Refused(_)
+                ),
+                "case {change}"
+            );
+            assert_eq!(fixture.server.snapshot().state, WireState::Reconciling);
+            assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_finish_cannot_use_claimed_wire_time_to_bypass_expired_deadline() {
+        let attempt = AttemptId::new(929);
+        let deadline = MonotonicTick::new(1);
+        let mut store = ControllerSqliteStore::in_memory().unwrap();
+        let committed = DeploymentAttempt::start(
+            attempt,
+            deadline,
+            ResourcePolicy::new(
+                NonZeroUsize::new(2).unwrap(),
+                0,
+                0,
+                CpuContentionBasisPoints::new(0).unwrap(),
+                MemoryPressure::Critical,
+            ),
+            identity(41),
+        )
+        .persist(&mut store)
+        .unwrap();
+        let (guardian, old) =
+            Guardian::new(attempt, deadline, Observer, vec![identity(42)]).unwrap();
+        let mut server = GuardianServer::new(guardian, old, test_build()).unwrap();
+        let native = NativeGuardianIdentity {
+            nonce: GuardianLifetimeNonce::new([4; 16]).unwrap(),
+            process: identity(43),
+        };
+        server.stage_native_identity(native);
+        let binding = store
+            .commit_initial_binding(
+                attempt,
+                deadline,
+                PersistenceRevision::first(),
+                native,
+                &[crate::NativeGuardianSlot {
+                    process: identity(42),
+                    liveness: crate::NativeSlotLiveness::Running,
+                }],
+            )
+            .unwrap();
+        let binding = store
+            .commit_detached_binding(&binding, binding.slots())
+            .unwrap();
+        committed
+            .into_parts()
+            .0
+            .interrupt()
+            .unwrap()
+            .persist(&mut store)
+            .unwrap();
+        let binding = store
+            .commit_fresh_interruption_binding(
+                &binding,
+                PersistenceRevision::new(NonZeroU64::new(2).unwrap()),
+            )
+            .unwrap();
+        server.handle(Request::Hello {
+            build: test_build(),
+        });
+        server.handle(Request::Fence {
+            session: old.into(),
+        });
+        // Enter through the trusted in-process begin seam so expiry is tested at finish,
+        // not rejected earlier by native begin's independent deadline check.
+        server.native_unbound = false;
+        server.stage_interruption(binding.current_session().interruption_revision);
+        let Response::ReconciliationBegun { session } =
+            server.handle(Request::BeginReconciliation {
+                instance: server.snapshot().instance,
+                inventory: server.snapshot().slots,
+                interruption_revision: 2,
+            })
+        else {
+            panic!("trusted begin")
+        };
+        server.native_unbound = true;
+        let loaded = store.load_attempt(attempt).unwrap().unwrap();
+        let _committed = store
+            .commit_native_sampling_recovery_at(loaded, &binding, crate::MonotonicTick::new(0))
+            .unwrap();
+        let evidence = store
+            .read_native_reconciliation_evidence(attempt, binding.current_session().generation)
+            .unwrap();
+        let completion = evidence.as_ref().unwrap().2;
+        server.stage_native_reader(Box::new(ReconciliationReader(evidence)));
+        assert!(matches!(
+            server.handle(Request::FinishReconciliation {
+                session,
+                applied_revision: 3,
+                now: 0
+            }),
+            Response::Refused(_)
+        ));
+        assert_eq!(server.snapshot().state, WireState::Reconciling);
+        let permit = crate::ReconciledSessionPermit::after_committed_reconciliation(
+            server.session,
+            attempt,
+            deadline,
+            completion.recovery_revision(),
+        );
+        let prepared = server
+            .guardian
+            .prepare_reconciliation(server.session, permit, MonotonicTick::new(0))
+            .unwrap();
+        server.prepared_activation = Some((completion, prepared));
+        let proof = crate::PreparedNativeReconciliation::after_live_prepare(
+            session,
+            attempt,
+            binding.identity(),
+            deadline,
+            completion.recovery_revision(),
+        );
+        let (_, _, committed) = store
+            .commit_native_reconciliation_activation_at(
+                &binding,
+                completion,
+                proof,
+                MonotonicTick::new(0),
+            )
+            .unwrap();
+        let (session, attempt, recovery_revision, binding_revision) = committed.into_locator();
+        let activation = store
+            .read_native_reconciliation_activation_evidence(
+                attempt,
+                binding.current_session().generation,
+            )
+            .unwrap();
+        server.stage_native_reader(Box::new(ActivationReader(activation)));
+        assert_eq!(
+            server.handle(Request::ActivateReconciliation {
+                session,
+                attempt: attempt.get(),
+                recovery_revision: recovery_revision.get(),
+                binding_revision: binding_revision.get()
+            }),
+            Response::Refused(WireError::Guardian(WireGuardianError::DeadlineExpired))
+        );
+        assert_eq!(server.snapshot().state, WireState::AuthorityLost);
+        assert!(server.prepared_activation.is_none());
+    }
+
+    #[test]
+    fn finish_dto_rejects_unknown_authority_fields() {
+        let body = serde_json::json!({ "op": "finish_reconciliation", "data": {
+            "session": { "instance": 1, "generation": 2 }, "applied_revision": 3, "now": 0,
+            "permit": { "reconciled": true }
+        }});
+        assert!(serde_json::from_value::<Request>(body).is_err());
+        let request = serde_json::json!({"op":"activate_reconciliation", "data": {"session":{"instance":1,"generation":2}, "attempt":1, "recovery_revision":3,"binding_revision":4,"permit":true}});
+        assert!(serde_json::from_value::<Request>(request).is_err());
+        let response = serde_json::json!({"op":"reconciliation_prepared", "data": {"session":{"instance":1,"generation":2}, "attempt":1, "recovery_revision":3,"permit":true}});
+        assert!(serde_json::from_value::<Response>(response).is_err());
     }
 
     #[test]
@@ -3272,15 +4224,15 @@ mod native_evidence_tests {
         ];
         for request in forbidden {
             let expected = match &request {
-                Request::DispatchAdmit { .. } | Request::AckAfterAppliedRevision { .. } => {
-                    WireError::MissingProof
-                }
+                Request::DispatchAdmit { .. }
+                | Request::AckAfterAppliedRevision { .. }
+                | Request::FinishReconciliation { .. }
+                | Request::ActivateReconciliation { .. } => WireError::MissingProof,
                 Request::DispatchSubmit { .. } => WireError::UnknownAdmission,
                 Request::Hello { .. }
                 | Request::Snapshot
                 | Request::Fence { .. }
                 | Request::BeginReconciliation { .. }
-                | Request::FinishReconciliation { .. }
                 | Request::ReleaseInitial { .. }
                 | Request::Inventory
                 | Request::ObserveSlot { .. }

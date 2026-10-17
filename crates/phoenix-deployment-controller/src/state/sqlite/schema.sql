@@ -109,6 +109,7 @@ CREATE TABLE guardian_sessions (
     interruption_revision BLOB NOT NULL CHECK(length(interruption_revision) = 8 AND interruption_revision != zeroblob(8)),
     state TEXT NOT NULL CHECK(state IN ('active','detached','reconciling')),
     PRIMARY KEY(attempt_id, generation),
+    UNIQUE(attempt_id, generation, interruption_revision),
     UNIQUE(attempt_id, interruption_revision)
 ) STRICT;
 CREATE UNIQUE INDEX guardian_one_live_session ON guardian_sessions(attempt_id) WHERE state IN ('active','reconciling');
@@ -191,4 +192,64 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'confirmed native sampling application is immutable');
 END;
-PRAGMA user_version = 4;
+CREATE TABLE native_reconciliation_completions (
+    attempt_id BLOB NOT NULL,
+    session_generation BLOB NOT NULL CHECK(length(session_generation) = 8 AND session_generation != zeroblob(8)),
+    interruption_revision BLOB NOT NULL CHECK(length(interruption_revision) = 8 AND interruption_revision != zeroblob(8)),
+    recovery_revision BLOB NOT NULL CHECK(length(recovery_revision) = 8 AND recovery_revision > interruption_revision),
+    binding_revision BLOB NOT NULL CHECK(length(binding_revision) = 8 AND binding_revision != zeroblob(8)),
+    PRIMARY KEY(attempt_id, session_generation),
+    UNIQUE(attempt_id, recovery_revision),
+    FOREIGN KEY(attempt_id, session_generation, interruption_revision)
+        REFERENCES guardian_sessions(attempt_id, generation, interruption_revision)
+) STRICT;
+CREATE TRIGGER native_reconciliation_completion_requires_exact_preparation
+BEFORE INSERT ON native_reconciliation_completions
+WHEN NOT EXISTS (
+    SELECT 1 FROM attempts a
+    JOIN guardian_bindings b USING(attempt_id)
+    JOIN guardian_sessions s USING(attempt_id)
+    WHERE a.attempt_id=NEW.attempt_id
+      AND a.revision=NEW.recovery_revision AND a.phase='sampling'
+      AND b.revision=NEW.binding_revision AND b.dispatch_floor=NEW.interruption_revision
+      AND s.generation=NEW.session_generation
+      AND s.interruption_revision=NEW.interruption_revision AND s.state='reconciling'
+      AND s.generation=(SELECT max(generation) FROM guardian_sessions WHERE attempt_id=NEW.attempt_id)
+)
+BEGIN SELECT RAISE(ABORT, 'completion requires exact prepared checkpoint and session'); END;
+CREATE TRIGGER native_reconciliation_completion_is_immutable
+BEFORE UPDATE ON native_reconciliation_completions
+BEGIN SELECT RAISE(ABORT, 'prepared completion is immutable'); END;
+CREATE TRIGGER native_reconciliation_completion_cannot_be_deleted
+BEFORE DELETE ON native_reconciliation_completions
+BEGIN SELECT RAISE(ABORT, 'prepared completion is immutable'); END;
+CREATE TABLE native_reconciliation_activations (
+    attempt_id BLOB NOT NULL,
+    session_generation BLOB NOT NULL CHECK(length(session_generation)=8 AND session_generation!=zeroblob(8)),
+    binding_revision BLOB NOT NULL CHECK(length(binding_revision)=8 AND binding_revision!=zeroblob(8)),
+    PRIMARY KEY(attempt_id, session_generation),
+    FOREIGN KEY(attempt_id, session_generation)
+        REFERENCES native_reconciliation_completions(attempt_id, session_generation)
+) STRICT;
+CREATE TRIGGER native_reconciliation_activation_requires_exact_active_binding
+BEFORE INSERT ON native_reconciliation_activations
+WHEN NOT EXISTS (
+    SELECT 1 FROM native_reconciliation_completions c
+    JOIN attempts a USING(attempt_id)
+    JOIN guardian_bindings b USING(attempt_id)
+    JOIN guardian_sessions s ON s.attempt_id=c.attempt_id AND s.generation=c.session_generation
+    WHERE c.attempt_id=NEW.attempt_id AND c.session_generation=NEW.session_generation
+      AND a.revision=c.recovery_revision AND a.phase='sampling'
+      AND b.revision=NEW.binding_revision AND b.revision>c.binding_revision
+      AND b.dispatch_floor=c.recovery_revision
+      AND s.interruption_revision=c.interruption_revision AND s.state='active'
+      AND s.generation=(SELECT max(generation) FROM guardian_sessions WHERE attempt_id=NEW.attempt_id)
+)
+BEGIN SELECT RAISE(ABORT, 'activation requires exact active checkpoint and session'); END;
+CREATE TRIGGER native_reconciliation_activation_is_immutable
+BEFORE UPDATE ON native_reconciliation_activations
+BEGIN SELECT RAISE(ABORT, 'activation is immutable'); END;
+CREATE TRIGGER native_reconciliation_activation_cannot_be_deleted
+BEFORE DELETE ON native_reconciliation_activations
+BEGIN SELECT RAISE(ABORT, 'activation is immutable'); END;
+PRAGMA user_version = 5;
