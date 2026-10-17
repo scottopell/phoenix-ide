@@ -2641,3 +2641,46 @@ atomically for **one causal normal qualification**. The dedicated diagnostic
 branch remains frozen at `191dac` and its original artifact/app pins; it is not
 pushed or rerun by this candidate. Controlled six-report acceptance, stock
 comparison, overhead and full acceptance remain unproven until actual results.
+
+### Full-source gate exposed before controlled browser execution
+
+Run `38989132913`, shared `b099397b499a31474e7dab731de8e9dc73c19c16`, app
+`2ad41de0b681528d65d8a534b251c82d53a4df04`, is **fully terminal failure**.
+Rust (`117267398630`) and all standard lanes passed. The witness
+`117267336253` passed both separate UI builds/admission, codegen, owned Coordinator
+fixture and libtest capture, but failed full pinned-app UI qualification:
+tsc/eslint/stylelint passed; Vitest had1 failure,3586 pass,2 skip across170 files.
+The failure was `InlineMessageReaction.test.tsx`, `uses touch presentation when
+reselecting a tokenless source`, expecting `Docked reaction` but observing the
+floating `React to selected text` region. Controlled Chromium preparation and
+all six controlled journeys were **skipped**. No pagination runtime acceptance
+can be inferred from this run.
+
+Original artifact `12084009960` is95,560,135 bytes. Bounded index/log/receipt
+reads were retained locally; selected UI log and receipt fetched73,266 bytes.
+The absent browser result was checked against the ZIP index, not manufactured.
+No unchanged run or full-suite retry was performed.
+
+The sole app-source owner ran the unchanged named test (1 pass) and whole owning
+file (30 pass); this did not reproduce the hosted failure or establish a product
+root cause. Source inspection shows pointerup schedules/cancels the owning
+animation frame and `read` applies presentation there. A test-only delta aligns
+this tokenless test with adjacent frame-driven regressions: fake only rAF and
+cancel-rAF; assert no selection before first frame; advance owning frame to the
+floating pill; assert floating remains before touch frame; advance to docked
+presentation and require exact retained tokenless source equality. No product
+logic, timeout, retry, expected touch result or source identity was weakened.
+
+Imported donor `b17af62db296930ab77b0cd9f72147b0ace7fea8` as exact one-file delta
+atop `2ad`, producing clean app `35f7cfbc8dcab2d454d5bb07ad3f808dfa31b39f`,
+tree `a548be3b0ad35596434018068e297bf3f5066af5`, published as
+`qualification/history-joint-source-35f7cfbc8`. Parent reviewed the exact diff,
+independently passed named1/owning30 and genuine composite tsc-b; shared131 Node
+and70 Python also pass at the new pin. The earlier553 app/8 artifact tests apply
+to its unchanged pagination-product parent. Owner reported independent read-only
+approval, changed-file lint pass, and retained transient warning logs without
+claiming a cleanup/product fix.
+
+One changed-candidate normal qualification is authorized to exercise this
+completion-boundary correction and then the still-unqualified pagination repair.
+Stock sampling/unsupported resume/overhead false/full acceptance false unchanged.
