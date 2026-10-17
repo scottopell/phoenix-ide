@@ -47,6 +47,7 @@ phoenix-skills = { path = "../phoenix-skills" }
 # Named-agent discovery (.claude/agents, .agents/agents) for the spawn-time
 # agent_type resolution and persona composition.
 phoenix-agents = { path = "../phoenix-agents" }
+phoenix-browser = { path = "../phoenix-browser" }
 
 # Tool implementations (bash, patch, browser, tmux, search, …). The Tool
 # trait, ToolContext, and ToolRegistry live here. The axum/HTTP glue that
