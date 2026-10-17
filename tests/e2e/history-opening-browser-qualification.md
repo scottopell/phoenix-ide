@@ -2475,3 +2475,28 @@ CLI and no browser startup on import. Controlled23 tests pass including placehol
 rejection and missing/readonly negatives; independent narrow review approved one
 causal harness successor. No app pin/product/oracle/physical/timing rule changed.
 Unit selector correction is not actual successor acceptance.
+
+### Actual physical fix confirmed; controlled writable fixture prerequisite repaired
+
+Composer-selector successor `38984649048` at harnessb962 is terminal FAIL at
+composer_owner; witness `117253514945`, Rust `117253592241` and all standard
+jobs pass. Exact artifact `12082193993` is96,431,697B; bounded failure reads74,612B.
+A reviewed <=5min same-artifact diagnostic `38986434292`, job `117259416719`,
+is terminal SUCCESS, sourceed3eea096. Artifact `12084337181` is64,110B and
+retains safe observations/screenshot/provenance/completion. In ALL five actual
+frames strict containment=true, target top93.5 versus clip93 (+0.5 margin), exact
+identity/sourcepin/route true. Composer count is0, not disabled/readOnly. This
+confirms actual corrected ordinary geometry, not exact-six qualification.
+
+Source diagnosis proves a fixture prerequisite mismatch: equal_text_fixture
+exhausts the newest accepted successor, and ConversationPage correctly excludes
+ordinary composer for context_exhausted. Controlled capture requires a writable
+latest owner. The narrow fixture change adds writable=False by default, preserving
+stock exhaustion byte-for-byte; only controlled ordinary/Global passTrue, retain
+the existing accepted-opening persisted-idle wait and explicitly assert idle,
+then omit the final synthetic exhaustion. All member messages/pages/identities/
+boundaries are refetched and validated afterward; predecessor summary and separate
+accepted opening remain exact. No target/oracle/composer/sampler rule is weakened.
+Python70 tests pass including stock exhaustion, controlled no-exhaustion and
+nonidle rejection. Independent narrow review approved one causal successor;
+actual six-scenario collector/export/drain remains required. No app pin changed.

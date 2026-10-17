@@ -1326,4 +1326,26 @@ class FixtureSettlementTests(unittest.TestCase):
         self.assertEqual(len([c for c in self.calls if c[1].endswith("/messages/reconcile")]), 2)
 
 
+class ControlledWritableFixtureTests(unittest.TestCase):
+    def test_controlled_successor_stays_persisted_idle_while_stock_exhausts(self):
+        for writable in (False, True):
+            fixture = MagicMock()
+            fixture.wait.return_value = {'conversation': {'state': 'idle'}}
+            fixture.h._state_str.side_effect = lambda state: state
+            opening.settle_equal_text_successor(fixture, 'UNIT-successor', 'UNIT-opening', writable)
+            fixture.wait.assert_called_once_with('UNIT-successor', message_id='UNIT-opening')
+            if writable:
+                fixture.send.assert_not_called()
+            else:
+                fixture.send.assert_called_once_with('UNIT-successor', '[[scenario:context_window_exceeded]] [[ttft:0]]', True)
+
+    def test_controlled_nonidle_successor_is_rejected_not_assumed_writable(self):
+        fixture = MagicMock()
+        fixture.wait.return_value = {'conversation': {'state': 'context_exhausted'}}
+        fixture.h._state_str.side_effect = lambda state: state
+        with self.assertRaisesRegex(AssertionError, 'idle'):
+            opening.settle_equal_text_successor(fixture, 'UNIT-successor', 'UNIT-opening', True)
+        fixture.send.assert_not_called()
+
+
 if __name__ == "__main__": unittest.main()

@@ -649,7 +649,15 @@ def exhausted_summary(state):
     return state["summary"]
 
 
-def equal_text_fixture(fixture, aggregate):
+def settle_equal_text_successor(fixture, successor, opening_id, writable):
+    data = fixture.wait(successor, message_id=opening_id)
+    if writable:
+        assert fixture.h._state_str(data['conversation']['state']) == 'idle', 'controlled latest owner must be idle'
+    else:
+        fixture.send(successor, '[[scenario:context_window_exceeded]] [[ttft:0]]', True)
+
+
+def equal_text_fixture(fixture, aggregate, *, writable=False):
     predecessor = aggregate["members"][-1]
     fixture.send(predecessor, "[[scenario:context_window_exceeded]] [[ttft:0]]", True)
     persisted = fixture.request("GET", f"/api/conversations/{predecessor}")
@@ -660,8 +668,7 @@ def equal_text_fixture(fixture, aggregate):
     successor = response["conversation_id"]
     assert response["status"] == "accepted" and successor not in aggregate["members"], response
     opening_id = f"{successor}:{key}"
-    fixture.wait(successor, message_id=opening_id)
-    fixture.send(successor, "[[scenario:context_window_exceeded]] [[ttft:0]]", True)
+    settle_equal_text_successor(fixture, successor, opening_id, writable)
 
     members = aggregate["members"] + [successor]
     member_messages = [fixture.request("GET", f"/api/conversations/{row}")["messages"]
@@ -896,7 +903,7 @@ def qualify(app, exe, output, joint_telemetry=False, controlled=False):
                                     cwd = work / "cwd"
                                     cwd.mkdir(mode=0o700)
                                     aggregate = equal_text_fixture(
-                                        fixture, fixture.build(kind, cwd))
+                                        fixture, fixture.build(kind, cwd), writable=controlled)
                                     if receiver:
                                         other_kind = ("global" if kind == "ordinary"
                                                       else "ordinary")
@@ -904,7 +911,7 @@ def qualify(app, exe, output, joint_telemetry=False, controlled=False):
                                         other_cwd.mkdir(mode=0o700)
                                         other = fixture.build(other_kind, other_cwd)
                                         if controlled:
-                                            other = equal_text_fixture(fixture, other)
+                                            other = equal_text_fixture(fixture, other, writable=True)
                                         other = other | {
                                             "latest_transcript_row_id": other["members"][-1]}
                                         fixtures = joint_fixture(
