@@ -3441,3 +3441,27 @@ three injected tests include initial zero and missing-stat reclassification to
 zero. No exact failing PID or kernel-thread identity was logged, so neither is
 claimed as the observed cause. Root authority, timeouts and assertions remain.
 No local Rust execution is claimed; fresh whole-head qualification is required.
+
+
+## Published citation and standing-direction composition
+
+App `b104ccfb39ed84125141beba41d45252c860d58f`, tree
+`046043ef3d571bd65aa408b7b1227ac9bc8fae10`, preserves published main
+`1f9529c634a074c6ab6ea36eb15ca284770df1a5` and its typed citation and
+continuation standing-direction changes. Nine of13 incoming paths equal main;
+four are mechanical unions retaining both parent deltas, independently reviewed
+without an actionable composition finding. Native code, ADRs and prior source
+fixes are unchanged. The parent independently ran64 citation UI tests; source
+owner TypeScript/ESLint and standalone formatting passed. Offline guidance
+checks are source-contract checks only, not model behavior or Rust execution.
+
+The preceding exact0f6c45594 run is retained without cancellation. Its Linux
+real-server/native qualification passed, including all zero-aware guards and
+real descendant/escaped-writer/Chrome cases; rebuilt artifact12111152765 shows
+six reports, six real collector204 acceptances and six semantic exports with
+normal app/receiver drain and no errors. macOS39059669370 both jobs passed.
+Those results do not qualify this published-main composition or establish
+performance/overhead/resume/full acceptance. This successor requires its own
+whole-head qualification after the preceding run reaches a terminal result.
+The separate performance composition2702d838 remains explicitly pinned to9ee,
+not relabelled as the later citation-fixed product UI.
