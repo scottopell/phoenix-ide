@@ -10,9 +10,10 @@ const input=JSON.parse(readFileSync(process.env.PROBE_INPUT,'utf8'));
 const out=resolve(process.env.PROBE_OUTPUT,'native-capability.json');
 const base=process.env.HISTORY_BASE_URL;
 const {chromium}=createRequire(resolve(process.env.APP_ROOT,'ui/package.json'))('playwright');
-const result={scope:'separate_desktop_native_bfcache_probe_controlled_artifact_not_PWA_or_physical_suspend',
+const result={scope:'separate_full_chromium_desktop_native_bfcache_probe_controlled_artifact_not_PWA_or_physical_suspend',
+  environment_change:'full_chromium_channel_not_headless_shell_after_delegate_rejection',
   full_acceptance:false,overhead_clearance:false,status:'failed',reports:[],rejections:[],
-  launch:{headless:true,ignoreDefaultArgs:['--disable-back-forward-cache']}};
+  launch:{headless:true,channel:'chromium',ignoreDefaultArgs:['--disable-back-forward-cache']}};
 let browser,context,page,parseErrors=0;
 result.stage='launch';
 const save=()=>writeFileSync(out,JSON.stringify(result,null,2));
