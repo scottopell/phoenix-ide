@@ -169,7 +169,20 @@ WHEN a more-specific prepared-deployment requirement admits a source ledger alre
 THE SYSTEM SHALL retain the same offline snapshot, mandatory candidate invocation, exact target verification, and post-invocation forward-only boundary
 AND SHALL treat that admission as one bounded prepared replacement, not as another schema interval or a generic cross-binary compatibility guarantee.
 
+WHEN an explicitly selected protected published-release current-schema transition uses a source ledger exactly equal to the complete candidate-registry prefix through migration 114,
+THE SYSTEM SHALL admit only the exact migration-128 target registry defined above and an exact immutable release identity under `specs/launchd-deployment/requirements.md` REQ-LDD-019
+AND SHALL bind the activation helper to a separately explicit full controller commit, not the candidate release commit, retaining its bytes and SHA-256 while obtaining the candidate binary and complete registry from the release commit
+AND SHALL retain the same capacity, exclusive offline snapshot, durable `migration_started`, mandatory candidate invocation, exact target verification, and candidate-only post-invocation recovery boundaries.
+
+This admission SHALL NOT authorize another source baseline, a source range, a future registry, generic release compatibility, or automatic post-invocation database rollback. Prepared exact-123 and exact-target admission remain distinct from this exact-114 published-release transition.
+
 ### REQ-COMP-013: Ordinary forward activation is not downgrade-safe after candidate start
+
+WHEN an ordinary launchd deployment has pending migrations outside an explicitly qualified ordinary interval,
+THE SYSTEM SHALL reject it before runtime disruption
+AND SHALL NOT infer qualification from the candidate's highest migration version, general forward-migration support, or protected current-schema admission.
+
+The exact-114 published-release transition SHALL require the protected current-schema route; it SHALL NOT extend the ordinary interval.
 
 For the qualified ordinary in-place transition from the migration-123 baseline to the exact candidate migration-128 registry, the system SHALL treat the first candidate startup attempt as the conservative predecessor-compatibility boundary. Before that boundary, runtime artifact rollback MAY restart the unchanged predecessor database. At or after that boundary, failure or uncertainty SHALL retain the exact candidate and fail stopped/forward-only; it SHALL NOT infer predecessor compatibility from failed health, unchanged highest ledger, or absent production row evidence.
 

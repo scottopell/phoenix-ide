@@ -65,6 +65,10 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        capacity = shutil.disk_usage(self.root)._replace(free=100 * 1024**3)
+        disk_usage = mock.patch.object(helper.shutil, "disk_usage", return_value=capacity)
+        disk_usage.start()
+        self.addCleanup(disk_usage.stop)
 
     def database(self, *, through: int = 123) -> Path:
         path = self.root / f"schema-{through}.sqlite3"
@@ -182,6 +186,73 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         status = json.loads(Path(manifest.status_path).read_text())
         self.assertEqual(status["prepared_mode"], "current_schema")
 
+    def release_manifest(self, database: Path) -> helper.Manifest:
+        base = self.manifest(database)
+        return dataclasses.replace(
+            base, source_kind="published_release", release_tag="v2.0.0",
+            release_commit=base.source_commit,
+        )
+
+    def test_source_qualified_prefixes_are_exact_and_distinct(self) -> None:
+        for source_kind in ("prepared_artifact", "published_release"):
+            for through in range(113, 130):
+                with self.subTest(source_kind=source_kind, through=through):
+                    database = self.database(through=through)
+                    admitted = (123, 128) if source_kind == "prepared_artifact" else (114,)
+                    if through in admitted:
+                        self.assertEqual(
+                            helper.validate_current_schema_database(
+                                database, self.registry, source_kind=source_kind,
+                            ), tuple(compiled_ledger(through)),
+                        )
+                    else:
+                        if through == 129:
+                            with sqlite3.connect(database) as connection:
+                                connection.execute("INSERT INTO _migrations VALUES (129, 'future')")
+                        with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
+                            helper.validate_current_schema_database(
+                                database, self.registry, source_kind=source_kind,
+                            )
+
+    def test_release_114_rejects_incomplete_mismatched_and_extra_ledger(self) -> None:
+        for mutation in (
+            "DELETE FROM _migrations WHERE version = 70",
+            "UPDATE _migrations SET name = 'wrong' WHERE version = 114",
+            "INSERT INTO _migrations VALUES (115, 'unexpected')",
+        ):
+            with self.subTest(mutation=mutation):
+                database = self.database(through=114)
+                with sqlite3.connect(database) as connection:
+                    connection.execute(mutation)
+                with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
+                    helper.validate_current_schema_database(
+                        database, self.registry, source_kind="published_release",
+                    )
+
+    def test_release_mode_requires_exact_candidate_binding_and_retained_helper(self) -> None:
+        manifest = self.release_manifest(self.database(through=114))
+        current = manifest.current_schema_upgrade
+        with mock.patch.object(helper, "__file__", current.controller_helper_path):
+            helper.validate_manifest_mode(manifest)
+            for fields in (
+                {"release_commit": "e" * 40}, {"release_tag": None},
+                {"expected": helper.Identity("2.0.0", "e" * 40)},
+                {"source_kind": "local_head"},
+            ):
+                with self.subTest(fields=fields), self.assertRaises(helper.ActivationError):
+                    helper.validate_manifest_mode(dataclasses.replace(manifest, **fields))
+            same_source = dataclasses.replace(
+                manifest,
+                current_schema_upgrade=dataclasses.replace(
+                    current, controller_source_commit=manifest.source_commit,
+                ),
+            )
+            with self.assertRaisesRegex(helper.ActivationError, "exact release candidate source binding"):
+                helper.validate_manifest_mode(same_source)
+            Path(current.controller_helper_path).write_text("changed helper")
+            with self.assertRaisesRegex(helper.ActivationError, "helper bytes changed"):
+                helper.validate_manifest_mode(manifest)
+
     def ordinary_manifest(self, database: Path) -> helper.Manifest:
         base = self.manifest(database)
         current = base.current_schema_upgrade
@@ -274,6 +345,26 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         ledger = helper.validate_current_schema_database(database, self.registry)
 
         self.assertEqual(ledger, tuple(compiled_ledger()))
+
+    def test_candidate_registry_must_contain_qualified_source_baseline(self) -> None:
+        for source_kind, baseline in (("prepared_artifact", 123), ("published_release", 114)):
+            for migrated in (False, True):
+                with self.subTest(source_kind=source_kind, migrated=migrated):
+                    registry = self.root / "missing-baseline.rs"
+                    source = self.registry.read_text()
+                    registry.write_text(re.sub(
+                        rf'    Migration\s*\{{\s*version:\s*{baseline},.*?\n    \}},\n',
+                        "", source, count=1, flags=re.S,
+                    ))
+                    parsed = helper.migration_registry(registry)
+                    self.assertNotIn(baseline, [version for version, _name in parsed])
+                    database = self.database(through=128)
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("DELETE FROM _migrations WHERE version = ?", (baseline,))
+                    with self.assertRaisesRegex(helper.ActivationError, "missing the qualified source baseline"):
+                        helper.validate_current_schema_database(
+                            database, registry, source_kind=source_kind, migrated=migrated,
+                        )
 
     def test_partial_target_is_not_an_admitted_prepared_source(self) -> None:
         database = self.database(through=127)
@@ -690,7 +781,8 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         growth_bytes: int = 0,
     ) -> None:
         target = Path(manifest.target_binary)
-        pending = [item for item in compiled_ledger() if item[0] > 123]
+        baseline = 114 if manifest.source_kind == "published_release" else 123
+        pending = [item for item in compiled_ledger() if item[0] > baseline]
         migrations = pending[:1] if partial else pending
         growth = (
             "connection.execute('CREATE TABLE migration_growth (payload BLOB NOT NULL)')\n"
@@ -710,6 +802,63 @@ sys.exit({7 if partial else 0})
         target.write_text(script)
         target.chmod(0o755)
         object.__setattr__(manifest, "candidate_binary_sha256", helper.sha256(target))
+
+    def test_release_114_migration_and_startup_failures_never_launch_predecessor(self) -> None:
+        for failure in ("migration", "startup"):
+            with self.subTest(failure=failure):
+                database = self.database(through=114)
+                manifest = self.release_manifest(database)
+                self.migration_script(manifest, partial=failure == "migration")
+                current = manifest.current_schema_upgrade
+                Path(manifest.target_plist).write_bytes(Path(manifest.rollback_plist).read_bytes())
+                Path(manifest.active_path).write_text(manifest.transaction_id)
+                helper.write_status(manifest, "prepared")
+                reservation = self.migration_reservation(manifest)
+                Path(current.backup_path).touch(mode=0o600)
+
+                class CandidateLaunch:
+                    disruption_started = False
+                    starts = 0
+
+                    def stop(self):
+                        self.disruption_started = True
+                        return 71
+
+                    def inspect(self):
+                        return "not_loaded", None
+
+                    def start(self, old_pid, plist_path=None):
+                        self.starts += 1
+                        raise helper.ActivationError("injected startup failure")
+
+                launchctl = CandidateLaunch()
+                real_run = helper.subprocess.run
+                invoked = []
+
+                def run(command, **kwargs):
+                    if "--migrate-only" in command:
+                        self.assertEqual(helper.read_status(manifest)["state"], "migration_started")
+                        invoked.append(command)
+                    return real_run(command, **kwargs)
+
+                with mock.patch.object(helper, "__file__", current.controller_helper_path), \
+                     mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                     mock.patch.object(helper, "reserve_database_capacity", return_value=reservation), \
+                     mock.patch.object(helper, "assert_database_exclusive"), \
+                     mock.patch.object(helper, "_reservation_still_sufficient"), \
+                     mock.patch.object(helper, "_require_current_schema_free_space"), \
+                     mock.patch.object(helper, "restore") as restore, \
+                     mock.patch.object(helper.subprocess, "run", side_effect=run):
+                    state = helper.activate(manifest)
+                restore.assert_not_called()
+                self.assertEqual(len(invoked), 1)
+                self.assertEqual(launchctl.starts, 0 if failure == "migration" else 1)
+                self.assertEqual(state, "activation_failed_database_committed" if failure == "migration" else "committed")
+                self.assertEqual(Path(manifest.active_path).read_text(), manifest.transaction_id)
+                proof = helper._snapshot_proof(manifest)
+                self.assertEqual(proof["source_ledger"], [list(item) for item in compiled_ledger(114)])
+                self.assertEqual(helper.database_ledger(database)[-1][0], 115 if failure == "migration" else 128)
+                self.assertTrue(helper.read_status(manifest)["finalization_pending"])
 
     def test_offline_migration_commits_exact_target_ledger_and_proof(self) -> None:
         database = self.database()
@@ -741,8 +890,46 @@ sys.exit({7 if partial else 0})
         self.assertIn("migration_committed_at", proof)
 
     def test_exact_target_source_still_invokes_offline_candidate(self) -> None:
+        self.assert_exact_target_invokes_offline_candidate(self.manifest)
+
+    def test_protected_release_exact_target_fails_before_disruption(self) -> None:
         database = self.database(through=128)
-        manifest = self.manifest(database)
+        manifest = self.release_manifest(database)
+        self.write_current_status(manifest, "prepared")
+        before = database.read_bytes()
+        launchctl = mock.Mock()
+
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "reserve_database_capacity") as reserve, \
+             mock.patch.object(helper, "run_current_schema_migration") as migrate:
+            with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
+                helper.activate(manifest)
+
+        launchctl.stop.assert_not_called()
+        launchctl.start.assert_not_called()
+        reserve.assert_not_called()
+        migrate.assert_not_called()
+        self.assertEqual(database.read_bytes(), before)
+        self.assertFalse(Path(manifest.current_schema_upgrade.backup_path).exists())
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_failed")
+        self.assertEqual(status["prepared_mode"], "current_schema")
+
+    def test_migrated_target_is_valid_for_both_current_schema_sources(self) -> None:
+        database = self.database(through=128)
+        for source_kind in ("prepared_artifact", "published_release"):
+            with self.subTest(source_kind=source_kind):
+                self.assertEqual(
+                    helper.validate_current_schema_database(
+                        database, self.registry, source_kind=source_kind, migrated=True,
+                    ),
+                    tuple(compiled_ledger(128)),
+                )
+
+    def assert_exact_target_invokes_offline_candidate(self, manifest_factory) -> None:
+        database = self.database(through=128)
+        manifest = manifest_factory(database)
         current = manifest.current_schema_upgrade
         assert current is not None
         target = Path(manifest.target_binary)
@@ -761,8 +948,15 @@ connection.close()
         self.write_snapshot_proof(manifest)
         reservation = self.migration_reservation(manifest)
 
-        with mock.patch.object(helper, "assert_database_exclusive"):
+        real_run = helper.subprocess.run
+        with mock.patch.object(helper, "assert_database_exclusive"), mock.patch.object(
+            helper.subprocess, "run", side_effect=real_run,
+        ) as run:
             helper.run_current_schema_migration(manifest, reservation)
+        invocations = [call for call in run.call_args_list if "--migrate-only" in call.args[0]]
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(invocations[0].args[0], [str(target), "--migrate-only"])
+        self.assertEqual(invocations[0].kwargs["env"]["PHOENIX_DB_PATH"], str(database))
 
         with sqlite3.connect(database) as connection:
             self.assertEqual(
@@ -937,7 +1131,7 @@ connection.close()
         self.assertEqual(proof["source_logical_digest"], proof["backup_logical_digest"])
         self.assertEqual(proof["sha256"], helper.sha256(Path(current.backup_path)))
 
-    def test_ordinary_nonqualified_schema_does_not_impose_128_ceiling(self) -> None:
+    def test_ordinary_unqualified_pending_interval_rejected_but_future_exact_target_allowed(self) -> None:
         database = self.database(through=122)
         manifest = self.ordinary_manifest(database)
         ordinary = manifest.ordinary_forward_migration
@@ -961,6 +1155,11 @@ connection.close()
             helper.migration_registry(registry)
 
         helper.validate_manifest_mode(manifest)
+        with self.assertRaisesRegex(helper.ActivationError, "pending migration interval is not qualified"):
+            helper.ordinary_forward_policy_applies(manifest)
+        with sqlite3.connect(database) as connection:
+            connection.execute("DELETE FROM _migrations")
+            connection.executemany("INSERT INTO _migrations VALUES (?, ?)", compiled_ledger() + [(129, "future")])
         self.assertFalse(helper.ordinary_forward_policy_applies(manifest))
 
     def test_helper_rejects_unknown_source_kind_for_every_mode(self) -> None:
@@ -1260,6 +1459,62 @@ connection.close()
         self.assertTrue(helper._capacity_observation_path(reservation).exists())
         self.assertEqual(status["prepared_mode"], "current_schema")
 
+    def test_standalone_controller_policy_uses_staged_helper_and_actual_ledgers(self) -> None:
+        import runpy
+
+        standalone = self.root / "standalone-controller"
+        standalone.mkdir()
+        shutil.copy2(ROOT / "dev.py", standalone / "dev.py")
+        self.assertFalse((standalone / "scripts").exists())
+        preflight = runpy.run_path(str(standalone / "dev.py"))["_preflight_ordinary_launchd_policy"]
+        for through in (114, 123, 128):
+            for source_kind in ("local_head", "published_release"):
+                with self.subTest(through=through, source_kind=source_kind):
+                    manifest = dataclasses.replace(self.ordinary_manifest(self.database(through=through)), source_kind=source_kind)
+                    manifest_path = self.root / "manifest.json"
+                    manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
+                    if through == 114:
+                        with self.assertRaisesRegex(RuntimeError, "pending migration interval is not qualified"):
+                            preflight(manifest_path, Path(manifest.ordinary_forward_migration.helper_path))
+                    else:
+                        preflight(manifest_path, Path(manifest.ordinary_forward_migration.helper_path))
+
+    def test_controller_policy_verifies_helper_binding_before_execution(self) -> None:
+        import runpy
+
+        preflight = runpy.run_path(str(ROOT / "dev.py"))["_preflight_ordinary_launchd_policy"]
+        manifest = self.ordinary_manifest(self.database())
+        manifest_path = self.root / "manifest.json"
+        manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
+        staged_helper = Path(manifest.ordinary_forward_migration.helper_path)
+        replacement = self.root / "unbound-helper.py"
+        replacement.write_text("raise AssertionError('unbound helper executed')")
+        with self.assertRaisesRegex(SystemExit, "helper does not match"):
+            preflight(manifest_path, replacement)
+        staged_helper.write_text("raise AssertionError('tampered helper executed')")
+        with self.assertRaisesRegex(SystemExit, "helper does not match"):
+            preflight(manifest_path, staged_helper)
+
+    def test_ordinary_114_rejected_before_stop_for_release_and_local_sources(self) -> None:
+        for source_kind in ("local_head", "published_release"):
+            with self.subTest(source_kind=source_kind):
+                database = self.database(through=114)
+                manifest = dataclasses.replace(self.ordinary_manifest(database), source_kind=source_kind)
+                with mock.patch.object(helper, "Launchctl") as launchctl:
+                    with self.assertRaisesRegex(helper.ActivationError, "pending migration interval is not qualified"):
+                        helper.activate(manifest)
+                launchctl.assert_not_called()
+                self.assertEqual(helper.read_status(manifest)["state"], "precondition_failed")
+                self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(114)))
+                self.assertEqual(Path(manifest.target_binary).read_text(), "old predecessor")
+
+    def test_ordinary_exact_target_stays_ordinary_for_release_and_local_sources(self) -> None:
+        for source_kind in ("local_head", "published_release"):
+            with self.subTest(source_kind=source_kind):
+                manifest = dataclasses.replace(self.ordinary_manifest(self.database(through=128)), source_kind=source_kind)
+                helper.validate_manifest_mode(manifest)
+                self.assertFalse(helper.ordinary_forward_policy_applies(manifest))
+
     def test_unreadable_ordinary_ledger_fails_before_candidate_start(self) -> None:
         database = self.database()
         manifest = self.ordinary_manifest(database)
@@ -1489,10 +1744,14 @@ connection.close()
         manifest = self.manifest(database)
         claim = Path(manifest.active_path)
         claim.write_text(manifest.transaction_id + "\n")
-        with mock.patch.object(helper, "fsync_dir", side_effect=OSError("fsync failed")):
-            with self.assertRaisesRegex(OSError, "fsync failed"):
-                helper.release_claim(manifest)
-        self.assertEqual(claim.read_text().strip(), manifest.transaction_id)
+        for restored_fsync in (None, OSError("restored claim fsync failed")):
+            with self.subTest(restored_fsync=restored_fsync), mock.patch.object(
+                helper, "fsync_dir", side_effect=[OSError("fsync failed"), restored_fsync]
+            ) as fsync_dir:
+                with self.assertRaisesRegex(OSError, "restored claim fsync failed" if restored_fsync else "fsync failed"):
+                    helper.release_claim(manifest)
+            self.assertEqual(fsync_dir.call_args_list, [mock.call(claim.parent)] * 2)
+            self.assertEqual(claim.read_text(), manifest.transaction_id + "\n")
 
     def test_current_recovery_rechecks_unchanged_source_after_teardown(self) -> None:
         database = self.database()
@@ -2132,6 +2391,7 @@ connection.close()
             with self.subTest(prepared_mode=prepared_mode):
                 status = {
                     "transaction_id": manifest.transaction_id,
+                    "source_kind": manifest.source_kind,
                     "state": "precondition_cleanup_pending",
                 }
                 if prepared_mode is not None:
@@ -2146,7 +2406,7 @@ connection.close()
                 ), mock.patch.object(helper, "_remove_capacity_files") as remove:
                     with self.assertRaisesRegex(
                         helper.CleanupPreconditionRejected,
-                        "matching pending status",
+                        "status source kind or prepared mode",
                     ):
                         helper.cleanup_precondition_capacity(
                             manifest, current_schema=True
@@ -2185,6 +2445,34 @@ connection.close()
         status = json.loads(Path(manifest.status_path).read_text())
         self.assertEqual(status["state"], "precondition_cleanup_pending")
         self.assertIn("fsync still uncertain", status["cleanup_failure"])
+
+    def test_cleanup_enumeration_failure_retains_pending_state_and_claim(self) -> None:
+        database = self.database()
+        manifest = self.manifest(database)
+        claim = Path(manifest.active_path)
+        claim.write_text(manifest.transaction_id)
+        self.write_current_status(
+            manifest,
+            "precondition_cleanup_pending",
+            failure="reservation failed",
+        )
+
+        with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+            helper, "validate_manifest_mode"
+        ), mock.patch.object(
+            helper.os, "scandir", side_effect=PermissionError("enumeration denied")
+        ), mock.patch.object(helper, "Launchctl") as launchctl:
+            with self.assertRaisesRegex(
+                helper.DatabaseCapacityCleanupFailure,
+                "could not enumerate atomic evidence temporaries.*enumeration denied",
+            ):
+                helper.cleanup_precondition_capacity(manifest, current_schema=True)
+
+        launchctl.assert_not_called()
+        self.assertEqual(claim.read_text(), manifest.transaction_id)
+        status = json.loads(Path(manifest.status_path).read_text())
+        self.assertEqual(status["state"], "precondition_cleanup_pending")
+        self.assertIn("enumeration denied", status["cleanup_failure"])
 
     def test_cleanup_main_preserves_original_failure_when_retry_fails(self) -> None:
         database = self.database()
