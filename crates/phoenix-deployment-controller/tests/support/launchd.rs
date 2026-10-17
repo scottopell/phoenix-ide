@@ -970,7 +970,10 @@ impl RunnerJobSpec {
             match mode {
                 InstalledRunnerMode::InitialPauseAfterApplication => "initial-sample",
                 InstalledRunnerMode::RecoverAppliedAck => "recover-applied-ack",
-                InstalledRunnerMode::RecoverFinishAndReady => "recover-finish-and-ready",
+                InstalledRunnerMode::RecoverFinishAndReady
+                | InstalledRunnerMode::RecoverFinishAndReadyPauseAfterIdentityObservation => {
+                    "recover-finish-and-ready"
+                }
                 InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication
                 | InstalledRunnerMode::RecoverFinishAndChildListPauseAfterObservation => {
                     "recover-finish-and-child-list"
@@ -980,9 +983,6 @@ impl RunnerJobSpec {
                 }
                 InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification => {
                     "recover-unapplied-identity"
-                }
-                InstalledRunnerMode::RecoverFinishAndReadyPauseAfterIdentityObservation => {
-                    "recover-finish-and-ready"
                 }
                 InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => {
                     "recover-child-list-ack"
@@ -1026,12 +1026,8 @@ impl RunnerJobSpec {
                 "--fixture-release-file".into(),
                 self.release_file().to_str().unwrap().into(),
             ]),
-            InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification => args.extend([
-                "--fixture-pause-after-recovery-verification".into(),
-                "--fixture-release-file".into(),
-                self.release_file().to_str().unwrap().into(),
-            ]),
-            InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification => args.extend([
+            InstalledRunnerMode::RecoverUnappliedChildListPauseAfterVerification
+            | InstalledRunnerMode::RecoverUnappliedIdentityPauseAfterVerification => args.extend([
                 "--fixture-pause-after-recovery-verification".into(),
                 "--fixture-release-file".into(),
                 self.release_file().to_str().unwrap().into(),
@@ -1041,7 +1037,7 @@ impl RunnerJobSpec {
                     "--fixture-pause-after-identity-observation".into(),
                     "--fixture-release-file".into(),
                     self.release_file().to_str().unwrap().into(),
-                ])
+                ]);
             }
             InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => args.extend([
                 "--fixture-pause-after-child-list-ack".into(),
