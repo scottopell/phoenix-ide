@@ -24,6 +24,29 @@ provider bootstrap, Vite startup, browser opening, or automatic fallback to norm
 server mode. Older binaries must fail on the unsupported invocation; never rerun
 without the observation flags to work around that failure.
 
+### Portable debug artifacts
+
+The artifact producer must build the exact UI before building the existing binary
+with its opt-in embedding feature:
+
+```sh
+corepack pnpm --dir ui run build
+CARGO_BUILD_JOBS=1 cargo build -p phoenix_ide --bin phoenix_ide --features portable-ui
+CARGO_BUILD_JOBS=1 cargo test -p phoenix_ide --features portable-ui \
+  --test observation_startup portable_ui_serves_exact_built_entry_assets_from_private_cwd \
+  -- --test-threads=1 --nocapture
+```
+
+These producer commands are not implicit launcher actions or permission to compile
+on a constrained consumer. `portable-ui` forwards `rust-embed/debug-embed`; default
+development and release behavior remain unchanged. Default debug binaries may
+require the build machine's filesystem and are not portable merely because a UI
+build passed. The feature-gated startup guard uses a private cwd without `ui/dist`,
+checks root HTML and its actual content-hashed module entries, verifies JavaScript
+MIME/nonempty bytes, and prints SHA-256 values matching the built files. Retain
+that manifest with source/tree, selected feature and binary SHA. On the receiving
+machine, verify root and entry-asset HTTP responses before browser qualification.
+
 `--port 0` (the default) lets the OS choose a free loopback port. The server prints
 `Observation listening on http://127.0.0.1:PORT` after admission and binding; use
 that actual URL, not a guessed port. A nonzero `--port` requests that exact port;

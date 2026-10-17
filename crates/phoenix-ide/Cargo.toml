@@ -6,6 +6,7 @@ rust-version = "1.95"
 
 [features]
 default = []
+portable-ui = ["rust-embed/debug-embed"]
 datadog-tracing = ["dep:datadog-opentelemetry"]
 
 [dependencies]
