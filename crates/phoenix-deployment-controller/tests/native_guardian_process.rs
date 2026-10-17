@@ -447,6 +447,58 @@ fn assert_runner_output_ends_at(output: &str, marker: &str) {
     );
 }
 
+fn settle_initial_sample_with_replacement_ack(
+    socket_dir: &Path,
+    path: &Path,
+    root: ProcessIdentity,
+) -> WireSnapshot {
+    let mut initial = GuardedRunner::spawn(sampling_runner_command_with_root(
+        socket_dir, path, root, true,
+    ));
+    assert!(initial
+        .line()
+        .starts_with("verified binding: InitialActive"));
+    assert!(initial.line().starts_with("released child "));
+    assert!(initial.line().starts_with("native_sample_retained key="));
+    assert!(initial
+        .line()
+        .starts_with("application_committed_pending_ack revision="));
+    wait_for_process_name(i32::try_from(root.pid().get()).unwrap(), "sleep");
+    initial.finish();
+    assert_eq!(wait_for_detached(socket_dir).retained.len(), 1);
+
+    let replacement = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
+        .args([
+            "--mode",
+            "recover-applied-ack",
+            "--socket-dir",
+            socket_dir.to_str().unwrap(),
+            "--store",
+            path.to_str().unwrap(),
+            "--attempt",
+            "64",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        replacement.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replacement.stderr)
+    );
+    let output = String::from_utf8_lossy(&replacement.stdout);
+    assert!(
+        output.contains("reconciling generation=2 interruption="),
+        "{output}"
+    );
+    assert!(
+        output.contains("sample_ack_confirmed generation=2"),
+        "{output}"
+    );
+    let detached = wait_for_detached(socket_dir);
+    assert!(detached.retained.is_empty());
+    detached
+}
+
 #[test]
 fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
     let ChildListProcessFixture {
@@ -454,31 +506,17 @@ fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
         dir,
         path,
         attempt,
-        deadline,
+        deadline: _,
         root,
         mut guardian,
     } = start_child_list_fixture();
-    let initial = sampling_runner_command_with_root(&dir, &path, deadline, root, false)
-        .output()
-        .unwrap();
-    assert!(
-        initial.status.success(),
-        "initial sample failed: {}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
+    let initial_detached = settle_initial_sample_with_replacement_ack(&dir, &path, root);
+    let initial_sampling = sampling_rows(&path);
     assert_eq!(
-        String::from_utf8_lossy(&initial.stdout)
-            .lines()
-            .collect::<Vec<_>>(),
-        vec![
-            "verified binding: InitialActive",
-            "sample_ack_confirmed generation=1"
-        ]
+        (initial_sampling.0, initial_sampling.1, initial_sampling.2),
+        (1, 1, 1)
     );
-    assert_eq!(sampling_rows(&path).0, 1);
-    wait_for_process_name(i32::try_from(root.pid().get()).unwrap(), "sleep");
-    let initial_detached = wait_for_detached(&dir);
-    assert!(initial_detached.retained.is_empty());
+    assert_eq!(initial_sampling.4, 0);
 
     let runner = child_list_runner_command(&dir, &path, "recover-finish-and-child-list")
         .output()
@@ -544,22 +582,17 @@ fn child_list_ack_recovery_does_not_reenumerate_or_reapply_after_runner_crash() 
         dir,
         path,
         attempt,
-        deadline,
+        deadline: _,
         root,
         mut guardian,
     } = start_child_list_fixture();
-    let initial = sampling_runner_command_with_root(&dir, &path, deadline, root, false)
-        .output()
-        .unwrap();
-    assert!(
-        initial.status.success(),
-        "initial sample failed: {}",
-        String::from_utf8_lossy(&initial.stderr)
+    let initial_detached = settle_initial_sample_with_replacement_ack(&dir, &path, root);
+    let initial_sampling = sampling_rows(&path);
+    assert_eq!(
+        (initial_sampling.0, initial_sampling.1, initial_sampling.2),
+        (1, 1, 1)
     );
-    assert_eq!(sampling_rows(&path).0, 1);
-    wait_for_process_name(i32::try_from(root.pid().get()).unwrap(), "sleep");
-    let initial_detached = wait_for_detached(&dir);
-    assert!(initial_detached.retained.is_empty());
+    assert_eq!(initial_sampling.4, 0);
 
     let mut runner = GuardedRunner::new(
         child_list_runner_command(&dir, &path, "recover-finish-and-child-list")
