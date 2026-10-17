@@ -53,11 +53,11 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     const query = new URLSearchParams(location.search);
     query.delete('source_tool');
     if (target.kind === 'pending') query.delete('source_transcript');
-    else if (target.transcriptId && (historyBoundaries !== undefined || query.has('source_transcript'))) query.set('source_transcript', target.transcriptId);
+    else if (target.transcriptId && query.has('source_transcript')) query.set('source_transcript', target.transcriptId);
     navigate({ pathname: location.pathname, search: query.toString(), hash: target.kind === 'persisted' ? `#message-${encodeURIComponent(target.messageId)}` : '' }, {
       state: target.kind === 'pending' ? { chapterSelection: 'pending' } : null,
     });
-  }, [historyBoundaries, location.pathname, location.search, navigate]);
+  }, [location.pathname, location.search, navigate]);
 
   const handleJump = useCallback((chapter: Chapter) => {
     onUpdateOlderMessagesRestore?.({ kind: 'reader_viewport' });
