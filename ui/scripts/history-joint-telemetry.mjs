@@ -222,7 +222,7 @@ export function installObservedHistoryTelemetry(page, baseURL, ownership) {
       } else if (url.pathname.startsWith('/api/') && url.searchParams.has('open_id')) {
         assert.ok(requests.length < 128, 'history correlated request capture bound');
         assert.equal(url.searchParams.getAll('open_id').length, 1);
-        const record = { method: request.method(), url: request.url(), open_id: url.searchParams.get('open_id'),
+        const record = { method: request.method(), pathname: url.pathname, has_before: url.searchParams.has('before'), open_id: url.searchParams.get('open_id'),
           kind: /\/api\/conversations\/[^/]+\/stream$/.test(url.pathname) ? 'sse' : 'request', trace_id: null };
         requests.push(record); requestRecords.set(request, record);
       }

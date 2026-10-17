@@ -282,13 +282,17 @@ test('UNIT ONLY late report capture retains raw body/response and independent he
     bindPage: () => {},
     snapshot: () => ({ pairs: historyInventory().requestOwners, failure: null }),
   });
-  const request = { method: () => 'GET', url: () => 'http://127.0.0.1:12345/api/product-conversations/unit?open_id=unit-history' };
+  const request = { method: () => 'GET', url: () => 'http://127.0.0.1:12345/api/product-conversations/unit?open_id=unit-history&before=SECRET-cursor&unknown=SECRET' };
   page.emit('request', request);
   page.emit('response', { request: () => request, status: () => 200, headers: () => ({ traceparent: '00-' + 'a'.repeat(32) + '-' + 'b'.repeat(16) + '-01' }) });
   assert.equal(capture.snapshot().reports.length, 0);
   const report = historyInventory().reports[0], post = { method: () => 'POST', url: () => 'http://127.0.0.1:12345/api/telemetry/conversation-view', postData: () => JSON.stringify(report) };
   page.emit('request', post); page.emit('response', { request: () => post, status: () => 204, headers: () => ({}) });
   const retained = capture.snapshot(); assert.equal(retained.requestRecords[0].trace_id, 'a'.repeat(32));
+  assert.equal(retained.requestRecords[0].pathname, '/api/product-conversations/unit');
+  assert.equal(retained.requestRecords[0].has_before, true);
+  assert.equal(Object.hasOwn(retained.requestRecords[0], 'url'), false);
+  assert.doesNotMatch(JSON.stringify(retained), /SECRET|127\.0\.0\.1/);
   assert.deepEqual(retained.reports, [report]); assert.equal(retained.statuses[0].status, 204);
   appendObservedHistory(stock(), retained, input().fixtures.identity, unitModule);
 });

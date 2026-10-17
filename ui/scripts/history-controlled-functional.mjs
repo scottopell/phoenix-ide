@@ -234,7 +234,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             assertOwnedReport(trial.reports[0], network.snapshot());
             phase = 'additional_history_request_present';
             const historicalRequests = network.snapshot().requestRecords.filter(r => r.kind === 'request'
-              && new URL(r.url).pathname === fixture.endpoint && new URL(r.url).searchParams.has('before'));
+              && r.pathname === fixture.endpoint && r.has_before);
             assert.ok(historicalRequests.length > 0, 'actual additional history GET required before historical ready');
             phase = 'additional_history_owner';
             for (const request of historicalRequests) assert.ok(trial.reports[0].correlations.some(c => c.kind === 'request' && c.id === request.open_id), 'additional history request must remain in its original journey');
@@ -242,7 +242,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             assertActualPaginationOwned(actualPagination, historicalRequests.length);
             trial.additional_history = { report_count: 1, request_count: historicalRequests.length, original_owner: trial.reports[0].open_id };
             phase = 'stream_owner';
-            assert.ok(network.snapshot().requestRecords.some(r => r.kind === 'sse' && new URL(r.url).pathname === `/api/conversations/${target.composerOwner}/stream`), 'stream must belong to independently selected writable owner');
+            assert.ok(network.snapshot().requestRecords.some(r => r.kind === 'sse' && r.pathname === `/api/conversations/${target.composerOwner}/stream`), 'stream must belong to independently selected writable owner');
             trial.physical_history = { original_page: true, anchor: physical, composer_owner: target.composerOwner,
               viewport: { ...CONTROLLED_VIEWPORT }, stability_frames: physical.stability_frames.length };
             return trial;

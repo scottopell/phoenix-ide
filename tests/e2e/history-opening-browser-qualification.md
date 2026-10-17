@@ -2581,3 +2581,11 @@ observation; later source changes do not retrospectively strengthen it.
 Cached shared regressions: **130 pass** (joint66, controlled25, diagnostic4,
 existing opening35); diff check passes. Positive additional-history, original
 journey, strict geometry, stock and acceptance constraints are unchanged.
+
+Before admitting paginated requests into the correlated observer, its retained
+request schema was projected from raw URL to `pathname` plus `has_before` and
+already-allowed opaque request/trace IDs. Actual endpoint matching remains exact;
+cursors, arbitrary query values and origin are not retained in controlled
+ownership receipts. A regression includes sentinel cursor/unknown query values
+and proves neither enters the snapshot. This does not rewrite immutable stock
+baseline evidence. All130 shared cached Node regressions still pass.
