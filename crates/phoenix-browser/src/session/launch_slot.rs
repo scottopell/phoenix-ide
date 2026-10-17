@@ -687,7 +687,7 @@ pub(super) mod tests {
         let shim = std::env::var_os("PHOENIX_TEST_CHROME_SHIM_EXECUTABLE")
             .map(PathBuf::from)
             .expect("hosted qualification must provide the actual matched native-shim binary");
-        crate::process_group::ChromeExecShim::install_external_qualification_executable(shim)
+        crate::process_group::ChromeExecShim::install_external_qualification_executable(&shim)
             .unwrap();
         let (manager, fault) = manager_with_fault(false);
         let scope = scope();
