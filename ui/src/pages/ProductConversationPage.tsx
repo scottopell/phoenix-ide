@@ -1329,7 +1329,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           : current.value;
         const retainsRequestedBoundary = current.value.before === snapshot.before
           && current.value.has_older === snapshot.has_older;
-        const acquiredPage = retainsRequestedBoundary || appliesFreshTail ? older : {
+        const acquiredPage = (!refreshedTail && retainsRequestedBoundary) || appliesFreshTail ? older : {
           ...older, before: current.value.before, has_older: current.value.has_older,
         };
         return { ...current, value: mergeOlderSegments(authoritativeTail, acquiredPage),

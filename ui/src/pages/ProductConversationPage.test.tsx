@@ -2948,6 +2948,35 @@ describe('ProductConversationPage', () => {
     expect(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(4);
   });
 
+  it.each([false, true])('does not commit recovered-page exhaustion when its fresh tail loses ownership (Global=%s)', async global => {
+    const { api } = await import('../api');
+    const initial = makeSnapshot({ before: 'C1' });
+    const fresh = makeSnapshot({ before: 'C2', segments: initial.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [...segment.messages, makeMessage('fresh-tail-only', 5, 'row-2')] } : segment) });
+    const background = { ...initial, segments: initial.segments.map(segment => segment.transcript_row_id === 'row-2' ? { ...segment, messages: [...segment.messages, makeMessage('background-committed', 5, 'row-2')] } : segment) };
+    const older = makeSnapshot({ before: null, has_older: false, segments: [{ ...initial.segments[0]!, messages: [makeMessage('recovered-prefix', 0, 'row-1')] }] });
+    let resolveFresh!: (snapshot: ProductConversationSnapshotView) => void;
+    let resolveBackground!: (snapshot: ProductConversationSnapshotView) => void;
+    const freshPending = new Promise<ProductConversationSnapshotView>(resolve => { resolveFresh = resolve; });
+    const backgroundPending = new Promise<ProductConversationSnapshotView>(resolve => { resolveBackground = resolve; });
+    const shape = (value: ProductConversationSnapshotView) => global ? coordinatorSnapshot(value) : value;
+    const fetchSnapshot = vi.mocked(global ? api.getCoordinatorHistory : api.getProductConversationHistorySnapshot);
+    fetchSnapshot.mockResolvedValueOnce(shape(initial)).mockRejectedValueOnce(new ApiResponseError('stale cursor', 400))
+      .mockImplementationOnce(() => freshPending.then(shape)).mockImplementationOnce(() => backgroundPending.then(shape)).mockResolvedValueOnce(shape(older));
+    renderPage(global ? '/global/row-1' : '/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(fetchSnapshot).toHaveBeenCalledTimes(3));
+    act(() => window.dispatchEvent(new Event('phoenix:automatic-continuation-updated')));
+    await waitFor(() => expect(fetchSnapshot).toHaveBeenCalledTimes(4));
+    await act(async () => resolveBackground(background));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('background-committed'));
+    await act(async () => resolveFresh(fresh));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('recovered-prefix'));
+    expect(screen.getByTestId('message-order')).not.toHaveTextContent('fresh-tail-only');
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.hasOlderMessages).toBe(true);
+    expect(fetchSnapshot).toHaveBeenLastCalledWith(global ? 'row-1' : 'pc-1', expect.objectContaining({ before: 'C2' }));
+  });
+
   it.each([false, true])('correlates every older/recovery GET with its original unfinished journey (Global=%s)', async global => {
     const {api} = await import('../api');
     const reporter = new ViewJourneyReporter();
