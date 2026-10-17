@@ -115,6 +115,48 @@ both before and after the awaited-URL correction. The successor source still
 owes one fresh whole-head qualification. No full-acceptance, overhead-clearance,
 escaped-helper coverage, or native-resume claim follows from these results.
 
+### Darwin group-query contract and scoped verification
+
+The macOS native failure on shared `35a10aeca` had no captured query return
+values. The diagnostic-only `b8723941a` escaped-writer execution passed without
+reproducing it; that negative remains unresolved as a specific causal trace.
+
+The Apple XNU source audit, pinned to
+[`f6217f891ac0bb64f3d375211650a4c1ff8ca1ea`](https://github.com/apple-oss-distributions/xnu/tree/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea),
+found that `libsyscall/wrappers/libproc/libproc.c::proc_listpids` maps syscall
+failure to zero while preserving errno, and successful kernel enumeration in
+`bsd/kern/proc_info.c::proc_listpids` can return zero matching PID bytes.
+Successful calls do not clear errno. The typed query wrapper therefore clears
+and captures thread-local errno immediately around each call. The decoder accepts
+zero only with zero errno and a valid capacity; errors, negative/non-PID-sized
+counts, and full or over-capacity results remain fail-closed. Empty decoding does
+not grant ownership: drain requires the exclusive retained child and proven exit
+both before enumeration and after an empty observation.
+
+[Run 39051330381](https://github.com/scottopell/phoenix-ide/actions/runs/39051330381)
+executed exact `5bcfca51f` contract and escaped-writer tests successfully. Its raw
+receipt showed four PID bytes/errno zero before root reap and zero bytes/errno
+zero **after reap**. This proves successful empty enumeration only in that
+post-reap observation, not zero results under retained-root authority, and does
+not establish the earlier `35a10` failure's return values or cause. Post-reap
+signal authority remains explicitly rejected.
+
+Exact source `06c7512b1b8cbfd5ecc416cf606d27f502a6fb32`, via qualifier
+`75dbbbeebe295d25748b4ebeb67bb8364691bcc8`, passed the complete seven-test native
+module (0 failed, 0.29 s) and browser library/tests Clippy (2 min 14 s) in
+[macOS run 39051966895](https://github.com/scottopell/phoenix-ide/actions/runs/39051966895).
+Artifact `12107518333` retains the receipt. All Linux lanes on the older shared
+`35a10` candidate also passed, including full Rust; its macOS native failure is
+not erased or relabelled. The decoder successor still owes actual Chrome and
+whole-head Linux/macOS qualification. No escaped-helper, overhead, native-resume,
+or full-acceptance guarantee is added.
+
+The source freshness check found main advanced from `489442688` to
+`ea5df4b473ebd62ee8edd59daad9e43a119e9630` (published schema-114 launchd activation).
+That deployment/harness/spec delta is not included in this scoped browser source
+packet; the integration owner must compose it and refresh base/source/tree pins
+before claiming current-main qualification.
+
 ## Verification
 
 Lifecycle and installed-command coverage live in `crates/phoenix-tools/tests/browser_cli.rs`. Browser-free preflight and operation-catalog parity live in `browser::access_tests`; profiling validation and methodology retain their existing unit coverage. Engine snapshot and console tests use actual Chrome for document replacement, native input, artifacts, source-event capture, and iframe diagnostics.
