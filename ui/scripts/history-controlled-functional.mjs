@@ -103,10 +103,10 @@ function controlledObserver(page, network, module, identity, fixture, ownership,
   };
   const getReports = () => network.snapshot().reports.map(raw => {
     const report = module.captureReport(JSON.stringify(raw), []);
-    if (kind === 'history' || fixture.kind !== 'global' || report.product_conversation_id !== undefined) {
+    if (kind === 'history' || report.product_conversation_id !== undefined) {
       assert.equal(report.product_conversation_id, fixture.product_conversation_id);
     } else {
-      assert.equal(report.outcome, kind === 'pagehide' ? 'incomplete' : 'canceled', 'unresolved Global identity belongs only to the expected pending terminal report');
+      assert.equal(report.outcome, kind === 'pagehide' ? 'incomplete' : 'canceled', 'unresolved identity belongs only to the expected pending terminal report');
     }
     assert.equal(report.frontend_source, identity.frontendSource);
     return report;
@@ -266,8 +266,10 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
           await cdp.send('Network.enable');
           await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 400, downloadThroughput: -1, uploadThroughput: -1 });
           check();
-          await page.goto(baseURL + fixture.route, { waitUntil: 'commit', timeout: Math.min(15000, clock.remaining()) });
+          const entryRoute = route === 'global' ? `/global/${encodeURIComponent(fixture.members[0])}` : fixture.route;
+          await page.goto(baseURL + entryRoute, { waitUntil: 'commit', timeout: Math.min(15000, clock.remaining()) });
           await observer.wait(() => observer.getPendingPrimaryRequests().length > 0, Math.min(10000, check()));
+          assert.equal(page.url(), new URL(entryRoute, baseURL).href, 'pending scenario retains its exact owning API reference');
           const pending = observer.getPendingPrimaryRequests();
           const before = await page.evaluate(() => performance.timeOrigin);
           phase = kind === 'pagehide' ? 'pagehide_departure' : 'sidebar_cancellation';

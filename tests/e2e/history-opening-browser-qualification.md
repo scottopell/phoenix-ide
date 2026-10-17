@@ -2748,3 +2748,48 @@ Rust and all standard lanes succeeded. The canonical-source/failure-projection
 candidate is committed only after that complete result, with unchanged app35f.
 A single causal normal qualification will exercise the corrected Global entry;
 there was no repeated diagnostic or unchanged full run in this interval.
+
+### Both historical routes clear; pending ordinary identity is unresolved
+
+Run `38992494875`, shared90ad/app35f, witness `117277723793`, failed at
+**ordinary/pagehide/departure_report_wait**. Rust `117277778971` was still running
+at this entry. Original artifact `12085831605` is96,394,534 bytes; bounded
+browser receipt/log fetch78,376 bytes.
+
+Unlike the previous masked receipt, this actual receipt retains **both** prior
+historical trials: ordinary and Global ready, each one report, each exactly two
+older GETs owned by its original journey. Both completed strict physical target
+acquisition/four-frame stability, exact fixture/source pin/original canonical
+route, current editable composer, original request/stream ownership and final
+context-drain inventory checks. These are partial controlled scenario facts,
+not six-report collector/export/drain acceptance.
+
+The ordinary pagehide failure retained one actual incomplete report with one
+request correlation, one admission, zero network errors, no collector response
+(as permitted for departure), no remaining pending request, and **no product
+identity**. Source ProductConversationPage constructs its local journey with
+only `enabled` and enriches product identity from the accepted snapshot, just as
+Global does. The previous Global-only absence exception was too narrow.
+Expected pending incomplete/canceled reports on either route may now truthfully
+omit unresolved product identity; every supplied identity must still match, and
+historical-ready identity remains mandatory. No value is invented. Actual finite
+pending request, original producer/network/report join, frontend, route, exact
+outcome, collector/export and strict historical checks are retained.
+
+Source review also found the adjacent pending Global route/API mismatch before
+running into it: fixture endpoint/fault filter identifies the owning root, but
+an unpinned `/global/<latest>` entry resolves ProductPage's API reference as that
+latest slug, not the root. Controlled pending Global now enters unpinned
+`/global/<root>` with no source query/hash and asserts that exact original URL
+after observing the pending root GET. The source owner independently confirmed
+this valid same-owner route retains ensure/resolve prerequisites and calls the
+exact root API endpoint. Stock aggregate fixtures/routes are not changed.
+Historical pinned Global entry and pending unpinned root entry remain distinct.
+
+Cached shared138 Node tests pass, including both-route unresolved pending
+identity with exact finite correlation and root-entry/no-query/no-hash checks.
+An intermediate new test assumed the retained request-ID strings were objects;
+its expectation was corrected to the actual string schema without product or
+oracle change. Existing71 Python/43 actual route tests apply to unchanged target
+factory/production source. No local native/browser/build, no app-source edit,
+no unchanged normal rerun or diagnostic runner was performed.

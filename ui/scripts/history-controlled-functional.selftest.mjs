@@ -38,7 +38,7 @@ test('UNIT independently served controlled bytes must match every admitted asset
 });
 function fakeRuntime(options={}){
   let count=0,closed=0;const pages=[];
-  const fixtures={identity:{serverInstanceId:'UNIT-instance'},aggregates:['ordinary','global'].map(kind=>({kind,route:`/${kind}/latest`,endpoint:`/api/${kind}/history`,product_conversation_id:`UNIT-${kind}`}))};
+  const fixtures={identity:{serverInstanceId:'UNIT-instance'},aggregates:['ordinary','global'].map(kind=>({kind,route:`/${kind}/latest`,endpoint:`/api/${kind}/history`,product_conversation_id:`UNIT-${kind}`,members:[`UNIT-${kind}-root`,`UNIT-${kind}-latest`]}))};
   const targets=fixtures.aggregates.map(f=>({kind:f.kind,route:`/${f.kind}/root`,anchor:{sourceRow:'UNIT-root',persistedMessageID:'UNIT-original'},composerOwner:'UNIT-latest'}));
   class Context {
     async exposeBinding(_,callback){this.callback=callback;}
@@ -60,6 +60,7 @@ function fakeRuntime(options={}){
     diagnostic(event){this.context.callback({page:this,frame:this.frame},event);}
     request(path,method='GET',body){const req={url:()=>new URL(path,'http://127.0.0.1:12345').href,method:()=>method,postData:()=>body};this.emit('request',req);return req;}
     async goto(url){
+      (this.navigations??=[]).push(url);
       this.location=url;
       if(url==='about:blank'){this.report('incomplete');return;}
       this.fixture=fixtures.aggregates.find(f=>new URL(url).pathname.startsWith('/'+f.kind));
@@ -84,6 +85,7 @@ function fakeRuntime(options={}){
       if(options.missingGlobalIdentity&&this.fixture.kind==='global')delete report.product_conversation_id;
       if(options.unsafeReport)report.unrecognized_private_field='PRIVATE-never-retained';
       if(options.unresolvedPendingGlobal&&this.fixture.kind==='global'&&outcome!=='ready')delete report.product_conversation_id;
+      if(options.unresolvedPending&&outcome!=='ready')delete report.product_conversation_id;
       if(options.wrongPendingGlobalIdentity&&this.fixture.kind==='global'&&outcome!=='ready')report.product_conversation_id='UNIT-foreign-product';
       const req=this.request('/api/telemetry/conversation-view','POST',JSON.stringify(report));
       if(outcome!=='incomplete')this.emit('response',{request:()=>req,status:()=>204});
@@ -167,6 +169,24 @@ test('UNIT a supplied pending Global product identity must still match the indep
   assert.equal(failure.controlledReceipt.failure_location.route,'global');
   assert.equal(failure.controlledReceipt.failure_location.kind,'pagehide');
   assert.equal(failure.controlledReceipt.diagnostic_reports.reports[0].product_conversation_id,'UNIT-foreign-product');
+});
+test('UNIT both routes may truthfully omit unresolved pending identity while keeping exact finite ownership',async()=>{
+  const runtime=fakeRuntime({unresolvedPending:true});
+  const result=await runControlledFunctional(runtime.input,runtime.UNIT);
+  for(const t of result.trials.filter(t=>t.kind!=='history')){
+    assert.equal(Object.hasOwn(t.reports[0],'product_conversation_id'),false);
+    assert.ok(t.primaryRequestOpenIds.some(id=>t.reports[0].correlations.some(c=>c.kind==='request'&&c.id===id)));
+  }
+  assert.equal(result.trials.filter(t=>t.kind==='history'&&t.reports[0].product_conversation_id).length,2);
+});
+test('UNIT pending Global enters its exact root API reference without source pin or latest alias',async()=>{
+  const runtime=fakeRuntime();await runControlledFunctional(runtime.input,runtime.UNIT);
+  for(const index of [3,5]){
+    const entry=new URL(runtime.pages[index].navigations[0]);
+    assert.equal(entry.pathname,'/global/UNIT-global-root');
+    assert.equal(entry.search,'');assert.equal(entry.hash,'');
+  }
+  for(const index of [2,4])assert.equal(new URL(runtime.pages[index].navigations[0]).pathname,'/ordinary/latest');
 });
 test('UNIT actual pinned report parser filters invalid failure bodies but retains truthful unresolved Global diagnostics',async()=>{
   const {resolve}=await import('node:path'),{pathToFileURL}=await import('node:url');
