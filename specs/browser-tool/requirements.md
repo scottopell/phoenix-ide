@@ -51,6 +51,12 @@ As an AI agent optimizing a web app, I need to measure performance under a repro
 
 The `browser_navigate` tool SHALL navigate to a specified URL and wait for the page to be ready for interaction
 
+WHEN the destination equals the current URL
+`browser_navigate` SHALL reload the document, replacing its DOM and JavaScript state while retaining browser-session cookies and origin storage
+
+WHEN only the URL fragment changes
+`browser_navigate` SHALL preserve native navigation semantics and complete without requiring a document load event when the browser performs same-document navigation
+
 WHEN navigation fails (network error, DNS failure, timeout, HTTP error)
 `browser_navigate` SHALL return a clear error message indicating the failure type
 
@@ -71,7 +77,8 @@ WHEN the expression returns a Promise
 `browser_eval` SHALL await the Promise and return the resolved value (configurable via the `await` parameter)
 
 WHEN execution throws an exception
-`browser_eval` SHALL return the error message and context
+`browser_eval` SHALL return a concise error message with an available source location
+AND SHALL retain the full exception context, including any stack trace, separately from the concise summary
 
 WHEN the result exceeds 4096 bytes
 `browser_eval` SHALL write output to a temp file and return the file path
@@ -88,6 +95,16 @@ The `browser_take_screenshot` tool SHALL capture a screenshot of the current vie
 
 WHEN a CSS selector is provided
 `browser_take_screenshot` SHALL capture only the matching element
+
+WHEN an explicit output path is provided
+`browser_take_screenshot` SHALL require a nonempty absolute server-filesystem path before browser access,
+SHALL save the PNG at that path, replacing an existing regular file when writing succeeds,
+AND SHALL report that same saved path in the result.
+
+THE SYSTEM SHALL reject a symbolic-link or non-regular-file output destination without writing through it.
+
+WHEN the destination cannot be written
+`browser_take_screenshot` SHALL report the save failure rather than claim a saved screenshot.
 
 THE SYSTEM SHALL make the screenshot visible to the agent by passing the saved path to `read_image`
 
