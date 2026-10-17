@@ -156,17 +156,17 @@ fn prior_v6_schema_and_normalized_rows_are_untouched_by_every_open_mode() {
 }
 
 #[test]
-fn fresh_v7_has_normalized_child_tables_and_no_prior_rows() {
+fn fresh_v8_has_normalized_child_tables_and_no_prior_rows() {
     let store = ControllerSqliteStore::in_memory().unwrap();
     drop(store);
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("v7.sqlite");
+    let path = dir.path().join("v8.sqlite");
     drop(ControllerSqliteStore::open(&path).unwrap());
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     for table in [
         "native_child_list_issues",

@@ -1890,6 +1890,7 @@ impl<E: GuardianExecutor> GuardianServer<E> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ack_native_sampling_failure_settlement(
         &mut self,
         session: WireSession,

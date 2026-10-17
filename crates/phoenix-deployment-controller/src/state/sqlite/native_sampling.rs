@@ -282,6 +282,24 @@ impl VerifiedNativeSamplingFailureAckConfirmation {
             confirming_session_generation,
         }
     }
+
+    const fn into_parts(
+        self,
+    ) -> (
+        NativeSamplingIssue,
+        ResourceObservationFailure,
+        PersistenceRevision,
+        PersistenceRevision,
+        NonZeroU64,
+    ) {
+        (
+            self.issue,
+            self.failure,
+            self.applying_revision,
+            self.settlement_revision,
+            self.confirming_session_generation,
+        )
+    }
 }
 
 /// Durable diagnostic classification; loading it never reconstructs authority.
@@ -422,7 +440,7 @@ fn validate_failure_settlement(
         );
         match read_status(tx, dispatch)? {
             Some(NativeSamplingStatus::ParkedRetained { .. }) if dispatch == issue.key() => {
-                failures += 1
+                failures += 1;
             }
             Some(NativeSamplingStatus::SampleAckConfirmed { .. }) => {}
             _ => return Err(ControllerStoreError::RevisionConflict),
@@ -619,13 +637,13 @@ impl ControllerSqliteStore {
     ) -> Result<NativeSamplingStatus> {
         self.ensure_usable()?;
         let result = (|| {
-            let VerifiedNativeSamplingFailureAckConfirmation {
+            let (
                 issue,
                 failure,
                 applying_revision,
                 settlement_revision,
                 confirming_session_generation,
-            } = confirmation;
+            ) = confirmation.into_parts();
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;

@@ -524,11 +524,14 @@ fn preparation_rejects_wrong_key_stale_checkpoint_and_multiple_evidence() {
         match case {
             0 => {
                 dispatch =
-                    DispatchKey::from_committed_parts(AttemptId::new(999), dispatch.revision(), 0)
+                    DispatchKey::from_committed_parts(AttemptId::new(999), dispatch.revision(), 0);
             }
             1 => {
-                dispatch =
-                    DispatchKey::from_committed_parts(dispatch.attempt_id(), dispatch.revision(), 1)
+                dispatch = DispatchKey::from_committed_parts(
+                    dispatch.attempt_id(),
+                    dispatch.revision(),
+                    1,
+                );
             }
             2 => fixture.reconnect(),
             3 => insert_extra_issue(&fixture),
