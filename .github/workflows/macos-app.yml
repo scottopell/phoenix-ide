@@ -30,7 +30,7 @@ on:
       - "scripts/test-publish-release-assets.sh"
       - "scripts/test-verify-published-release.sh"
   push:
-    branches: [main]
+    branches: [main, qualification/history-observation-projection]
     paths:
       - "macos/Phoenix/**"
       - "crates/phoenix-ide/src/api/deployment.rs"
@@ -62,6 +62,7 @@ concurrency:
 
 jobs:
   build-and-test:
+    if: github.ref != 'refs/heads/qualification/history-observation-projection'
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -142,3 +143,56 @@ jobs:
           set -e
           test "$status" -ne 0
           grep -F "Release builds require PHOENIX_SIDECAR_PATH" "$RUNNER_TEMP/release-without-sidecar.log"
+
+  readonly-projection-contract:
+    if: github.ref == 'refs/heads/qualification/history-observation-projection'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RAYON_NUM_THREADS: '2'
+      RUST_TEST_THREADS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: readonly-projection-macos
+      - name: Build exact existing UI assets needed by the Rust embed
+        working-directory: ui
+        run: |
+          npm install -g corepack@latest
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: Test immutable first-unit projection contract and owning suite
+        run: |
+          set -o pipefail
+          test "$(git rev-parse HEAD:crates/phoenix-ide/src/api/product_conversations.rs)" = "$(git rev-parse 196fc1e3d:crates/phoenix-ide/src/api/product_conversations.rs)"
+          cargo test -p phoenix_ide --lib api::product_conversations::tests::db_history_projections_preserve_pending_openings_boundaries_and_null_presentations -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/projection-contract.log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/projection-contract.log"
+          cargo test -p phoenix_ide --lib api::product_conversations::tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/projection-owning.log"
+          grep -F 'test result: ok.' "$RUNNER_TEMP/projection-owning.log"
+          if grep -F 'test result: ok. 0 passed;' "$RUNNER_TEMP/projection-owning.log"; then exit 1; fi
+      - name: Check projection lib and tests with Clippy
+        run: cargo clippy -p phoenix_ide --lib --tests -- -D warnings
+      - name: Retain source-only qualification logs, never fixture data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readonly-projection-first-unit-contract
+          path: |
+            ${{ runner.temp }}/projection-contract.log
+            ${{ runner.temp }}/projection-owning.log
+          if-no-files-found: warn
+          retention-days: 7
