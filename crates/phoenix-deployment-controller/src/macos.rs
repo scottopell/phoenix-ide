@@ -379,8 +379,8 @@ impl crate::GuardianExecutor for MacOsGuardianExecutor {
                             (
                                 IdentityObservation::SameIdentity { .. },
                                 crate::ChildSlotObservation::Running,
-                            ) => observed,
-                            (IdentityObservation::Unresolved(_), _) => observed,
+                            )
+                            | (IdentityObservation::Unresolved(_), _) => observed,
                             (_, crate::ChildSlotObservation::Unavailable) => {
                                 IdentityObservation::Unresolved(
                                     ObservationFailure::TemporarilyUnavailable,
