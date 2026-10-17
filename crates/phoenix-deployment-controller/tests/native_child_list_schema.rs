@@ -104,23 +104,78 @@ fn prior_v5_schema_and_normalized_rows_are_untouched_by_every_open_mode() {
 }
 
 #[test]
-fn fresh_v6_has_normalized_child_tables_and_no_prior_rows() {
+fn prior_v6_schema_and_normalized_rows_are_untouched_by_every_open_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v6.sqlite");
+    let raw = Connection::open(&path).unwrap();
+    raw.pragma_update(None, "foreign_keys", true).unwrap();
+    raw.execute_batch(include_str!("fixtures/controller_v6.sql"))
+        .unwrap();
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
+    let before = snapshot(&raw);
+    assert_eq!(before.0, 6);
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM native_child_list_issues", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM native_child_list_applications",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM native_child_list_ack_confirmations",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let openers: [StoreOpener; 3] = [open_store, open_existing_store, open_read_only_store];
+    for open in openers {
+        assert!(matches!(
+            open(&path),
+            Err(ControllerStoreError::UnsupportedSchema(6))
+        ));
+        assert_eq!(snapshot(&raw), before);
+    }
+}
+
+#[test]
+fn fresh_v7_has_normalized_child_tables_and_no_prior_rows() {
     let store = ControllerSqliteStore::in_memory().unwrap();
     drop(store);
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("v6.sqlite");
+    let path = dir.path().join("v7.sqlite");
     drop(ControllerSqliteStore::open(&path).unwrap());
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     for table in [
         "native_child_list_issues",
         "native_child_list_applications",
         "native_child_list_result_children",
         "native_child_list_ack_confirmations",
+        "native_identity_observation_issues",
+        "native_identity_observation_applications",
+        "native_identity_observation_ack_confirmations",
     ] {
         assert_eq!(
             raw.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r

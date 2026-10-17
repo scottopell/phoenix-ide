@@ -34,11 +34,17 @@ use crate::{
 };
 
 mod native_child_list;
+mod native_identity_observation;
 pub use native_child_list::{
     NativeChildListCompletion, NativeChildListDispatch, NativeChildListIssue,
     NativeChildListRecoveryCandidate, NativeChildListStatus,
     VerifiedNativeChildListAckConfirmation, VerifiedNativeChildListCompletion,
     VerifiedRecoveredNativeChildList,
+};
+pub use native_identity_observation::{
+    NativeIdentityObservationDispatch, NativeIdentityObservationIssue,
+    NativeIdentityObservationStatus, VerifiedNativeIdentityObservationAckConfirmation,
+    VerifiedNativeIdentityObservationCompletion,
 };
 mod native_reconciliation;
 pub use native_reconciliation::{
@@ -55,10 +61,10 @@ pub use native_sampling::{
 mod tree;
 
 const SCHEMA: &str = include_str!("sqlite/schema.sql");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// An independent controller database, never a Phoenix application connection.
-/// Only schema version 6 is supported; there is no upgrade/downgrade policy.
+/// Only schema version 7 is supported; there is no upgrade/downgrade policy.
 #[derive(Debug)]
 pub struct ControllerSqliteStore {
     connection: Connection,
@@ -148,7 +154,7 @@ impl ControllerSqliteStore {
         })
     }
 
-    /// Opens an existing schema-v6 store for guardian read-only evidence.
+    /// Opens an existing schema-v7 store for guardian read-only evidence.
     /// # Errors
     /// Rejects missing or incompatible stores.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
@@ -561,6 +567,7 @@ impl ControllerSqliteStore {
             reconciliation,
             recovered_sample,
             None,
+            None,
             clock,
         )
     }
@@ -584,6 +591,10 @@ impl ControllerSqliteStore {
             &DeploymentAttempt,
             &NativeGuardianBinding,
             &NativeChildListIssue,
+        )>,
+        identity_application: Option<(
+            &NativeIdentityObservationIssue,
+            &crate::IdentityObservation,
         )>,
         clock: &mut (impl FnMut() -> Result<MonotonicTick> + ?Sized),
     ) -> Result<PersistenceRevision> {
@@ -649,7 +660,7 @@ impl ControllerSqliteStore {
                 return Err(ControllerStoreError::RevisionConflict);
             }
         }
-        if child_application.is_some()
+        if (child_application.is_some() || identity_application.is_some())
             && clock()?
                 >= required(durable.as_ref(), "missing native child list checkpoint")?.deadline()
         {
@@ -665,6 +676,15 @@ impl ControllerSqliteStore {
                     completion,
                 )?;
             }
+        }
+        if let Some((issue, observation)) = identity_application {
+            native_identity_observation::validate_application(
+                &transaction,
+                durable.as_ref(),
+                checkpoint,
+                issue,
+                observation,
+            )?;
         }
         let mut next = checkpoint.clone();
         next.set_revision(revision);
@@ -700,10 +720,20 @@ impl ControllerSqliteStore {
         if let Some((issue, completion)) = child_application {
             native_child_list::insert_application(&transaction, issue, completion, revision)?;
         }
+        if let Some((issue, observation)) = identity_application {
+            native_identity_observation::insert_application(
+                &transaction,
+                issue,
+                observation,
+                revision,
+            )?;
+        }
         if let Some((_, binding, _)) = reconciliation {
             native_reconciliation::insert_completion(&transaction, binding, revision)?;
         }
-        if child_application.is_some() && clock()? >= checkpoint.deadline() {
+        if (child_application.is_some() || identity_application.is_some())
+            && clock()? >= checkpoint.deadline()
+        {
             return Err(ControllerStoreError::RevisionConflict);
         }
         if let Some((interrupted, _, _)) = recovered_sample {

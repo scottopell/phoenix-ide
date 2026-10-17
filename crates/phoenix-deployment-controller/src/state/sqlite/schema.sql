@@ -317,4 +317,71 @@ CREATE TRIGGER native_child_list_child_no_delete BEFORE DELETE ON native_child_l
 BEGIN SELECT RAISE(ABORT,'child list child is immutable'); END;
 CREATE TRIGGER native_child_list_ack_no_delete BEFORE DELETE ON native_child_list_ack_confirmations
 BEGIN SELECT RAISE(ABORT,'child list ACK is immutable'); END;
-PRAGMA user_version = 6;
+CREATE TABLE native_identity_observation_issues (
+    attempt_id BLOB NOT NULL REFERENCES guardian_bindings(attempt_id),
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision)=8 AND dispatch_revision!=zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+    session_generation BLOB NOT NULL CHECK(length(session_generation)=8 AND session_generation!=zeroblob(8)),
+    target_pid INTEGER NOT NULL CHECK(target_pid BETWEEN 1 AND 4294967295),
+    target_birth_seconds BLOB NOT NULL CHECK(length(target_birth_seconds)=8),
+    target_birth_nanos INTEGER NOT NULL CHECK(target_birth_nanos BETWEEN 0 AND 999999999),
+    PRIMARY KEY(attempt_id,dispatch_revision,ordinal),
+    FOREIGN KEY(attempt_id,session_generation) REFERENCES guardian_sessions(attempt_id,generation)
+) STRICT;
+CREATE TRIGGER native_identity_observation_issue_requires_root BEFORE INSERT ON native_identity_observation_issues
+WHEN NOT EXISTS (
+    SELECT 1 FROM attempts a JOIN guardian_bindings b USING(attempt_id)
+    JOIN guardian_sessions s ON s.attempt_id=b.attempt_id AND s.generation=NEW.session_generation
+    JOIN guardian_slots slot ON slot.attempt_id=b.attempt_id
+    WHERE a.attempt_id=NEW.attempt_id AND a.revision=NEW.dispatch_revision
+      AND a.phase IN ('cleaning','verifying') AND b.dispatch_floor<=NEW.dispatch_revision
+      AND s.state='active' AND s.generation=(SELECT max(generation) FROM guardian_sessions WHERE attempt_id=a.attempt_id)
+      AND b.slot_count=1 AND slot.ordinal=0 AND slot.pid=NEW.target_pid
+      AND slot.birth_seconds=NEW.target_birth_seconds AND slot.birth_nanos=NEW.target_birth_nanos
+)
+BEGIN SELECT RAISE(ABORT,'identity issue requires exact active owned root'); END;
+CREATE TABLE native_identity_observation_applications (
+    attempt_id BLOB NOT NULL,
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision)=8 AND dispatch_revision!=zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+    applying_revision BLOB NOT NULL CHECK(length(applying_revision)=8 AND applying_revision!=zeroblob(8)),
+    outcome TEXT NOT NULL CHECK(outcome IN ('same_identity','exact_identity_absent','pid_reused','unresolved')),
+    current_parent_pid INTEGER CHECK(current_parent_pid BETWEEN 1 AND 4294967295),
+    current_parent_birth_seconds BLOB CHECK(current_parent_birth_seconds IS NULL OR length(current_parent_birth_seconds)=8),
+    current_parent_birth_nanos INTEGER CHECK(current_parent_birth_nanos BETWEEN 0 AND 999999999),
+    replacement_pid INTEGER CHECK(replacement_pid BETWEEN 1 AND 4294967295),
+    replacement_birth_seconds BLOB CHECK(replacement_birth_seconds IS NULL OR length(replacement_birth_seconds)=8),
+    replacement_birth_nanos INTEGER CHECK(replacement_birth_nanos BETWEEN 0 AND 999999999),
+    failure TEXT CHECK(failure IN ('no_such_process','permission_denied','temporarily_unavailable','malformed')),
+    CHECK((current_parent_pid IS NULL)=(current_parent_birth_seconds IS NULL) AND (current_parent_pid IS NULL)=(current_parent_birth_nanos IS NULL)),
+    CHECK((replacement_pid IS NULL)=(replacement_birth_seconds IS NULL) AND (replacement_pid IS NULL)=(replacement_birth_nanos IS NULL)),
+    CHECK(outcome='same_identity' OR current_parent_pid IS NULL),
+    CHECK((outcome='pid_reused')=(replacement_pid IS NOT NULL)),
+    CHECK((outcome='unresolved')=(failure IS NOT NULL)),
+    PRIMARY KEY(attempt_id,dispatch_revision,ordinal),
+    UNIQUE(attempt_id,dispatch_revision,ordinal,applying_revision),
+    FOREIGN KEY(attempt_id,dispatch_revision,ordinal) REFERENCES native_identity_observation_issues(attempt_id,dispatch_revision,ordinal)
+) STRICT;
+CREATE TABLE native_identity_observation_ack_confirmations (
+    attempt_id BLOB NOT NULL,
+    dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision)=8 AND dispatch_revision!=zeroblob(8)),
+    ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+    applying_revision BLOB NOT NULL CHECK(length(applying_revision)=8 AND applying_revision!=zeroblob(8)),
+    confirming_session_generation BLOB NOT NULL CHECK(length(confirming_session_generation)=8 AND confirming_session_generation!=zeroblob(8)),
+    PRIMARY KEY(attempt_id,dispatch_revision,ordinal),
+    FOREIGN KEY(attempt_id,dispatch_revision,ordinal,applying_revision) REFERENCES native_identity_observation_applications(attempt_id,dispatch_revision,ordinal,applying_revision),
+    FOREIGN KEY(attempt_id,confirming_session_generation) REFERENCES guardian_sessions(attempt_id,generation)
+) STRICT;
+CREATE TRIGGER native_identity_observation_issue_immutable BEFORE UPDATE ON native_identity_observation_issues
+BEGIN SELECT RAISE(ABORT,'identity issue immutable'); END;
+CREATE TRIGGER native_identity_observation_issue_no_delete BEFORE DELETE ON native_identity_observation_issues
+BEGIN SELECT RAISE(ABORT,'identity issue immutable'); END;
+CREATE TRIGGER native_identity_observation_application_immutable BEFORE UPDATE ON native_identity_observation_applications
+BEGIN SELECT RAISE(ABORT,'identity application immutable'); END;
+CREATE TRIGGER native_identity_observation_application_no_delete BEFORE DELETE ON native_identity_observation_applications
+BEGIN SELECT RAISE(ABORT,'identity application immutable'); END;
+CREATE TRIGGER native_identity_observation_ack_immutable BEFORE UPDATE ON native_identity_observation_ack_confirmations
+BEGIN SELECT RAISE(ABORT,'identity ACK immutable'); END;
+CREATE TRIGGER native_identity_observation_ack_no_delete BEFORE DELETE ON native_identity_observation_ack_confirmations
+BEGIN SELECT RAISE(ABORT,'identity ACK immutable'); END;
+PRAGMA user_version = 7;

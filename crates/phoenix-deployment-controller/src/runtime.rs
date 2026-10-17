@@ -295,6 +295,36 @@ impl AttemptStore for NativeChildListStore<'_> {
     }
 }
 
+struct NativeIdentityObservationStore<'a> {
+    store: &'a mut crate::ControllerSqliteStore,
+    issue: crate::NativeIdentityObservationIssue,
+    observation: crate::IdentityObservation,
+    clock: Option<&'a mut dyn FnMut() -> Result<MonotonicTick, crate::ControllerStoreError>>,
+}
+
+impl AttemptStore for NativeIdentityObservationStore<'_> {
+    type Error = crate::ControllerStoreError;
+
+    fn persist(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+    ) -> Result<PersistenceRevision, Self::Error> {
+        match self.clock.as_deref_mut() {
+            Some(clock) => self.store.persist_native_identity_observation_with_clock(
+                checkpoint,
+                &self.issue,
+                &self.observation,
+                clock,
+            ),
+            None => self.store.persist_native_identity_observation(
+                checkpoint,
+                &self.issue,
+                &self.observation,
+            ),
+        }
+    }
+}
+
 enum Receipt {
     Applied,
     Parked(ParkReason),
@@ -646,6 +676,81 @@ impl PolicyLoop {
             store,
             issue,
             completion,
+            clock,
+        };
+        self.apply_retained(&executed, &mut adapter)
+    }
+
+    /// Applies one verified exact-root observation with its checkpoint before any ACK.
+    /// # Errors
+    /// Unissued, mismatched, duplicate or failed persistence grants no ACK authority.
+    pub fn apply_native_identity_observation(
+        &mut self,
+        verified: crate::VerifiedNativeIdentityObservationCompletion,
+        store: &mut crate::ControllerSqliteStore,
+    ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
+        self.apply_native_identity_observation_with_clock(verified, store, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_native_identity_observation_at<'a>(
+        &mut self,
+        verified: crate::VerifiedNativeIdentityObservationCompletion,
+        store: &'a mut crate::ControllerSqliteStore,
+        clock: &'a mut dyn FnMut() -> Result<MonotonicTick, crate::ControllerStoreError>,
+    ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
+        self.apply_native_identity_observation_with_clock(verified, store, Some(clock))
+    }
+
+    fn apply_native_identity_observation_with_clock<'a>(
+        &mut self,
+        verified: crate::VerifiedNativeIdentityObservationCompletion,
+        store: &'a mut crate::ControllerSqliteStore,
+        clock: Option<&'a mut dyn FnMut() -> Result<MonotonicTick, crate::ControllerStoreError>>,
+    ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
+        let (ticket, issue, observation) = verified.into_parts();
+        let key = ticket.key();
+        if !self.rounds.iter().any(|round| {
+            round
+                .issued
+                .iter()
+                .any(|issued| issued.key == key && issued.effect == *ticket.effect())
+        }) {
+            return Err(LoopError::NotIssued(key));
+        }
+        let OsEffect::ObserveIdentity { identity } = ticket.effect() else {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        };
+        if key != issue.key() || *identity != issue.target() {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        }
+        let status = store
+            .load_native_identity_observation_status(key)
+            .map_err(|error| {
+                self.status = LoopStatus::FailStopped;
+                LoopError::Persistence(error)
+            })?;
+        if status
+            != Some(crate::NativeIdentityObservationStatus::IssuedPendingApplication { issue })
+        {
+            self.status = LoopStatus::FailStopped;
+            return Err(LoopError::NotIssued(key));
+        }
+        let identity = *identity;
+        let (key, _) = ticket.into_parts();
+        let executed = ExecutedEffect::from_parts(
+            key,
+            EffectCompletion::ObserveIdentity {
+                identity,
+                observation,
+            },
+        );
+        let mut adapter = NativeIdentityObservationStore {
+            store,
+            issue,
+            observation,
             clock,
         };
         self.apply_retained(&executed, &mut adapter)

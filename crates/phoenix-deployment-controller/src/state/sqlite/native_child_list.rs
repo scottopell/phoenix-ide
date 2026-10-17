@@ -702,6 +702,7 @@ impl ControllerSqliteStore {
                 None,
                 None,
                 Some((&loaded.checkpoint, &binding, &issue)),
+                None,
                 &mut clock,
             )?;
             Ok(NativeChildListStatus::AppliedPendingAck {

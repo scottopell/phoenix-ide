@@ -1436,6 +1436,17 @@ impl DeploymentAttempt {
         }
     }
 
+    pub(crate) fn native_root_identity_observation(&self, root: ProcessIdentity) -> bool {
+        match self {
+            Self::Active(ActiveAttempt::Ownership(OwnershipAttempt {
+                phase: OwnershipPhase::Cleaning | OwnershipPhase::Verifying,
+                tree,
+                ..
+            })) => tree.identities().contains_key(&root),
+            _ => false,
+        }
+    }
+
     /// The initial root is identifiable only while discovery has exactly one owned identity.
     pub(crate) fn native_root_scan(&self, parent: ProcessIdentity) -> bool {
         let tree = match self {
