@@ -138,6 +138,7 @@ async fn application() -> (ApplicationState, String) {
 async fn actual_router_completes_success_error_and_denial_before_response_handoff() {
     let (application, product_id) = application().await;
     let existing = Capture::default();
+    let mut sample_emitted = false;
     for outer in [tracing::Dispatch::none(), existing.dispatch()] {
         for (suffix, forwarded, status) in [
             ("", false, StatusCode::OK),
@@ -254,6 +255,13 @@ async fn actual_router_completes_success_error_and_denial_before_response_handof
                                 .any(|span| span["name"] == "product_conversation.aggregate")));
                     }
                 }
+            }
+            if status == StatusCode::OK && !sample_emitted {
+                println!(
+                    "observation_attribution_sample={}",
+                    serde_json::to_string(&records).unwrap()
+                );
+                sample_emitted = true;
             }
             let count = events.len();
             let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
