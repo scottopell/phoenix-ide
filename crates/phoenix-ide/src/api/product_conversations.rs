@@ -1504,14 +1504,87 @@ mod tests {
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
 
-    #[tokio::test]
-    async fn routed_history_reads_export_initial_cursor_and_recovery_identity() {
+    #[test]
+    fn routed_history_reads_export_initial_cursor_and_recovery_identity() {
+        const CHILD: &str = "PHOENIX_TEST_ROUTED_HISTORY_GLOBAL_SUBSCRIBER";
+        const COMPLETE: &str = "routed-history-global-subscriber-complete";
+        let test = concat!(
+            module_path!(),
+            "::routed_history_reads_export_initial_cursor_and_recovery_identity"
+        );
+        let test = test.strip_prefix("phoenix_ide::").unwrap_or(test);
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "isolated routed-history test failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.lines().any(|line| line == COMPLETE),
+                "child did not complete scenario: {stdout}"
+            );
+            assert!(
+                stdout.contains("1 passed; 0 failed; 0 ignored"),
+                "child did not run exactly one test: {stdout}"
+            );
+            return;
+        }
+        assert!(std::env::args().any(|arg| arg == "--exact"));
+        assert!(std::env::args().any(|arg| arg == test));
+        run_routed_history_with_global_subscriber();
+        println!("\n{COMPLETE}");
+    }
+
+    fn run_routed_history_with_global_subscriber() {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-        use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::prelude::*;
 
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("routed-history-correlation"))
+                .with_filter(tracing_subscriber::filter::filter_fn(
+                    crate::logging::otel_metadata_enabled,
+                )),
+        );
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let expected = runtime.block_on(routed_history_correlation_scenario());
+        drop(runtime);
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        for (ids, expected_open, expected_request) in expected {
+            let route_spans: Vec<_> = spans
+                .iter()
+                .filter(|span| span.name == expected_open || span.name == expected_request)
+                .cloned()
+                .collect();
+            assert_history_request_spans(
+                &route_spans,
+                [&ids[0], &ids[1], &ids[2]],
+                expected_open,
+                expected_request,
+            );
+        }
+    }
+
+    async fn routed_history_correlation_scenario() -> Vec<([String; 3], &'static str, &'static str)>
+    {
         let state = make_test_state().await;
+        let mut expected = Vec::new();
         let ordinary = state
             .db
             .create_conversation("correlation", "correlation", "/tmp", true, None, None)
@@ -1542,18 +1615,6 @@ mod tests {
             let initial_id = uuid::Uuid::new_v4().to_string();
             let cursor_id = uuid::Uuid::new_v4().to_string();
             let recovery_id = uuid::Uuid::new_v4().to_string();
-            let exporter = InMemorySpanExporter::default();
-            let provider = SdkTracerProvider::builder()
-                .with_simple_exporter(exporter.clone())
-                .build();
-            let subscriber = tracing_subscriber::registry().with(
-                tracing_opentelemetry::layer()
-                    .with_tracer(provider.tracer("routed-history-correlation"))
-                    .with_filter(tracing_subscriber::filter::filter_fn(
-                        crate::logging::otel_metadata_enabled,
-                    )),
-            );
-            let dispatch = tracing::Dispatch::new(subscriber);
             let mut cursor = None;
             for (ordinal, suffix) in [
                 format!("open_id={initial_id}"),
@@ -1576,7 +1637,6 @@ mod tests {
                             .body(Body::empty())
                             .unwrap(),
                     )
-                    .with_subscriber(dispatch.clone())
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
@@ -1594,15 +1654,15 @@ mod tests {
                     );
                 }
             }
-            provider.force_flush().unwrap();
-            let spans = exporter.get_finished_spans().unwrap();
-            assert_history_request_spans(
-                &spans,
-                [&initial_id, &cursor_id, &recovery_id],
+            expected.push((
+                [initial_id, cursor_id, recovery_id],
                 expected_open,
                 expected_request,
-            );
+            ));
         }
+        state.db.pool().close().await;
+        drop(state);
+        expected
     }
 
     fn assert_bounded_correlation_page(page: &serde_json::Value) {
