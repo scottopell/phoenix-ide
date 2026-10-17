@@ -249,7 +249,7 @@ fn child_list_issue_parent(
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let (pid, seconds, nanos): (u32, u64, u32) = db
+    let (pid, seconds, nanos): (u32, i64, u32) = db
         .query_row(
             "SELECT parent_pid,parent_birth_seconds,parent_birth_nanos FROM native_child_list_issues",
             [],
@@ -258,7 +258,8 @@ fn child_list_issue_parent(
         .unwrap();
     phoenix_deployment_controller::ProcessIdentity::new(
         phoenix_deployment_controller::ProcessId::new(std::num::NonZeroU32::new(pid).unwrap()),
-        phoenix_deployment_controller::BirthToken::new(seconds, nanos).unwrap(),
+        phoenix_deployment_controller::BirthToken::new(u64::try_from(seconds).unwrap(), nanos)
+            .unwrap(),
     )
 }
 
