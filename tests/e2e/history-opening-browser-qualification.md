@@ -3361,3 +3361,19 @@ witness qualification is separately required; the earlier a236 Linux native
 and full Rust pass is not relabeled as this successor's acceptance.
 The shared native qualification script now also runs the pending authority
 test explicitly, preserving every existing guard and native topology check.
+
+
+## Cross-platform native-qualified test-only successor
+
+App7d17bd70b9c539b3fca6deb133bb2475f9a96e04/tree880ef3074ab1f37504f25366d2906197ebd8275c
+retains current-main4894426888d175d4fd65095647bede65bb09718e. Prior sharedb2fd54
+qualified actual Chrome owned teardown on macOS39048480300 and Linux39048480354,
+plus macOS app build and full Linux Rust (all5checks876.5s). Rebuilt witness
+artifact12107545384 independently range-read sixreports=sixexports with normal
+app/collector drain and no errors; full/overhead clearance remains false.
+Its whole-head failures were one test-arm missing semicolon and a synchronous
+canonical Global URL assertion after an intermediate render. Successor adds
+that semicolon and awaits the same exact URL, with no timeout increase or
+production behavior change. Local focused2/owning18/tsc/eslint passed; the
+hosted UI failure did not reproduce locally, so no local red-to-green is claimed.
+One fresh exact-head whole Linux/macOS qualification is required.
