@@ -2469,7 +2469,10 @@ mod tests {
         // Keep the executor runnable: OS child progress must not auto-advance Tokio time.
         let watchdog = std::time::Instant::now();
         while !dir.path().join("ready").exists() {
-            assert!(watchdog.elapsed() < Duration::from_secs(5), "child never ready");
+            assert!(
+                watchdog.elapsed() < Duration::from_secs(5),
+                "child never ready"
+            );
             tokio::task::yield_now().await;
         }
         let reservation = ctx
@@ -2495,7 +2498,10 @@ mod tests {
         release.write_all(b"release\n").await.unwrap();
         let watchdog = std::time::Instant::now();
         while !settlement.is_finished() {
-            assert!(watchdog.elapsed() < Duration::from_secs(5), "settlement stalled");
+            assert!(
+                watchdog.elapsed() < Duration::from_secs(5),
+                "settlement stalled"
+            );
             tokio::task::yield_now().await;
         }
         let response = response_json(settlement.await.unwrap());
@@ -2668,9 +2674,11 @@ mod tests {
         .expect("settled launch kept teardown pending");
         assert!(permit.exact_process_groups.is_empty());
         let outcome = registry.complete_retirement(&permit).await;
-        assert_eq!(outcome.report().kill_failures.len(), 1);
-        assert_eq!(outcome.report().kill_failures[0].0, 0);
-        assert!(outcome.report().kill_failures[0].1.contains("unverified"));
+        assert!(outcome.report().kill_failures.is_empty());
+        assert_eq!(
+            outcome.report().scope_uncertainty,
+            Some(crate::bash::registry::BashScopeUncertainty::UnregisteredLaunch)
+        );
     }
 
     #[cfg(unix)]
@@ -2799,7 +2807,7 @@ mod tests {
         .await
         .expect("cancelled caller lost bounded custody");
         let outcome = registry.complete_retirement(&permit).await;
-        assert!(!outcome.report().kill_failures.is_empty());
+        assert!(outcome.report().has_failures());
         assert!(
             scratch.exists(),
             "unverified descendants may still use scratch"

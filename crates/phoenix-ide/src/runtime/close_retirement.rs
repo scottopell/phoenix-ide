@@ -7187,16 +7187,17 @@ fn require_absent(outcome: BashRetirementOutcome) -> Result<CloseProcessStepOutc
         BashRetirementOutcome::StaleGeneration(_) => {
             Err("bash retirement generation is stale".to_string())
         }
-        BashRetirementOutcome::Retired(report) if report.kill_failures.is_empty() => {
+        BashRetirementOutcome::Retired(report) if !report.has_failures() => {
             Ok(CloseProcessStepOutcome::Retired)
         }
-        BashRetirementOutcome::AbsenceVerified(report) if report.kill_failures.is_empty() => {
+        BashRetirementOutcome::AbsenceVerified(report) if !report.has_failures() => {
             Ok(CloseProcessStepOutcome::AbsenceVerified)
         }
         BashRetirementOutcome::Retired(report) | BashRetirementOutcome::AbsenceVerified(report) => {
             Err(format!(
-                "bash retirement left {} kill failure(s)",
-                report.kill_failures.len()
+                "bash retirement left {} process-group failure(s); scope uncertainty: {:?}",
+                report.kill_failures.len(),
+                report.scope_uncertainty
             ))
         }
     }
@@ -7241,6 +7242,29 @@ fn require_browser_absent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scope_uncertainty_blocks_close_without_inventing_a_process_failure() {
+        use phoenix_tools::bash::registry::{
+            BashRetirementOutcome, BashScopeUncertainty, CascadeBashReport,
+        };
+
+        let report = CascadeBashReport {
+            scope_uncertainty: Some(BashScopeUncertainty::UnregisteredLaunch),
+            ..CascadeBashReport::default()
+        };
+        assert!(report.kill_failures.is_empty());
+        for outcome in [
+            BashRetirementOutcome::Retired(report.clone()),
+            BashRetirementOutcome::AbsenceVerified(report),
+        ] {
+            let error = super::require_absent(outcome)
+                .err()
+                .expect("scope uncertainty must block Close");
+            assert!(error.contains("0 process-group failure(s)"));
+            assert!(error.contains("UnregisteredLaunch"));
+        }
+    }
+
     use super::{
         both_worktree_paths_absent, canonical_status_observation,
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,

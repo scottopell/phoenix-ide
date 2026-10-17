@@ -913,7 +913,7 @@ impl BashHandleRegistry {
         let table = permit.entry.read().await;
         if table.teardown_started && table.teardown_generation == permit.generation().0 {
             if table.admission.unverified_launch.load(Ordering::Acquire) {
-                report.kill_failures.push((0, "unregistered bash launch: descendant shutdown is unverified; no PID or process-group action is authorized".to_string()));
+                report.scope_uncertainty = Some(BashScopeUncertainty::UnregisteredLaunch);
             }
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
@@ -1054,14 +1054,17 @@ impl BashHandleRegistry {
         }
         match verified {
             BashRetirementOutcome::Retired(verification) => {
+                report.scope_uncertainty = verification.scope_uncertainty;
                 report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::Retired(report)
             }
             BashRetirementOutcome::AbsenceVerified(verification) => {
+                report.scope_uncertainty = verification.scope_uncertainty;
                 report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::AbsenceVerified(report)
             }
             BashRetirementOutcome::StaleGeneration(verification) => {
+                report.scope_uncertainty = verification.scope_uncertainty;
                 report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::StaleGeneration(report)
             }
@@ -1105,6 +1108,11 @@ impl BashHandleRegistry {
 /// orchestrator logs at WARN; nothing here is fatal — the conversation
 /// row is removed regardless. The orchestrator already knows the
 /// `ResourceScopeKey` (it's an argument), so it is not duplicated here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashScopeUncertainty {
+    UnregisteredLaunch,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeBashReport {
     /// pids that were live at snapshot time (informational; kills target
@@ -1117,13 +1125,19 @@ pub struct CascadeBashReport {
     /// to land yet). Surfaced separately because these are the most
     /// likely D-state offenders for an operator chasing orphans.
     pub kill_pending_kernel_pids: Vec<i32>,
-    /// Retirement failures. A group id of zero denotes an unregistered launch
-    /// with no signal authority; it is diagnostic only, never a signal target.
-    /// Successful kills and `ESRCH` do not appear here.
+    /// Scope-level uncertainty without a process identity or signal authority.
+    pub scope_uncertainty: Option<BashScopeUncertainty>,
+    /// Process-group signal/verification failures. Successful kills and `ESRCH` are absent.
     pub kill_failures: Vec<(i32, String)>,
     /// Fence identity installed by an owner-level teardown. Absent when the
     /// owner was preserved and only actor-restricted handles were removed.
     pub teardown_generation: Option<BashTeardownGeneration>,
+}
+
+impl CascadeBashReport {
+    pub fn has_failures(&self) -> bool {
+        self.scope_uncertainty.is_some() || !self.kill_failures.is_empty()
+    }
 }
 
 /// Run the bash side of the hard-delete cascade for `work_scope`

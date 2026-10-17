@@ -2675,6 +2675,9 @@ impl RuntimeManager {
                     work_scope,
                 )
                 .await;
+                if let Some(uncertainty) = report.scope_uncertainty {
+                    tracing::warn!(work_scope = %scope_id, ?uncertainty, "bash scope shutdown remains unverified");
+                }
                 for (pgid, error) in report.kill_failures {
                     tracing::warn!(work_scope = %scope_id, pgid, %error, "bash process-group cleanup after work-scope retirement failed");
                 }
