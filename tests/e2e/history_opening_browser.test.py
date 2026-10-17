@@ -33,6 +33,7 @@ class OpeningQualificationTests(unittest.TestCase):
             "opaque_initial_launch_failure_status_retains_lifetime_and_barrier",
             "partial_initial_launch_failure_status_retains_lifetime_and_barrier",
             "dead_chrome_cleanup_failure_remains_visible_until_explicit_close",
+            "sigterm_during_chrome_startup_cleans_up_the_published_browser",
         ):
             self.assertIn(f"run_exact {name} -p phoenix-tools --test browser_cli", script)
         for relative, invocation in (

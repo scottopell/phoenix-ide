@@ -47,6 +47,7 @@ grep -F 'test result: ok. 2 passed; 0 failed;' "$CHROME_QUALIFICATION_OUTPUT/ser
 run_exact opaque_initial_launch_failure_status_retains_lifetime_and_barrier -p phoenix-tools --test browser_cli
 run_exact partial_initial_launch_failure_status_retains_lifetime_and_barrier -p phoenix-tools --test browser_cli
 run_exact dead_chrome_cleanup_failure_remains_visible_until_explicit_close -p phoenix-tools --test browser_cli
+run_exact sigterm_during_chrome_startup_cleans_up_the_published_browser -p phoenix-tools --test browser_cli
 run_exact lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime -p phoenix-tools --test browser_cli
 # This test can early-return when Chrome is skipped; require its actual native layout witnesses.
 grep -F 'chrome_layout ' "$CHROME_QUALIFICATION_OUTPUT/lost_chrome_reports_state_loss_and_open_replaces_only_browser_lifetime.log"
