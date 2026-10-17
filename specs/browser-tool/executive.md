@@ -14,6 +14,8 @@ Built using the `chromiumoxide` crate for async CDP communication. Tools are sta
 
 Console logs are captured through one ordered CDP reader that associates per-target execution contexts with immutable document identities. Recursive iframe attachment captures isolated cross-origin targets, with bounded child-stream barriers at navigation boundaries. Navigation capture preserves errors from removed child frames while excluding prior-document errors; it leaves ordinary console history intact. The connection shares bounded target attachment with snapshot collection and limits frames/messages to 8 MiB. Ownership or listener failures make navigation capture unavailable explicitly. Objects and arrays use the CDP preview field. Large output (>4096 bytes total) writes to a temp file; per-entry content is truncated only at retrieval after the buffer's memory-protection cap. See ADR-110 and ADR-111 for ordering, document ownership, and isolated-frame capture.
 
+Navigation uses one bounded native CDP connection for destination dispatch, current-URL reload, and document readiness. It handles same-document completion without a missing-load-event timeout, returns native navigation errors, and avoids leaving a library navigation watcher queued after timeout. Reload checks the observed loader before dispatch.
+
 ## Status Summary
 
 ### Core Requirements
@@ -22,7 +24,7 @@ Console logs are captured through one ordered CDP reader that associates per-tar
 |-------------|--------|-------|
 | **REQ-BT-001:** Navigate to URLs | ✅ Complete | `browser_navigate` tool |
 | **REQ-BT-002:** Execute JavaScript | ✅ Complete | `browser_eval` tool |
-| **REQ-BT-003:** Take Screenshots | ✅ Complete | `browser_take_screenshot` + `read_image` |
+| **REQ-BT-003:** Take Screenshots | ✅ Complete | `browser_take_screenshot` + `read_image`; optional absolute output path with visible save failures. |
 | **REQ-BT-004:** Capture Console Logs | ✅ Complete | CDP event subscription |
 | **REQ-BT-005:** Resize Viewport | ✅ Complete | `browser_resize` tool |
 | **REQ-BT-006:** Read Image Files | ✅ Complete | `read_image` tool |

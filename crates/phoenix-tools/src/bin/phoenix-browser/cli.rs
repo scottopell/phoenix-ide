@@ -16,12 +16,12 @@ const HELP: &str = "phoenix-browser — persistent browser for coding agents (ma
 
 Usage: phoenix-browser [--session NAME] [--json] [--idle-timeout SECONDS] COMMAND
 
-  open URL                         Navigate; lazily start a browser
+  open URL                         Navigate; same URL reloads; lazily start a browser
   snapshot [--interactive]          Accessibility tree with click/type refs
   click TARGET                     Click @ref or CSS selector
   type TARGET TEXT [--clear]        Type into @ref or CSS selector
   eval EXPRESSION | eval --stdin    Evaluate JavaScript (await promises)
-  screenshot [--selector CSS]       Save a PNG artifact
+  screenshot [--selector CSS] [--output PATH]  Save a PNG artifact
   resize WIDTH HEIGHT              Set viewport dimensions
   key KEY [--modifiers JSON]        Key or chord (e.g. key Enter)
   wait SELECTOR                    Wait for a CSS selector
@@ -40,7 +40,7 @@ Idle timeout: --idle-timeout > PHOENIX_BROWSER_IDLE_TIMEOUT > 1800 seconds;
 chosen when a daemon starts. Active requests do not count as idle.
 Errors: exit 1; invalid CLI input: exit 2. --json emits a tagged success/error.
 Only open starts a browser; after state loss, inspect with status then open again.
-See docs/phoenix-browser.md for profiling and lifecycle examples.";
+Documentation: https://github.com/scottopell/phoenix-ide/blob/main/docs/phoenix-browser.md";
 
 pub struct Options {
     pub session: String,
@@ -163,6 +163,12 @@ fn parse_request(mut args: Vec<String>) -> Result<Request, String> {
     if clear {
         input["clear"] = json!(true);
     }
+    if let Some(path) = take_option(&mut args, "--output")? {
+        if command != "screenshot" {
+            return Err("--output is only valid with screenshot".into());
+        }
+        input["path"] = json!(path);
+    }
     if let Some(selector) = take_option(&mut args, "--selector")? {
         input["selector"] = json!(selector);
     }
@@ -206,6 +212,9 @@ fn validate_parameters(command: &str, input: &Value) -> Result<(), String> {
     let Some(operation) = daemon::operation(command) else {
         return Ok(());
     };
+    if command == "screenshot" && input.get("path").and_then(Value::as_str) == Some("") {
+        return Err("screenshot path must be nonempty".into());
+    }
     let schema = operation.input_schema();
     if let Some(required) = schema["required"].as_array() {
         for key in required.iter().filter_map(Value::as_str) {
@@ -639,6 +648,42 @@ fn print_response(response: &Response, json_mode: bool) {
         return;
     }
     match &response.outcome {
+        Outcome::Success { result } if result["kind"] == "evaluation" => {
+            match result["data"]["kind"].as_str() {
+                Some("json") => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result["data"]["value"])
+                        .expect("JSON value serializes")
+                ),
+                Some("undefined") => println!("undefined"),
+                Some("unserializable") => println!(
+                    "{}",
+                    result["data"]["value"]
+                        .as_str()
+                        .expect("non-JSON value text")
+                ),
+                Some(kind @ ("json_artifact" | "unserializable_artifact")) => {
+                    let format = if kind == "json_artifact" {
+                        "JSON"
+                    } else {
+                        "JavaScript scalar text"
+                    };
+                    for path in result["artifacts"]
+                        .as_array()
+                        .expect("evaluation artifacts")
+                    {
+                        println!(
+                            "Output written to {} ({format})",
+                            path.as_str().expect("artifact path")
+                        );
+                    }
+                }
+                _ => println!(
+                    "{}",
+                    serde_json::to_string_pretty(result).expect("result serializes")
+                ),
+            }
+        }
         Outcome::Success { result } if result.get("navigation").is_some() => {
             println!(
                 "{} — {}",
