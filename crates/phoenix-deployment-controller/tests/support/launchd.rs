@@ -1302,11 +1302,15 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
                 }
                 return Err(io::Error::other(format!("expected {prefix}, got {line}")));
             }
-            if self.observation()?
-                != (JobObservation::Loaded {
-                    pid: Some(self.pid().pid().get()),
-                })
-            {
+            let identity = self.pid();
+            let runner_is_live = match inspect(identity.pid().get()) {
+                Ok(live) => {
+                    live.identity == identity && live.parent == 1 && live.uid == self.spec.uid
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => false,
+                Err(error) => return Err(error),
+            };
+            if !runner_is_live {
                 return Err(io::Error::other(format!(
                     "runner exited before {prefix}: {}",
                     bounded_text(&self.spec.stderr())?
