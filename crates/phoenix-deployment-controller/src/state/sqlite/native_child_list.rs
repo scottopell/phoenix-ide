@@ -67,6 +67,11 @@ impl NativeChildListDispatch {
     pub(crate) fn new(ticket: DispatchTicket, issue: NativeChildListIssue) -> Self {
         Self { ticket, issue }
     }
+
+    #[must_use]
+    pub(crate) const fn issue(&self) -> NativeChildListIssue {
+        self.issue
+    }
     pub(crate) fn into_parts(self) -> (DispatchTicket, NativeChildListIssue) {
         (self.ticket, self.issue)
     }

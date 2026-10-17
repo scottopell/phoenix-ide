@@ -7,8 +7,30 @@ pub(super) fn sampling_runner_command(
     deadline: MonotonicTick,
     pause: bool,
 ) -> Command {
+    sampling_runner_command_with_root(
+        dir,
+        path,
+        deadline,
+        phoenix_deployment_controller::ProcessIdentity::new(
+            phoenix_deployment_controller::ProcessId::new(std::num::NonZeroU32::new(42).unwrap()),
+            phoenix_deployment_controller::BirthToken::new(1, 0).unwrap(),
+        ),
+        pause,
+    )
+}
+
+pub(super) fn sampling_runner_command_with_root(
+    dir: &Path,
+    path: &Path,
+    deadline: MonotonicTick,
+    root: phoenix_deployment_controller::ProcessIdentity,
+    pause: bool,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"));
     let deadline_arg = deadline.get().to_string();
+    let root_pid = root.pid().get().to_string();
+    let root_birth_seconds = root.birth().seconds().to_string();
+    let root_birth_nanos = root.birth().nanos().to_string();
     command.args([
         "--mode",
         "initial-sample",
@@ -21,11 +43,11 @@ pub(super) fn sampling_runner_command(
         "--deadline-nanoseconds",
         &deadline_arg,
         "--root-pid",
-        "42",
+        &root_pid,
         "--root-birth-seconds",
-        "1",
+        &root_birth_seconds,
         "--root-birth-nanos",
-        "0",
+        &root_birth_nanos,
     ]);
     if pause {
         command.arg("--fixture-pause-after-apply");

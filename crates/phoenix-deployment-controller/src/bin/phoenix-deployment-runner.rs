@@ -4,12 +4,14 @@
 use phoenix_deployment_controller::{
     guardian_ipc::{WireNativeBinding, WireSnapshot, WireState},
     native_guardian::{
-        recover_native_sampling_ack, verify_native_binding, GuardianClient, VerifiedBindingStatus,
+        recover_native_child_list_ack, recover_native_sampling_ack, verify_native_binding,
+        GuardianClient, VerifiedBindingStatus,
     },
     AckDisposition, AttemptId, BirthToken, CommittedTransition, ControllerSqliteStore,
     CpuContentionBasisPoints, DeploymentAttempt, GuardianLifetimeNonce, LoopProgress,
-    MemoryPressure, MonotonicTick, NativeGuardianSlot, NativeSamplingStatus, PersistenceRevision,
-    Phase, PolicyLoop, ProcessId, ProcessIdentity, RecoveryDisposition, ResourcePolicy,
+    MemoryPressure, MonotonicTick, NativeChildListStatus, NativeGuardianSlot, NativeSamplingStatus,
+    OsEffect, PersistenceRevision, Phase, PolicyLoop, ProcessId, ProcessIdentity,
+    RecoveryDisposition, ResourcePolicy,
 };
 #[cfg(unix)]
 use std::{
@@ -55,6 +57,10 @@ enum RunnerMode {
     RecoverFinishAndSample {
         fixture: SampleFixture,
     },
+    RecoverFinishAndChildList {
+        fixture: ChildListFixture,
+    },
+    RecoverChildListAck(ChildListAckFixture),
 }
 
 #[cfg(unix)]
@@ -71,6 +77,7 @@ enum AckRecoveryFixture {
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
 enum ReleaseSource {
     Stdin,
     DisposableFile(PathBuf),
@@ -99,18 +106,35 @@ enum SampleFixture {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+enum ChildListFixture {
+    Run,
+    PauseAfterApplication(ReleaseSource),
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+enum ChildListAckFixture {
+    Run,
+    PauseAfterConfirmation(ReleaseSource),
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
 enum RecoveryRun {
     Finish(FinishFixture),
     FinishAndSample(SampleFixture),
+    FinishAndChildList(ChildListFixture),
 }
 
 #[cfg(unix)]
 impl RecoveryRun {
-    fn activation_fixture(self) -> FinishFixture {
+    fn activation_fixture(&self) -> FinishFixture {
         match self {
-            Self::Finish(fixture) => fixture,
-            Self::FinishAndSample(SampleFixture::Run) => FinishFixture::Run,
+            Self::Finish(fixture) => *fixture,
+            Self::FinishAndSample(SampleFixture::Run) | Self::FinishAndChildList(_) => {
+                FinishFixture::Run
+            }
             Self::FinishAndSample(SampleFixture::ActivationAndSampleBarriers) => {
                 FinishFixture::ActivationBarriers
             }
@@ -190,8 +214,45 @@ fn parse_recover_applied_ack(args: &[OsString], usage: &str) -> Result<RunnerMod
 }
 
 #[cfg(unix)]
+fn parse_recover_child_list(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
+    let fixture = match args {
+        [_, _, _, _, _, _, _, _] => ChildListFixture::Run,
+        [_, _, _, _, _, _, _, _, pause] if pause == "--fixture-pause-after-child-list-apply" => {
+            ChildListFixture::PauseAfterApplication(ReleaseSource::Stdin)
+        }
+        [_, _, _, _, _, _, _, _, pause, release, path]
+            if pause == "--fixture-pause-after-child-list-apply"
+                && release == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(path);
+            validate_release_path(&path)?;
+            ChildListFixture::PauseAfterApplication(ReleaseSource::DisposableFile(path))
+        }
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::RecoverFinishAndChildList { fixture })
+}
+
+#[cfg(unix)]
+fn parse_recover_child_list_ack(args: &[OsString], usage: &str) -> Result<RunnerMode, String> {
+    let fixture = match args {
+        [_, _, _, _, _, _, _, _] => ChildListAckFixture::Run,
+        [_, _, _, _, _, _, _, _, pause, release, path]
+            if pause == "--fixture-pause-after-child-list-ack"
+                && release == "--fixture-release-file" =>
+        {
+            let path = PathBuf::from(path);
+            validate_release_path(&path)?;
+            ChildListAckFixture::PauseAfterConfirmation(ReleaseSource::DisposableFile(path))
+        }
+        _ => return Err(usage.into()),
+    };
+    Ok(RunnerMode::RecoverChildListAck(fixture))
+}
+
+#[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample|recover-finish-and-child-list|recover-child-list-ack> --socket-dir <private fixture> --store <existing schema-v6 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal]] | --fixture-pause-after-recovered-ack --fixture-release-file /tmp/sdc-disposable-*/runner-release.signal (recover-applied-ack only) | --fixture-pause-after-recovery-verification [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-unapplied-sample only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only) | --fixture-pause-after-child-list-apply [--fixture-release-file /tmp/sdc-disposable-*/runner-release.signal] (recover-finish-and-child-list only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -257,6 +318,8 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
                 fixture: SampleFixture::ActivationAndSampleBarriers,
             }
         }
+        "recover-finish-and-child-list" => parse_recover_child_list(args, usage)?,
+        "recover-child-list-ack" => parse_recover_child_list_ack(args, usage)?,
         "initial-sample" => parse_initial_sample(args, usage)?,
         _ => return Err(usage.into()),
     };
@@ -697,10 +760,15 @@ fn run_recover_and_finish(
         serde_json::to_string(&active).map_err(|e| e.to_string())?
     );
     std::io::stdout().flush().map_err(|e| e.to_string())?;
-    let RecoveryRun::FinishAndSample(sample_fixture) = run else {
-        return Ok(());
+    let (sample_fixture, child_list_fixture) = match run {
+        RecoveryRun::FinishAndSample(fixture) => (Some(fixture), None),
+        RecoveryRun::FinishAndChildList(fixture) => (None, Some(fixture)),
+        RecoveryRun::Finish(_) => return Ok(()),
     };
-    if matches!(sample_fixture, SampleFixture::ActivationAndSampleBarriers) {
+    if matches!(
+        sample_fixture,
+        Some(SampleFixture::ActivationAndSampleBarriers)
+    ) {
         println!("post_activation_sample_pending");
         std::io::stdout().flush().map_err(|e| e.to_string())?;
         activation_barrier(FinishFixture::ActivationBarriers)?;
@@ -735,7 +803,142 @@ fn run_recover_and_finish(
         issue.key().ordinal(),
         issue.sequence()
     );
-    std::io::stdout().flush().map_err(|e| e.to_string())
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    match child_list_fixture {
+        Some(fixture) => run_recovered_child_list(
+            store,
+            client,
+            attempt,
+            session,
+            policy,
+            &active_binding,
+            fixture,
+        ),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_recovered_child_list(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    attempt: AttemptId,
+    session: phoenix_deployment_controller::guardian_ipc::WireSession,
+    mut policy: PolicyLoop,
+    binding: &phoenix_deployment_controller::NativeGuardianBinding,
+    fixture: ChildListFixture,
+) -> Result<(), String> {
+    let child_ticket = policy
+        .issue_next()
+        .ok_or("missing ListChildren successor after recovered sample")?;
+    let OsEffect::ListChildren { parent } = child_ticket.effect() else {
+        return Err("recovered sample successor was not ListChildren".into());
+    };
+    let root = binding
+        .slots()
+        .first()
+        .ok_or("missing harmless root slot")?
+        .process;
+    if *parent != root {
+        return Err("ListChildren successor did not target harmless root".into());
+    }
+    let child_issue = store
+        .commit_native_child_list_issue(&child_ticket, binding)
+        .map_err(|error| format!("child-list issue: {error}"))?;
+    let dispatched = dispatch_child_list(client, child_ticket, child_issue)?;
+    let verified = client
+        .observe_native_child_list(dispatched)
+        .map_err(|error| format!("child-list observe: {error:?}"))?;
+    let progress = policy
+        .apply_native_child_list(verified, store)
+        .map_err(|error| format!("child-list apply: {error:?}"))?;
+    if !matches!(progress, LoopProgress::Applied { key, ack: AckDisposition::AcknowledgeNow, .. } if key == child_issue.key())
+    {
+        return Err(format!(
+            "child-list did not produce exact immediate ACK: {progress:?}"
+        ));
+    }
+    let pending = store
+        .load_native_child_list_status(child_issue.key())
+        .map_err(|error| error.to_string())?
+        .ok_or("child-list application was not durable")?;
+    if !matches!(pending, NativeChildListStatus::AppliedPendingAck { issue, children, .. } if issue == child_issue && children.is_empty())
+    {
+        return Err("child-list completion was not successful and empty".into());
+    }
+    if let ChildListFixture::PauseAfterApplication(release) = fixture {
+        let gate = release.prepare()?;
+        println!(
+            "child_list_application_committed_pending_ack revision={}",
+            child_issue.key().revision().get()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        gate.wait()?;
+    }
+    let confirmed = recover_native_child_list_ack(store, client, child_issue.key())
+        .map_err(|error| format!("child-list ACK: {error:?}"))?;
+    if !matches!(confirmed, NativeChildListStatus::ChildrenAckConfirmed { issue, children, confirming_session_generation, .. } if issue == child_issue && children.is_empty() && confirming_session_generation.get() == session.generation)
+    {
+        return Err("child-list ACK confirmation mismatch".into());
+    }
+    policy
+        .finish_ownership_scan(store)
+        .map_err(|error| format!("finish ownership scan: {error:?}"))?;
+    let final_attempt = store
+        .load_attempt(attempt)
+        .map_err(|error| error.to_string())?
+        .ok_or("missing final attempt")?;
+    if final_attempt.phase() != Phase::CleaningOwnedTree {
+        return Err(format!(
+            "child-list recovery did not reach CleaningOwnedTree: {:?}",
+            final_attempt.phase()
+        ));
+    }
+    println!(
+        "child_list_ack_confirmed attempt={} revision={} generation={} phase=CleaningOwnedTree; observe_identity_not_issued",
+        child_issue.key().attempt_id().get(),
+        child_issue.key().revision().get(),
+        session.generation,
+    );
+    std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn run_recover_child_list_ack(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    key: phoenix_deployment_controller::DispatchKey,
+    fixture: &ChildListAckFixture,
+) -> Result<(), String> {
+    let confirmed = recover_native_child_list_ack(store, client, key)
+        .map_err(|error| format!("child-list ACK recovery: {error:?}"))?;
+    if !matches!(confirmed, NativeChildListStatus::ChildrenAckConfirmed { issue, children, .. } if issue.key() == key && children.is_empty())
+    {
+        return Err("recovered child-list ACK did not confirm exact empty result".into());
+    }
+    let attempt = store
+        .load_attempt(key.attempt_id())
+        .map_err(|error| error.to_string())?
+        .ok_or("missing attempt after child-list ACK")?;
+    println!(
+        "child_list_ack_confirmed attempt={} revision={} phase={:?}; recovery_gap=PolicyLoop authority is intentionally not reconstructed, so ownership scan cannot safely finish",
+        key.attempt_id().get(),
+        key.revision().get(),
+        attempt.phase(),
+    );
+    let gate = match fixture {
+        ChildListAckFixture::PauseAfterConfirmation(release) => Some(release.prepare()?),
+        ChildListAckFixture::Run => None,
+    };
+    std::io::stdout()
+        .flush()
+        .map_err(|error| error.to_string())?;
+    if let Some(gate) = gate {
+        gate.wait()?;
+    }
+    Ok(())
 }
 
 fn run_recover_unapplied_sample(
@@ -827,6 +1030,24 @@ fn dispatch_sampling(
         }
         Err(NativeSamplingDispatchError::SubmissionUnknown(error)) => Err(format!(
             "dispatch submission unknown (issue retained): {error:?}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn dispatch_child_list(
+    client: &mut GuardianClient,
+    ticket: phoenix_deployment_controller::DispatchTicket,
+    issue: phoenix_deployment_controller::NativeChildListIssue,
+) -> Result<phoenix_deployment_controller::NativeChildListDispatch, String> {
+    use phoenix_deployment_controller::native_guardian::NativeChildListDispatchError;
+    match client.dispatch_native_child_list(ticket, issue) {
+        Ok(dispatched) => Ok(dispatched),
+        Err(NativeChildListDispatchError::KnownUnsubmitted { error, .. }) => Err(format!(
+            "child-list dispatch pre-submit (issue retained; no cancellation API): {error:?}"
+        )),
+        Err(NativeChildListDispatchError::SubmissionUnknown(error)) => Err(format!(
+            "child-list dispatch ambiguous after submit (issue retained): {error:?}"
         )),
     }
 }
@@ -1117,7 +1338,9 @@ fn main() -> Result<(), String> {
         ControllerSqliteStore::open_existing(&config.store).map_err(|e| e.to_string())?;
     if matches!(
         config.mode,
-        RunnerMode::RecoverAndFinish { .. } | RunnerMode::RecoverFinishAndSample { .. }
+        RunnerMode::RecoverAndFinish { .. }
+            | RunnerMode::RecoverFinishAndSample { .. }
+            | RunnerMode::RecoverFinishAndChildList { .. }
     ) {
         preflight_recover_and_finish(&mut store, config.attempt)?;
     }
@@ -1126,7 +1349,15 @@ fn main() -> Result<(), String> {
             store
                 .pending_native_sampling_ack(config.attempt)
                 .map_err(|e| e.to_string())?
-                .ok_or("no unique successful pending ACK")?
+                .ok_or("no unique successful pending sample ACK")?
+                .0,
+        )
+    } else if matches!(config.mode, RunnerMode::RecoverChildListAck(_)) {
+        Some(
+            store
+                .pending_native_child_list_ack(config.attempt)
+                .map_err(|e| e.to_string())?
+                .ok_or("no unique successful pending child-list ACK")?
                 .0,
         )
     } else {
@@ -1154,6 +1385,8 @@ fn main() -> Result<(), String> {
             | RunnerMode::RecoverUnappliedSample { .. }
             | RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
+            | RunnerMode::RecoverFinishAndChildList { .. }
+            | RunnerMode::RecoverChildListAck(_)
     ) && status == VerifiedBindingStatus::InitialActive
     {
         return Err("recovery requires detached guardian".into());
@@ -1190,10 +1423,12 @@ fn main() -> Result<(), String> {
             match config.mode {
                 RunnerMode::RecoverAndFinish { fixture } => fixture,
                 RunnerMode::RecoverFinishAndSample { .. }
+                | RunnerMode::RecoverFinishAndChildList { .. }
                 | RunnerMode::ObserveOnly { .. }
                 | RunnerMode::InitialSample { .. }
                 | RunnerMode::RecoverAppliedAck(_)
-                | RunnerMode::RecoverUnappliedSample { .. } => FinishFixture::Run,
+                | RunnerMode::RecoverUnappliedSample { .. }
+                | RunnerMode::RecoverChildListAck(_) => FinishFixture::Run,
             },
         )?)
     };
@@ -1217,6 +1452,14 @@ fn main() -> Result<(), String> {
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
             RecoveryRun::FinishAndSample(*fixture),
         ),
+        RunnerMode::RecoverFinishAndChildList { fixture } => run_recover_and_finish(
+            &mut store,
+            &mut client,
+            config.attempt,
+            &snapshot,
+            reconciliation_session.ok_or("missing fresh reconciliation session")?,
+            RecoveryRun::FinishAndChildList(fixture.clone()),
+        ),
         RunnerMode::RecoverUnappliedSample { fixture } => run_recover_unapplied_sample(
             &mut store,
             &mut client,
@@ -1228,6 +1471,12 @@ fn main() -> Result<(), String> {
             &mut store,
             &mut client,
             pending_recovery_key.ok_or("missing preflight pending ACK")?,
+            fixture,
+        ),
+        RunnerMode::RecoverChildListAck(fixture) => run_recover_child_list_ack(
+            &mut store,
+            &mut client,
+            pending_recovery_key.ok_or("missing preflight pending child-list ACK")?,
             fixture,
         ),
         RunnerMode::InitialSample { fixture, .. } => run_initial_sample(
@@ -2067,6 +2316,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn child_list_modes_have_isolated_fixtures_and_explicit_ack_mode() {
+        assert!(matches!(
+            parse_args(&args("recover-child-list-ack")),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverChildListAck(ChildListAckFixture::Run),
+                ..
+            })
+        ));
+        let mut ack_with_fixture = args("recover-child-list-ack");
+        ack_with_fixture.push("--fixture-pause-after-child-list-apply".into());
+        assert!(parse_args(&ack_with_fixture).is_err());
+
+        assert!(matches!(
+            parse_args(&args("recover-finish-and-child-list")),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndChildList {
+                    fixture: ChildListFixture::Run
+                },
+                ..
+            })
+        ));
+        let mut child_pause = args("recover-finish-and-child-list");
+        child_pause.push("--fixture-pause-after-child-list-apply".into());
+        assert!(matches!(
+            parse_args(&child_pause),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverFinishAndChildList {
+                    fixture: ChildListFixture::PauseAfterApplication(ReleaseSource::Stdin)
+                },
+                ..
+            })
+        ));
+        let mut child_with_sample_fixture = args("recover-finish-and-child-list");
+        child_with_sample_fixture.push("--fixture-activation-and-sample-barriers".into());
+        assert!(parse_args(&child_with_sample_fixture).is_err());
+        let mut sample_with_child_fixture = args("recover-finish-and-sample");
+        sample_with_child_fixture.push("--fixture-pause-after-child-list-apply".into());
+        assert!(parse_args(&sample_with_child_fixture).is_err());
     }
 
     #[test]

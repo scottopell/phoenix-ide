@@ -13,7 +13,8 @@ use native_sampling::{sampling_rows, sampling_runner_command, settled_sampling_k
 use phoenix_deployment_controller::{
     guardian_ipc::{WireCompletion, WireMemoryPressure, WireSnapshot, WireState},
     native_guardian::{verify_native_binding, GuardianClient, VerifiedBindingStatus},
-    ControllerSqliteStore, MonotonicTick, NativeSamplingStatus, NativeSessionState, Phase,
+    ControllerSqliteStore, MonotonicTick, NativeChildListStatus, NativeSamplingStatus,
+    NativeSessionState, Phase,
 };
 use std::{
     io::Write,
@@ -224,6 +225,48 @@ fn sampling_table_counts(path: &std::path::Path) -> [i64; 5] {
     counts()
 }
 
+fn child_list_table_counts(path: &std::path::Path) -> [i64; 4] {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    [
+        "native_child_list_issues",
+        "native_child_list_applications",
+        "native_child_list_ack_confirmations",
+        "native_child_list_result_children",
+    ]
+    .map(|table| {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    })
+}
+
+fn child_list_issue_parent(
+    path: &std::path::Path,
+) -> phoenix_deployment_controller::ProcessIdentity {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (pid, seconds, nanos): (u32, u64, u32) = db
+        .query_row(
+            "SELECT parent_pid,parent_birth_seconds,parent_birth_nanos FROM native_child_list_issues",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    phoenix_deployment_controller::ProcessIdentity::new(
+        phoenix_deployment_controller::ProcessId::new(std::num::NonZeroU32::new(pid).unwrap()),
+        phoenix_deployment_controller::BirthToken::new(seconds, nanos).unwrap(),
+    )
+}
+
+fn live_guardian_snapshot(guardian: &DisposableLaunchdGuardian) -> WireSnapshot {
+    let mut client = GuardianClient::connect(&guardian.socket_dir()).unwrap();
+    client.hello().unwrap()
+}
+
 fn assert_initial_applied_ack(
     runner: &mut DisposableLaunchdRunnerJob<'_>,
     path: &std::path::Path,
@@ -363,6 +406,154 @@ fn installed_two_job_launchd_recovers_applied_ack_without_touching_application()
     installation.assert_witnesses().unwrap();
     drop(store);
     installation.finish().unwrap();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn installed_two_job_launchd_recovers_child_list_ack_without_reenumeration_or_mutation() {
+    let mut installation = DisposableLaunchdInstallation::start().unwrap();
+    installation.assert_witnesses().unwrap();
+    let root_path = installation.guardian().root().to_path_buf();
+    let path = installation.guardian().store();
+    let deadline = installation.guardian().deadline();
+    let original_guardian = installation.guardian().guardian();
+    let original_child = installation.guardian().child();
+    installation.guardian().assert_original_parent().unwrap();
+
+    let mut runner = DisposableLaunchdRunnerJob::start(&mut installation).unwrap();
+    runner.assert_live().unwrap();
+    assert_eq!(
+        runner.marker("verified binding: InitialActive").unwrap(),
+        "verified binding: InitialActive"
+    );
+    runner
+        .marker("application_committed_pending_ack revision=")
+        .unwrap();
+    runner.assert_witnesses().unwrap();
+    runner.kill().unwrap();
+    let initial_detached = detached(runner.guardian());
+    assert_eq!(initial_detached.retained.len(), 1);
+
+    runner.recover_applied_ack().unwrap();
+    runner.assert_archived_generation(1).unwrap();
+    assert_eq!(
+        runner.marker("verified binding: Detached").unwrap(),
+        "verified binding: Detached"
+    );
+    runner
+        .marker("reconciling generation=2 interruption=")
+        .unwrap();
+    assert_eq!(
+        runner.marker("sample_ack_confirmed generation=2").unwrap(),
+        "sample_ack_confirmed generation=2"
+    );
+    runner.assert_live().unwrap();
+    runner.guardian().assert_original_parent().unwrap();
+    runner.release().unwrap();
+    runner.success().unwrap();
+    runner.assert_witnesses().unwrap();
+
+    runner.recover_finish_and_child_list().unwrap();
+    runner.assert_archived_generation(2).unwrap();
+    assert_eq!(
+        runner.marker("verified binding: Detached").unwrap(),
+        "verified binding: Detached"
+    );
+    runner
+        .marker("reconciling generation=3 interruption=")
+        .unwrap();
+    runner.marker("prepared_snapshot=").unwrap();
+    runner.marker("durable_activation_snapshot=").unwrap();
+    runner.marker("reconciliation_active attempt=64").unwrap();
+    runner.marker("active_snapshot=").unwrap();
+    let sample_marker = runner
+        .marker("recovered_sample_applied_ack attempt=64")
+        .unwrap();
+    assert!(sample_marker.ends_with("sequence=1"), "{sample_marker}");
+    let child_marker = runner
+        .marker("child_list_application_committed_pending_ack revision=")
+        .unwrap();
+    assert!(child_marker.contains("revision="), "{child_marker}");
+    runner.assert_live().unwrap();
+    runner.guardian().assert_original_parent().unwrap();
+    runner.assert_witnesses().unwrap();
+    assert_eq!(child_list_table_counts(&path), [1, 1, 0, 0]);
+    assert_eq!(child_list_issue_parent(&path), original_child);
+    let mut before_ack = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let (child_key, child_status) = before_ack
+        .pending_native_child_list_ack(ATTEMPT)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        child_status,
+        NativeChildListStatus::AppliedPendingAck { children, .. } if children.is_empty()
+    ));
+
+    runner.kill().unwrap();
+    let fenced = detached(runner.guardian());
+    assert_eq!(fenced.retained.len(), 1);
+    assert!(matches!(
+        &fenced.retained[0].completion,
+        WireCompletion::ListChildren {
+            parent,
+            result: Ok(children),
+        } if *parent == original_child.into() && children.is_empty()
+    ));
+    assert_eq!(child_list_table_counts(&path), [1, 1, 0, 0]);
+    runner.guardian().assert_original_parent().unwrap();
+    runner.assert_witnesses().unwrap();
+
+    runner.recover_child_list_ack().unwrap();
+    runner.assert_archived_generation(3).unwrap();
+    assert_eq!(
+        runner.marker("verified binding: Detached").unwrap(),
+        "verified binding: Detached"
+    );
+    runner
+        .marker("reconciling generation=4 interruption=")
+        .unwrap();
+    let ack_marker = runner
+        .marker("child_list_ack_confirmed attempt=64")
+        .unwrap();
+    assert!(ack_marker.contains("phase=Interrupted"), "{ack_marker}");
+    runner.assert_live().unwrap();
+    runner.guardian().assert_original_parent().unwrap();
+    runner.assert_witnesses().unwrap();
+    assert_eq!(child_list_table_counts(&path), [1, 1, 1, 0]);
+
+    runner.release().unwrap();
+    runner.success().unwrap();
+    let confirmed_detached = detached(runner.guardian());
+    assert!(confirmed_detached.retained.is_empty());
+    let mut store = ControllerSqliteStore::open_read_only(&path).unwrap();
+    assert_eq!(child_list_table_counts(&path), [1, 1, 1, 0]);
+    assert_eq!(child_list_issue_parent(&path), original_child);
+    let final_binding = store.load_native_binding(ATTEMPT).unwrap().unwrap();
+    assert_eq!(final_binding.identity().process, original_guardian);
+    assert_eq!(final_binding.slots()[0].process, original_child);
+    assert_eq!(
+        store.load_attempt(ATTEMPT).unwrap().unwrap().phase(),
+        Phase::Interrupted
+    );
+    assert!(matches!(
+        store.load_native_child_list_status(child_key).unwrap(),
+        Some(NativeChildListStatus::ChildrenAckConfirmed { children, .. })
+            if children.is_empty()
+    ));
+    assert_eq!(sampling_rows(&path).0, 2);
+    assert_eq!(sampling_rows(&path).1, 2);
+    assert_eq!(sampling_rows(&path).2, 2);
+    assert!(unsafe { libc::kill(i32::try_from(original_child.pid().get()).unwrap(), 0) } == 0);
+    runner.guardian().assert_original_parent().unwrap();
+    runner.finish().unwrap();
+    installation.assert_witnesses().unwrap();
+    drop(store);
+    installation.finish().unwrap();
+    assert!(
+        !root_path.exists(),
+        "qualified fixture root was not torn down"
+    );
+    assert!(MonotonicTick::native_now().unwrap() < deadline);
 }
 
 #[test]

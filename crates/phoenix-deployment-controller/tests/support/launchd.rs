@@ -373,7 +373,8 @@ impl DisposableLaunchdGuardian {
         let (status, _, stderr) = owned.launchctl(LaunchctlAction::Bootstrap)?;
         if !status.success() {
             return Err(io::Error::other(format!(
-                "disposable bootstrap failed in {domain}; requires this UID's logged-in GUI domain (no system/user fallback, sudo, or silent skip): {stderr}")));
+                "disposable bootstrap failed in {domain}; requires this UID's logged-in GUI domain (no system/user fallback, sudo, or silent skip): {stderr}"
+            )));
         }
         owned.wait_ready()?;
         Ok(owned)
@@ -637,7 +638,7 @@ fn wait_gone(identity: ProcessIdentity) -> io::Result<()> {
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
             Err(e) => return Err(e),
             Ok(live) if live.identity != identity => {
-                return Err(io::Error::other("PID reused during teardown"))
+                return Err(io::Error::other("PID reused during teardown"));
             }
             Ok(_) => {}
         }
@@ -863,6 +864,8 @@ impl Drop for DisposableLaunchdInstallation {
 pub(super) enum InstalledRunnerMode {
     InitialPauseAfterApplication,
     RecoverAppliedAck,
+    RecoverFinishAndChildListPauseAfterApplication,
+    RecoverChildListAckPauseAfterConfirmation,
 }
 
 struct RunnerJobSpec {
@@ -873,11 +876,14 @@ struct RunnerJobSpec {
     socket: PathBuf,
     store: PathBuf,
     deadline: MonotonicTick,
+    root_identity: ProcessIdentity,
 }
 
 impl RunnerJobSpec {
     fn from_installation(installation: &DisposableLaunchdInstallation) -> Self {
-        Self::from_guardian_spec(&installation.guardian.spec)
+        let mut spec = Self::from_guardian_spec(&installation.guardian.spec);
+        spec.root_identity = installation.guardian.child();
+        spec
     }
 
     fn from_guardian_spec(guardian: &JobSpec) -> Self {
@@ -890,6 +896,10 @@ impl RunnerJobSpec {
             socket: guardian.socket_dir(),
             store: guardian.store(),
             deadline: guardian.deadline,
+            root_identity: ProcessIdentity::new(
+                ProcessId::new(NonZeroU32::new(7).expect("fixture PID")),
+                BirthToken::new(1, 0).expect("fixture birth"),
+            ),
         }
     }
 
@@ -916,6 +926,12 @@ impl RunnerJobSpec {
             match mode {
                 InstalledRunnerMode::InitialPauseAfterApplication => "initial-sample",
                 InstalledRunnerMode::RecoverAppliedAck => "recover-applied-ack",
+                InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication => {
+                    "recover-finish-and-child-list"
+                }
+                InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => {
+                    "recover-child-list-ack"
+                }
             }
             .into(),
             "--socket-dir".into(),
@@ -930,17 +946,27 @@ impl RunnerJobSpec {
                 "--deadline-nanoseconds".into(),
                 self.deadline.get().to_string(),
                 "--root-pid".into(),
-                "42".into(),
+                self.root_identity.pid().get().to_string(),
                 "--root-birth-seconds".into(),
-                "1".into(),
+                self.root_identity.birth().seconds().to_string(),
                 "--root-birth-nanos".into(),
-                "0".into(),
+                self.root_identity.birth().nanos().to_string(),
                 "--fixture-pause-after-apply".into(),
                 "--fixture-release-file".into(),
                 self.release_file().to_str().unwrap().into(),
             ]),
             InstalledRunnerMode::RecoverAppliedAck => args.extend([
                 "--fixture-pause-after-recovered-ack".into(),
+                "--fixture-release-file".into(),
+                self.release_file().to_str().unwrap().into(),
+            ]),
+            InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication => args.extend([
+                "--fixture-pause-after-child-list-apply".into(),
+                "--fixture-release-file".into(),
+                self.release_file().to_str().unwrap().into(),
+            ]),
+            InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => args.extend([
+                "--fixture-pause-after-child-list-ack".into(),
                 "--fixture-release-file".into(),
                 self.release_file().to_str().unwrap().into(),
             ]),
@@ -967,9 +993,13 @@ impl RunnerJobSpec {
     }
 
     fn plist(&self, mode: InstalledRunnerMode) -> String {
-        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array>{}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><false/>\n<key>ProcessType</key><string>Background</string>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
-            xml(&self.label), plist_arguments(&self.arguments(mode)),
-            xml(self.stdout().to_str().unwrap()), xml(self.stderr().to_str().unwrap()))
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array>{}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><false/>\n<key>ProcessType</key><string>Background</string>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+            xml(&self.label),
+            plist_arguments(&self.arguments(mode)),
+            xml(self.stdout().to_str().unwrap()),
+            xml(self.stderr().to_str().unwrap())
+        )
     }
 }
 
@@ -1126,7 +1156,7 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
         match self.observation()? {
             JobObservation::Absent => {}
             JobObservation::Loaded { .. } => {
-                return Err(io::Error::other("runner label already exists"))
+                return Err(io::Error::other("runner label already exists"));
             }
         }
         self.spec.clear_release_file()?;
@@ -1282,6 +1312,17 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
         Ok(())
     }
 
+    pub(super) fn assert_archived_generation(&self, generation: u32) -> io::Result<()> {
+        for suffix in ["plist", "stdout", "stderr"] {
+            let path = self
+                .spec
+                .root
+                .join(format!("runner-generation-{generation}.{suffix}"));
+            assert_private_fixture(&path, self.spec.uid)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn assert_initial_generation_evidence(&self) -> io::Result<()> {
         let archive = self.spec.root.join("runner-generation-1.plist");
         let archived = match fs::symlink_metadata(&archive) {
@@ -1319,26 +1360,48 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
         Ok(())
     }
 
-    pub(super) fn recover_applied_ack(&mut self) -> io::Result<()> {
-        self.bootout()?;
+    fn archive_generation(&mut self, generation: u32) -> io::Result<()> {
         for (source, archive) in [
             (
                 self.spec.plist_path(),
-                self.spec.root.join("runner-generation-1.plist"),
+                self.spec
+                    .root
+                    .join(format!("runner-generation-{generation}.plist")),
             ),
             (
                 self.spec.stdout(),
-                self.spec.root.join("runner-generation-1.stdout"),
+                self.spec
+                    .root
+                    .join(format!("runner-generation-{generation}.stdout")),
             ),
             (
                 self.spec.stderr(),
-                self.spec.root.join("runner-generation-1.stderr"),
+                self.spec
+                    .root
+                    .join(format!("runner-generation-{generation}.stderr")),
             ),
         ] {
             archive_initial_file(&self.spec, &source, &archive)?;
         }
-        File::open(&self.spec.root)?.sync_all()?;
+        File::open(&self.spec.root)?.sync_all()
+    }
+
+    pub(super) fn recover_applied_ack(&mut self) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(1)?;
         self.bootstrap(InstalledRunnerMode::RecoverAppliedAck)
+    }
+
+    pub(super) fn recover_finish_and_child_list(&mut self) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(2)?;
+        self.bootstrap(InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication)
+    }
+
+    pub(super) fn recover_child_list_ack(&mut self) -> io::Result<()> {
+        self.bootout()?;
+        self.archive_generation(3)?;
+        self.bootstrap(InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation)
     }
 
     pub(super) fn success(&mut self) -> io::Result<()> {
@@ -1366,7 +1429,7 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
                     return Ok(());
                 }
                 JobObservation::Absent => {
-                    return Err(io::Error::other("runner job disappeared before bootout"))
+                    return Err(io::Error::other("runner job disappeared before bootout"));
                 }
                 JobObservation::Loaded { .. } => {}
             }
@@ -1603,8 +1666,10 @@ mod tests {
             assert!(!plist.contains(forbidden), "{forbidden}");
         }
         assert_eq!(xml("a&<b>\"' $;"), "a&amp;&lt;b&gt;&quot;&apos; $;");
-        assert_eq!(plist_arguments(&["/tmp/build & <x>/guardian \"'".into(), "$; --flag".into()]),
-            "<string>/tmp/build &amp; &lt;x&gt;/guardian &quot;&apos;</string><string>$; --flag</string>");
+        assert_eq!(
+            plist_arguments(&["/tmp/build & <x>/guardian \"'".into(), "$; --flag".into()]),
+            "<string>/tmp/build &amp; &lt;x&gt;/guardian &quot;&apos;</string><string>$; --flag</string>"
+        );
         assert!(plist.contains(&format!(
             "<key>ProgramArguments</key><array>{}</array>",
             plist_arguments(&args)
@@ -1771,6 +1836,8 @@ mod tests {
         for mode in [
             InstalledRunnerMode::InitialPauseAfterApplication,
             InstalledRunnerMode::RecoverAppliedAck,
+            InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication,
+            InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation,
         ] {
             let args = runner.arguments(mode);
             assert_eq!(args[0], runner.program.to_str().unwrap());
@@ -1797,6 +1864,9 @@ mod tests {
                             runner.release_file().to_str().unwrap()
                         ]
                     );
+                    assert_eq!(args[12], runner.root_identity.pid().get().to_string());
+                    assert_eq!(args[14], runner.root_identity.birth().seconds().to_string());
+                    assert_eq!(args[16], runner.root_identity.birth().nanos().to_string());
                 }
                 InstalledRunnerMode::RecoverAppliedAck => {
                     assert_eq!(args.len(), 12);
@@ -1805,6 +1875,30 @@ mod tests {
                         &args[9..],
                         [
                             "--fixture-pause-after-recovered-ack",
+                            "--fixture-release-file",
+                            runner.release_file().to_str().unwrap()
+                        ]
+                    );
+                }
+                InstalledRunnerMode::RecoverFinishAndChildListPauseAfterApplication => {
+                    assert_eq!(args.len(), 12);
+                    assert_eq!(args[2], "recover-finish-and-child-list");
+                    assert_eq!(
+                        &args[9..],
+                        [
+                            "--fixture-pause-after-child-list-apply",
+                            "--fixture-release-file",
+                            runner.release_file().to_str().unwrap()
+                        ]
+                    );
+                }
+                InstalledRunnerMode::RecoverChildListAckPauseAfterConfirmation => {
+                    assert_eq!(args.len(), 12);
+                    assert_eq!(args[2], "recover-child-list-ack");
+                    assert_eq!(
+                        &args[9..],
+                        [
+                            "--fixture-pause-after-child-list-ack",
                             "--fixture-release-file",
                             runner.release_file().to_str().unwrap()
                         ]

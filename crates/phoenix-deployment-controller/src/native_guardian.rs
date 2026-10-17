@@ -125,6 +125,28 @@ impl SqliteNativeEvidenceReader {
             .read_native_sampling_evidence(key)
             .map_err(|_| NativeEvidenceReadError)
     }
+
+    /// Reads exact root child-list evidence without constructing executable authority.
+    /// # Errors
+    /// Refuses another attempt or invalid durable evidence.
+    pub fn child_list_evidence(
+        &mut self,
+        key: crate::DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeChildListStatus,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        if key.attempt_id() != self.attempt {
+            return Err(NativeEvidenceReadError);
+        }
+        self.store
+            .read_native_child_list_evidence(key)
+            .map_err(|_| NativeEvidenceReadError)
+    }
 }
 
 impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
@@ -161,6 +183,19 @@ impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
         NativeEvidenceReadError,
     > {
         Self::sampling_evidence(self, key)
+    }
+    fn child_list_evidence(
+        &mut self,
+        key: crate::DispatchKey,
+    ) -> Result<
+        Option<(
+            crate::LoadedAttempt,
+            crate::NativeGuardianBinding,
+            crate::NativeChildListStatus,
+        )>,
+        NativeEvidenceReadError,
+    > {
+        Self::child_list_evidence(self, key)
     }
     fn reconciliation_evidence(
         &mut self,
@@ -427,10 +462,17 @@ fn serve_frame<E: GuardianExecutor>(
 ) -> Result<(), CodecError> {
     let result = (|| {
         let request: Request = read_frame(stream)?;
-        if matches!(request, Request::DispatchSubmit { .. }) {
+        if matches!(
+            request,
+            Request::DispatchSubmit { .. } | Request::NativeChildListSubmit { .. }
+        ) {
             stream.deadline = (Instant::now() + EFFECT_RESPONSE_SLICE).min(until);
         }
-        let ack_request = matches!(request, Request::AckAfterAppliedRevision { .. });
+        let ack_request = matches!(
+            request,
+            Request::AckAfterAppliedRevision { .. }
+                | Request::AckNativeChildListAfterApplied { .. }
+        );
         let response = server.handle(request);
         if ack_request && matches!(response, Response::Acked { .. }) {
             if let Some(listener) = ack_response_barrier.take() {
@@ -646,6 +688,95 @@ pub struct GuardianClient {
     build: BuildIdentity,
     verified_snapshot: Option<WireSnapshot>,
 }
+/// Affine proof that this exact child-list ticket was never submitted.
+#[derive(Debug)]
+pub struct UnsubmittedNativeChildList {
+    ticket: crate::DispatchTicket,
+    issue: crate::NativeChildListIssue,
+}
+
+impl UnsubmittedNativeChildList {
+    /// Recovers the original affine values for an explicit retry after a proven pre-execution refusal.
+    #[must_use]
+    pub fn into_retry_parts(self) -> (crate::DispatchTicket, crate::NativeChildListIssue) {
+        (self.ticket, self.issue)
+    }
+}
+
+#[derive(Debug)]
+pub enum NativeChildListDispatchError {
+    KnownUnsubmitted {
+        error: ClientError,
+        unsubmitted: Box<UnsubmittedNativeChildList>,
+    },
+    SubmissionUnknown(ClientError),
+}
+
+fn child_list_submit_refusal_is_unsubmitted(error: &ClientError) -> bool {
+    use crate::guardian_ipc::WireGuardianError as G;
+    matches!(
+        error,
+        ClientError::Refused(
+            WireError::UnknownAdmission
+                | WireError::AdmissionMismatch
+                | WireError::MissingProof
+                | WireError::UnsupportedDurableBinding
+                | WireError::Guardian(
+                    G::StaleSession
+                        | G::StaleDispatchRevision
+                        | G::NotActive
+                        | G::SessionFenced
+                        | G::AttemptMismatch
+                        | G::InstanceMismatch
+                        | G::DeadlineExpired
+                        | G::AuthorityLost
+                        | G::RetainedResultCapacityExceeded
+                )
+        )
+    )
+}
+
+fn child_list_snapshot_matches(
+    snapshot: &WireSnapshot,
+    issue: crate::NativeChildListIssue,
+) -> bool {
+    let Some(native) = snapshot.native_binding.as_ref() else {
+        return false;
+    };
+    let guardian = issue.guardian_identity();
+    snapshot.state == crate::guardian_ipc::WireState::Active
+        && snapshot.attempt == issue.key().attempt_id().get()
+        && snapshot.session.instance == snapshot.instance
+        && snapshot.session.generation == issue.session_generation().get()
+        && native.attempt == snapshot.attempt
+        && native.deadline == snapshot.deadline
+        && native.nonce == guardian.nonce.bytes()
+        && native.guardian == guardian.process.into()
+        && native.slots.len() == 1
+        && native.slots[0].identity == issue.parent().into()
+}
+
+fn child_list_ack_snapshot_matches(
+    snapshot: &WireSnapshot,
+    issue: crate::NativeChildListIssue,
+) -> bool {
+    let Some(native) = snapshot.native_binding.as_ref() else {
+        return false;
+    };
+    let guardian = issue.guardian_identity();
+    matches!(
+        snapshot.state,
+        crate::guardian_ipc::WireState::Active | crate::guardian_ipc::WireState::Reconciling
+    ) && snapshot.attempt == issue.key().attempt_id().get()
+        && snapshot.session.instance == snapshot.instance
+        && native.attempt == snapshot.attempt
+        && native.deadline == snapshot.deadline
+        && native.nonce == guardian.nonce.bytes()
+        && native.guardian == guardian.process.into()
+        && native.slots.len() == 1
+        && native.slots[0].identity == issue.parent().into()
+}
+
 impl GuardianClient {
     /// # Errors
     /// Rejects insecure socket paths or peer identities.
@@ -922,6 +1053,213 @@ impl GuardianClient {
                 }
             }
         }
+    }
+
+    /// Consumes and submits an exact durable root child-list issue.
+    /// # Errors
+    /// Returns the original authority only when execution is proven not to have started; ambiguous
+    /// post-submit outcomes remain `SubmissionUnknown` and return no retry authority.
+    pub fn dispatch_native_child_list(
+        &mut self,
+        ticket: crate::DispatchTicket,
+        issue: crate::NativeChildListIssue,
+    ) -> Result<crate::NativeChildListDispatch, NativeChildListDispatchError> {
+        let prepared = (|| {
+            if ticket.key() != issue.key()
+                || !matches!(ticket.effect(), crate::OsEffect::ListChildren { parent } if *parent == issue.parent())
+                || self.verified_snapshot.is_none()
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let snapshot = self.snapshot()?;
+            if !child_list_snapshot_matches(&snapshot, issue)
+                || !crate::MonotonicTick::native_now()
+                    .is_ok_and(|now| now.get() < snapshot.deadline)
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            let key = crate::guardian_ipc::WireKey::try_from(issue.key())
+                .map_err(ClientError::Refused)?;
+            let Response::Admitted { admission } =
+                self.exchange(&Request::NativeChildListAdmit {
+                    session: snapshot.session,
+                    key,
+                    parent: issue.parent().into(),
+                })?
+            else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+            let now = crate::MonotonicTick::native_now().map_err(ClientError::Io)?;
+            if now.get() >= snapshot.deadline {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            Ok((snapshot.session, key, admission, now))
+        })();
+        let (session, key, admission, now) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.stream.take();
+                self.verified_snapshot = None;
+                return Err(NativeChildListDispatchError::KnownUnsubmitted {
+                    error,
+                    unsubmitted: Box::new(UnsubmittedNativeChildList { ticket, issue }),
+                });
+            }
+        };
+        let result = self.exchange_with_slice(
+            &Request::NativeChildListSubmit {
+                session,
+                admission,
+                now: now.get(),
+            },
+            EFFECT_RESPONSE_SLICE,
+        );
+        match result {
+            Ok(Response::Submitted { key: returned }) if returned == key => {
+                Ok(crate::NativeChildListDispatch::new(ticket, issue))
+            }
+            result => {
+                let error = result.err().unwrap_or(ClientError::UnexpectedResponse);
+                self.stream.take();
+                self.verified_snapshot = None;
+                if child_list_submit_refusal_is_unsubmitted(&error) {
+                    Err(NativeChildListDispatchError::KnownUnsubmitted {
+                        error,
+                        unsubmitted: Box::new(UnsubmittedNativeChildList { ticket, issue }),
+                    })
+                } else {
+                    Err(NativeChildListDispatchError::SubmissionUnknown(error))
+                }
+            }
+        }
+    }
+
+    /// Read and verify the exact retained root child-list completion.
+    /// # Errors
+    /// Refuses stale snapshots, mismatched custody, malformed child vectors, or wrong parents.
+    pub fn observe_native_child_list(
+        &mut self,
+        dispatch: crate::NativeChildListDispatch,
+    ) -> Result<crate::VerifiedNativeChildListCompletion, ClientError> {
+        let issue = dispatch.issue();
+        if self.verified_snapshot.is_none() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        if !child_list_snapshot_matches(&snapshot, issue) {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let retained = match self.exchange(&Request::ObserveNativeChildList {
+            session: snapshot.session,
+            key,
+        })? {
+            Response::Retained(Some(retained)) if retained.key == key => retained,
+            Response::Hello { .. }
+            | Response::Snapshot(_)
+            | Response::Fenced
+            | Response::ReconciliationBegun { .. }
+            | Response::InitialReleased { .. }
+            | Response::ReconciliationPrepared { .. }
+            | Response::ReconciliationFinished
+            | Response::Inventory(_)
+            | Response::SlotObserved(_)
+            | Response::Retained(_)
+            | Response::RecoveredNativeSampling { .. }
+            | Response::Acked { .. }
+            | Response::SignalRoundReserved
+            | Response::Admitted { .. }
+            | Response::Submitted { .. }
+            | Response::Refused(_) => return Err(ClientError::UnexpectedResponse),
+        };
+        let crate::guardian_ipc::WireCompletion::ListChildren { parent, result } =
+            retained.completion
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        let parent: crate::ProcessIdentity = parent
+            .try_into()
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        if parent != issue.parent() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let completion = match result {
+            Ok(children) => {
+                if children.len() > crate::guardian_ipc::MAX_NATIVE_CHILDREN {
+                    return Err(ClientError::UnexpectedResponse);
+                }
+                let children = children
+                    .into_iter()
+                    .map(|pid| std::num::NonZeroU32::new(pid).map(crate::ProcessId::new))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(ClientError::UnexpectedResponse)?;
+                crate::NativeChildListCompletion::Children(children)
+            }
+            Err(error) => crate::NativeChildListCompletion::Failure(match error {
+                crate::guardian_ipc::WireQueryError::PermissionDenied => {
+                    crate::OsQueryError::PermissionDenied
+                }
+                crate::guardian_ipc::WireQueryError::TemporarilyUnavailable => {
+                    crate::OsQueryError::TemporarilyUnavailable
+                }
+                crate::guardian_ipc::WireQueryError::Malformed => crate::OsQueryError::Malformed,
+            }),
+        };
+        Ok(crate::VerifiedNativeChildListCompletion::new(
+            dispatch, completion,
+        ))
+    }
+
+    /// ACK only the exact successful durable application after its result was persisted.
+    /// # Errors
+    /// Refuses absent application evidence, mismatched retained custody, stale sessions, or an
+    /// uncorrelated ACK response.
+    pub fn ack_native_child_list(
+        &mut self,
+        status: crate::NativeChildListStatus,
+    ) -> Result<crate::VerifiedNativeChildListAckConfirmation, ClientError> {
+        let crate::NativeChildListStatus::AppliedPendingAck {
+            issue,
+            children,
+            applying_revision,
+        } = status
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if self.verified_snapshot.is_none() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let snapshot = self.snapshot()?;
+        if !child_list_ack_snapshot_matches(&snapshot, issue)
+            || !crate::MonotonicTick::native_now().is_ok_and(|now| now.get() < snapshot.deadline)
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let key =
+            crate::guardian_ipc::WireKey::try_from(issue.key()).map_err(ClientError::Refused)?;
+        let Response::Acked {
+            key: returned,
+            applied_revision: returned_revision,
+        } = self.exchange(&Request::AckNativeChildListAfterApplied {
+            session: snapshot.session,
+            key,
+            applied_revision: applying_revision.get(),
+        })?
+        else {
+            return Err(ClientError::UnexpectedResponse);
+        };
+        if returned != key || returned_revision != applying_revision.get() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let generation = std::num::NonZeroU64::new(snapshot.session.generation)
+            .ok_or(ClientError::UnexpectedResponse)?;
+        Ok(crate::VerifiedNativeChildListAckConfirmation::new(
+            issue,
+            children,
+            applying_revision,
+            generation,
+        ))
     }
 
     /// Read and verify the exact retained sampling completion from this live guardian.
@@ -1348,6 +1686,45 @@ pub fn recover_native_sampling_ack(
     store
         .confirm_native_sampling_ack(proof)
         .map_err(NativeSamplingAckRecoveryError::Store)
+}
+
+/// Diagnostic child-list recovery ACK; it never recreates a ticket or policy loop.
+#[derive(Debug)]
+pub enum NativeChildListAckRecoveryError {
+    Store(crate::ControllerStoreError),
+    Guardian(ClientError),
+    NoPendingApplication,
+}
+
+/// # Errors
+/// Refuses absent/failed application, guardian mismatch, or store failure.
+pub fn recover_native_child_list_ack(
+    store: &mut crate::ControllerSqliteStore,
+    client: &mut GuardianClient,
+    key: crate::DispatchKey,
+) -> Result<crate::NativeChildListStatus, NativeChildListAckRecoveryError> {
+    let (_, _, status) = store
+        .read_native_child_list_evidence(key)
+        .map_err(NativeChildListAckRecoveryError::Store)?
+        .ok_or(NativeChildListAckRecoveryError::NoPendingApplication)?;
+    if matches!(
+        status,
+        crate::NativeChildListStatus::ChildrenAckConfirmed { .. }
+    ) {
+        return Ok(status);
+    }
+    if !matches!(
+        status,
+        crate::NativeChildListStatus::AppliedPendingAck { .. }
+    ) {
+        return Err(NativeChildListAckRecoveryError::NoPendingApplication);
+    }
+    let proof = client
+        .ack_native_child_list(status)
+        .map_err(NativeChildListAckRecoveryError::Guardian)?;
+    store
+        .confirm_native_child_list_ack(proof)
+        .map_err(NativeChildListAckRecoveryError::Store)
 }
 
 /// Verified diagnostic outcome, not a live controller session or execution permit.
@@ -2250,6 +2627,30 @@ mod native_sampling_snapshot_tests {
                 store.load_native_sampling_status(issue.key()).unwrap(),
                 Some(crate::NativeSamplingStatus::IssuedPendingApplication { issue })
             );
+        }
+    }
+
+    #[test]
+    fn child_list_submit_refusal_classification_keeps_only_preexecution_errors_retryable() {
+        use crate::guardian_ipc::WireGuardianError as G;
+
+        for error in [
+            ClientError::Refused(WireError::UnknownAdmission),
+            ClientError::Refused(WireError::AdmissionMismatch),
+            ClientError::Refused(WireError::MissingProof),
+            ClientError::Refused(WireError::UnsupportedDurableBinding),
+            ClientError::Refused(WireError::Guardian(G::StaleSession)),
+            ClientError::Refused(WireError::Guardian(G::DeadlineExpired)),
+            ClientError::Refused(WireError::Guardian(G::AuthorityLost)),
+        ] {
+            assert!(child_list_submit_refusal_is_unsubmitted(&error));
+        }
+        for error in [
+            ClientError::UnexpectedResponse,
+            ClientError::Refused(WireError::InvalidValue),
+            ClientError::Refused(WireError::Guardian(G::ExecutorCorrelationMismatch)),
+        ] {
+            assert!(!child_list_submit_refusal_is_unsubmitted(&error));
         }
     }
 

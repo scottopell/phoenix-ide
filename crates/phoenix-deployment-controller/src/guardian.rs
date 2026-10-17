@@ -848,6 +848,29 @@ impl<E: GuardianExecutor> Guardian<E> {
         Ok(())
     }
 
+    pub(crate) fn validate_native_child_list_admission(
+        &self,
+        session: ControllerSession,
+        key: DispatchKey,
+        parent: ProcessIdentity,
+        now: MonotonicTick,
+    ) -> Result<(), GuardianError> {
+        self.require_dispatch(session, key, &OsEffect::ListChildren { parent })?;
+        if now >= self.deadline {
+            return Err(GuardianError::DeadlineExpired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn submit_native_child_list(
+        &mut self,
+        admission: crate::guardian_ipc::NativeChildListAdmission,
+        now: MonotonicTick,
+    ) -> Result<DispatchKey, PolicySubmissionError> {
+        let (session, ticket) = admission.into_ticket();
+        self.submit_policy_ticket(session, ticket, now)
+    }
+
     pub(crate) fn submit_native_sampling(
         &mut self,
         admission: crate::guardian_ipc::NativeSamplingAdmission,

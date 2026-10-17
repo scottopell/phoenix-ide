@@ -1,9 +1,12 @@
 #![cfg(target_os = "macos")]
 #[path = "support/native_sampling.rs"]
 mod native_sampling;
-use native_sampling::{sampling_rows, sampling_runner_command, settled_sampling_keys};
+use native_sampling::{
+    sampling_rows, sampling_runner_command, sampling_runner_command_with_root,
+    settled_sampling_keys,
+};
 use phoenix_deployment_controller::{
-    guardian_ipc::{WireSnapshot, WireState},
+    guardian_ipc::{WireCompletion, WireSnapshot, WireState},
     native_guardian::GuardianClient,
     AttemptId, BirthToken, ControllerOs, ControllerSqliteStore, CpuContentionBasisPoints,
     DeploymentAttempt, IdentityObservation, MacOsControllerOs, MemoryPressure, MonotonicTick,
@@ -309,6 +312,362 @@ fn wait_for_detached(dir: &Path) -> WireSnapshot {
         // test-timing-allow: bounded polling observes the protocol state transition.
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+struct ChildListProcessFixture {
+    _parent: tempfile::TempDir,
+    dir: PathBuf,
+    path: PathBuf,
+    attempt: AttemptId,
+    deadline: MonotonicTick,
+    root: ProcessIdentity,
+    guardian: GuardedGuardian,
+}
+
+fn start_child_list_fixture() -> ChildListProcessFixture {
+    let parent = tempfile::Builder::new()
+        .prefix("sdc-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = parent.path().join("sdc-disposable-child-list-process");
+    let path = parent.path().join("controller.sqlite");
+    let attempt = AttemptId::new(64);
+    let deadline = MonotonicTick::native_now()
+        .unwrap()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
+    drop(ControllerSqliteStore::open(&path).unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-guardian"));
+    command
+        .args([
+            "--socket-dir",
+            dir.to_str().unwrap(),
+            "--child-seconds",
+            "25",
+            "--serve-seconds",
+            "30",
+            "--attempt",
+            "64",
+            "--deadline-nanoseconds",
+            &deadline.get().to_string(),
+            "--store",
+            path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped());
+    let mut guardian = GuardedGuardian::new(command.spawn().unwrap());
+    let line = BufReader::new(guardian.stdout.take().unwrap())
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap();
+    let child_pid = line
+        .strip_prefix("disposable child pid=")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let birth: Vec<_> = line.split("birth=").nth(1).unwrap().split(':').collect();
+    let root = ProcessIdentity::new(
+        ProcessId::new(NonZeroU32::new(child_pid).unwrap()),
+        BirthToken::new(birth[0].parse().unwrap(), birth[1].parse().unwrap()).unwrap(),
+    );
+    wait_for_process_name(i32::try_from(child_pid).unwrap(), "sleep");
+    ChildListProcessFixture {
+        _parent: parent,
+        dir,
+        path,
+        attempt,
+        deadline,
+        root,
+        guardian,
+    }
+}
+
+fn child_list_runner_command(dir: &Path, path: &Path, mode: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"));
+    command.args([
+        "--mode",
+        mode,
+        "--socket-dir",
+        dir.to_str().unwrap(),
+        "--store",
+        path.to_str().unwrap(),
+        "--attempt",
+        "64",
+    ]);
+    command
+}
+
+fn child_list_rows(path: &Path) -> (i64, i64, i64, i64) {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let count = |table: &str| -> i64 {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    (
+        count("native_child_list_issues"),
+        count("native_child_list_applications"),
+        count("native_child_list_ack_confirmations"),
+        count("native_child_list_result_children"),
+    )
+}
+
+fn assert_child_list_issue_parent(path: &Path, root: ProcessIdentity) {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (pid, seconds, nanos): (i64, i64, i64) = db
+        .query_row(
+            "SELECT parent_pid,parent_birth_seconds,parent_birth_nanos FROM native_child_list_issues",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(pid, i64::from(root.pid().get()));
+    assert_eq!(seconds, i64::try_from(root.birth().seconds()).unwrap());
+    assert_eq!(nanos, i64::from(root.birth().nanos()));
+}
+
+fn assert_runner_output_ends_at(output: &str, marker: &str) {
+    let lines: Vec<_> = output.lines().collect();
+    let marker_index = lines
+        .iter()
+        .position(|line| line.starts_with(marker))
+        .unwrap_or_else(|| panic!("missing marker {marker:?} in output:\n{output}"));
+    assert_eq!(
+        marker_index,
+        lines.len() - 1,
+        "extra runner output: {output}"
+    );
+}
+
+#[test]
+fn fresh_runner_lists_guardian_root_children_without_mutating_custody() {
+    let ChildListProcessFixture {
+        _parent,
+        dir,
+        path,
+        attempt,
+        deadline,
+        root,
+        mut guardian,
+    } = start_child_list_fixture();
+    let initial = sampling_runner_command_with_root(&dir, &path, deadline, root, false)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "initial sample failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&initial.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "verified binding: InitialActive",
+            "sample_ack_confirmed generation=1"
+        ]
+    );
+    assert_eq!(sampling_rows(&path).0, 1);
+    let initial_detached = wait_for_detached(&dir);
+    assert!(initial_detached.retained.is_empty());
+
+    let runner = child_list_runner_command(&dir, &path, "recover-finish-and-child-list")
+        .output()
+        .unwrap();
+    assert!(
+        runner.status.success(),
+        "child-list runner failed: {}",
+        String::from_utf8_lossy(&runner.stderr)
+    );
+    let output = String::from_utf8_lossy(&runner.stdout);
+    assert!(
+        output.contains("recovered_sample_applied_ack attempt=64") && output.contains("sequence=1"),
+        "fresh runner did not settle the second sample:\n{output}"
+    );
+    assert_runner_output_ends_at(&output, "child_list_ack_confirmed attempt=64");
+
+    let final_snapshot = wait_for_detached(&dir);
+    assert!(final_snapshot.retained.is_empty());
+    assert_eq!(final_snapshot.slots.len(), 1);
+    assert_eq!(final_snapshot.slots, initial_detached.slots);
+    assert_eq!(
+        final_snapshot.native_binding.as_ref().unwrap().nonce,
+        initial_detached.native_binding.as_ref().unwrap().nonce
+    );
+    assert_eq!(
+        final_snapshot.native_binding.as_ref().unwrap().guardian,
+        initial_detached.native_binding.as_ref().unwrap().guardian
+    );
+    assert_eq!(
+        final_snapshot.native_binding.as_ref().unwrap().slots[0].identity,
+        root.into()
+    );
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(root.pid().get()).unwrap(), 0) },
+        0
+    );
+    assert_guardian_is_parent(i32::try_from(root.pid().get()).unwrap(), guardian.id());
+    assert_eq!(child_list_rows(&path), (1, 1, 1, 0));
+    assert_child_list_issue_parent(&path, root);
+    assert_eq!(sampling_rows(&path).0, 2);
+    assert_eq!(sampling_rows(&path).1, 2);
+    assert_eq!(sampling_rows(&path).2, 2);
+    assert_eq!(sampling_rows(&path).4, 1);
+
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(binding.slots()[0].process, root);
+    assert_eq!(
+        observed.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::CleaningOwnedTree
+    );
+    guardian.finish();
+    wait_process_gone(
+        i32::try_from(root.pid().get()).unwrap(),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn child_list_ack_recovery_does_not_reenumerate_or_reapply_after_runner_crash() {
+    let ChildListProcessFixture {
+        _parent,
+        dir,
+        path,
+        attempt,
+        deadline,
+        root,
+        mut guardian,
+    } = start_child_list_fixture();
+    let initial = sampling_runner_command_with_root(&dir, &path, deadline, root, false)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "initial sample failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    assert_eq!(sampling_rows(&path).0, 1);
+    let initial_detached = wait_for_detached(&dir);
+    assert!(initial_detached.retained.is_empty());
+
+    let mut runner = GuardedRunner::new(
+        child_list_runner_command(&dir, &path, "recover-finish-and-child-list")
+            .arg("--fixture-pause-after-child-list-apply")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = BufReader::new(runner.stdout.take().unwrap());
+    let mut second_sample_seen = false;
+    loop {
+        let marker = line(&mut output);
+        if marker.starts_with("recovered_sample_applied_ack attempt=64") {
+            assert!(marker.ends_with("sequence=1"), "{marker}");
+            second_sample_seen = true;
+        }
+        if marker.starts_with("child_list_application_committed_pending_ack revision=") {
+            assert!(second_sample_seen, "child list preceded the second sample");
+            break;
+        }
+    }
+    assert!(runner.try_wait().unwrap().is_none());
+    assert_eq!(child_list_rows(&path), (1, 1, 0, 0));
+    assert_child_list_issue_parent(&path, root);
+    let mut observed = ControllerSqliteStore::open_read_only(&path).unwrap();
+    let (key, status) = observed
+        .pending_native_child_list_ack(attempt)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        status,
+        phoenix_deployment_controller::NativeChildListStatus::AppliedPendingAck {
+            children,
+            ..
+        } if children.is_empty()
+    ));
+
+    runner.kill_checked();
+    let crashed = wait_for_detached(&dir);
+    assert_eq!(crashed.retained.len(), 1);
+    assert!(matches!(
+        &crashed.retained[0].completion,
+        WireCompletion::ListChildren {
+            parent,
+            result: Ok(children),
+        } if *parent == root.into() && children.is_empty()
+    ));
+    assert_eq!(child_list_rows(&path), (1, 1, 0, 0));
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(root.pid().get()).unwrap(), 0) },
+        0
+    );
+    assert_guardian_is_parent(i32::try_from(root.pid().get()).unwrap(), guardian.id());
+
+    let replacement = child_list_runner_command(&dir, &path, "recover-child-list-ack")
+        .output()
+        .unwrap();
+    assert!(
+        replacement.status.success(),
+        "child-list ACK recovery failed: {}",
+        String::from_utf8_lossy(&replacement.stderr)
+    );
+    let replacement_output = String::from_utf8_lossy(&replacement.stdout);
+    assert!(replacement_output.starts_with("verified binding: Detached\n"));
+    assert!(replacement_output.contains("reconciling generation=3 interruption="));
+    assert!(replacement_output.contains("child_list_ack_confirmed attempt=64"));
+    assert!(!replacement_output.contains("child_list_application_committed_pending_ack"));
+    assert_runner_output_ends_at(&replacement_output, "child_list_ack_confirmed attempt=64");
+
+    let final_snapshot = wait_for_detached(&dir);
+    assert!(final_snapshot.retained.is_empty());
+    assert_eq!(final_snapshot.slots, crashed.slots);
+    assert_eq!(
+        final_snapshot.native_binding.as_ref().unwrap().nonce,
+        crashed.native_binding.as_ref().unwrap().nonce
+    );
+    assert_eq!(
+        final_snapshot.native_binding.as_ref().unwrap().guardian,
+        crashed.native_binding.as_ref().unwrap().guardian
+    );
+    assert_eq!(child_list_rows(&path), (1, 1, 1, 0));
+    assert_child_list_issue_parent(&path, root);
+    let final_binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(final_binding.slots()[0].process, root);
+    assert_eq!(
+        observed.load_attempt(attempt).unwrap().unwrap().phase(),
+        Phase::Interrupted
+    );
+    assert!(matches!(
+        observed.load_native_child_list_status(key).unwrap(),
+        Some(phoenix_deployment_controller::NativeChildListStatus::ChildrenAckConfirmed {
+            children,
+            ..
+        }) if children.is_empty()
+    ));
+    assert_eq!(sampling_rows(&path).0, 2);
+    assert_eq!(sampling_rows(&path).1, 2);
+    assert_eq!(sampling_rows(&path).2, 2);
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(root.pid().get()).unwrap(), 0) },
+        0
+    );
+    assert_guardian_is_parent(i32::try_from(root.pid().get()).unwrap(), guardian.id());
+    guardian.finish();
+    wait_process_gone(
+        i32::try_from(root.pid().get()).unwrap(),
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
