@@ -214,7 +214,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: ae5c1c060fedda1391b0ed339e32cab70a6e2699
+          ref: f16afb227d9336a863c0b0345960ea9a6d62b7c7
           path: pinned-app
           fetch-depth: 0
           persist-credentials: false
@@ -256,7 +256,7 @@ jobs:
           spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
           import sys
           module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
-          source='ae5c1c060fedda1391b0ed339e32cab70a6e2699'; tree='46d7a13bbf193e849c7909a38776d62972c6b040'
+          source='f16afb227d9336a863c0b0345960ea9a6d62b7c7'; tree='369305dcd94862d4ee12e7af9fd463d5da14d808'
           for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
               module.admit_artifact(root, root/'ui'/name, source, tree, mode)
           (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
@@ -267,8 +267,8 @@ jobs:
         shell: bash
         working-directory: pinned-app
         run: |
-          test "$(git rev-parse HEAD)" = ae5c1c060fedda1391b0ed339e32cab70a6e2699
-          test "$(git rev-parse HEAD^{tree})" = 46d7a13bbf193e849c7909a38776d62972c6b040
+          test "$(git rev-parse HEAD)" = f16afb227d9336a863c0b0345960ea9a6d62b7c7
+          test "$(git rev-parse HEAD^{tree})" = 369305dcd94862d4ee12e7af9fd463d5da14d808
           test "$(git merge-base HEAD 1f9529c634a074c6ab6ea36eb15ca284770df1a5)" = 1f9529c634a074c6ab6ea36eb15ca284770df1a5
           git config user.email ci@phoenix-ide.invalid
           git config user.name 'Phoenix CI'
@@ -294,6 +294,24 @@ jobs:
               'cargo_lock_sha256': hashlib.sha256((root/'Cargo.lock').read_bytes()).hexdigest(),
               'codegen_command': './dev.py codegen', 'generated_files': files}, indent=2))
           PY
+      - name: Exact SQLx bound ceiling plan and full-row parity
+        shell: bash
+        working-directory: pinned-app
+        run: |
+          set -euo pipefail
+          output="$GITHUB_WORKSPACE/opening-bound-ceiling"
+          mkdir -p "$output"
+          for selector in \
+            message_page_materializes_bound_snapshot_ceiling_once_with_result_parity \
+            message_page_query_enforces_transcript_first_indexed_join \
+            late_hydration_matches_full_row_oracle_matrix; do
+            cargo test -p phoenix-db --lib "product_conversation_read::tests::$selector" \
+              -- --exact --nocapture --test-threads=1 2>&1 | tee "$output/$selector.log"
+            grep -F 'running 1 test' "$output/$selector.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$output/$selector.log"
+          done
+          grep -E 'bound_snapshot_ceiling_sqlite_version=[0-9]+\.[0-9]+\.[0-9]+' \
+            "$output/message_page_materializes_bound_snapshot_ceiling_once_with_result_parity.log"
       - name: Execute owned Coordinator continuation admission fixture
         shell: bash
         working-directory: pinned-app
@@ -501,6 +519,7 @@ jobs:
           if-no-files-found: warn
           path: |
             opening-codegen-receipt.json
+            opening-bound-ceiling/
             opening-codegen.log
             opening-coordinator-home-fixture.log
             opening-coordinator-home-fixture-receipt.json

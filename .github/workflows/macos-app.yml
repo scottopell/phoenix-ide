@@ -172,7 +172,7 @@ jobs:
           shared-key: owned-chrome-macos
       - name: Admit exact app sources, build existing UI embed and install owned Chromium
         run: |
-          git diff --exit-code ae5c1c060fedda1391b0ed339e32cab70a6e2699 HEAD -- crates
+          git diff --exit-code f16afb227d9336a863c0b0345960ea9a6d62b7c7 HEAD -- crates
           cd ui
           npm install -g corepack@latest
           corepack enable

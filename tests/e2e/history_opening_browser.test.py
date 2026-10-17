@@ -176,6 +176,22 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("command = [str(destination), 'opening_qualifier::', '--nocapture', '--test-threads=1']", workflow)
         self.assertIn("'11 passed; 0 failed; 1 ignored'", workflow)
 
+    def test_bound_ceiling_sqlx_qualification_requires_exact_execution_and_engine_receipt(self):
+        workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("      - name: Exact SQLx bound ceiling plan and full-row parity\n", 1)[1].split("      - name:", 1)[0]
+        for selector in [
+            "message_page_materializes_bound_snapshot_ceiling_once_with_result_parity",
+            "message_page_query_enforces_transcript_first_indexed_join",
+            "late_hydration_matches_full_row_oracle_matrix",
+        ]:
+            self.assertIn(selector, step)
+        self.assertIn("set -euo pipefail", step)
+        self.assertIn('cargo test -p phoenix-db --lib "product_conversation_read::tests::$selector"', step)
+        self.assertIn("-- --exact --nocapture --test-threads=1", step)
+        self.assertIn("test result: ok. 1 passed; 0 failed; 0 ignored;", step)
+        self.assertIn("bound_snapshot_ceiling_sqlite_version=", step)
+        self.assertIn("            opening-bound-ceiling/\n", workflow)
+
     def test_actual_pinned_git_module_bytes_match_both_unmocked_hash_consumers(self):
         import hashlib
         import subprocess
