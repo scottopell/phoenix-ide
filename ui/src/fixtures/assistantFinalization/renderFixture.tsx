@@ -29,7 +29,7 @@ export function AssistantFinalizationFixture({ density }: { density: Density }) 
       <DensityContext.Provider value={{ density, setDensity: () => {} }}>
         <main className="assistant-finalization-fixture" data-finalization-ready={ready} data-finalized={finalized} data-column={new URLSearchParams(window.location.search).get('column') === 'narrow' ? 'narrow' : 'normal'}>
           <button type="button" data-testid="finalize-assistant" onClick={() => setFinalized(true)}>Finalize identical text</button>
-          <UserMessage message={{ event_presentation: null, message_id: 'user-control', conversation_id: 'geometry', sequence_id: 1, message_type: 'user', created_at: timestamp, content: { text: 'User message geometry is outside the assistant chrome change.' } }} />
+          <UserMessage message={{ origin: { kind: 'user_api' }, event_presentation: null, message_id: 'user-control', conversation_id: 'geometry', sequence_id: 1, message_type: 'user', created_at: timestamp, content: { text: 'User message geometry is outside the assistant chrome change.' } }} />
           {cases.map(({ id, isFirstInTurn, mode }, index) => {
             const message: Message = {
               event_presentation: null, message_id: id, conversation_id: 'geometry', sequence_id: index + 2,
