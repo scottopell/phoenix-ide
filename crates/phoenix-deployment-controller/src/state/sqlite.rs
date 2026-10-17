@@ -540,6 +540,7 @@ impl ControllerSqliteStore {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn persist_checkpoint_with_sample(
         &mut self,
         checkpoint: &DeploymentAttempt,
@@ -554,7 +555,7 @@ impl ControllerSqliteStore {
             &NativeGuardianBinding,
             &NativeSamplingIssue,
         )>,
-        clock: &mut impl FnMut() -> Result<MonotonicTick>,
+        clock: &mut (impl FnMut() -> Result<MonotonicTick> + ?Sized),
     ) -> Result<PersistenceRevision> {
         let transaction = self
             .connection
@@ -602,6 +603,12 @@ impl ControllerSqliteStore {
                 return Err(ControllerStoreError::RevisionConflict);
             }
         }
+        if child_application.is_some()
+            && clock()?
+                >= required(durable.as_ref(), "missing native child list checkpoint")?.deadline()
+        {
+            return Err(ControllerStoreError::RevisionConflict);
+        }
         if let Some((issue, completion)) = child_application {
             native_child_list::validate_application(
                 &transaction,
@@ -647,6 +654,9 @@ impl ControllerSqliteStore {
         }
         if let Some((_, binding, _)) = reconciliation {
             native_reconciliation::insert_completion(&transaction, binding, revision)?;
+        }
+        if child_application.is_some() && clock()? >= checkpoint.deadline() {
+            return Err(ControllerStoreError::RevisionConflict);
         }
         if let Some((interrupted, _, _)) = recovered_sample {
             if clock()? >= interrupted.deadline() {

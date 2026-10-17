@@ -271,6 +271,7 @@ struct NativeChildListStore<'a> {
     store: &'a mut crate::ControllerSqliteStore,
     issue: crate::NativeChildListIssue,
     completion: crate::NativeChildListCompletion,
+    clock: Option<&'a mut dyn FnMut() -> Result<crate::MonotonicTick, crate::ControllerStoreError>>,
 }
 
 impl AttemptStore for NativeChildListStore<'_> {
@@ -280,8 +281,17 @@ impl AttemptStore for NativeChildListStore<'_> {
         &mut self,
         checkpoint: &DeploymentAttempt,
     ) -> Result<PersistenceRevision, Self::Error> {
-        self.store
-            .persist_native_child_list(checkpoint, &self.issue, &self.completion)
+        match self.clock.as_deref_mut() {
+            Some(clock) => self.store.persist_native_child_list_with_clock(
+                checkpoint,
+                &self.issue,
+                &self.completion,
+                clock,
+            ),
+            None => self
+                .store
+                .persist_native_child_list(checkpoint, &self.issue, &self.completion),
+        }
     }
 }
 
@@ -576,6 +586,27 @@ impl PolicyLoop {
         verified: crate::VerifiedNativeChildListCompletion,
         store: &mut crate::ControllerSqliteStore,
     ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
+        self.apply_native_child_list_with_clock(verified, store, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_native_child_list_at<'a>(
+        &mut self,
+        verified: crate::VerifiedNativeChildListCompletion,
+        store: &'a mut crate::ControllerSqliteStore,
+        clock: &'a mut dyn FnMut() -> Result<crate::MonotonicTick, crate::ControllerStoreError>,
+    ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
+        self.apply_native_child_list_with_clock(verified, store, Some(clock))
+    }
+
+    fn apply_native_child_list_with_clock<'a>(
+        &mut self,
+        verified: crate::VerifiedNativeChildListCompletion,
+        store: &'a mut crate::ControllerSqliteStore,
+        clock: Option<
+            &'a mut dyn FnMut() -> Result<crate::MonotonicTick, crate::ControllerStoreError>,
+        >,
+    ) -> Result<LoopProgress, LoopError<crate::ControllerStoreError>> {
         let (ticket, issue, completion) = verified.into_parts();
         let key = ticket.key();
         let belongs_to_loop = self.rounds.iter().any(|round| {
@@ -615,6 +646,7 @@ impl PolicyLoop {
             store,
             issue,
             completion,
+            clock,
         };
         self.apply_retained(&executed, &mut adapter)
     }

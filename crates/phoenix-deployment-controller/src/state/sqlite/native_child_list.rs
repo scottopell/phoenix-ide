@@ -452,6 +452,21 @@ impl ControllerSqliteStore {
         issue: &NativeChildListIssue,
         completion: &NativeChildListCompletion,
     ) -> Result<PersistenceRevision> {
+        self.persist_native_child_list_with_clock(
+            checkpoint,
+            issue,
+            completion,
+            &mut super::native_sampling::native_deadline_now,
+        )
+    }
+
+    pub(crate) fn persist_native_child_list_with_clock(
+        &mut self,
+        checkpoint: &DeploymentAttempt,
+        issue: &NativeChildListIssue,
+        completion: &NativeChildListCompletion,
+        clock: &mut (impl FnMut() -> Result<MonotonicTick> + ?Sized),
+    ) -> Result<PersistenceRevision> {
         self.ensure_usable()?;
         let result = self.persist_checkpoint_with_sample(
             checkpoint,
@@ -459,7 +474,7 @@ impl ControllerSqliteStore {
             Some((issue, completion)),
             None,
             None,
-            &mut super::native_sampling::native_deadline_now,
+            clock,
         );
         if result.is_err() {
             self.poisoned = true;

@@ -16,10 +16,17 @@ fn identity(pid: u32) -> ProcessIdentity {
 fn setup(
     slots: &[NativeGuardianSlot],
 ) -> (ControllerSqliteStore, PolicyLoop, NativeGuardianBinding) {
+    setup_with_deadline(slots, MonotonicTick::new(u64::MAX))
+}
+
+fn setup_with_deadline(
+    slots: &[NativeGuardianSlot],
+    deadline: MonotonicTick,
+) -> (ControllerSqliteStore, PolicyLoop, NativeGuardianBinding) {
     let mut store = ControllerSqliteStore::in_memory().unwrap();
     let committed = DeploymentAttempt::start(
         crate::AttemptId::new(9),
-        MonotonicTick::new(100),
+        deadline,
         ResourcePolicy::new(
             NonZeroUsize::new(1).unwrap(),
             0,
@@ -34,7 +41,7 @@ fn setup(
     let binding = store
         .commit_initial_binding(
             crate::AttemptId::new(9),
-            MonotonicTick::new(100),
+            deadline,
             PersistenceRevision::first(),
             NativeGuardianIdentity {
                 nonce: GuardianLifetimeNonce::new([5; 16]).unwrap(),
@@ -196,6 +203,67 @@ fn complete_empty_and_nonempty_result_ack_and_replay() {
 }
 
 #[test]
+fn application_refuses_expiry_before_validation_or_commit() {
+    for ticks in [[100, 100], [99, 100]] {
+        let (mut store, mut policy, binding) =
+            setup_with_deadline(&[root_slot()], MonotonicTick::new(100));
+        let ticket = policy.issue_next().unwrap();
+        let issue = store
+            .commit_native_child_list_issue_at(&ticket, &binding, MonotonicTick::new(1))
+            .unwrap();
+        let (id, _, _) = parts(issue);
+        let revision_before: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT revision FROM attempts WHERE attempt_id=?1",
+                params![&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dispatch = NativeChildListDispatch::new(ticket, issue);
+        let mut ticks = ticks.into_iter();
+        let error = policy
+            .apply_native_child_list_at(
+                VerifiedNativeChildListCompletion::new(
+                    dispatch,
+                    NativeChildListCompletion::Children(Vec::new()),
+                ),
+                &mut store,
+                &mut || Ok(MonotonicTick::new(ticks.next().unwrap())),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LoopError::Persistence(ControllerStoreError::RevisionConflict)
+        ));
+        assert_eq!(
+            read_status(&store.connection, issue.key()).unwrap(),
+            Some(NativeChildListStatus::IssuedPendingApplication { issue })
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_child_list_applications",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let revision_after: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT revision FROM attempts WHERE attempt_id=?1",
+                params![&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_after, revision_before);
+    }
+}
+
+#[test]
 fn failures_park_and_never_offer_ack() {
     for failure in [
         OsQueryError::PermissionDenied,
@@ -239,7 +307,11 @@ fn rejection_poison_and_deadline_and_root_slot() {
             }],
             _ => vec![root_slot()],
         };
-        let (mut store, mut policy, binding) = setup(&slots);
+        let (mut store, mut policy, binding) = if bad == "deadline" {
+            setup_with_deadline(&slots, MonotonicTick::new(100))
+        } else {
+            setup(&slots)
+        };
         let ticket = policy.issue_next().unwrap();
         let forged = if bad == "wrong_parent" {
             DispatchTicket::from_committed_parts(
