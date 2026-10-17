@@ -658,7 +658,7 @@ fn child_list_ack_recovery_does_not_reenumerate_or_reapply_after_runner_crash() 
     );
     let replacement_output = String::from_utf8_lossy(&replacement.stdout);
     assert!(replacement_output.starts_with("verified binding: Detached\n"));
-    assert!(replacement_output.contains("reconciling generation=3 interruption="));
+    assert!(replacement_output.contains("reconciling generation=4 interruption="));
     assert!(replacement_output.contains("child_list_ack_confirmed attempt=64"));
     assert!(!replacement_output.contains("child_list_application_committed_pending_ack"));
     assert_runner_output_ends_at(&replacement_output, "child_list_ack_confirmed attempt=64");
