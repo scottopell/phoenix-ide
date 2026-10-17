@@ -66,9 +66,12 @@ impl OwnedChromeGroup {
             return Ok(true);
         }
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
+        let observed_identity =
+            phoenix_core::process_identity::current_process_identity(self.root.pid);
         // SAFETY: getpgid only observes this candidate process; no signal here.
-        let live_matches =
-            process_identity_matches(self.root) && unsafe { libc::getpgid(pid) } == pid;
+        let observed_group = unsafe { libc::getpgid(pid) };
+        let group_error = (observed_group == -1).then(io::Error::last_os_error);
+        let live_matches = observed_identity == Some(self.root) && observed_group == pid;
         if live_matches {
             return Ok(false);
         }
@@ -76,9 +79,10 @@ impl OwnedChromeGroup {
         if self.waitable_exit()? {
             return Ok(true);
         }
-        Err(io::Error::other(
-            "live Chrome root birth identity or launch group changed",
-        ))
+        Err(io::Error::other(format!(
+            "live Chrome root birth identity or launch group changed: expected={:?} observed={observed_identity:?} child_pid={:?} pgid={observed_group} pgid_error={group_error:?} waitable_exit=false",
+            self.root, child.id(),
+        )))
     }
 
     fn signal(&self, child: &mut tokio::process::Child, signal: libc::c_int) -> io::Result<()> {
@@ -227,7 +231,7 @@ mod tests {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-    async fn sentinel() -> tokio::process::Child {
+    fn sentinel() -> tokio::process::Child {
         tokio::process::Command::new("/bin/sh")
             .args(["-c", "exec cat >/dev/null"])
             .stdin(Stdio::piped())
@@ -240,7 +244,7 @@ mod tests {
     async fn exited_root_drains_stderr_closed_writer_before_profile_removal() {
         let profile = tempfile::tempdir().unwrap();
         let path = profile.path().to_path_buf();
-        let mut unrelated = sentinel().await;
+        let mut unrelated = sentinel();
         let script = r#"
 /bin/sh -c 'trap "" TERM; exec 2>/dev/null; : > "$1/writer"; echo ready; while :; do printf x > "$1/writer"; done' writer "$1" </dev/null &
 read release
@@ -424,7 +428,7 @@ exit 0
     #[tokio::test]
     async fn reaped_or_mismatched_root_cannot_authorize_old_group_signals() {
         let profile = tempfile::tempdir().unwrap();
-        let mut unrelated = sentinel().await;
+        let mut unrelated = sentinel();
         let mut root = tokio::process::Command::new("/bin/sh")
             .args(["-c", "read release"])
             .stdin(Stdio::piped())
