@@ -1200,10 +1200,13 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     ].filter((id): id is string => Boolean(id)));
     if (notificationIds.size === 0) return;
     const refresh = (source: 'close' | 'stream') => {
-      const closeNeedsLiveRefresh = ordinarySnapshot?.close != null
-        && (ordinarySnapshot.close.phase !== 'completed'
-          || ordinarySnapshot.close.outcome === 'close_incomplete'
-          || ordinarySnapshot.close.outcome === 'archived_cleanup_attention');
+      const current = ownedSnapshotRef.current;
+      if (current && current.productConversationId !== productConversationId) return;
+      const close = current?.value.kind === 'ordinary' ? current.value.close : null;
+      const closeNeedsLiveRefresh = close != null
+        && (close.phase !== 'completed'
+          || close.outcome === 'close_incomplete'
+          || close.outcome === 'archived_cleanup_attention');
       if (source === 'close' || closeNeedsLiveRefresh) setSnapshotRetry((retry) => retry + 1);
     };
     const unsubscribes = [...notificationIds].map((id) =>
