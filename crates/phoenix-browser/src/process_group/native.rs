@@ -209,37 +209,70 @@ impl Drop for OwnedChromeGroup {
 fn group_has_live_members(group: u32) -> io::Result<bool> {
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
-        if entry
+        let Some(pid) = entry
             .file_name()
             .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-            .is_none()
-        {
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+        else {
             continue;
-        }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
         };
-        let tail = stat
-            .rsplit_once(')')
-            .ok_or_else(|| io::Error::other("invalid process stat"))?
-            .1;
-        let mut fields = tail.split_whitespace();
-        let state = fields
-            .next()
-            .ok_or_else(|| io::Error::other("missing process state"))?;
-        let _parent = fields.next();
-        let actual = fields
-            .next()
-            .and_then(|field| field.parse::<u32>().ok())
-            .ok_or_else(|| io::Error::other("missing process group"))?;
-        if actual == group && state != "Z" && state != "X" {
+        if linux_process_is_live_member(pid, group, query_process_group, || {
+            std::fs::read_to_string(entry.path().join("stat"))
+        })? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn query_process_group(pid: libc::pid_t) -> io::Result<libc::pid_t> {
+    let group = unsafe { libc::getpgid(pid) };
+    if group < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(group)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_process_is_live_member(
+    pid: libc::pid_t,
+    group: u32,
+    mut query_group: impl FnMut(libc::pid_t) -> io::Result<libc::pid_t>,
+    read_stat: impl FnOnce() -> io::Result<String>,
+) -> io::Result<bool> {
+    let mut is_member = || match query_group(pid) {
+        Ok(actual) if actual > 0 => Ok(u32::try_from(actual).map_err(io::Error::other)? == group),
+        Ok(_) => Err(io::Error::other("invalid process group")),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Err(error) => Err(error),
+    };
+    if !is_member()? {
+        return Ok(false);
+    }
+    let stat = match read_stat() {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return if is_member()? { Err(error) } else { Ok(false) };
+        }
+        Err(error) => return Err(error),
+    };
+    let tail = stat
+        .rsplit_once(')')
+        .ok_or_else(|| io::Error::other("invalid process stat"))?
+        .1;
+    let mut fields = tail.split_whitespace();
+    let state = fields
+        .next()
+        .ok_or_else(|| io::Error::other("missing process state"))?;
+    let _parent = fields.next();
+    let actual = fields
+        .next()
+        .and_then(|field| field.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::other("missing process group"))?;
+    Ok(actual == group && state != "Z" && state != "X")
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -353,6 +386,90 @@ mod tests {
     use phoenix_core::process_identity::current_process_identity;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn linux_scan_skips_only_kernel_proven_nonmembers_without_reading_stat() {
+        for membership in [Ok(99), Err(io::Error::from_raw_os_error(libc::ESRCH))] {
+            let mut membership = Some(membership);
+            assert!(!linux_process_is_live_member(
+                42,
+                42,
+                |_| membership.take().unwrap(),
+                || panic!("unrelated or vanished process must not require procfs access"),
+            )
+            .unwrap());
+        }
+        for invalid in [0, -1] {
+            assert!(linux_process_is_live_member(
+                42,
+                42,
+                |_| Ok(invalid),
+                || panic!("invalid process group must not authorize a stat read"),
+            )
+            .is_err());
+        }
+        let denied = linux_process_is_live_member(
+            42,
+            42,
+            |_| Err(io::Error::from_raw_os_error(libc::EPERM)),
+            || panic!("unknown membership must fail before stat"),
+        )
+        .unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(libc::EPERM));
+        let owned = linux_process_is_live_member(
+            42,
+            42,
+            |_| Ok(42),
+            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert_eq!(owned.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn linux_scan_reclassifies_missing_candidate_stat_without_assuming_exit() {
+        for after in [Ok(99), Err(io::Error::from_raw_os_error(libc::ESRCH))] {
+            let mut observations = [Ok(42), after].into_iter();
+            assert!(!linux_process_is_live_member(
+                42,
+                42,
+                |_| observations.next().unwrap(),
+                || Err(io::Error::from(io::ErrorKind::NotFound)),
+            )
+            .unwrap());
+            assert!(observations.next().is_none());
+        }
+        for after in [Ok(42), Err(io::Error::from_raw_os_error(libc::EPERM))] {
+            let mut observations = [Ok(42), after].into_iter();
+            assert!(linux_process_is_live_member(
+                42,
+                42,
+                |_| observations.next().unwrap(),
+                || Err(io::Error::from(io::ErrorKind::NotFound)),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn linux_scan_requires_readable_candidate_state_and_rechecks_stat_group() {
+        for (stat, live) in [
+            ("42 (Chrome worker) S 1 42", true),
+            ("42 (Chrome worker) Z 1 42", false),
+            ("42 (Chrome worker) X 1 42", false),
+            ("42 (replacement) S 1 99", false),
+        ] {
+            assert_eq!(
+                linux_process_is_live_member(42, 42, |_| Ok(42), || Ok(stat.to_owned())).unwrap(),
+                live,
+            );
+        }
+        for stat in ["invalid", "42 (Chrome)", "42 (Chrome) S 1 invalid"] {
+            assert!(
+                linux_process_is_live_member(42, 42, |_| Ok(42), || Ok(stat.to_owned())).is_err()
+            );
+        }
+    }
 
     #[test]
     fn pending_exit_authorizes_neither_signal_nor_completion() {
