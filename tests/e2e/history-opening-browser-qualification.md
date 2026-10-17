@@ -3062,3 +3062,33 @@ TSc-b,79 lifecycle tests, the actual full spEARS shape validator and diff check.
 The clean immutable source is published qualification/history-joint-source-fc39f4403.
 The shared landing successor composes this fix and atomically repins it for one
 changed-candidate hosted qualification after the complete prior terminal result.
+
+### Second current-main hosted run: real SQL matrix, lint and CLI composition gates
+
+Run39006122848 at94eb/fc39 is fully terminal failure. UI/specs, E2E/tasks/workers
+and routine macOS CI39006122822 passed. Genuine codegen, both isolated UI builds,
+libtest and full pinned-app UI source qualification passed in the witness, but
+browser launch did not occur: CLI still rejected --timeout420 because its
+controlled ceiling was300. The budget source regression had checked arithmetic,
+not the actual parser. The parser is now a side-effect-free function exercised
+with the exact workflow timeout and negative missing-joint/above-cap inputs.
+No output directory, executable, native service or browser is touched by this
+regression. All79 Python tests pass; lower-level browser195s/launch230s and normal
+exit65s remain unchanged.
+
+Actual Rust execution exposed
+late_hydration_matches_full_row_oracle_matrix: Database(SqliteError1,
+"no such table: product_conversations") in its custom fixture. The composed SQL
+now legitimately consults typed product kind/role; the source owner is repairing
+the test schema/rows, not removing the product filter or weakening equality.
+Nextest reported1160 pass/1 fail before cancellation of165, so no claim is made
+that the remaining cases ran. Clippy reported the new coordinator fixture's
+length, opening-helper import placement, view-capacity test length/style, and
+SseWireEvent size after composing event presentation with opening. These are
+explicit source obligations, not bypassed with blanket lint allows. The source
+writer is preparing a bounded child packet with unchanged JSON/wire expectations.
+
+Artifact12091277117 is96,607,629 bytes; exact failed Rust/clippy/witness logs and
+terminal JSON are preserved. No unchanged or concurrent qualification was
+started. The prior greenedac/35f baseline remains immutable; the two successor
+failures are not retroactively qualified by it.

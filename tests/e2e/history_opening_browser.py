@@ -1145,7 +1145,7 @@ def retained_evidence(path, missing_status, errors):
         return {"status": "invalid_evidence", **fact}
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app-root", required=True, type=Path)
     parser.add_argument("--instrumented-exe", required=True, type=Path)
@@ -1155,11 +1155,16 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument('--controlled-functional', action='store_true', help='separate controlled UI; never stock or overhead evidence')
     parser.add_argument("--timeout", type=int, default=1100)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not 120 <= args.timeout <= 1200:
         parser.error("whole-run timeout must be 120..1200 seconds")
-    if args.controlled_functional and (not args.joint_telemetry or args.timeout > 300):
-        parser.error('controlled capture requires --joint-telemetry and --timeout <=300')
+    if args.controlled_functional and (not args.joint_telemetry or args.timeout > 420):
+        parser.error('controlled capture requires --joint-telemetry and --timeout <=420')
+    return args
+
+
+def main():
+    args = parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     result = {"status": "failed", "evidence_class": CLASS, "runtime_executed": False,

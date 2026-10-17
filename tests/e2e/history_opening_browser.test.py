@@ -943,6 +943,16 @@ class OpeningQualificationTests(unittest.TestCase):
         minutes = int(re.search(r'    timeout-minutes: (\d+)', job).group(1))
         outer = int(re.search(r'opening-browser-evidence" --timeout (\d+)', job).group(1))
         self.assertGreaterEqual(outer, 230 + 2 + opening.SERVER_COMPLETION_TIMEOUT + 60)
+        required = ['--app-root', str(self.root / 'unused-app'), '--instrumented-exe', str(self.root / 'unused-exe'),
+                    '--instrumented-receipt', str(self.root / 'unused-receipt'), '--output', str(self.root / 'not-created')]
+        parsed = opening.parse_args(required + ['--joint-telemetry', '--controlled-functional', '--timeout', str(outer)])
+        self.assertEqual(parsed.timeout, outer)
+        self.assertFalse((self.root / 'not-created').exists())
+        import contextlib, io
+        for flags in (['--controlled-functional', '--timeout', str(outer)],
+                      ['--joint-telemetry', '--controlled-functional', '--timeout', str(outer + 1)]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                opening.parse_args(required + flags)
         known_phases = 900 + 900 + 10 + 6 * 120 + outer + 3 * 600
         self.assertGreaterEqual(minutes * 60, known_phases + 600)
         for name in ('CARGO_BUILD_JOBS', 'RAYON_NUM_THREADS', 'RUST_TEST_THREADS'):
