@@ -30,6 +30,8 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("real_chrome_partial_initialization_retains_child_and_retries_exact_close", script)
         self.assertIn("run_exact process_group::native::tests::darwin_pending_exit_preserves_birth_identity_and_requires_missing_group -p phoenix-browser --lib", script)
         self.assertIn("run_exact process_group::native::tests::linux_scan_reclassifies_stat_esrch_without_assuming_exit -p phoenix-browser --lib", script)
+        self.assertIn("run_exact process_group::native::tests::escaped_writer_unwind_before_identity_cancels_pending_readiness -p phoenix-browser --lib", script)
+        self.assertIn("run_exact process_group::native::tests::escaped_writer_unwind_cleans_owned_fixture_before_release -p phoenix-browser --lib", script)
         self.assertIn('"$name" -- --ignored --exact --nocapture --test-threads=1', script)
         for name in (
             "opaque_initial_launch_failure_status_retains_lifetime_and_barrier",
