@@ -2545,6 +2545,11 @@ mod tests {
     async fn message_page_materializes_bound_snapshot_ceiling_once_with_result_parity() {
         let (db, root) = bound_ceiling_fixture().await;
         let mut connection = db.pool.acquire().await.unwrap();
+        let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        eprintln!("bound_snapshot_ceiling_sqlite_version={sqlite_version}");
         let all = full_message_page_rows(
             &mut connection,
             PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
