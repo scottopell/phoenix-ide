@@ -3,6 +3,7 @@ import { MemoryRouter, useLocation } from 'react-router-dom';
 import type { Chapter } from '../conversation/conversationChapters';
 import { describe, expect, it, vi } from 'vitest';
 import { ConversationNavStack } from './ConversationNavStack';
+import { coordinatorConversationLinkState } from './conversationReturnOrigin';
 const scrollToUnitIndex = vi.hoisted(() => vi.fn());
 vi.mock('./MessageList', async () => {
   const { forwardRef, useImperativeHandle } = await import('react');
@@ -19,10 +20,25 @@ vi.mock('./ConversationNav', () => ({ ConversationNav: ({ onJump, onJumpBoundary
     <button onClick={() => onJump({ kind: 'prompt', unitIndex: 2, label: 'Other member', sequenceId: 2, target: { kind: 'persisted', messageId: 'row-2-message', transcriptId: 'row-2' } })}>Other member chapter</button>
     <button onClick={() => onJumpBoundary('row-2-boundary')}>Unloaded member boundary</button>
     <div data-testid="nav-location">{location.pathname}{location.search}{location.hash}</div>
+    <div data-testid="nav-state">{JSON.stringify(location.state)}</div>
   </>;
 } }));
 vi.mock('../hooks/useFloatingNavStack', () => ({ useFloatingNavStack: () => {} }));
 describe('source locator decoding', () => {
+  it.each(['Loaded chapter', 'Pending chapter', 'Unloaded member boundary'])('preserves Coordinator return origin and unrelated state through %s, then clears pending-only state', button => {
+    const origin = coordinatorConversationLinkState('/global/coordinator?viewer=inspect#message-origin', '/c/fixture')!;
+    render(<MemoryRouter initialEntries={[{ pathname: '/c/fixture', state: { ...origin, unrelated: 'keep', chapterSelection: 'pending' } }]}><ConversationNavStack
+      messages={[]} pendingMessages={[]} historyBoundaries={[{ message_id: 'row-2-boundary', predecessor_transcript_row_id: 'row-2', successor_transcript_row_id: 'row-3', represented_successor_opening_message_id: null, segment_ordinal: 1 }]}
+      streamingRequestId={null} convState={{ type: 'idle' }} onRetry={vi.fn()} onOpenFile={undefined}
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'fixture', generation: 1, transcriptGeneration: 1 } }}
+    /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('button', { name: button }));
+    expect(JSON.parse(screen.getByTestId('nav-state').textContent!)).toEqual({ ...origin, unrelated: 'keep', ...(button === 'Pending chapter' ? { chapterSelection: 'pending' } : {}) });
+    fireEvent.click(screen.getByRole('button', { name: 'Pending chapter' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Loaded chapter' }));
+    expect(JSON.parse(screen.getByTestId('nav-state').textContent!)).toEqual({ ...origin, unrelated: 'keep' });
+  });
+
   it.each([false, true])('uses one persisted chapter owner and local pending navigation (aggregate=%s)', aggregate => {
     const update = vi.fn();
     scrollToUnitIndex.mockClear();

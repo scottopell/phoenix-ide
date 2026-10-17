@@ -54,10 +54,13 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     query.delete('source_tool');
     if (target.kind === 'pending') query.delete('source_transcript');
     else if (target.transcriptId && (historyBoundaries !== undefined || query.has('source_transcript'))) query.set('source_transcript', target.transcriptId);
+    const state: Record<string, unknown> = { ...location.state };
+    if (target.kind === 'pending') state['chapterSelection'] = 'pending';
+    else delete state['chapterSelection'];
     navigate({ pathname: location.pathname, search: query.toString(), hash: target.kind === 'persisted' ? `#message-${encodeURIComponent(target.messageId)}` : '' }, {
-      state: target.kind === 'pending' ? { chapterSelection: 'pending' } : null,
+      state,
     });
-  }, [historyBoundaries, location.pathname, location.search, navigate]);
+  }, [historyBoundaries, location.pathname, location.search, location.state, navigate]);
 
   const handleJump = useCallback((chapter: Chapter) => {
     onUpdateOlderMessagesRestore?.({ kind: 'reader_viewport' });
