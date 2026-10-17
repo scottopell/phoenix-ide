@@ -1,0 +1,1283 @@
+-- allium: 3
+-- Standalone deployment-controller evidence, cleanup, and recovery core.
+--
+-- This module refines the independent-owner and truthful-recovery obligations in
+-- specs/production-deployment and specs/launchd-deployment. It does not replace
+-- either deployment contract or grant production activation authority.
+--
+-- Requirement traceability:
+-- REQ-SDC-001: transitions and PersistInterruption
+-- REQ-SDC-002: RecordResourceSample, AdmitSustainedResources, BlockInsufficientResources
+-- REQ-SDC-003: RecordChildDiscoveryBeforeIdentity and AdoptStableChildIdentity
+-- REQ-SDC-004: PreserveUnidentifiedChildObservation and RequireAdministrativeCloseoutAtDeadline
+-- REQ-SDC-005: RecheckBeforeEveryOwnedSignal, KeepReparentedIdentityOwned, IgnoreReplacementAtOwnedPid
+-- REQ-SDC-006: CompleteVerifiedCleanup and cleanup invariants
+-- REQ-SDC-007: AcceptAdministrativeRiskWithoutCleanupClaim
+-- REQ-SDC-008: PersistInterruption and RecoverByReconciliation
+-- REQ-SDC-009: RecordCandidateMigrationInvocation and RecoverForwardAfterMigrationInvocation
+-- REQ-SDC-010: ControllerOsBoundary
+-- REQ-SDC-011: ControllerSqliteBoundary
+-- REQ-SDC-012: MacOsSupervisionBoundary
+-- REQ-SDC-013: AffineDispatchBoundary
+-- REQ-SDC-014: SafeStoreCliBoundary
+-- REQ-SDC-015: NativeRunnerBoundary
+-- REQ-SDC-016: NativeGuardianIpcBoundary
+-- REQ-SDC-017: NativeDispatchAdmissionBoundary
+-- REQ-SDC-018: NativeGuardianPersistenceBoundary and NativeGuardianReconnectBoundary
+-- REQ-SDC-019: NativeSameBuildBoundary
+-- REQ-SDC-020: NativeGuardianQualificationBoundary
+-- REQ-SDC-021: NativeDispatchAdmissionBoundary, NativeGuardianPersistenceBoundary, NativeGuardianQualificationBoundary
+
+value ProcessIdentity {
+    pid: Integer
+    birth_token: String
+}
+
+value DiscoveryEpoch {
+    sequence: Integer
+    hinted_pid: Integer
+    verified_parent: ProcessIdentity
+}
+
+value RetainedCandidateIdentity {
+    full_commit: String
+    artifact_hash: String
+}
+
+value ResourceCapacity {
+    available_memory_bytes: Integer
+    available_storage_bytes: Integer
+}
+
+value ResourceContention {
+    cpu_contention_basis_points: Integer
+    memory_pressure: MemoryPressure
+}
+
+value ResourceSample {
+    sequence: Integer
+    capacity: ResourceCapacity
+    contention: ResourceContention
+}
+
+enum MemoryPressure { nominal | warning | critical }
+
+enum ControllerPhase {
+    pending | resource_sampling | ownership_discovery | awaiting_birth_evidence
+    | cleaning_owned_tree | verifying_cleanup | ready_for_disruption
+    | resource_blocked | interrupted | recovering | forward_recovery
+    | administrative_closeout_required | administratively_closed
+}
+
+enum PersistedControllerPhase {
+    resource_sampling | ownership_discovery | awaiting_birth_evidence
+    | cleaning_owned_tree | verifying_cleanup | ready_for_disruption
+    | resource_blocked | interrupted | recovering | forward_recovery
+    | administrative_closeout_required | administratively_closed
+}
+
+enum CompatibilityBoundary { predecessor_eligible | candidate_migration_invoked }
+
+enum CleanupResult {
+    not_started | in_progress | verified_clean | unresolved_risk | administrative_risk_accepted
+}
+
+enum ObservationFailure {
+    no_such_process | permission_denied | temporarily_unavailable | malformed_observation
+}
+
+value DispatchKey {
+    attempt_id: String
+    persistence_revision: Integer
+    ordinal: Integer
+}
+
+enum DispatchEffectKind {
+    sample_resources | list_children | acquire_child_identity | observe_identity
+    | signal_exact_identity | reverify_retained_candidate
+}
+
+enum EffectCompletionKind {
+    resource_sample | resource_observation_failure | child_list | child_query_failure
+    | child_identity_observation | identity_observation | signal_outcome
+    | candidate_verification
+}
+
+value CommittedTransition {
+    attempt_id: String
+    persistence_revision: Integer
+    effect_count: Integer
+}
+
+value DispatchTicket {
+    key: DispatchKey
+    effect_kind: DispatchEffectKind
+}
+
+value DispatchBatch {
+    attempt_id: String
+    persistence_revision: Integer
+    next_ordinal: Integer
+    remaining: Integer
+}
+
+value ExecutedEffect {
+    key: DispatchKey
+    effect_kind: DispatchEffectKind
+    completion_kind: EffectCompletionKind
+}
+
+value SignalRoundResults {
+    completed_count: Integer
+}
+
+enum GuardianSessionState {
+    active | detached_fenced | reconciling | authority_lost
+}
+
+value GuardianBinding {
+    attempt_id: String
+    guardian_instance_nonce: String
+    guardian_pid: Integer
+    guardian_birth: Timestamp
+    state: GuardianSessionState
+    minimum_dispatch_revision: Integer?
+    reconciliation_floor: Integer?
+    latest_reconciliation_revision: Integer?
+}
+
+value StatusSummary {
+    attempt_id: String
+    persistence_revision: Integer
+    phase: PersistedControllerPhase
+    cleanup_outcome: CleanupResult
+}
+
+entity DeploymentAttempt {
+    id: String
+    phase: ControllerPhase
+    operation_deadline: Timestamp
+    next_discovery_sequence: Integer
+    compatibility_boundary: CompatibilityBoundary
+    retained_candidate: RetainedCandidateIdentity?
+    resume_phase: ControllerPhase?
+    cleanup_result: CleanupResult
+    last_observation_failure: ObservationFailure?
+    resource_samples: List<ResourceSample>
+    owned_identities: Set<ProcessIdentity>
+    unresolved_discoveries: Set<DiscoveryEpoch>
+    pending_child_scans: Set<ProcessIdentity>
+    verified_absent_identities: Set<ProcessIdentity>
+
+    transitions phase {
+        pending -> resource_sampling
+        resource_sampling -> ownership_discovery
+        resource_sampling -> resource_blocked
+        resource_sampling -> interrupted
+        ownership_discovery -> awaiting_birth_evidence
+        ownership_discovery -> cleaning_owned_tree
+        ownership_discovery -> administrative_closeout_required
+        ownership_discovery -> interrupted
+        awaiting_birth_evidence -> ownership_discovery
+        awaiting_birth_evidence -> cleaning_owned_tree
+        awaiting_birth_evidence -> administrative_closeout_required
+        awaiting_birth_evidence -> interrupted
+        cleaning_owned_tree -> verifying_cleanup
+        cleaning_owned_tree -> ready_for_disruption
+        cleaning_owned_tree -> administrative_closeout_required
+        cleaning_owned_tree -> interrupted
+        verifying_cleanup -> ready_for_disruption
+        ready_for_disruption -> forward_recovery
+        verifying_cleanup -> cleaning_owned_tree
+        verifying_cleanup -> awaiting_birth_evidence
+        verifying_cleanup -> administrative_closeout_required
+        verifying_cleanup -> interrupted
+        interrupted -> recovering
+        interrupted -> resource_sampling
+        interrupted -> forward_recovery
+        recovering -> recovering
+        recovering -> ownership_discovery
+        recovering -> awaiting_birth_evidence
+        recovering -> ready_for_disruption
+        recovering -> cleaning_owned_tree
+        recovering -> verifying_cleanup
+        recovering -> administrative_closeout_required
+        recovering -> interrupted
+        forward_recovery -> forward_recovery
+        forward_recovery -> interrupted
+        administrative_closeout_required -> administratively_closed
+        terminal: resource_blocked, administratively_closed
+    }
+}
+
+config {
+    minimum_sustained_samples: Integer = 3
+}
+
+rule StartResourceAssessment {
+    when: DeploymentRequested(attempt)
+    requires: attempt.phase = pending
+    ensures:
+        attempt.phase = resource_sampling
+        attempt.compatibility_boundary = predecessor_eligible
+        attempt.cleanup_result = not_started
+        attempt.next_discovery_sequence = 0
+}
+
+rule RecordResourceSample {
+    when: ResourceSampleObserved(attempt, sample)
+    requires: attempt.phase = resource_sampling
+    requires: sample.sequence_is_after(attempt.resource_samples)
+    ensures: attempt.resource_samples.append(sample)
+}
+
+rule AdmitSustainedResources {
+    when: ResourceSamplingCompleted(attempt)
+    requires: attempt.phase = resource_sampling
+    requires: sustained_capacity_and_contention_are_admissible(
+        attempt.resource_samples,
+        minimum_sustained_samples
+    )
+    ensures: attempt.phase = ownership_discovery
+}
+
+rule BlockInsufficientResources {
+    when: ResourceSamplingCompleted(attempt)
+    requires: attempt.phase = resource_sampling
+    requires: not sustained_capacity_and_contention_are_admissible(
+        attempt.resource_samples,
+        minimum_sustained_samples
+    )
+    ensures: attempt.phase = resource_blocked
+}
+
+rule RecordChildDiscoveryBeforeIdentity {
+    when: ChildPidObserved(attempt, parent, pid)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.owned_identities.contains(parent)
+    requires: pid > 1
+    ensures:
+        attempt.unresolved_discoveries.add(DiscoveryEpoch {
+            sequence: attempt.next_discovery_sequence,
+            hinted_pid: pid,
+            verified_parent: parent
+        })
+        attempt.next_discovery_sequence = attempt.next_discovery_sequence + 1
+        BirthIdentityProbeRequested(attempt, attempt.next_discovery_sequence - 1)
+}
+
+rule AdoptStableChildIdentity {
+    when: StableChildIdentityObserved(attempt, discovery, identity)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.unresolved_discoveries.contains(discovery)
+    requires: stable_child_evidence_binds(discovery, identity)
+    requires: discovery_has_no_prior_observation_gap(attempt, discovery)
+    ensures:
+        attempt.unresolved_discoveries.remove(discovery)
+        attempt.owned_identities.add(identity)
+        attempt.pending_child_scans.add(identity)
+        OwnedChildScanRequested(attempt, identity)
+        if previous(attempt.phase) = recovering:
+            attempt.phase = recovering
+            OwnedIdentityObservationRequested(attempt, identity)
+        else:
+            if attempt.unresolved_discoveries.count > 0:
+                attempt.phase = awaiting_birth_evidence
+            else:
+                attempt.phase = ownership_discovery
+        attempt.last_observation_failure = null
+}
+
+rule PreserveUnidentifiedChildObservation {
+    when: ChildIdentityProbeFailed(attempt, discovery, failure)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.unresolved_discoveries.contains(discovery)
+    requires: failure in {
+        no_such_process,
+        permission_denied,
+        temporarily_unavailable,
+        malformed_observation
+    }
+    ensures:
+        if previous(attempt.phase) = recovering:
+            attempt.phase = recovering
+        else:
+            attempt.phase = awaiting_birth_evidence
+        attempt.last_observation_failure = failure
+        attempt.unresolved_discoveries.contains(discovery)
+}
+
+rule PreserveDiscoveryAcrossPidReuse {
+    when: HintPidNowNamesDifferentProcess(attempt, discovery, replacement)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence, recovering }
+    requires: attempt.unresolved_discoveries.contains(discovery)
+    requires: replacement.pid = discovery.hinted_pid
+    requires: not stable_child_evidence_binds(discovery, replacement)
+    ensures:
+        if previous(attempt.phase) = recovering:
+            attempt.phase = recovering
+        else:
+            attempt.phase = awaiting_birth_evidence
+        attempt.unresolved_discoveries.contains(discovery)
+        not attempt.owned_identities.contains(replacement)
+        not OwnedSignalRequested(attempt, replacement)
+}
+
+rule CompleteOwnedChildScan {
+    when: OwnedChildScanCompleted(attempt, parent)
+    requires: attempt.phase in {
+        ownership_discovery,
+        awaiting_birth_evidence,
+        recovering
+    }
+    requires: attempt.pending_child_scans.contains(parent)
+    ensures: attempt.pending_child_scans.remove(parent)
+}
+
+rule BeginOwnedTreeCleanup {
+    when: OwnershipScanCompleted(attempt)
+    requires: attempt.phase in { ownership_discovery, awaiting_birth_evidence }
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: attempt.pending_child_scans.count = 0
+    ensures:
+        attempt.phase = cleaning_owned_tree
+        attempt.cleanup_result = in_progress
+}
+
+rule RecheckBeforeEveryOwnedSignal {
+    when: OwnedCleanupRequested(attempt, identity)
+    requires: attempt.phase = cleaning_owned_tree
+    requires: attempt.owned_identities.contains(identity)
+    requires: freshly_observed_same_identity(identity)
+    requires: now < attempt.operation_deadline
+    ensures: OwnedSignalRequested(attempt, identity)
+}
+
+rule CompleteVerifiedCleanupAtExpiredMutationBoundary {
+    when: CleanupMutationPassRequested(attempt)
+    requires: attempt.phase = cleaning_owned_tree
+    requires: now >= attempt.operation_deadline
+    requires: every_owned_identity_is_verified_absent(attempt)
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: attempt.pending_child_scans.count = 0
+    ensures:
+        attempt.cleanup_result = verified_clean
+        attempt.phase = ready_for_disruption
+        not OwnedSignalRequestedForAttempt(attempt)
+}
+
+rule RefuseExpiredOwnedMutation {
+    when: CleanupMutationPassRequested(attempt)
+    requires: attempt.phase = cleaning_owned_tree
+    requires: now >= attempt.operation_deadline
+    requires: cleanup_evidence_is_unresolved(attempt)
+    ensures:
+        attempt.cleanup_result = unresolved_risk
+        attempt.phase = administrative_closeout_required
+        not OwnedSignalRequestedForAttempt(attempt)
+}
+
+rule KeepReparentedIdentityOwned {
+    when: OwnedIdentityObservedWithDifferentParent(attempt, identity)
+    requires: attempt.phase in { cleaning_owned_tree, verifying_cleanup, recovering }
+    requires: attempt.owned_identities.contains(identity)
+    requires: freshly_observed_same_identity(identity)
+    ensures:
+        attempt.owned_identities.contains(identity)
+        not attempt.verified_absent_identities.contains(identity)
+}
+
+rule RecordVerifiedOwnedIdentityAbsence {
+    when: OwnedIdentityAbsenceVerified(attempt, identity)
+    requires: attempt.phase in { cleaning_owned_tree, verifying_cleanup, recovering }
+    requires: attempt.owned_identities.contains(identity)
+    requires: exact_identity_absence_is_verified(identity)
+    ensures: attempt.verified_absent_identities.add(identity)
+}
+
+rule IgnoreReplacementAtOwnedPid {
+    when: OwnedPidReused(attempt, owned_identity, replacement)
+    requires: attempt.phase in { cleaning_owned_tree, verifying_cleanup, recovering }
+    requires: attempt.owned_identities.contains(owned_identity)
+    requires: replacement.pid = owned_identity.pid
+    requires: replacement.birth_token != owned_identity.birth_token
+    ensures:
+        attempt.verified_absent_identities.add(owned_identity)
+        not attempt.owned_identities.contains(replacement)
+        not OwnedSignalRequested(attempt, replacement)
+}
+
+rule VerifyOwnedTreeCleanup {
+    when: CleanupSignalsSettled(attempt)
+    requires: attempt.phase = cleaning_owned_tree
+    ensures: attempt.phase = verifying_cleanup
+}
+
+rule CompleteVerifiedCleanup {
+    when: CleanupVerificationCompleted(attempt)
+    requires: attempt.phase = verifying_cleanup
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: attempt.pending_child_scans.count = 0
+    requires: every_owned_identity_is_verified_absent(attempt)
+    ensures:
+        attempt.cleanup_result = verified_clean
+        attempt.phase = ready_for_disruption
+}
+
+rule ContinueCleanupForLiveOwnedIdentity {
+    when: CleanupVerificationCompleted(attempt)
+    requires: attempt.phase = verifying_cleanup
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: attempt.pending_child_scans.count = 0
+    requires: a_freshly_matching_owned_identity_is_live(attempt)
+    requires: now < attempt.operation_deadline
+    ensures: attempt.phase = cleaning_owned_tree
+}
+
+rule AwaitFreshEvidenceForUncertainOwnedIdentity {
+    when: CleanupVerificationCompleted(attempt)
+    requires: attempt.phase = verifying_cleanup
+    requires: cleanup_evidence_is_unresolved(attempt)
+    requires: now < attempt.operation_deadline
+    ensures: attempt.phase = awaiting_birth_evidence
+}
+
+rule RequireAdministrativeCloseoutAtDeadline {
+    when: attempt: DeploymentAttempt.operation_deadline <= now
+    requires: attempt.phase in {
+        awaiting_birth_evidence,
+        ownership_discovery,
+        cleaning_owned_tree,
+        verifying_cleanup,
+        recovering
+    }
+    requires: cleanup_evidence_is_unresolved(attempt)
+    ensures:
+        attempt.cleanup_result = unresolved_risk
+        attempt.phase = administrative_closeout_required
+}
+
+rule AcceptAdministrativeRiskWithoutCleanupClaim {
+    when: AdministrativeRiskAccepted(attempt)
+    requires: attempt.phase = administrative_closeout_required
+    requires: explicit_risk_acceptance_matches(attempt)
+    ensures:
+        attempt.cleanup_result = administrative_risk_accepted
+        attempt.phase = administratively_closed
+        not VerifiedCleanupClaimed(attempt)
+        no_additional_process_signal_requested(attempt)
+}
+
+rule PersistInterruption {
+    when: ControllerInterrupted(attempt)
+    requires: attempt.phase in {
+        resource_sampling,
+        ownership_discovery,
+        awaiting_birth_evidence,
+        cleaning_owned_tree,
+        verifying_cleanup
+    }
+    ensures:
+        attempt.resume_phase = previous(attempt.phase)
+        attempt.phase = interrupted
+        DurableAttemptWritten(attempt)
+}
+
+rule RecoverByReconciliation {
+    when: RecoveryRequested(attempt)
+    requires: attempt.phase = interrupted
+    requires: attempt.compatibility_boundary = predecessor_eligible
+    requires: attempt.resume_phase in {
+        ownership_discovery,
+        awaiting_birth_evidence,
+        cleaning_owned_tree,
+        verifying_cleanup
+    }
+    ensures:
+        attempt.phase = recovering
+        recovery_observation_barrier_restarted(attempt)
+        FreshOwnershipReconciliationRequested(attempt)
+        OutstandingChildScansRequested(attempt)
+        UnresolvedBirthProbesRequested(attempt)
+}
+
+rule CompleteRecoveryReconciliation {
+    when: RecoveryReconciliationCompleted(attempt)
+    requires: attempt.phase = recovering
+    requires: every_owned_identity_was_freshly_observed(attempt)
+    requires: now < attempt.operation_deadline
+    ensures:
+        no_owned_mutation_preceded_reconciliation(attempt)
+        attempt.phase = recovery_resume_phase(attempt)
+}
+
+rule ReinterruptRecovery {
+    when: ControllerInterrupted(attempt)
+    requires: attempt.phase = recovering
+    ensures:
+        attempt.resume_phase = previous(attempt.resume_phase)
+        attempt.phase = interrupted
+        DurableAttemptWritten(attempt)
+}
+
+rule CompleteVerifiedRecoveryAtDeadline {
+    when: RecoveryReconciliationCompleted(attempt)
+    requires: attempt.phase = recovering
+    requires: every_owned_identity_was_freshly_observed(attempt)
+    requires: now >= attempt.operation_deadline
+    requires: every_owned_identity_is_verified_absent(attempt)
+    requires: attempt.unresolved_discoveries.count = 0
+    requires: attempt.pending_child_scans.count = 0
+    ensures:
+        no_owned_mutation_preceded_reconciliation(attempt)
+        attempt.cleanup_result = verified_clean
+        attempt.phase = ready_for_disruption
+        not OwnedSignalRequestedForAttempt(attempt)
+}
+
+rule CloseRecoveryAtDeadline {
+    when: RecoveryReconciliationCompleted(attempt)
+    requires: attempt.phase = recovering
+    requires: every_owned_identity_was_freshly_observed(attempt)
+    requires: now >= attempt.operation_deadline
+    requires: not every_owned_identity_is_verified_absent(attempt)
+              or attempt.unresolved_discoveries.count > 0
+              or attempt.pending_child_scans.count > 0
+    ensures:
+        attempt.cleanup_result = unresolved_risk
+        attempt.phase = administrative_closeout_required
+        not OwnedSignalRequestedForAttempt(attempt)
+}
+
+rule RecoverPendingResourceSample {
+    when: RecoveryRequested(attempt)
+    requires: attempt.phase = interrupted
+    requires: attempt.resume_phase = resource_sampling
+    requires: attempt.compatibility_boundary = predecessor_eligible
+    ensures:
+        attempt.phase = resource_sampling
+        ExactPendingResourceSampleRequested(attempt)
+}
+
+rule ApplyRetainedPendingResourceSample {
+    when: RetainedNativeResourceSampleVerified(attempt, sample)
+    requires: attempt.phase = interrupted
+    requires: attempt.resume_phase = resource_sampling
+    requires: attempt.compatibility_boundary = predecessor_eligible
+    requires: now < attempt.operation_deadline
+    requires: sample.sequence_is_after(attempt.resource_samples)
+    requires: attempt.resource_samples.count + 1 < minimum_sustained_samples
+    requires: exact_reconciling_guardian_retains_issuing_provenance(attempt, sample)
+    requires: sole_pending_native_issue_matches(attempt, sample)
+    ensures:
+        attempt.resource_samples.append(sample)
+        attempt.phase = interrupted
+        attempt.resume_phase = resource_sampling
+        DurableRecoveredSampleApplicationWritten(attempt, sample)
+        RetainedResultAckRequestedAfterDurableApplication(attempt, sample)
+        not ExactPendingResourceSampleRequested(attempt)
+        not NativeEffectRequestedForAttempt(attempt)
+    @guidance
+        -- The live response and store candidate combine into one application-only
+        -- capability. Neither source alone constructs a ticket, completion, ACK,
+        -- transition, or runnable loop. Failed or terminal samples remain retained.
+}
+
+rule RecordCandidateMigrationInvocation {
+    when: CandidateMigrationInvoked(attempt, candidate)
+    requires: attempt.phase = ready_for_disruption
+    requires: attempt.compatibility_boundary = predecessor_eligible
+    requires: candidate_identity_is_exact(candidate)
+    ensures:
+        attempt.compatibility_boundary = candidate_migration_invoked
+        attempt.retained_candidate = candidate
+        DurableAttemptWritten(attempt)
+}
+
+rule RecoverForwardAfterMigrationInvocation {
+    when: RecoveryRequested(attempt)
+    requires: attempt.phase in { ready_for_disruption, forward_recovery }
+    requires: attempt.compatibility_boundary = candidate_migration_invoked
+    requires: attempt.retained_candidate != null
+    ensures:
+        attempt.phase = forward_recovery
+        ExactRetainedCandidateReverificationRequested(
+            attempt,
+            attempt.retained_candidate
+        )
+}
+
+rule PreserveForwardFenceOnFailure {
+    when: ForwardRecoveryFailed(attempt)
+    requires: attempt.phase = forward_recovery
+    ensures:
+        attempt.phase = forward_recovery
+        attempt.compatibility_boundary = candidate_migration_invoked
+        not PredecessorStartupRequested(attempt)
+}
+
+invariant SignalsRequireStableOwnedIdentity {
+    for attempt in DeploymentAttempts:
+        for identity in ProcessIdentities:
+            OwnedSignalRequested(attempt, identity) implies
+                attempt.owned_identities.contains(identity)
+                and freshly_observed_same_identity(identity)
+}
+
+invariant UnresolvedDiscoveryIsNotAbsence {
+    for attempt in DeploymentAttempts:
+        (attempt.unresolved_discoveries.count > 0
+         or attempt.pending_child_scans.count > 0) implies
+            attempt.cleanup_result != verified_clean
+            and attempt.phase != ready_for_disruption
+}
+
+invariant AdministrativeCloseoutIsNotVerifiedCleanup {
+    for attempt in DeploymentAttempts where attempt.phase = administrative_closeout_required:
+        attempt.cleanup_result = unresolved_risk
+        and attempt.cleanup_result != verified_clean
+}
+
+invariant AdministrativeAcceptanceIsNotVerifiedCleanup {
+    for attempt in DeploymentAttempts where attempt.phase = administratively_closed:
+        attempt.cleanup_result = administrative_risk_accepted
+        and attempt.cleanup_result != verified_clean
+        and not VerifiedCleanupClaimed(attempt)
+}
+
+invariant DeadlineIsAbsolute {
+    for attempt in DeploymentAttempts:
+        recovery_or_retry_does_not_change(attempt.operation_deadline)
+}
+
+invariant ResourceAdmissionUsesMeasurements {
+    for attempt in DeploymentAttempts where attempt.phase != pending:
+        resource_decision_uses_only_capacity_and_contention_samples(attempt)
+}
+
+invariant MigrationInvocationIsForwardOnly {
+    for attempt in DeploymentAttempts:
+        attempt.compatibility_boundary = candidate_migration_invoked implies
+            attempt.retained_candidate != null
+            and not PredecessorStartupRequested(attempt)
+}
+
+invariant MigrationCandidateIsFrozen {
+    for attempt in DeploymentAttempts where
+        attempt.compatibility_boundary = candidate_migration_invoked:
+            retained_candidate_never_changes(attempt)
+}
+
+invariant RecoveryMutationWaitsForCompleteReconciliation {
+    for attempt in DeploymentAttempts where attempt.phase = recovering:
+        not OwnedSignalRequestedForAttempt(attempt)
+}
+
+contract ControllerOsBoundary {
+    list_children: (parent: ProcessIdentity) -> ChildListObservation
+    acquire_child_identity: (discovery: DiscoveryEpoch) -> ChildIdentityObservation
+    observe_identity: (identity: ProcessIdentity) -> IdentityObservation
+    sample_resources: (sequence: Integer) -> ResourceObservation
+    signal_exact_identity: (identity: ProcessIdentity, signal: Signal) -> SignalOutcome
+    reverify_retained_candidate: (candidate: RetainedCandidateIdentity) -> CandidateVerification
+
+    @invariant BirthIdentityBeforeMutation
+        -- A PID hint or process-group relationship is discovery evidence only.
+        -- Mutation requires a high-resolution birth token rechecked at the edge.
+
+    @invariant ObservationFailuresRemainTyped
+        -- ESRCH while acquiring a birth token, permission denial, temporary
+        -- unavailability, and malformed metadata remain distinct observations.
+        -- None is silently converted into verified process absence.
+        -- ChildListObservation is Result<List<ProcessId>, OsQueryError> and
+        -- ResourceObservation is Result<ResourceSample, ResourceObservationFailure>.
+        -- Identity, child, signal, and candidate results retain their native typed
+        -- observation variants rather than collapsing uncertainty to Boolean/null.
+
+    @invariant NoProcessBlacklistAdmission
+        -- Resource admission is based on a sustained series of measured capacity
+        -- and contention samples. Process names and a globally invariant process
+        -- metadata snapshot are not admission authorities.
+
+    @invariant PersistenceBeforeEffects
+        -- Every phase/evidence change is durably written before its requested OS
+        -- mutation. Recovery re-observes identities instead of replaying a signal.
+}
+
+contract ControllerSqliteBoundary {
+    persist_checkpoint: (attempt: DeploymentAttempt) -> CommittedTransition
+    load_attempt: (attempt_id: String) -> LoadedAttempt?
+    prepare_recovery: (loaded: LoadedAttempt) -> PersistableRecoveryCheckpoint?
+    refresh_interruption: (loaded: LoadedAttempt) -> PersistableInterruptionCheckpoint?
+
+    @invariant IndependentNormalizedAuthority
+        -- Controller persistence is a distinct SQLite lifecycle. Attempts,
+        -- samples, identities, pending scans, discoveries, candidates, guardian
+        -- bindings, sessions, child slots, and retained results are normalized
+        -- relational rows rather than child collections in a blob. Native binding
+        -- and acknowledgement follow NativeGuardianPersistenceBoundary.
+
+    @invariant AuthorityLossFailsStop
+        -- An unclassified checkpoint write exposes no OS effect and stops the
+        -- controller rather than projecting semantic uncertainty.
+
+    @invariant DurableRevisionCompareAndSwap
+        -- First persistence requires row absence. Every replacement compares the
+        -- attempt's revision with the durable row and advances it in the same
+        -- transaction, so stale clones cannot erase evidence or retarget candidates.
+
+    @invariant CrashLoadHasNoMutationAuthority
+        -- A crash-loaded active checkpoint is affine recovery evidence, not a live
+        -- DeploymentAttempt. Interruption and fresh reconciliation are committed
+        -- before any process-mutation effect can become accessible.
+
+    @invariant CrashSeamInterruptionRefresh
+        -- If the runner dies after interruption commits but before the guardian
+        -- accepts BeginReconciliation, a successor may consume fresh affine
+        -- crash-loaded Interrupted evidence to commit another Interrupted
+        -- checkpoint with zero effects. It preserves the original deadline,
+        -- resume phase, owned and acquired identities, compatibility fence,
+        -- and interruption kind. Non-Interrupted evidence cannot refresh.
+        -- Each refresh requires a new crash load of committed evidence and
+        -- advances the SQLite CAS revision; historical plans and transitions
+        -- are not reusable. The refresh alone grants no recovery preparation,
+        -- reconciliation, mutation, or acknowledgement authority.
+
+    @invariant FailedAuthorityPoisonsHandle
+        -- Persistence or loading that cannot classify durable authority invalidates
+        -- the handle until reopen and classification; no new attempt is admitted.
+}
+
+contract AffineDispatchBoundary {
+    into_dispatch: (committed: CommittedTransition) -> DispatchBatch
+    next_ticket: (batch: DispatchBatch) -> DispatchTicket?
+    execute: (ticket: DispatchTicket) -> ExecutedEffect
+
+    @invariant SuccessfulPersistenceIsTheIssuingBoundary
+        -- CommittedTransition, DispatchBatch, and DispatchTicket are affine and
+        -- cannot be cloned. Consumption of a plan accepted by a trusted AttemptStore
+        -- issues a batch for the EffectExecutor. Diagnostic checkpoint/effect values
+        -- cannot fabricate tickets; diagnostic decomposition discards executor
+        -- admission. Uncommitted transitions, failed persistence, and crash loads
+        -- issue none. ControllerOs remains an adapter boundary rather than a global
+        -- operating-system capability sandbox.
+
+    @invariant StableSiblingCorrelation
+        -- Each ticket contains one OsEffect and one DispatchKey. The key names
+        -- the exact attempt, issuing committed revision, and zero-based ordinal
+        -- in that plan. Equal-valued sibling effects still have distinct ordinals.
+        -- next_ticket returns the retained remainder together with the next ticket;
+        -- issuing one sibling does not consume or renumber the others.
+
+    @invariant OneCallAndStructurallyPairedOutcome
+        -- Consuming a ticket calls exactly its matching ControllerOs method once:
+        -- SampleResources -> sample_resources; ListChildren -> list_children;
+        -- AcquireChildIdentity -> acquire_child_identity;
+        -- ObserveIdentity -> observe_identity;
+        -- SignalExactIdentity -> signal_exact_identity;
+        -- ReverifyRetainedCandidate -> reverify_retained_candidate.
+        -- ExecutedEffect privately pairs that ticket's original key with a typed
+        -- EffectCompletion variant containing the effect inputs and exact native
+        -- result. Resource/query errors and observation/signal/verification outcomes
+        -- retain their types; no empty or fabricated evidence replaces a failure.
+
+    @invariant NoExecutorPolicyOrActivation
+        -- The executor does not retry, escalate, roll back, infer phase, or apply
+        -- outcomes to policy. CandidateVerification::Exact is observation only,
+        -- never activation permission. There is no activation effect.
+
+    @invariant DroppingIsNotDispatch
+        -- Dropping a batch or unexecuted ticket makes no OS call. Affine dispatch
+        -- is not exactly-once execution across crash and gives no replay permission.
+}
+
+contract SafeStoreCliBoundary {
+    status: (store_path: String, attempt_id: String) -> StatusSummary
+    closeout: (store_path: String, attempt_id: String) -> StatusSummary
+
+    @invariant OnlyTwoSafeCommands
+        -- The phoenix-deployment-controller safe store binary accepts only
+        -- status --store PATH --attempt U128 and closeout with the same flags.
+        -- Flags occur once, in either order. U128 is unsigned ASCII
+        -- decimal within u128 range. Bad/duplicate/unknown arguments or commands
+        -- fail before store open. No native run/reconcile/deploy, activation,
+        -- installer, schema migration, or native deployment adapter is reachable.
+
+    @invariant ExistingStoreOnly
+        -- Store open never creates a missing database or initializes an unversioned
+        -- one. Schema admission, CAS revisions, and load/write handle poisoning
+        -- remain the ControllerSqliteBoundary contract.
+
+    @invariant StatusIsAffineInspectionOnly
+        -- Status loads affine evidence and prints only attempt_id as a canonical
+        -- decimal string, positive persistence_revision, snake-case phase, and
+        -- snake-case cleanup_outcome. It exposes no live checkpoint/effects/native
+        -- details and performs no recovery preparation or checkpoint mutation.
+
+    @invariant CloseoutIsPhaseFenced
+        -- Only administrative_closeout_required proceeds to stable evidence and
+        -- matching AdministrativeRiskAcceptance. Persist closeout, check the batch
+        -- has zero effects, and summarize administratively_closed with unresolved
+        -- evidence retained and administrative_risk_accepted, not verified cleanup.
+        -- Every other phase fails before recovery preparation or persistence,
+        -- with no revision change or effect execution.
+
+    @invariant JsonAndCategoryOnlyOutput
+        -- Success is one JSON StatusSummary object plus newline on stdout.
+        -- Errors expose only a fixed category plus newline on stderr, never paths,
+        -- arguments, raw SQL/SQLite errors, command lines, or environment values.
+        -- Exit codes: 0 success; 2 usage_error; 3 store_error; 4 attempt_not_found;
+        -- 5 wrong_phase; 6 internal_error (invariant, encoding, or stdout failure).
+}
+
+contract MacOsSupervisionBoundary {
+    spawn_owned_group: (attempt_id: String) -> ProcessIdentity?
+    signal_owned_group: (leader: ProcessIdentity) -> Boolean
+    wait_owned_group: (leader: ProcessIdentity) -> Boolean
+
+    @invariant UnreapedLeaderReservesIdentity
+        -- The direct group leader remains unreaped until group cleanup and wait,
+        -- preventing PID reuse while the affine supervision value exists.
+
+    @invariant ArbitraryObservationHasNoMutationAuthority
+        -- A PID-plus-birth observation without owned-child supervision cannot
+        -- invoke kill(2).
+
+    @invariant SupervisionGapsRemainVisible
+        -- Group escape, deliberate same-session join, and controller exit are
+        -- unresolved risks. Controller exit loses authority unless a surviving
+        -- supervisor handoff is positively identified.
+}
+
+contract SurvivingGuardianBoundary {
+    fence_controller_loss: (binding: GuardianBinding) -> GuardianBinding
+    begin_reconciliation: (binding: GuardianBinding) -> GuardianBinding?
+    admit_observation: (binding: GuardianBinding, ticket: DispatchTicket) -> Boolean
+    admit_mutation: (binding: GuardianBinding, ticket: DispatchTicket) -> Boolean
+
+    @invariant ControllerLossDetachesAndFences
+        -- Controller exit changes the same retained guardian instance to
+        -- detached_fenced. Already-started work may continue and results remain
+        -- retained, but the guardian starts no new step and sends no new signal.
+        -- Socket EOF or heartbeat expiry does not authorize cancellation.
+
+    @invariant RecoveryRequiresTheSameGuardian
+        -- Reconciliation requires positive identity of the same living guardian
+        -- instance and its retained child slots. A label, socket path, PID, PGID,
+        -- or replacement instance cannot reconstruct native mutation authority.
+
+    @invariant FreshReconciliationPrecedesMutation
+        -- A replacement controller commits interruption and a complete fresh
+        -- observation barrier before any new mutation, preserving the attempt's
+        -- original absolute deadline and forward-only compatibility boundary.
+
+    @invariant ReconciliationRevisionNeverRegresses
+        -- Reconciliation is bound to the exact committed interruption revision.
+        -- Observation tickets and the final reconciliation permit cannot predate
+        -- that floor, and a later session never lowers the installed dispatch floor.
+        -- Every replacement session starts from an interruption revision strictly
+        -- newer than every earlier reconciliation session, including one that did not
+        -- finish. Retained historical evidence cannot reactivate a guardian.
+
+    @invariant GuardianLossFailsStop
+        -- Guardian loss, replacement, or deadline expiry preserves unresolved
+        -- supervision risk. No historical process identity is adopted and no
+        -- automatic TERM/KILL sequence is inferred from liveness telemetry.
+}
+
+contract DeterministicPolicyLoop {
+    apply_retained: (result: ExecutedEffect) -> Boolean
+    settle_signal_round: (results: SignalRoundResults) -> Boolean
+
+    @invariant PersistBeforeAcknowledgement
+        -- A guardian-held result is acknowledged only after its corresponding
+        -- checkpoint or explicit round settlement commits. Query failures and
+        -- unsettled signal outcomes remain retained rather than fabricating evidence.
+
+    @invariant SiblingResultsRemainAdmissible
+        -- Applying one sibling may advance the checkpoint revision but does not
+        -- invalidate other issued siblings from the same committed dispatch batch.
+
+    @invariant FailedPersistenceFencesCustody
+        -- Unclassified persistence discards unissued loop authority and moves the
+        -- bound guardian to authority_lost before another ticket can execute.
+
+    @invariant OversizedMutationBatchFailsClosed
+        -- A signal round larger than the bounded guardian result capacity emits no
+        -- partial mutation and enters administrative closeout with unresolved risk.
+        -- A bounded round starts only after the guardian reserves enough unoccupied
+        -- result custody for every signal; reservation refusal emits no mutation.
+}
+
+contract NativeRunnerBoundary {
+    run_disposable: (attempt_id: String) -> StatusSummary
+
+    @invariant ThreeSeparateExecutableRoles
+        -- The safe store CLI remains status/closeout only. Separate same-build
+        -- runner and guardian executables implement the native path. The runner
+        -- owns policy, commits, completion application, and ACK issuance. The
+        -- guardian owns effects and custody, never autonomous policy or activation.
+
+    @invariant LaunchdOwnsTheOriginalParent
+        -- A disposable launchd job owns the guardian independently of the runner.
+        -- The guardian originally parents harmless work and retains its unreaped
+        -- child/group ownership through runner death; historical PID/group/label
+        -- discovery cannot transfer parenthood to a new guardian.
+
+    @invariant NoInstallerOrProductionAdoption
+        -- The runnable loop is invocable without installer/dev.py orchestration.
+        -- Only disposable resources and harmless work are permitted. There is no
+        -- prepared-helper invocation, production label change, application DB
+        -- mutation, artifact installation, or production activation. Installer,
+        -- claim, ledger, signature, source-binding, and migration policy stay outside.
+}
+
+contract NativeGuardianIpcBoundary {
+    exchange: (request: GuardianRequestDto) -> GuardianResponseDto
+
+    @invariant OwnerOnlyTransport
+        -- Unix-domain stream socket and containing directory are owner-only; peer
+        -- owner identity is checked before admission. The trusted same-owner
+        -- boundary is not a sandbox against other code running as that owner.
+        -- A pathname is neither peer authentication nor live guardian identity.
+
+    @invariant BoundedTypedFrames
+        -- Four-byte unsigned big-endian length, then one UTF-8 typed JSON message.
+        -- Both peers enforce a finite shared build-defined payload limit before
+        -- allocation and reject zero length, oversize, truncation, malformed JSON,
+        -- unknown variants, and invalid schema without executing a requested effect.
+        -- Partial reads/writes preserve framing. EOF/protocol failure fences the
+        -- session; it does not cancel work or authorize a signal.
+
+    @invariant HandshakeBeforeSession
+        -- Exact build, protocol version, attempt, and live guardian identity must
+        -- match. Mismatch admits no session, negotiation, fallback, or mutation.
+        -- Handshake, inventory, admission, dispatch, results, reconciliation, and
+        -- ACK have explicit typed DTO variants and correlated category failures.
+}
+
+contract NativeDispatchAdmissionBoundary {
+    request_admission: (request: DispatchAdmissionRequestDto) -> DispatchAdmissionResponseDto
+    dispatch_admitted: (request: AdmittedDispatchDto) -> GuardianResponseDto
+
+    @invariant NoDeserializedAffineAuthority
+        -- Wire DTOs are distinct from all internal affine authority, including
+        -- CommittedTransition, DispatchBatch, DispatchTicket, SessionDispatchTicket,
+        -- ExecutedEffect, ReconciledSessionPermit, and AppliedResultAck.
+        -- Deserialization constructs no internal affine authority. Keys,
+        -- descriptions, diagnostic evidence, and claimed revisions alone cannot
+        -- mint execution, reconciliation, or ACK authority.
+
+    @invariant GuardianMintsAndConsumesAdmission
+        -- The trusted runner consumes a committed affine ticket to request
+        -- admission. The guardian validates binding, session, revision floor,
+        -- recovery gate, and capacity, then registers an opaque one-use admission
+        -- for the exact live instance/session/attempt/DispatchKey/full typed effect.
+        -- Full effect equality includes all inputs, not just effect kind. The
+        -- live registry owns authority; the token DTO only locates an entry.
+        -- Matching dispatch consumes that entry before one native executor call.
+        -- Unknown, spent, fenced, wrong-instance/session/key/effect tokens execute
+        -- nothing. Duplicate or uncertain delivery never automatically replays.
+
+    @invariant ExactOwnedRootEnumeration
+        -- A native ListChildren admission consumes the exact committed pending
+        -- effect and independently rereads its durable issue. The live guardian
+        -- accepts only the current session, key, revision, deadline, parent identity,
+        -- and its sole exact owned root slot. A PID/birth DTO, persisted binding,
+        -- label, or socket path alone cannot authorize enumeration. The complete
+        -- child vector is bounded before allocation and retained as one typed result.
+
+    @invariant CapacityBeforeFirstMutation
+        -- Reserve result custody for the complete mutation round before its first
+        -- effect. Reservation or admission refusal before execution emits no partial
+        -- round. Interruption during execution retains completed results and does
+        -- not authorize finishing the round. No exactly-once crash claim follows.
+}
+
+contract NativeGuardianPersistenceBoundary {
+    commit_binding: (binding: GuardianBindingDto) -> BindingCommitEvidence
+    apply_result: (result: RetainedResultDto) -> ResultApplicationEvidence
+    acknowledge: (request: ResultAckDto) -> GuardianResponseDto
+
+    @invariant NormalizedEvidenceNotNativeOwnership
+        -- Attempt-bound columns/rows contain guardian nonce and native PID/birth,
+        -- session identity/fencing state, exact child-slot/native-identity inventory,
+        -- dispatch and reconciliation floors, and result identities with application
+        -- and ACK state. Foreign keys, uniqueness, shape constraints, and meaningful
+        -- ordering enforce structure. Child collections are never checkpoint blobs.
+        -- New timestamp columns obey REQ-COMP-005 integer Unix microseconds.
+        -- Commit binding before authorizing workload execution. Loaded rows convey
+        -- evidence, never parenthood, live sessions, tickets, or live admissions.
+        -- Unknown commit outcomes retain ControllerSqliteBoundary fail-stop behavior.
+
+    @invariant DurableApplicationBeforeAck
+        -- Correlate result instance, session of issuance, key, full effect, and typed
+        -- outcome. Commit policy application or explicit round settlement before
+        -- emitting ACK for that result and its applying revision. Guardian validates
+        -- the binding before releasing custody. A revision claim or delivery alone
+        -- is insufficient. Failed/ambiguous commit authorizes no ACK.
+        -- A recovered session may ACK an earlier session's result after verified
+        -- same-instance reattachment and proof of durable application, even while
+        -- fresh reconciliation is incomplete. ACK cannot restore mutation authority.
+        -- Lost ACK allows repeat evidence retrieval/ACK, not application/effect replay.
+
+    @invariant NormalizedChildListApplication
+        -- Native child-list issue, application, ordered result-child, and ACK
+        -- evidence occupy normalized rows. No result blob or second deadline
+        -- represents the same fact. Successful application consumes the original
+        -- affine ticket and verified completion through the same policy loop in the
+        -- checkpoint transaction before ACK. Result-child rows preserve received
+        -- order while policy canonicalizes PID hints before discovery. Query failure,
+        -- malformed rows, stale
+        -- evidence, mismatch, ambiguity, and deadline expiry grant no ACK or policy
+        -- advance. Empty success closes only that pending scan; it is neither root
+        -- absence nor cleanup verification, and listed PIDs still require birth-token
+        -- acquisition before they can become owned process identities.
+
+    @invariant ChildListAckRecoveryIsNotCleanupRecovery
+        -- A same-live fresh session may ACK an earlier successful child-list result
+        -- only from exact durable application evidence. It does not re-enumerate,
+        -- reapply, reconstruct a ticket or policy loop, observe identity, or restore
+        -- cleanup authority. Establishing the replacement session interrupts the
+        -- ownership checkpoint, so ACK-only recovery remains interrupted and
+        -- cleanup progress requires the separate identity-reconciliation barrier.
+
+    @invariant RecoveredSampleApplicationIsNotDispatch
+        -- A fresh reconciling session may combine the sole durable pending issue with
+        -- exact same-live retained issuing provenance to obtain one application-only
+        -- capability. Only a successful nonterminal resource sample may atomically
+        -- advance the interrupted sampling resume state and application row. The
+        -- attempt stays interrupted and no ticket, executable plan, activation,
+        -- process mutation, or ACK authority is returned. Failed, terminal, stale,
+        -- mismatched, ambiguous, or expired evidence remains retained and unapplied.
+}
+
+contract NativeGuardianReconnectBoundary {
+    reconnect: (request: GuardianReconnectDto) -> GuardianResponseDto
+
+    @invariant DisconnectRevokesUnusedAdmissions
+        -- Disconnect/death fences the ended session and every unused admission.
+        -- Original child ownership and unacknowledged results remain retained;
+        -- only already-started work continues. No new step or signal follows EOF,
+        -- heartbeat expiry, timeout, or connection. An active owner cannot be
+        -- silently replaced by a second connection.
+
+    @invariant ExactLiveInventoryAndDeadline
+        -- A fresh session requires the same live guardian, exact retained child
+        -- slot/native-identity inventory, and original absolute deadline matched
+        -- against durable binding evidence. Completion may change typed liveness
+        -- and results, never slot identity. Mismatch, replacement/loss, or deadline
+        -- expiry preserves unresolved supervision risk without adoption or repair.
+
+    @guidance
+        -- Verify same instance and inventory; commit a fresh interruption revision
+        -- strictly above every prior reconciliation session, even unfinished ones;
+        -- freshly reconcile every acquired identity; commit complete reconciliation;
+        -- only then admit new mutation. Retained results cannot replace fresh
+        -- observation. Dispatch floors never regress; deadlines never extend.
+        -- Application of an already-executed retained nonterminal sample may commit
+        -- while this fresh reconciliation remains incomplete. It is not a new native
+        -- mutation and grants no activation or continuation; the attempt stays
+        -- interrupted and any later progress starts with another fresh barrier.
+}
+
+contract NativeSameBuildBoundary {
+    admit_versions: (request: GuardianHandshakeDto) -> GuardianResponseDto
+
+    @invariant DisposableSameVersionOnly
+        -- Native protocol and controller schema require exact same build and
+        -- admitted schema/protocol versions. Reject unsupported versions before
+        -- mutation. No schema-v1 upgrade, downgrade, rolling/mixed-version use,
+        -- live guardian replacement, guardian-death/logout/reboot recovery, or
+        -- cross-boot deadline guarantee exists. A fresh disposable store cannot
+        -- reinterpret or erase incompatible attempt evidence as successful recovery.
+        -- Same-build runner restart behind the same live guardian is the entire
+        -- reconnect guarantee; it adds no application-database migration promise.
+}
+
+contract NativeGuardianQualificationBoundary {
+    qualify_disposable_native: (build_identity: String) -> NativeQualificationReport
+
+    @invariant RealProcessDeathIsASeparateQualification
+        -- Exercise separate real guardian and runner processes, a disposable
+        -- launchd job, owner-only socket, disposable store, and harmless originally
+        -- guardian-parented workload. Kill the runner while work is live; prove
+        -- the same guardian and child survive, no autonomous step/signal occurs,
+        -- detached completion remains retained, and fresh runner recovery commits
+        -- interruption and complete reconciliation within the original deadline.
+        -- Cover death after receipt/before commit, after commit/before ACK, and
+        -- lost ACK, proving retained custody and no blind replay. Reject stale
+        -- sessions, spent/wrong-bound admissions, malformed/oversize frames,
+        -- build/protocol/schema/inventory mismatch, replaced/dead guardians, and
+        -- expired deadlines. Prove persistence fail-stop and full-round capacity
+        -- refusal without partial mutation. In-process results do not prove IPC
+        -- or survival; neither qualification authorizes production adoption,
+        -- installer integration, helper invocation, or exactly-once crash claims.
+        -- One bounded journey continues a successful resource sample into the exact
+        -- guardian-owned root ListChildren successor, applies an empty result, ACKs,
+        -- and reaches owned-tree cleanup without dispatching identity observation.
+        -- Another kills the runner after durable child-list application and proves
+        -- same-live ACK recovery without re-enumeration or reapplication; because
+        -- fresh session establishment interrupts ownership, that journey remains
+        -- interrupted rather than claiming cleanup or readiness.
+}
+
+-- Helper meanings
+--
+-- sequence_is_after(sample, samples) -> Boolean
+-- sustained_capacity_and_contention_are_admissible(samples, count) -> Boolean
+-- stable_child_evidence_binds(discovery, identity) -> Boolean
+-- discovery_has_no_prior_observation_gap(attempt, discovery) -> Boolean
+-- recovery_observation_barrier_restarted(attempt) -> Boolean
+-- every_owned_identity_was_freshly_observed(attempt) -> Boolean
+-- no_owned_mutation_preceded_reconciliation(attempt) -> Boolean
+-- recovery_resume_phase(attempt) -> ControllerPhase
+-- retained_candidate_never_changes(attempt) -> Boolean
+-- freshly_observed_same_identity(identity) -> Boolean
+-- exact_identity_absence_is_verified(identity) -> Boolean
+-- every_owned_identity_is_verified_absent(attempt) -> Boolean
+-- a_freshly_matching_owned_identity_is_live(attempt) -> Boolean
+-- cleanup_evidence_is_unresolved(attempt) -> Boolean
+-- explicit_risk_acceptance_matches(attempt) -> Boolean
+-- no_additional_process_signal_requested(attempt) -> Boolean
+-- recovery_or_retry_does_not_change(deadline) -> Boolean
+-- resource_decision_uses_only_capacity_and_contention_samples(attempt) -> Boolean
+-- candidate_identity_is_exact(candidate) -> Boolean
+-- exact_reconciling_guardian_retains_issuing_provenance(attempt, sample) -> Boolean
+-- sole_pending_native_issue_matches(attempt, sample) -> Boolean
+--
+-- stable_child_evidence_binds(discovery, identity) is true only when one OS-boundary
+-- observation verifies discovery.verified_parent at its recorded birth, the child
+-- relationship, and identity's high-resolution birth token. A later process at the
+-- same PID cannot satisfy an older discovery epoch merely by reusing that PID.
+--
+-- recovery_observation_barrier_restarted(attempt) invalidates every observation
+-- from an earlier recovery round and requires a new observation of every acquired
+-- identity. every_owned_identity_was_freshly_observed(attempt) is true only when
+-- all identities, including children adopted during this round, have completed
+-- those observations. OwnedIdentityObservationRequested requests that observation
+-- for a newly adopted identity; child-list completion does not satisfy it.
+--
+-- recovery_resume_phase(attempt) uses the preserved original resume_phase, never
+-- recovering itself. After the complete observation barrier, unresolved discoveries
+-- select awaiting_birth_evidence and pending child scans select ownership_discovery.
+-- With neither outstanding, original discovery/birth-evidence phases advance to
+-- cleaning_owned_tree; original cleaning/verifying phases resume unchanged.
+-- Resource-sample recovery reissues the exact pending sample unless the same live
+-- guardian retains the exact successful nonterminal completion from the issuing
+-- session. That completion may be applied once to the interrupted resume state under
+-- the application-only rule, but it cannot activate recovery or issue another effect.
+-- Any later owned-mutation pass rechecks the unchanged absolute deadline and either
+-- recognizes already verified cleanup or enters administrative closeout without a
+-- signal; resource recovery cannot establish verified owned-tree cleanup.
+--
+-- exact_identity_absence_is_verified(identity) is stronger than an empty PID scan or
+-- an ESRCH returned while birth identity is still unknown. It proves that the exact
+-- acquired pid-plus-birth identity is no longer present.
+--
+-- cleanup_evidence_is_unresolved(attempt) is true when any acquired identity lacks
+-- verified absence, any discovery remains unresolved, or any child scan is pending.
+-- Absence of acquired identities alone cannot discharge discovery or scan debt.
+--
+-- sustained_capacity_and_contention_are_admissible(samples, count) requires at least
+-- count ordered consecutive samples with sufficient measured capacity and refuses
+-- contention only when it exceeds policy throughout that window. One transient busy
+-- sample is not sustained contention. Process names and whole-process-table equality
+-- are not admission authorities.
+--
+-- administrative_closeout_required is a truthful stopped state. Explicit matching
+-- risk acceptance may close scheduling ownership without claiming verified cleanup,
+-- sending another signal, or authorizing the interrupted deployment to continue.
+--
+-- candidate_identity_is_exact requires a complete source commit and artifact hash.
+-- Once candidate migration invocation is durable, recovery may run only the exact
+-- retained candidate. This module grants no older-binary or database downgrade
+-- compatibility.
+--
+-- Resource and process diagnostics expose typed values and categories only; command
+-- lines, environment values, credentials, and raw secret-bearing OS errors are not
+-- durable telemetry.
+
+surface StandaloneDeploymentController {
+    contracts:
+        demands ControllerOsBoundary
+        demands ControllerSqliteBoundary
+        demands AffineDispatchBoundary
+        demands MacOsSupervisionBoundary
+    context attempt: DeploymentAttempt
+    exposes:
+        attempt.id
+        attempt.phase
+        attempt.operation_deadline
+        attempt.cleanup_result
+        attempt.compatibility_boundary
+        attempt.owned_identities
+        attempt.unresolved_discoveries
+        attempt.pending_child_scans
+    provides:
+        DeploymentRequested(attempt)
+        ResourceSampleObserved(attempt, sample)
+        ResourceSamplingCompleted(attempt)
+        ChildPidObserved(attempt, parent, pid)
+        StableChildIdentityObserved(attempt, discovery, identity)
+        ChildIdentityProbeFailed(attempt, discovery, failure)
+        HintPidNowNamesDifferentProcess(attempt, discovery, replacement)
+        OwnershipScanCompleted(attempt)
+        OwnedChildScanCompleted(attempt, parent)
+        RecoveryReconciliationCompleted(attempt)
+        OwnedCleanupRequested(attempt, identity)
+        CleanupMutationPassRequested(attempt)
+        OwnedIdentityObservedWithDifferentParent(attempt, identity)
+        OwnedIdentityAbsenceVerified(attempt, identity)
+        OwnedPidReused(attempt, owned_identity, replacement)
+        CleanupSignalsSettled(attempt)
+        CleanupVerificationCompleted(attempt)
+        ControllerInterrupted(attempt)
+        RecoveryRequested(attempt)
+        RetainedNativeResourceSampleVerified(attempt, sample)
+        CandidateMigrationInvoked(attempt, candidate)
+        ForwardRecoveryFailed(attempt)
+        AdministrativeRiskAccepted(attempt)
+}
+
+surface AffineDispatchCorrelation {
+    contracts:
+        demands AffineDispatchBoundary
+    context key: DispatchKey
+    exposes:
+        key.attempt_id
+        key.persistence_revision
+        key.ordinal
+}
+
+surface SafeStandaloneStoreCli {
+    contracts:
+        demands SafeStoreCliBoundary
+    context summary: StatusSummary
+    exposes:
+        summary.attempt_id
+        summary.persistence_revision
+        summary.phase
+        summary.cleanup_outcome
+}
+
+surface DisposableNativeGuardianRunner {
+    contracts:
+        demands NativeRunnerBoundary
+        demands NativeGuardianIpcBoundary
+        demands NativeDispatchAdmissionBoundary
+        demands NativeGuardianPersistenceBoundary
+        demands NativeGuardianReconnectBoundary
+        demands NativeSameBuildBoundary
+        demands NativeGuardianQualificationBoundary
+        demands SurvivingGuardianBoundary
+        demands DeterministicPolicyLoop
+    context binding: GuardianBinding
+    exposes:
+        binding.attempt_id
+        binding.guardian_instance_nonce
+        binding.state
+        binding.minimum_dispatch_revision
+        binding.reconciliation_floor
+        binding.latest_reconciliation_revision
+}
