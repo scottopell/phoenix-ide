@@ -199,13 +199,16 @@ test('source stage remains after sealed physical history and before server stop;
   assert.match(source.slice(stage), /harnessPath: fileURLToPath\(import.meta.url\)/);
 });
 
+function detailRecord(open_id, trace_id = null) {
+  return {kind: 'request', method: 'GET', pathname: '/api/product-conversations/ordinary-product', status: 200, finished: true, failed: false, open_id, trace_id};
+}
 function historyInventory() {
-  const report = { ...structuredClone(stock().trials[0].reports[0]), open_id: 'unit-history', correlations: [{ kind: 'request', id: 'unit-history' }] };
+  const report = { ...structuredClone(stock().trials[0].reports[0]), open_id: 'unit-history', route: 'ordinary', product_conversation_id: 'ordinary-product', correlations: [{ kind: 'request', id: 'unit-history' }] };
   return { scope: 'UNIT_ONLY_original_history', errors: [], ownershipFailure: null,
     requestOwners: [{ journey_id: report.open_id, request_id: report.open_id }],
     streamOwners: [],
     reports: [report], statuses: [{ open_id: report.open_id, status: 204 }],
-    requestRecords: [{ kind: 'request', open_id: report.open_id, trace_id: null }] };
+    requestRecords: [detailRecord(report.open_id, null)] };
 }
 const unitModule = {
   captureReport: raw => JSON.parse(raw),
@@ -214,7 +217,7 @@ const unitModule = {
     ...Object.fromEntries(Object.entries(report.marks).map(([k, v]) => [`browser.${k}_ms`, v])) } }),
 };
 test('UNIT ONLY independently captured original history views join exact stock inventory without receiver output', () => {
-  const result = appendObservedHistory(stock(), historyInventory(), input().fixtures.identity, unitModule);
+  const result = appendObservedHistory(stock(), historyInventory(), input().fixtures.identity, unitModule, input().fixtures);
   assert.equal(result.journeys.length, 2); assert.equal(result.additional_history.reports, 1);
   assert.deepEqual(result.trials.at(-1).reports.map(r => r.open_id), ['unit-history']);
 });
@@ -222,19 +225,19 @@ test('UNIT ONLY journey UUID differs from independently observed finite request 
   const inventory = historyInventory();
   inventory.reports[0].correlations = [{ kind: 'request', id: 'distinct-request-id' },
     { kind: 'trace', id: 'a'.repeat(32) }];
-  inventory.requestRecords = [{ kind: 'request', open_id: 'distinct-request-id', trace_id: 'a'.repeat(32) }];
+  inventory.requestRecords = [detailRecord('distinct-request-id', 'a'.repeat(32))];
   inventory.requestOwners = [{ journey_id: 'unit-history', request_id: 'distinct-request-id' }];
-  const result = appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule);
+  const result = appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule, input().fixtures);
   assert.equal(result.journeys.at(-1).open_id, 'unit-history');
   assert.equal(result.trials.at(-1).requestRecords[0].open_id, 'distinct-request-id');
   const foreign = structuredClone(inventory);
-  foreign.requestRecords = [{ kind: 'request', open_id: 'unit-history', trace_id: 'a'.repeat(32) }];
-  assert.throws(() => appendObservedHistory(stock(), foreign, input().fixtures.identity, unitModule),
+  foreign.requestRecords = [detailRecord('unit-history', 'a'.repeat(32))];
+  assert.throws(() => appendObservedHistory(stock(), foreign, input().fixtures.identity, unitModule, input().fixtures),
     /independently observed finite request/);
   const borrowed = structuredClone(inventory);
   borrowed.requestRecords[0].trace_id = null;
-  borrowed.requestRecords.push({ kind: 'request', open_id: 'unreported-request', trace_id: 'a'.repeat(32) });
-  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule),
+  borrowed.requestRecords.push(detailRecord('unreported-request', 'a'.repeat(32)));
+  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule, input().fixtures),
     /independent request\/response provenance/);
 });
 
@@ -251,7 +254,7 @@ for (const [name, mutate] of Object.entries({
   duplicate_stock_identity: i => { i.reports[0].open_id = 'unit-ready'; },
   rejected_collector: i => { i.statuses[0].status = 400; },
 })) test(`original history inventory rejects ${name} (UNIT ONLY)`, () => {
-  const i = historyInventory(); mutate(i); assert.throws(() => appendObservedHistory(stock(), i, input().fixtures.identity, unitModule));
+  const i = historyInventory(); mutate(i); assert.throws(() => appendObservedHistory(stock(), i, input().fixtures.identity, unitModule, input().fixtures));
 });
 test('UNIT pagination diagnostic distinguishes actual uncorrelated GETs without retaining private values', () => {
   const page = new EventEmitter(), base = 'http://127.0.0.1:12345';
@@ -260,6 +263,7 @@ test('UNIT pagination diagnostic distinguishes actual uncorrelated GETs without 
     const request = { method: () => method, url: () => base + path };
     page.emit('request', request);
     page.emit('response', { request: () => request, status: () => 200 });
+    page.emit('requestfinished', request);
   };
   emit('/api/private-product?before=SECRET-cursor');
   emit('/api/other?before=SECRET-cursor');
@@ -268,8 +272,8 @@ test('UNIT pagination diagnostic distinguishes actual uncorrelated GETs without 
   emit('/api/private-product?before=SECRET-cursor&open_id=SECRET-request');
   const result = diagnostic.snapshot([{ correlations: [{ kind: 'request', id: 'SECRET-request' }] }]);
   assert.deepEqual(result, { errors: 0, requests: [
-    { has_open_id: false, before_report: true, status: 200, in_report: false },
-    { has_open_id: true, before_report: false, status: 200, in_report: true },
+    { has_open_id: false, before_report: true, status: 200, finished: true, failed: false, in_report: false },
+    { has_open_id: true, before_report: false, status: 200, finished: true, failed: false, in_report: true },
   ] });
   assert.doesNotMatch(JSON.stringify(result), /SECRET|private-product|cursor|http/);
   for (let n = 0; n < 130; n++) emit('/api/private-product?before=SECRET');
@@ -281,7 +285,7 @@ test('UNIT recovery request correlation is finite and exclusive without initial-
   const base = 'http://127.0.0.1:12345', path = '/api/product-conversations/unit';
   const page = new EventEmitter(), capture = installObservedHistoryTelemetry(page, base);
   page.emit('request', { method: () => 'GET', url: () => base + path + '?request_id=UNIT-recovery&unknown=SECRET' });
-  assert.deepEqual(capture.snapshot().requestRecords, [{ method: 'GET', pathname: path, has_before: false, open_id: 'UNIT-recovery', kind: 'request', trace_id: null }]);
+  assert.deepEqual(capture.snapshot().requestRecords, [{ method: 'GET', pathname: path, has_before: false, open_id: 'UNIT-recovery', kind: 'request', trace_id: null, status: null, finished: false, failed: false }]);
   assert.deepEqual(capture.snapshot().errors, []);
   assert.doesNotMatch(JSON.stringify(capture.snapshot()), /SECRET|request_id=/);
   for (const query of ['open_id=a&request_id=b', 'request_id=a&request_id=b', 'request_id=', 'open_id=']) {
@@ -297,19 +301,20 @@ test('UNIT ONLY late report capture retains raw body/response and independent he
     bindPage: () => {},
     snapshot: () => ({ pairs: historyInventory().requestOwners, failure: null }),
   });
-  const request = { method: () => 'GET', url: () => 'http://127.0.0.1:12345/api/product-conversations/unit?open_id=unit-history&before=SECRET-cursor&unknown=SECRET' };
+  const request = { method: () => 'GET', url: () => 'http://127.0.0.1:12345/api/product-conversations/ordinary-product?open_id=unit-history&before=SECRET-cursor&unknown=SECRET' };
   page.emit('request', request);
   page.emit('response', { request: () => request, status: () => 200, headers: () => ({ traceparent: '00-' + 'a'.repeat(32) + '-' + 'b'.repeat(16) + '-01' }) });
+  page.emit('requestfinished', request);
   assert.equal(capture.snapshot().reports.length, 0);
   const report = historyInventory().reports[0], post = { method: () => 'POST', url: () => 'http://127.0.0.1:12345/api/telemetry/conversation-view', postData: () => JSON.stringify(report) };
   page.emit('request', post); page.emit('response', { request: () => post, status: () => 204, headers: () => ({}) });
   const retained = capture.snapshot(); assert.equal(retained.requestRecords[0].trace_id, 'a'.repeat(32));
-  assert.equal(retained.requestRecords[0].pathname, '/api/product-conversations/unit');
+  assert.equal(retained.requestRecords[0].pathname, '/api/product-conversations/ordinary-product');
   assert.equal(retained.requestRecords[0].has_before, true);
   assert.equal(Object.hasOwn(retained.requestRecords[0], 'url'), false);
   assert.doesNotMatch(JSON.stringify(retained), /SECRET|127\.0\.0\.1/);
   assert.deepEqual(retained.reports, [report]); assert.equal(retained.statuses[0].status, 204);
-  appendObservedHistory(stock(), retained, input().fixtures.identity, unitModule);
+  appendObservedHistory(stock(), retained, input().fixtures.identity, unitModule, input().fixtures);
 });
 test('source observer precedes first history navigation and union follows browser close before server stop', () => {
   const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
@@ -327,16 +332,16 @@ test('UNIT ONLY history trace belongs to the same report request, never a differ
   const own = historyInventory();
   own.requestRecords[0].trace_id = 'a'.repeat(32);
   own.reports[0].correlations.push({ kind: 'trace', id: 'a'.repeat(32) });
-  own.requestRecords.push({ kind: 'request', open_id: 'unit-other-journey', trace_id: 'b'.repeat(32) });
-  appendObservedHistory(stock(), own, input().fixtures.identity, unitModule);
+  own.requestRecords.push(detailRecord('unit-other-journey', 'b'.repeat(32)));
+  appendObservedHistory(stock(), own, input().fixtures.identity, unitModule, input().fixtures);
   const borrowed = structuredClone(own);
   borrowed.reports[0].correlations.find(c => c.kind === 'trace').id = 'b'.repeat(32);
-  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule), /independent request\/response provenance/);
+  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule, input().fixtures), /independent request\/response provenance/);
   borrowed.reports[0].correlations.push({ kind: 'request', id: 'unit-other-journey' });
   borrowed.requestOwners.push({ journey_id: 'foreign-journey', request_id: 'unit-other-journey' });
-  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule), /independently observed journey/);
+  assert.throws(() => appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule, input().fixtures), /independently observed journey/);
   borrowed.requestOwners.push({ journey_id: 'unit-history', request_id: 'unit-other-journey' });
-  appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule);
+  appendObservedHistory(stock(), borrowed, input().fixtures.identity, unitModule, input().fixtures);
 });
 
 
@@ -452,13 +457,13 @@ test('UNIT ONLY SSE correlation needs independent same-journey producer edge AND
   const inventory = historyInventory();
   inventory.reports[0].correlations.push({ kind: 'sse', id: 'UNIT-stream' });
   inventory.requestRecords.push({ kind: 'sse', open_id: 'UNIT-stream', trace_id: null });
-  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule), /SSE must belong/);
+  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule, input().fixtures), /SSE must belong/);
   inventory.streamOwners.push({ journey_id: 'UNIT-foreign', stream_id: 'UNIT-stream' });
-  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule), /SSE must belong/);
+  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule, input().fixtures), /SSE must belong/);
   inventory.streamOwners.push({ journey_id: 'unit-history', stream_id: 'UNIT-stream' });
-  appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule);
+  appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule, input().fixtures);
   inventory.requestRecords.pop();
-  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule), /independent request\/response provenance/);
+  assert.throws(() => appendObservedHistory(stock(), inventory, input().fixtures.identity, unitModule, input().fixtures), /independent request\/response provenance/);
 });
 test('UNIT ONLY request and SSE producer edges share the fixed ownership cap', async () => {
   let callback;
@@ -495,4 +500,24 @@ test('UNIT ONLY producer event bound is independent of ownership edge count', as
   callback(source, admission);
   assert.equal(owner.snapshot().failure, 'invalid_or_overflow_history_request_ownership');
   assert.deepEqual(owner.snapshot().pairs, []);
+});
+
+test('UNIT ready detail join rejects arbitrary APIs, methods, unsuccessful or unfinished transports',()=>{
+  for(const mutate of [r=>r.pathname='/api/health',r=>r.method='POST',r=>r.status=500,r=>r.status=null,r=>r.finished=false,r=>r.failed=true]){
+    const inventory=historyInventory();mutate(inventory.requestRecords[0]);
+    assert.throws(()=>appendObservedHistory(stock(),inventory,input().fixtures.identity,unitModule,input().fixtures));
+  }
+});
+
+test('UNIT fixture-specific Global member aliases join while foreign aliases fail; pending detail stays pending',()=>{
+  for(const member of input().fixtures.aggregates[1].members){
+    const inventory=historyInventory();Object.assign(inventory.reports[0],{route:'global',product_conversation_id:'global-product'});
+    inventory.requestRecords[0].pathname=`/api/global/coordinator/history/${member}`;
+    appendObservedHistory(stock(),inventory,input().fixtures.identity,unitModule,input().fixtures);
+    inventory.requestRecords[0].pathname='/api/global/coordinator/history/foreign';
+    assert.throws(()=>appendObservedHistory(stock(),inventory,input().fixtures.identity,unitModule,input().fixtures));
+  }
+  const pending=historyInventory();Object.assign(pending.reports[0],{outcome:'canceled',product_conversation_id:null});
+  Object.assign(pending.requestRecords[0],{status:null,finished:false});
+  appendObservedHistory(stock(),pending,input().fixtures.identity,unitModule,input().fixtures);
 });

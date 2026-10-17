@@ -39,7 +39,7 @@ test('UNIT independently served controlled bytes must match every admitted asset
 function fakeRuntime(options={}){
   let count=0,closed=0;const pages=[];
   const fixtures={identity:{serverInstanceId:'UNIT-instance'},aggregates:['ordinary','global'].map(kind=>({kind,route:`/${kind}/latest`,endpoint:`/api/${kind}/history`,product_conversation_id:`UNIT-${kind}`,members:[`UNIT-${kind}-root`,`UNIT-${kind}-latest`]}))};
-  const targets=fixtures.aggregates.map(f=>({kind:f.kind,route:`/${f.kind}/root`,anchor:{sourceRow:'UNIT-root',persistedMessageID:'UNIT-original'},composerOwner:'UNIT-latest'}));
+  const targets=fixtures.aggregates.map(f=>({kind:f.kind,route:`/${f.kind}/root`,anchor:{sourceRow:'UNIT-root',persistedMessageID:'UNIT-original'},composerOwner:f.members.at(-1)}));
   class Context {
     async exposeBinding(_,callback){this.callback=callback;}
     async addInitScript(){}
@@ -56,8 +56,9 @@ function fakeRuntime(options={}){
     constructor(context){super();this.context=context;context.page=this;this.frame={};this.open_id=`UNIT-open-${++count}`;}
     mainFrame(){return this.frame;}
     async close(){}
+    async route(_pattern, handler){this.chatRoute=handler;}
     url(){return this.location;}
-    diagnostic(event){this.context.callback({page:this,frame:this.frame},event);}
+    diagnostic(event){if(options.dropOwnership||(options.dropStreamOwnership&&event.kind==='sse')||(options.dropRequestOwnership&&event.kind==='request'))return; const deliver=()=>this.context.callback({page:this,frame:this.frame},event); if(options.delayedOwnership)setImmediate(deliver);else deliver();}
     request(path,method='GET',body){const req={url:()=>new URL(path,'http://127.0.0.1:12345').href,method:()=>method,postData:()=>body};this.emit('request',req);return req;}
     async goto(url){
       (this.navigations??=[]).push(url);
@@ -69,18 +70,26 @@ function fakeRuntime(options={}){
       this.diagnostic({kind:'request',open_id:this.open_id,request_id:this.request_id});
       this.pending=this.request(this.fixture.endpoint+'?open_id='+this.request_id);
       if(url.endsWith('/root')){
+        this.emit('response',{request:()=>this.pending,status:()=>200,headers:()=>({})});
+        this.emit('requestfinished',this.pending);
         if(!options.omitHistoryRequest){
           this.diagnostic({kind:'request',open_id:this.open_id,request_id:this.request_id+'-older'});
-          this.request(this.fixture.endpoint+'?before=UNIT-cursor&open_id='+this.request_id+'-older');
+          const older=this.request(this.fixture.endpoint+'?before=UNIT-cursor&open_id='+this.request_id+'-older');
+          const completeOlder=()=>{
+            if(!options.noOlderResponse)this.emit('response',{request:()=>older,status:()=>options.older500?500:200,headers:()=>({})});
+            if(options.failedOlder)this.emit('requestfailed',older);else if(!options.incompleteOlder)this.emit('requestfinished',older);
+          };
+          if(options.delayedOlder)setImmediate(completeOlder);else completeOlder();
         }
         if(options.extraUncorrelatedHistory)this.request(this.fixture.endpoint+'?before=UNIT-unowned');
         this.diagnostic({kind:'sse',open_id:this.open_id,stream_id:'UNIT-stream'});
-        this.request('/api/conversations/UNIT-latest/stream?open_id=UNIT-stream');
+        this.request(`/api/conversations/${this.fixture.members.at(-1)}/stream?open_id=UNIT-stream`);
         this.report('ready');
       }
     }
     report(outcome){
       const report={open_id:this.open_id,route:options.wrongRoute?'foreign':this.fixture.kind,sample_rate:options.wrongSampleRate?0.25:1,outcome,product_conversation_id:this.fixture.product_conversation_id,correlations:[{kind:'request',id:this.request_id}]};
+      if(outcome==='ready')report.correlations.push({kind:'sse',id:'UNIT-stream'});
       if(outcome==='ready'&&!options.omitHistoryRequest&&!options.omitHistoryCorrelation)report.correlations.push({kind:'request',id:this.request_id+'-older'});
       if(options.missingGlobalIdentity&&this.fixture.kind==='global')delete report.product_conversation_id;
       if(options.unsafeReport)report.unrecognized_private_field='PRIVATE-never-retained';
@@ -96,7 +105,7 @@ function fakeRuntime(options={}){
     }
     async evaluate(_fn,arg){
       if(options.completeBeforeAction&&this.pending)this.emit('requestfinished',this.pending);
-      if(!arg){await new Promise(resolve=>setImmediate(resolve));return 123;}
+      if(!arg){if(!options.delayedOwnership&&!options.delayedOlder)await new Promise(resolve=>setImmediate(resolve));return 123;}
       this.physicalReads=(this.physicalReads??0)+1;
       const missing=options.missingPhysical||(options.delayedPhysical&&this.physicalReads===1);
       return {observation:missing?null:{...arg.known[0],key:'UNIT-virtual',offset:0,messageOffset:0,currentURL:this.location,
@@ -105,7 +114,17 @@ function fakeRuntime(options={}){
     locator(selector){
       assert.ok(!selector.includes('placeholder'), 'composer identity cannot depend on dynamic presentation text');
       if(selector.startsWith('textarea'))assert.equal(selector,'textarea#message-input');
-      return {count:async()=>options.missingComposer?0:1,isEditable:async()=>!options.readonlyComposer,waitFor:async()=>{},isEnabled:async()=>true,evaluate:async()=> 'BUTTON',click:async()=>{this.location='http://127.0.0.1:12345/';this.report('canceled');}};}
+      return {fill:async text=>{this.probe=text;},press:async key=>{
+        assert.equal(key,'Enter');assert.equal(this.probe,'qualification owner probe');
+        const req=this.request(`/api/conversations/${options.wrongWriteOwner?this.fixture.members[0]:this.fixture.members.at(-1)}/chat`,'POST');
+        let continued=false;
+        await this.chatRoute({request:()=>req,abort:async()=>{this.blockedWrite=true;this.emit('requestfailed',req);},continue:async()=>{continued=true;}});
+        if(!continued)return;
+        this.sentWrites=(this.sentWrites??0)+1;
+        if(!options.noWriteResponse)this.emit('response',{request:()=>req,status:()=>options.write500?500:200});
+        if(options.failedWrite)this.emit('requestfailed',req);else if(!options.incompleteWrite)this.emit('requestfinished',req);
+        if(options.duplicateWrite)this.request(`/api/conversations/${this.fixture.members.at(-1)}/chat`,'POST');
+      },count:async()=>options.missingComposer?0:1,isEditable:async()=>!options.readonlyComposer,waitFor:async()=>{},isEnabled:async()=>true,evaluate:async()=> 'BUTTON',click:async()=>{this.location='http://127.0.0.1:12345/';this.report('canceled');}};}
     async waitForURL(){}
   }
   const contextOptions=[];
@@ -299,7 +318,7 @@ test('UNIT outer lifecycle preserves allowlisted scenario failure location inste
     publish:r=>published.push(structuredClone(r)),timeoutMs:1000}));
   const result=published.at(-1);assert.equal(result.failure,'controlled_scenario_failed');
   assert.deepEqual(result.failure_location,{scope:'scenario',route:'ordinary',kind:'history',
-    phase:'additional_history_request_present',error_kind:'assertion',counts:{reports:1,responses:[204],admissions:1,requests:2,pending:1,errors:0},physical:{predicates:{},observation_present:true,fixture_identity_matches:true,sourcepin_matches:true},pagination:{errors:0,requests:[]}});
+    phase:'additional_history_request_present',error_kind:'assertion',counts:{reports:1,responses:[204],admissions:1,requests:2,pending:0,errors:0},physical:{predicates:{},observation_present:true,fixture_identity_matches:true,sourcepin_matches:true},pagination:{errors:0,requests:[]}});
 });
 test('UNIT phase receipts expose bounded counts, not raw errors or private setup details',async()=>{
   const runtime=fakeRuntime();const published=[];
@@ -359,4 +378,53 @@ test('UNIT dynamic-placeholder-independent composer still requires exactly one e
     assert.ok(error);assert.equal(error.controlledReceipt.failure_location.phase,'composer_owner');
     assert.equal(runtime.getClosed(),1);
   }
+});
+
+test('UNIT actual older GET requires a successful completed response, not just correlation',async()=>{
+  for(const options of [{noOlderResponse:true},{older500:true},{incompleteOlder:true},{failedOlder:true}]){
+    const runtime=fakeRuntime(options);runtime.input.deadlineMs=100;
+    await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT));
+  }
+});
+test('UNIT asynchronous producer delivery joins admission and every owner before report assertion',async()=>{
+  const runtime=fakeRuntime({delayedOwnership:true});
+  assertControlledInventory(await runControlledFunctional(runtime.input,runtime.UNIT));
+});
+test('UNIT missing producer delivery fails explicitly within existing absolute deadline',async()=>{
+  const runtime=fakeRuntime({dropOwnership:true});runtime.input.deadlineMs=50;
+  await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT),/deadline/);
+});
+test('UNIT composer probe observes exactly one successful completed POST to the writable owner',async()=>{
+  for(const options of [{wrongWriteOwner:true},{write500:true},{failedWrite:true},{noWriteResponse:true},{incompleteWrite:true},{duplicateWrite:true}]){
+    const runtime=fakeRuntime(options);runtime.input.deadlineMs=100;
+    await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT),error=>{
+      assert.equal(error.controlledReceipt.failure_location.phase,'composer_write_probe');return true;
+    });
+  }
+});
+
+test('UNIT wrong-owner composer POST is blocked before backend dispatch',async()=>{
+  const runtime=fakeRuntime({wrongWriteOwner:true});
+  await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT));
+  assert.equal(runtime.pages[0].blockedWrite,true);assert.equal(runtime.pages[0].sentWrites,undefined);
+});
+test('UNIT missing individual request or SSE owner cannot pass on admission alone',async()=>{
+  for(const options of [{dropStreamOwnership:true},{dropRequestOwnership:true}]){
+    const runtime=fakeRuntime(options);runtime.input.deadlineMs=50;
+    await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT),/deadline/);
+  }
+});
+
+test('UNIT successful composer receipt retains only owner/status after physical stability, never probe text',async()=>{
+  const runtime=fakeRuntime();const result=await runControlledFunctional(runtime.input,runtime.UNIT);
+  for(const trial of result.trials.filter(t=>t.kind==='history')){
+    assert.deepEqual(trial.composer_write,{owner:`UNIT-${trial.route}-latest`,status:200});
+    assert.equal(runtime.pages.find(p=>p.open_id===trial.reports[0].open_id).sentWrites,1);
+  }
+  assert.doesNotMatch(JSON.stringify(result),/qualification owner probe/);
+});
+
+test('UNIT older response completion can trail physical readiness without a race or sleep',async()=>{
+  const runtime=fakeRuntime({delayedOlder:true});
+  assertControlledInventory(await runControlledFunctional(runtime.input,runtime.UNIT));
 });

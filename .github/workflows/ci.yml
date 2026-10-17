@@ -192,10 +192,13 @@ jobs:
 
   qualify-history-realserver:
     name: typed codegen and isolated instrumented opening witness (not shipping)
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qualification/continuation-opening-codegen' }}
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'qualification/continuation-opening-codegen' || github.head_ref == 'integration/v013-history-current-main') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 90
     env:
+      CARGO_BUILD_JOBS: "2"
+      RAYON_NUM_THREADS: "2"
+      RUST_TEST_THREADS: "2"
       APP_ROOT: ${{ github.workspace }}/pinned-app
       APP_BUILD_RECEIPT: ${{ github.workspace }}/history-build.json
       PHOENIX_CHECK_ALL: "1"
@@ -240,6 +243,7 @@ jobs:
           node --test ui/scripts/qualify-history-realserver.selftest.mjs
           node --check ui/scripts/qualify-history-realserver.mjs
       - name: Build separate stock and controlled UI artifacts (not runtime qualification)
+        timeout-minutes: 10
         working-directory: pinned-app/ui
         run: |
           pnpm install --frozen-lockfile
@@ -259,6 +263,7 @@ jobs:
               'ui_artifacts':module.build_owner_binding(root), 'scope':'hosted exact-source two-build attestation; not runtime acceptance'},indent=2))
           PY
       - name: Genuine typed-contract codegen through existing dev.py
+        timeout-minutes: 10
         shell: bash
         working-directory: pinned-app
         run: |
@@ -418,6 +423,8 @@ jobs:
           node --check ui/scripts/qualify-history-controlled-functional.mjs
           node --test ui/scripts/qualify-history-opening-realserver.selftest.mjs
           node --test ui/scripts/history-joint-telemetry.selftest.mjs
+          node --test ui/scripts/history-postfault-baseline.selftest.mjs
+          node --test ui/scripts/history-opening-navigation.selftest.mjs
           test -f ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
           node --check ../pinned-app/ui/scripts/qualify-view-telemetry.mjs
           node --check ../pinned-app/ui/scripts/view-telemetry-diagnostics.mjs
@@ -426,6 +433,7 @@ jobs:
           cd ../../harness
           node --check ui/scripts/qualify-history-opening-realserver.mjs
       - name: Full UI source qualification at exact pinned app (no filtered retry)
+        timeout-minutes: 10
         shell: bash
         working-directory: pinned-app
         run: |
@@ -470,7 +478,7 @@ jobs:
             --app-root "$GITHUB_WORKSPACE/pinned-app" \
             --instrumented-exe "$GITHUB_WORKSPACE/opening-instrumented-libtest" \
             --instrumented-receipt "$GITHUB_WORKSPACE/opening-instrumented-receipt.json" \
-            --output "$GITHUB_WORKSPACE/opening-browser-evidence" --timeout 300
+            --output "$GITHUB_WORKSPACE/opening-browser-evidence" --timeout 420
       - name: Retain receipts on success or failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v4

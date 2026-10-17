@@ -829,14 +829,14 @@ def request_normal_server_stop(control):
             raise RuntimeError('normal control stop acknowledgement rejected')
 
 
-def normal_server_completion(server, case, startup, control, failures):
+def normal_server_completion(server, case, startup, control, failures, *, request_stop=False):
     """Called before owned_process's forced process-group cleanup."""
     primary_error = None
     receipt = {"status": "failed", "normal_wait_timeout_seconds": SERVER_COMPLETION_TIMEOUT,
                "owned_home": startup["home"], "control": str(control), "returncode": None,
-               "stop": "already_exited"}
+               "stop": "already_exited" if server.poll() is not None else "browser_owned"}
     try:
-        if server.poll() is None:
+        if request_stop and server.poll() is None:
             receipt['status'] = 'stop_request_failed'
             receipt['stop'] = 'failed'
             request_normal_server_stop(control)
@@ -1054,7 +1054,7 @@ def qualify(app, exe, output, joint_telemetry=False, controlled=False):
                                     receiver_serving_check(receiver)
                                     receiver.assert_receipt(telemetry_result)
                                 completion = normal_server_completion(
-                                    server, case, startup, control, failures)
+                                    server, case, startup, control, failures, request_stop=controlled)
                                 app_stopped = (completion["status"] == "success"
                                                and server.poll() == 0)
                                 if receiver:

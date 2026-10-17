@@ -20,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: 191dacb3e7bcd671990298be8896d6cdcdb2015c
           path: harness
           persist-credentials: false
       - uses: actions/checkout@v4

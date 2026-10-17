@@ -139,7 +139,8 @@ export async function installHistoryRequestOwnership(context, config, UNIT) {
       ({ captureDiagnostic } = await import(pathToFileURL(helper).href));
     }
   } catch { throw new Error('history diagnostic parser setup failed'); }
-  const pairs = [], streams = [], producerEvents = [], admissions = new Set();
+  const pairs = [], streams = [], producerEvents = [], admissions = new Set(), subscribers = new Set();
+  const signal = () => { for (const notify of subscribers) notify(); };
   let events = 0, failure = null, canceled = false, timer, observedPage, phase = 'binding';
   const binding = '__phoenixHistoryDiagnostic';
   const operation = (async () => {
@@ -157,6 +158,7 @@ export async function installHistoryRequestOwnership(context, config, UNIT) {
           else streams.push({ journey_id: event.open_id, stream_id: event.stream_id });
         }
       } catch { failure = 'invalid_or_overflow_history_request_ownership'; }
+      signal();
     });
     assert.ok(!canceled, 'history diagnostics installation canceled');
     phase = 'init_script';
@@ -179,6 +181,7 @@ export async function installHistoryRequestOwnership(context, config, UNIT) {
     bindPage(page) { assert.ok(!observedPage, 'history observed page must bind once'); observedPage = page; },
     snapshot: () => structuredClone({ pairs, streams, failure }),
     diagnostics: () => structuredClone(producerEvents),
+    subscribe(notify) { subscribers.add(notify); return () => subscribers.delete(notify); },
   };
 }
 
@@ -192,7 +195,7 @@ export function installHistoryPaginationDiagnostic(page, baseURL, endpoint) {
       if (url.pathname === '/api/telemetry/conversation-view' && request.method() === 'POST') reportStarted = true;
       if (url.pathname !== endpoint || request.method() !== 'GET' || !url.searchParams.has('before')) return;
       assert.ok(requests.size < 128);
-      const record = { has_open_id: url.searchParams.getAll('open_id').length === 1 && Boolean(url.searchParams.get('open_id')), before_report: !reportStarted, status: null };
+      const record = { has_open_id: url.searchParams.getAll('open_id').length === 1 && Boolean(url.searchParams.get('open_id')), before_report: !reportStarted, status: null, finished: false, failed: false };
       requests.set(request, { record, id: url.searchParams.get('open_id') });
     } catch { errors = Math.min(128, errors + 1); }
   });
@@ -200,6 +203,8 @@ export function installHistoryPaginationDiagnostic(page, baseURL, endpoint) {
     try { const observed = requests.get(response.request()); if (observed) observed.record.status = response.status(); }
     catch { errors = Math.min(128, errors + 1); }
   });
+  page.on('requestfinished', request => { const observed = requests.get(request); if (observed) observed.record.finished = true; });
+  page.on('requestfailed', request => { const observed = requests.get(request); if (observed) observed.record.failed = true; });
   return { snapshot(reports = []) {
     correlations.clear();
     for (const report of reports) for (const c of report.correlations ?? []) if (c.kind === 'request') correlations.add(c.id);
@@ -229,7 +234,7 @@ export function installObservedHistoryTelemetry(page, baseURL, ownership) {
         const kind = /\/api\/conversations\/[^/]+\/stream$/.test(url.pathname) ? 'sse' : 'request';
         if (kind === 'sse') assert.equal(key, 'open_id');
         const record = { method: request.method(), pathname: url.pathname, has_before: url.searchParams.has('before'), open_id: url.searchParams.get(key),
-          kind, trace_id: null };
+          kind, trace_id: null, status: null, finished: false, failed: false };
         requests.push(record); requestRecords.set(request, record);
       }
     } catch { if (errors.length === 0) errors.push('invalid_or_overflow_history_network_observation'); }
@@ -240,11 +245,14 @@ export function installObservedHistoryTelemetry(page, baseURL, ownership) {
       if (postReports.has(request)) statuses.push({ open_id: postReports.get(request).open_id, status: response.status() });
       const record = requestRecords.get(request);
       if (record) {
+        record.status = response.status();
         const trace = response.headers().traceparent?.match(/^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$/i);
         if (trace && !/^0{32}$/.test(trace[1]) && !/^0{16}$/.test(trace[2])) record.trace_id = trace[1].toLowerCase();
       }
     } catch { if (errors.length === 0) errors.push('invalid_or_overflow_history_network_observation'); }
   });
+  page.on('requestfinished', request => { const record = requestRecords.get(request); if (record) record.finished = true; });
+  page.on('requestfailed', request => { const record = requestRecords.get(request); if (record) record.failed = true; });
   return { snapshot() {
     const owned = ownership?.snapshot();
     return structuredClone({ scope: 'independently_captured_original_history_page_not_receiver_derived',
@@ -253,7 +261,7 @@ export function installObservedHistoryTelemetry(page, baseURL, ownership) {
   } };
 }
 
-export function appendObservedHistory(result, inventory, identity, module) {
+export function appendObservedHistory(result, inventory, identity, module, fixtures) {
   assert.deepEqual(inventory.errors, [], 'history report observer errors');
   assert.equal(inventory.ownershipFailure, null, 'history producer ownership observation must succeed');
   assert.ok(Array.isArray(inventory.requestOwners) && Array.isArray(inventory.streamOwners)
@@ -275,8 +283,17 @@ export function appendObservedHistory(result, inventory, identity, module) {
     assert.ok(report.correlations.filter(c => c.kind === 'sse').every(c => ownedStreams.has(c.id)),
       'history SSE must belong to independently observed journey');
     assert.ok([...reportedRequests].every(id => ownedRequests.has(id)), 'history report request must belong to independently observed journey');
-    const finite = inventory.requestRecords.filter(record => record.kind === 'request' && reportedRequests.has(record.open_id) && ownedRequests.has(record.open_id));
+    const fixture = fixtures.aggregates.find(f => f.kind === report.route
+      && (report.product_conversation_id === null || f.product_conversation_id === report.product_conversation_id));
+    assert.ok(fixture, 'history report requires independently selected fixture');
+    const detailPaths = new Set([fixture.endpoint, ...(fixture.kind === 'global'
+      ? fixture.members.map(member => `/api/global/coordinator/history/${encodeURIComponent(member)}`) : [])]);
+    const finite = inventory.requestRecords.filter(record => record.kind === 'request' && record.method === 'GET'
+      && detailPaths.has(record.pathname) && reportedRequests.has(record.open_id) && ownedRequests.has(record.open_id));
     assert.ok(finite.length > 0, 'history report needs independently observed finite request');
+    assert.ok([...reportedRequests].every(id => finite.some(record => record.open_id === id)), 'every history request correlation requires fixture detail GET');
+    if (report.outcome === 'ready') assert.ok(finite.every(record => record.status >= 200 && record.status < 300
+      && record.finished === true && record.failed === false), 'ready history detail GET requires successful completed response');
     module.assertRequestCorrelation(finite.map(record => record.open_id), report);
     for (const correlation of report.correlations) {
       const observed = inventory.requestRecords.some(record => correlation.kind === 'trace'
@@ -383,7 +400,7 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
     let finalized = false;
     return { receipt, finalizeHistory(inventory) {
       assert.equal(finalized, false, 'history inventory finalizes once after browser closure'); finalized = true;
-      appendObservedHistory(result, inventory, config.input.fixtures.identity, module);
+      appendObservedHistory(result, inventory, config.input.fixtures.identity, module, config.input.fixtures);
       writeFileSync(resolve(outputDir, 'telemetry/telemetry-browser-result.json'), JSON.stringify(result, null, 2));
       receipt.additional_history = result.additional_history;
     } };

@@ -700,9 +700,21 @@ class OpeningQualificationTests(unittest.TestCase):
             server.returncode = 0
         server.wait.side_effect = wait
         with patch.object(opening, 'request_normal_server_stop', side_effect=lambda control: events.append('stop')):
-            receipt = opening.normal_server_completion(server, self.root, {'home': str(self.root / 'removed-home')}, self.root / 'removed.sock', opening.LifecycleFailures())
+            receipt = opening.normal_server_completion(server, self.root, {'home': str(self.root / 'removed-home')}, self.root / 'removed.sock', opening.LifecycleFailures(), request_stop=True)
         self.assertEqual(events, ['stop', 'wait'])
         self.assertEqual(receipt['stop'], 'acknowledged')
+        self.assertEqual(receipt['status'], 'success')
+        server.wait.assert_called_once_with(timeout=65)
+
+    def test_stock_browser_owned_stop_is_not_sent_again_while_process_exits(self):
+        from unittest.mock import Mock
+        server = Mock(returncode=None)
+        server.poll.return_value = None
+        server.wait.side_effect = lambda **kwargs: setattr(server, 'returncode', 0)
+        with patch.object(opening, 'request_normal_server_stop') as stop:
+            receipt = opening.normal_server_completion(server, self.root, {'home': str(self.root / 'removed')}, self.root / 'removed.sock', opening.LifecycleFailures())
+        stop.assert_not_called()
+        self.assertEqual(receipt['stop'], 'browser_owned')
         self.assertEqual(receipt['status'], 'success')
         server.wait.assert_called_once_with(timeout=65)
 
@@ -714,7 +726,7 @@ class OpeningQualificationTests(unittest.TestCase):
         failures = opening.LifecycleFailures()
         with patch.object(opening, 'request_normal_server_stop', side_effect=primary):
             with self.assertRaises(RuntimeError) as caught:
-                opening.normal_server_completion(server, self.root, {'home': str(self.root / 'home')}, self.root / 'owned.sock', failures)
+                opening.normal_server_completion(server, self.root, {'home': str(self.root / 'home')}, self.root / 'owned.sock', failures, request_stop=True)
         self.assertIs(caught.exception, primary)
         server.wait.assert_not_called()
         receipt = json.loads((self.root / 'server-completion.json').read_text())
@@ -922,6 +934,28 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("telemetry/telemetry-browser-result.json", source)
         self.assertNotIn("'app_stopped': True", source)
         self.assertNotIn("'receiver_stopped': True", source)
+
+    def test_landing_workflow_budget_contains_phase_bounds_and_standalone_workers(self):
+        import re
+        workflow = (Path(opening.__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text()
+        job = workflow.split('  qualify-history-realserver:', 1)[1].split('\n  qualify-history-keepalive', 1)[0]
+        self.assertIn("github.head_ref == 'integration/v013-history-current-main'", job)
+        minutes = int(re.search(r'    timeout-minutes: (\d+)', job).group(1))
+        outer = int(re.search(r'opening-browser-evidence" --timeout (\d+)', job).group(1))
+        self.assertGreaterEqual(outer, 230 + 2 + opening.SERVER_COMPLETION_TIMEOUT + 60)
+        known_phases = 900 + 900 + 10 + 6 * 120 + outer + 3 * 600
+        self.assertGreaterEqual(minutes * 60, known_phases + 600)
+        for name in ('CARGO_BUILD_JOBS', 'RAYON_NUM_THREADS', 'RUST_TEST_THREADS'):
+            self.assertIn(f'{name}: "2"', job)
+        for name in ('history-postfault-baseline.selftest.mjs', 'history-opening-navigation.selftest.mjs'):
+            self.assertIn('node --test ui/scripts/' + name, job)
+
+    def test_frozen_geometry_workflow_uses_its_frozen_harness_bundle(self):
+        workflow = (Path(opening.__file__).resolve().parents[2] / '.github/workflows/history-geometry-repro.yml').read_text()
+        self.assertIn('ref: 191dacb3e7bcd671990298be8896d6cdcdb2015c', workflow)
+        self.assertIn('ref: 302a3733e9013bb09beb1e83c92b29b616ab0706', workflow)
+        self.assertIn('12084070461', workflow)
+        self.assertIn('38986752552', workflow)
 
     def test_joint_consumers_use_one_authoritative_controlled_receipt_without_copy(self):
         import ast

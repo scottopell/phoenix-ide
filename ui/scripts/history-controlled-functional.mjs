@@ -7,6 +7,7 @@ import { installHistoryRequestOwnership, installObservedHistoryTelemetry, instal
 function assertActualPaginationOwned(actualPagination, expectedCount) {
   assert.equal(actualPagination.errors, 0, 'actual pagination diagnostic must be complete');
   assert.equal(actualPagination.requests.length, expectedCount, 'no actual older GET may disappear from correlated inventory');
+  assert.ok(actualPagination.requests.every(r => r.status >= 200 && r.status < 300 && r.finished === true && r.failed === false), 'every actual older GET requires successful completed response');
   assert.ok(actualPagination.requests.every(r => r.has_open_id && r.before_report && r.in_report), 'every actual older GET must belong to the original pending report');
 }
 
@@ -78,21 +79,30 @@ export function assertOwnedReport(report, inventory) {
   assert.ok(report.correlations.some(c => c.kind === 'request' && finite.some(r => r.open_id === c.id)));
 }
 
-function controlledObserver(page, network, module, identity, fixture, ownership, kind) {
-  const pending = new Set(), reportTransports = new Set(), changed = new Set();
+function controlledObserver(page, network, module, identity, fixture, ownership, kind, baseURL) {
+  const pending = new Set(), reportTransports = new Set(), changed = new Set(), writes = new Map();
+  const origin = new URL(baseURL).origin;
   let failure = null;
   const signal = () => { for (const notify of changed) notify(); };
+  const unsubscribe = ownership.subscribe(signal);
   const request = req => {
     try {
       const url = new URL(req.url());
+      if (url.origin !== origin) return;
+      const chat = url.pathname.match(/^\/api\/conversations\/([^/]+)\/chat$/);
+      if (chat && req.method() === 'POST') {
+        assert.ok(writes.size < 8);
+        writes.set(req, { owner: decodeURIComponent(chat[1]), status: null, responses: 0, finished: false, failed: false });
+      }
       if (url.pathname === '/api/telemetry/conversation-view' && req.method() === 'POST') reportTransports.add(req);
       if (url.pathname === fixture.endpoint && req.method() === 'GET' && url.searchParams.has('open_id')) pending.add(req);
     } catch { failure = 'invalid_controlled_request'; }
     signal();
   };
-  const finished = req => { pending.delete(req); reportTransports.delete(req); signal(); };
-  const response = () => signal();
-  page.on('request', request); page.on('requestfinished', finished); page.on('requestfailed', finished); page.on('response', response);
+  const finished = req => { pending.delete(req); reportTransports.delete(req); if (writes.has(req)) writes.get(req).finished = true; signal(); };
+  const failed = req => { pending.delete(req); reportTransports.delete(req); if (writes.has(req)) writes.get(req).failed = true; signal(); };
+  const response = res => { const write = writes.get(res.request()); if (write) { write.status = res.status(); write.responses++; } signal(); };
+  page.on('request', request); page.on('requestfinished', finished); page.on('requestfailed', failed); page.on('response', response);
   const diagnosticReports = () => {
     const reports = []; let invalid_report_count = 0;
     for (const raw of network.snapshot().reports) {
@@ -113,6 +123,15 @@ function controlledObserver(page, network, module, identity, fixture, ownership,
   });
   return {
     getReports, diagnosticReports,
+    getWrites: () => structuredClone([...writes.values()]),
+    ownershipReady(report) {
+      const data = network.snapshot();
+      assert.equal(data.ownershipFailure, null, 'producer ownership delivery failed');
+      const admissions = ownership.diagnostics().filter(e => e.kind === 'admission' && e.open_id === report.open_id && e.sampled);
+      return admissions.length > 0 && report.correlations.every(c => c.kind === 'request'
+        ? data.requestOwners.some(p => p.journey_id === report.open_id && p.request_id === c.id) && data.requestRecords.some(r => r.kind === 'request' && r.open_id === c.id)
+        : c.kind === 'sse' ? data.streamOwners.some(p => p.journey_id === report.open_id && p.stream_id === c.id) && data.requestRecords.some(r => r.kind === 'sse' && r.open_id === c.id) : true);
+    },
     failureCounts: () => ({ reports: Math.min(8, network.snapshot().reports.length),
       responses: network.snapshot().statuses.map(s => s.status).slice(0, 8),
       admissions: Math.min(8, ownership.diagnostics().filter(e => e.kind === 'admission').length),
@@ -131,7 +150,7 @@ function controlledObserver(page, network, module, identity, fixture, ownership,
         changed.add(test); timer = setTimeout(() => { clean(); reject(new Error('controlled observation deadline')); }, timeout); test();
       });
     },
-    dispose() { page.off('request', request); page.off('requestfinished', finished); page.off('requestfailed', finished); page.off('response', response); },
+    dispose() { unsubscribe(); page.off('request', request); page.off('requestfinished', finished); page.off('requestfailed', failed); page.off('response', response); },
   };
 }
 
@@ -190,10 +209,11 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
           if (canceled) { await page.close(); throw new Error('controlled late page creation canceled'); }
           paginationDiagnostic = installHistoryPaginationDiagnostic(page, baseURL, fixture.endpoint);
           const network = installObservedHistoryTelemetry(page, baseURL, ownership);
-          observer = controlledObserver(page, network, module, fixtures.identity, fixture, ownership, kind);
+          observer = controlledObserver(page, network, module, fixtures.identity, fixture, ownership, kind, baseURL);
           const reports = [], statuses = [];
           // Observer helpers validate network bodies before they enter any retained receipt.
           const collect = async () => {
+            await observer.wait(() => observer.getReports().length === 1 && observer.ownershipReady(observer.getReports()[0]), Math.min(5000, check()));
             const actual = observer.getReports();
             assert.equal(actual.length, 1, 'controlled scenario report count');
             reports.push(actual[0]); statuses.push(...observer.getStatuses());
@@ -211,6 +231,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
           if (kind === 'history') {
             const target = historyTargets.find(t => t.kind === route);
             assert.ok(target && target.route && target.anchor && target.composerOwner);
+            assert.equal(target.composerOwner, fixture.members.at(-1), 'composer probe must select the independently generated latest member');
             phase = 'history_navigate';
             await page.goto(baseURL + target.route, { waitUntil: 'domcontentloaded', timeout: Math.min(15000, clock.remaining()) });
             phase = 'history_report_wait';
@@ -251,11 +272,53 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
             assert.ok(historicalRequests.length > 0, 'actual additional history GET required before historical ready');
             phase = 'additional_history_owner';
             for (const request of historicalRequests) assert.ok(trial.reports[0].correlations.some(c => c.kind === 'request' && c.id === request.open_id), 'additional history request must remain in its original journey');
+            assert.equal(paginationDiagnostic.snapshot(trial.reports).requests.length, historicalRequests.length, 'no actual older GET may disappear from correlated inventory');
+            phase = 'additional_history_transport';
+            await observer.wait(() => {
+              const actual = paginationDiagnostic.snapshot(trial.reports);
+              assert.equal(actual.errors, 0);
+              assert.equal(actual.requests.length, historicalRequests.length, 'no actual older GET may disappear from correlated inventory');
+              for (const request of actual.requests) {
+                assert.ok(request.has_open_id && request.before_report && request.in_report);
+                assert.equal(request.failed, false, 'actual older GET failed');
+                if (request.status !== null) assert.ok(request.status >= 200 && request.status < 300, 'actual older GET requires 2xx');
+              }
+              return actual.requests.every(request => request.finished && request.status !== null);
+            }, Math.min(5000, check()));
             const actualPagination = paginationDiagnostic.snapshot(trial.reports);
             assertActualPaginationOwned(actualPagination, historicalRequests.length);
             trial.additional_history = { report_count: 1, request_count: historicalRequests.length, original_owner: trial.reports[0].open_id };
             phase = 'stream_owner';
             assert.ok(network.snapshot().requestRecords.some(r => r.kind === 'sse' && r.pathname === `/api/conversations/${target.composerOwner}/stream`), 'stream must belong to independently selected writable owner');
+            phase = 'composer_write_probe';
+            assert.deepEqual(observer.getWrites(), [], 'no chat POST before the physical and report oracles');
+            let dispatched = false;
+            await page.route('**/api/conversations/*/chat*', async route => {
+              const request = route.request(), url = new URL(request.url());
+              if (request.method() === 'POST' && (dispatched || url.origin !== new URL(baseURL).origin
+                || url.pathname !== `/api/conversations/${target.composerOwner}/chat`)) {
+                await route.abort();
+              } else {
+                if (request.method() === 'POST') dispatched = true;
+                await route.continue();
+              }
+            });
+            await page.locator(COMPOSER_SELECTOR).fill('qualification owner probe', { timeout: Math.min(5000, check()) });
+            await page.locator(COMPOSER_SELECTOR).press('Enter', { timeout: Math.min(5000, check()) });
+            await observer.wait(() => {
+              const writes = observer.getWrites();
+              assert.ok(writes.length <= 1, 'exactly one composer probe POST');
+              if (!writes.length) return false;
+              const write = writes[0];
+              assert.equal(write.owner, target.composerOwner, 'composer must POST only to the independently selected latest owner');
+              assert.equal(write.failed, false, 'composer POST failed');
+              if (write.status !== null) assert.ok(write.status >= 200 && write.status < 300, 'composer POST requires 2xx');
+              assert.ok(write.responses <= 1, 'exactly one composer response');
+              return write.finished && write.responses === 1;
+            }, Math.min(5000, check()));
+            assert.equal(page.url(), new URL(target.route, baseURL).href, 'composer probe retains original canonical page');
+            assert.equal(observer.getReports().length, 1, 'composer probe cannot change report inventory');
+            trial.composer_write = { owner: observer.getWrites()[0].owner, status: observer.getWrites()[0].status };
             trial.physical_history = { original_page: true, anchor: physical, composer_owner: target.composerOwner,
               viewport: { ...CONTROLLED_VIEWPORT }, stability_frames: physical.stability_frames.length };
             return trial;
@@ -312,7 +375,13 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
         assert.equal(observer.getReports().length, 1, 'late report cannot change controlled inventory');
         assert.equal(observer.getAdmissionCount(), 1, 'late or successor admission cannot disappear');
         assert.deepEqual(observer.getErrors(), []);
-        if (kind === 'history') assertActualPaginationOwned(paginationDiagnostic.snapshot(observer.getReports()), trial.additional_history.request_count);
+        if (kind === 'history') {
+          assertActualPaginationOwned(paginationDiagnostic.snapshot(observer.getReports()), trial.additional_history.request_count);
+          const writes = observer.getWrites();
+          assert.equal(writes.length, 1, 'late composer POST cannot disappear');
+          assert.equal(writes[0].responses, 1); assert.equal(writes[0].finished, true); assert.equal(writes[0].failed, false);
+          assert.equal(writes[0].owner, trial.composer_write.owner); assert.equal(writes[0].status, trial.composer_write.status);
+        }
         trials.push(trial);
       } catch (error) {
         canceled = true;

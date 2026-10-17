@@ -9,12 +9,13 @@ const fixture = { kind: 'global', members: ['root', 'middle'], occurrences: [[0,
 const known = historicalMessageIdentities(fixture);
 const box = (top = 110, height = 50) => ({ top, bottom: top + height, height, left: 10, right: 310, width: 300 });
 function dom(options = {}) {
-  const { scrollTop = 0, extraRows = [], outsideChildren = [] } = options;
-  const makeRow = ({ id = 'message-root:known', data = null, key = 'agent-group-unknown', childBox = box(120, 20), rowBox = box(), nested = false, hidden = false, empty = false, children = null } = {}) => {
-    const row = { dataset: { virtualKey: key }, hidden, getBoundingClientRect: () => rowBox, getClientRects: () => [rowBox] };
+  const { scrollTop = 0, extraRows = [], outsideChildren = [], ancestorOpacity = '1', scrollerOpacity = '1' } = options;
+  const ancestor = { opacity: ancestorOpacity, parentElement: null };
+  const makeRow = ({ id = 'message-root:known', data = null, key = 'agent-group-unknown', childBox = box(120, 20), rowBox = box(), nested = false, hidden = false, opacity = '1', messageOpacity = '1', empty = false, children = null } = {}) => {
+    const row = { dataset: { virtualKey: key }, hidden, opacity, parentElement: ancestor, getBoundingClientRect: () => rowBox, getClientRects: () => [rowBox] };
     const makeChild = ({ id: childID = id, data: childData = data, childBox: b = childBox, hidden: childHidden = hidden } = {}) => ({
       getAttribute: name => name === 'id' ? childID : childData, getBoundingClientRect: () => b,
-      hidden: childHidden, getClientRects: () => [b], closest: () => nested ? {} : row,
+      hidden: childHidden, opacity: messageOpacity, parentElement: row, getClientRects: () => [b], closest: () => nested ? {} : row,
     });
     row.children = empty ? [] : children ? children.map(makeChild) : [makeChild()];
     row.querySelectorAll = () => row.children;
@@ -22,9 +23,10 @@ function dom(options = {}) {
   };
   const rows = [makeRow(options), ...extraRows.map(makeRow)];
   const allChildren = [...rows.flatMap(row => row.children), ...outsideChildren.map(({ id, data = null }) => ({ getAttribute: name => name === 'id' ? id : data }))];
-  const scroller = { getBoundingClientRect: () => box(100, 729), querySelectorAll: () => rows, scrollTop, scrollHeight: 21806, clientHeight: 729 };
+  const scroller = { opacity: scrollerOpacity, parentElement: ancestor, getBoundingClientRect: () => box(100, 729), querySelectorAll: () => rows, scrollTop, scrollHeight: 21806, clientHeight: 729 };
+  rows.forEach(row => { row.parentElement = scroller; });
   const context = { document: { querySelector: () => scroller, querySelectorAll: selector => selector === '[data-virtual-key]' ? rows : allChildren }, innerHeight: 900, innerWidth: 1360,
-    getComputedStyle: el => ({ display: 'block', visibility: el.hidden ? 'hidden' : 'visible' }),
+    getComputedStyle: el => ({ display: 'block', visibility: el.hidden ? 'hidden' : 'visible', opacity: el.opacity ?? '1' }),
     location: { href: 'http://127.0.0.1:123/global/root?source_transcript=middle#message-middle%3Aknown' }, URL };
   return (expected, diagnostics = false) => runInNewContext(`(${observePhysicalHistoricalRow.toString()})`, context)({ known, expected, diagnostics });
 }
@@ -223,4 +225,19 @@ test('UNIT actual app intersection predicate does not imply strict physical cont
     if(!contained){assert.equal(probe.predicates.known_target_row_clipped,1,name);
       assert.equal(probe.predicates.known_target_message_clipped,1,name);}
   }
+});
+
+for (const [name, options] of Object.entries({
+  row: { opacity: '0' }, message: { messageOpacity: '0' },
+  scroller: { scrollerOpacity: '0' }, ancestor: { ancestorOpacity: '0' },
+})) test(`physical oracle rejects zero opacity ${name}, including followup and diagnostics`, async () => {
+  const read = dom(options), before = dom()();
+  assert.equal(read(), null); assert.equal(read(before), null);
+  const probe = read(null, true);
+  assert.equal(probe.observation, null);
+  assert.ok(probe.predicates[name === 'message' ? 'message_zero_opacity' : 'row_zero_opacity'] > 0);
+  await assert.rejects(holdPostFaultBaseline(before, read, async () => {}));
+});
+test('physical oracle permits nonzero opacity without inventing a visibility threshold', () => {
+  assert.ok(dom({ opacity: '0.01', messageOpacity: '0.1', ancestorOpacity: '0.2' })());
 });

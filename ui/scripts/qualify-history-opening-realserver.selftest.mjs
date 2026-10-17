@@ -563,3 +563,63 @@ test('both actual driver document navigations use tested body-settling wrapper w
   assert.doesNotMatch(script, /const (?:manual_identity|pending_historical)Navigation = recorder\.beginNavigation/);
   assert.match(script, /const response = await dispatch\(\);\s*this\.confirmNavigation\(token, response\)/);
 });
+
+// Fabricated wire UNIT ONLY: execute the installed coverage block, not a replay model.
+function reconnectCoverage(init, overrides = {}) {
+  const source = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('  assert.equal(init.pending_truncated');
+  const end = source.indexOf('  assert.ok(published.message', start);
+  assert.ok(start >= 0 && end > start, 'installed reconnect coverage block required');
+  const message = (message_id, text, sequence_id) => ({ message_id, conversation_id: 'successor', message_type: 'user', content: { text }, sequence_id });
+  const context = {
+    assert, init, requestCursor: 5, latest: 'successor', id: 'successor:key', instruction: 'opening', requestGeneration: 1,
+    ack: { canonical_message_id: 'successor:chat' }, chatRequest: { text: 'submitted' },
+    preDropRow: { conversation: { id: 'successor', transcript_generation: 1 },
+      messages: [message('successor:key', 'opening', 1), message('successor:chat', 'submitted', 2)] }, ...overrides,
+  };
+  return new Function(...Object.keys(context), source.slice(start, end))(...Object.values(context));
+}
+const reconnectSnapshot = coverage => ({ transcript_coverage: coverage, pending_truncated: false,
+  pending_anchor_sequence_id: 5, last_sequence_id: 8, pending_events: [6, 7, 8].map(sequence_id => ({ sequence_id })),
+  messages: coverage === 'preserve' ? [] : [
+    { message_id: 'successor:key', conversation_id: 'successor', message_type: 'user', content: { text: 'opening' } },
+    { message_id: 'successor:chat', conversation_id: 'successor', message_type: 'user', content: { text: 'submitted' } },
+  ],
+});
+for (const coverage of ['preserve', 'complete', 'tail']) {
+  test(`reconnect ${coverage} accepts exact contiguous interval and empty interval`, () => {
+    reconnectCoverage(reconnectSnapshot(coverage));
+    reconnectCoverage({ ...reconnectSnapshot(coverage), last_sequence_id: 5, pending_events: [] });
+  });
+  for (const [name, mutate] of Object.entries({
+    interior_gap: d => d.pending_events.splice(1, 1), missing_first: d => d.pending_events.shift(),
+    missing_tip: d => d.pending_events.pop(), duplicate: d => d.pending_events.splice(1, 0, { sequence_id: 6 }),
+    reversed: d => d.pending_events.reverse(), beyond_tip: d => d.pending_events.push({ sequence_id: 9 }),
+    anchor_missing: d => { delete d.pending_anchor_sequence_id; }, anchor_negative: d => { d.pending_anchor_sequence_id = -1; },
+    anchor_fractional: d => { d.pending_anchor_sequence_id = 5.5; }, anchor_string: d => { d.pending_anchor_sequence_id = '5'; },
+    anchor_past_tip: d => { d.pending_anchor_sequence_id = 9; },
+    anchor_unsafe: d => { d.pending_anchor_sequence_id = Number.MAX_SAFE_INTEGER + 1; },
+    empty_replay_gap: d => { d.pending_events = []; },
+    truncated: d => { d.pending_truncated = true; },
+  })) test(`reconnect ${coverage} rejects ${name}`, () => {
+    const value = reconnectSnapshot(coverage); mutate(value); assert.throws(() => reconnectCoverage(value));
+  });
+}
+for (const coverage of ['complete', 'tail']) {
+  for (const [name, mutate] of Object.entries({
+    missing: d => d.messages.pop(), duplicate: d => d.messages.push(structuredClone(d.messages[1])),
+    wrong_owner: d => { d.messages[1].conversation_id = 'foreign'; }, wrong_type: d => { d.messages[1].message_type = 'agent'; },
+    wrong_content: d => { d.messages[1].content.text += 'corrupt'; },
+  })) test(`reconnect ${coverage} rejects ${name} acknowledged chat`, () => {
+    const value = reconnectSnapshot(coverage); mutate(value); assert.throws(() => reconnectCoverage(value));
+  });
+  test(`reconnect ${coverage} replay is anchored by snapshot, not request cursor`, () => {
+    reconnectCoverage({ ...reconnectSnapshot(coverage), pending_anchor_sequence_id: 4,
+      pending_events: [5, 6, 7, 8].map(sequence_id => ({ sequence_id })) });
+    reconnectCoverage({ ...reconnectSnapshot(coverage), pending_anchor_sequence_id: 6,
+      pending_events: [7, 8].map(sequence_id => ({ sequence_id })) });
+  });
+}
+test('preserve cannot claim an anchor newer than retained cursor', () => {
+  assert.throws(() => reconnectCoverage({ ...reconnectSnapshot('preserve'), pending_anchor_sequence_id: 6 }));
+});

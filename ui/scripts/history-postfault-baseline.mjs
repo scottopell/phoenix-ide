@@ -36,6 +36,11 @@ export function observePhysicalHistoricalRow({ known, expected = null, diagnosti
     if (!(b.height > 0 && b.width > 0)) return 'nonpositive_geometry';
     if (!(el.getClientRects().length > 0)) return 'no_client_rect';
     if (style.display === 'none' || style.visibility !== 'visible') return 'hidden';
+    for (let ancestor = el; ancestor; ancestor = ancestor.parentElement) {
+      const ancestorStyle = getComputedStyle(ancestor);
+      if (ancestorStyle.display === 'none' || ancestorStyle.visibility !== 'visible') return 'hidden';
+      if (Number(ancestorStyle.opacity) === 0) return 'zero_opacity';
+    }
     if (!(b.top >= clip.top && b.bottom <= clip.bottom && b.left >= clip.left && b.right <= clip.right)) return 'clipped';
     return null;
   };

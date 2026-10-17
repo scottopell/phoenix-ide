@@ -224,15 +224,19 @@ export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, se
   assert.ok(requestCursor <= init.last_sequence_id, 'reconnect cursor cannot exceed tip');
   assert.equal(init.pending_truncated, false, 'reconnect pending events not truncated');
   assert.ok(Array.isArray(init.pending_events), 'reconnect pending events required');
-  let priorPendingSequence = requestCursor;
+  const coverage = init.transcript_coverage;
+  assert.ok(Number.isSafeInteger(init.pending_anchor_sequence_id) && init.pending_anchor_sequence_id >= 0,
+    'reconnect anchor required for every coverage variant');
+  assert.ok(init.pending_anchor_sequence_id <= init.last_sequence_id, 'reconnect anchor cannot exceed tip');
+  let priorPendingSequence = coverage === 'preserve' ? requestCursor : init.pending_anchor_sequence_id;
   for (const event of init.pending_events) {
-    assert.ok(Number.isSafeInteger(event.sequence_id) && event.sequence_id > priorPendingSequence,
-      'reconnect pending events ordered unique strictly after cursor');
+    assert.ok(Number.isSafeInteger(event.sequence_id) && event.sequence_id === priorPendingSequence + 1,
+      'reconnect pending events must cover contiguous replay interval');
     assert.ok(event.sequence_id <= init.last_sequence_id, 'reconnect pending event cannot exceed tip');
     priorPendingSequence = event.sequence_id;
   }
 
-  const coverage = init.transcript_coverage;
+  assert.equal(priorPendingSequence, init.last_sequence_id, 'reconnect replay must reach claimed tip');
   if (coverage === 'preserve') {
     assert.deepEqual(init.messages, [], 'preserve reconnect messages must be empty');
     assert.equal(init.last_sequence_id, priorPendingSequence, 'preserve replay must reach claimed tip');
@@ -260,6 +264,11 @@ export function validateGlobalCacheAuthority(a, { evidence, cached, accepted, se
     assert.ok(['complete', 'tail'].includes(coverage), 'reconnect coverage must be complete, tail, or preserve');
     assert.ok(Array.isArray(init.messages) && init.messages.length > 0, 'complete/tail reconnect must bear messages');
     assert.equal(init.messages.filter(message => message.message_id === id).length, 1, 'unique reconnect opening');
+    const chat = init.messages.filter(message => message.message_id === ack.canonical_message_id);
+    assert.equal(chat.length, 1, 'unique reconnect acknowledged chat');
+    assert.equal(chat[0].conversation_id, latest, 'reconnect acknowledged chat owner');
+    assert.equal(chat[0].message_type, 'user', 'reconnect acknowledged chat shape');
+    assert.deepEqual(chat[0].content, { text: chatRequest.text }, 'reconnect acknowledged chat request bytes');
   }
   assert.ok(published.message, 'full accepted publication message required');
   const authoritativeMessages = [published.message];
