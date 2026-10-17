@@ -882,7 +882,7 @@ fn settle_unregistered_run(
                 label,
                 launch_error,
                 descendants: "unverified".to_string(),
-                output_complete,
+                output_complete: output_complete && ring.start_offset() == 0,
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 window: window_to_typed(&read.view, read.partial),
             },
@@ -2543,6 +2543,41 @@ mod tests {
             std::fs::read_to_string(dir.path().join("count")).unwrap(),
             "once"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unregistered_empty_line_flood_reports_evicted_capture_as_incomplete() {
+        let ctx = test_context(&scope("identity-empty-line-flood"));
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = "printf '\\n%.0s' {1..128}";
+        let child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let reservation = ctx
+            .bash_handle_registry()
+            .reserve_spawn(&ctx.work_scope)
+            .await
+            .unwrap();
+        let response = response_json(
+            &settle_unregistered_run(
+                child,
+                reservation,
+                cmd,
+                None,
+                8,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["status"], "unregistered_exited");
+        assert_eq!(response["exit_code"], 0);
+        assert_eq!(response["output_complete"], false);
+        assert_eq!(response["truncated_before"], true);
+        assert_eq!(response["start_offset"], 120);
+        assert_eq!(response["end_offset"], 128);
+        let lines = response["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 8);
+        assert!(lines.iter().all(|line| line["bytes"] == ""));
     }
 
     #[cfg(unix)]

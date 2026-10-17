@@ -1184,7 +1184,17 @@ pub async fn cascade_bash_on_delete(
             .await
             .remove_restricted_created_by(actor.conversation_id());
         registry.remove_from_global_index(&handles).await;
-        return kill_selected_handles(registry, work_scope, handles).await;
+        let mut report = kill_selected_handles(registry, work_scope, handles).await;
+        if entry
+            .read()
+            .await
+            .admission
+            .unverified_launch
+            .load(Ordering::Acquire)
+        {
+            report.scope_uncertainty = Some(BashScopeUncertainty::UnregisteredLaunch);
+        }
+        return report;
     }
     teardown_bash_owner(registry, work_scope).await
 }
@@ -2092,11 +2102,35 @@ mod tests {
         // Inheritor resolves to the same scope → skip teardown.
         let report = cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&wt)).await;
         assert!(report.live_handle_pgids.is_empty());
-        assert!(report.kill_failures.is_empty());
+        assert!(!report.has_failures());
         // The table is preserved and the handle is still reachable.
         assert_eq!(registry.scope_count().await, 1);
         let preserved = registry.get_or_create(&wt).await;
         assert!(preserved.read().await.get(&HandleId::new("b-1")).is_some());
+    }
+
+    #[tokio::test]
+    async fn cascade_same_scope_inheritor_reports_unregistered_launch_uncertainty() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("inherited-unregistered-launch");
+        let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
+        reservation.mark_launched();
+        drop(reservation);
+
+        let report =
+            cascade_bash_on_delete(&registry, &owner, &work_actor("owner"), Some(&owner)).await;
+        assert_eq!(
+            report.scope_uncertainty,
+            Some(BashScopeUncertainty::UnregisteredLaunch)
+        );
+        assert!(report.has_failures());
+        assert!(report.live_handle_pids.is_empty());
+        assert!(report.live_handle_pgids.is_empty());
+        assert!(report.kill_failures.is_empty());
+        assert!(report.teardown_generation.is_none());
+        let entry = registry.get_existing(&owner).await.unwrap();
+        assert!(!entry.read().await.teardown_started);
+        assert!(registry.reserve_spawn(&owner).await.is_err());
     }
 
     /// A continuation that resolves to a DIFFERENT scope does not preserve;

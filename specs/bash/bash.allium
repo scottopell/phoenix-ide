@@ -751,13 +751,14 @@ rule RingLineAppended {
         -- this model's granularity output is a sequence of complete lines.
 }
 
--- REQ-BASH-004: oldest line evicted because ring_bytes_used exceeded the
--- byte cap.
+-- REQ-BASH-004: oldest line evicted because retained content bytes or
+-- retained line count exceeded the cap (empty lines still occupy records).
 rule RingLineEvicted {
     when: RingBufferOverflow(handle)
 
     requires: handle.status = running
     requires: handle.ring_bytes_used > config.ring_buffer_bytes
+        or count(handle.ring_lines) > config.ring_buffer_bytes
     requires: count(handle.ring_lines) > 1
 
     let oldest = first_line(handle.ring_lines)

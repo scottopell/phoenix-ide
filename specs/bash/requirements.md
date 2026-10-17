@@ -105,8 +105,9 @@ AND SHALL mark output capture incomplete when closing readers at the settlement 
 
 WHEN any launch remains unregistered
 THE SYSTEM SHALL report `launch_error: "identity_unavailable"` or `"registration_failed"`, `descendants: "unverified"`, and `output_complete`
+AND SHALL set `output_complete: false` if reader capture is interrupted or any captured lines are evicted from the ring
 AND SHALL release pending admission after bounded settlement even on caller cancellation
-AND SHALL retain a process-local uncertainty record that fences subsequent spawns and causes teardown to report unverified shutdown rather than hang or claim resource absence
+AND SHALL retain a process-local uncertainty record that fences subsequent spawns and causes teardown, including same-scope-inheritor cleanup, to report unverified shutdown rather than hang or claim resource absence
 AND SHALL delegate any unreaped direct child to the runtime's child reaper without inferring signal authority from a numeric PID
 AND SHALL preserve sandbox scratch because unverified descendants may still use it.
 
@@ -287,10 +288,12 @@ THE SYSTEM SHALL append the bytes to a per-handle ring buffer bounded by
 AND split incoming bytes on newline boundaries to assign each complete line a
 monotonically increasing offset (line 0, 1, 2, ... since spawn)
 
-WHEN the ring buffer's retained complete-line bytes reach `RING_BUFFER_BYTES`
-and new content arrives
-THE SYSTEM SHALL evict the oldest lines until the new content fits
+WHEN inserting a complete line exceeds either `RING_BUFFER_BYTES` in retained
+complete-line content bytes or `RING_BUFFER_BYTES` in retained line count
+THE SYSTEM SHALL evict the oldest lines until both bounds are satisfied,
+retaining at least the newest line even when it alone exceeds the byte cap
 AND advance `start_offset` to the offset of the oldest still-retained line
+AND apply the line-count bound to empty lines without changing content-byte accounting
 
 THE SYSTEM SHALL track a monotonic count of total bytes the process has
 written — incremented on every append, inclusive of bytes currently held as

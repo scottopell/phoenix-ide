@@ -34,6 +34,8 @@ jobs:
         run: |
           cargo test -p phoenix-core process_identity::tests
           cargo test -p phoenix-tools bash::operations::tests
+          cargo test -p phoenix-tools bash::ring::tests
+          cargo test -p phoenix-tools bash::registry::tests::cascade_same_scope_inheritor_reports_unregistered_launch_uncertainty
       - uses: actions/upload-artifact@v4
         if: always()
         with:
