@@ -40,7 +40,9 @@ enum RunnerMode {
         fixture: InitialFixture,
     },
     RecoverAppliedAck,
-    RecoverUnappliedSample,
+    RecoverUnappliedSample {
+        fixture: UnappliedRecoveryFixture,
+    },
     RecoverAndFinish {
         fixture: FinishFixture,
     },
@@ -55,6 +57,13 @@ enum InitialFixture {
     Run,
     PauseAfterObservation,
     PauseAfterApplication,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum UnappliedRecoveryFixture {
+    Run,
+    PauseAfterVerification,
 }
 
 #[cfg(unix)]
@@ -94,7 +103,7 @@ impl RecoveryRun {
 
 #[cfg(unix)]
 fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
-    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply] | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
+    let usage = "usage: --mode <observe-only|initial-sample|recover-applied-ack|recover-unapplied-sample|recover-and-finish|recover-finish-and-sample> --socket-dir <private fixture> --store <existing schema-v5 store> --attempt <u128> [--observe-seconds 1..60 | --deadline-nanoseconds <u64> --root-pid <u32> --root-birth-seconds <u64> --root-birth-nanos <u32> [--fixture-pause-after-observation|--fixture-pause-after-apply] | --fixture-pause-after-recovery-verification (recover-unapplied-sample only) | --fixture-pause-before-begin or --fixture-activation-barriers (recover-and-finish only) | --fixture-activation-and-sample-barriers (recover-finish-and-sample only)]";
     if args.len() < 8
         || args[0] != "--mode"
         || args[2] != "--socket-dir"
@@ -121,7 +130,16 @@ fn parse_args(args: &[OsString]) -> Result<RunnerConfig, String> {
             }
         }
         "recover-applied-ack" if args.len() == 8 => RunnerMode::RecoverAppliedAck,
-        "recover-unapplied-sample" if args.len() == 8 => RunnerMode::RecoverUnappliedSample,
+        "recover-unapplied-sample" if args.len() == 8 => RunnerMode::RecoverUnappliedSample {
+            fixture: UnappliedRecoveryFixture::Run,
+        },
+        "recover-unapplied-sample"
+            if args.len() == 9 && args[8] == "--fixture-pause-after-recovery-verification" =>
+        {
+            RunnerMode::RecoverUnappliedSample {
+                fixture: UnappliedRecoveryFixture::PauseAfterVerification,
+            }
+        }
         "recover-and-finish" if args.len() == 8 => RunnerMode::RecoverAndFinish {
             fixture: FinishFixture::Run,
         },
@@ -650,6 +668,7 @@ fn run_recover_unapplied_sample(
     client: &mut GuardianClient,
     attempt: AttemptId,
     session: phoenix_deployment_controller::guardian_ipc::WireSession,
+    fixture: UnappliedRecoveryFixture,
 ) -> Result<(), String> {
     let loaded = store
         .load_attempt(attempt)
@@ -662,6 +681,17 @@ fn run_recover_unapplied_sample(
     let verified = client
         .verify_recovered_native_sampling(candidate)
         .map_err(|error| format!("verify recovered sample: {error:?}"))?;
+    if matches!(fixture, UnappliedRecoveryFixture::PauseAfterVerification) {
+        println!(
+            "recovered_sample_verified_pending_application revision={} sequence={}",
+            issue.key().revision().get(),
+            issue.sequence()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        activation_barrier(FinishFixture::ActivationBarriers)?;
+    }
     let applied = store
         .apply_recovered_native_sampling(verified)
         .map_err(|error| format!("apply recovered sample: {error}"))?;
@@ -851,7 +881,7 @@ fn main() -> Result<(), String> {
     if matches!(
         config.mode,
         RunnerMode::RecoverAppliedAck
-            | RunnerMode::RecoverUnappliedSample
+            | RunnerMode::RecoverUnappliedSample { .. }
             | RunnerMode::RecoverAndFinish { .. }
             | RunnerMode::RecoverFinishAndSample { .. }
     ) && status == VerifiedBindingStatus::InitialActive
@@ -893,7 +923,7 @@ fn main() -> Result<(), String> {
                 | RunnerMode::ObserveOnly { .. }
                 | RunnerMode::InitialSample { .. }
                 | RunnerMode::RecoverAppliedAck
-                | RunnerMode::RecoverUnappliedSample => FinishFixture::Run,
+                | RunnerMode::RecoverUnappliedSample { .. } => FinishFixture::Run,
             },
         )?)
     };
@@ -917,11 +947,12 @@ fn main() -> Result<(), String> {
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
             RecoveryRun::FinishAndSample(fixture),
         ),
-        RunnerMode::RecoverUnappliedSample => run_recover_unapplied_sample(
+        RunnerMode::RecoverUnappliedSample { fixture } => run_recover_unapplied_sample(
             &mut store,
             &mut client,
             config.attempt,
             reconciliation_session.ok_or("missing fresh reconciliation session")?,
+            fixture,
         ),
         RunnerMode::RecoverAppliedAck => run_recover_applied_ack(
             &mut store,
@@ -1024,7 +1055,9 @@ mod tests {
         assert!(matches!(
             parse_args(&args("recover-unapplied-sample")),
             Ok(RunnerConfig {
-                mode: RunnerMode::RecoverUnappliedSample,
+                mode: RunnerMode::RecoverUnappliedSample {
+                    fixture: UnappliedRecoveryFixture::Run
+                },
                 ..
             })
         ));
@@ -1455,6 +1488,51 @@ mod tests {
         }
         finish.push("--fixture-pause-after-apply".into());
         assert!(parse_args(&finish).is_err());
+    }
+
+    #[test]
+    fn recovery_verification_gate_is_only_available_to_unapplied_recovery() {
+        let flag = "--fixture-pause-after-recovery-verification";
+        let mut recovery = args("recover-unapplied-sample");
+        recovery.push(flag.into());
+        assert!(matches!(
+            parse_args(&recovery),
+            Ok(RunnerConfig {
+                mode: RunnerMode::RecoverUnappliedSample {
+                    fixture: UnappliedRecoveryFixture::PauseAfterVerification
+                },
+                ..
+            })
+        ));
+        recovery.push(flag.into());
+        assert!(parse_args(&recovery).is_err(), "duplicate fixture");
+        for mode in [
+            "observe-only",
+            "initial-sample",
+            "recover-applied-ack",
+            "recover-and-finish",
+            "recover-finish-and-sample",
+        ] {
+            let mut invalid = args(mode);
+            let options: &[&str] = match mode {
+                "observe-only" => &["--observe-seconds", "5"],
+                "initial-sample" => &[
+                    "--deadline-nanoseconds",
+                    "100",
+                    "--root-pid",
+                    "42",
+                    "--root-birth-seconds",
+                    "1",
+                    "--root-birth-nanos",
+                    "0",
+                ],
+                _ => &[],
+            };
+            invalid.extend(options.iter().map(OsString::from));
+            assert!(parse_args(&invalid).is_ok(), "valid {mode} baseline");
+            invalid.push(flag.into());
+            assert!(parse_args(&invalid).is_err(), "{mode}");
+        }
     }
 
     #[test]

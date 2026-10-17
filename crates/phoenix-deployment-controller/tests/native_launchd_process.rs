@@ -337,11 +337,9 @@ fn launchd_recovers_completed_but_unapplied_initial_sample() {
     );
     assert_eq!(still_pending.deadline(), checkpoint.deadline());
 
-    let mut replacement = Runner::start(
-        recovery_command(&guardian, "recover-unapplied-sample"),
-        &guardian,
-        "recover-unapplied",
-    );
+    let mut paused_command = recovery_command(&guardian, "recover-unapplied-sample");
+    paused_command.arg("--fixture-pause-after-recovery-verification");
+    let mut replacement = Runner::start(paused_command, &guardian, "recover-unapplied-paused");
     assert_ne!(replacement.child.id(), initial_pid);
     replacement.marker("verified binding: Detached");
     let interruption = issue_revision.checked_next().unwrap();
@@ -353,27 +351,105 @@ fn launchd_recovers_completed_but_unapplied_initial_sample() {
         )
     );
     assert_eq!(
-        replacement.marker("recovered_sample_applied_ack "),
+        replacement.marker("recovered_sample_verified_pending_application "),
+        format!(
+            "recovered_sample_verified_pending_application revision={} sequence=0",
+            issue_revision.get()
+        )
+    );
+    assert!(replacement.child.try_wait().unwrap().is_none());
+    assert_eq!(counts(), [1, 0, 0, 0, 0]);
+    let pending_issues: i64 = raw.query_row(
+        "SELECT count(*) FROM native_sampling_issues i WHERE NOT EXISTS (SELECT 1 FROM native_sampling_applications a WHERE a.attempt_id = i.attempt_id AND a.dispatch_revision = i.dispatch_revision AND a.ordinal = i.ordinal)",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(pending_issues, 1, "exact issued-pending-application row");
+    let still_issued: (Vec<u8>, Vec<u8>, i64, Vec<u8>, Vec<u8>) = raw.query_row(
+        "SELECT attempt_id, dispatch_revision, ordinal, sequence, session_generation FROM native_sampling_issues",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).unwrap();
+    assert_eq!(
+        u128::from_be_bytes(still_issued.0.try_into().unwrap()),
+        attempt.get()
+    );
+    assert_eq!(
+        u64::from_be_bytes(still_issued.1.try_into().unwrap()),
+        issue_revision.get()
+    );
+    assert_eq!(still_issued.2, 0);
+    assert_eq!(u64::from_be_bytes(still_issued.3.try_into().unwrap()), 0);
+    assert_eq!(u64::from_be_bytes(still_issued.4.try_into().unwrap()), 1);
+    assert!(observed
+        .pending_native_sampling_ack(attempt)
+        .unwrap()
+        .is_none());
+    let pending = observed.load_attempt(attempt).unwrap().unwrap();
+    assert_eq!(pending.phase(), Phase::Interrupted);
+    assert_eq!(pending.persistence_revision(), interruption);
+    assert_eq!(pending.deadline(), deadline);
+    let pending_binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(pending_binding.identity(), binding.identity());
+    assert_eq!(pending_binding.slots(), binding.slots());
+    assert_eq!(pending_binding.deadline(), deadline);
+    assert_eq!(
+        pending_binding.current_session().state,
+        NativeSessionState::Reconciling
+    );
+    assert_eq!(pending_binding.current_session().generation.get(), 2);
+    assert_eq!(
+        pending_binding.current_session().interruption_revision,
+        interruption
+    );
+    guardian.assert_original_parent().unwrap();
+    replacement.kill();
+    let fenced_again = detached(&mut guardian);
+    assert_eq!(fenced_again.state, WireState::DetachedFenced);
+    assert_eq!(fenced_again.session.generation, 2);
+    assert_eq!(fenced_again.retained, active.retained);
+    same_custody(&fenced_again, &active);
+    assert_eq!(counts(), [1, 0, 0, 0, 0]);
+
+    let mut final_runner = Runner::start(
+        recovery_command(&guardian, "recover-unapplied-sample"),
+        &guardian,
+        "recover-unapplied-final",
+    );
+    assert_ne!(final_runner.child.id(), replacement.child.id());
+    assert_ne!(final_runner.child.id(), initial_pid);
+    final_runner.marker("verified binding: Detached");
+    let second_interruption = interruption.checked_next().unwrap();
+    assert_eq!(
+        final_runner.marker("reconciling generation=3 interruption="),
+        format!(
+            "reconciling generation=3 interruption={}",
+            second_interruption.get()
+        )
+    );
+    assert_eq!(
+        final_runner.marker("recovered_sample_applied_ack "),
         format!(
             "recovered_sample_applied_ack attempt=64 revision={} ordinal=0 sequence=0",
             issue_revision.get()
         )
     );
-    replacement.success();
-    let final_output = bounded_text(&replacement.out).unwrap();
+    final_runner.success();
+    let final_output = bounded_text(&final_runner.out).unwrap();
     assert_eq!(
-        replacement.consumed,
+        final_runner.consumed,
         final_output.len(),
         "recovery runner must not emit a follow-up effect: {:?}",
-        final_output.get(replacement.consumed..).unwrap_or_default()
+        final_output
+            .get(final_runner.consumed..)
+            .unwrap_or_default()
     );
 
     assert_eq!(counts(), [1, 1, 1, 0, 0]);
-    let applied_revision = interruption.checked_next().unwrap();
+    let applied_revision = second_interruption.checked_next().unwrap();
     assert_eq!(sampling_rows(&path), (1, 1, 1, applied_revision.get(), 0));
     assert_eq!(
         settled_sampling_keys(&path),
-        vec![(issue_revision.get(), 0, 0, 1, 2)]
+        vec![(issue_revision.get(), 0, 0, 1, 3)]
     );
     let application: (Vec<u8>, Vec<u8>, Vec<u8>, i64, String) = raw
         .query_row(
@@ -423,7 +499,7 @@ fn launchd_recovers_completed_but_unapplied_initial_sample() {
         u64::from_be_bytes(confirmation.3.try_into().unwrap()),
         applied_revision.get()
     );
-    assert_eq!(u64::from_be_bytes(confirmation.4.try_into().unwrap()), 2);
+    assert_eq!(u64::from_be_bytes(confirmation.4.try_into().unwrap()), 3);
     assert!(observed
         .pending_native_sampling_ack(attempt)
         .unwrap()
@@ -440,20 +516,20 @@ fn launchd_recovers_completed_but_unapplied_initial_sample() {
         after_binding.current_session().state,
         NativeSessionState::Reconciling
     );
-    assert_eq!(after_binding.current_session().generation.get(), 2);
+    assert_eq!(after_binding.current_session().generation.get(), 3);
     assert_eq!(
         after_binding.current_session().interruption_revision,
-        interruption
+        second_interruption
     );
     let final_snapshot = detached(&mut guardian);
     assert_eq!(final_snapshot.state, WireState::DetachedFenced);
-    assert_eq!(final_snapshot.session.generation, 2);
+    assert_eq!(final_snapshot.session.generation, 3);
     assert!(final_snapshot.retained.is_empty());
     same_custody(&final_snapshot, &active);
     assert_eq!(counts(), [1, 1, 1, 0, 0]);
     guardian.assert_original_parent().unwrap();
     assert!(MonotonicTick::native_now().unwrap() < deadline);
-    drop((initial, replacement, observed, raw));
+    drop((initial, replacement, final_runner, observed, raw));
     guardian.finish().unwrap();
 }
 

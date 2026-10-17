@@ -1050,7 +1050,9 @@ fn observed_first_sample_survives_runner_death_before_application() {
                 path.to_str().unwrap(),
                 "--attempt",
                 "64",
+                "--fixture-pause-after-recovery-verification",
             ])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -1070,13 +1072,101 @@ fn observed_first_sample_survives_runner_death_before_application() {
     assert_eq!(
         line(&mut replacement_output),
         format!(
+            "recovered_sample_verified_pending_application revision={} sequence=0",
+            issue_revision.get()
+        )
+    );
+    assert!(replacement.try_wait().unwrap().is_none());
+    assert_eq!(counts(), [1, 0, 0, 0, 0]);
+    let pending_issues: i64 = db.query_row(
+        "SELECT count(*) FROM native_sampling_issues i WHERE NOT EXISTS (SELECT 1 FROM native_sampling_applications a WHERE a.attempt_id = i.attempt_id AND a.dispatch_revision = i.dispatch_revision AND a.ordinal = i.ordinal)",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(pending_issues, 1, "exact issued-pending-application row");
+    let still_issued: (Vec<u8>, i64, Vec<u8>, Vec<u8>) = db.query_row(
+        "SELECT dispatch_revision, ordinal, sequence, session_generation FROM native_sampling_issues",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(
+        u64::from_be_bytes(still_issued.0.try_into().unwrap()),
+        issue_revision.get()
+    );
+    assert_eq!(still_issued.1, 0);
+    assert_eq!(u64::from_be_bytes(still_issued.2.try_into().unwrap()), 0);
+    assert_eq!(u64::from_be_bytes(still_issued.3.try_into().unwrap()), 1);
+    assert!(observed
+        .pending_native_sampling_ack(attempt)
+        .unwrap()
+        .is_none());
+    let pending = observed.load_attempt(attempt).unwrap().unwrap();
+    assert_eq!(pending.phase(), Phase::Interrupted);
+    assert_eq!(pending.persistence_revision(), interruption);
+    assert_eq!(pending.deadline(), deadline);
+    let pending_binding = observed.load_native_binding(attempt).unwrap().unwrap();
+    assert_eq!(pending_binding.identity(), binding.identity());
+    assert_eq!(pending_binding.slots(), binding.slots());
+    assert_eq!(pending_binding.deadline(), deadline);
+    assert_eq!(
+        pending_binding.current_session().state,
+        NativeSessionState::Reconciling
+    );
+    assert_eq!(pending_binding.current_session().generation.get(), 2);
+    assert_eq!(
+        pending_binding.current_session().interruption_revision,
+        interruption
+    );
+    assert_guardian_is_parent(child_pid, guardian.id());
+    replacement.kill_checked();
+    let again = wait_for_detached(&dir);
+    assert_eq!(again.state, WireState::DetachedFenced);
+    assert_eq!(again.session.generation, 2);
+    assert_eq!(again.retained, active.retained);
+    assert_eq!(again.native_binding, active.native_binding);
+    assert_eq!(again.instance, active.instance);
+    assert_eq!(again.attempt, active.attempt);
+    assert_eq!(again.deadline, active.deadline);
+    assert_eq!(again.slots, active.slots);
+    assert_eq!(counts(), [1, 0, 0, 0, 0]);
+
+    let mut final_runner = GuardedRunner::new(
+        Command::new(env!("CARGO_BIN_EXE_phoenix-deployment-runner"))
+            .args([
+                "--mode",
+                "recover-unapplied-sample",
+                "--socket-dir",
+                dir.to_str().unwrap(),
+                "--store",
+                path.to_str().unwrap(),
+                "--attempt",
+                "64",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert_ne!(replacement.id(), final_runner.id());
+    assert_ne!(initial.id(), final_runner.id());
+    let mut final_output = BufReader::new(final_runner.stdout.take().unwrap());
+    assert!(line(&mut final_output).starts_with("verified binding: Detached"));
+    let second_interruption = interruption.checked_next().unwrap();
+    assert_eq!(
+        line(&mut final_output),
+        format!(
+            "reconciling generation=3 interruption={}",
+            second_interruption.get()
+        )
+    );
+    assert_eq!(
+        line(&mut final_output),
+        format!(
             "recovered_sample_applied_ack attempt=64 revision={} ordinal=0 sequence=0",
             issue_revision.get()
         )
     );
-    success(&mut replacement);
+    success(&mut final_runner);
     let mut remaining = String::new();
-    std::io::Read::read_to_string(&mut replacement_output, &mut remaining).unwrap();
+    std::io::Read::read_to_string(&mut final_output, &mut remaining).unwrap();
     assert!(
         remaining.is_empty(),
         "no follow-up output/effect: {remaining}"
@@ -1084,13 +1174,13 @@ fn observed_first_sample_survives_runner_death_before_application() {
     assert_eq!(counts(), [1, 1, 1, 0, 0]);
     assert_eq!(
         settled_sampling_keys(&path),
-        vec![(issue_revision.get(), 0, 0, 1, 2)]
+        vec![(issue_revision.get(), 0, 0, 1, 3)]
     );
     assert!(observed
         .pending_native_sampling_ack(attempt)
         .unwrap()
         .is_none());
-    let applied_revision = interruption.checked_next().unwrap();
+    let applied_revision = second_interruption.checked_next().unwrap();
     let application: (Vec<u8>, Vec<u8>, Vec<u8>, i64, String) = db.query_row(
         "SELECT applying_revision, available_memory, available_storage, cpu, pressure FROM native_sampling_applications",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
@@ -1123,7 +1213,7 @@ fn observed_first_sample_survives_runner_death_before_application() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(u64::from_be_bytes(generation.try_into().unwrap()), 2);
+    assert_eq!(u64::from_be_bytes(generation.try_into().unwrap()), 3);
     let checkpoint = observed.load_attempt(attempt).unwrap().unwrap();
     assert_eq!(checkpoint.phase(), Phase::Interrupted);
     assert_eq!(checkpoint.persistence_revision(), applied_revision);
@@ -1136,10 +1226,10 @@ fn observed_first_sample_survives_runner_death_before_application() {
         binding_after.current_session().state,
         NativeSessionState::Reconciling
     );
-    assert_eq!(binding_after.current_session().generation.get(), 2);
+    assert_eq!(binding_after.current_session().generation.get(), 3);
     assert_eq!(
         binding_after.current_session().interruption_revision,
-        interruption
+        second_interruption
     );
     let after = wait_for_detached(&dir);
     assert_eq!(after.state, WireState::DetachedFenced);
