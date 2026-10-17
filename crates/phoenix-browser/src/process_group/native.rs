@@ -144,16 +144,27 @@ impl OwnedChromeGroup {
         }
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
         // SAFETY: the unreaped owned child anchors this isolated launch group.
-        if unsafe { libc::kill(-pid, signal) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(true)
+        let result = if unsafe { libc::kill(-pid, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+        signal_delivery(result)
     }
 
     pub(crate) async fn drain(
         &mut self,
         child: &mut tokio::process::Child,
         budget: Duration,
+    ) -> io::Result<()> {
+        self.drain_with_signal(child, budget, Self::signal).await
+    }
+
+    async fn drain_with_signal(
+        &mut self,
+        child: &mut tokio::process::Child,
+        budget: Duration,
+        mut signal: impl FnMut(&Self, &mut tokio::process::Child, libc::c_int) -> io::Result<bool>,
     ) -> io::Result<()> {
         if self.drained {
             return Ok(());
@@ -185,13 +196,21 @@ impl OwnedChromeGroup {
                 ));
             }
             if !terminated {
-                terminated = self.signal(child, libc::SIGTERM)?;
+                terminated = signal(self, child, libc::SIGTERM)?;
             } else if !killed && now >= escalate {
-                killed = self.signal(child, libc::SIGKILL)?;
+                killed = signal(self, child, libc::SIGKILL)?;
             }
             // This observes kernel process completion, never retries deletion.
             tokio::task::yield_now().await;
         }
+    }
+}
+
+fn signal_delivery(result: io::Result<()>) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -476,6 +495,72 @@ mod tests {
                 linux_process_is_live_member(42, 42, |_| Ok(42), || Ok(stat.to_owned())).is_err()
             );
         }
+    }
+
+    #[test]
+    fn missing_signal_target_requires_reobservation_not_completion() {
+        assert!(!signal_delivery(Err(io::Error::from_raw_os_error(libc::ESRCH))).unwrap());
+        assert!(signal_delivery(Ok(())).unwrap());
+        for errno in [libc::EPERM, libc::EINVAL] {
+            assert_eq!(
+                signal_delivery(Err(io::Error::from_raw_os_error(errno)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(errno),
+            );
+        }
+        assert!(!RootObservation::Live.permits_completion());
+        assert!(!RootObservation::ExitPending.permits_completion());
+    }
+
+    #[tokio::test]
+    async fn signal_exit_race_reobserves_owned_child_before_draining() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "echo ready; read release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let identity = current_process_identity(child.id().unwrap()).unwrap();
+        let mut group = OwnedChromeGroup::adopt(identity, &mut child).unwrap();
+        let mut attempts = 0;
+        group
+            .drain_with_signal(
+                &mut child,
+                Duration::from_secs(5),
+                |owner, retained_child, signal| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        assert_eq!(
+                            owner.observe_root(retained_child).unwrap(),
+                            RootObservation::Live
+                        );
+                        assert!(!owner.is_drained());
+                        signal_delivery(Err(io::Error::from_raw_os_error(libc::ESRCH)))
+                    } else {
+                        assert!(attempts >= 2);
+                        owner.signal(retained_child, signal)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(attempts >= 2, "ESRCH must not mark the group drained");
+        assert!(group.is_drained());
+        assert_eq!(
+            group.observe_root(&mut child).unwrap(),
+            RootObservation::Exited
+        );
+        child.wait().await.unwrap();
     }
 
     #[test]

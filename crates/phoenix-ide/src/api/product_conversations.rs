@@ -56,6 +56,7 @@ pub struct SnapshotQuery {
     pub before: Option<String>,
     pub message_limit: Option<usize>,
     pub open_id: Option<uuid::Uuid>,
+    pub request_id: Option<uuid::Uuid>,
     #[serde(default)]
     pub boundary_representation: BoundaryRepresentation,
 }
@@ -73,6 +74,7 @@ pub struct CoordinatorHistoryQuery {
     pub before: Option<String>,
     pub message_limit: Option<usize>,
     pub open_id: Option<uuid::Uuid>,
+    pub request_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -477,6 +479,10 @@ pub async fn get_coordinator_history(
         tracing::info_span!(target: "phoenix_ide::otel", "coordinator.history_open",
             "open.id" = query.open_id.as_ref().map(uuid::Uuid::to_string),
             "product_conversation.id" = tracing::field::Empty)
+    } else if query.open_id.is_some() || query.request_id.is_some() {
+        tracing::info_span!(target: "phoenix_ide::otel", "coordinator.history_request",
+            "open.id" = query.open_id.as_ref().map(uuid::Uuid::to_string),
+            "request.id" = query.request_id.as_ref().map(uuid::Uuid::to_string))
     } else {
         tracing::Span::none()
     };
@@ -607,6 +613,7 @@ pub async fn get_product_conversation(
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<OrdinarySnapshotResponse>, AppError> {
     let open_id = query.open_id;
+    let request_id = query.request_id;
     async move {
         let message_limit = message_limit(query.message_limit)?;
         let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
@@ -659,6 +666,7 @@ pub async fn get_product_conversation(
         target: "phoenix_ide::otel",
         "product_conversation.detail_get",
         "open.id" = open_id.map(|id| id.to_string()).as_deref(),
+        "request.id" = request_id.map(|id| id.to_string()).as_deref(),
     ))
     .await
 }
@@ -1495,6 +1503,209 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    #[tokio::test]
+    async fn routed_history_reads_export_initial_cursor_and_recovery_identity() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+
+        let state = make_test_state().await;
+        let ordinary = state
+            .db
+            .create_conversation("correlation", "correlation", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let global = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        add_history_correlation_messages(&state, &ordinary.id).await;
+        add_history_correlation_messages(&state, &global.id).await;
+        for (route, expected_open, expected_request) in [
+            (
+                format!(
+                    "/api/product-conversations/{}",
+                    ordinary.product_conversation_id
+                ),
+                "product_conversation.detail_get",
+                "product_conversation.detail_get",
+            ),
+            (
+                format!("/api/global/coordinator/history/{}", global.id),
+                "coordinator.history_open",
+                "coordinator.history_request",
+            ),
+        ] {
+            let initial_id = uuid::Uuid::new_v4().to_string();
+            let cursor_id = uuid::Uuid::new_v4().to_string();
+            let recovery_id = uuid::Uuid::new_v4().to_string();
+            let exporter = InMemorySpanExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer("routed-history-correlation"))
+                    .with_filter(tracing_subscriber::filter::filter_fn(
+                        crate::logging::otel_metadata_enabled,
+                    )),
+            );
+            let dispatch = tracing::Dispatch::new(subscriber);
+            let mut cursor = None;
+            for (ordinal, suffix) in [
+                format!("open_id={initial_id}"),
+                String::new(),
+                format!("request_id={recovery_id}"),
+                String::new(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let query = if ordinal == 1 {
+                    format!("open_id={cursor_id}&before={}", cursor.as_ref().unwrap())
+                } else {
+                    suffix
+                };
+                let response = create_router(state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("{route}?message_limit=1&{query}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .with_subscriber(dispatch.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let page: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                )
+                .unwrap();
+                if ordinal == 0 {
+                    assert_bounded_correlation_page(&page);
+                    cursor = Some(
+                        page["before"]
+                            .as_str()
+                            .expect("bounded page cursor")
+                            .to_owned(),
+                    );
+                }
+            }
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            assert_history_request_spans(
+                &spans,
+                [&initial_id, &cursor_id, &recovery_id],
+                expected_open,
+                expected_request,
+            );
+        }
+    }
+
+    fn assert_bounded_correlation_page(page: &serde_json::Value) {
+        assert_eq!(page["has_older"], true);
+        assert_eq!(
+            page["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|segment| segment["messages"].as_array().unwrap().len())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    async fn add_history_correlation_messages(state: &AppState, conversation_id: &str) {
+        for index in 0..3 {
+            state
+                .db
+                .add_message(
+                    &format!("{conversation_id}-message-{index}"),
+                    conversation_id,
+                    &MessageContent::user("message"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn assert_history_request_spans(
+        spans: &[opentelemetry_sdk::trace::SpanData],
+        [initial_id, cursor_id, recovery_id]: [&str; 3],
+        expected_open: &str,
+        expected_request: &str,
+    ) {
+        let with_attribute = |key: &str, value: &str| {
+            spans
+                .iter()
+                .filter(|span| {
+                    span.attributes.iter().any(|attribute| {
+                        attribute.key.as_str() == key
+                            && attribute.value
+                                == opentelemetry::Value::String(value.to_owned().into())
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let initial = with_attribute("open.id", initial_id);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].name, expected_open);
+        let older = with_attribute("open.id", cursor_id);
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].name, expected_request);
+        let recovered = with_attribute("request.id", recovery_id);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.name == expected_request)
+                .count(),
+            if expected_open == expected_request {
+                4
+            } else {
+                2
+            }
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key.as_str() == "open.id"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key.as_str() == "request.id"))
+                .count(),
+            1
+        );
+        assert_eq!(recovered[0].name, expected_request);
+        assert!(!recovered[0]
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == "open.id"));
+        if expected_open != expected_request {
+            assert_eq!(
+                spans
+                    .iter()
+                    .filter(|span| span.name == expected_open)
+                    .count(),
+                1
+            );
+        }
+    }
 
     fn close_failure_fixture() -> crate::db::CloseCleanupFailure {
         use crate::db::{

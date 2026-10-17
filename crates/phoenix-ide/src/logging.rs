@@ -436,6 +436,7 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "browser.conversation_view"),
     ("phoenix_ide::otel", "browser.view_correlation"),
     ("phoenix_ide::otel", "coordinator.history_open"),
+    ("phoenix_ide::otel", "coordinator.history_request"),
     ("phoenix_ide::otel", "product_conversation.detail_get"),
     (
         "phoenix_ide::otel",
@@ -565,7 +566,7 @@ fn direct_turn_settlement_span_for_path(
     )
 }
 
-fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
+pub(crate) fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
     meta.is_span() && OTEL_SPANS.contains(&(meta.target(), meta.name()))
 }
 
