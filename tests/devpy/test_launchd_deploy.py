@@ -4040,24 +4040,37 @@ class PreparationTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, "1\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active_path), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", root / "deploy" / "activate.lock"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root / "install"), \
-                 mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", root / "service.plist"), \
-                 mock.patch.object(self.dev, "PROD_SHA_PATH", root / "deployed.sha"), \
-                 mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
-                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
-                 mock.patch.object(self.dev, "_prepare_local_candidate", return_value=prepared), \
-                 mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
-                 mock.patch.object(self.dev, "capture_login_shell_path", return_value=("/bin", "test")), \
-                 mock.patch.object(self.dev, "print_launchd_path_report"), \
-                 mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_text("# retained helper\n")), \
-                 mock.patch.object(self.dev, "_ensure_newsyslog_config", side_effect=SystemExit("sudo required")), \
-                 mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+            patches = (
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active_path),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", root / "deploy" / "activate.lock"),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path),
+                mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"),
+                mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root / "install"),
+                mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", root / "service.plist"),
+                mock.patch.object(self.dev, "PROD_SHA_PATH", root / "deployed.sha"),
+                mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)),
+                mock.patch.object(self.dev, "_preflight_prod_bind_auth"),
+                mock.patch.object(self.dev, "_prepare_local_candidate", return_value=prepared),
+                mock.patch.object(self.dev, "_binary_identity", return_value=identity),
+                mock.patch.object(self.dev, "capture_login_shell_path", return_value=("/bin", "test")),
+                mock.patch.object(self.dev, "print_launchd_path_report"),
+                mock.patch.object(
+                    self.dev,
+                    "_materialize_helper",
+                    side_effect=lambda _commit, path, _kind: path.write_text("# retained helper\n"),
+                ),
+                mock.patch.object(
+                    self.dev,
+                    "_ensure_newsyslog_config",
+                    side_effect=SystemExit("sudo required"),
+                ),
+                mock.patch.object(self.dev.subprocess, "run", side_effect=run),
+            )
+            with contextlib.ExitStack() as stack:
+                for patcher in patches:
+                    stack.enter_context(patcher)
                 with self.assertRaisesRegex(SystemExit, "sudo required"):
                     self.dev.launchd_prod_deploy()
 
