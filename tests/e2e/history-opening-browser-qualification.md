@@ -3339,3 +3339,25 @@ tree and all provenance pins move atomically to a236/5ccd; main0f054 remains
 the base. Exactly one fresh causal full Linux/native/macOS qualification follows
 after both preceding runs are terminal, with no ignored test, weakened assertion,
 cleanup retry, synthetic lifecycle event, threshold or acceptance waiver.
+
+
+## Evidence-backed Darwin exit-transition successor
+
+App aff5126e1e82cc72ef7a1bd567c57c0d3c487c4e,
+tree cf5314ebcd4598bbdd4d3f8caf9b9b52fd528892, composes metadata-only
+main4894426888d175d4fd65095647bede65bb09718e. Exact source mapping corrects
+earlier failure attribution:07302/e94 failed after root release in exit
+observation, not adoption; readiness did not fix the failure. Preserved
+raw diagnostic39046690493/artifact12106521163 observed procinfo/getpgid
+unavailable before waitid exposed the retained exact child as CLD_EXITED.
+The typed RootObservation::ExitPending state authorizes neither signal nor
+completion; observation remains within the same owned drain deadline.
+No profile-delete retry, sleep, reaping, broad PID kill or escaped-writer
+closure claim was added. Exact17a8 pure-macOS qualification39047567616
+passed the real exited-root writer/drain test1/0 (0.27s) and pending authority
+mapping test1/0 (0.00s), each with83filtered and exact one-test guards.
+Artifact12105519932. Full actual Chrome Linux/macOS and rebuilt current-head
+witness qualification is separately required; the earlier a236 Linux native
+and full Rust pass is not relabeled as this successor's acceptance.
+The shared native qualification script now also runs the pending authority
+test explicitly, preserving every existing guard and native topology check.
