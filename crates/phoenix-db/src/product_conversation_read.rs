@@ -10,6 +10,97 @@ use tracing::Instrument;
 
 use crate::{CloseProjection, Database, DbError, DbResult, MessageContent, MessageType};
 
+#[derive(Clone, Copy)]
+enum ReadStage {
+    Product,
+    Topology,
+    Member,
+    Handoff,
+    Source,
+    PoolWait,
+    BeginRead,
+    Resolve,
+    Aggregate,
+    Close,
+    MessagePage,
+    SnapshotRead,
+    RollbackRead,
+}
+
+impl ReadStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Product => "observation.db.product",
+            Self::Topology => "observation.db.topology",
+            Self::Member => "observation.db.read_member",
+            Self::Handoff => "observation.db.handoff",
+            Self::Source => "observation.db.source",
+            Self::PoolWait => "product_conversation.pool_wait",
+            Self::BeginRead => "product_conversation.begin_read",
+            Self::Resolve => "product_conversation.resolve",
+            Self::Aggregate => "product_conversation.aggregate",
+            Self::Close => "product_conversation.close",
+            Self::MessagePage => "product_conversation.message_page",
+            Self::SnapshotRead => "product_conversation.snapshot_read",
+            Self::RollbackRead => "product_conversation.rollback_read",
+        }
+    }
+}
+
+struct ReadCompletion {
+    stage: ReadStage,
+    started: std::time::Instant,
+    dispatch: tracing::Dispatch,
+    parent: tracing::Span,
+    finished: bool,
+}
+
+impl ReadCompletion {
+    fn new(stage: ReadStage) -> Self {
+        Self {
+            stage,
+            started: std::time::Instant::now(),
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+            parent: tracing::Span::current(),
+            finished: false,
+        }
+    }
+
+    fn complete<T, E>(mut self, result: &Result<T, E>) {
+        self.emit(if result.is_ok() { "success" } else { "error" });
+    }
+
+    fn emit(&mut self, outcome: &'static str) {
+        self.finished = true;
+        let elapsed_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            self.parent.in_scope(|| {
+                tracing::event!(name: "observation.stage_complete", target: "phoenix::observation::completion",
+                    parent: &self.parent, tracing::Level::INFO,
+                    stage = self.stage.name(), outcome, elapsed_us);
+            });
+        });
+    }
+}
+
+impl Drop for ReadCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("cancel");
+        }
+    }
+}
+
+async fn complete_read<T, E>(
+    stage: ReadStage,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let completion = ReadCompletion::new(stage);
+    let result = future.await;
+    completion.complete(&result);
+    result
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProductConversation {
     pub product_conversation_id: ProductConversationId,
@@ -780,12 +871,12 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<ProductConversationAggregate> {
         let product =
-            sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations p WHERE id = ?1
+            complete_read(ReadStage::Product, sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations p WHERE id = ?1
                 AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
                     WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')")
                 .bind(product_conversation_id.as_str())
                 .fetch_optional(&self.pool)
-                .instrument(tracing::info_span!("observation.db.product"))
+                .instrument(tracing::info_span!("observation.db.product")))
                 .await?;
         let Some(product) = product else {
             return Err(DbError::ConversationNotFound(
@@ -804,7 +895,7 @@ impl Database {
                 DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
             })?;
 
-        let rows = sqlx::query(
+        let rows = complete_read(ReadStage::Topology, sqlx::query(
             "WITH RECURSIVE transcript(id, ordinal) AS (
                  SELECT root.id, 0
                  FROM conversations root
@@ -852,17 +943,19 @@ impl Database {
         )
         .bind(product_conversation_id.as_str())
         .fetch_all(&self.pool)
-        .instrument(tracing::info_span!("observation.db.topology"))
+        .instrument(tracing::info_span!("observation.db.topology")))
         .await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.try_get("id")?;
             let ordinal: i64 = row.try_get("ordinal")?;
             transcript_rows.push(ProductConversationTranscriptRow {
-                conversation: self
-                    .get_conversation(&id)
-                    .instrument(tracing::info_span!("observation.db.read_member"))
-                    .await?,
+                conversation: complete_read(
+                    ReadStage::Member,
+                    self.get_conversation(&id)
+                        .instrument(tracing::info_span!("observation.db.read_member")),
+                )
+                .await?,
                 segment_ordinal: ordinal,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
@@ -879,11 +972,14 @@ impl Database {
             debug_assert_eq!(transcript_row.conversation.runtime_role, RuntimeRole::User);
             let handoff = match transcript_row.conversation.continued_in_conv_id.as_deref() {
                 Some(successor_transcript_row_id) => {
-                    self.continuation_handoff(
-                        &transcript_row.conversation.id,
-                        successor_transcript_row_id,
+                    complete_read(
+                        ReadStage::Handoff,
+                        self.continuation_handoff(
+                            &transcript_row.conversation.id,
+                            successor_transcript_row_id,
+                        )
+                        .instrument(tracing::info_span!("observation.db.handoff")),
                     )
-                    .instrument(tracing::info_span!("observation.db.handoff"))
                     .await?
                 }
                 None => None,
@@ -903,10 +999,12 @@ impl Database {
             .ok_or_else(|| {
                 DbError::Serialization("aggregate has no updated timestamp".to_string())
             })?;
-        let source = self
-            .product_conversation_source(product_conversation_id)
-            .instrument(tracing::info_span!("observation.db.source"))
-            .await?;
+        let source = complete_read(
+            ReadStage::Source,
+            self.product_conversation_source(product_conversation_id)
+                .instrument(tracing::info_span!("observation.db.source")),
+        )
+        .await?;
         Ok(ProductConversationAggregate {
             product_conversation: ProductConversation::ordinary(
                 product_conversation_id.clone(),
@@ -933,63 +1031,88 @@ impl Database {
         segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<ProductConversationSnapshotRead> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .instrument(tracing::info_span!("product_conversation.pool_wait"))
-            .await?;
-        let mut tx = connection
-            .begin()
-            .instrument(tracing::info_span!("product_conversation.begin_read"))
-            .await?;
-        let result = async {
-            let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, reference)
-                .instrument(tracing::info_span!("product_conversation.resolve"))
+        let mut connection = complete_read(
+            ReadStage::PoolWait,
+            self.pool
+                .acquire()
+                .instrument(tracing::info_span!("product_conversation.pool_wait")),
+        )
+        .await?;
+        let mut tx = complete_read(
+            ReadStage::BeginRead,
+            connection
+                .begin()
+                .instrument(tracing::info_span!("product_conversation.begin_read")),
+        )
+        .await?;
+        let result = complete_read(
+            ReadStage::SnapshotRead,
+            async {
+                let resolved = complete_read(
+                    ReadStage::Resolve,
+                    Self::resolve_ordinary_product_conversation_on(&mut tx, reference)
+                        .instrument(tracing::info_span!("product_conversation.resolve")),
+                )
                 .await?;
-            tracing::Span::current().record(
-                "product.reference",
-                resolved.product_conversation_id.as_str(),
-            );
-            let aggregate = Self::get_ordinary_product_conversation_on(
-                &mut tx,
-                &resolved.product_conversation_id,
-            )
-            .instrument(tracing::info_span!("product_conversation.aggregate"))
-            .await?;
-            let latest_opening =
-                Self::read_continuation_opening_on(&mut tx, &aggregate.latest_transcript_row_id)
-                    .await?;
-            let close = Self::get_active_close_projection_for_product_on(
-                &mut tx,
-                aggregate.product_conversation.id(),
-            )
-            .instrument(tracing::info_span!("product_conversation.close"))
-            .await?;
-            let messages = Self::get_product_conversation_messages_page_on(
-                &mut tx,
-                aggregate.product_conversation.id(),
-                before,
-                segment_ceilings,
-                limit,
-            )
-            .instrument(tracing::info_span!("product_conversation.message_page"))
-            .await?;
-            Ok(ProductConversationSnapshotRead {
-                aggregate,
-                latest_opening,
-                close,
-                messages,
-                requested_transcript_row_id: resolved.requested_transcript_row_id,
-            })
-        }
-        .instrument(tracing::info_span!(
-            "product_conversation.snapshot_read",
-            "product.reference" = tracing::field::Empty,
-        ))
+                tracing::Span::current().record(
+                    "product.reference",
+                    resolved.product_conversation_id.as_str(),
+                );
+                let aggregate = complete_read(
+                    ReadStage::Aggregate,
+                    Self::get_ordinary_product_conversation_on(
+                        &mut tx,
+                        &resolved.product_conversation_id,
+                    )
+                    .instrument(tracing::info_span!("product_conversation.aggregate")),
+                )
+                .await?;
+                let latest_opening = Self::read_continuation_opening_on(
+                    &mut tx,
+                    &aggregate.latest_transcript_row_id,
+                )
+                .await?;
+                let close = complete_read(
+                    ReadStage::Close,
+                    Self::get_active_close_projection_for_product_on(
+                        &mut tx,
+                        aggregate.product_conversation.id(),
+                    )
+                    .instrument(tracing::info_span!("product_conversation.close")),
+                )
+                .await?;
+                let messages = complete_read(
+                    ReadStage::MessagePage,
+                    Self::get_product_conversation_messages_page_on(
+                        &mut tx,
+                        aggregate.product_conversation.id(),
+                        before,
+                        segment_ceilings,
+                        limit,
+                    )
+                    .instrument(tracing::info_span!("product_conversation.message_page")),
+                )
+                .await?;
+                Ok(ProductConversationSnapshotRead {
+                    aggregate,
+                    latest_opening,
+                    close,
+                    messages,
+                    requested_transcript_row_id: resolved.requested_transcript_row_id,
+                })
+            }
+            .instrument(tracing::info_span!(
+                "product_conversation.snapshot_read",
+                "product.reference" = tracing::field::Empty,
+            )),
+        )
         .await;
-        tx.rollback()
-            .instrument(tracing::info_span!("product_conversation.rollback_read"))
-            .await?;
+        complete_read(
+            ReadStage::RollbackRead,
+            tx.rollback()
+                .instrument(tracing::info_span!("product_conversation.rollback_read")),
+        )
+        .await?;
         result
     }
 
@@ -1108,12 +1231,12 @@ impl Database {
         kind: ProductConversationKind,
     ) -> DbResult<ProductConversationAggregate> {
         let product =
-            sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations p WHERE id = ?1
+            complete_read(ReadStage::Product, sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations p WHERE id = ?1
                 AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
                     WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')")
                 .bind(product_conversation_id.as_str())
                 .fetch_optional(&mut *connection)
-                .instrument(tracing::info_span!("observation.db.product"))
+                .instrument(tracing::info_span!("observation.db.product")))
                 .await?;
         let Some(product) = product else {
             return Err(DbError::ConversationNotFound(
@@ -1144,7 +1267,7 @@ impl Database {
             ProductConversationKind::Ordinary => "user",
             ProductConversationKind::Coordinator => "coordinator",
         };
-        let rows = sqlx::query(
+        let rows = complete_read(ReadStage::Topology, sqlx::query(
             "WITH RECURSIVE transcript(id, ordinal) AS (
                  SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1
                    AND root.runtime_role = ?2 AND root.parent_conversation_id IS NULL
@@ -1173,14 +1296,17 @@ impl Database {
                ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
         ).bind(product_conversation_id.as_str()).bind(runtime_role).fetch_all(&mut *connection)
-        .instrument(tracing::info_span!("observation.db.topology")).await?;
+        .instrument(tracing::info_span!("observation.db.topology"))).await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.try_get("id")?;
             transcript_rows.push(ProductConversationTranscriptRow {
-                conversation: Self::get_conversation_on(connection, &id)
-                    .instrument(tracing::info_span!("observation.db.read_member"))
-                    .await?,
+                conversation: complete_read(
+                    ReadStage::Member,
+                    Self::get_conversation_on(connection, &id)
+                        .instrument(tracing::info_span!("observation.db.read_member")),
+                )
+                .await?,
                 segment_ordinal: row.try_get("ordinal")?,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
@@ -1196,12 +1322,15 @@ impl Database {
         for transcript_row in transcript_rows {
             let handoff = match transcript_row.conversation.continued_in_conv_id.as_deref() {
                 Some(successor) => {
-                    Self::continuation_handoff_on(
-                        connection,
-                        &transcript_row.conversation.id,
-                        successor,
+                    complete_read(
+                        ReadStage::Handoff,
+                        Self::continuation_handoff_on(
+                            connection,
+                            &transcript_row.conversation.id,
+                            successor,
+                        )
+                        .instrument(tracing::info_span!("observation.db.handoff")),
                     )
-                    .instrument(tracing::info_span!("observation.db.handoff"))
                     .await?
                 }
                 None => None,
@@ -1221,9 +1350,12 @@ impl Database {
             .ok_or_else(|| {
                 DbError::Serialization("aggregate has no updated timestamp".to_string())
             })?;
-        let source = Self::product_conversation_source_on(connection, product_conversation_id)
-            .instrument(tracing::info_span!("observation.db.source"))
-            .await?;
+        let source = complete_read(
+            ReadStage::Source,
+            Self::product_conversation_source_on(connection, product_conversation_id)
+                .instrument(tracing::info_span!("observation.db.source")),
+        )
+        .await?;
         Ok(ProductConversationAggregate {
             product_conversation,
             root,
@@ -3579,5 +3711,82 @@ mod tests {
                 .await,
             Err(DbError::ConversationNotFound(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::{complete_read, ReadStage};
+    use std::{io::Write, sync::Arc, sync::Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn read_completion_reports_actual_result_or_await_drop_once_under_owner() {
+        use tracing::instrument::WithSubscriber;
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let owner = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        assert_eq!(
+            complete_read(ReadStage::Product, async { Ok::<_, ()>(7) })
+                .with_subscriber(owner.clone())
+                .await,
+            Ok(7)
+        );
+        assert_eq!(
+            complete_read(ReadStage::Product, async { Err::<(), _>(9) })
+                .with_subscriber(owner.clone())
+                .await,
+            Err(9)
+        );
+        let foreign_capture = Capture::default();
+        let writer = foreign_capture.clone();
+        let foreign = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        drop(complete_read(
+            ReadStage::Member,
+            std::future::pending::<Result<(), ()>>(),
+        ));
+        for ambient in [tracing::Dispatch::none(), foreign] {
+            let mut future = Box::pin(complete_read(
+                ReadStage::Member,
+                std::future::pending::<Result<(), ()>>(),
+            ));
+            tracing::dispatcher::with_default(&owner, || {
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_pending());
+            });
+            tracing::dispatcher::with_default(&ambient, || drop(future));
+        }
+        let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 4, "{text}");
+        assert_eq!(text.matches("outcome=\"success\"").count(), 1, "{text}");
+        assert_eq!(text.matches("outcome=\"error\"").count(), 1, "{text}");
+        assert_eq!(text.matches("outcome=\"cancel\"").count(), 2, "{text}");
+        assert_eq!(text.matches("elapsed_us=").count(), 4, "{text}");
+        assert!(foreign_capture.0.lock().unwrap().is_empty());
     }
 }

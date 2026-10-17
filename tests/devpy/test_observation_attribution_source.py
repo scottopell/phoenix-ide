@@ -15,10 +15,11 @@ ROUTES = "crates/phoenix-ide/src/api/observation.rs"
 AUTH = "crates/phoenix-ide/src/api/auth.rs"
 STARTUP = "crates/phoenix-ide/src/observation_startup.rs"
 FUNCTIONS = {
-    DB: ["get_ordinary_product_conversation", "get_product_conversation_on"],
+    DB: ["ReadStage::name", "ReadCompletion::new", "ReadCompletion::complete", "ReadCompletion::emit", "ReadCompletion::drop", "complete_read", "get_ordinary_product_conversation", "read_ordinary_product_conversation_snapshot", "get_product_conversation_on"],
     AUTH: ["observation_request_span", "auth_middleware"],
     ROUTES: ["resolve_reference", "require_member"],
-    STARTUP: ["attribution_subscriber", "AttributionRequest::poll", "AttributionRequest::drop", "with_attribution_dispatch", "run", "run_with_attribution", "serve"],
+    "crates/phoenix-ide/src/api/product_conversations.rs": ["read_product_conversation"],
+    STARTUP: ["Stage::name", "StageCompletion::new", "StageCompletion::complete", "StageCompletion::emit", "StageCompletion::drop", "complete_stage", "RequestCompletion::new", "RequestCompletion::response_ready", "RequestCompletion::emit", "RequestCompletion::drop", "attribution_subscriber", "AttributionRequest::poll", "AttributionRequest::drop", "with_attribution_dispatch", "run", "run_with_attribution", "serve"],
     "crates/phoenix-ide/src/observation_startup/attribution_tests.rs": [],
     "docs/conversation-observation-attribution.md": [],
     "tests/devpy/test_observation_attribution_source.py": [],
@@ -47,15 +48,21 @@ def tokens(source):
 
 
 def without_wrappers(source, path):
+    if path == DB:
+        start = source.index("#[derive(Clone, Copy)]\nenum ReadStage")
+        end = source.index("#[derive(Debug, Clone, PartialEq, Eq)]", start)
+        source = source[:start] + source[end:]
+        source = source[:source.index("#[cfg(test)]\nmod completion_tests {")]
     items = tokens(source)
 
-    def remove_exact(fragment, count):
+    def remove_exact(fragment, count, replacement=""):
         nonlocal items
         sequence = tokens(fragment)
         result, index, found = [], 0, 0
         while index < len(items):
             if items[index:index + len(sequence)] == sequence:
                 found += 1
+                result.extend(tokens(replacement))
                 index += len(sequence)
             else:
                 result.append(items[index])
@@ -64,32 +71,86 @@ def without_wrappers(source, path):
             raise AssertionError(f"{fragment}: expected {count} exact wrappers, got {found}")
         items = result
 
-    for name, count in WRAPPERS[path].items():
-        remove_exact(f'.instrument(tracing::info_span!("{name}"))', count)
+    if path in WRAPPERS:
+        for name, count in WRAPPERS[path].items():
+            remove_exact(f'.instrument(tracing::info_span!("{name}"))', count)
     if path == ROUTES:
         remove_exact('#[tracing::instrument(name = "observation.require_member", skip_all)]', 1)
         remove_exact("use tracing::Instrument;", 1)
+        remove_exact("use crate::observation_startup::{complete_stage, Stage};", 1)
+        stages = {name: 1 for name in ["Admission", "ResolveOrdinary", "GetAggregate", "RequireMember", "MemberResolveOrdinary", "MemberGetAggregate"]}
+        callee, enum = "complete_stage", "Stage"
+    elif path == DB:
+        remove_exact("Self::read_continuation_opening_on(&mut tx, &aggregate.latest_transcript_row_id,)", 1,
+                     "Self::read_continuation_opening_on(&mut tx, &aggregate.latest_transcript_row_id)")
+        stages = {name: 2 for name in ["Product", "Topology", "Member", "Handoff", "Source"]}
+        stages.update({name: 1 for name in ["PoolWait", "BeginRead", "Resolve", "Aggregate", "Close", "MessagePage", "SnapshotRead", "RollbackRead"]})
+        callee, enum = "complete_read", "ReadStage"
+    else:
+        stages = {"Detail": 1, "Projection": 1}
+        callee, enum = "crate::observation_startup::complete_stage", "crate::observation_startup::Stage"
+    prefix = tokens(callee + "(" + enum + "::")
+    found = dict.fromkeys(stages, 0)
+
+    def unwrap(sequence):
+        result, index = [], 0
+        while index < len(sequence):
+            if sequence[index:index + len(prefix)] != prefix:
+                result.append(sequence[index])
+                index += 1
+                continue
+            stage_index = index + len(prefix)
+            stage = sequence[stage_index]
+            if stage not in stages or sequence[stage_index + 1] != ",":
+                raise AssertionError("unreviewed stage wrapper")
+            found[stage] += 1
+            inner_start = stage_index + 2
+            depth, end = 1, inner_start
+            while depth:
+                depth += (sequence[end] == "(") - (sequence[end] == ")")
+                end += 1
+            inner = sequence[inner_start:end - 1]
+            if inner[-1:] == [","]:
+                inner = inner[:-1]
+            if stage in ["Admission", "RequireMember"]:
+                if inner[:2] != ["async", "{"] or inner[-1:] != ["}"] or sequence[end:end+2] != [".", "await"]:
+                    raise AssertionError("expected exact whole-method await wrapper")
+                inner, end = inner[2:-1], end + 2
+            result.extend(unwrap(inner))
+            index = end
+        return result
+
+    items = unwrap(items)
+    if found != stages:
+        raise AssertionError(f"stage inventory mismatch: {found} != {stages}")
     return items
 
 
 def without_auth_branch_instrumentation(source):
     expected = '''ApplicationState::Observation(application) => {
-        use tracing::Instrument;
-        let span = observation_request_span(&req);
-        return async {
-            let admitted = tracing::info_span!("observation.authorization")
-                .in_scope(|| application.admit_peer(peer_from_extensions(&req), req.headers()));
-            let response = match admitted {
-                Ok(()) => next.run(req).await,
-                Err(error) => error.into_response(),
-            };
-            tracing::Span::current().record("status", response.status().as_u16());
-            tracing::Span::current().record("response_ready", true);
-            response
-        }
-        .instrument(span)
-        .await;
-    }'''
+            use crate::observation_startup::{RequestCompletion, Stage, StageCompletion};
+            use tracing::Instrument;
+            let (request_id, span) = observation_request_span(&req);
+            return async {
+                let completion = RequestCompletion::new(request_id);
+                let admitted = tracing::info_span!("observation.authorization").in_scope(|| {
+                    let completion = StageCompletion::new(Stage::Authorization);
+                    let result = application.admit_peer(peer_from_extensions(&req), req.headers());
+                    completion.complete(&result);
+                    result
+                });
+                let response = match admitted {
+                    Ok(()) => next.run(req).await,
+                    Err(error) => error.into_response(),
+                };
+                tracing::Span::current().record("status", response.status().as_u16());
+                tracing::Span::current().record("response_ready", true);
+                completion.response_ready(response.status());
+                response
+            }
+            .instrument(span)
+            .await;
+        }'''
     if tokens(source) != tokens(expected):
         raise AssertionError("auth branch differs from exact synchronous admission/root future wrapper")
     return tokens('''ApplicationState::Observation(application) => {
@@ -134,7 +195,7 @@ class AttributionSourceTests(unittest.TestCase):
         self.assertEqual(changed, set(FUNCTIONS) | {PACKET})
 
     def test_only_exact_instrument_wrappers_change_db_and_admission_tokens(self):
-        for path in [DB, ROUTES]:
+        for path in [DB, ROUTES, "crates/phoenix-ide/src/api/product_conversations.rs"]:
             with self.subTest(path=path):
                 self.assertEqual(tokens(pinned(path)), without_wrappers((ROOT / path).read_text(), path))
 
@@ -146,7 +207,10 @@ class AttributionSourceTests(unittest.TestCase):
                         source.replace(".get_conversation(&id)", ".get_conversation_by_slug(&id)", 1)]:
             self.assertNotEqual(tokens(pinned(DB)), without_wrappers(changed, DB))
         with self.assertRaises(AssertionError):
-            without_wrappers(source.replace('"observation.db.read_member"', '"unreviewed"', 1), DB)
+            without_wrappers(source.replace('.instrument(tracing::info_span!("observation.db.read_member"))',
+                                            '.instrument(tracing::info_span!("unreviewed"))', 1), DB)
+        with self.assertRaises(AssertionError):
+            without_wrappers(source.replace("ReadStage::Member,", "ReadStage::Unreviewed,", 1), DB)
 
     def test_live_auth_and_response_path_outside_observation_branch_are_exact(self):
         baseline, actual = pinned(AUTH), (ROOT / AUTH).read_text()
@@ -160,121 +224,60 @@ class AttributionSourceTests(unittest.TestCase):
         observation_branch = actual[new_start:new_end]
         self.assertEqual(tokens(baseline[old_start:old_end]),
                          without_auth_branch_instrumentation(observation_branch))
-        synchronous_admission = '''tracing::info_span!("observation.authorization")
-                    .in_scope(|| application.admit_peer(peer_from_extensions(&req), req.headers()))'''
-        borrowed_async_admission = '''async { application.admit_peer(peer_from_extensions(&req), req.headers()) }
-                    .instrument(tracing::info_span!("observation.authorization")).await'''
+        synchronous_admission = "let result = application.admit_peer(peer_from_extensions(&req), req.headers());"
         self.assertIn(synchronous_admission, observation_branch)
-        for changed in [observation_branch.replace(synchronous_admission, borrowed_async_admission, 1),
+        for changed in [observation_branch.replace(synchronous_admission, "let result = async { application.admit_peer(peer_from_extensions(&req), req.headers()) }.await;", 1),
                         observation_branch.replace("peer_from_extensions(&req)", "None", 1),
                         observation_branch.replace("req.headers()", "&Default::default()", 1),
-                        observation_branch.replace("Err(error) => error.into_response()",
-                                                   "Err(error) => next.run(req).await", 1)]:
+                        observation_branch.replace("Err(error) => error.into_response()", "Err(error) => next.run(req).await", 1),
+                        observation_branch.replace("completion.response_ready(response.status());", "", 1)]:
             with self.assertRaises(AssertionError):
                 without_auth_branch_instrumentation(changed)
         actual = actual[:new_start] + baseline[old_start:old_end] + actual[new_end:]
         self.assertEqual(actual, baseline)
 
-    def test_private_subscriber_uses_scoped_dispatch_not_global_or_live_logging(self):
+    def test_finite_events_have_owner_dispatch_monotonic_elapsed_and_no_payload_fields(self):
         startup = (ROOT / STARTUP).read_text()
-        self.assertIn("FmtSpan::CLOSE", startup)
-        self.assertIn("metadata.is_span()", startup)
+        db = (ROOT / DB).read_text()
+        self.assertIn("FmtSpan::CLOSE", startup)  # diagnostic only
+        self.assertIn('metadata.target() == "phoenix::observation::completion"', startup)
+        self.assertIn('"observation.stage_complete" | "observation.request_complete"', startup)
+        for source in [startup, db]:
+            self.assertIn("std::time::Instant::now()", source)
+            self.assertIn("self.started.elapsed().as_micros()", source)
+            self.assertIn("tracing::dispatcher::get_default(Clone::clone)", source)
+            self.assertIn("tracing::dispatcher::with_default(&self.dispatch", source)
+            self.assertIn("parent: &self.parent", source)
+            self.assertIn('self.emit("cancel")', source)
+            self.assertIn("completion.complete(&result);", source)
+            self.assertIn("self.finished = true;", source)
+            for forbidden in ["set_global_default", "task_local!", "on_event(", "Subscriber for", "std::time::SystemTime"]:
+                self.assertNotIn(forbidden, source)
+        self.assertIn('self.emit("cancel", None)', startup)
+        self.assertIn('request_id = self.request_id', startup)
+        self.assertIn('response_ready = status.is_some()', startup)
+        self.assertIn("with_default(&self.dispatch, || drop(self.future.take()))", startup)
+        self.assertIn("this.future.as_mut().unwrap().as_mut().poll(cx)", startup)
         self.assertIn(".with_subscriber(dispatch)", startup)
-        helper = '''fn with_attribution_dispatch(app: axum::Router, dispatch: tracing::Dispatch) -> axum::Router {
-    app.layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| AttributionRequest {
-            future: Some(Box::pin(next.run(request))),
-            dispatch: dispatch.clone(),
-        },
-    ))
-}'''
-        self.assertNotIn("next.run(request).with_subscriber", startup)
-        self.assertIn('''tracing::dispatcher::with_default(&this.dispatch, || {
-            this.future.as_mut().unwrap().as_mut().poll(cx)
-        })''', startup)
-        self.assertIn('''impl Drop for AttributionRequest {
-    fn drop(&mut self) {
-        tracing::dispatcher::with_default(&self.dispatch, || drop(self.future.take()));
-    }
-}''', startup)
-        self.assertIn(helper, startup)
-        self.assertIn('''let app = with_attribution_dispatch(
-        create_router(ApplicationState::Observation(application))
-            .layer(CompressionLayer::new().gzip(true).br(true)),
-        dispatch,
-    );''', startup)
-        inventory = startup.split('metadata.name(),', 1)[1].split(')', 1)[0]
-        self.assertEqual(re.findall(r'"([^"]+)"', inventory), [
-            "observation.request", "observation.authorization", "replay.admission",
-            "observation.resolve_ordinary", "observation.get_aggregate", "observation.require_member",
-            "observation.member.resolve_ordinary", "observation.member.get_aggregate",
-            "observation.db.product", "observation.db.topology", "observation.db.read_member",
-            "observation.db.handoff", "observation.db.source", "product_conversation.detail_get",
-            "product_conversation.post_snapshot_projection", "product_conversation.pool_wait",
-            "product_conversation.begin_read", "product_conversation.resolve", "product_conversation.aggregate",
-            "product_conversation.close", "product_conversation.message_page",
-            "product_conversation.snapshot_read", "product_conversation.rollback_read",
-        ])
+        stage_event = '''tracing::event!(name: "observation.stage_complete", target: "phoenix::observation::completion",
+                    parent: &self.parent, tracing::Level::INFO,
+                    stage = self.stage.name(), outcome, elapsed_us);'''
+        request_event = '''tracing::event!(name: "observation.request_complete", target: "phoenix::observation::completion",
+                    parent: &self.parent, tracing::Level::INFO,
+                    stage = "observation.request", request_id = self.request_id,
+                    outcome, elapsed_us, status, response_ready = status.is_some());'''
+        for source, expected in [(startup, [stage_event, request_event]), (db.split("#[cfg(test)]", 1)[0], [stage_event])]:
+            actual = re.findall(r"tracing::event!\(.*?;", source, re.S)
+            self.assertEqual([tokens(event) for event in actual], [tokens(event) for event in expected])
         for forbidden in [".init()", "try_init", "set_global_default", "EnvFilter", "init_logging", ".enter()"]:
             self.assertNotIn(forbidden, startup)
         self.assertEqual(git("diff", BASE, "--", "crates/phoenix-ide/src/main.rs", "crates/phoenix-ide/src/logging.rs"), "")
 
-    def test_authored_actual_router_case_uses_startup_helper_and_another_dispatch(self):
+    def test_authored_router_and_cancellation_cases_assert_events_not_root_close(self):
         source = (ROOT / "crates/phoenix-ide/src/observation_startup/attribution_tests.rs").read_text()
-        self.assertIn("async fn startup_dispatch_captures_actual_product_detail_without_inheriting_default()", source)
-        self.assertIn('''for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
-        .into_iter()
-        .enumerate()''', source)
-        self.assertIn("let emit_sample = index == 0;", source)
-        self.assertNotIn("outer.is_none()", source)
-        self.assertIn("fn assert_send<T: Send>(_: &T) {}", source)
-        self.assertIn('''|state: State<ApplicationState>, req: Request<Body>, next: Next| async move {
-                let future = auth_middleware(state, req, next);
-                assert_send(&future);
-                future.await
-            }''', source)
-        self.assertIn("let app = with_attribution_dispatch(", source)
-        self.assertIn("crate::api::create_router(", source)
-        self.assertIn("crate::api::application_state::ApplicationState::Observation(application.clone())", source)
-        self.assertIn('"/api/product-conversations/{}"', source)
-        self.assertIn("ObservationApplication::for_target(db, &target.id)", source)
-        self.assertIn("Database::open_in_memory()", source)
-        self.assertEqual(re.findall(r"\.with_subscriber\(([^)]*)\)", source), ["outer"])
-        self.assertIn("async fn dropping_pending_request_restores_dispatch_and_closes_parent_references()", source)
-        self.assertIn("std::task::Context::from_waker(std::task::Waker::noop())", source)
-        cancellation = source.split("async fn cancellation_closes_request_and_child_without_claiming_response_ready()", 1)[1].split("#[tokio::test]", 1)[0]
-        self.assertIn('''for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
-        .into_iter()
-        .enumerate()''', cancellation)
-        self.assertIn('''impl Drop for AmbientRequest {
-        fn drop(&mut self) {
-            tracing::dispatcher::with_default(&self.dispatch, || {
-                drop(self.future.take());
-                drop(tracing::info_span!("observation.authorization"));
-            });
-        }
-    }''', cancellation)
-        self.assertIn("tokio::spawn(AmbientRequest {", cancellation)
-        self.assertIn('''task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        let records = capture.records();''', cancellation)
-        for expected in ['request["span"]["response_ready"], false',
-                         'request["span"]["status"].is_null()',
-                         '"observation.db.read_member"',
-                         '"missing associated child; captured records: {records:#?}"',
-                         '"post-drop sentinel leaked into private dispatch: {records:#?}"',
-                         '''assert_eq!(
-            outer_records.len(),
-            index,
-            "outer records: {outer_records:#?}"
-        )''',
-                         'outer_records[0]["span"]["request_id"].is_null()']:
-            self.assertIn(expected, cancellation)
-        for forbidden in ["sleep(", "yield_now(", "with_subscriber("]:
-            self.assertNotIn(forbidden, cancellation)
-        self.assertEqual(source.count('panic!("missing request close record; captured records: {records:#?}")'), 1)
-        self.assertEqual(source.count('assert_eq!(roots.len(), 1, "captured records: {records:#?}")'), 3)
-        for forbidden in ["TcpListener", "open_read_only", "standalone_path", "set_global_default"]:
+        for expected in ["actual_router_completes_success_error_and_denial_before_response_handoff", "crate::api::create_router(application.clone())", "pending_drop_emits_one_cancel_per_started_stage_under_owner_not_ambient", "abort_is_observed_at_await_drop_not_a_sqlite_worker_completion", "tracing::Dispatch::none(), existing.dispatch()", "std::task::Waker::noop()", "drop(future);", "task.abort();", "task.await.unwrap_err().is_cancelled()", "fn assert_send<T: Send>", "assert_send(&future)", '"elapsed_us"', '"response_ready"', '"request_id"', '"cancel"', '"product_conversation.snapshot_read"', '"product_conversation.aggregate"', '"product_conversation.post_snapshot_projection"', "assert_stage(&events", "terminal(&events)", "completions(&capture.records()).len(),", "diagnostic CLOSE is not a terminal event", "actual_router_admission_error_completes_only_started_stages", "request_terminal_is_available_with_root_span_still_retained"]:
+            self.assertIn(expected, source)
+        for forbidden in ["sleep(", "yield_now(", "TcpListener", "open_read_only", "standalone_path", "set_global_default", 'record["span"]["name"] == "observation.request"']:
             self.assertNotIn(forbidden, source)
 
     def test_all_ui_bytes_except_exactly_manifested_guard_are_pinned(self):

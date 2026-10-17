@@ -1,273 +1,205 @@
-# PRIVATE ordinary observation attribution — source review packet
+# PRIVATE ordinary observation attribution — explicit completion contract
 
-## Boundary and audit
+## Boundary and qualification
 
-Base: `2702d8389c2fc78ac2e528c876c35a1a7040d692`. Branch:
-`bench/current-task-observation-attribution`, separate worktree
-`.phoenix/current-task-attribution`. Source checkpoint
-`35e6c30f619cc898cff825516997a3b7484d6ace` is preserved. Its sample-emission
-follow-up `f095d1ad7051c83e4806ab5b66af30336a57c82f` failed hosted compilation
-in run **39065608814**. Follow-up `bef36e9e4` fixed the reported E0277 auth-future
-Send failure and E0599 nonexistent `Dispatch::is_none` call. Per the parent's
-hosted results, bef36 compiled and the success/error/denial Rust case passed,
-but cancellation failed to find the request close record. This uncommitted
-source-only correction addresses the dispatch lifetime during request destruction;
-it has not been compiled or dispatched for another hosted attempt.
-This packet supplements, not rewrites, the prior composition packet. Its only
-non-UI exceptions are the exact attribution changes in the separate
+Product-source baseline: `2702d8389c2fc78ac2e528c876c35a1a7040d692`.
+This source-only contract change is atop `dfcd8b477468b4d94c9ec2830a1e92bf5bcdb62b`
+on `bench/current-task-observation-attribution`. The exact exception blobs,
+diffs and production-function inventory are in
 [`conversation-observation-attribution.json`](conversation-observation-attribution.json).
-All UI bytes at 2702 are preserved except the explicitly manifested source guard.
+This supplements, not rewrites, the earlier composition packet. All 2702 UI
+bytes remain exact except the explicitly manifested source-parity guard.
 
-`main::Invocation::Observation` calls `observation_startup::run` directly, bypassing
-normal server logging initialization. The existing `replay.admission`, handler,
-projection and database spans therefore have no observation-owned subscriber at
-that entrypoint. This is a source audit, not evidence from deployed logs; no
-service/log endpoint, production trace collector or fixture was contacted.
-Roadmap context could not be refreshed under the no-network authorization.
+**This source is UNCOMPILED. Its Rust tests are authored, UNRUN.** No Cargo,
+build, codegen, installation, child/server executable, fixture/SQL operation,
+network request, new GET, service, browser, production action or hosted dispatch
+was performed. Cached Python/UI source tests and rustfmt are not Rust type or
+runtime qualification. Roadmap issue #806 could not be refreshed under the
+no-network authorization. The existing artifact and service are untouched.
 
-## Scoped use of existing tracing
+## Completion, not span lifetime
 
-- The observation entrypoint creates only a `tracing_subscriber` JSON fmt layer,
-  default timestamps and `FmtSpan::CLOSE`, writing to stderr. No global subscriber,
-  OTLP/collector, live logging initialization, environment/config flag, tracing
-  API, timer framework or dependency is added.
-- `WithSubscriber` installs/restores its dispatch for each future poll. Startup
-  and shutdown run under this scope. The private `with_attribution_dispatch`
-  middleware-layer helper is reused by `serve` and the in-memory tests. Its
-  request-specific, non-generic `AttributionRequest` owns a pinned boxed
-  `Next::run` response future and installs that same dispatch for **both polling
-  and destruction**. The future stays pinned; its optional slot is taken only
-  during `Drop`. This adds one box per private request, not a reusable future
-  engine. Tokio's spawned HTTP connection tasks do **not** inherit a thread-local
-  subscriber automatically. An existing default/global subscriber is restored
-  after each synchronous poll/drop scope, not permanently replaced.
-- The fmt filter admits only the explicit span-name inventory in
-  `attribution_subscriber`, and no ordinary events. Existing arbitrary error,
-  SQL, payload and access-log events are not routed to this output. The selected
-  existing fields are `open.id` and `product.reference`; new fields are a
-  process-local monotonic numeric `request_id`, static `MatchedPath` route
-  template (or `unmatched`), numeric status and boolean `response_ready`.
-  No body, cursor/query text, raw URL/reference, auth/forwarding value or fixture
-  path is added. Startup spans have no request parent and must not be attributed
-  to a request.
-- Each private-auth observation branch creates a root `observation.request`
-  span. `observation.authorization` uses synchronous `Span::in_scope` around
-  the existing peer/forwarding check, with no async borrow of `Request<Body>`.
-  The root request still instruments the async handler future.
-  The request span closes on response, error response or future drop; readiness
-  remains false if no response was produced. False means unfinished, not proof
-  of cancellation rather than panic. IDs are process-local, not cross-run IDs.
-- New admission children cover ordinary resolution, aggregate lookup and
-  `require_member`, including that method's ordinary resolution/aggregate reads.
-  DB children cover each existing aggregate's product query, topology query,
-  member SQL-plus-decode read, handoff read and source read. Repeated member and
-  edge children reflect the existing finite topology loops; no IDs or payloads
-  are attached. No extra SQL, cache, query reorder or new endpoint is introduced.
+Only these fixed events are completion authority:
 
-## Cancellation failure model — locked source audit
+| Target | Event name | Fields |
+|---|---|---|
+| `phoenix::observation::completion` | `observation.stage_complete` | `stage`, `outcome`, `elapsed_us` |
+| `phoenix::observation::completion` | `observation.request_complete` | `stage = observation.request`, explicit numeric `request_id`, `outcome`, `elapsed_us`, optional numeric `status`, `response_ready` |
 
-The missing-root failure has a concrete source-level mechanism. The following
-anchors are in the cached sources for the versions pinned by `Cargo.lock`:
+Each finite stage starts when its guarded future is first polled (authorization
+is synchronous). It captures a monotonic `Instant`, its owning `Dispatch`, and
+its current parent `Span`. The result wrapper awaits the unchanged operation,
+then consumes the guard with the actual returned `Result`: `success` for `Ok`,
+`error` for `Err`. The result and its data are returned unchanged; neither error
+text nor return values are logged. An operation returning `Ok(None)` is a
+successful operation even if its enclosing aggregate later rejects absence.
 
-- `tracing-0.1.44/src/instrument.rs`, `WithDispatch<T>` and its `Future::poll`:
-  the default dispatch guard exists only during `poll`; `WithDispatch` has no
-  drop scope. `Instrumented<T>::PinnedDrop` enters its span while destroying its
-  inner future, but does **not** install that span's dispatch as the default.
-  `tracing-0.1.44/src/span.rs`, `Span::do_enter` and `Span::drop`, call the span's
-  stored subscriber directly; entering a span is not a default-dispatch switch.
-  `tracing-core-0.1.36/src/dispatcher.rs`, `Dispatch::try_close`, also delegates
-  directly without installing a default dispatch.
-- `tracing-subscriber-0.3.23/src/registry/sharded.rs`, `Registry::new_span` and
-  `DataInner::clear`: each child retains a parent reference; clearing the child
-  releases that reference through `dispatcher::get_default(Dispatch::clone)`
-  and `subscriber.try_close(parent)`, not through the child's stored dispatch.
-  Thus a pending request dropped outside its polling dispatch can emit the
-  child's close through its stored subscriber yet release the parent through
-  an absent or unrelated default. The observation registry's parent reference
-  is not decremented, so dropping the request's own span cannot close the root.
-  Adding a root clone does not repair the missed decrement.
-- `tracing-subscriber-0.3.23/src/fmt/fmt_layer.rs`, `with_event_from_span!` and
-  `Layer::on_close`, construct the close event with an **explicit** parent ID.
-  `src/fmt/format/json.rs`, `Format<Json, N>::format_event`, selects `event.parent()`
-  before falling back to `lookup_current()` for JSON `span`. Therefore the
-  `request_record` predicate on `span.name` is retained: an entered child alone
-  does not relabel an emitted root close as a child close. `SerializableContext`
-  does use the current span for the JSON `spans` ancestry; the existing child
-  association assertions remain necessary and unchanged.
-- `tokio-1.52.3/src/runtime/task/harness.rs`, `cancel_task`, calls
-  `core.drop_future_or_output()` before storing the cancellation result. Awaiting
-  the cancelled `JoinHandle` is already the destruction boundary. No extra sleep,
-  scheduling yield, timeout increase, deferred-drop claim or after-await polling
-  is justified by this failure.
+A guard dropped without a returned result emits exactly one `cancel` event.
+**Cancel means the await/request was dropped, not that SQLx/SQLite worker work
+ended.** It also does not distinguish cancellation from panic unwinding. An
+unpolled future has not started a stage and owes no completion. Process abort,
+SIGKILL, writer failure or a panicking subscriber cannot guarantee delivery.
 
-`AttributionRequest::Drop` now takes and destroys the entire inner request future
-under its owning dispatch, so every descendant/parent release in that synchronous
-unwind sees the correct registry. Polling uses the same dispatch. Neither auth
-logic, the root/child span schema, filters nor JSON formatting changes.
+The observation auth root owns an explicit process-local numeric request ID,
+not one recovered from formatting or inferred from a raw route/reference. Its
+terminal event is emitted under its captured owner dispatch **before returning
+the Response** from auth or during cancellation destruction. HTTP 4xx/5xx
+response readiness is an `error`; other returned statuses are `success`.
+Canceled roots have `response_ready = false` and no status. IDs are not
+cross-run identifiers. The root span retains the same ID for ancestry.
 
-The existing abort/await cancellation test now loops over explicitly absent and
-unrelated outer dispatches. A test-only `AmbientRequest` installs that outer
-(not expected/private) dispatch during both polling and abort destruction, then
-emits a sentinel after dropping the actual router future. Using only
-`WithDispatch` around this task would not exercise foreign-dispatch destruction,
-because its scope ends after each poll. Immediately after `abort` and awaiting
-the cancelled handle, assertions require exactly one private root with
-`response_ready = false`, absent status, an associated DB child, no private
-sentinel leak, and a sentinel only in the unrelated outer subscriber. There are
-no added sleeps, yields or after-await polls. The private startup middleware must
-still supply its own nested dispatch during destruction; the harness cannot
-supply it.
+Stage events correlate via their captured parent and JSON `spans` ancestry to
+that root ID; DB APIs do not accept a new context argument. IDE guards live in
+`observation_startup`; the private DB read guard lives only in the existing
+`product_conversation_read` module. Both accept finite enums, not arbitrary
+stage names or payload fields. They do not implement a subscriber, forward
+callbacks, discover ancestors, use task-local/global routing, instrument spawned
+SQL workers, or introduce a cross-crate tracing engine. Ordinary async calls
+retain root ancestry through the existing `Instrument` wrappers.
 
-A separate authored regression polls the actual middleware request once to
-`Pending` with a no-op waker, then drops it synchronously under each of an
-explicitly absent and an unrelated dispatch. It likewise requires immediate
-root/child closure and a post-drop sentinel only in the unrelated subscriber.
-Every request close lookup/count now includes the full captured records in its
-failure message, including the actual-router root count; a recurring hosted
-failure will retain the evidence absent from the prior plain `unwrap` panic.
-These Rust changes are source-reviewed only; the hosted failure's exact captured
-record set is unknown and the new fix is not runtime-verified.
+The private subscriber admits only the fixed target/event-name pair and the
+explicit diagnostic span-name inventory. Other ordinary events (including SQL,
+errors and access logs) are excluded. Existing `open.id` and `product.reference`
+remain on existing **diagnostic spans**, not new event fields. JSON span context
+can therefore still contain those selected diagnostic identifiers. New events
+add no raw URI/reference, query/cursor, body, header, auth/forwarding value,
+fixture path or error payload. Root span route metadata is a static MatchedPath
+template, or `unmatched`.
 
-## Reading durations without double counting
+`FmtSpan::CLOSE`, timestamps, `time.busy`, and `time.idle` remain **lifetime
+DIAGNOSTICS ONLY**. They are not completion, cancellation, readiness or elapsed
+wall-time authority. A retained child/parent reference can delay or prevent a
+CLOSE record without withholding an explicit terminal event. No completion
+depends on `on_close`, registry parent release, or parsing a close timestamp.
 
-`close` records have a timestamp, `time.busy` and `time.idle`, with JSON span
-context linking children to their request. Busy is time entered/polled, **not CPU
-usage**; idle includes waiting between polls. Busy + idle is the span's inclusive
-wall lifetime (including small construction/drop overhead). Awaited SQL/pool
-wait is not lost by measuring only synchronous execution. Never hold an entered
-span guard across `await`; the added futures use `Instrument` instead.
+## Private dispatch lifetime
 
-`observation.request` starts in private auth middleware and ends once `Next::run`
-has returned the response, including Axum's `Json::into_response` body
-serialization on these ordinary handlers. It excludes routing/outer middleware
-before that point, compression (the compression layer is outside this scope),
-network/socket delivery and response body drain. It is **response-ready latency,
-not client completion**. The unmodified HTTP `TraceLayer` span can outlive body
-drain and is deliberately excluded from the private fmt inventory.
+The ordinary observation entrypoint bypasses normal live logging. It constructs
+a scoped JSON fmt subscriber writing to stderr, without global initialization,
+OTLP, collector configuration, dependencies or live logging changes.
+`WithSubscriber` scopes startup/shutdown polls. The existing private,
+non-generic `AttributionRequest` wrapper is retained: it owns one pinned boxed
+`Next::run` response future and restores the private dispatch for **both polls
+and destruction**, then restores any absent or foreign ambient dispatcher.
+Each completion guard additionally owns its dispatch and installs it while
+emitting, with an explicit captured parent entered synchronously for JSON
+ancestry. No entered span or dispatcher guard crosses an await.
 
-Reuse `product_conversation.detail_get` and
-`product_conversation.post_snapshot_projection`; there is no new parallel
-handler/projection total. The audited 2702 source has no separate snapshot-view
-metadata/enrichment timing spans: that work remains within the existing
-post-snapshot projection parent, not separately measured. The existing snapshot
-pool-wait, begin, resolve, aggregate, Close, message-page and rollback spans are
-reused exactly. `snapshot_read` includes latest-opening work without a separate
-child. Do not label all residual snapshot/projection time as SQL.
+No DB runtime API, query, fetch, bind, call order, topology loop, limit,
+transaction boundary, rollback policy, response data, route or GET changes.
+Shared DB/API guards and existing spans can be observed by an independently
+enabled subscriber in a future live build; only the new private subscriber's
+installation/output is observation-startup-specific. This is not a production
+logging deployment or a request-context propagation promise for spawned tasks.
 
-These are nested inclusive spans: admission includes member authorization, whose
-aggregate includes member/handoff reads. Snapshot aggregate has analogous
-children. **Do not sum parents and descendants**, or sum all busy/idle values as
-an aggregate request attribution. Compare request response-ready wall first,
-then sibling subpasses within their parent; retain unattributed residual time.
-Concurrent/overlapping spans are not additive and this packet supplies no naive
-aggregate attribution, percentiles, bottleneck verdict or performance claim.
+## Finite stage inventory and reading durations
 
-The JSON fmt observer writes synchronously to stderr on span close. Formatting
-and writing a child's close record happen inside its still-running parent's
-lifetime; that cost is included in the parent's measured busy/wall time, while
-that child's own close write is largely excluded from its already-captured
-duration. Stderr backpressure can therefore affect parent timings and residuals.
-Observer bookkeeping also has cost. Unattributed residual time is **not pure
-application cost**, nor a precise serialization/enrichment estimate; this packet
-does not subtract or benchmark observer overhead.
+| Region | Completion stages |
+|---|---|
+| Root and peer admission | `observation.request`, `observation.authorization` |
+| Target/reference/member admission | `replay.admission`, `observation.resolve_ordinary`, `observation.get_aggregate`, `observation.require_member`, `observation.member.resolve_ordinary`, `observation.member.get_aggregate` |
+| Existing aggregate subpasses (admission and snapshot) | `observation.db.product`, `.topology`, `.read_member`, `.handoff`, `.source` |
+| Shared ordinary snapshot | `product_conversation.pool_wait`, `.begin_read`, `.resolve`, `.aggregate`, `.close`, `.message_page`, `.snapshot_read`, `.rollback_read` |
+| Handler and projection | `product_conversation.detail_get`, `product_conversation.post_snapshot_projection` |
 
-If executed successfully, the authored actual-router synthetic test would emit
-one `observation_attribution_sample=` JSON record array only after privacy and
-request/child correlation assertions pass. It would contain captured synthetic
-span metadata, not fixture bodies. Such a sample would demonstrate layer shape,
-not fixture latency or performance; none was produced by the failed run.
+`elapsed_us` is monotonic inclusive wall time from guard creation to terminal
+emission preparation (microseconds, integer, saturating at u64 max). It includes
+await/scheduling/pool/SQLite delay and decoding within the wrapped operation,
+not just entered-span/poll time. It is **not CPU time**. `read_member` includes
+its existing SQL-plus-decode helper, not an isolated SQL measurement. Snapshot
+read includes latest-opening work without a separate child. Projection includes
+its existing metadata/enrichment awaits; no unsupported finer split is claimed.
 
-## Static semantic proof and regression evidence
+The request root measures response-ready latency in auth: admission, handler
+work and Axum JSON serialization before the Response returns. It excludes
+routing/outer middleware before auth, outer compression, socket delivery and
+body drain. Client/network completion minus this root is a **network/outer
+residual**, not CPU or a pure network measurement. It also includes unmeasured
+routing, compression, scheduling and observation-boundary differences.
 
-The source guard strips **only** the fourteen exact new future wrappers (ten DB,
-four route) plus the one skip-all member attribute/new trait import, then compares
-Rust token streams of the *entire* owning files with pinned 2702. SQL string
-whitespace remains significant. This proves the same query literals, bindings,
-fetch/helper calls, ordering, branches, limits, snapshot boundaries, rollback and
-response semantics in those files, modulo instrumentation/formatting. Negative
-checks alter a query/helper/wrapper and require rejection. Other handler,
-projection, enrichment, schema, generated type, UI, main/logging and launcher
-sources remain exact. A separate auth guard proves all live auth/source outside
-the observation branch is unchanged and normalizes only the exact token sequence
-of the synchronous admission/root-future instrumentation to the pinned branch.
-Negative cases reject borrowed async admission and changes to the peer, headers
-or denial response; no arbitrary observation-branch replacement is accepted.
-Exact changed-file blobs/diffs and the changed production-function inventory are
-separately pinned in the manifest;
-the original f389/product UI inventory remains unedited.
+Stages are nested and inclusive. Compare admission against detail/snapshot and
+projection first, then compare sibling passes inside a parent. **Never sum a
+parent with descendants** (e.g. aggregate plus its member reads, or snapshot
+plus aggregate). Finite-loop member/handoff events may repeat; count them per
+request and parent, not as duplicate request terminals. Preserve unattributed
+residuals; snapshot/projection residuals are not automatically SQL or CPU.
 
-Auth instrumentation's response construction still calls the same existing
-`next.run(req)` or denial `into_response` once. No response headers/body are
-rewritten. Static proof does not replace the existing shared body-parity and
-real startup/admission tests: those remain authoritative for later hosted
-qualification of the exact integrated source.
+Formatting/writing is synchronous. A child's event/CLOSE formatting and stderr
+backpressure occur inside still-running parents and affect their elapsed time;
+a child's own event formatting is after its elapsed sample. Guard/span creation,
+result wrapping and diagnostic bookkeeping also cost time. Residuals therefore
+include observer overhead; nothing here subtracts it or claims precise
+serialization cost, latency percentiles or a bottleneck verdict.
 
-The Rust cases reuse the exact startup dispatch-layer helper, not
-an expected-subscriber wrapper around the test's `oneshot`. The actual
-`create_router(ApplicationState::Observation(...))` ordinary product-detail GET
-case uses the existing in-memory database/conversation/`for_target` builders and
-production compression layer, without a listener or supplied fixture. It polls
-worker tasks under an explicitly absent dispatch and a different existing
-subscriber; expected output must arrive through the helper's `Next::run`
-transfer. Assertions require the existing `product_conversation.detail_get`,
-`snapshot_read`, projection and snapshot DB subpass close records, plus new DB
-product/topology/member/source children, to associate with the root request ID.
-Snapshot children must retain detail/aggregate ancestry. A sentinel after the
-request checks restoration of the different default subscriber, and the ordinary
-response's product ID is checked after closure-before-body-drain assertions.
-The single-member synthetic case does not exercise a continuation handoff.
+## Failure history (not new qualification)
 
-The synthetic-handler cases also use the startup helper. The existing
-success/error/denial oneshot case now invokes the actual `auth_middleware`
-through an Axum-provided `Next` and asserts that its exact future is `Send`
-before awaiting it; no `Next` constructor or extra task is introduced. This is
-a retained compile oracle; the parent reports that bef36 compiled and this
-success/error/denial case passed in hosted execution. This drop-scope correction
-and its new regression remain **uncompiled and unrun**. The actual
-router's middleware bounds supply an additional compile oracle. Sample emission
-uses the index of the explicitly enumerated absent/existing dispatches, not a
-nonexistent dispatch-inspection method. Cases cover success,
-handler error, authorization denial, awaited time plus deliberately slow JSON
-serialization, cancellation RAII, metadata redaction and closure before body
-drain. A synchronous scope test covers unmatched-route redaction and preservation
-of a preexisting scoped subscriber. New synthetic in-memory test data is created
-only when Rust tests are executed; source guards do not execute these Rust cases
-or open a supplied fixture.
+- Checkpoint `35e6c30f619cc898cff825516997a3b7484d6ace` and sample follow-up
+  `f095d1ad7051c83e4806ab5b66af30336a57c82f` used span CLOSE as authority.
+  Hosted run **39065608814** failed compilation: E0277 from an async admission
+  borrow of `&Request<Body>` making auth non-Send, plus E0599 for nonexistent
+  `Dispatch::is_none`. Failed-run artifacts are diagnostics, not binaries.
+- Per parent report, `bef36e9e4` compiled and its success/error/denial case
+  passed; cancellation failed to find the root close. Those results do not
+  qualify this source or establish cancellation success.
+- `dfcd8b477` retained owner dispatch during request destruction. Its source
+  audit identified that WithDispatch scopes polls, not destruction, while
+  registry child cleanup can release parent references through the ambient
+  default dispatcher. It did not establish that span lifetime is completion.
+- This explicitly authorized contract change makes monotonic guarded events
+  authoritative. No sleep, yield, worker-completion claim or subscriber-forwarding
+  repair is offered. Earlier CLOSE samples, if retained separately, are lifetime
+  diagnostics only, not samples of the event contract. No new runtime sample
+  has been generated or qualified.
 
-Source-only validation rerun for this correction:
+## Static proof and authored regressions
 
-- Python attribution source guard: **7 passed**, including exact token-sequence
-  stripping, negative query/helper/wrapper and synchronous-auth normalization
-  checks, the span-name allowlist, exact request poll/drop scopes, startup helper
-  reuse/source-only test boundary, two-ambient abort/await cancellation and
-  post-drop restoration assertions, retained Send oracle, captured-record
-  diagnostic guards and all eight manifest entries.
-- Prior packet only (not rerun for this correction): existing Python observation
-  mock-launcher/source checks **8 passed**; no real child binary was launched and
-  no supplied fixture was opened.
-- Cached Vitest: **18 passed** across source parity (**4**) and
-  `PersistedObservation` (**14**), using one worker.
-- `rustfmt --check --edition 2021`: **passed** for all five changed Rust files,
-  including the authored tests. `git diff --check`: **passed**.
-- Prior packet only (not rerun): cached ESLint **passed** for
-  `ui/tests/observationSourceParity.test.ts` with zero warnings.
+The Python guard unwraps only the enumerated finite calls and original exact
+instrumentation wrappers, the exact added import/member attribute and the DB
+helper/test block, then compares entire owning-file Rust token streams to 2702.
+The one rustfmt-added trailing comma on the unchanged latest-opening call is
+normalized by its exact full call token sequence, not a general comma eraser.
+SQL string tokens retain byte-for-byte whitespace. Query/helper/wrapper changes
+and changed auth admission/denial/terminal sequences are negative test cases.
+The exact helper code and all other exceptions remain pinned separately by
+whole-file blobs/diffs. Live auth and all source outside the observation auth
+branch remain byte-exact. Main/logging, schemas, generated types and UI code are
+unchanged; only the enumerated source-parity test changes.
 
-Hosted run **39065608814** failed Rust compilation at the f095 checkpoint:
-E0277 (`FromFn` could not accept the non-Send auth future because borrowed
-`&Request<Body>` crossed an async admission wrapper), and E0599
-(`Dispatch::is_none` does not exist). That run supplies **failure diagnostics,
-not a qualified candidate binary**, executed attribution tests, a synthetic
-sample or runtime/performance proof. Any retained f095 failed-run artifact is
-**diagnostic only, not a binary**. The parent's later bef36 results establish
-compilation and the first success/error/denial case only, not cancellation
-success or a qualified runtime sample.
+Authored Rust regressions (all **UNRUN**):
 
-This corrected source remains **UNCOMPILED** and its Rust tests **UNRUN**;
-rustfmt is formatting, not type-checking. Parent review and commit must precede
-any separately and explicitly authorized hosted retry. No local Cargo, codegen,
-build, installation, service/child binary, browser, network GET, fixture query,
-new hosted dispatch or production operation was performed for this correction.
-The existing artifact and service have not been modified. Shared DB helper
-instrument wrappers would also be visible to an independently enabled subscriber
-in a future live build of this branch; the new fmt subscriber itself is strictly
-private-startup-only. This source packet is not a production deployment change.
+- Actual production router + observation application + compression: success,
+  cursor-validation error, missing-reference admission error and forwarding
+  denial, under explicit NONE and foreign defaults. Require one explicit terminal before Response/body handoff, exact
+  stage counts/outcomes, numeric elapsed/status/readiness, request ancestry,
+  snapshot-aggregate ancestry, privacy and ordinary response product identity.
+  The one-member fixture expects no handoff stage; continuation loops are not
+  separately exercised by this synthetic case.
+- A retained-root regression requires the terminal event while the root span
+  is still owned; diagnostic closure is not a precondition. Only completion-event
+  counts, not diagnostic record counts, must remain stable after body drain.
+- Pending request manually polled then synchronously dropped under NONE/foreign:
+  one canceled projection and request, one successful authorization, no status,
+  no ambient leak and post-drop sentinel restoration. The real auth future has
+  a retained compile-time `Send` assertion.
+- Notify/abort/await regression, without sleeps/yields: completion events are
+  available after cancellation destruction. It does not claim worker shutdown.
+- DB-specific result wrapper: unchanged Ok/Err values, one success, one error,
+  one cancel per started pending await under NONE/foreign owner-switching.
+  An unpolled future owes no event. This test does not query SQLite.
+- Fixed event filter rejects unrelated events/target-name impostors and raw
+  unmatched-path data. Assertions do not use root CLOSE as terminal authority.
+
+Source-only validation actually run for this contract change:
+
+- Python: **15 passed** (attribution source guard **7**, existing mocked
+  observation launcher/source checks **8**). No real child or fixture opened.
+- Cached Vitest, one worker: **18 passed** (source parity **4**,
+  `PersistedObservation` **14**); fetch/EventSource are mocked, no browser/server.
+- `rustfmt --check --edition 2021`: **passed**, all six changed Rust files.
+- Cached ESLint: **passed**, the changed UI source guard, zero warnings.
+- `git diff --check`: **passed**.
+
+Rustfmt is syntax/formatting, **not compilation**. All new Rust tests remain
+**UNRUN**. Full Rust/router/runtime qualification remains a parent-owned gate
+requiring separate authorization; no retry or dispatch is implicitly authorized
+by this packet.

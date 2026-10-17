@@ -20,6 +20,7 @@ const attributionPaths = [
   'crates/phoenix-db/src/product_conversation_read.rs',
   'crates/phoenix-ide/src/api/auth.rs',
   'crates/phoenix-ide/src/api/observation.rs',
+  'crates/phoenix-ide/src/api/product_conversations.rs',
   'crates/phoenix-ide/src/observation_startup.rs',
   'crates/phoenix-ide/src/observation_startup/attribution_tests.rs',
   'docs/conversation-observation-attribution.md',

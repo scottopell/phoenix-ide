@@ -449,21 +449,23 @@ fn is_exempt_path(path: &str) -> bool {
     false
 }
 
-pub(crate) fn observation_request_span(req: &Request<Body>) -> tracing::Span {
+pub(crate) fn observation_request_span(req: &Request<Body>) -> (u64, tracing::Span) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
     let route = req
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .map_or("unmatched", axum::extract::MatchedPath::as_str);
-    tracing::info_span!(
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let span = tracing::info_span!(
         parent: None,
         "observation.request",
-        request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        request_id,
         route,
         status = tracing::field::Empty,
         response_ready = false,
-    )
+    );
+    (request_id, span)
 }
 
 /// Axum middleware that enforces password auth when `PHOENIX_PASSWORD` is set.
@@ -475,17 +477,24 @@ pub async fn auth_middleware(
     let state = match &application {
         ApplicationState::Live(state) => state,
         ApplicationState::Observation(application) => {
+            use crate::observation_startup::{RequestCompletion, Stage, StageCompletion};
             use tracing::Instrument;
-            let span = observation_request_span(&req);
+            let (request_id, span) = observation_request_span(&req);
             return async {
-                let admitted = tracing::info_span!("observation.authorization")
-                    .in_scope(|| application.admit_peer(peer_from_extensions(&req), req.headers()));
+                let completion = RequestCompletion::new(request_id);
+                let admitted = tracing::info_span!("observation.authorization").in_scope(|| {
+                    let completion = StageCompletion::new(Stage::Authorization);
+                    let result = application.admit_peer(peer_from_extensions(&req), req.headers());
+                    completion.complete(&result);
+                    result
+                });
                 let response = match admitted {
                     Ok(()) => next.run(req).await,
                     Err(error) => error.into_response(),
                 };
                 tracing::Span::current().record("status", response.status().as_u16());
                 tracing::Span::current().record("response_ready", true);
+                completion.response_ready(response.status());
                 response
             }
             .instrument(span)

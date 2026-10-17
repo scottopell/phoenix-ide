@@ -634,53 +634,59 @@ pub(super) async fn read_product_conversation(
     query: SnapshotQuery,
 ) -> Result<Json<OrdinarySnapshotResponse>, AppError> {
     let open_id = query.open_id;
-    async move {
-        let message_limit = message_limit(query.message_limit)?;
-        let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
-        let segment_ceilings = cursor.as_ref().map(|cursor| {
-            cursor
-                .segment_ceilings
-                .iter()
-                .map(|ceiling| ProductConversationSegmentCeiling {
-                    transcript_row_id: ceiling.transcript_row_id.clone(),
-                    tail_sequence_id: ceiling.tail_sequence_id,
-                    tail_message_id: ceiling.tail_message_id.clone(),
-                })
-                .collect::<Vec<_>>()
-        });
-        let snapshot = db
-            .read_ordinary_product_conversation_snapshot(
-                &reference,
-                cursor.as_ref().map(|cursor| {
-                    (
-                        cursor.before_segment_ordinal,
-                        cursor.before_sequence_id,
-                        cursor.before_message_id.clone(),
-                    )
-                }),
-                segment_ceilings.as_deref(),
-                message_limit + 1,
-            )
-            .await
-            .map_err(db_to_app)?;
-        if let Some(cursor) = &cursor {
-            validate_cursor(&snapshot.aggregate, cursor)?;
-        }
-        Ok(Json(
-            snapshot_view(
-                db,
-                snapshot,
-                cursor,
-                message_limit,
-                query.boundary_representation,
-            )
-            .instrument(tracing::info_span!(
-                target: "phoenix_ide::otel",
-                "product_conversation.post_snapshot_projection"
+    crate::observation_startup::complete_stage(
+        crate::observation_startup::Stage::Detail,
+        async move {
+            let message_limit = message_limit(query.message_limit)?;
+            let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
+            let segment_ceilings = cursor.as_ref().map(|cursor| {
+                cursor
+                    .segment_ceilings
+                    .iter()
+                    .map(|ceiling| ProductConversationSegmentCeiling {
+                        transcript_row_id: ceiling.transcript_row_id.clone(),
+                        tail_sequence_id: ceiling.tail_sequence_id,
+                        tail_message_id: ceiling.tail_message_id.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let snapshot = db
+                .read_ordinary_product_conversation_snapshot(
+                    &reference,
+                    cursor.as_ref().map(|cursor| {
+                        (
+                            cursor.before_segment_ordinal,
+                            cursor.before_sequence_id,
+                            cursor.before_message_id.clone(),
+                        )
+                    }),
+                    segment_ceilings.as_deref(),
+                    message_limit + 1,
+                )
+                .await
+                .map_err(db_to_app)?;
+            if let Some(cursor) = &cursor {
+                validate_cursor(&snapshot.aggregate, cursor)?;
+            }
+            Ok(Json(
+                crate::observation_startup::complete_stage(
+                    crate::observation_startup::Stage::Projection,
+                    snapshot_view(
+                        db,
+                        snapshot,
+                        cursor,
+                        message_limit,
+                        query.boundary_representation,
+                    ),
+                )
+                .instrument(tracing::info_span!(
+                    target: "phoenix_ide::otel",
+                    "product_conversation.post_snapshot_projection"
+                ))
+                .await?,
             ))
-            .await?,
-        ))
-    }
+        },
+    )
     .instrument(tracing::info_span!(
         target: "phoenix_ide::otel",
         "product_conversation.detail_get",

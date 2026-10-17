@@ -23,35 +23,174 @@ where
             .with_writer(writer)
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
             .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
-                metadata.is_span()
+                (metadata.is_event()
+                    && metadata.target() == "phoenix::observation::completion"
                     && matches!(
                         metadata.name(),
-                        "observation.request"
-                            | "observation.authorization"
-                            | "replay.admission"
-                            | "observation.resolve_ordinary"
-                            | "observation.get_aggregate"
-                            | "observation.require_member"
-                            | "observation.member.resolve_ordinary"
-                            | "observation.member.get_aggregate"
-                            | "observation.db.product"
-                            | "observation.db.topology"
-                            | "observation.db.read_member"
-                            | "observation.db.handoff"
-                            | "observation.db.source"
-                            | "product_conversation.detail_get"
-                            | "product_conversation.post_snapshot_projection"
-                            | "product_conversation.pool_wait"
-                            | "product_conversation.begin_read"
-                            | "product_conversation.resolve"
-                            | "product_conversation.aggregate"
-                            | "product_conversation.close"
-                            | "product_conversation.message_page"
-                            | "product_conversation.snapshot_read"
-                            | "product_conversation.rollback_read"
-                    )
+                        "observation.stage_complete" | "observation.request_complete"
+                    ))
+                    || (metadata.is_span()
+                        && matches!(
+                            metadata.name(),
+                            "observation.request"
+                                | "observation.authorization"
+                                | "replay.admission"
+                                | "observation.resolve_ordinary"
+                                | "observation.get_aggregate"
+                                | "observation.require_member"
+                                | "observation.member.resolve_ordinary"
+                                | "observation.member.get_aggregate"
+                                | "observation.db.product"
+                                | "observation.db.topology"
+                                | "observation.db.read_member"
+                                | "observation.db.handoff"
+                                | "observation.db.source"
+                                | "product_conversation.detail_get"
+                                | "product_conversation.post_snapshot_projection"
+                                | "product_conversation.pool_wait"
+                                | "product_conversation.begin_read"
+                                | "product_conversation.resolve"
+                                | "product_conversation.aggregate"
+                                | "product_conversation.close"
+                                | "product_conversation.message_page"
+                                | "product_conversation.snapshot_read"
+                                | "product_conversation.rollback_read"
+                        ))
             })),
     )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Stage {
+    Authorization,
+    Admission,
+    ResolveOrdinary,
+    GetAggregate,
+    RequireMember,
+    MemberResolveOrdinary,
+    MemberGetAggregate,
+    Detail,
+    Projection,
+}
+
+impl Stage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Authorization => "observation.authorization",
+            Self::Admission => "replay.admission",
+            Self::ResolveOrdinary => "observation.resolve_ordinary",
+            Self::GetAggregate => "observation.get_aggregate",
+            Self::RequireMember => "observation.require_member",
+            Self::MemberResolveOrdinary => "observation.member.resolve_ordinary",
+            Self::MemberGetAggregate => "observation.member.get_aggregate",
+            Self::Detail => "product_conversation.detail_get",
+            Self::Projection => "product_conversation.post_snapshot_projection",
+        }
+    }
+}
+
+pub(crate) struct StageCompletion {
+    stage: Stage,
+    started: std::time::Instant,
+    dispatch: tracing::Dispatch,
+    parent: tracing::Span,
+    finished: bool,
+}
+
+impl StageCompletion {
+    pub(crate) fn new(stage: Stage) -> Self {
+        Self {
+            stage,
+            started: std::time::Instant::now(),
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+            parent: tracing::Span::current(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn complete<T, E>(mut self, result: &Result<T, E>) {
+        self.emit(if result.is_ok() { "success" } else { "error" });
+    }
+
+    fn emit(&mut self, outcome: &'static str) {
+        self.finished = true;
+        let elapsed_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            self.parent.in_scope(|| {
+                tracing::event!(name: "observation.stage_complete", target: "phoenix::observation::completion",
+                    parent: &self.parent, tracing::Level::INFO,
+                    stage = self.stage.name(), outcome, elapsed_us);
+            });
+        });
+    }
+}
+
+impl Drop for StageCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("cancel");
+        }
+    }
+}
+
+pub(crate) async fn complete_stage<T, E>(
+    stage: Stage,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let completion = StageCompletion::new(stage);
+    let result = future.await;
+    completion.complete(&result);
+    result
+}
+
+pub(crate) struct RequestCompletion {
+    request_id: u64,
+    started: std::time::Instant,
+    dispatch: tracing::Dispatch,
+    parent: tracing::Span,
+    finished: bool,
+}
+
+impl RequestCompletion {
+    pub(crate) fn new(request_id: u64) -> Self {
+        Self {
+            request_id,
+            started: std::time::Instant::now(),
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+            parent: tracing::Span::current(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn response_ready(mut self, status: axum::http::StatusCode) {
+        let outcome = if status.is_client_error() || status.is_server_error() {
+            "error"
+        } else {
+            "success"
+        };
+        self.emit(outcome, Some(status.as_u16()));
+    }
+
+    fn emit(&mut self, outcome: &'static str, status: Option<u16>) {
+        self.finished = true;
+        let elapsed_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            self.parent.in_scope(|| {
+                tracing::event!(name: "observation.request_complete", target: "phoenix::observation::completion",
+                    parent: &self.parent, tracing::Level::INFO,
+                    stage = "observation.request", request_id = self.request_id,
+                    outcome, elapsed_us, status, response_ready = status.is_some());
+            });
+        });
+    }
+}
+
+impl Drop for RequestCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("cancel", None);
+        }
+    }
 }
 
 struct AttributionRequest {

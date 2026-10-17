@@ -13,6 +13,7 @@ use super::types::{
     ProductConversationTranscriptRowView,
 };
 use crate::db::{Database, DbError};
+use crate::observation_startup::{complete_stage, Stage};
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use serde::Serialize;
 use tracing::Instrument;
@@ -78,82 +79,92 @@ impl ConversationRouteObservations {
         &self,
         reference: &str,
     ) -> Result<phoenix_db::ResolvedProductConversation, DbError> {
-        if matches!(self.scope, RouteScope::Coordinator(_)) {
-            return Err(DbError::ConversationNotFound(reference.to_owned()));
-        }
-        let mut resolved = self
-            .db
-            .resolve_ordinary_product_conversation(reference)
-            .instrument(tracing::info_span!("observation.resolve_ordinary"))
-            .await?;
-        if let RouteScope::Product(target) = &self.scope {
-            if &resolved.product_conversation_id != target {
+        complete_stage(Stage::Admission, async {
+            if matches!(self.scope, RouteScope::Coordinator(_)) {
                 return Err(DbError::ConversationNotFound(reference.to_owned()));
             }
-            if reference == resolved.product_conversation_id.as_str() {
-                resolved.requested_transcript_row_id = self
-                    .db
-                    .get_ordinary_product_conversation(target)
+            let mut resolved = complete_stage(
+                Stage::ResolveOrdinary,
+                self.db.resolve_ordinary_product_conversation(reference),
+            )
+            .instrument(tracing::info_span!("observation.resolve_ordinary"))
+            .await?;
+            if let RouteScope::Product(target) = &self.scope {
+                if &resolved.product_conversation_id != target {
+                    return Err(DbError::ConversationNotFound(reference.to_owned()));
+                }
+                if reference == resolved.product_conversation_id.as_str() {
+                    resolved.requested_transcript_row_id = complete_stage(
+                        Stage::GetAggregate,
+                        self.db.get_ordinary_product_conversation(target),
+                    )
                     .instrument(tracing::info_span!("observation.get_aggregate"))
                     .await?
                     .root
                     .conversation
                     .id;
+                }
+                self.require_member(&resolved.requested_transcript_row_id)
+                    .await?;
             }
-            self.require_member(&resolved.requested_transcript_row_id)
-                .await?;
-        }
-        Ok(resolved)
+            Ok(resolved)
+        })
+        .await
     }
 
     #[tracing::instrument(name = "observation.require_member", skip_all)]
     pub(crate) async fn require_member(&self, id: &str) -> Result<(), DbError> {
-        if let RouteScope::Coordinator(target) = &self.scope {
-            let snapshot = self
-                .db
-                .read_coordinator_product_conversation_snapshot(id, None, None, 1)
-                .await?;
-            if snapshot.aggregate.product_conversation.id() != target {
-                return Err(DbError::ConversationNotFound(id.to_owned()));
-            }
-            return Ok(());
-        }
-        let RouteScope::Product(target) = &self.scope else {
-            return Ok(());
-        };
-        let resolved = self
-            .db
-            .resolve_ordinary_product_conversation(id)
-            .instrument(tracing::info_span!("observation.member.resolve_ordinary"))
-            .await?;
-        if &resolved.product_conversation_id != target {
-            return Err(DbError::ConversationNotFound(id.to_owned()));
-        }
-        let aggregate = self
-            .db
-            .get_ordinary_product_conversation(target)
-            .instrument(tracing::info_span!("observation.member.get_aggregate"))
-            .await?;
-        let mut next = Some(aggregate.root.conversation.id.as_str());
-        for _ in 0..aggregate.segments.len() {
-            let Some(member) = next.and_then(|next| {
-                aggregate
-                    .segments
-                    .iter()
-                    .find(|segment| segment.transcript_row.conversation.id == next)
-            }) else {
-                break;
-            };
-            if member.transcript_row.conversation.id == id {
+        complete_stage(Stage::RequireMember, async {
+            if let RouteScope::Coordinator(target) = &self.scope {
+                let snapshot = self
+                    .db
+                    .read_coordinator_product_conversation_snapshot(id, None, None, 1)
+                    .await?;
+                if snapshot.aggregate.product_conversation.id() != target {
+                    return Err(DbError::ConversationNotFound(id.to_owned()));
+                }
                 return Ok(());
             }
-            next = member
-                .transcript_row
-                .conversation
-                .continued_in_conv_id
-                .as_deref();
-        }
-        Err(DbError::ConversationNotFound(id.to_owned()))
+            let RouteScope::Product(target) = &self.scope else {
+                return Ok(());
+            };
+            let resolved = complete_stage(
+                Stage::MemberResolveOrdinary,
+                self.db.resolve_ordinary_product_conversation(id),
+            )
+            .instrument(tracing::info_span!("observation.member.resolve_ordinary"))
+            .await?;
+            if &resolved.product_conversation_id != target {
+                return Err(DbError::ConversationNotFound(id.to_owned()));
+            }
+            let aggregate = complete_stage(
+                Stage::MemberGetAggregate,
+                self.db.get_ordinary_product_conversation(target),
+            )
+            .instrument(tracing::info_span!("observation.member.get_aggregate"))
+            .await?;
+            let mut next = Some(aggregate.root.conversation.id.as_str());
+            for _ in 0..aggregate.segments.len() {
+                let Some(member) = next.and_then(|next| {
+                    aggregate
+                        .segments
+                        .iter()
+                        .find(|segment| segment.transcript_row.conversation.id == next)
+                }) else {
+                    break;
+                };
+                if member.transcript_row.conversation.id == id {
+                    return Ok(());
+                }
+                next = member
+                    .transcript_row
+                    .conversation
+                    .continued_in_conv_id
+                    .as_deref();
+            }
+            Err(DbError::ConversationNotFound(id.to_owned()))
+        })
+        .await
     }
 
     pub(crate) async fn target(&self) -> Result<ObservationTargetResponse, AppError> {

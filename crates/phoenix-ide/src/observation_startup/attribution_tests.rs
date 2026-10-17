@@ -1,19 +1,18 @@
-use super::{attribution_subscriber, with_attribution_dispatch};
+use super::{attribution_subscriber, complete_stage, with_attribution_dispatch, Stage};
 use crate::api::{
     application_state::{ApplicationState, ObservationApplication},
     auth::auth_middleware,
 };
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, State},
     http::{Request, StatusCode},
     middleware::Next,
     routing::get,
-    Json, Router,
+    Router,
 };
-use serde::{Serialize, Serializer};
 use serde_json::Value;
-use std::{io::Write, net::SocketAddr, sync::Arc, sync::Mutex, time::Duration};
+use std::{io::Write, net::SocketAddr, sync::Arc, sync::Mutex};
 use tower::ServiceExt;
 use tracing::{instrument::WithSubscriber, Instrument};
 
@@ -46,21 +45,73 @@ impl Capture {
     }
 }
 
-async fn application() -> crate::api::application_state::ApplicationState {
-    let db = crate::db::Database::open_in_memory().await.unwrap();
-    let target = db
-        .create_conversation("target", "target-slug", "/fixture", true, None, None)
-        .await
-        .unwrap();
-    ObservationApplication::for_target(db, &target.id)
-        .await
-        .map(crate::api::application_state::ApplicationState::Observation)
-        .unwrap()
+fn completions(records: &[Value]) -> Vec<&Value> {
+    records
+        .iter()
+        .filter(|record| record["target"] == "phoenix::observation::completion")
+        .collect()
 }
 
-fn request(reference: &str, forwarded: bool) -> Request<Body> {
+fn terminal<'a>(events: &[&'a Value]) -> &'a Value {
+    let roots: Vec<_> = events
+        .iter()
+        .copied()
+        .filter(|event| event["fields"]["stage"] == "observation.request")
+        .collect();
+    assert_eq!(roots.len(), 1, "terminal events: {events:#?}");
+    roots[0]
+}
+
+fn assert_private(records: &[Value]) {
+    let text = serde_json::to_string(records).unwrap();
+    assert!(!text.contains("SECRET"), "private input leaked: {text}");
+    for event in completions(records) {
+        let fields = event["fields"].as_object().unwrap();
+        assert!(fields["elapsed_us"].as_u64().is_some());
+        assert!(matches!(
+            fields["outcome"].as_str(),
+            Some("success" | "error" | "cancel")
+        ));
+        for key in fields.keys() {
+            assert!(
+                [
+                    "stage",
+                    "request_id",
+                    "outcome",
+                    "elapsed_us",
+                    "status",
+                    "response_ready"
+                ]
+                .contains(&key.as_str()),
+                "unexpected event field: {key}"
+            );
+        }
+    }
+}
+
+fn assert_stage(events: &[&Value], stage: &str, count: usize, outcome: &str, request_id: u64) {
+    let stages: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["stage"] == stage)
+        .collect();
+    assert_eq!(stages.len(), count, "{stage}: {events:#?}");
+    for event in stages {
+        assert_eq!(event["fields"]["outcome"], outcome);
+        assert!(
+            event["spans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|span| span["name"] == "observation.request"
+                    && span["request_id"] == request_id),
+            "uncorrelated stage: {event}"
+        );
+    }
+}
+
+fn request(uri: String, forwarded: bool) -> Request<Body> {
     let mut builder = Request::builder()
-        .uri(format!("/attribution/{reference}?before=CURSOR_SECRET"))
+        .uri(uri)
         .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
         .header("authorization", "Bearer AUTH_SECRET");
     if forwarded {
@@ -69,257 +120,246 @@ fn request(reference: &str, forwarded: bool) -> Request<Body> {
     builder.body(Body::from("REQUEST_BODY_SECRET")).unwrap()
 }
 
-struct SlowBody;
-
-impl Serialize for SlowBody {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        std::thread::sleep(Duration::from_millis(20));
-        serializer.serialize_str("RESPONSE_BODY_SECRET")
-    }
-}
-
-async fn handler(Path(reference): Path<String>) -> Result<Json<SlowBody>, StatusCode> {
-    tokio::time::sleep(Duration::from_millis(25))
-        .instrument(tracing::info_span!("observation.db.read_member"))
-        .await;
-    tracing::error!(secret = "EVENT_SECRET", "not attribution metadata");
-    if reference == "ERROR_SECRET" {
-        Err(StatusCode::BAD_REQUEST)
-    } else {
-        Ok(Json(SlowBody))
-    }
-}
-
-fn request_record(record: &Value) -> bool {
-    record["span"]["name"] == "observation.request"
-}
-
-fn seconds(value: &Value) -> f64 {
-    let text = value.as_str().unwrap();
-    for (suffix, scale) in [("ns", 1e-9), ("µs", 1e-6), ("ms", 1e-3), ("s", 1.0)] {
-        if let Some(number) = text.strip_suffix(suffix) {
-            return number.parse::<f64>().unwrap() * scale;
-        }
-    }
-    panic!("unexpected fmt duration: {text}");
-}
-
-fn assert_private(records: &[Value]) {
-    let text = serde_json::to_string(records).unwrap();
-    assert!(!text.contains("SECRET"), "private input leaked: {text}");
-    for record in records {
-        assert!(record["timestamp"].as_str().is_some());
-        assert_eq!(record["fields"]["message"], "close");
-        assert!(record["fields"]["time.busy"].as_str().is_some());
-        assert!(record["fields"]["time.idle"].as_str().is_some());
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn closes_associated_success_error_and_denial_before_body_drain() {
-    fn assert_send<T: Send>(_: &T) {}
-
-    let capture = Capture::default();
-    let dispatch = capture.dispatch();
-    let app = Router::new()
-        .route("/attribution/:reference", get(handler))
-        .layer(axum::middleware::from_fn_with_state(
-            application().await,
-            |state: State<ApplicationState>, req: Request<Body>, next: Next| async move {
-                let future = auth_middleware(state, req, next);
-                assert_send(&future);
-                future.await
-            },
-        ));
-    let app = with_attribution_dispatch(app, dispatch);
-    let mut previous_id = 0;
-    for (reference, forwarded, status) in [
-        ("SUCCESS_SECRET", false, StatusCode::OK),
-        ("ERROR_SECRET", false, StatusCode::BAD_REQUEST),
-        ("DENIED_SECRET", true, StatusCode::FORBIDDEN),
-    ] {
-        let response = tokio::spawn(app.clone().oneshot(request(reference, forwarded)))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(response.status(), status);
-        let records = capture.records();
-        assert_private(&records);
-        let request = records
-            .iter()
-            .filter(|record| request_record(record))
-            .next_back()
-            .unwrap_or_else(|| {
-                panic!("missing request close record; captured records: {records:#?}")
-            });
-        let id = request["span"]["request_id"].as_u64().unwrap();
-        assert!(id > previous_id);
-        previous_id = id;
-        assert_eq!(request["span"]["route"], "/attribution/:reference");
-        assert_eq!(request["span"]["status"], status.as_u16());
-        assert_eq!(request["span"]["response_ready"], true);
-        if status == StatusCode::OK {
-            let wall =
-                seconds(&request["fields"]["time.busy"]) + seconds(&request["fields"]["time.idle"]);
-            assert!(
-                wall >= 0.040,
-                "await and serialization must be included: {wall}"
-            );
-        }
-        assert!(records.iter().any(|record| {
-            record["span"]["name"] == "observation.authorization"
-                && record["spans"]
-                    .as_array()
-                    .is_some_and(|spans| spans.iter().any(|span| span["request_id"] == id))
-        }));
-        let count = records.len();
-        let _ = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        assert_eq!(capture.records().len(), count);
-    }
+async fn application() -> (ApplicationState, String) {
+    let db = crate::db::Database::open_in_memory().await.unwrap();
+    let target = db
+        .create_conversation("target", "target-slug", "/fixture", true, None, None)
+        .await
+        .unwrap();
+    let product_id = target.product_conversation_id.to_string();
+    let application = ObservationApplication::for_target(db, &target.id)
+        .await
+        .unwrap();
+    (ApplicationState::Observation(application), product_id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
-async fn cancellation_closes_request_and_child_without_claiming_response_ready() {
-    struct AmbientRequest {
-        future: Option<
-            std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>>,
-        >,
-        dispatch: tracing::Dispatch,
-    }
-
-    impl std::future::Future for AmbientRequest {
-        type Output = axum::response::Response;
-
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            let this = self.get_mut();
-            tracing::dispatcher::with_default(&this.dispatch, || {
-                this.future.as_mut().unwrap().as_mut().poll(cx)
-            })
-        }
-    }
-
-    impl Drop for AmbientRequest {
-        fn drop(&mut self) {
-            tracing::dispatcher::with_default(&self.dispatch, || {
-                drop(self.future.take());
-                drop(tracing::info_span!("observation.authorization"));
-            });
-        }
-    }
-
-    let application = application().await;
+async fn actual_router_completes_success_error_and_denial_before_response_handoff() {
+    let (application, product_id) = application().await;
     let existing = Capture::default();
-    for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
-        .into_iter()
-        .enumerate()
-    {
+    for outer in [tracing::Dispatch::none(), existing.dispatch()] {
+        for (suffix, forwarded, status) in [
+            ("", false, StatusCode::OK),
+            ("?before=CURSOR_SECRET", false, StatusCode::BAD_REQUEST),
+            ("", true, StatusCode::FORBIDDEN),
+        ] {
+            let capture = Capture::default();
+            let app = with_attribution_dispatch(
+                crate::api::create_router(application.clone()).layer(
+                    tower_http::compression::CompressionLayer::new()
+                        .gzip(true)
+                        .br(true),
+                ),
+                capture.dispatch(),
+            );
+            let response = app
+                .oneshot(request(
+                    format!("/api/product-conversations/{product_id}{suffix}"),
+                    forwarded,
+                ))
+                .with_subscriber(outer.clone())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let records = capture.records();
+            assert_private(&records);
+            let events = completions(&records);
+            let root = terminal(&events);
+            let id = root["fields"]["request_id"].as_u64().unwrap();
+            assert_eq!(root["fields"]["status"], status.as_u16());
+            assert_eq!(root["fields"]["response_ready"], true);
+            assert_eq!(
+                root["fields"]["outcome"],
+                if status == StatusCode::OK {
+                    "success"
+                } else {
+                    "error"
+                }
+            );
+            assert_eq!(
+                events.last().copied(),
+                Some(root),
+                "request terminal must follow stage completion"
+            );
+            assert_stage(
+                &events,
+                "observation.authorization",
+                1,
+                if forwarded { "error" } else { "success" },
+                id,
+            );
+            if forwarded {
+                assert_eq!(events.len(), 2);
+            } else {
+                for stage in [
+                    "replay.admission",
+                    "observation.resolve_ordinary",
+                    "observation.get_aggregate",
+                    "observation.require_member",
+                    "observation.member.resolve_ordinary",
+                    "observation.member.get_aggregate",
+                ] {
+                    assert_stage(&events, stage, 1, "success", id);
+                }
+                assert_stage(
+                    &events,
+                    "product_conversation.detail_get",
+                    1,
+                    if status == StatusCode::OK {
+                        "success"
+                    } else {
+                        "error"
+                    },
+                    id,
+                );
+                for stage in [
+                    "product_conversation.pool_wait",
+                    "product_conversation.begin_read",
+                    "product_conversation.resolve",
+                    "product_conversation.aggregate",
+                    "product_conversation.close",
+                    "product_conversation.message_page",
+                    "product_conversation.snapshot_read",
+                    "product_conversation.rollback_read",
+                    "product_conversation.post_snapshot_projection",
+                ] {
+                    assert_stage(
+                        &events,
+                        stage,
+                        usize::from(status == StatusCode::OK),
+                        "success",
+                        id,
+                    );
+                }
+                for stage in ["product", "topology", "read_member", "source"] {
+                    assert_stage(
+                        &events,
+                        &format!("observation.db.{stage}"),
+                        if status == StatusCode::OK { 3 } else { 2 },
+                        "success",
+                        id,
+                    );
+                }
+                assert_stage(&events, "observation.db.handoff", 0, "success", id);
+                assert_eq!(events.len(), if status == StatusCode::OK { 30 } else { 17 });
+                if status == StatusCode::OK {
+                    for stage in ["product", "topology", "read_member", "source"] {
+                        assert!(events.iter().any(|event| event["fields"]["stage"]
+                            == format!("observation.db.{stage}")
+                            && event["spans"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|span| span["name"] == "product_conversation.aggregate")));
+                    }
+                }
+            }
+            let count = events.len();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            if status == StatusCode::OK {
+                let detail: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(detail["product_conversation_id"], product_id);
+            }
+            assert_eq!(
+                completions(&capture.records()).len(),
+                count,
+                "terminal must precede body drain"
+            );
+        }
+    }
+    assert!(
+        existing.records().is_empty(),
+        "completion escaped private dispatcher"
+    );
+}
+
+#[tokio::test]
+async fn actual_router_admission_error_completes_only_started_stages() {
+    let (application, _) = application().await;
+    let existing = Capture::default();
+    for outer in [tracing::Dispatch::none(), existing.dispatch()] {
         let capture = Capture::default();
-        let started = Arc::new(tokio::sync::Notify::new());
-        let notify = started.clone();
+        let app = with_attribution_dispatch(
+            crate::api::create_router(application.clone()),
+            capture.dispatch(),
+        );
+        let response = app
+            .oneshot(request(
+                "/api/product-conversations/UNKNOWN_SECRET".into(),
+                false,
+            ))
+            .with_subscriber(outer)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let records = capture.records();
+        assert_private(&records);
+        let events = completions(&records);
+        let root = terminal(&events);
+        let id = root["fields"]["request_id"].as_u64().unwrap();
+        assert_eq!(root["fields"]["outcome"], "error");
+        assert_eq!(root["fields"]["status"], StatusCode::NOT_FOUND.as_u16());
+        assert_eq!(root["fields"]["response_ready"], true);
+        assert_stage(&events, "observation.authorization", 1, "success", id);
+        assert_stage(&events, "observation.resolve_ordinary", 1, "error", id);
+        assert_stage(&events, "replay.admission", 1, "error", id);
+        assert_eq!(events.len(), 4);
+    }
+    assert!(existing.records().is_empty());
+}
+
+#[test]
+fn request_terminal_is_available_with_root_span_still_retained() {
+    let capture = Capture::default();
+    tracing::dispatcher::with_default(&capture.dispatch(), || {
+        let (id, span) =
+            crate::api::auth::observation_request_span(&request("/UNMATCHED_SECRET".into(), false));
+        span.in_scope(|| super::RequestCompletion::new(id).response_ready(StatusCode::OK));
+        let records = capture.records();
+        let events = completions(&records);
+        assert_eq!(terminal(&events)["fields"]["request_id"], id);
+        assert_eq!(events.len(), 1);
+        assert_private(&records);
+        drop(span);
+    });
+}
+
+#[tokio::test]
+async fn pending_drop_emits_one_cancel_per_started_stage_under_owner_not_ambient() {
+    fn assert_send<T: Send>(_: &T) {}
+    let (application, _) = application().await;
+    let existing = Capture::default();
+    for outer in [tracing::Dispatch::none(), existing.dispatch()] {
+        let capture = Capture::default();
         let app = Router::new()
             .route(
-                "/attribution/:reference",
-                get(move || async move {
-                    async {
-                        notify.notify_one();
-                        std::future::pending::<StatusCode>().await
-                    }
-                    .instrument(tracing::info_span!("observation.db.read_member"))
+                "/attribution",
+                get(|| async {
+                    complete_stage(
+                        Stage::Projection,
+                        std::future::pending::<Result<StatusCode, StatusCode>>(),
+                    )
+                    .instrument(tracing::info_span!(
+                        "product_conversation.post_snapshot_projection"
+                    ))
                     .await
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
                 application.clone(),
-                auth_middleware,
+                |state: State<ApplicationState>, req: Request<Body>, next: Next| async move {
+                    let future = auth_middleware(state, req, next);
+                    assert_send(&future);
+                    future.await
+                },
             ));
         let app = with_attribution_dispatch(app, capture.dispatch());
-        // The harness keeps the outer dispatch installed during abort destruction too.
-        let task = tokio::spawn(AmbientRequest {
-            future: Some(Box::pin(async move {
-                app.oneshot(request("CANCEL_SECRET", false)).await.unwrap()
-            })),
-            dispatch: outer,
-        });
-        tokio::time::timeout(Duration::from_secs(2), started.notified())
-            .await
-            .unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        let records = capture.records();
-        assert_private(&records);
-        let roots: Vec<_> = records
-            .iter()
-            .filter(|record| request_record(record))
-            .collect();
-        assert_eq!(roots.len(), 1, "captured records: {records:#?}");
-        let request = roots[0];
-        assert_eq!(request["span"]["response_ready"], false);
-        assert!(request["span"]["status"].is_null());
-        let id = request["span"]["request_id"].as_u64().unwrap();
-        assert!(
-            records.iter().any(|record| {
-                record["span"]["name"] == "observation.db.read_member"
-                    && record["spans"]
-                        .as_array()
-                        .is_some_and(|spans| spans.iter().any(|span| span["request_id"] == id))
-            }),
-            "missing associated child; captured records: {records:#?}"
-        );
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record["span"]["name"] == "observation.authorization")
-                .count(),
-            1,
-            "post-drop sentinel leaked into private dispatch: {records:#?}"
-        );
-        let outer_records = existing.records();
-        assert_private(&outer_records);
-        assert_eq!(
-            outer_records.len(),
-            index,
-            "outer records: {outer_records:#?}"
-        );
-        if index == 1 {
-            assert_eq!(
-                outer_records[0]["span"]["name"],
-                "observation.authorization"
-            );
-            assert!(outer_records[0]["span"]["request_id"].is_null());
-        }
-    }
-}
-
-#[tokio::test]
-async fn dropping_pending_request_restores_dispatch_and_closes_parent_references() {
-    let application = application().await;
-    let existing = Capture::default();
-    for outer in [tracing::Dispatch::none(), existing.dispatch()] {
-        let capture = Capture::default();
-        let app = with_attribution_dispatch(
-            Router::new()
-                .route(
-                    "/attribution/:reference",
-                    get(|| async {
-                        std::future::pending::<StatusCode>()
-                            .instrument(tracing::info_span!("observation.db.read_member"))
-                            .await
-                    }),
-                )
-                .layer(axum::middleware::from_fn_with_state(
-                    application.clone(),
-                    auth_middleware,
-                )),
-            capture.dispatch(),
-        );
         tracing::dispatcher::with_default(&outer, || {
-            let mut future = Box::pin(app.oneshot(request("DROP_SECRET", false)));
+            let mut future =
+                Box::pin(app.oneshot(request("/attribution?before=CURSOR_SECRET".into(), false)));
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_pending());
             drop(future);
@@ -327,190 +367,122 @@ async fn dropping_pending_request_restores_dispatch_and_closes_parent_references
         });
         let records = capture.records();
         assert_private(&records);
-        let roots: Vec<_> = records
-            .iter()
-            .filter(|record| request_record(record))
-            .collect();
-        assert_eq!(roots.len(), 1, "captured records: {records:#?}");
-        let root = roots[0];
-        assert_eq!(root["span"]["response_ready"], false);
-        assert!(root["span"]["status"].is_null());
-        let id = root["span"]["request_id"].as_u64().unwrap();
-        assert!(
-            records.iter().any(|record| {
-                record["span"]["name"] == "observation.db.read_member"
-                    && record["spans"]
-                        .as_array()
-                        .is_some_and(|spans| spans.iter().any(|span| span["request_id"] == id))
-            }),
-            "missing associated child; captured records: {records:#?}"
-        );
-    }
-    let records = existing.records();
-    assert_private(&records);
-    assert_eq!(records.len(), 1, "captured records: {records:#?}");
-    assert_eq!(records[0]["span"]["name"], "observation.authorization");
-    assert!(records[0]["span"]["request_id"].is_null());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::too_many_lines)]
-async fn startup_dispatch_captures_actual_product_detail_without_inheriting_default() {
-    let db = crate::db::Database::open_in_memory().await.unwrap();
-    let target = db
-        .create_conversation("target", "target-slug", "/fixture", true, None, None)
-        .await
-        .unwrap();
-    let application = ObservationApplication::for_target(db, &target.id)
-        .await
-        .unwrap();
-    let existing = Capture::default();
-    for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
-        .into_iter()
-        .enumerate()
-    {
-        let emit_sample = index == 0;
-        let capture = Capture::default();
-        let app = with_attribution_dispatch(
-            crate::api::create_router(
-                crate::api::application_state::ApplicationState::Observation(application.clone()),
-            )
-            .layer(
-                tower_http::compression::CompressionLayer::new()
-                    .gzip(true)
-                    .br(true),
-            ),
-            capture.dispatch(),
-        );
-        let request = Request::builder()
-            .uri(format!(
-                "/api/product-conversations/{}",
-                target.product_conversation_id
-            ))
-            .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
-            .header("authorization", "Bearer AUTH_SECRET")
-            .body(Body::empty())
-            .unwrap();
-        let response = tokio::spawn(
-            async move {
-                let response = app.oneshot(request).await.unwrap();
-                drop(tracing::info_span!("observation.authorization"));
-                response
-            }
-            .with_subscriber(outer),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let records = capture.records();
-        assert_private(&records);
-        let roots: Vec<_> = records
-            .iter()
-            .filter(|record| request_record(record))
-            .collect();
-        assert_eq!(roots.len(), 1, "captured records: {records:#?}");
-        let request = roots[0];
-        let id = request["span"]["request_id"].as_u64().unwrap();
-        assert_eq!(
-            request["span"]["route"],
-            "/api/product-conversations/:reference"
-        );
-        assert_eq!(request["span"]["status"], StatusCode::OK.as_u16());
-        assert_eq!(request["span"]["response_ready"], true);
-        for name in [
-            "observation.authorization",
-            "product_conversation.detail_get",
+        let events = completions(&records);
+        let root = terminal(&events);
+        let id = root["fields"]["request_id"].as_u64().unwrap();
+        assert_eq!(root["fields"]["outcome"], "cancel");
+        assert_eq!(root["fields"]["response_ready"], false);
+        assert!(root["fields"]["status"].is_null());
+        assert_stage(&events, "observation.authorization", 1, "success", id);
+        assert_stage(
+            &events,
             "product_conversation.post_snapshot_projection",
-            "product_conversation.pool_wait",
-            "product_conversation.begin_read",
-            "product_conversation.resolve",
-            "product_conversation.aggregate",
-            "product_conversation.close",
-            "product_conversation.message_page",
-            "product_conversation.snapshot_read",
-            "product_conversation.rollback_read",
-            "observation.db.product",
-            "observation.db.topology",
-            "observation.db.read_member",
-            "observation.db.source",
-        ] {
-            let children: Vec<_> = records
-                .iter()
-                .filter(|record| record["span"]["name"] == name)
-                .collect();
-            assert!(!children.is_empty(), "missing close record: {name}");
-            for child in children {
-                assert!(
-                    child["spans"].as_array().unwrap().iter().any(|span| {
-                        span["name"] == "observation.request" && span["request_id"] == id
-                    }),
-                    "unassociated child: {child}"
-                );
-            }
-        }
-        assert!(records.iter().any(|record| {
-            record["span"]["name"] == "product_conversation.snapshot_read"
-                && record["spans"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|span| span["name"] == "product_conversation.detail_get")
-        }));
-        for name in ["product", "topology", "read_member", "source"] {
-            assert!(
-                records.iter().any(|record| {
-                    record["span"]["name"] == format!("observation.db.{name}")
-                        && record["spans"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|span| span["name"] == "product_conversation.aggregate")
-                }),
-                "missing snapshot aggregate child: {name}"
-            );
-        }
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let detail: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            detail["product_conversation_id"],
-            target.product_conversation_id.as_str()
+            1,
+            "cancel",
+            id,
         );
-        assert_eq!(capture.records().len(), records.len());
-        if emit_sample {
-            println!(
-                "observation_attribution_sample={}",
-                serde_json::to_string(&records).unwrap()
-            );
-        }
+        assert_eq!(events.len(), 3);
+        assert_eq!(events.last().copied(), Some(root));
+        assert_eq!(
+            records
+                .iter()
+                .filter(
+                    |record| record["span"]["name"] == "observation.authorization"
+                        && record["fields"]["message"] == "close"
+                )
+                .count(),
+            1,
+            "sentinel leaked into private dispatch"
+        );
     }
     let records = existing.records();
-    assert_private(&records);
     assert_eq!(
         records.len(),
         1,
-        "request spans escaped the startup dispatch"
+        "outer sentinel not restored: {records:#?}"
     );
     assert_eq!(records[0]["span"]["name"], "observation.authorization");
     assert!(records[0]["span"]["request_id"].is_null());
 }
 
-#[test]
-fn scoped_subscriber_does_not_replace_existing_default_or_log_unmatched_path() {
-    let capture = Capture::default();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_is_observed_at_await_drop_not_a_sqlite_worker_completion() {
+    let (application, _) = application().await;
     let existing = Capture::default();
-    tracing::dispatcher::with_default(&existing.dispatch(), || {
-        tracing::dispatcher::with_default(&capture.dispatch(), || {
-            let request = request("UNMATCHED_SECRET", false);
-            drop(crate::api::auth::observation_request_span(&request));
+    for outer in [tracing::Dispatch::none(), existing.dispatch()] {
+        let capture = Capture::default();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let app = Router::new()
+            .route(
+                "/attribution",
+                get(move || {
+                    let notify = notify.clone();
+                    async move {
+                        complete_stage(Stage::Projection, async {
+                            notify.notify_one();
+                            std::future::pending::<Result<StatusCode, StatusCode>>().await
+                        })
+                        .instrument(tracing::info_span!(
+                            "product_conversation.post_snapshot_projection"
+                        ))
+                        .await
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                application.clone(),
+                auth_middleware,
+            ));
+        let app = with_attribution_dispatch(app, capture.dispatch());
+        let task = tokio::spawn(async move {
+            app.oneshot(request("/attribution".into(), false))
+                .with_subscriber(outer)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let records = capture.records();
+        assert_private(&records);
+        let events = completions(&records);
+        let root = terminal(&events);
+        let id = root["fields"]["request_id"].as_u64().unwrap();
+        assert_eq!(root["fields"]["outcome"], "cancel");
+        assert_eq!(root["fields"]["response_ready"], false);
+        assert!(root["fields"]["status"].is_null());
+        assert_stage(
+            &events,
+            "product_conversation.post_snapshot_projection",
+            1,
+            "cancel",
+            id,
+        );
+        assert_eq!(events.len(), 3);
+    }
+    assert!(existing.records().is_empty());
+}
+
+#[test]
+fn private_filter_rejects_unrelated_events_and_unmatched_path_data() {
+    let capture = Capture::default();
+    tracing::dispatcher::with_default(&capture.dispatch(), || {
+        let (_, span) =
+            crate::api::auth::observation_request_span(&request("/UNMATCHED_SECRET".into(), false));
+        span.in_scope(|| {
+            tracing::error!(secret = "EVENT_SECRET", "not attribution metadata");
+            tracing::event!(name: "unreviewed", target: "phoenix::observation::completion", tracing::Level::INFO, secret = "EVENT_SECRET");
             drop(tracing::info_span!("unrelated", secret = "SPAN_SECRET"));
         });
-        drop(tracing::info_span!("observation.authorization"));
     });
     let records = capture.records();
     assert_private(&records);
+    assert!(
+        completions(&records).is_empty(),
+        "diagnostic CLOSE is not a terminal event"
+    );
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["span"]["route"], "unmatched");
-    assert_eq!(existing.records().len(), 1);
 }
