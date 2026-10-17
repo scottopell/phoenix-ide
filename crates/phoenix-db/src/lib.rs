@@ -21371,7 +21371,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let home = tempfile::TempDir::new().unwrap();
         let home_scope = db
-            .initialize_coordinator_work_scope(home.path())
+            .initialize_coordinator_work_scope(home.path().to_str().unwrap())
             .await
             .unwrap();
         let coordinator = db
