@@ -740,21 +740,57 @@ fn await_process_exit(process: ProcessIdentity) {
     });
 }
 
-struct PendingLaunchCleanup {
+struct PendingLaunchCleanup<'a> {
+    cli: &'a BrowserCli,
     release: PathBuf,
+    cancel: PathBuf,
+    ready: PathBuf,
+    opening: Option<std::process::Child>,
     processes: Vec<ProcessIdentity>,
 }
 
-impl Drop for PendingLaunchCleanup {
+fn startup_launch_identity(ready: &Path) -> Option<(ProcessIdentity, ProcessIdentity, PathBuf)> {
+    let contents = std::fs::read_to_string(ready).ok()?;
+    let mut lines = contents.lines();
+    let chrome = current_process_identity(lines.next()?.parse().ok()?)?;
+    let daemon = current_process_identity(lines.next()?.parse().ok()?)?;
+    let profile = PathBuf::from(lines.next()?);
+    Some((chrome, daemon, profile))
+}
+
+impl Drop for PendingLaunchCleanup<'_> {
     fn drop(&mut self) {
+        let _ = std::fs::write(&self.cancel, b"cancel");
+        if self.processes.is_empty() {
+            if let Some((chrome, daemon, _)) = startup_launch_identity(&self.ready) {
+                self.processes.extend([daemon, chrome]);
+            }
+        }
+        if let Some(chrome) = self.processes.get(1).copied() {
+            if let Ok(processes) = initial_launch_processes(chrome) {
+                self.processes.extend(processes);
+            }
+        }
         let _ = std::fs::write(&self.release, b"release");
-        for process in &self.processes {
+        if let Some(opening) = self.opening.as_mut() {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while matches!(opening.try_wait(), Ok(None)) && Instant::now() < deadline {
+                // test-timing-allow: settle the accepted startup call before closing its daemon.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let _ = self.cli.command().arg("close").output();
+        for process in self.processes.iter().rev() {
             if process_identity_matches(*process) {
                 if let Ok(pid) = libc::pid_t::try_from(process.pid) {
                     // SAFETY: only an exact process created by this test is signaled.
-                    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+                    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
                 }
             }
+        }
+        if let Some(mut opening) = self.opening.take() {
+            let _ = opening.kill();
+            let _ = opening.wait();
         }
     }
 }
@@ -2167,69 +2203,72 @@ fn sigterm_during_chrome_startup_cleans_up_the_published_browser() {
     let wrapper = cli.directory.path().join("chrome-launch-barrier.sh");
     let ready = cli.directory.path().join("launch-ready");
     let release = cli.directory.path().join("launch-release");
-    std::fs::write(&wrapper, b"#!/bin/sh\nprintf '%s %s\\n' \"$$\" \"$PPID\" > \"$PHOENIX_BROWSER_TEST_READY\"\nwhile [ ! -e \"$PHOENIX_BROWSER_TEST_RELEASE\" ]; do sleep 0.02; done\nexec \"$PHOENIX_BROWSER_TEST_CHROME\" \"$@\"\n").unwrap();
+    let cancel = cli.directory.path().join("launch-cancel");
+    std::fs::write(&wrapper, b"#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --user-data-dir=*) profile=${arg#--user-data-dir=};; esac; done\nprintf '%s\\n%s\\n%s\\n' \"$$\" \"$PPID\" \"$profile\" > \"$PHOENIX_BROWSER_TEST_READY\"\nwhile [ ! -e \"$PHOENIX_BROWSER_TEST_RELEASE\" ]; do sleep 0.02; done\n[ ! -e \"$PHOENIX_BROWSER_TEST_CANCEL\" ] || exit 92\nexec \"$PHOENIX_BROWSER_TEST_CHROME\" \"$@\"\n").unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut cleanup = PendingLaunchCleanup {
+        cli: &cli,
         release: release.clone(),
+        cancel: cancel.clone(),
+        ready: ready.clone(),
+        opening: None,
         processes: Vec::new(),
     };
-    let mut opening = cli
-        .command()
-        .args(["open", &fixture()])
-        .env("PHOENIX_CHROME_EXECUTABLE", &wrapper)
-        .env("PHOENIX_BROWSER_TEST_READY", &ready)
-        .env("PHOENIX_BROWSER_TEST_RELEASE", &release)
-        .env("PHOENIX_BROWSER_TEST_CHROME", &executable)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let (chrome, daemon) = wait_for_observation("Chrome launch barrier was reached", || {
-        if let Ok(contents) = std::fs::read_to_string(&ready) {
-            let pids: Vec<_> = contents
-                .split_whitespace()
-                .filter_map(|pid| pid.parse::<u32>().ok())
-                .collect();
-            if pids.len() == 2 {
-                return Some((
-                    current_process_identity(pids[0]).unwrap(),
-                    current_process_identity(pids[1]).unwrap(),
-                ));
+    cleanup.opening = Some(
+        cli.command()
+            .args(["open", &fixture()])
+            .env("PHOENIX_CHROME_EXECUTABLE", &wrapper)
+            .env("PHOENIX_BROWSER_TEST_READY", &ready)
+            .env("PHOENIX_BROWSER_TEST_RELEASE", &release)
+            .env("PHOENIX_BROWSER_TEST_CHROME", &executable)
+            .env("PHOENIX_BROWSER_TEST_CANCEL", &cancel)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let (chrome, daemon, profile) =
+        wait_for_observation("Chrome launch barrier was reached", || {
+            if let Some(identity) = startup_launch_identity(&ready) {
+                return Some(identity);
             }
-        }
-        assert!(
-            opening.try_wait().unwrap().is_none(),
-            "CLI exited before launch barrier"
-        );
-        None
-    });
-    cleanup.processes.extend([daemon, chrome]);
-    let profiles: Vec<_> = std::fs::read_dir(cli.directory.path().join("scratch"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.is_dir()
-                && path
-                    .file_name()
+            assert!(
+                cleanup
+                    .opening
+                    .as_mut()
                     .unwrap()
-                    .to_string_lossy()
-                    .starts_with("phoenix-chrome-")
-        })
-        .collect();
-    assert_eq!(profiles.len(), 1);
+                    .try_wait()
+                    .unwrap()
+                    .is_none(),
+                "CLI exited before launch barrier"
+            );
+            None
+        });
+    cleanup.processes.extend([daemon, chrome]);
+    assert!(profile.starts_with(cli.directory.path().join("scratch")));
+    assert!(
+        profile.is_dir(),
+        "actual launch profile missing: {}",
+        profile.display()
+    );
     signal_owned(daemon, libc::SIGTERM);
     std::fs::write(&release, b"release").unwrap();
     wait_for_observation("accepted startup operation completed", || {
-        opening.try_wait().unwrap()
+        cleanup.opening.as_mut().unwrap().try_wait().unwrap()
     });
-    let output = opening.wait_with_output().unwrap();
+    let output = cleanup.opening.take().unwrap().wait_with_output().unwrap();
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     if !output.status.success() {
         assert_eq!(response["error"]["code"], "operation_cancelled");
     }
     await_process_exit(daemon);
     await_process_exit(chrome);
-    assert!(!profiles[0].exists(), "startup profile was orphaned");
+    assert!(
+        !profile.exists(),
+        "startup profile was orphaned: {}",
+        profile.display()
+    );
+    assert!(!cli.socket().exists(), "startup daemon socket was orphaned");
     assert_eq!(cli.ok(&["status"])["result"]["active"], false);
 }
 
