@@ -1,14 +1,19 @@
 # ADR-115: Bound owned-child settlement after Bash launch
 
-- Status: Accepted
-- Date: 2026-10-17
-- Requirements: `specs/bash/requirements.md` REQ-BASH-017
+- **Status:** Accepted
+- **Date:** 2026-10-17
+- **Affects:** `specs/bash/requirements.md` REQ-BASH-017
 
 ## Context
 
 The OS can successfully launch Bash before a birth-identity probe returns no result. On macOS, `proc_pidinfo` can return zero or a short result; a short-lived child can also exit before the probe. Calling this `spawn_failed` loses output and invites duplicate execution. A later numeric-PID observation does not prove the original launch identity.
 
 A launch gate could hold user execution until identity was captured, but would add shell protocol, handshake descriptors and sandbox integration to every command. The existing Tokio Child already owns direct-child wait status, including a cached terminal status. Registry admission must not stay pending forever because an unregistered child or its descendants retain a pipe.
+
+## Options considered
+
+1. **Gate execution on birth-identity capture.** Requires a launch protocol, handshake descriptors and sandbox integration on every command.
+2. **Retain the owned Child for bounded settlement.** Preserves direct-child output and wait status without inventing a process identity or keeping registry admission pending indefinitely.
 
 ## Decision
 

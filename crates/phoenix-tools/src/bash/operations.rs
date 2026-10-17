@@ -2371,7 +2371,9 @@ mod tests {
             )
             .await
         });
-        launched.notified().await;
+        tokio::time::timeout(Duration::from_secs(3), launched.notified())
+            .await
+            .expect("launch did not reach the registration barrier");
         caller.abort();
         let _ = caller.await;
         drop(held_lock.lock().unwrap().take());
@@ -2604,7 +2606,7 @@ mod tests {
         let ctx = test_context(&scope("identity-delayed"));
         let dir = tempfile::tempdir().unwrap();
         let child = injected_unregistered_child(&ctx, dir.path(), "printf tail; exit 7", |_| {
-            // Models a descheduled launch thread; no second identity observation.
+            // test-timing-allow: inject launch-thread descheduling before the missing identity observation to exercise owned-child wait status retention
             std::thread::sleep(Duration::from_millis(100));
             None
         });
