@@ -8,6 +8,7 @@ import dataclasses
 import datetime as dt
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import pwd
@@ -285,7 +286,11 @@ def validate_health_url(value: Optional[str], description: str) -> None:
     if value is None:
         return
     parsed = urllib.parse.urlparse(value)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
+    try:
+        loopback = parsed.hostname == "localhost" or ipaddress.ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        loopback = False
+    if parsed.scheme not in {"http", "https"} or not loopback:
         raise ValidationError(f"{description} must be a loopback HTTP endpoint")
     if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path != "/api/version":
         raise ValidationError(f"{description} must be a credential-free /api/version endpoint")
@@ -1544,12 +1549,144 @@ def installed_environment(path: Path) -> dict[str, str]:
     return environment
 
 
-def installed_health_url(environment: dict[str, str]) -> str:
-    tls = environment.get("PHOENIX_TLS", "").strip().lower() in {"1", "true", "on", "auto", "manual"}
-    tls = tls or bool(environment.get("PHOENIX_TLS_CERT_PATH") and environment.get("PHOENIX_TLS_KEY_PATH"))
-    scheme = "https" if tls else "http"
-    port = environment.get("PHOENIX_PORT", "8031")
-    return f"{scheme}://localhost:{port}/api/version"
+@dataclasses.dataclass(frozen=True)
+class InstalledHttp:
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class InstalledAutoTls:
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class InstalledManualTls:
+    cert_path: Path
+    key_path: Path
+
+
+InstalledTls = InstalledHttp | InstalledAutoTls | InstalledManualTls
+
+
+def installed_tls(environment: dict[str, str]) -> InstalledTls:
+    cert = environment.get("PHOENIX_TLS_CERT_PATH")
+    key = environment.get("PHOENIX_TLS_KEY_PATH")
+    if cert is not None and key is not None:
+        return InstalledManualTls(Path(cert), Path(key))
+    if cert is not None or key is not None:
+        raise ValidationError("installed TLS requires both certificate and key paths")
+    mode = environment.get("PHOENIX_TLS", "").strip().lower()
+    if mode in {"", "0", "false", "off", "none"}:
+        return InstalledHttp()
+    if mode in {"1", "true", "on", "auto"}:
+        return InstalledAutoTls()
+    raise ValidationError("installed TLS mode is unsupported or lacks manual paths")
+
+
+def validate_installed_tls(tls: InstalledTls, service_user: str) -> None:
+    if isinstance(tls, InstalledManualTls):
+        try:
+            account = pwd.getpwnam(service_user)
+            groups = set(os.getgrouplist(account.pw_name, account.pw_gid)) | {account.pw_gid}
+        except (KeyError, OSError) as exc:
+            raise ValidationError("installed TLS service user identity cannot be resolved") from exc
+
+        def permitted(metadata: os.stat_result, owner_bit: int) -> bool:
+            if account.pw_uid == 0:
+                return True
+            if metadata.st_uid == account.pw_uid:
+                bit = owner_bit
+            elif metadata.st_gid in groups:
+                bit = owner_bit >> 3
+            else:
+                bit = owner_bit >> 6
+            return bool(metadata.st_mode & bit)
+
+        for path in (tls.cert_path, tls.key_path):
+            if ".." in path.parts:
+                raise ValidationError("installed TLS paths must not contain parent traversal")
+            try:
+                if not path.is_absolute():
+                    raise ValidationError("installed TLS paths must be absolute regular non-symlink files")
+                for parent in reversed(path.parents):
+                    metadata = parent.lstat()
+                    if not stat.S_ISDIR(metadata.st_mode):
+                        raise ValidationError("installed TLS paths require non-symlink directory ancestors")
+                    if not permitted(metadata, stat.S_IXUSR):
+                        raise ValidationError("installed TLS paths are not traversable by service user")
+                metadata = path.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValidationError("installed TLS paths must be absolute regular non-symlink files")
+                if not permitted(metadata, stat.S_IRUSR):
+                    raise ValidationError("installed TLS paths are not readable by service user")
+            except OSError as exc:
+                raise ValidationError("installed TLS paths cannot be inspected safely") from exc
+
+
+def installed_socket_listener(path: Path) -> tuple[str, int]:
+    section = None
+    sections: set[str] = set()
+    listeners = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line in {"[Unit]", "[Socket]", "[Install]"}:
+            if line in sections:
+                raise ValidationError("installed socket has repeated sections")
+            sections.add(line)
+            section = line
+            continue
+        key, sep, value = line.partition("=")
+        if (section is None or not sep or re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", key.strip()) is None
+                or line.endswith("\\")):
+            raise ValidationError("unsupported installed socket syntax")
+        key, value = key.strip(), value.strip()
+        if section == "[Socket]" and key not in {"ListenStream", "NoDelay", "Backlog", "BindIPv6Only"}:
+            raise ValidationError("unsupported installed socket customization")
+        if key.startswith("Listen"):
+            if section != "[Socket]" or key != "ListenStream":
+                raise ValidationError("installed socket requires one TCP ListenStream only")
+            listeners.append(value)
+    if len(listeners) != 1:
+        raise ValidationError("installed socket requires one TCP ListenStream only")
+    listener = listeners[0]
+    host = "::"  # systemd interprets a bare port as an IPv6 listener.
+    if re.fullmatch(r"[0-9]{1,5}", listener):
+        port_text = listener
+    else:
+        match = re.fullmatch(r"(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})", listener)
+        if match is None:
+            raise ValidationError("unsupported installed socket listener")
+        host = match[1] or match[2]
+        port_text = match[3]
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValidationError("unsupported installed socket address") from exc
+        if (address.version == 6) != (match[1] is not None):
+            raise ValidationError("unsupported installed socket address syntax")
+        if not address.is_unspecified and not address.is_loopback:
+            raise ValidationError("installed socket address must be wildcard or loopback")
+        host = str(address)
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValidationError("installed socket has invalid port")
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    return host, port
+
+
+def installed_health_url(environment: dict[str, str], socket: Path, service_user: str) -> str:
+    tls = installed_tls(environment)
+    validate_installed_tls(tls, service_user)
+    host, port = installed_socket_listener(socket)
+    configured_port = environment.get("PHOENIX_PORT")
+    if configured_port is not None and (re.fullmatch(r"[0-9]{1,5}", configured_port) is None
+                                        or int(configured_port) != port):
+        raise ValidationError("installed PHOENIX_PORT must match socket listener port")
+    scheme = "http" if isinstance(tls, InstalledHttp) else "https"
+    authority = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{authority}:{port}/api/version"
 
 
 def capture_rollback(transaction: Path, policy: ValidationPolicy, manifest_path: Path) -> None:
@@ -1582,8 +1719,22 @@ def capture_rollback(transaction: Path, policy: ValidationPolicy, manifest_path:
         manifest_raw["previous"] = dataclasses.asdict(previous)
         rollback_environment = rollback["environment"]
         environment_path = rollback_environment["path"]
+        environment = {}
+        for raw in Path(rollback["service"]["path"]).read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("Environment="):
+                for assignment in shlex.split(line.partition("=")[2]):
+                    key, sep, value = assignment.partition("=")
+                    if not sep:
+                        raise ValidationError("invalid installed service environment")
+                    environment[key] = value
+        if environment_path is not None:
+            environment.update(installed_environment(Path(environment_path)))
+        previous_user = service_user_from_unit(Path(rollback["service"]["path"]))
+        if manifest_raw.get("mode", "ordinary") == PROTECTED_MODE:
+            manifest_raw["service_user"] = previous_user
         manifest_raw["previous_health_url"] = installed_health_url(
-            installed_environment(Path(environment_path)) if environment_path is not None else {}
+            environment, Path(rollback["socket"]["path"]), previous_user
         )
     else:
         manifest_raw["previous"] = None
@@ -1598,7 +1749,6 @@ def capture_rollback(transaction: Path, policy: ValidationPolicy, manifest_path:
                 raise ValidationError("protected candidate configuration escapes transaction")
             atomic_write(retained, Path(rollback[name]["path"]).read_bytes())
             manifest_raw["candidate"][name] = {"path": str(retained), "sha256": sha256(retained)}
-        manifest_raw["service_user"] = service_user_from_unit(Path(rollback["service"]["path"]))
         manifest_raw["expected_health_url"] = manifest_raw["previous_health_url"]
     atomic_write(manifest_path, (json.dumps(manifest_raw, sort_keys=True, indent=2) + "\n").encode())
 

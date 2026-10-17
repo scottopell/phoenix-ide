@@ -896,6 +896,23 @@ rule PreservePreparedRecoveryFailure {
 --   REQ-PD-023, complete ordered registry prefix through65, existing predecessor,
 --   preserved installed env/service/socket/canonical DB path, absent live marker,
 --   and independently bound explicit different controller commit/helper hash.
+--   Root staging binds both retained health URLs to exactly one preserved TCP
+--   ListenStream: bare port (IPv6), IPv4/bracketed IPv6 wildcard, or explicit
+--   loopback. It maps wildcard to same-family loopback, preserves explicit
+--   loopback, brackets IPv6 URL hosts, and requires port1..65535 plus equality
+--   with PHOENIX_PORT if present. Unix/hostname/non-loopback/multiple/other
+--   listeners, ranges and unsupported syntax reject before inhibit/stop/marker.
+--   Only exact Unit/Socket/Install sections are admitted, without repeats;
+--   Socket keys are exactly ListenStream/NoDelay/Backlog/BindIPv6Only.
+--   Accept/BindToDevice and all other Socket options reject.
+--   Scheme follows pinned ConfigSource::from_env: both cert/key paths select
+--   manual HTTPS regardless of mode; one path rejects; no paths admit trimmed
+--   case-insensitive empty/0/false/off/none as HTTP and 1/true/on/auto as auto
+--   HTTPS only. Manual-without-paths and unknown modes reject. Manual paths
+--   must be absolute regular files with no symlink or parent-directory traversal
+--   at root staging. Resolve service uid plus primary/supplementary groups;
+--   require mode-based execute on every ancestor and read on both files,
+--   admitting root permission bypass; unresolved identities or denied modes reject.
 -- systemd_database_admission_valid(transaction) -> Boolean
 --   True for other backends. Protected mode requires its exact source proof;
 --   ordinary mode derives the target by running the exact candidate --migrate-only

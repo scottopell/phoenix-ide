@@ -5,6 +5,7 @@ import json
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,21 +34,192 @@ def digest(path):
 
 
 class InstalledHealthUrlTests(unittest.TestCase):
-    def test_tls_modes_match_controller_and_runtime(self):
-        for value, scheme in (("1", "https"), ("true", "https"), ("on", "https"),
-                              ("auto", "https"), ("manual", "https"), (" TRUE ", "https"),
-                              ("none", "http"), ("disabled", "http"), ("off", "http"),
-                              ("false", "http"), ("0", "http"), ("", "http"),
-                              (" NONE ", "http"), ("unknown", "http")):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.socket = self.base / "installed.socket"
+        self.socket.write_text("[Socket]\nListenStream=8123\n")
+        self.user = pwd.getpwuid(os.getuid()).pw_name
+        self.cert, self.key = self.base / "cert", self.base / "key"
+        self.cert.write_text("certificate")
+        self.key.write_text("key")
+
+    def test_tls_modes_match_pinned_candidate(self):
+        for value, kind, scheme in (("1", helper.InstalledAutoTls, "https"),
+                                   ("true", helper.InstalledAutoTls, "https"),
+                                   ("on", helper.InstalledAutoTls, "https"),
+                                   ("auto", helper.InstalledAutoTls, "https"),
+                                   (" TRUE ", helper.InstalledAutoTls, "https"),
+                                   ("none", helper.InstalledHttp, "http"),
+                                   ("off", helper.InstalledHttp, "http"),
+                                   ("false", helper.InstalledHttp, "http"),
+                                   ("0", helper.InstalledHttp, "http"),
+                                   ("", helper.InstalledHttp, "http"),
+                                   (" NONE ", helper.InstalledHttp, "http")):
             with self.subTest(value=value):
-                self.assertEqual(f"{scheme}://localhost:8031/api/version",
-                                 helper.installed_health_url({"PHOENIX_TLS": value}))
-        for paths, scheme in (({}, "http"), ({"PHOENIX_TLS_CERT_PATH": "/cert"}, "http"),
-                              ({"PHOENIX_TLS_KEY_PATH": "/key"}, "http"),
-                              ({"PHOENIX_TLS_CERT_PATH": "/cert", "PHOENIX_TLS_KEY_PATH": "/key"}, "https")):
-            with self.subTest(paths=paths):
-                self.assertEqual(f"{scheme}://localhost:8123/api/version",
-                                 helper.installed_health_url({"PHOENIX_TLS": "none", "PHOENIX_PORT": "8123", **paths}))
+                environment = {"PHOENIX_TLS": value}
+                self.assertIsInstance(helper.installed_tls(environment), kind)
+                self.assertEqual(f"{scheme}://[::1]:8123/api/version",
+                                 helper.installed_health_url(environment, self.socket, self.user))
+        self.assertIsInstance(helper.installed_tls({}), helper.InstalledHttp)
+
+    def test_manual_paths_override_every_mode_only_as_a_complete_pair(self):
+        for mode in ("off", "auto", "manual", "unknown", ""):
+            with self.subTest(mode=mode):
+                environment = {"PHOENIX_TLS": mode, "PHOENIX_TLS_CERT_PATH": str(self.cert),
+                               "PHOENIX_TLS_KEY_PATH": str(self.key)}
+                self.assertEqual(helper.InstalledManualTls(self.cert, self.key), helper.installed_tls(environment))
+                self.assertEqual("https://[::1]:8123/api/version",
+                                 helper.installed_health_url(environment, self.socket, self.user))
+                for missing in ("PHOENIX_TLS_CERT_PATH", "PHOENIX_TLS_KEY_PATH"):
+                    with self.subTest(missing=missing), self.assertRaises(helper.ValidationError):
+                        helper.installed_health_url({k: v for k, v in environment.items() if k != missing}, self.socket, self.user)
+        for mode in ("manual", " MANUAL ", "disabled", "unknown", "2"):
+            with self.subTest(mode=mode), self.assertRaises(helper.ValidationError):
+                helper.installed_health_url({"PHOENIX_TLS": mode}, self.socket, self.user)
+        for key in ("PHOENIX_TLS_CERT_PATH", "PHOENIX_TLS_KEY_PATH"):
+            with self.subTest(empty_partial=key), self.assertRaises(helper.ValidationError):
+                helper.installed_tls({key: ""})
+
+    def test_manual_paths_must_be_absolute_regular_and_not_symlinked(self):
+        link = self.base / "link"
+        link.symlink_to(self.cert)
+        directory_link = self.base / "directory-link"
+        directory_link.symlink_to(self.base, target_is_directory=True)
+        for bad in ("", "relative", str(self.base / "missing"), str(self.base), str(link),
+                    str(directory_link / "cert")):
+            for field in ("PHOENIX_TLS_CERT_PATH", "PHOENIX_TLS_KEY_PATH"):
+                environment = {"PHOENIX_TLS_CERT_PATH": str(self.cert), "PHOENIX_TLS_KEY_PATH": str(self.key),
+                               field: bad}
+                with self.subTest(field=field, bad=bad), self.assertRaisesRegex(helper.ValidationError, "TLS paths"):
+                    helper.installed_health_url(environment, self.socket, self.user)
+
+    def test_single_listener_forms_determine_host_and_port(self):
+        for listener, host in (("8123", "[::1]"), ("0.0.0.0:8123", "127.0.0.1"),
+                               ("[::]:8123", "[::1]"), ("127.0.0.1:8123", "127.0.0.1"),
+                               ("127.0.0.2:8123", "127.0.0.2"), ("[::1]:8123", "[::1]"),
+                               ("[0:0:0:0:0:0:0:1]:8123", "[::1]")):
+            for environment, scheme in (({}, "http"), ({"PHOENIX_TLS": "auto", "PHOENIX_PORT": "8123"}, "https")):
+                with self.subTest(listener=listener, environment=environment):
+                    self.socket.write_text(f"[Unit]\nDescription=fixture\n[Socket]\n  ListenStream = {listener}\n"
+                                           "NoDelay=true\nBacklog=128\nBindIPv6Only=ipv6-only\n"
+                                           "[Install]\nWantedBy=sockets.target\n")
+                    url = helper.installed_health_url(environment, self.socket, self.user)
+                    self.assertEqual(f"{scheme}://{host}:8123/api/version", url)
+                    helper.validate_health_url(url, "installed")
+
+    def test_tls_validation_receives_service_user(self):
+        environment = {"PHOENIX_TLS_CERT_PATH": str(self.cert), "PHOENIX_TLS_KEY_PATH": str(self.key)}
+        with mock.patch.object(helper, "validate_installed_tls") as validate:
+            helper.installed_health_url(environment, self.socket, self.user)
+        validate.assert_called_once_with(helper.InstalledManualTls(self.cert, self.key), self.user)
+
+    def test_socket_sections_and_option_keys_are_case_sensitive(self):
+        for text in ("[socket]\nListenStream=8123\n",
+                     "[Socket]\nlistenstream=8123\n",
+                     "[Socket]\nListenStream=8123\nnodelay=true\n",
+                     "[Socket]\nListenStream=8123\nService=other.service\n",
+                     "[Socket]\nListenStream=8123\n[unit]\nDescription=fixture\n",
+                     "[Unit]\nDescription=fixture\n[Socket]\nListenStream=8123\n[Unit]\n",
+                     "[Socket]\nListenStream=8123\n[Install]\nWantedBy=sockets.target\n[Install]\n"):
+            with self.subTest(text=text), self.assertRaises(helper.ValidationError):
+                self.socket.write_text(text)
+                helper.installed_health_url({}, self.socket, self.user)
+
+    def test_port_mismatch_and_unsupported_listeners_fail_closed(self):
+        for port in ("8031", "", "0", "65536", "8123-8124", " 8123", "+8123", "not-a-port"):
+            with self.subTest(port=port), self.assertRaisesRegex(helper.ValidationError, "PHOENIX_PORT"):
+                helper.installed_health_url({"PHOENIX_PORT": port}, self.socket, self.user)
+        for listener in ("/tmp/phoenix.sock", "@phoenix", "localhost:8123", "host.example:8123",
+                         "192.0.2.1:8123", "[2001:db8::1]:8123", "*:8123", "8123-8124", "0", "65536",
+                         "[::1%lo]:8123", "::1:8123", "[127.0.0.1]:8123", "8123 # comment", ""):
+            with self.subTest(listener=listener), self.assertRaises(helper.ValidationError):
+                self.socket.write_text(f"[Socket]\nListenStream={listener}\n")
+                helper.installed_health_url({}, self.socket, self.user)
+        for text in ("[Socket]\n", "[Socket]\nListenDatagram=8123\n", "[Unit]\nListenStream=8123\n",
+                     "[Socket]\nListenStream=8123\nListenStream=8124\n",
+                     "[Socket]\nListenStream=8123\nListenDatagram=8124\n",
+                     "[Socket]\nListenStream=8123\nListenStream=\n",
+                     "[Socket]\nListenStream=8123\\\n", "[Socket]\nListenStream=8123\n[Socket]\n",
+                     "[Socket]\nListenStream=8123\n[Unknown]\n",
+                     "[Socket]\nListenStream=8123\nBindToDevice=eth0\n",
+                     "[Socket]\nListenStream=8123\nAccept=yes\n"):
+            with self.subTest(text=text), self.assertRaises(helper.ValidationError):
+                self.socket.write_text(text)
+                helper.installed_health_url({}, self.socket, self.user)
+
+
+class InstalledTlsReadabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.account = mock.Mock(pw_uid=1001, pw_gid=100, pw_name="fixture-service")
+        self.tls = helper.InstalledManualTls(Path("/tls/cert"), Path("/tls/key"))
+        self.metadata = {
+            Path("/"): self.metadata_for(stat.S_IFDIR | 0o755, 0, 0),
+            Path("/tls"): self.metadata_for(stat.S_IFDIR | 0o755, 0, 0),
+            self.tls.cert_path: self.metadata_for(stat.S_IFREG | 0o600, 1001, 100),
+            self.tls.key_path: self.metadata_for(stat.S_IFREG | 0o600, 1001, 100),
+        }
+        self.accounts = mock.patch.object(helper.pwd, "getpwnam", return_value=self.account).start()
+        self.addCleanup(mock.patch.stopall)
+        self.groups = mock.patch.object(helper.os, "getgrouplist", return_value=[200]).start()
+        mock.patch.object(Path, "lstat", autospec=True, side_effect=lambda path: self.metadata[path]).start()
+
+    @staticmethod
+    def metadata_for(mode, uid, gid):
+        return os.stat_result((mode, 0, 0, uid, gid, 0, 0, 0, 0, 0))
+
+    def test_owner_primary_supplementary_and_other_read_permission(self):
+        for path in (self.tls.cert_path, self.tls.key_path):
+            for uid, gid, readable, unreadable in (
+                    (1001, 100, 0o400, 0o044),
+                    (2001, 100, 0o040, 0o004),
+                    (2001, 200, 0o040, 0o004),
+                    (2001, 300, 0o004, 0o440)):
+                with self.subTest(path=path, uid=uid, gid=gid):
+                    original = self.metadata[path]
+                    self.metadata[path] = self.metadata_for(stat.S_IFREG | readable, uid, gid)
+                    helper.validate_installed_tls(self.tls, "fixture-service")
+                    self.metadata[path] = self.metadata_for(stat.S_IFREG | unreadable, uid, gid)
+                    with self.assertRaisesRegex(helper.ValidationError, "not readable"):
+                        helper.validate_installed_tls(self.tls, "fixture-service")
+                    self.metadata[path] = original
+        self.accounts.assert_called_with("fixture-service")
+        self.groups.assert_called_with("fixture-service", 100)
+
+    def test_every_ancestor_requires_owner_group_or_other_execute(self):
+        for path in (Path("/"), Path("/tls")):
+            for uid, gid, traversable, blocked in (
+                    (1001, 100, 0o100, 0o011),
+                    (2001, 100, 0o010, 0o001),
+                    (2001, 200, 0o010, 0o001),
+                    (2001, 300, 0o001, 0o110)):
+                with self.subTest(path=path, uid=uid, gid=gid):
+                    original = self.metadata[path]
+                    self.metadata[path] = self.metadata_for(stat.S_IFDIR | traversable, uid, gid)
+                    helper.validate_installed_tls(self.tls, "fixture-service")
+                    self.metadata[path] = self.metadata_for(stat.S_IFDIR | blocked, uid, gid)
+                    with self.assertRaisesRegex(helper.ValidationError, "not traversable"):
+                        helper.validate_installed_tls(self.tls, "fixture-service")
+                    self.metadata[path] = original
+
+    def test_root_service_user_can_read_mode_zero_regular_files(self):
+        self.account.pw_uid = 0
+        for path in (self.tls.cert_path, self.tls.key_path):
+            self.metadata[path] = self.metadata_for(stat.S_IFREG, 2001, 300)
+        helper.validate_installed_tls(self.tls, "fixture-service")
+        self.metadata[self.tls.key_path] = self.metadata_for(stat.S_IFLNK | 0o777, 0, 0)
+        with self.assertRaisesRegex(helper.ValidationError, "non-symlink"):
+            helper.validate_installed_tls(self.tls, "fixture-service")
+
+    def test_unresolvable_user_or_groups_reject(self):
+        self.accounts.side_effect = KeyError("missing service user")
+        with self.assertRaisesRegex(helper.ValidationError, "identity cannot be resolved"):
+            helper.validate_installed_tls(self.tls, "fixture-service")
+        self.accounts.side_effect = None
+        self.groups.side_effect = OSError("groups unavailable")
+        with self.assertRaisesRegex(helper.ValidationError, "identity cannot be resolved"):
+            helper.validate_installed_tls(self.tls, "fixture-service")
 
 
 class SystemdManifestValidationTests(unittest.TestCase):
@@ -297,8 +469,109 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
             manifest_path = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
         manifest = helper.Manifest.load(manifest_path)
         self.assertEqual(identity, manifest.previous)
-        self.assertEqual("https://localhost:9443/api/version", manifest.previous_health_url)
+        self.assertEqual("https://[::1]:9443/api/version", manifest.previous_health_url)
         self.assertIsNotNone(manifest.rollback.binary.path)
+
+    def protected_endpoint_bundle(self, policy, environment, socket_text, service_environment=""):
+        sources = self.staging_sources()
+        source_env = self.base / "source-candidate.env"
+        source_env.write_text("PHOENIX_TLS=auto\nPHOENIX_PORT=9999\n")
+        sources.append({"name": "candidate.env", "source": str(source_env), "sha256": digest(source_env)})
+        raw = dict(self.raw, mode=helper.PROTECTED_MODE)
+        transaction = policy.transaction_root / self.transaction_id
+        raw["candidate"] = {
+            field: {"path": str(transaction / name), "sha256": next(s["sha256"] for s in sources if s["name"] == name)}
+            for field, name in (("binary", "candidate-binary"), ("service", "candidate.service"),
+                                ("socket", "candidate.socket"), ("environment", "candidate.env"))
+        }
+        for field in ("status_path", "active_path", "activation_lock_path", "claim_lock_path"):
+            raw[field] = str(getattr(policy, field))
+        source_manifest = self.base / "protected-endpoint-manifest.json"
+        source_manifest.write_text(json.dumps(raw))
+        sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
+        for target, text in ((policy.targets.binary, "predecessor"),
+                             (policy.targets.service, f"[Service]\nUser={self.user}\n{service_environment}"),
+                             (policy.targets.socket, socket_text), (policy.targets.environment, environment)):
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        return self.bundle(sources)
+
+    def test_protected_root_staging_binds_both_urls_to_preserved_socket_and_tls(self):
+        cert, key = self.base.resolve() / "manual-cert", self.base.resolve() / "manual-key"
+        cert.write_text("certificate")
+        key.write_text("key")
+        original_copy = helper.copy_handoff_file
+        def copy_file(source, destination, expected_sha, source_uid, mode):
+            original_copy(source, destination, expected_sha, os.getuid(), mode)
+        for listener, host, environment, service_environment, scheme in (
+                ("9443", "[::1]", "PHOENIX_TLS=none\n", "", "http"),
+                ("0.0.0.0:9443", "127.0.0.1", "PHOENIX_TLS=auto\n", "", "https"),
+                ("[::]:9443", "[::1]", "PHOENIX_PORT=9443\n", " Environment=PHOENIX_TLS=auto\n", "https"),
+                ("127.0.0.1:9443", "127.0.0.1", "PHOENIX_TLS=off\n", "Environment=PHOENIX_TLS=auto\n", "http"),
+                ("[::1]:9443", "[::1]", "PHOENIX_TLS=on\nPHOENIX_PORT=9443\n", "", "https"),
+                ("127.0.0.1:9443", "127.0.0.1",
+                 f"PHOENIX_TLS=unknown\nPHOENIX_TLS_CERT_PATH={cert}\nPHOENIX_TLS_KEY_PATH={key}\n", "", "https")):
+            with self.subTest(listener=listener):
+                policy = self.staging_policy()
+                bundle = self.protected_endpoint_bundle(policy, environment, f"[Socket]\nListenStream={listener}\n", service_environment)
+                with mock.patch.object(helper, "copy_handoff_file", side_effect=copy_file), \
+                     mock.patch.object(helper, "installed_runtime_identity", return_value=helper.Identity("1.0.0", "a" * 12)), \
+                     mock.patch.object(helper, "validate_manifest"), mock.patch.object(helper, "database_preflight"):
+                    manifest = helper.Manifest.load(helper.stage_handoff(bundle, os.getuid(), policy))
+                url = f"{scheme}://{host}:9443/api/version"
+                self.assertEqual(url, manifest.expected_health_url)
+                self.assertEqual(url, manifest.previous_health_url)
+                self.assertEqual(Path(policy.targets.socket).read_bytes(), Path(manifest.candidate.socket.path).read_bytes())
+                shutil.rmtree(policy.transaction_root.parent)
+
+    def test_protected_root_staging_rejects_tls_and_endpoint_before_disruption(self):
+        cert, key = self.base.resolve() / "manual-cert", self.base.resolve() / "manual-key"
+        cert.write_text("certificate")
+        key.write_text("key")
+        link = self.base.resolve() / "linked-cert"
+        link.symlink_to(cert)
+        original_copy = helper.copy_handoff_file
+        def copy_file(source, destination, expected_sha, source_uid, mode):
+            original_copy(source, destination, expected_sha, os.getuid(), mode)
+        cases = [({"PHOENIX_TLS": mode}, "[Socket]\nListenStream=9443\n")
+                 for mode in ("manual", "disabled", "unknown")]
+        cases += [({key: value}, "[Socket]\nListenStream=9443\n")
+                  for key in ("PHOENIX_TLS_CERT_PATH", "PHOENIX_TLS_KEY_PATH") for value in ("/missing", "")]
+        for field in ("PHOENIX_TLS_CERT_PATH", "PHOENIX_TLS_KEY_PATH"):
+            for bad in ("", "relative", str(cert.parent / "missing"), str(cert.parent), str(link)):
+                environment = {"PHOENIX_TLS_CERT_PATH": str(cert), "PHOENIX_TLS_KEY_PATH": str(key), field: bad}
+                cases.append((environment, "[Socket]\nListenStream=9443\n"))
+        cases += [({"PHOENIX_PORT": "8031"}, "[Socket]\nListenStream=9443\n")]
+        cases += [({}, f"[Socket]\nListenStream={listener}\n") for listener in
+                  ("/tmp/phoenix.sock", "@phoenix", "localhost:9443", "192.0.2.1:9443",
+                   "[2001:db8::1]:9443", "9443-9444", "65536", "[::1%lo]:9443")]
+        cases += [({}, text) for text in ("[Socket]\nListenStream=9443\nListenStream=9444\n",
+                                         "[Socket]\nListenStream=9443\nListenDatagram=9444\n", "[Socket]\n",
+                                         "[Socket]\nListenStream=9443\nBindToDevice=eth0\n",
+                                         "[Socket]\nListenStream=9443\nAccept=yes\n")]
+        for environment, socket_text in cases:
+            with self.subTest(environment=environment, socket=socket_text):
+                policy = self.staging_policy()
+                bundle = self.protected_endpoint_bundle(
+                    policy, "".join(f"{key}={value}\n" for key, value in environment.items()), socket_text)
+                with mock.patch.object(helper, "copy_handoff_file", side_effect=copy_file), \
+                     mock.patch.object(helper, "installed_runtime_identity", return_value=helper.Identity("1.0.0", "a" * 12)), \
+                     mock.patch.object(helper, "Systemctl") as controller, \
+                     mock.patch.object(helper, "install_start_inhibit") as inhibit, \
+                     mock.patch.object(helper, "run_current_migration") as migration, \
+                     mock.patch.object(helper, "database_preflight") as database_preflight:
+                    with self.assertRaises(helper.ValidationError):
+                        helper.stage_handoff(bundle, os.getuid(), policy)
+                controller.assert_not_called()
+                inhibit.assert_not_called()
+                migration.assert_not_called()
+                database_preflight.assert_not_called()
+                self.assertFalse(list(policy.transaction_root.rglob("migration_started")))
+                self.assertFalse(list(Path(policy.targets.service).parent.rglob("*.conf")))
+                self.assertFalse(policy.active_path.exists())
+                self.assertFalse((policy.transaction_root / self.transaction_id).exists())
+                self.assertEqual(socket_text, Path(policy.targets.socket).read_text())
 
     def test_stage_handoff_rejects_non_allowlisted_artifact_before_claim(self):
         source = self.base / "secret"
