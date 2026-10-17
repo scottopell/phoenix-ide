@@ -265,7 +265,8 @@ describe('inline message reactions', () => {
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
   });
 
-  it('uses touch presentation when reselecting a tokenless source', async () => {
+  it('uses touch presentation when reselecting a tokenless source', () => {
+    vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame'] });
     setCoarsePointer(true);
     const store = new InlineReactionStore();
     render(<Harness store={store} append={vi.fn()} tokenless />);
@@ -273,13 +274,19 @@ describe('inline message reactions', () => {
     fireEvent.pointerDown(text, { pointerType: 'mouse' });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'mouse' });
-    expect(await screen.findByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
-    expect(store.getSnapshot('conversation-a')?.source.occurrenceToken).toBeUndefined();
+    expect(store.getSnapshot('conversation-a')).toBeNull();
+    act(() => vi.advanceTimersToNextFrame());
+    expect(screen.getByRole('region', { name: 'React to selected text' })).toBeInTheDocument();
+    const source = store.getSnapshot('conversation-a')?.source;
+    expect(source?.occurrenceToken).toBeUndefined();
     fireEvent.pointerDown(text, { pointerType: 'touch', clientX: 100, clientY: 60 });
     select(text);
     fireEvent.pointerUp(text, { pointerType: 'touch' });
-    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('floating');
+    act(() => vi.advanceTimersToNextFrame());
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+    expect(store.getSnapshot('conversation-a')?.source).toEqual(source);
   });
 
   it('keeps keyboard selection in the floating pill on a hybrid device', async () => {
