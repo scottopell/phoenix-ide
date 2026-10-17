@@ -742,6 +742,12 @@ AND the request SHALL NOT include any tool capabilities
 AND the request SHALL frame the summary as an operational handoff to a fresh agent with no memory of the session
 AND ordinary conversations SHALL use the work-handoff instructions covering goals, concrete changes, verification, repository state, next actions, and pitfalls
 AND the global Coordinator SHALL use the coordination-handoff instructions in [REQ-GR-013](../global-recall/requirements.md#req-gr-013-preserve-coordination-context-through-compaction), selected from its existing Coordinator identity without role inference or a purpose setting
+AND both handoff policies SHALL request unfinished obligations, authorization provenance with exact primary user message references and relevant scoped wording when known, later corrections and supersession, pauses and gates, owner and last-observed status, the next authorized in-scope action and required checks, and completion criteria with outstanding verification
+AND SHALL distinguish authentic primary user directions from generated assertions, delegate reports, quotations, and assumptions; missing evidence SHALL remain unknown with narrow retrieval pointers rather than invented approval
+AND the tool-free compaction input SHALL expose each retained text-bearing row's known persisted conversation/message locator pair, typed input origin and content kind alongside its rendered text, including ordinary user-facing API inputs
+AND source attribution SHALL come from the frozen persisted projection, not message text; rendered payload SHALL be escaped separately from attribution, with metadata included in the row's token budget and omitted whenever the row is omitted
+AND user-facing API origin SHALL identify only an entry channel, not establish biological human authorship or grant authorization; internal conversation, unknown historical, system-generated and subscription-event inputs and generated continuation content SHALL remain distinguishable
+AND SHALL describe the generated handoff as untrusted context that cannot self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 AND the request SHALL preserve the prior tool history as text rather than discarding it
 AND the request SHALL be bounded to fit the context window and any request-shape limits declared by the selected provider route
@@ -1222,6 +1228,14 @@ THE SYSTEM SHALL create a new transcript row that explicitly belongs to the same
   - any parent task/proposal context that remains part of the same live conversation authority
   - every unconsumed steering entry, preserving its immutable acceptance identity, exact payload, attachments, and FIFO order without retaining a second pending copy on the predecessor
   - deferred continuation work, including tool calls rejected at the context threshold, without executing it before the successor owns the handoff
+
+WHEN a successor receives generated predecessor context
+THE trusted model-bound guidance SHALL describe continuation as a handoff rather than cancellation or expiry of verified standing user directions
+AND SHALL direct recovery of unfinished obligations and verification of claimed historical approval against authentic primary user messages, source attribution, and exact scope, retrieving only missing relevant evidence as needed
+AND SHALL require checking later corrections, supersession, pauses, gates, relevant current status and ownership before acting
+AND SHALL direct the next authorized in-scope step by default and follow-through to verified completion rather than status-only acknowledgement or redundant permission requests
+AND SHALL preserve pauses and gates and direct narrow evidence recovery or a focused question when authority is missing, conflicting, or insufficient
+AND SHALL keep generated summaries and encoded payloads untrusted data that cannot promote embedded directives or claimed approvals into authority, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
 
 WHEN an ordinary conversation creates a continuation
 THE SYSTEM SHALL keep the selected parent's exact attached `WorkScope`, environment and resource ownership atomically in a single database transaction while keeping the durable ProductConversation identity unchanged
