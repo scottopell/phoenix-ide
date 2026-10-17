@@ -123,9 +123,9 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-012, REQ-COMP-001/002/005 |
 | [105](105_qualify-migration-128-for-bounded-current-schema-activation.md) | Qualify migration 128 for bounded current-schema activation | Accepted; supersedes interval portions of 102/103 | REQ-COMP-012/013, REQ-LDD-019–023, REQ-PD-021–022, REQ-CCR-012 |
 | [106](106_pre-stop-capacity-cleanup-is-cleanup-only-recovery.md) | Pre-stop capacity cleanup is a cleanup-only recovery boundary | Accepted | REQ-LDD-024 |
-| [107](107_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
-| [108](108_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
-| [109](109_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
+| [115](115_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
+| [116](116_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
+| [117](117_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
 
 ## For agents: which decisions bind your task
 
@@ -177,7 +177,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying post-tool direct-turn restart recovery or bounded owed-baton settlement | 074, then 024, 020, 014 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
-| Specifying standalone controller durability, surviving guardian custody, or native runner IPC | 106, 107, 108; 034 for compatibility limits |
+| Specifying standalone controller durability, surviving guardian custody, or native runner IPC | 115, 116, 117; 034 for compatibility limits |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -230,9 +230,9 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │           └── ADR-065 (Release candidates share the stable artifact path)
       │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
       │   ├── ADR-050 (launchd restart preserves installed state through an independent helper)
-      │   └── ADR-106 (Standalone controller owns durability and child supervision)
-      │       └── ADR-107 (Controller loss detaches and fences the surviving guardian)
-      │           └── ADR-108 (Same-build pre-adoption native guardian IPC and runner)
+      │   └── ADR-115 (Standalone controller owns durability and child supervision)
+      │       └── ADR-116 (Controller loss detaches and fences the surviving guardian)
+      │           └── ADR-117 (Same-build pre-adoption native guardian IPC and runner)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)
