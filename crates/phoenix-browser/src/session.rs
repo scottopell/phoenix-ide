@@ -1639,7 +1639,19 @@ struct ReopenPermitTestHook {
     release: Arc<tokio::sync::Notify>,
 }
 
-/// Global manager for all browser sessions
+pub struct BrowserRetainedLaunch {
+    pub reason: String,
+    pub browser_lifetime: String,
+    pub profile_path: PathBuf,
+}
+
+pub enum BrowserSessionLookup {
+    Absent,
+    Ready(Arc<RwLock<BrowserSession>>),
+    Retained(BrowserRetainedLaunch),
+}
+
+/// Global manager for all browser launch reservations and ready sessions.
 pub struct BrowserSessionManager {
     /// Keyed by browser session identity, with per-scope / per-actor retirement
     /// fences in the same lock so exact retirement can close admission without a
@@ -2352,6 +2364,22 @@ impl BrowserSessionManager {
                 "browser initialization is retained; close before reuse".into(),
             )
         })
+    }
+
+    /// Inspect an existing reservation without creating another launch.
+    pub async fn lookup_existing(&self, work_scope: &ResourceScopeKey) -> BrowserSessionLookup {
+        let slot = self
+            .state
+            .read()
+            .await
+            .sessions
+            .values()
+            .find(|entry| entry.scope == *work_scope)
+            .map(|entry| entry.session.clone());
+        match slot {
+            Some(slot) => slot.lookup().await,
+            None => BrowserSessionLookup::Absent,
+        }
     }
 
     /// Get the session for a `work_scope` **without creating one**.

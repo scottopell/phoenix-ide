@@ -710,6 +710,30 @@ fn wait_for_observation<T>(reason: &str, mut observe: impl FnMut() -> Option<T>)
     }
 }
 
+fn observe_process_exited_or_retained_zombie(process: ProcessIdentity) {
+    wait_for_observation(
+        "killed Chrome is gone or kernel-exited with retained identity",
+        || {
+            if !process_identity_matches(process) {
+                return Some(());
+            }
+            let output = Command::new("ps")
+                .args(["-p", &process.pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            eprintln!(
+                "pre_close_process_observation pid={} identity_retained=true state={}",
+                process.pid,
+                state.trim()
+            );
+            (output.status.success()
+                && matches!(state.trim_start().chars().next(), Some('Z' | 'X')))
+            .then_some(())
+        },
+    );
+}
+
 fn await_process_exit(process: ProcessIdentity) {
     wait_for_observation("owned process exited", || {
         (!process_identity_matches(process)).then_some(())
@@ -1639,6 +1663,105 @@ fn blocked_profile_preserves_structured_measurement_failure() {
     cli.ok(&["close"]);
 }
 
+#[test]
+fn opaque_initial_launch_failure_status_retains_lifetime_and_barrier() {
+    initial_launch_failure_status(true);
+}
+
+#[test]
+fn partial_initial_launch_failure_status_retains_lifetime_and_barrier() {
+    if chrome_enabled() {
+        initial_launch_failure_status(false);
+    }
+}
+
+fn initial_launch_failure_status(opaque: bool) {
+    struct OwnedDaemon(std::process::Child);
+    impl Drop for OwnedDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let cli = BrowserCli::new();
+    let key = hex::encode(&Sha256::digest(b"named:integration")[..12]);
+    let wrapper = cli.directory.path().join("failing-chrome");
+    let executable = if opaque {
+        PathBuf::from("/usr/bin/false")
+    } else {
+        let actual = std::env::var_os("PHOENIX_CHROME_EXECUTABLE")
+            .map(PathBuf::from)
+            .expect("hosted dev.py supplies installed Chrome for the partial-initialization test");
+        std::fs::write(&wrapper, b"#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --user-data-dir=*) profile=${arg#--user-data-dir=};; esac; done\nmkdir \"$profile/phoenix-profile-owner.json\" || exit 91\nexec \"$PHOENIX_BROWSER_TEST_CHROME\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        actual
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_phoenix-browser"));
+    command
+        .args(["__daemon", &key, "named:integration", "300"])
+        .arg(cli.directory.path())
+        .env("PHOENIX_TMP_DIR", cli.directory.path().join("scratch"))
+        .env(
+            "PHOENIX_CHROME_EXECUTABLE",
+            if opaque { &executable } else { &wrapper },
+        )
+        .env("PHOENIX_BROWSER_TEST_CHROME", &executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut daemon = OwnedDaemon(command.spawn().unwrap());
+    wait_for_observation("explicit owned daemon socket", || {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        cli.socket().exists().then_some(())
+    });
+    let opened = cli.invoke(&["open", &fixture()], None, false);
+    assert_eq!(opened["error"]["code"], "browser_start_failed");
+    if !opaque {
+        assert!(
+            opened["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("failed to publish browser profile marker"),
+            "must reach returned-Browser marker publication: {opened}"
+        );
+    }
+    let status = cli.invoke(&["status"], None, false);
+    assert_eq!(status["error"]["code"], "cleanup_failed");
+    assert!(status["browser_lifetime"].as_str().is_some());
+    assert!(status["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("retained browser initialization at"));
+    let profiles: Vec<_> = std::fs::read_dir(cli.directory.path().join("scratch"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("phoenix-browser-cli-")
+        })
+        .collect();
+    assert_eq!(profiles.len(), 1);
+    assert!(status["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(profiles[0].to_str().unwrap()));
+    if !opaque {
+        assert!(profiles[0].join("phoenix-profile-owner.json").is_dir());
+        assert!(status["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to publish browser profile marker"));
+    }
+    let repeated = cli.invoke(&["open", &fixture()], None, false);
+    assert_eq!(repeated["error"]["code"], "cleanup_failed");
+    assert_eq!(repeated["browser_lifetime"], status["browser_lifetime"]);
+    let stopping = cli.ok(&["status"]);
+    assert_eq!(stopping["result"]["phase"], "stopping");
+    assert_eq!(stopping["browser_lifetime"], status["browser_lifetime"]);
+}
+
 fn record_owned_chrome_layout(
     resources: &(PathBuf, ProcessIdentity),
     phase: &str,
@@ -1843,7 +1966,9 @@ fn dead_chrome_cleanup_failure_remains_visible_until_explicit_close() {
             None
         }
     });
-    await_process_exit(resources.1);
+    eprintln!("dead_chrome_cleanup_failure_first_status={failed}");
+    record_owned_chrome_layout(&resources, "cleanup_failed_before_explicit_close", false);
+    observe_process_exited_or_retained_zombie(resources.1);
     assert_eq!(failed["error"]["code"], "cleanup_failed");
     assert_eq!(failed["browser_lifetime"], opened["browser_lifetime"]);
     for _ in 0..2 {

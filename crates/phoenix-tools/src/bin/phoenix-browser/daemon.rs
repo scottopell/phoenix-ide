@@ -418,8 +418,19 @@ impl State {
     async fn live_browser(
         &self,
     ) -> Result<Option<Arc<RwLock<BrowserSession>>>, BrowserLookupFailure> {
-        let Some(browser) = self.manager.get_existing(&self.scope).await else {
-            return Ok(None);
+        let browser = match self.manager.lookup_existing(&self.scope).await {
+            phoenix_browser::session::BrowserSessionLookup::Absent => return Ok(None),
+            phoenix_browser::session::BrowserSessionLookup::Ready(browser) => browser,
+            phoenix_browser::session::BrowserSessionLookup::Retained(retained) => {
+                return Err(BrowserLookupFailure::CleanupFailed(RetainedCleanup {
+                    error: format!(
+                        "retained browser initialization at {}: {}",
+                        retained.profile_path.display(),
+                        retained.reason
+                    ),
+                    browser_lifetime: Some(retained.browser_lifetime),
+                }))
+            }
         };
         let running = browser
             .write()

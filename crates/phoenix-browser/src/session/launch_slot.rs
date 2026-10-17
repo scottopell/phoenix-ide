@@ -46,6 +46,7 @@ struct PendingBrowser {
     authority: InitialAuthority,
     identity: BrowserLaunchIdentity,
     marker: bool,
+    failure: Option<String>,
 }
 
 enum InitialAuthority {
@@ -87,6 +88,9 @@ impl LaunchSlot {
         let driver = tokio::spawn(async move {
             let mut state = slot.state.write().await;
             if let Err(error) = slot.initialize(&mut state).await {
+                if let LaunchState::Pending(pending) = &mut *state {
+                    pending.failure = Some(error.to_string());
+                }
                 if matches!(&*state, LaunchState::Reserved) {
                     *state = LaunchState::PreSpawnFailed(error.to_string());
                 }
@@ -132,6 +136,29 @@ impl LaunchSlot {
             .driver
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(driver);
+    }
+
+    pub(super) async fn lookup(&self) -> BrowserSessionLookup {
+        let state = self.state.read().await;
+        let reason = match &*state {
+            LaunchState::Ready(session) => return BrowserSessionLookup::Ready(session.clone()),
+            LaunchState::Reserved => "browser initialization is reserved".to_owned(),
+            LaunchState::PreSpawnFailed(reason) | LaunchState::UnobservableAttempt(reason) => {
+                reason.clone()
+            }
+            LaunchState::Pending(pending) => pending
+                .failure
+                .clone()
+                .unwrap_or_else(|| "partial browser launch retained".into()),
+            LaunchState::Stopped => "stopped launch awaits registry retirement".to_owned(),
+            #[cfg(test)]
+            LaunchState::InjectedPending(_) => "injected partial launch retained".into(),
+        };
+        BrowserSessionLookup::Retained(BrowserRetainedLaunch {
+            reason,
+            browser_lifetime: self.identity.launch_uuid.clone(),
+            profile_path: self.profile.clone(),
+        })
     }
 
     pub(super) fn observed_identity(&self) -> BrowserLaunchIdentity {
@@ -180,7 +207,7 @@ impl LaunchSlot {
                 },
                 LaunchState::PreSpawnFailed(reason) => return Err(BrowserError::LaunchFailed(reason.clone())),
                 LaunchState::UnobservableAttempt(reason) => return Err(BrowserError::LaunchFailed(reason.clone())),
-                LaunchState::Pending(_) => return Err(BrowserError::LaunchFailed("partial browser launch retained; close must stop the exact launch before reuse".into())),
+                LaunchState::Pending(pending) => return Err(BrowserError::LaunchFailed(pending.failure.clone().unwrap_or_else(|| "partial browser launch retained; close must stop the exact launch before reuse".into()))),
                 LaunchState::Stopped => return Err(BrowserError::LaunchFailed("launch slot stopped".into())),
             }
             changed.await;
@@ -204,10 +231,17 @@ impl LaunchSlot {
                 &self.key,
             )?;
         }
-        std::fs::create_dir_all(&self.profile)
-            .map_err(|error| BrowserError::LaunchFailed(error.to_string()))?;
         #[cfg(test)]
         let fault = self.fault.lock().unwrap().clone();
+        #[cfg(test)]
+        if fault
+            .as_ref()
+            .is_some_and(|fault| fault.preparation_failure.load(Ordering::SeqCst))
+        {
+            return Err(BrowserError::LaunchFailed(
+                "injected pre-spawn preparation failure".into(),
+            ));
+        }
         #[cfg(test)]
         let executable = match fault.as_ref().and_then(|fault| fault.executable.clone()) {
             Some(executable) => executable,
@@ -216,6 +250,8 @@ impl LaunchSlot {
         #[cfg(not(test))]
         let executable = select_executable().await?;
         let config = BrowserSession::browser_config(&self.profile, Some(&executable))?;
+        std::fs::create_dir_all(&self.profile)
+            .map_err(|error| BrowserError::LaunchFailed(error.to_string()))?;
         *state = LaunchState::UnobservableAttempt(
             "browser launch has not yielded a recoverable child".into(),
         );
@@ -242,6 +278,7 @@ impl LaunchSlot {
             authority: InitialAuthority::Unadopted,
             identity: self.identity.clone(),
             marker: false,
+            failure: None,
         }));
         let LaunchState::Pending(pending) = state else {
             unreachable!()
@@ -528,6 +565,7 @@ pub(super) mod tests {
         pub(super) opaque: bool,
         pub(super) executable: Option<PathBuf>,
         pub(super) attempts: AtomicUsize,
+        pub(super) preparation_failure: AtomicBool,
         cleanup_failures: AtomicUsize,
     }
 
@@ -546,6 +584,7 @@ pub(super) mod tests {
             opaque,
             executable: opaque.then(|| std::env::current_exe().unwrap()),
             attempts: AtomicUsize::new(0),
+            preparation_failure: AtomicBool::new(false),
             cleanup_failures: AtomicUsize::new(usize::from(!opaque)),
         });
         let manager = BrowserSessionManager {
@@ -554,6 +593,42 @@ pub(super) mod tests {
             ..BrowserSessionManager::default()
         };
         (Arc::new(manager), fault)
+    }
+
+    #[tokio::test]
+    async fn production_preparation_failure_retires_and_retries_the_same_ide_path() {
+        let (mut manager, fault) = manager_with_fault(true);
+        Arc::get_mut(&mut manager).unwrap().profile_policy = ProfilePolicy::StableScope;
+        fault.preparation_failure.store(true, Ordering::SeqCst);
+        let scope = scope();
+        assert!(manager.get_session(&scope).await.is_err());
+        let path = PathBuf::from(&manager.cleanup_identifiers(&scope).await[0].profile_path);
+        assert!(
+            !path.exists(),
+            "failed preparation must not create a poison profile"
+        );
+        assert_eq!(fault.attempts.load(Ordering::SeqCst), 0);
+        let permit = manager.begin_retirement(&scope).await;
+        assert_eq!(
+            manager.complete_retirement(&permit).await,
+            BrowserRetirementOutcome::Retired
+        );
+        manager.reopen_after_permit(permit).await;
+        fault.preparation_failure.store(false, Ordering::SeqCst);
+        assert!(manager.get_session(&scope).await.is_err());
+        assert_eq!(
+            fault.attempts.load(Ordering::SeqCst),
+            1,
+            "repair must reach the launch boundary on the same IDE path"
+        );
+        assert_eq!(
+            PathBuf::from(&manager.cleanup_identifiers(&scope).await[0].profile_path),
+            path
+        );
+        assert!(matches!(
+            manager.lookup_existing(&scope).await,
+            BrowserSessionLookup::Retained(_)
+        ));
     }
 
     #[tokio::test]
