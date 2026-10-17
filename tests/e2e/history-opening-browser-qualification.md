@@ -3146,3 +3146,26 @@ still in progress at this entry; no next candidate is published until its whole
 terminal state is established. Artifact12090904686 is96,845,740 bytes; bounded
 native result/browser selections and completed-job logs are retained. No
 browser scenario progress or source acceptance is claimed for this run yet.
+
+Run39007594676 is now fully terminal failure with **actual Rust lane success**;
+E2E/task/worker guards and routine macOS CI also passed. The remaining failures
+are the two capacity helper line limits, one mounted-stream fixture timing case,
+and the shared asynchronous-creation fixture error, all independently scoped.
+No browser scenario ran in that failed witness.
+
+Product ec710d65420c448b4a716e3e966a48d6aa74e934, tree
+5ba7814e9695595779180b56165947c32ee6a081, is a clean2-file child ofaac4. Capacity
+helpers are further factored while preserving22 base+8 marks+14 observations,
+all44 attributes and real OTLP accounting. The UI test now awaits actual fake
+stream attachment before emitting the same update, with unchanged waitFor
+budget/no retry; no product behavior is changed. Parent reviewed the exact delta
+and independently passed192 owning page tests, composite tsc-b and79 lifecycle
+tests. The source owner also passed named/owning/lint/rustfmt; Clippy remains the
+actual hosted gate rather than a physical source-line-count claim.
+
+The exact source branch qualification/history-joint-source-ec710d654 is published
+and all source pins select it. Shared19 creation regressions and79 lifecycle
+regressions retain strict publication/identity/normal drain semantics. One next
+changed-candidate normal qualification follows the complete preceding terminal
+state; no unchanged/parallel witness is launched. Baselineedac/35f and all scope
+boundaries remain unchanged.
