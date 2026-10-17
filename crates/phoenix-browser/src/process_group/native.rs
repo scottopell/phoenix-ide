@@ -241,13 +241,55 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct GroupQueryOutcome {
+    returned_bytes: libc::c_int,
+    errno: libc::c_int,
+}
+
+#[cfg(target_os = "macos")]
+fn query_group(group: u32, buffer: Option<&mut [libc::pid_t]>) -> io::Result<GroupQueryOutcome> {
+    let (pointer, capacity) = match buffer {
+        Some(buffer) => (
+            buffer.as_mut_ptr().cast(),
+            libc::c_int::try_from(std::mem::size_of_val(buffer)).map_err(io::Error::other)?,
+        ),
+        None => (std::ptr::null_mut(), 0),
+    };
+    // SAFETY: __error is thread-local; no other call intervenes before capture.
+    let outcome = unsafe {
+        *libc::__error() = 0;
+        let returned_bytes = libc::proc_listpids(2, group, pointer, capacity);
+        let errno = *libc::__error();
+        GroupQueryOutcome {
+            returned_bytes,
+            errno,
+        }
+    };
+    #[cfg(test)]
+    GROUP_QUERY_TRACE.with(|count| {
+        if count.get() < 32 {
+            eprintln!("owned_group_query sample={} group={group} capacity_bytes={capacity} returned_bytes={} errno={}", count.get(), outcome.returned_bytes, outcome.errno);
+            count.set(count.get() + 1);
+        }
+    });
+    Ok(outcome)
+}
+
+#[cfg(all(target_os = "macos", test))]
+thread_local! {
+    static GROUP_QUERY_TRACE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_os = "macos")]
 fn group_has_live_members(group: u32) -> io::Result<bool> {
     // PROC_PGRP_ONLY = 2, as defined by libproc.h.
-    let size = unsafe { libc::proc_listpids(2, group, std::ptr::null_mut(), 0) };
+    let sizing = query_group(group, None)?;
+    let size = sizing.returned_bytes;
     if size <= 0 {
         return Err(io::Error::other(format!(
             "could not size Chrome process group: group={group} size={size} errno={:?}",
-            io::Error::last_os_error()
+            sizing.errno
         )));
     }
     let mut pids = vec![
@@ -258,10 +300,11 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
     ];
     let bytes = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>())
         .map_err(io::Error::other)?;
-    let count = unsafe { libc::proc_listpids(2, group, pids.as_mut_ptr().cast(), bytes) };
+    let listing = query_group(group, Some(&mut pids))?;
+    let count = listing.returned_bytes;
     if count <= 0 || count >= bytes {
         return Err(io::Error::other(format!(
-            "could not enumerate complete Chrome process group: group={group} size={size} capacity_bytes={bytes} returned_bytes={count} errno={:?}", io::Error::last_os_error(),
+            "could not enumerate complete Chrome process group: group={group} size={size} capacity_bytes={bytes} returned_bytes={count} errno={:?}", listing.errno,
         )));
     }
     for pid in pids.into_iter().take(
@@ -304,6 +347,71 @@ mod tests {
         assert!(!RootObservation::Live.permits_completion());
         assert!(RootObservation::Exited.permits_signal());
         assert!(RootObservation::Exited.permits_completion());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn owned_empty_group_query_contract_before_and_after_root_reap() {
+        GROUP_QUERY_TRACE.with(|count| count.set(0));
+        let mut root = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "echo ready; read release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdout = tokio::io::BufReader::new(root.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let identity = current_process_identity(root.id().unwrap()).unwrap();
+        let group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
+        root.stdin
+            .take()
+            .unwrap()
+            .write_all(b"release\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while group.observe_root(&mut root).unwrap() != RootObservation::Exited {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for phase in ["unreaped", "reaped"] {
+            if phase == "reaped" {
+                root.wait().await.unwrap();
+            }
+            let sizing = query_group(identity.pid, None).unwrap();
+            assert!(sizing.returned_bytes > 0);
+            assert_eq!(sizing.errno, 0);
+            let mut pids = vec![
+                0;
+                usize::try_from(sizing.returned_bytes).unwrap()
+                    / std::mem::size_of::<libc::pid_t>()
+                    + 32
+            ];
+            let listing = query_group(identity.pid, Some(&mut pids)).unwrap();
+            eprintln!("owned_empty_group phase={phase} root={identity:?} child={:?} sizing={sizing:?} listing={listing:?}", root.id());
+            assert_eq!(
+                listing.errno, 0,
+                "owned-group query must not mask a syscall error"
+            );
+            assert!(listing.returned_bytes >= 0);
+            assert!(
+                usize::try_from(listing.returned_bytes).unwrap()
+                    < std::mem::size_of_val(pids.as_slice())
+            );
+        }
+        assert!(
+            group.observe_root(&mut root).is_err(),
+            "post-reap enumeration grants no signal authority"
+        );
     }
 
     fn sentinel() -> tokio::process::Child {
