@@ -788,7 +788,14 @@ fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobs
     assert_eq!(final_attempt.deadline(), deadline);
     let final_binding = store.load_native_binding(ATTEMPT).unwrap().unwrap();
     assert_eq!(final_binding.identity(), binding.identity());
-    assert_eq!(final_binding.slots(), binding.slots());
+    assert_eq!(final_binding.slots().len(), 1);
+    assert_eq!(binding.slots().len(), 1);
+    assert_eq!(final_binding.slots()[0].process, binding.slots()[0].process);
+    assert_eq!(
+        final_binding.slots()[0].liveness,
+        NativeSlotLiveness::Exited
+    );
+    assert_eq!(binding.slots()[0].liveness, NativeSlotLiveness::Running);
     assert_eq!(final_binding.deadline(), binding.deadline());
     let db =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
