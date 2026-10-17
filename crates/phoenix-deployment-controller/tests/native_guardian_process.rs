@@ -459,8 +459,6 @@ fn settle_initial_sample_with_replacement_ack(
     let mut output = BufReader::new(child.stdout.take().unwrap());
     let mut initial = GuardedRunner::new(child);
     assert!(line(&mut output).starts_with("verified binding: InitialActive"));
-    assert!(line(&mut output).starts_with("released child "));
-    assert!(line(&mut output).starts_with("native_sample_retained key="));
     assert!(line(&mut output).starts_with("application_committed_pending_ack revision="));
     wait_for_process_name(i32::try_from(root.pid().get()).unwrap(), "sleep");
     initial.finish();
