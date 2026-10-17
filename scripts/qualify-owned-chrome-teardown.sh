@@ -36,6 +36,7 @@ fi
 run_exact process_group::native::tests::missing_signal_target_requires_reobservation_not_completion -p phoenix-browser --lib
 run_exact process_group::native::tests::signal_exit_race_reobserves_owned_child_before_draining -p phoenix-browser --lib
 run_exact process_group::native::tests::pending_exit_authorizes_neither_signal_nor_completion -p phoenix-browser --lib
+run_exact process_group::native::tests::darwin_pending_exit_preserves_birth_identity_and_requires_missing_group -p phoenix-browser --lib
 run_exact process_group::native::tests::exited_root_drains_stderr_closed_writer_before_profile_removal -p phoenix-browser --lib
 run_exact process_group::native::tests::reaped_or_mismatched_root_cannot_authorize_old_group_signals -p phoenix-browser --lib
 run_exact process_group::native::tests::group_drain_does_not_claim_an_escaped_writer -p phoenix-browser --lib

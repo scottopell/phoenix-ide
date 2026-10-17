@@ -1,6 +1,8 @@
 ## Active qualification checkpoint
 
-Pinned app `4d57df1719a7995cfb1879e60c54fda33a41a766`, tree `69c9b261b4df7ab1b9229b6a9314a25180e27f82`, base `1f9529c634a074c6ab6ea36eb15ca284770df1a5`. This successor contains only two test corrections over be66: borrow the qualification executable path while retaining owned canonicalized storage; capture the actual startup profile from the launch-wrapper argument handshake rather than scanning an obsolete prefix. SIGTERM remains before wrapper release, and strict root/daemon/profile/socket absence assertions precede fallback cleanup. Exact native qualification adds this SIGTERM guard on both platforms without removing prior selectors. Successor Rust/Clippy/native execution is not yet claimed.
+Pinned app `353a1b98cbb566d25c9f84ba415bcec683db4d63`, tree `4efd49a3b7746a3093ce9dce3dac37c1175b5d54`, base `1f9529c634a074c6ab6ea36eb15ca284770df1a5`. This successor preserves the test-only path/profile repairs and adds two bounded repairs: ordinary/Global older-page progress survives an unchanged-boundary background refresh, while recovered-page progress remains coupled to its admitted fresh tail; Darwin same-birth plus missing-group/ESRCH and no WNOWAIT exit remains pending, authorizing neither signal nor completion. Retained Child, birth identity, final Exited/empty-group/Exited fences and deadline remain unchanged. Parent cached221UI tests passed; independent held-out source review found and verified the recovery coupling correction. Native selectors add the deterministic4×8 pending-exit predicate table while retaining the real ESRCH and startup SIGTERM guards. New Rust/Clippy/native execution is not yet claimed.
+
+Published predecessor shared `3f425943f1d071e65d20c0030249f2dd34a02ad0`: macOS39069775119 build-and-test passed but native failed the real ESRCH guard with same birth identity, getpgid ESRCH and WNOWAIT still false. Full log/artifact12114970898 retained; no flake/retry or exit-completion inference. Linux39069775091 terminal status/receipts must be independently preserved before this successor is pushed. Its Clippy/UI/E2E jobs passed at observation; active Rust/native/witness is not labelled green.
 
 Preserved shared `31baceb29a6ff90619455841aaf7a12c8a38ba40`: Linux39068002706 failed only Clippy (test-only needless pass by value) and Rust (2879 passed,1failed,1975notrun; obsolete startup-test profile-prefix assertion before SIGTERM). Other six required Linux jobs passed. Both macOS39068002699 jobs passed. Artifacts12115080275/12113349414 were downloaded; all11 new native guards actually ran1test/1passed/0ignored on each platform. The Linux witness independently yielded6collector204s=6semanticexports, clean app/receiver drain, no aggregation errors. This is not whole-head green or performance acceptance. Earlier cleanup-failure diagnostic passed on this Linux head, but the original465 failure cause remains unproved.
 
@@ -19,7 +21,7 @@ wire identity helpers with this witness; the app source remains pinned unchanged
 ## Inputs and hosted invocation
 
 Supply an independent, tracked-clean app checkout at
-`4d57df1719a7995cfb1879e60c54fda33a41a766`, its already-built `ui/dist`, installed
+`353a1b98cbb566d25c9f84ba415bcec683db4d63`, its already-built `ui/dist`, installed
 app-owned Vite/Playwright dependencies and Chromium, and the independently built
 ignored libtest artifact. This script never compiles, installs, starts production,
 or uses the shipping executable. Use the existing hosted preparation; workflow
