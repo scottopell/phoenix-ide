@@ -82,18 +82,18 @@ external entity ShellIntegrationProvider {
 -- Value Types
 ------------------------------------------------------------
 
--- The durable-owner key for work-affine resources. Defined in
--- crates/phoenix-ide/src/work_scope.rs. Worktree carries the worktree
--- path; Conversation carries the conversation id; Global carries no
--- payload (singleton). stable_key() makes the three namespaces disjoint
--- via "worktree:", "conversation:", and "global:" prefixes.
+-- The durable-owner key for work-affine resources is ResourceScopeKey.
+-- Work carries an opaque persisted scope ID; Unattached carries a fallback
+-- transcript ID. Coordinator and GlobalTerminal are separate singletons.
+-- stable_key() uses disjoint work:, unattached:, coordinator and global_terminal
+-- encodings; neither cwd nor ConvMode selects ordinary resource ownership.
 --
 -- Terminal mirrors the WorkScope ownership pattern of tmux
 -- (REQ-TMUX-WS-001) and browser (REQ-BROWSER-WS-001): continuation
 -- conversations resolving to the same scope share the terminal.
 value WorkScope {
     kind: WorkScopeKind
-    inner: String       -- worktree path, conversation id, or "" for Global
+    inner: String       -- persisted WorkScope ID, unattached conversation ID, or "" for Global
 }
 
 value TerminalDimensions {
@@ -126,7 +126,7 @@ value CommandRecord {
 -- worktree or conversation — used by the /new page and any UI surface
 -- that wants a terminal that outlives every individual conversation.
 enum WorkScopeKind {
-    worktree
+    work
     | conversation
     | global
 }
@@ -147,8 +147,7 @@ enum ShellIntegrationStatus {
 entity Terminal {
     -- The WorkScope this terminal belongs to (REQ-TERM-WS-001).
     -- A conversation accesses "its" terminal by resolving its own
-    -- WorkScope (worktree path if managed/branch, conversation id for
-    -- Direct mode) and looking up the matching Terminal. Continuation
+    -- persisted WorkScope ID and looking up the matching Terminal. Continuation
     -- conversations resolving to the same scope share the terminal.
     -- The Global scope holds a single terminal that is not associated
     -- with any conversation; see the UserOpensTerminal rule.
@@ -247,9 +246,9 @@ config {
 
 -- REQ-TERM-001, REQ-TERM-002, REQ-TERM-WS-001: Terminal opened, PTY spawned
 rule TerminalOpened {
-    -- A UserOpensTerminal is keyed by WorkScope. For Conversation and
-    -- Worktree scopes the cwd is derived from the scope (conversation
-    -- working_dir or worktree path). For Global, the cwd is $HOME.
+    -- A UserOpensTerminal is keyed by resource identity. Ordinary Work cwd
+    -- resolves from the persisted environment, not the opaque ID payload.
+    -- Unattached fallback uses its transcript cwd; Global uses $HOME.
     when: UserOpensTerminal(terminal, scope)
 
     requires: terminal.status = absent
@@ -272,9 +271,9 @@ rule TerminalOpened {
         --        dup2(slave_fd, 0/1/2)         slave is stdin, stdout, stderr
         --        close(slave_fd)               fd already dup'd
         --        chdir(spawn_cwd_for_scope(scope))
-        --        --   WorkScope::Conversation(id) -> conv.working_dir (REQ-BED-010)
-        --        --   WorkScope::Worktree(path)   -> path
-        --        --   WorkScope::Global           -> $HOME
+        --        --   Work(id) -> persisted environment effective path (REQ-BED-010)
+        --        --   Unattached(id) -> fallback transcript cwd
+        --        --   GlobalTerminal -> $HOME
         --        execvp($SHELL, ["-i"])         with explicit env (REQ-TERM-002)
         --      [parent]:
         --        close(slave_fd)               parent must not hold slave open
@@ -583,18 +582,15 @@ rule AgentCallsTerminalCommandHistoryEmpty {
     ensures: AgentReceivesError("no commands have completed in this terminal session yet")
 }
 
--- REQ-TERM-012: Terminal torn down when its Conversation-scope conversation ends.
--- Only fires for Conversation-scoped terminals (Direct-mode conversations
--- with no worktree). Worktree-scoped terminals survive across conversation
--- continuations and tear down on worktree cleanup (see
--- TerminalTornDownWithWorkScopeCleanup). Global-scoped terminals never
--- tear down via conversation lifecycle.
+-- REQ-TERM-012: only unattached fallback terminals use transcript lifecycle.
+-- Ordinary Direct/non-Git and Git-backed terminals use persisted WorkScope
+-- ownership and survive ContextExhausted/HandedOff without a PTY respawn.
 rule TerminalAbandonedWithConversation {
     -- Subscribes to bedrock's ConversationBecameTerminal lifecycle announcement,
     -- emitted whenever a conversation's is_terminal derived value becomes true
     -- (status enters { context_exhausted, terminal, completed, failed }).
     -- Using the named event rather than a cross-spec state-watch keeps the
-    -- cross-spec contract explicit and navigable. See tasks/08658 for rationale.
+    -- cross-spec contract explicit and navigable.
     when: ConversationBecameTerminal(terminal, conversation)
     -- Subscribed to bedrock's lifecycle announcement. The implementation
     -- wires this in the runtime executor; treated as a local event in
@@ -619,46 +615,26 @@ rule TerminalAbandonedWithConversation {
         -- requires guard naturally excludes them.
 }
 
--- REQ-TERM-WS-001 / REQ-TERM-012: Worktree-scoped terminal tears down on
--- the same cleanup events that destroy the worktree-scoped tmux server
--- (REQ-TMUX-WS-002): archive, abandon, mark-merged, hard-delete. The
--- preservation rule inherits from tmux — if any live conversation
--- other than the one being deleted still resolves to the same WorkScope (a
--- continuation that inherits it, or a live sibling such as a Work-mode
--- sub-agent sharing its parent's scope), the terminal is preserved; teardown
--- fires only when the last live owner is gone. A live conversation here is one
--- that is BOTH non-terminal in state AND not archived, determined from the
--- persisted conversation rows in the DATABASE — NOT from the set of live
--- runtime handles. A non-terminal conversation with no runtime handle (after a
--- server restart or runtime eviction) is still a live owner; enumerating
--- handles would tear down a scope whose surviving owner is handle-less. An
--- archived conversation does not count as a live owner even while non-terminal,
--- because archiving a chain archives earlier members before the leaf's cascade
--- runs.
---
--- Trigger params: `terminal` is the affected entity; `scope` is the
--- WorkScope whose lifecycle hook fired. Mirrors
--- `TerminalAbandonedWithConversation` above, which carries
--- (terminal, conversation) as a local event subscribed to bedrock's
--- announcement. `WorkScopeCleaned` is similarly a local-event name the
--- implementation wires to the unified `run_resource_cleanup_cascade`
--- in `api/handlers.rs` (Step 4) so the cross-spec contract stays
--- explicit and navigable.
+-- REQ-TERM-WS-001 / REQ-TERM-012: opaque persisted-scope cleanup owns teardown.
+-- Individual transcript handoff/exhaustion does not emit this cleanup.
+-- Aggregate retirement does not accept same-aggregate subordinate/continuation
+-- rows as independent retaining owners; distinct Open aggregate ownership and
+-- unresolved identity conflicts are handled by durable retirement authority.
 rule TerminalTornDownWithWorkScopeCleanup {
     when: WorkScopeCleaned(terminal, scope)
 
     requires: terminal.status = active
     requires: terminal.scope = scope
-    requires: scope.kind = worktree
+    requires: scope.kind = work
 
     ensures: MasterFdClosed(terminal)
     ensures: terminal.status = absent
 
     @guidance
-        -- WorkScopeCleaned fires from the same project-lifecycle hooks
-        -- that drive REQ-TMUX-WS-002. Conversation end alone does NOT
-        -- fire this — a Worktree-scoped terminal survives every individual
-        -- conversation in that worktree.
+        -- WorkScopeCleaned is authorized by scope/aggregate retirement,
+        -- including durable Close. Conversation end alone does NOT
+        -- fire this — a persisted-scope terminal survives individual
+        -- transcript handoffs, including Direct/non-Git continuation.
         --
         -- A Global-scoped terminal has no automatic teardown path; it
         -- lives for the lifetime of the Phoenix process. UserClosedTerminal
@@ -829,8 +805,7 @@ rule CwdReportedFromOsc7 {
 
 -- REQ-TERM-003, REQ-TERM-WS-001: at most one live terminal per WorkScope.
 -- The ActiveTerminals registry HashMap is keyed by WorkScope::stable_key()
--- and stable_key() is injective across the three variants (disjoint
--- "worktree:", "conversation:", "global:" prefixes). Two conversations
+-- and stable_key() uses disjoint resource namespaces. Two conversations
 -- that resolve to the same WorkScope therefore address the same Terminal
 -- entry — they share rather than collide.
 invariant OneTerminalPerWorkScope {

@@ -170,6 +170,7 @@ export function MessageListFixture({ scenario }: Props) {
     setMessages((current) => {
       const sequenceId = current.length + 1;
       return [...current, {
+        event_presentation: null,
         message_id: `fixture-tail-${sequenceId}`,
         conversation_id: data.conversationId,
         sequence_id: sequenceId,

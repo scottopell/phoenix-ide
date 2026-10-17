@@ -13,6 +13,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -33,13 +34,30 @@ HANDOFF_PROTOCOL_VERSION = 1
 FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
+CURRENT_SCHEMA_BASELINE_VERSION = 123
+CURRENT_SCHEMA_REQUIRED_MIGRATIONS = {
+    126: "retire_wake_feature_preserving_history",
+    127: "coordinator_owned_work_scope_home",
+    128: "product_creation_provisioning_stage",
+}
+MINIMUM_FREE_AFTER_RESERVATION_BYTES = 20 * 1024 * 1024 * 1024
+CURRENT_SCHEMA_GROWTH_MARGIN_MIN_BYTES = 1024 * 1024 * 1024
+CURRENT_SCHEMA_GROWTH_MARGIN_MAX_BYTES = 8 * 1024 * 1024 * 1024
+CURRENT_SCHEMA_GROWTH_MARGIN_DIVISOR = 10
+CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES = 2 * 1024 * 1024
+MAX_DATABASE_PROOF_BYTES = 1024 * 1024
+CAPACITY_EVIDENCE_BUDGET_BYTES = 4096
+PROJECTED_MIGRATION_TIMESTAMP = "9999-12-31T23:59:59.999999+00:00"
+DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
 
 TERMINAL_STATES = {
     "committed",
     "precondition_failed",
     "activation_failed_rolled_back",
     "activation_failed_rollback_failed",
+    "activation_failed_database_committed",
     "ordinary_activation_failed_rollback_failed",
+    "ordinary_activation_failed_forward_only",
     "rejected_concurrent",
 }
 
@@ -62,10 +80,40 @@ class PairedDatabaseUpgrade:
 
 
 @dataclasses.dataclass(frozen=True)
+class CurrentSchemaUpgrade:
+    database_path: str
+    backup_path: str
+    proof_path: str
+    controller_source_commit: str
+    controller_helper_sha256: str
+    controller_helper_path: str
+    migration_registry_sha256: str
+    migration_registry_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class OrdinaryForwardMigration:
+    database_path: str
+    helper_sha256: str
+    helper_path: str
+    migration_registry_sha256: str
+    migration_registry_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class DatabaseCapacityPlan:
+    reservation_bytes: int
+    ceiling_bytes: int
+
+
+@dataclasses.dataclass(frozen=True)
 class DatabaseCapacityReservation:
     backup_path: Path
     restore_path: Path
     capacity_bytes: int
+    ceiling_bytes: Optional[int] = None
+    observed_source_bytes: Optional[int] = None
+    measured_at: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,6 +155,8 @@ class Manifest:
     health_timeout_secs: float = 120.0
     # None is intentional for pre-feature runtime-only manifests.
     paired_database_upgrade: Optional[PairedDatabaseUpgrade] = None
+    current_schema_upgrade: Optional[CurrentSchemaUpgrade] = None
+    ordinary_forward_migration: Optional[OrdinaryForwardMigration] = None
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -119,6 +169,10 @@ class Manifest:
         raw["previous"] = Identity(**raw["previous"]) if raw.get("previous") else None
         paired = raw.get("paired_database_upgrade")
         raw["paired_database_upgrade"] = PairedDatabaseUpgrade(**paired) if paired else None
+        current = raw.get("current_schema_upgrade")
+        raw["current_schema_upgrade"] = CurrentSchemaUpgrade(**current) if current else None
+        ordinary = raw.get("ordinary_forward_migration")
+        raw["ordinary_forward_migration"] = OrdinaryForwardMigration(**ordinary) if ordinary else None
         # Runtime-only manifests written before the paired feature omit the field.
         raw.pop("database_mode", None)
         for legacy_key in ("database_path", "database_backup_path", "database_backup_sha256", "database_backup_verified", "database_proof_path", "controller_source_commit", "controller_helper_sha256", "controller_helper_path"):
@@ -131,6 +185,21 @@ class ActivationError(RuntimeError):
 
 
 class ConcurrentDeploy(ActivationError):
+    pass
+
+
+class CurrentSchemaPreconditionFailure(ActivationError):
+    pass
+
+
+class RecoveryModeMismatch(ActivationError):
+    pass
+
+class CleanupPreconditionRejected(ActivationError):
+    pass
+
+
+class DatabaseCapacityCleanupFailure(ActivationError):
     pass
 
 
@@ -239,6 +308,8 @@ def write_status(
     *,
     failure: Optional[str] = None,
     rollback_failure: Optional[str] = None,
+    cleanup_failure: Optional[str] = None,
+    precondition_cleanup_completed: bool = False,
     committed_diagnostic: Optional[str] = None,
     finalization_pending: bool = False,
     recovery_mode: Optional[str] = None,
@@ -262,10 +333,18 @@ def write_status(
         "updated_at": utc_now(),
         "failure": failure,
         "rollback_failure": rollback_failure,
+        "cleanup_failure": cleanup_failure,
+        "precondition_cleanup_completed": precondition_cleanup_completed,
         "committed_diagnostic": committed_diagnostic,
         "finalization_pending": finalization_pending,
         "recovery_mode": recovery_mode,
     }
+    if (
+        isinstance(prior, dict)
+        and prior.get("transaction_id") == manifest.transaction_id
+        and "prepared_mode" in prior
+    ):
+        status["prepared_mode"] = prior["prepared_mode"]
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
 
@@ -286,9 +365,10 @@ def verify_staged(path: Optional[str], expected_hash: Optional[str], description
 
 
 def database_paths(manifest: Manifest) -> tuple[Path, ...]:
-    if manifest.paired_database_upgrade is None:
-        raise ActivationError("paired database upgrade is not configured")
-    database = Path(manifest.paired_database_upgrade.database_path)
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("prepared database upgrade is not configured")
+    database = Path(upgrade.database_path)
     return tuple(database.parent / name for name in (database.name, database.name + "-wal", database.name + "-shm"))
 
 
@@ -305,6 +385,19 @@ def _regular_nosymlink(path: Path, description: str, *, required: bool = True) -
         raise ActivationError(f"{description} is not a regular non-symlink file")
 
 
+def prepared_database_upgrade(
+    manifest: Manifest,
+) -> PairedDatabaseUpgrade | CurrentSchemaUpgrade | None:
+    modes = tuple(
+        mode
+        for mode in (manifest.paired_database_upgrade, manifest.current_schema_upgrade)
+        if mode is not None
+    )
+    if len(modes) > 1:
+        raise ActivationError("prepared database upgrade modes are mutually exclusive")
+    return modes[0] if modes else None
+
+
 def _private_transaction_dir(path: Path) -> Path:
     try:
         mode = path.lstat().st_mode
@@ -319,12 +412,12 @@ def _private_transaction_dir(path: Path) -> Path:
 
 
 def _paired_path_context(manifest: Manifest) -> tuple[Path, Path, Path, Path]:
-    paired = manifest.paired_database_upgrade
-    if paired is None:
-        raise ActivationError("paired database upgrade is not configured")
-    database = Path(paired.database_path)
-    backup = Path(paired.backup_path)
-    proof = Path(paired.proof_path)
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("prepared database upgrade is not configured")
+    database = Path(upgrade.database_path)
+    backup = Path(upgrade.backup_path)
+    proof = Path(upgrade.proof_path)
     for path, description in ((database, "paired database"), (backup, "database backup"), (proof, "database proof")):
         if not path.is_absolute() or path.is_symlink():
             raise ActivationError(f"{description} path must be absolute and non-symlink")
@@ -390,10 +483,266 @@ def validate_database(path: Path) -> None:
     try:
         with closing(_readonly_connection(path)) as connection:
             result = connection.execute("PRAGMA integrity_check").fetchone()
+            foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
     except sqlite3.Error as exc:
         raise ActivationError(f"SQLite integrity check failed: {exc}") from exc
     if result != ("ok",):
         raise ActivationError(f"SQLite integrity check returned {result!r}")
+    if foreign_keys:
+        raise ActivationError("SQLite foreign key check failed")
+
+
+def migration_registry(
+    path: Path, *, qualified_current_target: bool = True
+) -> tuple[tuple[int, str], ...]:
+    try:
+        source = path.read_text()
+    except (OSError, UnicodeError) as exc:
+        raise ActivationError("candidate migration registry is unreadable") from exc
+    match = re.search(
+        r"const MIGRATIONS: &\[Migration\] = &\[(.*?)\n\];",
+        source,
+        re.DOTALL,
+    )
+    if match is None:
+        raise ActivationError("candidate migration registry is invalid")
+    entries = match.group(1).strip()
+    block_pattern = re.compile(
+        r'\s*Migration\s*\{((?:"(?:\\.|[^"\\])*"|[^{}"])*?)\}\s*(?:,|$)',
+        re.DOTALL,
+    )
+    field_pattern = re.compile(
+        r'\s*(?:version\s*:\s*(?P<version>[0-9]+)'
+        r'|name\s*:\s*"(?P<name>[^"\\]+)"'
+        r'|sql\s*:\s*(?P<sql>[A-Za-z_][A-Za-z0-9_]*'
+        r'|"(?:\\.|[^"\\])*"'
+        r'|include_str!\(\s*"(?:\\.|[^"\\])*"\s*\)))'
+        r'\s*(?:,|$)',
+        re.DOTALL,
+    )
+    parsed = []
+    position = 0
+    while position < len(entries):
+        block = block_pattern.match(entries, position)
+        if block is None:
+            raise ActivationError("candidate migration registry is invalid")
+        body = block.group(1).strip()
+        fields = {}
+        field_position = 0
+        while field_position < len(body):
+            field = field_pattern.match(body, field_position)
+            if field is None or field.lastgroup in fields:
+                raise ActivationError("candidate migration registry is invalid")
+            fields[field.lastgroup] = field.group(field.lastgroup)
+            field_position = field.end()
+        if set(fields) != {"version", "name", "sql"}:
+            raise ActivationError("candidate migration registry is invalid")
+        parsed.append((int(fields["version"]), fields["name"]))
+        position = block.end()
+    migrations = tuple(parsed)
+    versions = tuple(version for version, _name in migrations)
+    if not migrations or versions != tuple(sorted(set(versions))):
+        raise ActivationError("candidate migration registry is invalid")
+    if qualified_current_target:
+        registry = dict(migrations)
+        if any(
+            registry.get(version) != name
+            for version, name in CURRENT_SCHEMA_REQUIRED_MIGRATIONS.items()
+        ):
+            raise ActivationError(
+                "candidate migration registry lacks required irreversible migrations"
+            )
+        if migrations[-1][0] != max(CURRENT_SCHEMA_REQUIRED_MIGRATIONS):
+            raise ActivationError(
+                "candidate migration registry is newer than the qualified target"
+            )
+    return migrations
+
+
+def database_ledger(path: Path) -> tuple[tuple[int, str], ...]:
+    import sqlite3
+    from contextlib import closing
+    try:
+        with closing(_readonly_connection(path)) as connection:
+            rows = connection.execute(
+                "SELECT version, name FROM _migrations ORDER BY version"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ActivationError("SQLite migration ledger check failed") from exc
+    if any(not isinstance(version, int) or not isinstance(name, str) for version, name in rows):
+        raise ActivationError("SQLite migration ledger is malformed")
+    return tuple((version, name) for version, name in rows)
+
+
+def _validate_product_conversation_schema(connection) -> None:
+    required_tables = {
+        "conversations",
+        "product_conversations",
+        "product_conversation_sources",
+    }
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
+            tuple(sorted(required_tables)),
+        )
+    }
+    missing_tables = sorted(required_tables - tables)
+    if missing_tables:
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: missing table(s) "
+            + ", ".join(missing_tables)
+        )
+
+    conversation_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(conversations)")
+    }
+    if conversation_columns.get("product_conversation_id") != ("TEXT", 0, 0):
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "conversations.product_conversation_id must be nullable TEXT"
+        )
+    conversation_foreign_keys = {
+        (str(row[2]), str(row[3]), str(row[4]), str(row[6]).upper())
+        for row in connection.execute("PRAGMA foreign_key_list(conversations)")
+    }
+    if (
+        "product_conversations",
+        "product_conversation_id",
+        "id",
+        "CASCADE",
+    ) not in conversation_foreign_keys:
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "conversations.product_conversation_id foreign key is missing"
+        )
+
+    source_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(product_conversation_sources)")
+    }
+    required_source_columns = {
+        "target_product_conversation_id": ("TEXT", 0, 1),
+        "source_product_conversation_id": ("TEXT", 1, 0),
+        "source_conversation_id": ("TEXT", 1, 0),
+        "relation_kind": ("TEXT", 1, 0),
+        "relation_key": ("TEXT", 1, 0),
+        "created_at_us": ("INTEGER", 1, 0),
+    }
+    if any(
+        source_columns.get(name) != shape
+        for name, shape in required_source_columns.items()
+    ):
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "product_conversation_sources columns do not match migration 70"
+        )
+    source_foreign_keys = {
+        (str(row[2]), str(row[3]), str(row[4]), str(row[6]).upper())
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(product_conversation_sources)"
+        )
+    }
+    required_source_foreign_keys = {
+        (
+            "product_conversations",
+            "target_product_conversation_id",
+            "id",
+            "CASCADE",
+        ),
+    }
+    if not required_source_foreign_keys.issubset(source_foreign_keys):
+        raise ActivationError(
+            "current-schema migration requires ProductConversation schema: "
+            "product_conversation_sources foreign keys do not match migration 70"
+        )
+
+
+def validate_current_schema_database(
+    path: Path,
+    registry_path: Path,
+    *,
+    migrated: bool = False,
+) -> tuple[tuple[int, str], ...]:
+    import sqlite3
+    from contextlib import closing
+
+    validate_database(path)
+    registry = migration_registry(registry_path)
+    ledger = database_ledger(path)
+    target = tuple(registry)
+    baseline = tuple(
+        item for item in registry if item[0] <= CURRENT_SCHEMA_BASELINE_VERSION
+    )
+    admitted = (target,) if migrated else (baseline, target)
+    if not ledger or ledger not in admitted:
+        qualification = "candidate target" if migrated else "qualified source"
+        raise ActivationError(
+            f"current-schema migration ledger differs from {qualification}"
+        )
+    try:
+        with closing(_readonly_connection(path)) as connection:
+            _validate_product_conversation_schema(connection)
+    except sqlite3.Error as exc:
+        raise ActivationError("current-schema ProductConversation schema check failed") from exc
+    return ledger
+
+
+def database_logical_digest(path: Path) -> str:
+    import sqlite3
+    from contextlib import closing
+
+    try:
+        with closing(_readonly_connection(path)) as connection:
+            schema = connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+            digest = hashlib.sha256()
+            digest.update(json.dumps(schema, separators=(",", ":")).encode())
+            for kind, name, _table, _sql in schema:
+                if kind != "table":
+                    continue
+                quoted = '"' + name.replace('"', '""') + '"'
+                row_hashes = []
+                for row in connection.execute(f"SELECT * FROM {quoted}"):
+                    encoded = [
+                        ("blob", value.hex())
+                        if isinstance(value, bytes)
+                        else (type(value).__name__, value)
+                        for value in row
+                    ]
+                    row_hashes.append(
+                        hashlib.sha256(
+                            json.dumps(
+                                encoded, separators=(",", ":"), ensure_ascii=True
+                            ).encode()
+                        ).digest()
+                    )
+                digest.update(name.encode())
+                digest.update(len(row_hashes).to_bytes(8, "big"))
+                for row_hash in sorted(row_hashes):
+                    digest.update(row_hash)
+            return digest.hexdigest()
+    except sqlite3.Error as exc:
+        raise ActivationError("could not digest SQLite database") from exc
+
+
+def ordinary_forward_policy_applies(manifest: Manifest) -> bool:
+    ordinary = manifest.ordinary_forward_migration
+    if ordinary is None:
+        return False
+    database = Path(ordinary.database_path)
+    ledger = database_ledger(database)
+    if not ledger or ledger[-1][0] != CURRENT_SCHEMA_BASELINE_VERSION:
+        return False
+    registry = verify_staged(
+        ordinary.migration_registry_path,
+        ordinary.migration_registry_sha256,
+        "ordinary candidate migration registry",
+    )
+    validate_current_schema_database(database, registry)
+    return True
 
 
 def validate_legacy_database(path: Path) -> None:
@@ -471,10 +820,334 @@ def _allocate_private_sqlite(path: Path, size: int) -> None:
         raise ActivationError("could not reserve paired database capacity") from exc
 
 
+def _capacity_pool_key(path: Path) -> tuple[str, object]:
+    device = path.stat().st_dev
+    if sys.platform != "darwin":
+        return ("device", device)
+    mount_point = path if path.is_dir() else path.parent
+    mount_point = mount_point.resolve()
+    while not os.path.ismount(mount_point):
+        parent = mount_point.parent
+        if parent == mount_point:
+            raise ActivationError(f"could not identify mount point for {path}")
+        mount_point = parent
+    result = subprocess.run(
+        ["/usr/sbin/diskutil", "info", "-plist", str(mount_point)],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise ActivationError(f"could not identify capacity pool for {path}")
+    try:
+        info = plistlib.loads(result.stdout)
+    except (plistlib.InvalidFileException, ValueError) as exc:
+        raise ActivationError(f"could not parse capacity pool for {path}") from exc
+    container = info.get("APFSContainerReference")
+    if isinstance(container, str) and container:
+        return ("apfs_container", container)
+    return ("device", device)
+
+
+def _current_schema_live_growth_margin(observed: int) -> int:
+    proportional = (
+        observed + CURRENT_SCHEMA_GROWTH_MARGIN_DIVISOR - 1
+    ) // CURRENT_SCHEMA_GROWTH_MARGIN_DIVISOR
+    return min(
+        CURRENT_SCHEMA_GROWTH_MARGIN_MAX_BYTES,
+        max(CURRENT_SCHEMA_GROWTH_MARGIN_MIN_BYTES, proportional),
+    )
+
+
+def _current_schema_reservation_plan(
+    manifest: Manifest,
+    database: Path,
+    backup: Path,
+    restore: Path,
+    observed: int,
+) -> DatabaseCapacityPlan:
+    reservation_parents = (backup.parent, restore.parent)
+    reservations_per_pool: dict[tuple[str, object], int] = {}
+    parent_by_pool: dict[tuple[str, object], Path] = {}
+    paths_by_pool: dict[tuple[str, object], list[Path]] = {}
+    for parent in reservation_parents:
+        pool = _capacity_pool_key(parent)
+        reservations_per_pool[pool] = reservations_per_pool.get(pool, 0) + 1
+        parent_by_pool[pool] = parent
+        paths_by_pool.setdefault(pool, []).append(parent)
+    affected_paths = (
+        database.parent,
+        Path(manifest.target_binary).parent,
+        Path(manifest.target_plist).parent,
+    )
+    for path in affected_paths:
+        paths_by_pool.setdefault(_capacity_pool_key(path), []).append(path)
+
+    ceilings = []
+    allocation_units = []
+    database_pool = _capacity_pool_key(database)
+    evidence_pool = _capacity_pool_key(backup.parent)
+    for pool, count in reservations_per_pool.items():
+        parent = parent_by_pool[pool]
+        free = min(shutil.disk_usage(path).free for path in paths_by_pool[pool])
+        allocation_unit = max(os.statvfs(parent).f_frsize, 4096)
+        allocation_units.append(allocation_unit)
+        evidence_blocks = (
+            CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES if pool == evidence_pool else 0
+        )
+        holds_live_growth = 1 if pool == database_pool else 0
+        available = (
+            free
+            - MINIMUM_FREE_AFTER_RESERVATION_BYTES
+            - evidence_blocks
+        )
+        divisor = count + holds_live_growth
+        per_reservation = max(0, available // divisor)
+        ceilings.append(per_reservation - (per_reservation % allocation_unit))
+
+    for pool, paths in paths_by_pool.items():
+        if (
+            pool not in reservations_per_pool
+            and min(shutil.disk_usage(path).free for path in paths)
+            < MINIMUM_FREE_AFTER_RESERVATION_BYTES
+        ):
+            raise ActivationError(
+                "current-schema migration requires 20 GiB free after backup and restore reservations"
+            )
+
+    common_unit = math.lcm(*allocation_units)
+    ceiling = min(ceilings)
+    ceiling -= ceiling % common_unit
+    if ceiling < observed:
+        raise ActivationError(
+            "current-schema migration requires 20 GiB free after backup and restore reservations"
+        )
+    desired = observed + _current_schema_live_growth_margin(observed)
+    desired += -desired % common_unit
+    return DatabaseCapacityPlan(
+        reservation_bytes=min(desired, ceiling),
+        ceiling_bytes=ceiling,
+    )
+
+
+def _database_proof_bytes(
+    manifest: Manifest,
+    source: Path,
+    *,
+    backup_sha256: str,
+    source_logical_digest: str,
+    backup_logical_digest: str,
+) -> bytes:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("database proof requires a prepared database transaction")
+    payload = {
+        "transaction_id": manifest.transaction_id,
+        "source_commit": manifest.source_commit,
+        "database": str(source),
+        "sha256": backup_sha256,
+        "candidate_binary_sha256": manifest.candidate_binary_sha256,
+        "candidate_plist_sha256": manifest.candidate_plist_sha256,
+        "previous_binary_sha256": manifest.rollback_binary_sha256,
+        "previous_plist_sha256": manifest.rollback_plist_sha256,
+        "controller_source_commit": upgrade.controller_source_commit,
+        "controller_helper_sha256": upgrade.controller_helper_sha256,
+        "database_mode": (
+            "current_schema"
+            if manifest.current_schema_upgrade is not None
+            else "legacy_paired"
+        ),
+    }
+    if manifest.current_schema_upgrade is not None:
+        registry_path = Path(manifest.current_schema_upgrade.migration_registry_path)
+        payload.update(
+            migration_registry_sha256=(
+                manifest.current_schema_upgrade.migration_registry_sha256
+            ),
+            source_ledger=validate_current_schema_database(source, registry_path),
+            target_ledger=migration_registry(registry_path),
+            source_logical_digest=source_logical_digest,
+            backup_logical_digest=backup_logical_digest,
+        )
+    return _encode_database_proof(payload)
+
+
+def _encode_database_proof(payload: dict) -> bytes:
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode()
+    if len(encoded) > MAX_DATABASE_PROOF_BYTES:
+        raise ActivationError(
+            f"database proof exceeds {MAX_DATABASE_PROOF_BYTES} byte capacity bound"
+        )
+    return encoded
+
+
+def _project_migrated_database_proof(proof_bytes: bytes) -> bytes:
+    payload = json.loads(proof_bytes)
+    payload["migration_committed_at"] = PROJECTED_MIGRATION_TIMESTAMP
+    payload["migrated_ledger"] = payload["target_ledger"]
+    payload["migrated_logical_digest"] = "0" * 64
+    return _encode_database_proof(payload)
+
+
+def _allocated_bytes(size: int, allocation_unit: int) -> int:
+    return size + (-size % allocation_unit)
+
+
+def _validate_database_proof_lifecycle_budget(
+    initial_proof: bytes,
+    migrated_proof: bytes,
+    allocation_unit: int,
+) -> None:
+    capacity_evidence = _allocated_bytes(
+        CAPACITY_EVIDENCE_BUDGET_BYTES, allocation_unit
+    )
+    required = max(
+        _allocated_bytes(len(initial_proof), allocation_unit)
+        + _allocated_bytes(len(migrated_proof), allocation_unit)
+        + capacity_evidence,
+        2 * capacity_evidence,
+    )
+    if required > CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES:
+        raise ActivationError(
+            "database proof lifecycle exceeds durable-evidence capacity bound"
+        )
+
+
+def _capacity_observation_path(reservation: DatabaseCapacityReservation) -> Path:
+    return reservation.backup_path.parent / "capacity.json"
+
+
+def _resident_evidence_bytes(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> int:
+    allocation_unit = max(os.statvfs(reservation.backup_path.parent).f_frsize, 4096)
+    proof_path = Path(manifest.current_schema_upgrade.proof_path)
+    resident = 0
+    for path in (_capacity_observation_path(reservation), proof_path):
+        if not path.exists():
+            continue
+        stat = path.stat()
+        blocks = getattr(stat, "st_blocks", 0)
+        resident += (
+            blocks * 512
+            if isinstance(blocks, int) and blocks > 0
+            else _allocated_bytes(stat.st_size, allocation_unit)
+        )
+    if resident > CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES:
+        raise ActivationError("durable evidence exceeds its reserved capacity")
+    return resident
+
+
+def _remaining_evidence_allowance(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> int:
+    return CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES - _resident_evidence_bytes(
+        manifest, reservation
+    )
+
+
+def _require_current_schema_free_space(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> None:
+    directories = {
+        Path(manifest.current_schema_upgrade.database_path).parent,
+        reservation.backup_path.parent,
+        reservation.restore_path.parent,
+        Path(manifest.target_binary).parent,
+        Path(manifest.target_plist).parent,
+    }
+    free_by_pool: dict[tuple[str, str], int] = {}
+    for directory in directories:
+        pool = _capacity_pool_key(directory)
+        free = shutil.disk_usage(directory).free
+        free_by_pool[pool] = min(free_by_pool.get(pool, free), free)
+    if any(
+        free < MINIMUM_FREE_AFTER_RESERVATION_BYTES
+        for free in free_by_pool.values()
+    ):
+        raise ActivationError(
+            "current-schema capacity no longer preserves the 20 GiB safety floor"
+        )
+    remaining = _remaining_evidence_allowance(manifest, reservation)
+    evidence_pool = _capacity_pool_key(reservation.backup_path.parent)
+    if free_by_pool[evidence_pool] < MINIMUM_FREE_AFTER_RESERVATION_BYTES + remaining:
+        raise ActivationError(
+            "current-schema capacity no longer preserves the 20 GiB floor "
+            "plus its remaining durable-evidence allowance"
+        )
+
+
+def _write_capacity_observation(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+    *,
+    rechecked_source_bytes: Optional[int] = None,
+    rechecked_at: Optional[str] = None,
+) -> None:
+    payload = {
+        "transaction_id": manifest.transaction_id,
+        "observed_source_bytes": reservation.observed_source_bytes,
+        "measured_at": reservation.measured_at,
+        "reserved_capacity_bytes": reservation.capacity_bytes,
+        "reservation_ceiling_bytes": reservation.ceiling_bytes,
+        "rechecked_source_bytes": rechecked_source_bytes,
+        "rechecked_at": rechecked_at,
+    }
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    if len(encoded) > CAPACITY_EVIDENCE_BUDGET_BYTES:
+        raise ActivationError("capacity observation exceeds durable-evidence capacity bound")
+    atomic_write(_capacity_observation_path(reservation), encoded)
+
+
+def _remove_capacity_files(*paths: Path) -> None:
+    failures = []
+    parents = set()
+    for path in paths:
+        parents.add(path.parent)
+        try:
+            if path.is_symlink():
+                raise OSError("refusing symlinked capacity evidence")
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+    for parent in parents:
+        try:
+            fsync_dir(parent)
+        except OSError as exc:
+            failures.append(f"{parent}: {exc}")
+    if failures:
+        raise DatabaseCapacityCleanupFailure("; ".join(failures))
+
+
+def _owned_capacity_cleanup_paths(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> tuple[Path, ...]:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("capacity cleanup requires a prepared database mode")
+    proof = Path(upgrade.proof_path)
+    capacity = _capacity_observation_path(reservation)
+    paths = {
+        reservation.backup_path,
+        reservation.restore_path,
+        capacity,
+    }
+    for evidence in (capacity, proof):
+        paths.update(evidence.parent.glob(f".{evidence.name}.*"))
+    for allocation in (reservation.backup_path, reservation.restore_path):
+        paths.update(
+            allocation.with_name(allocation.name + suffix)
+            for suffix in ("-journal", "-wal", "-shm")
+        )
+    return tuple(sorted(paths, key=str))
+
+
 def reserve_database_capacity(manifest: Manifest) -> DatabaseCapacityReservation:
     """Hold backup and restore space while the service is stopped."""
-    if manifest.paired_database_upgrade is None:
-        raise ActivationError("paired database upgrade is not configured")
+    if prepared_database_upgrade(manifest) is None:
+        raise ActivationError("prepared database upgrade is not configured")
     database, backup, proof, transaction_dir = _paired_path_context(manifest)
     _regular_nosymlink(database, "paired database")
     _private_transaction_dir(transaction_dir)
@@ -482,22 +1155,95 @@ def reserve_database_capacity(manifest: Manifest) -> DatabaseCapacityReservation
     for path, description in ((restore, "restore reservation"),):
         if not path.is_absolute() or path.is_symlink():
             raise ActivationError(f"{description} path must be absolute and non-symlink")
-    capacity = _source_capacity_bytes(database)
+    observed = _source_capacity_bytes(database)
+    measured_at = utc_now()
+    projected_proof = None
+    if manifest.current_schema_upgrade is not None:
+        projected_proof = _database_proof_bytes(
+            manifest,
+            database,
+            backup_sha256="0" * 64,
+            source_logical_digest="0" * 64,
+            backup_logical_digest="0" * 64,
+        )
+    plan = (
+        _current_schema_reservation_plan(
+            manifest, database, backup, restore, observed
+        )
+        if manifest.current_schema_upgrade is not None
+        else DatabaseCapacityPlan(observed, observed)
+    )
+    if projected_proof is not None:
+        allocation_unit = max(os.statvfs(backup.parent).f_frsize, 4096)
+        _validate_database_proof_lifecycle_budget(
+            projected_proof,
+            _project_migrated_database_proof(projected_proof),
+            allocation_unit,
+        )
     # Never replace an existing protected snapshot: recovery must retain it.
     if backup.exists() or backup.is_symlink() or proof.exists() or proof.is_symlink():
         raise ActivationError("paired recovery snapshot is already present")
-    _allocate_private_sqlite(backup, capacity)
+    reservation = DatabaseCapacityReservation(
+        backup,
+        restore,
+        plan.reservation_bytes,
+        ceiling_bytes=plan.ceiling_bytes,
+        observed_source_bytes=observed,
+        measured_at=measured_at,
+    )
     try:
-        _allocate_private_sqlite(restore, capacity)
-    except BaseException:
-        backup.unlink(missing_ok=True)
+        _allocate_private_sqlite(backup, plan.reservation_bytes)
+        _allocate_private_sqlite(restore, plan.reservation_bytes)
+        if manifest.current_schema_upgrade is not None:
+            affected_directories = (
+                backup.parent,
+                restore.parent,
+                Path(manifest.target_binary).parent,
+                Path(manifest.target_plist).parent,
+            )
+            reservation_filesystems = {
+                path.stat().st_dev: path for path in affected_directories
+            }
+            if any(
+                shutil.disk_usage(path).free < MINIMUM_FREE_AFTER_RESERVATION_BYTES
+                for path in reservation_filesystems.values()
+            ):
+                raise ActivationError(
+                    "current-schema migration requires 20 GiB free after backup and restore reservations"
+                )
+    except BaseException as exc:
+        try:
+            _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+        except DatabaseCapacityCleanupFailure as cleanup_exc:
+            raise cleanup_exc from exc
         raise
-    return DatabaseCapacityReservation(backup, restore, capacity)
+    try:
+        if manifest.current_schema_upgrade is not None:
+            _require_current_schema_free_space(manifest, reservation)
+        _write_capacity_observation(manifest, reservation)
+    except BaseException as exc:
+        try:
+            _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+        except DatabaseCapacityCleanupFailure as cleanup_exc:
+            raise cleanup_exc from exc
+        raise ActivationError("could not persist paired capacity observation") from exc
+    return reservation
 
 
 def _reservation_still_sufficient(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
     database, _backup, _proof, _transaction = _paired_path_context(manifest)
     required = _source_capacity_bytes(database)
+    rechecked_at = utc_now()
+    if manifest.current_schema_upgrade is not None:
+        _require_current_schema_free_space(manifest, reservation)
+    _write_capacity_observation(
+        manifest,
+        reservation,
+        rechecked_source_bytes=required,
+        rechecked_at=rechecked_at,
+    )
+    if manifest.current_schema_upgrade is not None:
+        _require_current_schema_free_space(manifest, reservation)
     for path in (reservation.backup_path, reservation.restore_path):
         if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
             raise ActivationError("paired database capacity reservation is unavailable")
@@ -508,7 +1254,8 @@ def _reservation_still_sufficient(manifest: Manifest, reservation: DatabaseCapac
 def create_database_backup(manifest: Manifest, reservation: Optional[DatabaseCapacityReservation] = None) -> None:
     import sqlite3
     """Take a SQLite backup API snapshot into the held destination."""
-    if manifest.paired_database_upgrade is None:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
         return
     assert_database_exclusive(manifest)
     source, backup, proof_path, transaction_dir = _paired_path_context(manifest)
@@ -532,24 +1279,36 @@ def create_database_backup(manifest: Manifest, reservation: Optional[DatabaseCap
         _regular_nosymlink(backup, "database backup")
         validate_database(backup)
         observed = sha256(backup)
-        atomic_write(proof_path, (json.dumps({
-            "transaction_id": manifest.transaction_id,
-            "source_commit": manifest.source_commit,
-            "database": str(source),
-            "sha256": observed,
-            "candidate_binary_sha256": manifest.candidate_binary_sha256,
-            "candidate_plist_sha256": manifest.candidate_plist_sha256,
-            "previous_binary_sha256": manifest.rollback_binary_sha256,
-            "previous_plist_sha256": manifest.rollback_plist_sha256,
-            "controller_source_commit": manifest.paired_database_upgrade.controller_source_commit,
-            "controller_helper_sha256": manifest.paired_database_upgrade.controller_helper_sha256,
-        }, sort_keys=True) + "\n").encode(), 0o600)
+        if (
+            manifest.current_schema_upgrade is not None
+            and database_logical_digest(source) != database_logical_digest(backup)
+        ):
+            raise ActivationError("current-schema snapshot contents differ from stopped source")
+        proof_bytes = _database_proof_bytes(
+            manifest,
+            source,
+            backup_sha256=observed,
+            source_logical_digest=(
+                database_logical_digest(source)
+                if manifest.current_schema_upgrade is not None
+                else ""
+            ),
+            backup_logical_digest=(
+                database_logical_digest(backup)
+                if manifest.current_schema_upgrade is not None
+                else ""
+            ),
+        )
+        if manifest.current_schema_upgrade is not None:
+            _require_current_schema_free_space(manifest, reservation)
+        atomic_write(proof_path, proof_bytes, 0o600)
     except (sqlite3.Error, OSError, ValueError) as exc:
         raise ActivationError(f"database snapshot failed: {exc}") from exc
 
 
 def restore_database(manifest: Manifest) -> None:
-    if manifest.paired_database_upgrade is None:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
         return
     assert_database_exclusive(manifest)
     database, backup_path, proof_path, transaction_dir = _paired_path_context(manifest)
@@ -565,13 +1324,17 @@ def restore_database(manifest: Manifest) -> None:
         expected = {
             "transaction_id": manifest.transaction_id,
             "source_commit": manifest.source_commit,
-            "database": manifest.paired_database_upgrade.database_path,
+            "database": upgrade.database_path,
             "candidate_binary_sha256": manifest.candidate_binary_sha256,
             "candidate_plist_sha256": manifest.candidate_plist_sha256,
             "previous_binary_sha256": manifest.rollback_binary_sha256,
             "previous_plist_sha256": manifest.rollback_plist_sha256,
-            "controller_source_commit": manifest.paired_database_upgrade.controller_source_commit,
-            "controller_helper_sha256": manifest.paired_database_upgrade.controller_helper_sha256,
+            "controller_source_commit": upgrade.controller_source_commit,
+            "controller_helper_sha256": upgrade.controller_helper_sha256,
+            "database_mode": "current_schema" if manifest.current_schema_upgrade is not None else "legacy_paired",
+            **({
+                "migration_registry_sha256": manifest.current_schema_upgrade.migration_registry_sha256,
+            } if manifest.current_schema_upgrade is not None else {}),
         }
         if any(proof.get(key) != value for key, value in expected.items()):
             raise ActivationError("paired database snapshot proof context does not match manifest")
@@ -583,6 +1346,17 @@ def restore_database(manifest: Manifest) -> None:
     if backup.stat().st_mode & 0o777 != 0o600:
         raise ActivationError("database backup must be private")
     validate_database(backup)
+    _regular_nosymlink(database, "paired database")
+    if manifest.current_schema_upgrade is not None:
+        registry_path = Path(manifest.current_schema_upgrade.migration_registry_path)
+        validate_current_schema_database(backup, registry_path)
+        if database_logical_digest(backup) != proof.get("source_logical_digest"):
+            raise ActivationError("current-schema backup contents differ from snapshot proof")
+        backup_ledger = validate_current_schema_database(backup, registry_path)
+        if [list(item) for item in backup_ledger] != proof.get("source_ledger"):
+            raise ActivationError("current-schema backup ledger differs from snapshot proof")
+        if [list(item) for item in migration_registry(registry_path)] != proof.get("target_ledger"):
+            raise ActivationError("current-schema target ledger differs from snapshot proof")
     _regular_nosymlink(database, "paired database")
     reserved = _restore_capacity_path(manifest, database)
     if not reserved.exists():
@@ -605,6 +1379,12 @@ def restore_database(manifest: Manifest) -> None:
     os.replace(reserved, database)
     fsync_dir(database.parent)
     validate_database(database)
+    if manifest.current_schema_upgrade is not None:
+        validate_current_schema_database(
+            database, Path(manifest.current_schema_upgrade.migration_registry_path)
+        )
+        if database_logical_digest(database) != proof.get("source_logical_digest"):
+            raise ActivationError("restored current-schema database contents differ from proof")
 
 
 def service_absence_confirmed(output: str, label: str, uid: int) -> bool:
@@ -760,24 +1540,38 @@ def restore(
     candidate_binary_mutated: bool = True,
     rollback_plist: Optional[Path] = None,
 ) -> None:
+    upgrade = prepared_database_upgrade(manifest)
     try:
         launchctl.stop()
-        if manifest.paired_database_upgrade is not None:
+        if upgrade is not None:
             state, pid = launchctl.inspect()
             if state != "not_loaded" or pid is not None:
                 raise ActivationError("candidate remains loaded after stop")
     except ActivationError:
-        if manifest.paired_database_upgrade is not None:
+        if upgrade is not None:
             raise
-    if manifest.paired_database_upgrade is not None:
+    if upgrade is not None:
         quarantined = quarantine_paired_plist(manifest)
         if rollback_plist == Path(manifest.target_plist):
             rollback_plist = quarantined
-    if manifest.paired_database_upgrade is not None and database_snapshot:
-        restore_database(manifest)
-    elif manifest.paired_database_upgrade is not None:
+    if upgrade is not None and database_snapshot:
         assert_database_exclusive(manifest)
-        validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+        if (
+            manifest.current_schema_upgrade is not None
+            and not current_schema_database_is_uncommitted(manifest)
+        ):
+            raise ActivationError(
+                "current-schema database changed before exclusive snapshot replay"
+            )
+        restore_database(manifest)
+    elif upgrade is not None:
+        assert_database_exclusive(manifest)
+        if manifest.paired_database_upgrade is not None:
+            validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+        else:
+            validate_current_schema_database(
+                Path(upgrade.database_path), _current_schema_registry(manifest)
+            )
         if sha256(Path(manifest.target_binary)) != manifest.rollback_binary_sha256:
             raise ActivationError("unchanged predecessor binary proof failed")
         captured = captured_paired_plist(manifest)
@@ -804,7 +1598,7 @@ def restore(
             prepared_binary, _prepared_plist = prepared_rollback
             commit_atomic_install(prepared_binary, Path(manifest.target_binary))
 
-    if manifest.paired_database_upgrade is not None:
+    if upgrade is not None:
         rollback_plist = rollback_plist or captured_paired_plist(manifest)
         if rollback_plist is None:
             raise ActivationError("captured predecessor configuration is unverified")
@@ -845,11 +1639,11 @@ def restore(
     )
     try:
         restore_deployed_sha(manifest)
-        if manifest.paired_database_upgrade is not None:
+        if upgrade is not None:
             assert rollback_plist is not None
             commit_atomic_install(publication, Path(manifest.target_plist))
     except Exception as exc:
-        if manifest.paired_database_upgrade is not None:
+        if upgrade is not None:
             raise VerifiedPredecessorFinalizationError(str(exc)) from exc
         raise
 
@@ -858,13 +1652,13 @@ def write_verified_predecessor_status(manifest: Manifest, **diagnostics) -> None
     try:
         write_status(manifest, "activation_failed_rolled_back", **diagnostics)
     except Exception as exc:
-        if manifest.paired_database_upgrade is not None:
+        if prepared_database_upgrade(manifest) is not None:
             raise VerifiedPredecessorFinalizationError(str(exc)) from exc
         raise
 
 
 def finalize_verified_predecessor(manifest: Manifest, failure: str | None) -> None:
-    if manifest.paired_database_upgrade is not None:
+    if prepared_database_upgrade(manifest) is not None:
         try:
             checkpoint = json.loads(Path(manifest.status_path).read_text())
             if not isinstance(checkpoint, dict) or checkpoint.get("transaction_id") != manifest.transaction_id or checkpoint.get("recovery_mode") not in {"unchanged_predecessor", "snapshot_restored"}:
@@ -874,6 +1668,18 @@ def finalize_verified_predecessor(manifest: Manifest, failure: str | None) -> No
         except Exception as exc:
             raise VerifiedPredecessorFinalizationError(f"verified predecessor capacity finalization failed: {exc}") from exc
     write_verified_predecessor_status(manifest, failure=failure)
+
+
+def release_durable_terminal_claim(
+    manifest: Manifest, *, required_state: Optional[str] = None
+) -> bool:
+    if not status_is_durable_terminal(manifest):
+        return False
+    status = read_status(manifest)
+    if required_state is not None and status.get("state") != required_state:
+        return False
+    fsync_dir(Path(manifest.status_path).parent)
+    return release_claim(manifest)
 
 
 def release_claim(manifest: Manifest) -> bool:
@@ -886,12 +1692,28 @@ def release_claim(manifest: Manifest) -> bool:
             if claim.read_text().strip() != manifest.transaction_id:
                 return False
             claim.unlink()
+            try:
+                fsync_dir(claim.parent)
+            except OSError:
+                try:
+                    fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    pass
+                else:
+                    try:
+                        os.write(fd, f"{manifest.transaction_id}\n".encode())
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                raise
             return True
         except FileNotFoundError:
             return False
 
 
 def request_helper_bootout(uid: int, helper_label: str) -> None:
+    if not helper_label.startswith(f"{DEPLOY_HELPER_LABEL_PREFIX}."):
+        raise ActivationError("refusing to boot out an unverified helper label")
     subprocess.Popen(
         ["launchctl", "bootout", f"gui/{uid}/{helper_label}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
@@ -899,35 +1721,224 @@ def request_helper_bootout(uid: int, helper_label: str) -> None:
 
 
 def validate_manifest_mode(manifest: Manifest) -> None:
-    paired = manifest.paired_database_upgrade
-    if manifest.source_kind == "prepared_artifact" and paired is None:
-        raise ActivationError("prepared artifact requires paired database mode")
-    if paired is not None:
-        if manifest.source_kind != "prepared_artifact":
-            raise ActivationError("paired database mode requires a prepared artifact candidate")
-        if not FULL_GIT_SHA_RE.fullmatch(paired.controller_source_commit):
-            raise ActivationError("paired mode requires exact controller source binding")
-        if not paired.controller_helper_sha256 or not paired.controller_helper_path:
-            raise ActivationError("paired mode requires helper equivalence binding")
-        for raw_path in (paired.database_path, paired.backup_path, paired.proof_path, paired.controller_helper_path):
+    upgrade = prepared_database_upgrade(manifest)
+    if manifest.source_kind not in {
+        "prepared_artifact",
+        "local_head",
+        "published_release",
+    }:
+        raise ActivationError("manifest source kind is unsupported")
+    if manifest.source_kind == "prepared_artifact" and upgrade is None:
+        raise ActivationError("prepared artifact requires an explicit database upgrade mode")
+    ordinary = manifest.ordinary_forward_migration
+    if ordinary is not None:
+        if (
+            upgrade is not None
+            or manifest.source_kind not in {"local_head", "published_release"}
+        ):
+            raise ActivationError("ordinary forward policy cannot be combined with prepared mode")
+        for raw_path in (
+            ordinary.database_path,
+            ordinary.migration_registry_path,
+            ordinary.helper_path,
+        ):
             if not Path(raw_path).is_absolute() or Path(raw_path).is_symlink():
-                raise ActivationError("paired mode paths must be absolute non-symlinks")
-        helper = Path(paired.controller_helper_path)
-        running_helper = Path(__file__).resolve()
-        if helper.resolve() != running_helper:
-            raise ActivationError("paired mode helper path is not the running helper")
-        if not helper.is_file() or sha256(helper) != paired.controller_helper_sha256:
-            raise ActivationError("controller helper bytes changed")
-        _database, _backup, _proof, _transaction_dir = _paired_path_context(manifest)
-        if _transaction_dir != helper.parent:
-            raise ActivationError("paired snapshot must belong to the helper transaction")
-        if manifest.previous is None or manifest.rollback_binary_sha256 is None or manifest.rollback_plist_sha256 is None:
-            raise ActivationError("paired mode requires a predecessor")
-        database = str(Path(paired.database_path))
-        if _plist_database_path(Path(manifest.candidate_plist)) != database or _plist_database_path(Path(manifest.rollback_plist or "")) != database:
-            raise ActivationError("paired database path differs between candidate, predecessor, and manifest")
+                raise ActivationError("ordinary forward policy paths must be absolute non-symlinks")
+        helper = verify_staged(
+            ordinary.helper_path,
+            ordinary.helper_sha256,
+            "ordinary retained helper",
+        )
+        registry = verify_staged(
+            ordinary.migration_registry_path,
+            ordinary.migration_registry_sha256,
+            "ordinary candidate migration registry",
+        )
+        if registry.parent != Path(manifest.candidate_binary).parent or helper.parent != registry.parent:
+            raise ActivationError("ordinary forward evidence must belong to the helper transaction")
+        migration_registry(registry, qualified_current_target=False)
+        if _plist_database_path(Path(manifest.candidate_plist)) != ordinary.database_path:
+            raise ActivationError("ordinary migration database path differs from candidate configuration")
+    if upgrade is None:
+        return
+    if manifest.source_kind != "prepared_artifact":
+        raise ActivationError("prepared database mode requires a prepared artifact candidate")
+    if not FULL_GIT_SHA_RE.fullmatch(upgrade.controller_source_commit):
+        raise ActivationError("prepared mode requires exact controller source binding")
+    if not upgrade.controller_helper_sha256 or not upgrade.controller_helper_path:
+        raise ActivationError("prepared mode requires helper equivalence binding")
+    mode_paths = [
+        upgrade.database_path,
+        upgrade.backup_path,
+        upgrade.proof_path,
+        upgrade.controller_helper_path,
+    ]
+    if manifest.current_schema_upgrade is not None:
+        mode_paths.append(manifest.current_schema_upgrade.migration_registry_path)
+    for raw_path in mode_paths:
+        if not Path(raw_path).is_absolute() or Path(raw_path).is_symlink():
+            raise ActivationError("prepared mode paths must be absolute non-symlinks")
+    helper = Path(upgrade.controller_helper_path)
+    running_helper = Path(__file__).resolve()
+    if helper.resolve() != running_helper:
+        raise ActivationError("prepared mode helper path is not the running helper")
+    if not helper.is_file() or sha256(helper) != upgrade.controller_helper_sha256:
+        raise ActivationError("controller helper bytes changed")
+    _database, _backup, _proof, transaction_dir = _paired_path_context(manifest)
+    if transaction_dir != helper.parent:
+        raise ActivationError("prepared snapshot must belong to the helper transaction")
+    if manifest.previous is None or manifest.rollback_binary_sha256 is None or manifest.rollback_plist_sha256 is None:
+        raise ActivationError("prepared mode requires a predecessor")
+    database = str(Path(upgrade.database_path))
+    if _plist_database_path(Path(manifest.candidate_plist)) != database or _plist_database_path(Path(manifest.rollback_plist or "")) != database:
+        raise ActivationError("database path differs between candidate, predecessor, and manifest")
+    if manifest.current_schema_upgrade is not None:
+        registry = verify_staged(
+            manifest.current_schema_upgrade.migration_registry_path,
+            manifest.current_schema_upgrade.migration_registry_sha256,
+            "candidate migration registry",
+        )
+        if registry.parent != transaction_dir:
+            raise ActivationError("migration registry must belong to the helper transaction")
+        migration_registry(registry)
 
 
+
+
+def _current_schema_registry(manifest: Manifest) -> Path:
+    current = manifest.current_schema_upgrade
+    if current is None:
+        raise ActivationError("current-schema upgrade is not configured")
+    return verify_staged(
+        current.migration_registry_path,
+        current.migration_registry_sha256,
+        "candidate migration registry",
+    )
+
+
+def _snapshot_proof(manifest: Manifest) -> dict:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("prepared database upgrade is not configured")
+    path = Path(upgrade.proof_path)
+    _regular_nosymlink(path, "database proof")
+    if path.stat().st_mode & 0o777 != 0o600:
+        raise ActivationError("database proof must be private")
+    try:
+        proof = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ActivationError("database snapshot proof is unreadable") from exc
+    expected = {
+        "transaction_id": manifest.transaction_id,
+        "source_commit": manifest.source_commit,
+        "database": upgrade.database_path,
+        "candidate_binary_sha256": manifest.candidate_binary_sha256,
+        "candidate_plist_sha256": manifest.candidate_plist_sha256,
+        "previous_binary_sha256": manifest.rollback_binary_sha256,
+        "previous_plist_sha256": manifest.rollback_plist_sha256,
+        "controller_source_commit": upgrade.controller_source_commit,
+        "controller_helper_sha256": upgrade.controller_helper_sha256,
+        "database_mode": "current_schema" if manifest.current_schema_upgrade is not None else "legacy_paired",
+    }
+    if manifest.current_schema_upgrade is not None:
+        registry_path = _current_schema_registry(manifest)
+        registry = migration_registry(registry_path)
+        expected["migration_registry_sha256"] = manifest.current_schema_upgrade.migration_registry_sha256
+        expected["target_ledger"] = [list(item) for item in registry]
+    if not isinstance(proof, dict) or any(proof.get(key) != value for key, value in expected.items()):
+        raise ActivationError("database snapshot proof context mismatch")
+    backup = Path(upgrade.backup_path)
+    _regular_nosymlink(backup, "database backup")
+    if sha256(backup) != proof.get("sha256"):
+        raise ActivationError("database backup checksum mismatch")
+    if manifest.current_schema_upgrade is not None:
+        source_ledger = validate_current_schema_database(backup, registry_path)
+        if proof.get("source_ledger") != [list(item) for item in source_ledger]:
+            raise ActivationError("database snapshot proof context mismatch")
+        if database_logical_digest(backup) != proof.get("source_logical_digest"):
+            raise ActivationError("database backup contents differ from snapshot proof")
+    return proof
+
+
+def current_schema_database_is_uncommitted(manifest: Manifest) -> bool:
+    current = manifest.current_schema_upgrade
+    if current is None:
+        raise ActivationError("current-schema upgrade is not configured")
+    proof = _snapshot_proof(manifest)
+    database = Path(current.database_path)
+    try:
+        ledger = validate_current_schema_database(database, _current_schema_registry(manifest))
+        return (
+            [list(item) for item in ledger] == proof.get("source_ledger")
+            and database_logical_digest(database) == proof.get("source_logical_digest")
+        )
+    except ActivationError:
+        return False
+
+
+def run_current_schema_migration(
+    manifest: Manifest,
+    reservation: DatabaseCapacityReservation,
+) -> None:
+    current = manifest.current_schema_upgrade
+    if current is None:
+        return
+    database = Path(current.database_path)
+    registry = _current_schema_registry(manifest)
+    proof = _snapshot_proof(manifest)
+    if not current_schema_database_is_uncommitted(manifest):
+        raise ActivationError("current-schema database changed before offline migration")
+    assert_database_exclusive(manifest)
+    try:
+        with Path(manifest.candidate_plist).open("rb") as stream:
+            plist = plistlib.load(stream)
+        plist_environment = plist.get("EnvironmentVariables", {})
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        raise ActivationError("candidate launchd environment is unreadable") from exc
+    if not isinstance(plist_environment, dict):
+        raise ActivationError("candidate launchd environment is malformed")
+    environment = os.environ.copy()
+    environment.update({str(key): str(value) for key, value in plist_environment.items()})
+    if environment.get("PHOENIX_DB_PATH") != str(database):
+        raise ActivationError("candidate migration database path differs from manifest")
+    try:
+        result = subprocess.run(
+            [manifest.target_binary, "--migrate-only"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=7200,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ActivationError("candidate offline migration could not complete") from exc
+    assert_database_exclusive(manifest)
+    if result.returncode != 0:
+        raise ActivationError(
+            f"candidate offline migration failed with exit {result.returncode}"
+        )
+    migrated_ledger = validate_current_schema_database(database, registry, migrated=True)
+    migrated_size = _source_capacity_bytes(database)
+    if migrated_size > reservation.capacity_bytes:
+        raise ActivationError(
+            "migrated database grew beyond its reserved capacity after commit"
+        )
+    _require_current_schema_free_space(manifest, reservation)
+    proof["migration_committed_at"] = utc_now()
+    proof["migrated_ledger"] = migrated_ledger
+    proof["migrated_logical_digest"] = database_logical_digest(database)
+    proof_path = Path(current.proof_path)
+    encoded = _encode_database_proof(proof)
+    allocation_unit = max(os.statvfs(proof_path.parent).f_frsize, 4096)
+    _validate_database_proof_lifecycle_budget(
+        b"0" * proof_path.stat().st_size,
+        encoded,
+        allocation_unit,
+    )
+    _require_current_schema_free_space(manifest, reservation)
+    atomic_write(proof_path, encoded, 0o600)
 
 
 def validate_manifest_identities(manifest: Manifest) -> None:
@@ -951,6 +1962,21 @@ def validate_manifest_identities(manifest: Manifest) -> None:
         raise ActivationError("previous runtime identity is malformed")
 
 
+def require_fresh_prepared_activation(manifest: Manifest) -> None:
+    if manifest.current_schema_upgrade is None:
+        return
+    status = read_status(manifest)
+    if (
+        status.get("transaction_id") == manifest.transaction_id
+        and status.get("state") == "prepared"
+        and not status.get("finalization_pending", False)
+    ):
+        return
+    raise ActivationError(
+        "prepared activation requires the matching fresh prepared transaction"
+    )
+
+
 def activate(manifest: Manifest) -> str:
     lock_path = Path(manifest.lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -960,9 +1986,12 @@ def activate(manifest: Manifest) -> str:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another deployment is already activating") from exc
 
+        require_fresh_prepared_activation(manifest)
+
         prepared_installs: list[Path] = []
         prepared_rollback: Optional[tuple[Path, Path]] = None
         capacity_reservation: Optional[DatabaseCapacityReservation] = None
+        ordinary_forward_only = False
         try:
             validate_manifest_identities(manifest)
             validate_manifest_mode(manifest)
@@ -976,7 +2005,7 @@ def activate(manifest: Manifest) -> str:
             prepared_installs.append(prepared_candidate_binary)
             prepared_candidate_plist = (
                 prepare_plist_publication(candidate_plist, Path(manifest.target_plist))
-                if manifest.paired_database_upgrade is not None
+                if prepared_database_upgrade(manifest) is not None
                 else prepare_atomic_install(candidate_plist, Path(manifest.target_plist), 0o600)
             )
             prepared_installs.append(prepared_candidate_plist)
@@ -992,7 +2021,7 @@ def activate(manifest: Manifest) -> str:
                 prepared_installs.append(prepared_rollback_binary)
                 prepared_rollback_plist = (
                     prepare_plist_publication(rollback_plist, Path(manifest.target_plist))
-                    if manifest.paired_database_upgrade is not None
+                    if prepared_database_upgrade(manifest) is not None
                     else prepare_atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
                 )
                 prepared_installs.append(prepared_rollback_plist)
@@ -1004,13 +2033,32 @@ def activate(manifest: Manifest) -> str:
                 manifest.rollback_plist_sha256,
             )):
                 raise ActivationError("first-install rollback inputs are inconsistent")
+            ordinary_forward_only = ordinary_forward_policy_applies(manifest)
+            upgrade = prepared_database_upgrade(manifest)
             if manifest.paired_database_upgrade is not None:
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+            elif manifest.current_schema_upgrade is not None:
+                validate_current_schema_database(
+                    Path(manifest.current_schema_upgrade.database_path),
+                    _current_schema_registry(manifest),
+                )
+            if upgrade is not None:
                 capacity_reservation = reserve_database_capacity(manifest)
         except Exception as exc:
             for prepared in prepared_installs:
                 prepared.unlink(missing_ok=True)
-            write_status(manifest, "precondition_failed", failure=str(exc))
+            cleanup_pending = isinstance(exc, DatabaseCapacityCleanupFailure)
+            if cleanup_pending:
+                write_status(
+                    manifest,
+                    "precondition_cleanup_pending",
+                    failure=str(exc.__cause__ or exc),
+                    cleanup_failure=str(exc),
+                )
+            else:
+                write_status(manifest, "precondition_failed", failure=str(exc))
+            if manifest.current_schema_upgrade is not None and not cleanup_pending:
+                raise CurrentSchemaPreconditionFailure(str(exc)) from exc
             raise
 
         launchctl = Launchctl(manifest)
@@ -1020,39 +2068,78 @@ def activate(manifest: Manifest) -> str:
         candidate_binary_mutated = False
         database_snapshot = False
         committed_durable = False
+        current_schema_committed = False
+        current_schema_migration_started = False
+        ordinary_candidate_started = False
         try:
+            upgrade = prepared_database_upgrade(manifest)
             if manifest.paired_database_upgrade is not None:
-                # Production owns the database until launchd stops it; only the
-                # read-only legacy shape gate is safe before disruption.
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+            elif manifest.current_schema_upgrade is not None:
+                validate_current_schema_database(
+                    Path(manifest.current_schema_upgrade.database_path),
+                    _current_schema_registry(manifest),
+                )
             old_pid = launchctl.stop()
             disrupted = True
-            if manifest.paired_database_upgrade is not None:
+            if upgrade is not None:
                 quarantined_previous_plist = quarantine_paired_plist(manifest)
                 if quarantined_previous_plist is None:
-                    raise ActivationError("paired predecessor plist is unavailable")
+                    raise ActivationError("prepared predecessor plist is unavailable")
                 if sha256(quarantined_previous_plist) != manifest.rollback_plist_sha256:
                     raise ActivationError("captured predecessor plist checksum mismatch")
-                # Exclusivity is meaningful only after launchd confirms teardown.
                 assert_database_exclusive(manifest)
-                validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+                if manifest.paired_database_upgrade is not None:
+                    validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+                else:
+                    validate_current_schema_database(
+                        Path(manifest.current_schema_upgrade.database_path),
+                        _current_schema_registry(manifest),
+                    )
                 assert capacity_reservation is not None
                 _reservation_still_sufficient(manifest, capacity_reservation)
                 create_database_backup(manifest, capacity_reservation)
                 database_snapshot = True
             candidate_binary_mutated = True
             commit_atomic_install(prepared_candidate[0], Path(manifest.target_binary))
-            if manifest.paired_database_upgrade is None:
+            if manifest.current_schema_upgrade is not None:
+                write_status(
+                    manifest,
+                    "migration_started",
+                    finalization_pending=True,
+                    committed_diagnostic="offline candidate migration may have committed writes; predecessor rollback is forbidden",
+                )
+                current_schema_migration_started = True
+                run_current_schema_migration(manifest, capacity_reservation)
+                current_schema_committed = True
+                committed_durable = True
+                write_status(
+                    manifest,
+                    "committed",
+                    finalization_pending=True,
+                    committed_diagnostic="irreversible database migration committed; candidate start and publication pending",
+                )
+            if upgrade is None:
                 commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
+                if ordinary_forward_only:
+                    write_status(
+                        manifest,
+                        "candidate_may_migrate",
+                        finalization_pending=True,
+                        committed_diagnostic="candidate startup may commit irreversible forward migration or initialization",
+                    )
+                    ordinary_candidate_started = True
                 launchctl.start(old_pid)
             else:
+                if manifest.current_schema_upgrade is not None:
+                    assert_database_exclusive(manifest)
                 launchctl.start(old_pid, plist_path=manifest.candidate_plist)
             wait_for_identity(manifest, manifest.expected)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
-            paired_commit = manifest.paired_database_upgrade is not None
+            prepared_commit = upgrade is not None
             write_status(
-                manifest, "committed", finalization_pending=paired_commit,
-                committed_diagnostic="paired publication/cleanup pending; login/reboot persistence unconfirmed" if paired_commit else None,
+                manifest, "committed", finalization_pending=prepared_commit,
+                committed_diagnostic="prepared publication/cleanup pending; login/reboot persistence unconfirmed" if prepared_commit else None,
             )
             committed_durable = True
             diagnostics = []
@@ -1061,7 +2148,7 @@ def activate(manifest: Manifest) -> str:
                     release_capacity_reservation(manifest, capacity_reservation)
                 except Exception as capacity_exc:
                     diagnostics.append(f"restore reservation cleanup failed: {capacity_exc}")
-            if paired_commit:
+            if prepared_commit:
                 try:
                     commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
                 except Exception as publish_exc:
@@ -1077,8 +2164,59 @@ def activate(manifest: Manifest) -> str:
                 except Exception:
                     pass
                 return "committed"
+            if ordinary_forward_only and ordinary_candidate_started:
+                teardown_failure = None
+                try:
+                    launchctl.stop()
+                    state, pid = launchctl.inspect()
+                    if state != "not_loaded" or pid is not None:
+                        raise ActivationError("forward candidate remains loaded after failed activation")
+                except Exception as teardown_exc:
+                    teardown_failure = str(teardown_exc)
+                write_status(
+                    manifest,
+                    "ordinary_activation_failed_forward_only",
+                    failure=failure,
+                    rollback_failure=teardown_failure,
+                    finalization_pending=True,
+                    committed_diagnostic="candidate may have committed migrations or initialization; predecessor launch is forbidden",
+                )
+                return "ordinary_activation_failed_forward_only"
+            if (
+                manifest.current_schema_upgrade is not None
+                and database_snapshot
+                and current_schema_migration_started
+                and not current_schema_committed
+            ):
+                write_status(
+                    manifest,
+                    "activation_failed_database_committed",
+                    failure=failure,
+                    finalization_pending=True,
+                    committed_diagnostic="offline migration may have committed database writes; predecessor rollback is forbidden",
+                )
+                return "activation_failed_database_committed"
             if not disrupted:
-                write_status(manifest, "precondition_failed", failure=failure)
+                if capacity_reservation is not None and not database_snapshot:
+                    try:
+                        abandon_capacity_reservation(manifest, capacity_reservation)
+                        write_status(manifest, "precondition_failed", failure=failure)
+                    except Exception as cleanup_error:
+                        try:
+                            write_status(
+                                manifest,
+                                "precondition_cleanup_pending",
+                                failure=failure,
+                                cleanup_failure=str(cleanup_error),
+                                precondition_cleanup_completed=False,
+                            )
+                        except Exception:
+                            pass
+                        raise cleanup_error from activation_exc
+                else:
+                    write_status(manifest, "precondition_failed", failure=failure)
+                if manifest.current_schema_upgrade is not None:
+                    raise CurrentSchemaPreconditionFailure(failure) from activation_exc
                 raise
             try:
                 restore(
@@ -1093,7 +2231,7 @@ def activate(manifest: Manifest) -> str:
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
                 rollback_failure = str(rollback_exc)
-                if manifest.paired_database_upgrade is not None and not isinstance(rollback_exc, VerifiedPredecessorFinalizationError):
+                if prepared_database_upgrade(manifest) is not None and not isinstance(rollback_exc, VerifiedPredecessorFinalizationError):
                     try:
                         launchctl.stop()
                         state, pid = launchctl.inspect()
@@ -1101,13 +2239,13 @@ def activate(manifest: Manifest) -> str:
                             raise ActivationError("failed paired recovery teardown is unconfirmed")
                     except Exception as teardown_exc:
                         rollback_failure += f"; recovery teardown failed: {teardown_exc}"
-                if manifest.paired_database_upgrade is not None:
+                if prepared_database_upgrade(manifest) is not None:
                     try:
                         quarantine_paired_plist(manifest)
                     except Exception as quarantine:
                         rollback_failure += f"; durable plist quarantine failed: {quarantine}"
                 failed_state = (
-                    "activation_failed_rollback_failed" if manifest.paired_database_upgrade is not None
+                    "activation_failed_rollback_failed" if prepared_database_upgrade(manifest) is not None
                     else "ordinary_activation_failed_rollback_failed"
                 )
                 try:
@@ -1123,14 +2261,15 @@ def activate(manifest: Manifest) -> str:
 
 
 def quarantine_paired_plist(manifest: Manifest) -> Optional[Path]:
-    if manifest.paired_database_upgrade is None:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
         return None
     target = Path(manifest.target_plist)
     if target.is_symlink():
         raise ActivationError("unresolved target plist must not be a symlink")
     if not target.exists():
         return None
-    transaction = Path(manifest.paired_database_upgrade.proof_path).parent
+    transaction = Path(upgrade.proof_path).parent
     fd, name = tempfile.mkstemp(prefix="unresolved-launchagent-", suffix=".plist.quarantined", dir=transaction)
     os.close(fd)
     destination = Path(name)
@@ -1143,13 +2282,13 @@ def quarantine_paired_plist(manifest: Manifest) -> Optional[Path]:
 
 def captured_paired_plist(manifest: Manifest) -> Optional[Path]:
     """Return the retained predecessor plist only when its hash is proven."""
-    paired = manifest.paired_database_upgrade
-    if paired is None or manifest.rollback_plist_sha256 is None:
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None or manifest.rollback_plist_sha256 is None:
         return None
     target = Path(manifest.target_plist)
     if target.exists() and not target.is_symlink() and sha256(target) == manifest.rollback_plist_sha256:
         return target
-    transaction = Path(paired.proof_path).parent
+    transaction = Path(upgrade.proof_path).parent
     matches = [
         path for path in transaction.glob("unresolved-launchagent-*.plist.quarantined")
         if not path.is_symlink() and path.is_file() and sha256(path) == manifest.rollback_plist_sha256
@@ -1157,11 +2296,28 @@ def captured_paired_plist(manifest: Manifest) -> Optional[Path]:
     return max(matches, key=lambda path: path.stat().st_mtime_ns) if matches else None
 
 
+def abandon_capacity_reservation(
+    manifest: Manifest, reservation: DatabaseCapacityReservation
+) -> None:
+    """Delete both unsnapshotted capacity files before a pre-stop failure is terminal."""
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None:
+        raise ActivationError("prepared database upgrade is not configured")
+    expected_backup = Path(upgrade.backup_path)
+    expected_restore = _restore_capacity_path(manifest, Path(upgrade.database_path))
+    if (
+        reservation.backup_path != expected_backup
+        or reservation.restore_path != expected_restore
+    ):
+        raise ActivationError("capacity reservation does not belong to this transaction")
+    _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+
+
 def release_capacity_reservation(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
     """Release only the temporary restore reservation; retain audit snapshot/proof."""
-    paired = manifest.paired_database_upgrade
-    if paired is None or reservation.restore_path != _restore_capacity_path(manifest, Path(paired.database_path)):
-        raise ActivationError("restore reservation does not belong to this paired transaction")
+    upgrade = prepared_database_upgrade(manifest)
+    if upgrade is None or reservation.restore_path != _restore_capacity_path(manifest, Path(upgrade.database_path)):
+        raise ActivationError("restore reservation does not belong to this prepared transaction")
     path = reservation.restore_path
     if path.is_symlink():
         raise ActivationError("restore reservation is a symlink")
@@ -1173,11 +2329,9 @@ def release_unsnapshotted_capacity(manifest: Manifest) -> None:
     database, backup, proof, _transaction = _paired_path_context(manifest)
     if proof.exists() or proof.is_symlink():
         return
-    for path in (backup, _restore_capacity_path(manifest, database)):
-        if path.is_symlink():
-            raise ActivationError("unsnapshotted capacity is a symlink")
-        path.unlink(missing_ok=True)
-        fsync_dir(path.parent)
+    restore = _restore_capacity_path(manifest, database)
+    reservation = DatabaseCapacityReservation(backup, restore, 0)
+    _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
 
 
 def record_recovery_error(manifest: Manifest, error: str | Exception, *, quarantine: bool = False) -> None:
@@ -1196,7 +2350,12 @@ def record_recovery_error(manifest: Manifest, error: str | Exception, *, quarant
         prior = {}
     if not prior or prior.get("transaction_id") != manifest.transaction_id:
         return
-    if prior.get("state") in {"committed", "preparing"}:
+    if prior.get("state") in {
+        "committed",
+        "preparing",
+        "migration_started",
+        "activation_failed_database_committed",
+    }:
         return
     previous = prior.get("rollback_failure")
     merged = f"{previous}; recovery attempt failed: {error}" if previous else error
@@ -1215,7 +2374,83 @@ def require_loaded_plist(manifest: Manifest, launchctl: Launchctl, private: Path
         raise ActivationError("loaded configuration does not match retained private plist")
 
 
-def finalize_paired(manifest: Manifest) -> str:
+def cleanup_precondition_capacity(manifest: Manifest, *, current_schema: bool) -> str:
+    lock_path = Path(manifest.lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment is already activating") from exc
+
+        try:
+            validate_manifest_identities(manifest)
+            validate_manifest_mode(manifest)
+            upgrade = prepared_database_upgrade(manifest)
+            if upgrade is None or (manifest.current_schema_upgrade is not None) != current_schema:
+                raise ActivationError("precondition cleanup mode does not match the retained manifest")
+            status_path = Path(manifest.status_path)
+            if not status_path.is_file() or status_path.is_symlink():
+                raise ActivationError(
+                    "precondition cleanup requires a regular non-symlink status"
+                )
+            status = read_status(manifest)
+            expected_prepared_mode = "current_schema" if current_schema else "paired"
+            cleanup_pending = status.get("state") == "precondition_cleanup_pending"
+            cleanup_release_pending = (
+                status.get("state") == "precondition_failed"
+                and status.get("precondition_cleanup_completed") is True
+            )
+            if (
+                status.get("transaction_id") != manifest.transaction_id
+                or status.get("prepared_mode") != expected_prepared_mode
+                or not (cleanup_pending or cleanup_release_pending)
+            ):
+                raise ActivationError("precondition cleanup requires the matching pending status")
+            claim = Path(manifest.active_path)
+            if (
+                not claim.is_file()
+                or claim.is_symlink()
+                or claim.read_text().strip() != manifest.transaction_id
+            ):
+                raise ActivationError("precondition cleanup requires the matching active claim")
+
+            database, backup, proof, transaction_dir = _paired_path_context(manifest)
+            _private_transaction_dir(transaction_dir)
+            restore = _restore_capacity_path(manifest, database)
+            capacity_evidence = backup.parent / "capacity.json"
+            if proof.exists() or proof.is_symlink():
+                raise ActivationError("precondition cleanup refuses a transaction with snapshot proof")
+            for path in (backup, restore, capacity_evidence):
+                if not path.is_absolute() or path.is_symlink():
+                    raise ActivationError("precondition cleanup paths must be absolute non-symlinks")
+
+            reservation = DatabaseCapacityReservation(backup, restore, 0)
+        except Exception as exc:
+            raise CleanupPreconditionRejected(str(exc)) from exc
+        try:
+            _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+            write_status(
+                manifest,
+                "precondition_failed",
+                failure=status.get("failure"),
+                precondition_cleanup_completed=True,
+            )
+        except Exception as exc:
+            try:
+                write_status(
+                    manifest,
+                    "precondition_cleanup_pending",
+                    failure=status.get("failure"),
+                    cleanup_failure=str(exc),
+                )
+            except Exception:
+                pass
+            raise
+        return "precondition_failed"
+
+
+def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
     with Path(manifest.lock_path).open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1223,39 +2458,60 @@ def finalize_paired(manifest: Manifest) -> str:
             raise ConcurrentDeploy("another deployment owns finalization") from exc
         validate_manifest_identities(manifest)
         validate_manifest_mode(manifest)
-        if manifest.paired_database_upgrade is None:
-            raise ActivationError("finalization requires paired transaction")
+        upgrade = prepared_database_upgrade(manifest)
+        if upgrade is None:
+            raise ActivationError("finalization requires a prepared database transaction")
+        if current_schema != (manifest.current_schema_upgrade is not None):
+            raise ActivationError("finalization command does not match prepared database mode")
         old_helper = subprocess.run(["launchctl", "print", f"gui/{manifest.uid}/{manifest.helper_label}"], capture_output=True, text=True)
         if old_helper.returncode == 0 or not service_absence_confirmed(old_helper.stdout + "\n" + old_helper.stderr, manifest.helper_label, manifest.uid):
             raise ActivationError("activation helper absence unconfirmed")
         status = read_status(manifest)
-        if status.get("transaction_id") != manifest.transaction_id or status.get("state") != "committed":
-            raise ActivationError("finalization requires matching committed status")
+        allowed_states = {"committed", "migration_started"} if current_schema else {"committed"}
+        if status.get("transaction_id") != manifest.transaction_id or status.get("state") not in allowed_states:
+            raise ActivationError("finalization requires matching committed database evidence")
         claim = Path(manifest.active_path)
         owner = claim.read_text().strip() if claim.exists() else None
         if owner != manifest.transaction_id and (owner is not None or status.get("finalization_pending")):
             raise ActivationError("finalization claim mismatch")
-        if sha256(Path(__file__)) != manifest.paired_database_upgrade.controller_helper_sha256:
+        if sha256(Path(__file__)) != upgrade.controller_helper_sha256:
             raise ActivationError("retained helper checksum mismatch")
         verify_staged(manifest.target_binary, manifest.candidate_binary_sha256, "committed candidate binary")
         private = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "committed private plist")
-        launchctl = Launchctl(manifest)
-        state, pid = launchctl.inspect()
-        if state not in {"running", "active"} or pid is None:
-            raise ActivationError("committed candidate is not running")
-        require_loaded_plist(manifest, launchctl, private)
-        wait_for_identity(manifest, manifest.expected)
+        if manifest.current_schema_upgrade is not None:
+            proof = _snapshot_proof(manifest)
+            if proof.get("migration_committed_at") is None:
+                raise ActivationError("current-schema migration commit proof is unavailable")
+            validate_current_schema_database(
+                Path(manifest.current_schema_upgrade.database_path),
+                _current_schema_registry(manifest),
+                migrated=True,
+            )
         if owner is None and not status.get("finalization_pending"):
             if not Path(manifest.target_plist).samefile(private):
                 raise ActivationError("completed publication identity mismatch")
             return "committed"
-        write_status(manifest, "committed", finalization_pending=True, committed_diagnostic="paired finalization retry pending")
+        launchctl = Launchctl(manifest)
+        state, pid = launchctl.inspect()
+        if state not in {"running", "active"} or pid is None:
+            if not current_schema or state != "not_loaded":
+                raise ActivationError("committed candidate is not running")
+            assert_database_exclusive(manifest)
+            launchctl.start(None, plist_path=str(private))
+        require_loaded_plist(manifest, launchctl, private)
+        wait_for_identity(manifest, manifest.expected)
+        write_status(manifest, "committed", finalization_pending=True, committed_diagnostic="prepared finalization retry pending")
         try:
-            reservation = _restore_capacity_path(manifest, Path(manifest.paired_database_upgrade.database_path))
+            reservation = _restore_capacity_path(manifest, Path(upgrade.database_path))
             if reservation.is_symlink():
                 raise ActivationError("restore reservation is symlink")
             reservation.unlink(missing_ok=True)
             fsync_dir(reservation.parent)
+            atomic_write(
+                Path(manifest.deployed_sha_path),
+                (manifest.source_commit + "\n").encode(),
+                0o600,
+            )
             publication = prepare_plist_publication(private, Path(manifest.target_plist))
             commit_atomic_install(publication, Path(manifest.target_plist))
             write_status(manifest, "committed")
@@ -1266,7 +2522,73 @@ def finalize_paired(manifest: Manifest) -> str:
         return "committed"
 
 
-def recover_paired(manifest: Manifest) -> str:
+def resume_forward(manifest: Manifest) -> str:
+    with Path(manifest.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment owns forward recovery") from exc
+        validate_manifest_identities(manifest)
+        validate_manifest_mode(manifest)
+        if manifest.ordinary_forward_migration is None:
+            raise ActivationError("forward recovery requires an ordinary forward transaction")
+        old_helper = subprocess.run(
+            ["launchctl", "print", f"gui/{manifest.uid}/{manifest.helper_label}"],
+            capture_output=True,
+            text=True,
+        )
+        if old_helper.returncode == 0 or not service_absence_confirmed(
+            old_helper.stdout + "\n" + old_helper.stderr,
+            manifest.helper_label,
+            manifest.uid,
+        ):
+            raise ActivationError("activation helper absence unconfirmed")
+        status = read_status(manifest)
+        if status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {
+            "candidate_may_migrate",
+            "ordinary_activation_failed_forward_only",
+        }:
+            raise ActivationError("forward recovery requires matching unresolved status")
+        claim = Path(manifest.active_path)
+        if not claim.exists() or claim.read_text().strip() != manifest.transaction_id:
+            raise ActivationError("forward recovery claim mismatch")
+        verify_staged(manifest.target_binary, manifest.candidate_binary_sha256, "forward candidate binary")
+        verify_staged(manifest.target_plist, manifest.candidate_plist_sha256, "forward candidate plist")
+        launchctl = Launchctl(manifest)
+        state, pid = launchctl.inspect()
+        if state != "not_loaded" or pid is not None:
+            raise ActivationError("forward recovery requires a stopped target")
+        try:
+            launchctl.start(None)
+            wait_for_identity(manifest, manifest.expected)
+            atomic_write(
+                Path(manifest.deployed_sha_path),
+                (manifest.source_commit + "\n").encode(),
+                0o600,
+            )
+            write_status(manifest, "committed")
+        except BaseException as exc:
+            teardown_failure = None
+            try:
+                launchctl.stop()
+                state, pid = launchctl.inspect()
+                if state != "not_loaded" or pid is not None:
+                    raise ActivationError("forward candidate teardown is unconfirmed")
+            except Exception as teardown_exc:
+                teardown_failure = str(teardown_exc)
+            write_status(
+                manifest,
+                "ordinary_activation_failed_forward_only",
+                failure=str(exc),
+                rollback_failure=teardown_failure,
+                finalization_pending=True,
+                committed_diagnostic="forward candidate recovery failed; predecessor launch remains forbidden",
+            )
+            raise
+        return "committed"
+
+
+def recover_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
     with Path(manifest.lock_path).open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1274,8 +2596,13 @@ def recover_paired(manifest: Manifest) -> str:
             raise ConcurrentDeploy("another deployment operation owns recovery") from exc
         validate_manifest_identities(manifest)
         validate_manifest_mode(manifest)
-        if manifest.paired_database_upgrade is None:
-            raise ActivationError("paired recovery requires a paired transaction")
+        upgrade = prepared_database_upgrade(manifest)
+        if upgrade is None:
+            raise ActivationError("prepared recovery requires a prepared database transaction")
+        if current_schema != (manifest.current_schema_upgrade is not None):
+            raise RecoveryModeMismatch(
+                "recovery command does not match prepared database mode"
+            )
         claim = Path(manifest.active_path)
         try:
             status = read_status(manifest)
@@ -1301,8 +2628,7 @@ def recover_paired(manifest: Manifest) -> str:
                     raise VerifiedPredecessorFinalizationError(str(exc)) from exc
                 finalize_verified_predecessor(manifest, status.get("failure"))
                 return "activation_failed_rolled_back"
-            paired = manifest.paired_database_upgrade
-            snapshot_exists = Path(paired.proof_path).exists() or Path(paired.proof_path).is_symlink()
+            snapshot_exists = Path(upgrade.proof_path).exists() or Path(upgrade.proof_path).is_symlink()
             if not snapshot_exists:
                 plist = captured_paired_plist(manifest)
                 if plist is None:
@@ -1310,7 +2636,12 @@ def recover_paired(manifest: Manifest) -> str:
                 binary = Path(manifest.target_binary)
                 if not binary.exists() or sha256(binary) != manifest.rollback_binary_sha256:
                     raise ActivationError("interrupted transaction has no snapshot proof and runtime changes are unresolved")
-                validate_legacy_database(Path(paired.database_path))
+                if manifest.paired_database_upgrade is not None:
+                    validate_legacy_database(Path(upgrade.database_path))
+                else:
+                    validate_current_schema_database(
+                        Path(upgrade.database_path), _current_schema_registry(manifest)
+                    )
                 restore(
                     manifest,
                     launchctl,
@@ -1345,7 +2676,7 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
             and status.get("state") in TERMINAL_STATES
             and not status.get("finalization_pending", False)
             and not (
-                manifest.paired_database_upgrade is not None
+                prepared_database_upgrade(manifest) is not None
                 and status.get("state") == "activation_failed_rollback_failed"
             )
         )
@@ -1355,7 +2686,20 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", choices=["activate", "recover-paired", "finalize-paired"])
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=[
+            "activate",
+            "cleanup-paired",
+            "cleanup-current",
+            "recover-paired",
+            "recover-current",
+            "finalize-paired",
+            "finalize-current",
+            "resume-forward",
+        ],
+    )
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--probe-service-absence")
     parser.add_argument("--manifest", type=Path)
@@ -1371,38 +2715,170 @@ def main() -> int:
     if args.manifest is None or args.helper_label is None or args.uid is None:
         parser.error("activation requires --manifest, --helper-label, and --uid")
     manifest = None
+    verified_helper_label: Optional[str] = None
     try:
-        manifest = Manifest.load(args.manifest)
+        manifest_path = Path(args.manifest)
+        if args.command in {"cleanup-paired", "cleanup-current"} and (
+            not manifest_path.is_file() or manifest_path.is_symlink()
+        ):
+            raise CleanupPreconditionRejected(
+                "precondition cleanup requires a regular non-symlink manifest"
+            )
+        manifest = Manifest.load(manifest_path)
+        identity_rejection = (
+            CleanupPreconditionRejected
+            if args.command in {"cleanup-paired", "cleanup-current"}
+            else ActivationError
+        )
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
-            raise ActivationError("helper identity does not match the immutable manifest")
-        state = finalize_paired(manifest) if args.command == "finalize-paired" else recover_paired(manifest) if args.command == "recover-paired" else activate(manifest)
-        if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
-            fsync_dir(Path(manifest.status_path).parent)
-            release_claim(manifest)
+            raise identity_rejection("helper identity does not match the immutable manifest")
+        expected_helper_label = (
+            f"{DEPLOY_HELPER_LABEL_PREFIX}.{manifest.transaction_id}"
+        )
+        if manifest.helper_label != expected_helper_label:
+            raise identity_rejection("immutable manifest has an invalid helper label")
+        verified_helper_label = expected_helper_label
+        if args.command in {"cleanup-paired", "cleanup-current"}:
+            state = cleanup_precondition_capacity(
+                manifest, current_schema=args.command == "cleanup-current"
+            )
+        elif args.command in {"finalize-paired", "finalize-current"}:
+            state = finalize_paired(
+                manifest, current_schema=args.command == "finalize-current"
+            )
+        elif args.command in {"recover-paired", "recover-current"}:
+            state = recover_paired(
+                manifest, current_schema=args.command == "recover-current"
+            )
+        elif args.command == "resume-forward":
+            state = resume_forward(manifest)
+        else:
+            state = activate(manifest)
+        if state in TERMINAL_STATES:
+            released = release_durable_terminal_claim(manifest)
+            if args.command in {"cleanup-paired", "cleanup-current"} and not released:
+                raise ActivationError(
+                    "precondition cleanup completed but matching claim release failed"
+                )
         print(state, flush=True)
-        return 0 if state == "committed" or (args.command == "recover-paired" and state == "activation_failed_rolled_back") else 1
+        return 0 if (
+            state == "committed"
+            or (
+                args.command in {"cleanup-paired", "cleanup-current"}
+                and state == "precondition_failed"
+            )
+            or (
+                args.command in {"recover-paired", "recover-current"}
+                and state == "activation_failed_rolled_back"
+            )
+        ) else 1
     except ConcurrentDeploy as exc:
-        if manifest is not None and manifest.paired_database_upgrade is None:
+        protected_recovery = {
+            "cleanup-paired",
+            "cleanup-current",
+            "finalize-paired",
+            "finalize-current",
+            "resume-forward",
+        }
+        if (
+            manifest is not None
+            and prepared_database_upgrade(manifest) is None
+            and args.command not in protected_recovery
+        ):
             try:
-                if args.command == "recover-paired":
+                if args.command in {"recover-paired", "recover-current"}:
                     record_recovery_error(manifest, str(exc))
-                elif args.command != "finalize-paired":
+                else:
                     write_status(manifest, "rejected_concurrent", failure=str(exc))
             finally:
-                if args.command != "finalize-paired" and status_is_durable_terminal(manifest):
+                if status_is_durable_terminal(manifest):
                     release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        if manifest is not None and args.command == "recover-paired":
-            record_recovery_error(manifest, exc)
-        if manifest is not None and args.command != "finalize-paired" and manifest.paired_database_upgrade is None and status_is_durable_terminal(manifest):
-            release_claim(manifest)
+        if (
+            manifest is not None
+            and args.command in {"cleanup-paired", "cleanup-current"}
+            and not isinstance(exc, CleanupPreconditionRejected)
+        ):
+            try:
+                cleanup_status = read_status(manifest)
+                original_failure = cleanup_status.get("failure")
+                write_status(
+                    manifest,
+                    "precondition_cleanup_pending",
+                    failure=(
+                        original_failure
+                        if isinstance(original_failure, str)
+                        else None
+                    ),
+                    cleanup_failure=str(exc),
+                    precondition_cleanup_completed=False,
+                )
+            except Exception:
+                pass
+        if manifest is not None and args.command in {"recover-paired", "recover-current"}:
+            try:
+                recovery_status = read_status(manifest)
+            except Exception:
+                recovery_status = {}
+            cleanup_only_state = (
+                recovery_status.get("state") == "precondition_cleanup_pending"
+                or (
+                    recovery_status.get("state") == "precondition_failed"
+                    and recovery_status.get("precondition_cleanup_completed") is True
+                )
+            )
+            if not cleanup_only_state and not isinstance(exc, RecoveryModeMismatch):
+                record_recovery_error(manifest, exc)
+        if manifest is not None and args.command not in {
+            "cleanup-paired",
+            "cleanup-current",
+            "finalize-paired",
+            "finalize-current",
+            "resume-forward",
+        }:
+            if prepared_database_upgrade(manifest) is None:
+                if status_is_durable_terminal(manifest):
+                    release_claim(manifest)
+            elif (
+                args.command in {None, "activate"}
+                and isinstance(exc, CurrentSchemaPreconditionFailure)
+            ):
+                try:
+                    release_durable_terminal_claim(
+                        manifest, required_state="precondition_failed"
+                    )
+                except Exception as release_exc:
+                    try:
+                        terminal_status = read_status(manifest)
+                        original_failure = terminal_status.get("failure")
+                        write_status(
+                            manifest,
+                            "precondition_cleanup_pending",
+                            failure=(
+                                original_failure
+                                if isinstance(original_failure, str)
+                                else None
+                            ),
+                            cleanup_failure=str(release_exc),
+                            precondition_cleanup_completed=False,
+                        )
+                    except Exception:
+                        pass
+                    print(
+                        "activation helper could not release durable precondition claim: "
+                        f"{release_exc}",
+                        file=sys.stderr,
+                    )
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        if args.command != "finalize-paired":
-            request_helper_bootout(args.uid, args.helper_label)
+        if (
+            args.command not in {"finalize-paired", "finalize-current"}
+            and verified_helper_label is not None
+        ):
+            request_helper_bootout(args.uid, verified_helper_label)
 
 
 if __name__ == "__main__":

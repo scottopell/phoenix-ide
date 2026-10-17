@@ -16,8 +16,8 @@ The first batch ships:
   `references/language-reference.md` shipped alongside the SKILL.md.
 - **`/spears`** — spEARS requirements-driven development workflow, with
   workflow-specific reference files shipped alongside the SKILL.md.
-- **`phoenix-api`** — Global Coordinator-only reference for user-authorized
-  lifecycle actions through supported Phoenix HTTP APIs and scoped Bash.
+- **`phoenix-api`** — Global Coordinator-only non-exhaustive best-practice recipes
+  for user-authorized actions through supported public Phoenix HTTP APIs and scoped Bash.
 
 The mechanism is general — additional built-in skills are added by dropping
 a directory under `src/skills/builtin/` and committing.
@@ -70,7 +70,15 @@ normal precedence, while an invalid or empty definition does not disable it.
 | **REQ-BS-005:** spEARS workflow skill | ✅ Complete | `spears/SKILL.md` + workflow references extracted at startup |
 | **REQ-BS-006:** Allium with companion files | ✅ Complete | `allium/SKILL.md` + `allium/references/language-reference.md` extracted at startup |
 | **REQ-SK-008:** Runtime audience binding | ✅ Complete | `phoenix-api` is cataloged and invocable only by the Global Coordinator; visible/persisted results are an opaque receipt, while live-runtime authenticated bytes are overlaid during provider-request assembly |
-| **Coordinator API recipe** | ✅ Complete | Embedded payload provides scoped Bash creation with live auth/model/effort discovery, stable request identity, ambiguous-response reconciliation, and separate ProductConversation/transcript verification |
+| **Coordinator API recipes** | Implemented; focused qualification recorded below | Non-exhaustive public-API guidance preserves destination and scoped execution boundaries; creation and structured-question response recipes distinguish idempotency from freshness and acceptance from execution |
+
+## Non-exhaustive API guidance qualification
+
+ADR-113 records the recipe policy. The generated Coordinator suffix, embedded skill/reference, and normative guidance allow other supported public APIs grounded in inspected current deployment/source contracts and actual user authority. Source inspection alone does not establish deployed behavior or permission. Existing destination authentication, TLS, nonlocal encrypted transport, credential handling, active WorkScope, immutable identity/intent, fresh-read, and public-server-enforcement boundaries remain intact. Gap inventories are illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads within user authority, not invented guarantees/receipts, database/private-handler bypasses, or background monitors.
+
+The question recipe is verified against `respond_to_question`, `RespondToQuestionPayload`, `validate_question_request_identity`, the `UserQuestionResponse` transition, and `QuestionPanel.buildAnswerMap`. It permits exact user-provided answers or decisions made within explicit delegated decision scope for every question; generic inspect/unblock instructions are not decision authority and approvals must never be fabricated or delegation extended. It requires complete answers, exact full question keys and labels/custom text, current opaque `request_id` (not `tool_use_id`), comma-space multi-select strings, one POST and original-target observation. The backend does not enforce completeness. Request identity is freshness, not idempotency; uncertain outcomes are not automatically replayed and 409 is not success. Optional notes are consumed; submitted annotation previews are not.
+
+Focused Rust regressions in `builtin.rs`, the catalog metadata expectation, `system_prompt.rs` and `continuation.rs` are authored but not executed locally under the no-build constraint. Offline drift tests use the existing Python unittest discovery harness; they validate recipe JSON and source anchors without calling a live API. No live question was read or answered, and no merge/deployment or current-instruction activation is implied.
 
 ## Cross-Spec References
 

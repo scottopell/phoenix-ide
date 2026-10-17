@@ -17,7 +17,6 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use nix::sys::wait::waitpid;
-use phoenix_core::domain::db_schema::ConvMode;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
 use phoenix_terminal::session::{
@@ -48,7 +47,7 @@ pub async fn terminal_ws_handler(
     let db = state.db.clone();
     let runtime = Arc::clone(&state.runtime);
     ws.on_upgrade(move |socket| async move {
-        let (cwd, scope, teardown_on_terminal, legacy_worktree_path) =
+        let (cwd, scope, legacy_worktree_path) =
             match db.get_conversation(&conversation_id).await {
             Ok(conv) => {
                 if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
@@ -77,7 +76,6 @@ pub async fn terminal_ws_handler(
                 (
                     std::path::PathBuf::from(&conv.cwd),
                     scope,
-                    matches!(conv.conv_mode, ConvMode::Direct),
                     legacy_worktree_path,
                 )
             }
@@ -91,7 +89,6 @@ pub async fn terminal_ws_handler(
             scope,
             cwd,
             conversation_id,
-            teardown_on_terminal,
             legacy_worktree_path,
             terminals,
             runtime,
@@ -120,12 +117,36 @@ pub async fn terminal_ws_global_handler(
             ResourceScopeKey::GlobalTerminal,
             cwd,
             "global".to_string(),
-            false,
             None,
             terminals,
             runtime,
         )
     })
+}
+
+async fn watch_terminal_owner(
+    scope: &ResourceScopeKey,
+    runtime: &Arc<RuntimeManager>,
+    teardown_stop: tokio::sync::watch::Sender<StopReason>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let ResourceScopeKey::Unattached(conversation_id) = scope else {
+        return None;
+    };
+    let teardown_conv_id = conversation_id.clone();
+    let mut bcast_rx = runtime.subscribe(conversation_id).await.ok()?;
+    Some(tokio::spawn(async move {
+        loop {
+            match bcast_rx.recv().await {
+                Ok(SseEvent::ConversationBecameTerminal { .. }) => {
+                    tracing::debug!(conv_id = %teardown_conv_id, "Terminal: unattached conversation ended, tearing down PTY");
+                    let _ = teardown_stop.send(StopReason::TearDown);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }))
 }
 
 #[allow(clippy::too_many_lines)] // inherently dense PTY lifecycle; see relay.rs for the testable core
@@ -135,7 +156,6 @@ async fn handle_socket(
     scope: ResourceScopeKey,
     cwd: std::path::PathBuf,
     id_label: String,
-    teardown_on_terminal: bool,
     legacy_worktree_path: Option<std::path::PathBuf>,
     terminals: ActiveTerminals,
     runtime: Arc<RuntimeManager>,
@@ -220,25 +240,7 @@ async fn handle_socket(
     }
     let stop_rx = arc_handle.stop_tx.subscribe();
 
-    if teardown_on_terminal {
-        let teardown_stop = arc_handle.stop_tx.clone();
-        let teardown_conv_id = conversation_id.clone();
-        if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
-            tokio::spawn(async move {
-                loop {
-                    match bcast_rx.recv().await {
-                        Ok(SseEvent::ConversationBecameTerminal { .. }) => {
-                            tracing::debug!(conv_id = %teardown_conv_id, "Terminal: Direct conversation ended, tearing down PTY");
-                            let _ = teardown_stop.send(StopReason::TearDown);
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-    }
+    let _ = watch_terminal_owner(&scope, &runtime, arc_handle.stop_tx.clone()).await;
 
     // Adapt WS sender: Sink<Message> → Sink<Vec<u8>> by wrapping in Message::Binary.
     // Pin the With adaptor so it implements Unpin.
@@ -374,7 +376,18 @@ async fn acquire_handle(
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
     // conversation's project directory rather than Phoenix's own CWD.
-    let plan = resolve_exec_plan(conversation_id, scope, cwd, legacy_worktree_path, runtime).await;
+    let plan =
+        match resolve_exec_plan(conversation_id, scope, cwd, legacy_worktree_path, runtime).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                terminals.release_spawn(scope);
+                tracing::warn!(%error, "Terminal tmux owner resolution failed");
+                let _ = ws_sender
+                    .send(Message::Text("error: terminal unavailable".into()))
+                    .await;
+                return None;
+            }
+        };
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -428,21 +441,35 @@ async fn resolve_exec_plan(
     cwd: &std::path::Path,
     legacy_worktree_path: Option<&std::path::Path>,
     runtime: &Arc<RuntimeManager>,
-) -> PtyExecPlan {
+) -> Result<PtyExecPlan, String> {
     let registry = runtime.tmux_registry();
     if !registry.binary_available() {
-        return PtyExecPlan::Shell;
+        return Ok(PtyExecPlan::Shell);
     }
+    let legacy_conversation_id = match scope {
+        ResourceScopeKey::Work(id) => runtime
+            .db()
+            .get_work_scope_legacy_conversation_id(id)
+            .await
+            .map_err(|error| error.to_string())?,
+        ResourceScopeKey::Unattached(id) => Some(id.clone()),
+        ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal => None,
+    };
     match registry
-        .ensure_live(scope, cwd, legacy_worktree_path, Some(conversation_id))
+        .ensure_live(
+            scope,
+            cwd,
+            legacy_worktree_path,
+            legacy_conversation_id.as_deref(),
+        )
         .await
     {
         Ok(server_arc) => {
             let server = server_arc.read().await;
-            PtyExecPlan::Tmux {
+            Ok(PtyExecPlan::Tmux {
                 socket_path: server.socket_path.clone(),
                 config_path: registry.config_path(),
-            }
+            })
         }
         Err(e) => {
             tracing::warn!(
@@ -450,7 +477,7 @@ async fn resolve_exec_plan(
                 error = %e,
                 "Terminal: tmux ensure_live failed, falling back to direct shell"
             );
-            PtyExecPlan::Shell
+            Ok(PtyExecPlan::Shell)
         }
     }
 }
@@ -642,6 +669,269 @@ mod reclaim_tests {
             stop_tx,
             attach_permit: Arc::new(Semaphore::new(1)),
         })
+    }
+
+    struct DirectPtyFixture {
+        manager: Arc<crate::runtime::RuntimeManager>,
+        root: crate::db::Conversation,
+        scope: phoenix_core::work_scope::ResourceScopeKey,
+        handle: Arc<TerminalHandle>,
+        _cwd: tempfile::TempDir,
+    }
+
+    impl Drop for DirectPtyFixture {
+        fn drop(&mut self) {
+            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+
+            // Retirement may already have reaped this child.
+            if matches!(
+                waitpid(self.handle.child_pid, Some(WaitPidFlag::WNOHANG)),
+                Ok(WaitStatus::StillAlive)
+            ) {
+                let _ = nix::sys::signal::kill(
+                    self.handle.child_pid,
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = waitpid(self.handle.child_pid, None);
+            }
+        }
+    }
+
+    async fn direct_pty_fixture() -> DirectPtyFixture {
+        use crate::db::{ConvMode, Database};
+        use phoenix_core::work_scope::ResourceScopeKey;
+        use phoenix_terminal::session::Dims;
+        use phoenix_terminal::spawn::{spawn_pty, PtyExecPlan};
+        use tokio::io::AsyncReadExt;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = db
+            .create_conversation_with_project(
+                "direct-pty-handoff",
+                "direct-pty-handoff",
+                cwd.path().to_str().unwrap(),
+                false,
+                None,
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let scope = ResourceScopeKey::Work(root.attached_work_scope_id.clone().unwrap());
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::platform::PlatformCapability::None {
+                details: "direct PTY handoff regression".to_string(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        manager.terminals.reserve_spawn(&scope).unwrap();
+        let pty_cwd = cwd.path().to_path_buf();
+        let handle = tokio::task::spawn_blocking(move || {
+            spawn_pty(&pty_cwd, Dims::try_new(80, 24).unwrap(), PtyExecPlan::Shell)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let handle = manager
+            .terminals
+            .insert_reserved(scope.clone(), handle)
+            .unwrap();
+        let fixture = DirectPtyFixture {
+            manager,
+            root,
+            scope,
+            handle,
+            _cwd: cwd,
+        };
+
+        // The octal escapes prevent the terminal's input echo satisfying readiness.
+        let mut io = super::build_pty_io(fixture.handle.master_fd_raw().unwrap()).unwrap();
+        io.write_all(b"printf '\\137_PHOENIX_PTY_READY_\\137\\n'\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut output = Vec::new();
+            let mut buf = [0; 1024];
+            loop {
+                let read = io.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0, "shell exited before readiness");
+                output.extend_from_slice(&buf[..read]);
+                if output
+                    .windows(b"__PHOENIX_PTY_READY__".len())
+                    .any(|window| window == b"__PHOENIX_PTY_READY__")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("real shell readiness");
+        fixture.handle.tracker.lock().unwrap().ingest(&full_command(
+            "before-handoff",
+            "preserved\n",
+            Some(0),
+        ));
+        fixture
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn actual_direct_handoff_terminal_events_preserve_pty_for_successor_reclaim() {
+        use crate::db::{ContinueOutcome, ConvState};
+        use phoenix_core::work_scope::ResourceScopeKey;
+
+        let fixture = direct_pty_fixture().await;
+        let manager = &fixture.manager;
+        let handle = &fixture.handle;
+        let fd = handle.master_fd_raw().unwrap();
+        let pid = handle.child_pid;
+        let tracker = Arc::clone(&handle.tracker);
+        let stop_rx = handle.stop_tx.subscribe();
+        let (attached, permit) = super::acquire_permit(&fixture.root.id, Arc::clone(handle))
+            .await
+            .unwrap();
+        assert!(manager.terminals.prepare_relay(&fixture.scope, &attached));
+        assert!(
+            super::watch_terminal_owner(&fixture.scope, manager, handle.stop_tx.clone())
+                .await
+                .is_none()
+        );
+        let broadcaster = manager.conversation_broadcaster(&fixture.root.id).await;
+        let mut events = broadcaster.subscribe();
+
+        manager
+            .db()
+            .update_conversation_state(
+                &fixture.root.id,
+                &ConvState::ContextExhausted {
+                    summary: "continue direct work".into(),
+                },
+            )
+            .await
+            .unwrap();
+        broadcaster
+            .send_seq(|sequence_id| super::SseEvent::ConversationBecameTerminal { sequence_id })
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            super::SseEvent::ConversationBecameTerminal { .. }
+        ));
+        assert_eq!(*stop_rx.borrow(), StopReason::Running);
+        assert_eq!(handle.master_fd_raw(), Some(fd));
+        assert!(manager.terminals.get_for_attach(&fixture.scope).is_some());
+        assert!(manager.try_get_handle(&fixture.root.id).await.is_none());
+
+        let ContinueOutcome::Created(successor) = manager
+            .db()
+            .continue_conversation(&fixture.root.id)
+            .await
+            .unwrap()
+        else {
+            panic!("expected an actual Direct continuation");
+        };
+        assert_eq!(successor.conv_mode, crate::db::ConvMode::Direct);
+        assert_eq!(
+            successor.product_conversation_id,
+            fixture.root.product_conversation_id
+        );
+        let successor_scope = ResourceScopeKey::Work(successor.attached_work_scope_id.unwrap());
+        assert_eq!(successor_scope, fixture.scope);
+        manager
+            .db()
+            .update_conversation_state(
+                &fixture.root.id,
+                &ConvState::HandedOff {
+                    successor_conv_id: successor.id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        broadcaster
+            .send_seq(|sequence_id| super::SseEvent::ConversationBecameTerminal { sequence_id })
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            super::SseEvent::ConversationBecameTerminal { .. }
+        ));
+        assert_eq!(*stop_rx.borrow(), StopReason::Running);
+        assert_eq!(handle.master_fd_raw(), Some(fd));
+        assert_eq!(handle.attach_permit.available_permits(), 0);
+        drop(permit);
+        drop(attached);
+
+        let existing = manager.terminals.get_for_attach(&successor_scope).unwrap();
+        let (reclaimed, permit) = super::reclaim(&successor.id, existing).await.unwrap();
+        assert!(manager
+            .terminals
+            .prepare_relay(&successor_scope, &reclaimed));
+        assert!(
+            super::watch_terminal_owner(&successor_scope, manager, reclaimed.stop_tx.clone())
+                .await
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(&reclaimed, handle));
+        assert_eq!(reclaimed.master_fd_raw(), Some(fd));
+        assert_eq!(reclaimed.child_pid, pid);
+        assert!(Arc::ptr_eq(&reclaimed.tracker, &tracker));
+        assert_eq!(
+            tracker.lock().unwrap().last_command().unwrap().command_text,
+            "before-handoff"
+        );
+        assert_eq!(*stop_rx.borrow(), StopReason::Running);
+        assert!(manager.try_get_handle(&successor.id).await.is_none());
+        drop(permit);
+        drop(reclaimed);
+
+        let retirement = manager.terminals.begin_retirement(&successor_scope);
+        assert_eq!(
+            manager.terminals.complete_retirement(&retirement).await,
+            phoenix_terminal::session::TerminalRetirementOutcome::Retired
+        );
+        assert!(manager.terminals.get(&successor_scope).is_none());
+        assert_eq!(handle.master_fd_raw(), None);
+    }
+
+    #[tokio::test]
+    async fn direct_work_pty_without_attachment_is_still_retired_explicitly() {
+        let fixture = direct_pty_fixture().await;
+        let manager = &fixture.manager;
+        let stop_rx = fixture.handle.stop_tx.subscribe();
+        assert!(super::watch_terminal_owner(
+            &fixture.scope,
+            manager,
+            fixture.handle.stop_tx.clone(),
+        )
+        .await
+        .is_none());
+        assert_eq!(fixture.handle.attach_permit.available_permits(), 1);
+
+        let retirement = manager.terminals.begin_retirement(&fixture.scope);
+        assert!(manager.terminals.get_for_attach(&fixture.scope).is_none());
+        assert!(manager.terminals.reserve_spawn(&fixture.scope).is_err());
+        assert_eq!(
+            manager.terminals.complete_retirement(&retirement).await,
+            phoenix_terminal::session::TerminalRetirementOutcome::Retired,
+        );
+        assert!(manager.terminals.get(&fixture.scope).is_none());
+        assert_eq!(*stop_rx.borrow(), StopReason::TearDown);
+        assert_eq!(fixture.handle.master_fd_raw(), None);
+        assert_eq!(fixture.handle.attach_permit.available_permits(), 1);
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                fixture.handle.child_pid,
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD),
+        );
     }
 
     /// Emulate the handler's relay step for a single connection.

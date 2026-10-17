@@ -1,3 +1,4 @@
+import { eventCardFragments } from '../ConversationEventCard';
 import { prepareMarkdown, type MarkdownMode } from '../prepareMarkdown';
 
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
@@ -700,6 +701,13 @@ export function buildConversationSearchProjection(
   units.forEach((unit, unitIndex) => {
     switch (unit.kind) {
       case 'user':
+        if (unit.message.origin?.kind === 'subscription_event') {
+          const fragments = eventCardFragments(unit.message.event_presentation, unit.message.origin.event_id);
+          for (const [name, text] of Object.entries(fragments)) {
+            const fragmentId = `event-${name}`;
+            addConversationSource(sources, unitIndex, unit.kind, unit.key, fragmentId, text, fragmentId, { kind: 'message-text', fragmentId });
+          }
+        }
         addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'user-message', userMessageParts(unit.message));
         break;
       case 'pending_user':

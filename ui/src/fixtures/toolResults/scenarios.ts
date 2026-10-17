@@ -12,6 +12,7 @@ function createdAt(sequenceId: number, seconds: string): string {
 
 function userMessage(sequence_id: number, text: string): Message {
   return {
+    event_presentation: null,
     message_id: `user-${sequence_id}`,
     conversation_id: CONVERSATION_ID,
     sequence_id,
@@ -29,6 +30,7 @@ function agentMessage(
   display_data: Record<string, unknown> = {},
 ): Message {
   return {
+    event_presentation: null,
     message_id: `agent-${sequence_id}`,
     conversation_id: CONVERSATION_ID,
     sequence_id,
@@ -57,6 +59,7 @@ function toolMessage(
   };
   if (options?.images) toolContent.images = options.images;
   return {
+    event_presentation: null,
     message_id: `tool-${tool_use_id}`,
     conversation_id: CONVERSATION_ID,
     sequence_id,

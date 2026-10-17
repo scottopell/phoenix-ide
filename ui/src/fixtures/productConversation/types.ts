@@ -70,6 +70,8 @@ export const productConversationScenarioDefinitions = [
   },
   { id: 'ordinary-lazy-history', title: 'Ordinary three-member lazy history', viewport: 'desktop', state: 'ready' },
   { id: 'global-lazy-history', title: 'Global three-member lazy history', viewport: 'desktop', state: 'ready' },
+  { id: 'compact-events-ordinary', title: 'Compact ordinary events', viewport: 'desktop', state: 'ready' },
+  { id: 'compact-events-global', title: 'Compact Global events', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-global', title: 'One-click Global source send', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-ordinary', title: 'One-click historical ordinary source send', viewport: 'desktop', state: 'ready' },
 ] as const satisfies readonly {
@@ -82,6 +84,7 @@ export const productConversationScenarioDefinitions = [
 export type ProductConversationScenarioId = (typeof productConversationScenarioDefinitions)[number]['id'];
 
 interface ScenarioCommon {
+  initialEntry?: string;
   sourceSnapshot?: ProductConversationSnapshotView;
   sourceIsGlobal?: boolean;
   initialDraft?: string;

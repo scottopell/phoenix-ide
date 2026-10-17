@@ -77,7 +77,7 @@ const TRACKED_METRICS: &[&str] = &[
 
 #[derive(Debug, Deserialize)]
 struct ProfileInput {
-    action: String,
+    action: ProfileAction,
     /// `trace_start`: comma-separated category override.
     #[serde(default)]
     categories: Option<String>,
@@ -115,6 +115,35 @@ struct ProfileInput {
     /// `cpu_summary`: path to a saved CPU profile JSON to summarise.
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProfileAction {
+    Help,
+    CpuSummary,
+    RunScenario,
+    Metrics,
+    Throttle,
+    GcHeap,
+    CpuStart,
+    CpuStop,
+    TraceStart,
+    TraceStop,
+    WhyRender,
+    HeapSnapshot,
+    CoverageStart,
+    CoverageStop,
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_profile_input(input: Value) -> Result<ProfileInput, ToolOutput> {
+    let input: ProfileInput = serde_json::from_value(input)
+        .map_err(|error| ToolOutput::error(format!("Invalid input: {error}")))?;
+    if input.action == ProfileAction::Throttle {
+        validate_throttle_rate(input.rate)?;
+    }
+    Ok(input)
 }
 
 /// Per-run reset directive (REQ-BT-019.18). Accepts either the string
@@ -200,38 +229,40 @@ enum Step {
     WaitSelector {
         selector: String,
         #[serde(default)]
-        timeout: Option<String>,
+        timeout: Option<ScenarioWaitTimeout>,
     },
     WaitTiming {
         mark: String,
         #[serde(default)]
-        timeout: Option<String>,
+        timeout: Option<ScenarioWaitTimeout>,
     },
     WaitEval {
         expression: String,
         #[serde(default)]
-        timeout: Option<String>,
+        timeout: Option<ScenarioWaitTimeout>,
     },
 }
 
-/// Parse duration like "5s", "500ms", "1m". Mirrors `tools.rs::parse_duration`.
-fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if let Some(ms) = s.strip_suffix("ms") {
-        ms.trim().parse().ok().map(Duration::from_millis)
-    } else if let Some(v) = s.strip_suffix('s') {
-        v.trim().parse().ok().map(Duration::from_secs)
-    } else if let Some(m) = s.strip_suffix('m') {
-        m.trim()
-            .parse::<u64>()
-            .ok()
-            .map(|m| Duration::from_secs(m * 60))
-    } else {
-        s.parse().ok().map(Duration::from_secs)
-    }
-}
+use super::tools::parse_duration;
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(try_from = "String")]
+struct ScenarioWaitTimeout(Duration);
+
+impl TryFrom<String> for ScenarioWaitTimeout {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let duration = parse_duration(&value)
+            .ok_or_else(|| format!("Invalid scenario step timeout {value:?}"))?;
+        Instant::now().checked_add(duration).ok_or_else(|| {
+            format!("Scenario step timeout {value:?} exceeds the supported deadline")
+        })?;
+        Ok(Self(duration))
+    }
+}
 
 /// Run `f` with the conversation's [`ProfilingState`] mutably locked,
 /// without holding the session read-guard across the std `Mutex` (which
@@ -351,59 +382,77 @@ impl Tool for BrowserProfileTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        let input: ProfileInput = match serde_json::from_value(input) {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserProfileTool {
+    #[allow(clippy::result_large_err)]
+    pub(super) fn validate_input(input: Value) -> Result<(), ToolOutput> {
+        let input = parse_profile_input(input)?;
+        if input.action == ProfileAction::RunScenario {
+            validate_run_scenario(&input)?;
+        }
+        if input.action == ProfileAction::CpuSummary && input.path.is_none() {
+            return Err(ToolOutput::error(
+                "cpu_summary requires `path` (a saved CPU profile JSON)",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
+        macro_rules! on_browser {
+            ($session:ident => $action:expr) => {{
+                let $session: Arc<RwLock<BrowserSession>> = match access.browser().await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        return ToolOutput::error(format!("Failed to get browser: {error}"))
+                    }
+                };
+                $action
+            }};
+        }
+
+        let input = match parse_profile_input(input) {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+            Err(error) => return error,
         };
 
-        // help and cpu_summary need no browser (cpu_summary parses a
-        // file on disk — works even after the session died).
-        if input.action == "help" {
-            return ToolOutput::success(help_text());
-        }
-        if input.action == "cpu_summary" {
-            return action_cpu_summary(input.path.as_deref()).await;
-        }
-
-        // run_scenario's structural validation (empty steps, navigate/
-        // reload-in-steps, runs/throttle bounds) is pure input checking
-        // and MUST run BEFORE acquiring the browser — otherwise an
-        // invalid scenario in a no-Chrome env returns "Failed to get
-        // browser" instead of the real validation error, defeating the
-        // non-browser validation guarantee (Codex P2). Mirrors how
-        // `help` / `cpu_summary` are dispatched pre-browser.
-        if input.action == "run_scenario" {
-            let plan = match validate_run_scenario(&input) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
-                Ok(s) => s,
-                Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-            };
-            return action_run_scenario(&session, &input, plan).await;
-        }
-
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-        };
-
-        match input.action.as_str() {
-            "metrics" => action_metrics(&session).await,
-            "throttle" => action_throttle(&session, input.rate).await,
-            "gc_heap" => action_gc_heap(&session).await,
-            "cpu_start" => action_cpu_start(&session).await,
-            "cpu_stop" => action_cpu_stop(&session).await,
-            "trace_start" => action_trace_start(&session, input.categories.as_deref()).await,
-            "trace_stop" => action_trace_stop(&session).await,
-            "why_render" => action_why_render(&session).await,
-            "heap_snapshot" => action_heap_snapshot(&session, input.baseline.as_deref()).await,
-            "coverage_start" => action_coverage_start(&session).await,
-            "coverage_stop" => action_coverage_stop(&session).await,
-            other => ToolOutput::error(format!(
-                "Unknown action {other:?} — call action=\"help\" for the list"
-            )),
+        match input.action {
+            ProfileAction::Help => ToolOutput::success(help_text()),
+            ProfileAction::CpuSummary => action_cpu_summary(input.path.as_deref()).await,
+            ProfileAction::RunScenario => {
+                let plan = match validate_run_scenario(&input) {
+                    Ok(plan) => plan,
+                    Err(error) => return error,
+                };
+                on_browser!(session => action_run_scenario(&session, &input, plan).await)
+            }
+            ProfileAction::Metrics => on_browser!(session => action_metrics(&session).await),
+            ProfileAction::Throttle => {
+                on_browser!(session => action_throttle(&session, input.rate).await)
+            }
+            ProfileAction::GcHeap => on_browser!(session => action_gc_heap(&session).await),
+            ProfileAction::CpuStart => on_browser!(session => action_cpu_start(&session).await),
+            ProfileAction::CpuStop => on_browser!(session => action_cpu_stop(&session).await),
+            ProfileAction::TraceStart => {
+                on_browser!(session => action_trace_start(&session, input.categories.as_deref()).await)
+            }
+            ProfileAction::TraceStop => on_browser!(session => action_trace_stop(&session).await),
+            ProfileAction::WhyRender => on_browser!(session => action_why_render(&session).await),
+            ProfileAction::HeapSnapshot => {
+                on_browser!(session => action_heap_snapshot(&session, input.baseline.as_deref()).await)
+            }
+            ProfileAction::CoverageStart => {
+                on_browser!(session => action_coverage_start(&session).await)
+            }
+            ProfileAction::CoverageStop => {
+                on_browser!(session => action_coverage_stop(&session).await)
+            }
         }
     }
 }
@@ -588,17 +637,28 @@ async fn apply_throttle(session: &Arc<RwLock<BrowserSession>>, rate: f64) -> Res
     Ok(())
 }
 
-async fn action_throttle(session: &Arc<RwLock<BrowserSession>>, rate: Option<f64>) -> ToolOutput {
+#[allow(clippy::result_large_err)]
+fn validate_throttle_rate(rate: Option<f64>) -> Result<f64, ToolOutput> {
     let Some(rate) = rate else {
-        return ToolOutput::error("throttle requires `rate` (number >= 1; 1 = no throttle)");
+        return Err(ToolOutput::error(
+            "throttle requires `rate` (number >= 1; 1 = no throttle)",
+        ));
     };
     // Allium ThrottleRateWellFormed / invariant: rate < 1 must never be
     // representable as established override state.
     if rate < 1.0 {
-        return ToolOutput::error(format!(
+        return Err(ToolOutput::error(format!(
             "Invalid rate {rate}: must be >= 1 (1 = no throttling)"
-        ));
+        )));
     }
+    Ok(rate)
+}
+
+async fn action_throttle(session: &Arc<RwLock<BrowserSession>>, rate: Option<f64>) -> ToolOutput {
+    let rate = match validate_throttle_rate(rate) {
+        Ok(rate) => rate,
+        Err(error) => return error,
+    };
     if let Err(e) = apply_throttle(session, rate).await {
         return ToolOutput::error(e);
     }
@@ -1013,6 +1073,7 @@ struct ScenarioPlan {
     steps: Vec<Step>,
     runs: u32,
     warmup: u32,
+    total_runs: u32,
     gc_per_run: bool,
     reset: Reset,
 }
@@ -1062,6 +1123,10 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
     if runs < 1 {
         return Err(ToolOutput::error("run_scenario requires `runs` >= 1"));
     }
+    let warmup = resolve_warmup(input.warmup);
+    let total_runs = warmup.checked_add(runs).ok_or_else(|| {
+        ToolOutput::error("run_scenario warmup + runs exceeds the supported u32 run count")
+    })?;
     if let Some(tr) = input.throttle_rate {
         if tr < 1.0 {
             return Err(ToolOutput::error(format!(
@@ -1074,7 +1139,8 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
         steps,
         runs,
         // REQ-BT-019.16: warmup defaults to 1 (cold JIT/first-paint excluded).
-        warmup: resolve_warmup(input.warmup),
+        warmup,
+        total_runs,
         gc_per_run: input.gc_per_run.unwrap_or(true),
         reset: Reset::resolve(input.reset.as_ref()),
     })
@@ -1089,6 +1155,7 @@ async fn action_run_scenario(
         steps,
         runs,
         warmup,
+        total_runs,
         gc_per_run,
         reset,
     } = plan;
@@ -1110,7 +1177,6 @@ async fn action_run_scenario(
         }
     }
 
-    let total_runs = warmup + runs;
     let mut samples: Vec<RunSample> = Vec::with_capacity(runs as usize);
 
     // Warmup runs execute identically but their samples are discarded
@@ -1189,6 +1255,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             .map(|_| ())
             .map_err(|e| format!("reload failed: {e}")),
         Step::Click { selector } => {
+            let _input = guard.lock_native_input().await;
             let el = guard
                 .page
                 .find_element(selector)
@@ -1200,6 +1267,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
                 .map_err(|e| format!("click on {selector} failed: {e}"))
         }
         Step::Type { selector, text } => {
+            let _input = guard.lock_native_input().await;
             let el = guard
                 .page
                 .find_element(selector)
@@ -1240,10 +1308,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             .map(|_| ())
             .map_err(|e| format!("eval failed: {e}")),
         Step::WaitSelector { selector, timeout } => {
-            let to = timeout
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+            let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
             let check = format!(
                 "document.querySelector({}) !== null",
                 serde_json::to_string(selector).unwrap_or_default()
@@ -1251,10 +1316,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             poll(&guard, &check, to, &format!("wait_selector {selector}")).await
         }
         Step::WaitTiming { mark, timeout } => {
-            let to = timeout
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+            let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
             let check = format!(
                 "performance.getEntriesByName({}, 'mark').length > 0",
                 serde_json::to_string(mark).unwrap_or_default()
@@ -1265,10 +1327,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
             expression,
             timeout,
         } => {
-            let to = timeout
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+            let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
             poll(&guard, &format!("!!({expression})"), to, "wait_eval").await
         }
     }
@@ -1380,7 +1439,7 @@ async fn action_cpu_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
     ));
     match rankings.as_ref().and_then(|s| cpu_summary_json(s, &path)) {
         Some(display) => out.with_display(display),
-        None => out,
+        None => out.with_display(json!({"artifact_path": path})),
     }
 }
 
@@ -1411,7 +1470,7 @@ async fn action_cpu_summary(path: Option<&str>) -> ToolOutput {
     let out = ToolOutput::success(format!("CPU profile {path}\n\n{summary_text}"));
     match rankings.as_ref().and_then(|s| cpu_summary_json(s, path)) {
         Some(display) => out.with_display(display),
-        None => out,
+        None => out.with_display(json!({"artifact_path": path})),
     }
 }
 
@@ -2102,36 +2161,42 @@ async fn action_heap_snapshot(
         return ToolOutput::error(format!("heap_snapshot failed: {e}"));
     }
 
+    finish_heap_snapshot(&path, baseline).await
+}
+
+async fn finish_heap_snapshot(path: &str, baseline: Option<&str>) -> ToolOutput {
     let Some(baseline_path) = baseline else {
         return ToolOutput::success(format!(
             "Heap snapshot saved to {path} (load in Chrome DevTools → Memory). \
              Pass this path as `baseline` to a later heap_snapshot for a diff."
-        ));
+        ))
+        .with_display(json!({"artifact_path": path}));
     };
 
-    // Allium HeapDiffRequiresTwoSnapshots: a diff against a missing
-    // baseline is an error, not a zero-delta result.
-    let baseline_text = match tokio::fs::read_to_string(baseline_path).await {
-        Ok(t) => t,
-        Err(e) => {
-            return ToolOutput::error(format!(
-                "baseline snapshot {baseline_path} not readable: {e} \
-                 (\"no leak\" and \"never measured\" must stay distinguishable)"
-            ));
+    match heap_snapshot_diff(path, baseline_path).await {
+        Ok(output) => output,
+        Err(error) => {
+            ToolOutput::error(error).with_display(json!({"post": path, "baseline": baseline_path}))
         }
-    };
-    let post_text = match tokio::fs::read_to_string(&path).await {
-        Ok(t) => t,
-        Err(e) => return ToolOutput::error(format!("post snapshot not readable: {e}")),
-    };
-    let base_stats = match parse_heap_stats(&baseline_text) {
-        Ok(s) => s,
-        Err(e) => return ToolOutput::error(format!("parsing baseline: {e}")),
-    };
-    let post_stats = match parse_heap_stats(&post_text) {
-        Ok(s) => s,
-        Err(e) => return ToolOutput::error(format!("parsing post snapshot: {e}")),
-    };
+    }
+}
+
+async fn heap_snapshot_diff(path: &str, baseline_path: &str) -> Result<ToolOutput, String> {
+    let baseline_text = tokio::fs::read_to_string(baseline_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "baseline snapshot {baseline_path} not readable: {error} \
+                 (\"no leak\" and \"never measured\" must stay distinguishable)"
+            )
+        })?;
+    let post_text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("post snapshot not readable: {error}"))?;
+    let base_stats =
+        parse_heap_stats(&baseline_text).map_err(|error| format!("parsing baseline: {error}"))?;
+    let post_stats =
+        parse_heap_stats(&post_text).map_err(|error| format!("parsing post snapshot: {error}"))?;
 
     let node_delta = i64::try_from(post_stats.node_count).unwrap_or(i64::MAX)
         - i64::try_from(base_stats.node_count).unwrap_or(i64::MAX);
@@ -2151,7 +2216,7 @@ async fn action_heap_snapshot(
         base_stats.detached_dom_nodes,
         post_stats.detached_dom_nodes,
     );
-    ToolOutput::success(summary).with_display(json!({
+    Ok(ToolOutput::success(summary).with_display(json!({
         "baseline": baseline_path,
         "post": path,
         "node_count_delta": node_delta,
@@ -2161,7 +2226,7 @@ async fn action_heap_snapshot(
             "baseline": base_stats.detached_dom_nodes,
             "post": post_stats.detached_dom_nodes,
         },
-    }))
+    })))
 }
 
 // ============================================================================
@@ -2233,6 +2298,7 @@ async fn action_coverage_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutp
     ToolOutput::success(format!(
         "Coverage saved to {path} ({script_count} scripts)."
     ))
+    .with_display(json!({"artifact_path": path}))
 }
 
 #[cfg(test)]
@@ -2289,6 +2355,71 @@ mod tests {
         assert!((summary.long_task_total_ms() - 125.001).abs() < f64::EPSILON);
     }
 
+    #[tokio::test]
+    async fn captured_heap_snapshot_remains_discoverable_when_diff_fails() {
+        let scratch = tempfile::tempdir().expect("snapshot scratch directory");
+        let post_path = scratch.path().join("post.heapsnapshot");
+        let baseline_path = scratch.path().join("baseline.heapsnapshot");
+        let post = post_path.to_str().unwrap();
+        let baseline = baseline_path.to_str().unwrap();
+        let snapshot = r#"{"snapshot":{"meta":{"node_fields":["name","self_size"]}},"nodes":[0,42],"strings":["Object"]}"#;
+        tokio::fs::write(post, snapshot).await.unwrap();
+
+        let missing_baseline = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!missing_baseline.is_success());
+        assert!(missing_baseline.output().contains("not readable"));
+        assert_eq!(
+            missing_baseline.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+        assert_eq!(tokio::fs::read_to_string(post).await.unwrap(), snapshot);
+
+        tokio::fs::write(baseline, "bad baseline").await.unwrap();
+        let malformed_baseline = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!malformed_baseline.is_success());
+        assert!(malformed_baseline.output().contains("parsing baseline"));
+        assert_eq!(
+            malformed_baseline.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+
+        tokio::fs::write(baseline, snapshot).await.unwrap();
+        tokio::fs::write(post, "bad post").await.unwrap();
+        let malformed_post = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!malformed_post.is_success());
+        assert!(malformed_post.output().contains("parsing post"));
+        assert_eq!(
+            malformed_post.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+
+        tokio::fs::remove_file(post).await.unwrap();
+        let missing_post = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(!missing_post.is_success());
+        assert!(missing_post.output().contains("post snapshot not readable"));
+        assert_eq!(
+            missing_post.display_data(),
+            Some(&json!({"post": post, "baseline": baseline}))
+        );
+
+        tokio::fs::write(post, snapshot).await.unwrap();
+        let diff = finish_heap_snapshot(post, Some(baseline)).await;
+        assert!(diff.is_success(), "{}", diff.output());
+        let data = diff.display_data().unwrap();
+        assert_eq!(data["post"], post);
+        assert_eq!(data["baseline"], baseline);
+        assert_eq!(data["self_size_delta_bytes"], 0);
+        assert_eq!(data["node_count_delta"], 0);
+        assert!(data.get("artifact_path").is_none());
+
+        let standalone = finish_heap_snapshot(post, None).await;
+        assert!(standalone.is_success());
+        assert_eq!(
+            standalone.display_data(),
+            Some(&json!({"artifact_path": post}))
+        );
+    }
+
     #[test]
     fn step_deserializes_tagged() {
         let s: Step = serde_json::from_value(json!({"kind":"navigate","url":"about:blank"}))
@@ -2297,6 +2428,46 @@ mod tests {
         let w: Step = serde_json::from_value(json!({"kind":"wait_timing","mark":"ready"}))
             .expect("wait_timing");
         matches!(w, Step::WaitTiming { .. });
+    }
+
+    #[tokio::test]
+    async fn scenario_wait_timeouts_reject_invalid_values_before_browser_access() {
+        for mut step in [
+            json!({"kind": "wait_selector", "selector": "#ready"}),
+            json!({"kind": "wait_timing", "mark": "ready"}),
+            json!({"kind": "wait_eval", "expression": "window.ready"}),
+        ] {
+            for timeout in [
+                "",
+                "nope",
+                "-1s",
+                "18446744073709551615m",
+                "18446744073709551615s",
+            ] {
+                step["timeout"] = json!(timeout);
+                let input = json!({"action": "run_scenario", "steps": [step], "warmup": 0});
+                let error = BrowserProfileTool::validate_input(input.clone())
+                    .expect_err("invalid nested timeout must fail preflight");
+                assert!(error.output().contains("timeout"), "{}", error.output());
+                let boundary =
+                    super::super::ValidationBoundary(std::sync::atomic::AtomicBool::default());
+                let output = BrowserProfileTool::run_browser(input, &boundary).await;
+                assert!(
+                    !output.is_success(),
+                    "invalid nested timeout must fail execution"
+                );
+                assert!(output.output().contains("timeout"), "{}", output.output());
+                assert!(!boundary.0.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            step.as_object_mut().unwrap().remove("timeout");
+            BrowserProfileTool::validate_input(json!({"action": "run_scenario", "steps": [step]}))
+                .expect("omitted nested timeout uses the default");
+            for timeout in ["0ms", "125ms", "3s", "1m"] {
+                step["timeout"] = json!(timeout);
+                let input = json!({"action": "run_scenario", "steps": [step]});
+                BrowserProfileTool::validate_input(input).expect("valid nested timeout");
+            }
+        }
     }
 
     /// REQ-BT-019.13/.15 + cross-cutting: a not-measured field MUST

@@ -19,6 +19,7 @@ import {
 
 function userMsg(id: string, text = 'hi', files?: Array<{ original_name: string }>): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 1,
     conversation_id: 'c1',
@@ -30,6 +31,7 @@ function userMsg(id: string, text = 'hi', files?: Array<{ original_name: string 
 
 function agentMsg(id: string, blocks: ContentBlock[] = []): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 2,
     conversation_id: 'c1',
@@ -41,6 +43,7 @@ function agentMsg(id: string, blocks: ContentBlock[] = []): Message {
 
 function toolMsg(id: string, tool_use_id: string, content: Partial<Message['content']> & { content?: string; result?: string; error?: string }): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 3,
     conversation_id: 'c1',
@@ -52,6 +55,7 @@ function toolMsg(id: string, tool_use_id: string, content: Partial<Message['cont
 
 function systemMsg(id: string, text: string): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 4,
     conversation_id: 'c1',
@@ -63,6 +67,7 @@ function systemMsg(id: string, text: string): Message {
 
 function skillMsg(id: string, text: string): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 5,
     conversation_id: 'c1',
@@ -1035,6 +1040,7 @@ describe('buildConversationSearchProjection', () => {
       kind: 'user',
       key: 'u1',
       message: {
+        event_presentation: null,
         message_id: 'u1',
         sequence_id: 1,
         conversation_id: 'c1',

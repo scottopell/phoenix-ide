@@ -229,8 +229,25 @@ describe('parseEvent', () => {
     });
   });
 
+  it('retains both accepted-opening authority and event presentation in one live message', () => {
+    const {dispatch} = mockDispatch();
+    const presentation = {status: 'unavailable', event_id: 'event-merge', reason: 'redacted'};
+    const payload = {sequence_id: 5, opening: {status: 'none'}, message: {
+      message_id: 'event-message', sequence_id: 5, conversation_id: 'conv-1', message_type: 'user',
+      content: {text: 'event'}, origin: {kind: 'subscription_event', event_id: 'event-merge'}, created_at: '2024-01-01T00:00:00Z',
+      event_presentation: presentation,
+    }};
+    const parsed = parseEvent(SseMessageDataSchema, makeEvent(payload), 'message', dispatch);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.data.opening).toEqual({status: 'none'});
+      expect(parsed.data.message.event_presentation).toEqual(presentation);
+    }
+  });
+
   describe('message schema', () => {
     const goodMsg = {
+      event_presentation: null,
       message_id: 'msg-1',
       sequence_id: 5,
       conversation_id: 'conv-1',

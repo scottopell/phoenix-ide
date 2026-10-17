@@ -25,6 +25,7 @@ import type { ChainSseWireEvent } from './generated/ChainSseWireEvent';
 
 import * as v from 'valibot';
 import { ContinuationOpeningSchema } from './conversation/opening';
+import type { EventPresentation } from './generated/EventPresentation';
 import type { ErrorKind as WireErrorKind } from './generated/sse';
 import type { Conversation, InputOrigin, Message, QueuedSteeringMessage } from './api';
 // Generated wire types — aliased so we can reuse the short `Sse*Data`
@@ -126,6 +127,34 @@ export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.varian
   }),
 ]);
 
+export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation> = v.variant('status', [
+  v.looseObject({
+    status: v.literal('available'),
+    event_id: v.string(),
+    product_conversation_id: v.string(),
+    display_name: v.nullable(v.string()),
+    source_transcript_id: v.string(),
+    source_occurrence_kind: v.string(),
+    source_occurrence_id: v.string(),
+    source_generation: v.number(),
+    occurred_at_us: v.number(),
+    provenance: v.picklist(['subscription', 'mandatory_close_failure']),
+    outcome: v.variant('kind', [
+      v.looseObject({ kind: v.literal('turn_finished') }),
+      v.looseObject({ kind: v.literal('failed'), reason: v.string() }),
+      v.looseObject({ kind: v.literal('cleanup_failed'), reason: v.string() }),
+      v.looseObject({ kind: v.literal('cancelled') }),
+      v.looseObject({ kind: v.literal('awaiting_user_response') }),
+      v.looseObject({ kind: v.literal('awaiting_task_approval') }),
+    ]),
+  }),
+  v.looseObject({
+    status: v.literal('unavailable'),
+    event_id: v.string(),
+    reason: v.picklist(['missing', 'lookup_failed', 'redacted']),
+  }),
+]);
+
 /** Message block carried in `init.messages` and `message.message`. Validates
  *  the reducer's load-bearing fields (`sequence_id` as number is the main
  *  point — a string would corrupt the dedup guard).
@@ -141,6 +170,7 @@ const MessageSchema = v.pipe(
     conversation_id: v.string(),
     message_type: v.picklist(MESSAGE_TYPE_OPTIONS),
     origin: InputOriginSchema,
+    event_presentation: v.nullable(EventPresentationSchema),
     content: v.unknown(),
     display_data: v.optional(v.unknown()),
     usage_data: v.optional(v.unknown()),

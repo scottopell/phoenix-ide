@@ -8,6 +8,10 @@ Production deployment restores the previous binary, configuration, environment, 
 
 Database restore or replacement is an offline operator procedure. Phoenix does not provide live replacement fencing for an SQLite file already opened by a running process.
 
+The narrow prepared-artifact launchd exception admits either the exact migration-123 baseline or a source ledger exactly equal to the migration-128 candidate registry under ADR-105 and ADR-114, including named migrations 126/127/128 and immutable registry/digest checks. The 128-to-128 controller and regression changes are authored; hosted CI qualification is pending. Both sources require an offline snapshot and mandatory candidate `--migrate-only` invocation, permit automatic predecessor rollback only before invocation with unchanged transaction-bound source contents, and forbid snapshot replay or predecessor startup afterward. This is one bounded prepared replacement, not a general same-version, cross-binary, downgrade, or runtime compatibility guarantee.
+
+The ordinary in-place route does not gain a backup requirement. For the same exact 123-to-128 interval, the authored policy retains immutable registry/digest evidence and treats the first candidate startup attempt as a conservative downgrade boundary: later failure retains the candidate and stops forward-only because migration or initialization writes may already have committed. Hosted CI qualification remains pending.
+
 Internal SQLite timestamps use mixed representations. New or changed internal timestamp columns must converge on explicitly unit-named integer Unix microseconds unless a more specific normative requirement identifies an external reader and requires another representation.
 
 Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as an explicit opt-in, with sccache and uncached automatic fallbacks. Automatic selection excludes Kache for every build surface because restored-archive source-level debug fidelity is unqualified; the fidelity blocker remains open. Cache selection is scoped to Cargo subprocesses and does not establish a general cross-version, remote-cache, performance, or debug-symbol compatibility guarantee.
@@ -16,6 +20,8 @@ Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as
 
 | Requirement | Current coverage / gap |
 | --- | --- |
+| REQ-COMP-013 | Authored; hosted CI pending for exact 123-to-128 ordinary no-backup pre-start rollback, post-start forward-only fencing, no predecessor launch, immutable registry/digest checks, and exact-candidate resume regressions. No execution or deployment acceptance claimed. |
+| REQ-COMP-012 | Authored; hosted CI pending for exact 123-to-128 transition and prepared exact-target-ledger admission, named 126/127/128 identities, immutable registry/digest checks, mandatory offline candidate invocation, pre-invocation-only rollback, and partial/ambiguous-write fail-closed regressions in the launchd prepared helper. No execution or deployment acceptance claimed. |
 | REQ-COMP-001 | The requirement is defined in `requirements.md`, and contributor guidance points agents to that authority. A broader guarantee inventory remains follow-up work. |
 | REQ-COMP-002 | Phoenix-managed forward migrations and intentional seeder gaps are implemented and tested. Damaged or manually changed ledgers, historical-binary access to newer migrations, and project-wide data preservation are not guaranteed. |
 | REQ-COMP-003 | Foundation acceptance covers manual offline paired restore, but production deployment can still launch an older candidate without proving that restore occurred, and the UI overstates runtime-artifact rollback. Enforcement and truthful messaging are tracked in task 44016. |

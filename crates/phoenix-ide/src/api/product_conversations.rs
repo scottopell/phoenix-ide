@@ -533,11 +533,13 @@ async fn get_coordinator_history_snapshot(
         |cursor| cursor.segment_ceilings.clone(),
     );
     let (messages, has_older, page, _) = aggregate_messages(
+        &state.db,
         &aggregate,
         snapshot.messages,
         limit,
         BoundaryRepresentation::OriginalMessages,
-    );
+    )
+    .await;
     let latest = &aggregate
         .segments
         .last()
@@ -685,7 +687,7 @@ fn decode_recovery_cursor(cursor: &str) -> Result<(i64, String), AppError> {
     Ok((updated_at, request_id.to_string()))
 }
 
-fn creation_allowed_actions(
+pub(super) fn creation_allowed_actions(
     status: &str,
     delivery_retryable: bool,
 ) -> Vec<ProductConversationCreationAllowedActionView> {
@@ -695,8 +697,13 @@ fn creation_allowed_actions(
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
             actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
-        "delivery_failed" if delivery_retryable => {
-            actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
+        "delivery_pending" => {
+            actions.push(ProductConversationCreationAllowedActionView::Cancel);
+        }
+        "delivery_failed" => {
+            if delivery_retryable {
+                actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
+            }
         }
         "failed" | "cancelled" => {
             actions.push(ProductConversationCreationAllowedActionView::Delete);
@@ -715,13 +722,33 @@ mod creation_allowed_actions_tests {
     use super::{creation_allowed_actions, ProductConversationCreationAllowedActionView};
 
     #[test]
-    fn terminal_publication_has_no_retry_but_transient_delivery_failure_does() {
+    fn permanent_delivery_failure_has_no_backend_recovery_actions() {
         assert!(creation_allowed_actions("delivery_failed", false).is_empty());
-        assert!(creation_allowed_actions("published", false).is_empty());
+    }
+
+    #[test]
+    fn pending_delivery_offers_cancel_only() {
+        for delivery_retryable in [false, true] {
+            assert_eq!(
+                creation_allowed_actions("delivery_pending", delivery_retryable),
+                vec![ProductConversationCreationAllowedActionView::Cancel]
+            );
+        }
+    }
+
+    #[test]
+    fn transient_delivery_failure_offers_retry_only() {
         assert_eq!(
             creation_allowed_actions("delivery_failed", true),
             vec![ProductConversationCreationAllowedActionView::RetryDelivery]
         );
+    }
+
+    #[test]
+    fn published_creation_has_no_recovery_actions() {
+        for delivery_retryable in [false, true] {
+            assert!(creation_allowed_actions("published", delivery_retryable).is_empty());
+        }
     }
 }
 
@@ -832,7 +859,7 @@ async fn snapshot_view(
         |cursor| cursor.segment_ceilings.clone(),
     );
     let (messages, has_older, page_messages, boundary_message_ids) =
-        aggregate_messages(&aggregate, page, message_limit, representation);
+        aggregate_messages(&state.db, &aggregate, page, message_limit, representation).await;
     let source = match aggregate.source.as_mut() {
         Some(source) => {
             source.deleted = state
@@ -946,7 +973,8 @@ type AggregatePage = (
     std::collections::HashSet<String>,
 );
 
-fn aggregate_messages(
+async fn aggregate_messages(
+    db: &crate::db::Database,
     aggregate: &ProductConversationAggregate,
     mut messages: Vec<(i64, crate::db::Message)>,
     limit: usize,
@@ -954,6 +982,11 @@ fn aggregate_messages(
 ) -> AggregatePage {
     let has_older = messages.len() > limit;
     messages.truncate(limit);
+    let presentations = super::event_presentation::EventPresentations::load(
+        db,
+        messages.iter().map(|(_, message)| message),
+    )
+    .await;
     let boundary_message_ids = aggregate
         .segments
         .iter()
@@ -985,7 +1018,7 @@ fn aggregate_messages(
             by_segment
                 .entry(message.conversation_id.clone())
                 .or_default()
-                .push(crate::api::wire::EnrichedMessage::from(message));
+                .push(presentations.enrich(message));
         }
     }
     for segment_messages in by_segment.values_mut() {

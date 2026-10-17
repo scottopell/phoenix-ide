@@ -1,16 +1,19 @@
 ---
 name: phoenix-api
-description: Use supported Phoenix HTTP APIs for user-authorized Global Coordinator lifecycle actions.
+description: Use supported Phoenix HTTP APIs for user-authorized Global Coordinator actions with non-exhaustive best-practice recipes.
 audience: global-coordinator
 ---
 
 # Phoenix API for the Global Coordinator
 
-Use this skill only when the user has authorized a Phoenix lifecycle action. The authenticated API reference is included in this skill result; read it before acting and do not load a mutable filesystem copy.
+Use this skill only when the user has authorized a Phoenix API action. The authenticated API reference is included in this skill result; read it before acting and do not load a mutable filesystem copy. Its best-practice recipes are non-exhaustive, not an endpoint allowlist. Other supported public APIs may be used when grounded in inspected current deployment/source contracts and the user's authority; source inspection establishes contract facts, not permission or proof that local source is deployed.
 
-- Use scoped Bash in an active WorkScope and the documented Phoenix HTTP API; do not invent endpoints or guarantees.
-- Preserve normal Phoenix authorization. Discover whether auth is enabled without exposing credentials, and never print, persist, or place credentials in command arguments or tool output.
-- Resolve the current `ProductConversation` and its writable transcript before a transcript-targeted mutation. Do not infer a target from a stale transcript ID.
-- Generate the request identity once. Reuse it for an exact retry only where the endpoint documents idempotency; never generate a fresh identity for an uncertain retry.
+- Use scoped Bash in an active WorkScope and supported public Phoenix HTTP APIs; do not invent endpoints or guarantees. Verify the selected deployment's contract before acting; stop when support or deployment/source correspondence is uncertain.
+- An active local WorkScope authorizes local execution only. Separately establish the selected destination's identity, authentication, current target, and lifecycle state from authoritative, user-authorized sources. Require destination cwd provenance only when the operation consumes cwd.
+- Preserve normal Phoenix authorization. When authentication requires a credential, use only a user-identified credential source bound to that destination; never serialize credentials into arguments or output, and require authenticated encryption for nonlocal transport.
+- Apply the reference's existing lifecycle, target-resolution, and retry rules regardless of transport. Copyable curl recipes, local-only tools, and local cwd target only the local destination; nonlocal API calls must execute in the destination context with any required credential supplied without serialization, or stop.
+- Resolve the current `ProductConversation` and its writable transcript before a transcript-targeted mutation. Continue retries stay pinned to the retained original predecessor and exact intent; otherwise do not infer a target from a stale transcript ID.
+- Retain the operation's original target and exact intent. Generate caller-owned request identities once only where required; reuse them for an exact retry only where the endpoint supports idempotency. Never generate a fresh identity for an uncertain retry. A pending question's opaque server-owned `request_id` is a freshness guard, not an idempotency key.
 - Treat an HTTP success or an `accepted`/`queued` response as acceptance, not proof that asynchronous work completed. Re-read the documented state surface and report what Phoenix actually observed.
-- Stop and explain the endpoint gap when the requested guarantee is unavailable. A missing endpoint requires a separately justified follow-up, not an improvised administrative workflow.
+- For question responses, submit exact user-provided answers or decisions made within explicit delegated decision scope for every question. A generic instruction to inspect or unblock work is not decision authority. Never fabricate approvals or extend delegation. Follow the reference's read, exact-identity, complete-answer, single-POST, and re-read recipe.
+- Treat gap examples as an illustrative inventory qualified by inspected deployment/source, not a denylist. Verified supported alternatives and bounded state reads remain available within the user's authority. Never invent guarantees or receipts, bypass through databases/private handlers, or create background monitors. If no verified supported path provides the requested guarantee, explain the gap and scope a follow-up separately.

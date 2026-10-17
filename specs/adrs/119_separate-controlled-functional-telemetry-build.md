@@ -1,4 +1,4 @@
-# ADR-109: Separate controlled-functional telemetry build
+# ADR-119: Separate controlled-functional telemetry build
 
 - **Status:** Accepted
 - **Date:** 2026-10-16

@@ -100,7 +100,10 @@ import type { CoordinatorConversationSnapshotView } from './generated/Coordinato
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
+import type { ProductConversationCreateAcceptedResponse } from './generated/ProductConversationCreateAcceptedResponse';
+import type { ProductConversationCreationStatusResponse } from './generated/ProductConversationCreationStatusResponse';
 export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
+export type { ProductCreationProvisioningStage } from './generated/ProductCreationProvisioningStage';
 export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
 export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
 import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
@@ -679,6 +682,8 @@ export interface ToolCall {
 
 export type { InputOrigin } from './generated/InputOrigin';
 import type { InputOrigin } from './generated/InputOrigin';
+import type { EventPresentation } from './generated/EventPresentation';
+export type { EventPresentation } from './generated/EventPresentation';
 
 export interface Message {
   message_id: string;
@@ -687,6 +692,7 @@ export interface Message {
   message_type: 'user' | 'agent' | 'tool' | 'system' | 'error' | 'continuation' | 'skill';
   /** Synthetic UI messages may lack origin; authoritative wire messages require it. */
   origin?: InputOrigin;
+  event_presentation: EventPresentation | null;
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
@@ -789,10 +795,9 @@ export interface CreateProductConversationRequest {
   images?: ImageData[];
 }
 
-export interface CreateProductConversationResponse {
-  product_conversation_id: string;
-  canonical_route: string;
-}
+export type CreateProductConversationResponse = ProductConversationCreateAcceptedResponse;
+
+export type ProductConversationCreationObservation = ProductConversationCreationStatusResponse;
 
 export interface RecentManagementRootSuggestion {
   path: string;
@@ -1641,15 +1646,10 @@ export const api = {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
-      if (err.error_type === 'product_creation_retry_scheduled') {
-        const retryable = new Error(err.error || 'Product creation will retry') as Error & { retryable?: boolean };
-        retryable.retryable = true;
-        throw retryable;
-      }
       if (resp.status === 422) {
         throw new ExpansionError(err as ExpansionErrorDetail);
       }
-      throw new Error(err.error || 'Failed to create product conversation');
+      throw new ApiResponseError(err.error || 'Failed to create product conversation', resp.status, err.error_type);
     }
     return resp.json();
   },
@@ -1805,6 +1805,21 @@ export const api = {
       : await fetch('/api/product-conversations');
     if (!resp.ok) {
       throw new Error('Failed to fetch product conversations');
+    }
+    return resp.json();
+  },
+
+  async getProductConversationCreation(
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<ProductConversationCreationObservation> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}`, {
+      ...(signal ? { signal } : {}),
+      cache: 'no-store',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      throw new ApiResponseError(err.error || 'Failed to fetch product conversation creation', resp.status);
     }
     return resp.json();
   },

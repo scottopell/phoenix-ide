@@ -184,6 +184,7 @@ describe('useConversationView perf isolation (Finding B)', () => {
         epoch: 1,
         sequenceId: 4,
         message: {
+          event_presentation: null,
           message_id: 'm1',
           message_type: 'assistant',
           content: [{ type: 'text', text: 'hi' }],

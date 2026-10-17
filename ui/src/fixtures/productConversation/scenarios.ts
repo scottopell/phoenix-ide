@@ -25,6 +25,7 @@ function state(type: ConversationState['type']): ConversationState {
 
 function textMessage(id: string, sequenceId: number, messageType: 'user' | 'agent' | 'system', text: string, conversationState?: ConversationState): FixtureMessage {
   return {
+    event_presentation: null,
     message_id: id,
     conversation_id: ALIGNED_PREFIX_TRANSCRIPT_ROW_ID,
     sequence_id: sequenceId,

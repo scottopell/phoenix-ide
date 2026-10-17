@@ -523,6 +523,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
       esA.emit('message', {
         opening: null, sequence_id: 999,
         message: {
+          event_presentation: null,
           message_id: 'leaked-msg-from-A',
           sequence_id: 999,
           conversation_id: 'conv-A',

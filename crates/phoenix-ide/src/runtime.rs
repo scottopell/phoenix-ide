@@ -66,6 +66,11 @@ use tokio::sync::{
 };
 use tracing::Instrument;
 
+#[cfg(not(test))]
+const CREATION_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const CREATION_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Shared slot carrying the trace identity of whatever triggered a
 /// conversation's next turn: the HTTP request span that delivered the user
 /// event, or the parent's `conversation.turn` span for sub-agents. Written by
@@ -547,6 +552,8 @@ impl Drop for AdmittedOperation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SteeringAdmissionError {
+    #[error("product creation delivery claim was lost")]
+    ProductCreationClaimLost,
     #[error("conversation is fenced by an active Close attempt")]
     CloseAdmissionFenced,
     #[error("conversation is permanently unavailable in History")]
@@ -561,6 +568,11 @@ impl From<String> for SteeringAdmissionError {
     fn from(error: String) -> Self {
         Self::Internal(error)
     }
+}
+
+enum SteeringAppendAuthority<'a> {
+    Ordinary,
+    ProductCreation(&'a crate::db::ClaimedProductCreationJob),
 }
 
 pub struct RuntimeManager {
@@ -609,6 +621,10 @@ pub struct RuntimeManager {
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    creation_worker_idle_signal: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    product_creation_claim_guard_policy: Mutex<Option<creation_worker::ClaimGuardPolicy>>,
     #[cfg(test)]
     terminal_cleanup_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -1014,18 +1030,15 @@ impl ReplayRing {
         Some((self.anchor_seq, false, highest_present, replayed))
     }
 
-    /// Aggregate serialised JSON byte length across current ring entries.
-    /// Lazy / on-demand — iterates and serialises each entry via the
-    /// `SseWireEvent` conversion (matching the production wire path).
+    /// Aggregate base/redacted JSON byte length across current ring entries.
+    /// Lazy / on-demand; excludes database-backed private presentations and
+    /// SSE framing, so approximates delivery size.
     /// NOT a hot-path metric: call from the truncation log line or the
     /// `replay_ring_bytes()` ops accessor, not from per-event append.
     fn total_bytes(&self) -> usize {
         self.entries
             .iter()
-            .map(|e| {
-                let wire: crate::api::wire::SseWireEvent = e.event.clone().into();
-                serde_json::to_vec(&wire).map(|v| v.len()).unwrap_or(0)
-            })
+            .map(|e| crate::api::wire::SseWireEvent::replay_payload_size(&e.event).unwrap_or(0))
             .sum()
     }
 }
@@ -2500,6 +2513,10 @@ impl RuntimeManager {
             #[cfg(test)]
             hard_delete_barrier: AsyncMutex::new(None),
             #[cfg(test)]
+            creation_worker_idle_signal: Mutex::new(None),
+            #[cfg(test)]
+            product_creation_claim_guard_policy: Mutex::new(None),
+            #[cfg(test)]
             terminal_cleanup_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             bash_reconciliation_barrier: AsyncMutex::new(None),
@@ -3686,30 +3703,41 @@ impl RuntimeManager {
                         Some(chrono::Utc::now() + chrono::Duration::seconds(1))
                     }
                 };
-                if let Some(deadline) = next_deadline {
-                    let delay = (deadline - chrono::Utc::now())
+                #[cfg(test)]
+                let no_deadline = next_deadline.is_none();
+                let delay = next_deadline.map_or(CREATION_RECONCILE_INTERVAL, |deadline| {
+                    (deadline - chrono::Utc::now())
                         .to_std()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    tokio::select! {
-                        biased;
-                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
+                        .unwrap_or(std::time::Duration::ZERO)
+                        .min(CREATION_RECONCILE_INTERVAL)
+                });
+                let reconcile_sleep = tokio::time::sleep(delay);
+                #[cfg(test)]
+                let reconcile_sleep = async {
+                    let mut sleep = std::pin::pin!(reconcile_sleep);
+                    std::future::poll_fn(|cx| {
+                        let result = std::future::Future::poll(sleep.as_mut(), cx);
+                        // The biased select polls this only after fatal/kick waits are pending.
+                        if result.is_pending() && no_deadline {
+                            if let Some(idle) =
+                                manager.creation_worker_idle_signal.lock().unwrap().take()
+                            {
+                                let _ = idle.send(());
                             }
                         }
-                        () = tokio::time::sleep(delay) => {}
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
+                        result
+                    })
+                    .await;
+                };
+                tokio::select! {
+                    biased;
+                    _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
                         }
                     }
+                    () = reconcile_sleep => {}
                 }
             }
             tracing::info!("Conversation creation worker stopped");
@@ -6674,6 +6702,43 @@ impl RuntimeManager {
         event: Event,
         request_fingerprint: &str,
     ) -> Result<(), SteeringAdmissionError> {
+        self.enqueue_steer_message_with_authority(
+            conversation_id,
+            event,
+            request_fingerprint,
+            SteeringAppendAuthority::Ordinary,
+        )
+        .await
+    }
+
+    pub async fn enqueue_product_creation_steer_message(
+        self: &Arc<Self>,
+        delivery: &crate::db::ClaimedProductCreationJob,
+        event: Event,
+        request_fingerprint: &str,
+    ) -> Result<(), SteeringAdmissionError> {
+        let conversation_id = delivery
+            .job
+            .published_conversation_id
+            .as_deref()
+            .ok_or(SteeringAdmissionError::ProductCreationClaimLost)?;
+        self.enqueue_steer_message_with_authority(
+            conversation_id,
+            event,
+            request_fingerprint,
+            SteeringAppendAuthority::ProductCreation(delivery),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn enqueue_steer_message_with_authority(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+        request_fingerprint: &str,
+        authority: SteeringAppendAuthority<'_>,
+    ) -> Result<(), SteeringAdmissionError> {
         let Event::SteerMessage {
             ref text,
             ref origin,
@@ -6738,22 +6803,37 @@ impl RuntimeManager {
                 continue;
             }
 
-            let queue_position = self
-                .db()
-                .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
-                .await
-                .map_err(|error| match error {
-                    crate::db::DbError::CloseAdmissionFenced(_) => {
-                        SteeringAdmissionError::CloseAdmissionFenced
-                    }
-                    crate::db::DbError::ProductConversationUnavailable(_) => {
-                        SteeringAdmissionError::HistoryUnavailable
-                    }
-                    crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
-                    error => SteeringAdmissionError::Internal(format!(
-                        "Failed to persist steering queue before enqueue: {error}"
-                    )),
-                })?;
+            let append_result = match &authority {
+                SteeringAppendAuthority::Ordinary => {
+                    self.db()
+                        .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
+                        .await
+                }
+                SteeringAppendAuthority::ProductCreation(delivery) => {
+                    self.db()
+                        .append_product_creation_steering_entry(
+                            delivery,
+                            &new_entry,
+                            request_fingerprint,
+                        )
+                        .await
+                }
+            };
+            let queue_position = append_result.map_err(|error| match error {
+                crate::db::DbError::ProductCreationClaimLost => {
+                    SteeringAdmissionError::ProductCreationClaimLost
+                }
+                crate::db::DbError::CloseAdmissionFenced(_) => {
+                    SteeringAdmissionError::CloseAdmissionFenced
+                }
+                crate::db::DbError::ProductConversationUnavailable(_) => {
+                    SteeringAdmissionError::HistoryUnavailable
+                }
+                crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
+                error => SteeringAdmissionError::Internal(format!(
+                    "Failed to persist steering queue before enqueue: {error}"
+                )),
+            })?;
             let _ = handle.broadcast_tx.send_live_projection(|sequence_id| {
                 SseEvent::SteerMessageQueued {
                     sequence_id,
@@ -16224,6 +16304,73 @@ mod scope_liveness_tests {
             "HandedOff permanently transfers ownership; a terminal successor leaves \
              the scope unowned and eligible for cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn actual_direct_handoff_keeps_resource_scope_live_until_successor_terminates() {
+        let mgr = test_manager().await;
+        let parent = mgr
+            .db()
+            .create_conversation_with_project(
+                "direct-cleanup",
+                "direct-cleanup",
+                "/tmp",
+                false,
+                None,
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let scope = ResourceScopeKey::Work(parent.attached_work_scope_id.clone().unwrap());
+        mgr.db()
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::ContextExhausted {
+                    summary: "continue".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(child) =
+            mgr.db().continue_conversation(&parent.id).await.unwrap()
+        else {
+            panic!();
+        };
+        mgr.db()
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::HandedOff {
+                    successor_conv_id: child.id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(conversation_resource_scope(&child), Some(scope.clone()));
+        assert!(mgr
+            .scope_has_live_conversation_excluding(&scope, &parent.id)
+            .await
+            .unwrap());
+        assert!(!mgr
+            .scope_has_live_conversation_excluding(&scope, &child.id)
+            .await
+            .unwrap());
+        mgr.db()
+            .update_conversation_state(
+                &child.id,
+                &ConvState::Failed {
+                    error: "finished".into(),
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!mgr.scope_has_live_conversation(&scope).await.unwrap());
     }
 
     #[tokio::test]

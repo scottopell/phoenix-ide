@@ -129,6 +129,7 @@ function makeCounter(): { count: RenderCount; onRender: ProfilerOnRenderCallback
 
 function userMsg(id: string, text = 'hi'): Message {
   return {
+    event_presentation: null,
     message_id: id,
     sequence_id: 0,
     conversation_id: 'c1',

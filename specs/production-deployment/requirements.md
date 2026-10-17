@@ -114,3 +114,15 @@ THE shared production deployment contract SHALL treat the macOS launchd prepared
 ### REQ-PD-020 — Narrow committed paired finalization
 
 The shared command surface SHALL expose `prod finalize-paired TXN` only for the launchd paired contract under `specs/launchd-deployment/requirements.md` REQ-LDD-018. This operation SHALL be publication/reservation-only and SHALL NOT reuse runtime activation or database rollback. Unknown ownership, helper absence, committed identity or captured configuration SHALL retain the fence and refuse.
+
+### REQ-PD-021: Explicit prepared database mode selection
+
+**Condition:** When an operator deploys a prepared artifact through the production interface,
+**System:** the interface SHALL require exactly one of paired legacy upgrade or current-schema upgrade, SHALL reject either mode for release/local sources, SHALL require the expected full candidate commit, and SHALL expose mode-matched finalization and recovery commands without weakening artifact signature, notarization, receipt, architecture, source-commit, or embedded-identity verification.
+
+**Rationale:** Artifact provenance and database compatibility are separate dimensions; selecting a newer database family must not bypass the prepared artifact's existing supply-chain contract.
+
+### REQ-PD-022: Ordinary forward-only recovery surface
+
+**Condition:** When ordinary launchd activation crosses the qualified candidate-start boundary and does not verify candidate health,
+**System:** the production interface SHALL report that predecessor rollback is forbidden, retain the deployment claim and exact candidate evidence, and expose only explicit `prod resume-forward TXN` recovery for that transaction. It SHALL NOT require or imply a standalone backup for the normal in-place route.

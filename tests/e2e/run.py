@@ -1110,6 +1110,7 @@ def scenario_coordinator_home(_base_url: str) -> None:
             assert _get_conv(base_url, conv_id)['conversation']['cwd'] == cwd
             worker_root = root / 'ordinary-worker'
             worker_root.mkdir()
+            worker_root = worker_root.resolve()
             sentinel = worker_root / 'worker-sentinel.txt'
             sentinel.write_text('separate-worker-bytes')
             worker = _new_conv_in(base_url, str(worker_root), '[[scenario:plain_text]] separate ordinary work')
@@ -1127,7 +1128,8 @@ def scenario_coordinator_home(_base_url: str) -> None:
             before = len(_get_conv(base_url, conv_id)['messages'])
             _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
             _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' and m.get('content', {}).get('is_error') is False for m in messages[before:]), 'restarted successor rediscovers owned scope from system context', timeout=SCENARIO_TIMEOUT_SECONDS)
-            assert _get_conv(base_url, worker['id'])['conversation']['cwd'] == worker['cwd']
+            worker_cwd_after_restart = _get_conv(base_url, worker['id'])['conversation']['cwd']
+            assert worker_cwd_after_restart == str(worker_root), (worker_cwd_after_restart, str(worker_root))
             closed = httpx.post(f"{base_url}/api/conversations/{worker['id']}/archive", timeout=10)
             closed.raise_for_status()
             deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
@@ -1251,6 +1253,7 @@ def scenario_continuation(base_url: str) -> None:
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
     worktrees_before = _git_worktree_inventory()
     with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
+        request_id = str(uuid.uuid4())
         create = httpx.post(
             f"{base_url}/api/product-conversations/new",
             json={
@@ -1258,15 +1261,36 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
                 "model": _default_model(base_url),
                 "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
                 "images": [],
-                "request_id": str(uuid.uuid4()),
+                "request_id": request_id,
             },
             timeout=10.0,
         )
         create.raise_for_status()
-        created = create.json()
-        product_conversation_id = created["product_conversation_id"]
-        canonical_route = created["canonical_route"]
-        root_conv_id = created["transcript_row_id"]
+        assert create.status_code == 202, f"unexpected creation acceptance: {create.status_code}"
+        accepted = create.json()
+        product_conversation_id = accepted["product_conversation_id"]
+        assert accepted["request_id"] == request_id
+
+        deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+        while True:
+            status_response = httpx.get(
+                f"{base_url}/api/product-conversations/creation/{request_id}",
+                timeout=10.0,
+            )
+            status_response.raise_for_status()
+            creation = status_response.json()
+            kind = creation["kind"]
+            if kind == "published":
+                break
+            if kind in {"failed", "cancelled"}:
+                raise AssertionError(f"product creation did not publish: {creation!r}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for product publication: {creation!r}")
+            time.sleep(0.05)
+
+        assert creation["product_conversation_id"] == product_conversation_id
+        canonical_route = creation["canonical_route"]
+        root_conv_id = creation["transcript_row_id"]
 
         assert canonical_route == f"/c/{product_conversation_id}", (
             f"unexpected canonical route: {canonical_route!r}"
@@ -1290,6 +1314,14 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
             "root row should not yet point at a continuation"
         )
 
+        original_scope = exhausted['conversation']['work_scope_id']
+        assert original_scope, 'non-Git creation must own a persisted WorkScope'
+        assert exhausted['conversation']['conv_mode']['mode'] == 'Direct'
+        original_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{root_conv_id}'}, timeout=10)
+        original_resolution.raise_for_status()
+        original_environment = original_resolution.json()['work_scope']
+        assert original_environment['work_scope_id'] == original_scope
+        assert original_environment['environment_kind'] == 'unowned_cwd'
         handoff = "Continue with the same ProductConversation after natural context exhaustion."
         continue_response = httpx.post(
             f"{base_url}/api/conversations/{root_conv_id}/continue",
@@ -1325,6 +1357,11 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
         assert successor["conversation"].get("continued_in_conv_id") is None, (
             "successor should be the latest leaf row"
         )
+        assert successor['conversation']['work_scope_id'] == original_scope
+        assert successor['conversation']['cwd'] == exhausted['conversation']['cwd']
+        successor_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{successor_id}'}, timeout=10)
+        successor_resolution.raise_for_status()
+        assert successor_resolution.json()['work_scope'] == original_environment
         successor_state = _state_str(successor["conversation"]["state"])
         assert successor_state == "idle", f"successor not idle after handoff: {successor_state}"
         successor_agent_messages = [

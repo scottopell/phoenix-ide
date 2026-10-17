@@ -9,11 +9,11 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 
 The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
 
-The departing-document delivery evidence decision is [ADR-107](107_pagehide-delivery-uses-collector-and-export-evidence.md), affecting REQ-CVT-004/005/006.
+The departing-document delivery evidence decision is [ADR-117](117_pagehide-delivery-uses-collector-and-export-evidence.md), affecting REQ-CVT-004/005/006.
 
-Complete exported span capacity is governed by [ADR-108](108_preserve-complete-span-schemas-with-bounded-capacity.md), affecting REQ-CVT-005/006/007.
+Complete exported span capacity is governed by [ADR-118](118_preserve-complete-span-schemas-with-bounded-capacity.md), affecting REQ-CVT-005/006/007.
 
-Controlled-functional build isolation is governed by [ADR-109](109_separate-controlled-functional-telemetry-build.md), affecting REQ-CVT-001/005/006.
+Controlled-functional build isolation is governed by [ADR-119](119_separate-controlled-functional-telemetry-build.md), affecting REQ-CVT-001/005/006.
 
 ## Quick reference
 
@@ -123,11 +123,24 @@ Controlled-functional build isolation is governed by [ADR-109](109_separate-cont
 | [099](099_bounded-markdown-disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
 | [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
-| [102](102_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
-| [107](107_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
-| [108](108_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
-| [109](109_separate-controlled-functional-telemetry-build.md) | Separate controlled-functional telemetry build | Accepted | REQ-CVT-001, REQ-CVT-005, REQ-CVT-006 |
+| [102](102_current-schema-prepared-activation-commits-at-database-write.md) | Current-schema prepared activation commits at the database-write boundary | Accepted; interval superseded by 105 | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
+| [103](103_ordinary-forward-launch-is-the-downgrade-boundary.md) | Ordinary forward candidate launch is the downgrade boundary | Accepted; interval superseded by 105 | REQ-COMP-013, REQ-LDD-023, REQ-PD-022 |
+| [104](104_product-creation-stages-backfill-from-durable-evidence.md) | Product creation stages backfill from durable evidence | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-012, REQ-COMP-001/002/005 |
+| [105](105_qualify-migration-128-for-bounded-current-schema-activation.md) | Qualify migration 128 for bounded current-schema activation | Accepted; supersedes interval portions of 102/103; prepared-source restriction partially superseded by ADR-114 | REQ-COMP-012/013, REQ-LDD-019–023, REQ-PD-021–022, REQ-CCR-012 |
+| [106](106_pre-stop-capacity-cleanup-is-cleanup-only-recovery.md) | Pre-stop capacity cleanup is a cleanup-only recovery boundary | Accepted | REQ-LDD-024 |
+| [107](107_standalone-browser-uses-session-daemon.md) | Standalone browser commands share a local session daemon | Accepted | REQ-BCLI-001–012 |
+| [108](108_snapshot-input-and-collection-boundaries.md) | Snapshot interactions enforce identity at native input dispatch | Accepted | REQ-BT-008, REQ-BT-009, REQ-BT-025 |
+| [109](109_console-capture-uses-ordered-context-identities.md) | Navigation console capture uses ordered context identities | Superseded by ADR-110 | REQ-BT-004, REQ-BCLI-007 |
+| [110](110_console-capture-tracks-document-incarnations.md) | Navigation console capture tracks document incarnations | Accepted | REQ-BT-004, REQ-BCLI-007 |
+| [111](111_console-capture-attaches-isolated-frame-targets.md) | Console capture attaches isolated frame targets | Accepted | REQ-BT-004, REQ-BCLI-007 |
+| [112](112_browser-cli-shares-verified-release-publication.md) | Browser CLI shares verified release publication | Accepted | REQ-DESKTOP-REL-005/009/010/011 |
+| [113](113_coordinator-api-recipes-are-non-exhaustive.md) | Coordinator API recipes are non-exhaustive | Accepted | REQ-GR-007, REQ-AUQ-009; Phoenix API guidance |
+| [114](114_admit-exact-target-ledger-for-prepared-current-schema-activation.md) | Admit the exact target ledger for prepared current-schema activation | Accepted; partially supersedes ADR-105's prepared-source restriction | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
 | [115](115_successful-position-settles-geometric-anchor.md) | Successful positioning settles geometry without retaining command capability | Accepted | REQ-VT-003, REQ-VT-006, REQ-VT-007 |
+| [116](116_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
+| [117](117_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
+| [118](118_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
+| [119](119_separate-controlled-functional-telemetry-build.md) | Separate controlled-functional telemetry build | Accepted | REQ-CVT-001, REQ-CVT-005, REQ-CVT-006 |
 
 ## For agents: which decisions bind your task
 
@@ -135,6 +148,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
@@ -158,11 +172,15 @@ Consult the relevant ADRs before starting work of each kind.
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
 | Retiring wake execution and preserving wake history | 098, within 034's compatibility scope; 006/011/012 are historical only |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
+| Migrating product creation provisioning stages or changing checkpoint progression | 104, then 044, 043, 034, and 007 |
 | Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 044, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
 | Specifying protected prepared artifacts or paired launchd ProductConversation database recovery | 076, 077, within 034; then 050 and 017 |
+| Qualifying prepared current-schema admission from exact migration 123 or the exact migration-128 target | 114 partially supersedes the prepared-source restriction in 105; retain the exact target from 105 and the activation/recovery boundaries from 102, then 034 |
+| Qualifying the migration-123 to exact migration-128 ordinary activation interval | 105 supersedes the interval portion of 103; retain its activation/recovery boundary, then 104 and 034 |
+| Modifying pre-stop capacity reservation cleanup, cleanup-only recovery, or reservation-evidence ownership | 106, then 010, 034, 102, and 076 |
 | Specifying authoritative build identity, candidate verification, legacy predecessor rollback, or bare-supervisor replacement | 064, then 017 and 010 |
 | Reviewing historical wake registration, observation, or resume records | 098 governs retirement; 006, 011, 012 record former behavior without execution authority |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
@@ -210,6 +228,10 @@ ADR-000 (adopt spEARS v2 for new work)
       │       └── ADR-093 (Federation validates CA capability and types IPv6 persistence)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
+      │   ├── ADR-102 (Current-schema prepared activation commits at the database-write boundary)
+      │   │   └── ADR-103 (Ordinary forward candidate launch is the downgrade boundary)
+      │   │       └── ADR-105 (Qualify migration 128 for bounded current-schema activation; supersedes interval portions of 102/103 and applies ADR-104)
+      │   │           └── ADR-114 (Admit exact target ledger as a prepared source; retain 105 target and 102 boundary)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
       │   ├── ADR-082 (Legacy AUQ waits retain identity absence)
       │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
@@ -218,6 +240,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
       │   └── applies ADR-024 and ADR-034 to pre-obligation materialized direct turns
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
+      │   ├── ADR-106 (Pre-stop capacity cleanup is a cleanup-only recovery boundary)
       │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
       │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
@@ -251,6 +274,7 @@ ADR-000 (adopt spEARS v2 for new work)
               ├── ADR-046 (ProductConversation owns aggregate presentation without duplicating transcript authority)
               ├── ADR-043 (Creation staging uses a private locked namespace)
               ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
+              │   └── ADR-104 (Product creation stages backfill from durable evidence)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
                   ├── ADR-033 (Database rollback is offline and Foundation observations use relational scalar storage)
                   └── ADR-035 (Repository authority activation is consumer-triggered and offline)

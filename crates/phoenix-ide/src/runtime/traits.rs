@@ -125,6 +125,13 @@ pub trait MessageStore: Send + Sync {
         message_id: &str,
     ) -> Result<Option<crate::db::ContinuationOpeningRead>, String>;
 
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        _work_scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     async fn coordinator_home_scope(
         &self,
     ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
@@ -1600,6 +1607,16 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
         self.db
             .read_message_continuation_opening(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        work_scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        self.db
+            .get_work_scope_legacy_conversation_id(work_scope_id)
             .await
             .map_err(|error| error.to_string())
     }

@@ -1,4 +1,4 @@
-# ADR-108: Preserve complete span schemas with bounded provider capacity
+# ADR-118: Preserve complete span schemas with bounded provider capacity
 
 - **Status:** Accepted
 - **Date:** 2026-10-16

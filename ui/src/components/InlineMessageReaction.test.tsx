@@ -10,6 +10,7 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { FilePathContextMenu } from './FilePathContextMenu';
 
 const messages: Message[] = ['old', 'new'].map((id) => ({
+  event_presentation: null,
   message_id: id, sequence_id: 2, message_type: 'agent',
   conversation_id: `row-${id}`, created_at: '2026-09-19T12:00:00Z',
   content: [{ type: 'text', text: 'Deterministic state patterns' }],

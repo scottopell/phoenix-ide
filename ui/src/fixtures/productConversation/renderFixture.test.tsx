@@ -5,6 +5,8 @@ import { api } from '../../api';
 import { InlineReactionStore } from '../../conversation/InlineReactionStore';
 import { ProductConversationFixture } from './renderFixture';
 import { getProductConversationScenario } from './scenarios';
+import { makeCompactEventsScenario } from './eventCards';
+import { installProductConversationFixtureApi } from './mockApi';
 
 vi.mock('../../cache', () => ({
   cacheDB: {
@@ -82,6 +84,30 @@ describe('ProductConversationFixture', () => {
       expect(scenario.snapshot).not.toHaveProperty('ordinary_lifecycle');
       expect(scenario.snapshot).not.toHaveProperty('close');
     }
+  });
+
+  it('keeps the Global event receiver distinct from the ordinary source and serves only exercised status reads', async () => {
+    const scenario = makeCompactEventsScenario(true);
+    const originalFetch = globalThis.fetch;
+    const restore = installProductConversationFixtureApi(scenario);
+    try {
+      expect(scenario.initialEntry).toBe('/global/event-latest');
+      expect(scenario.alignedLatestMessages).toHaveLength(4);
+      expect(await api.resolveCoordinatorRoute('event-latest')).toEqual({ coordinator_id: 'event-latest' });
+      expect(await api.resolveCoordinatorRoute('source-member')).toEqual({ coordinator_id: null });
+      const source = await api.getProductConversationSnapshot('source-member');
+      expect(source.product_conversation_id).toBe('source-member');
+      expect(source.segments[0]!.messages[0]!.content).toEqual({ text: 'Source conversation for compact event acceptance.' });
+      expect(await api.listActiveCoordinatorWatches()).toEqual([]);
+      expect(await api.listLiveCoordinatorBashHandles()).toEqual([]);
+      expect(document.documentElement.dataset['productConversationFixtureWatchRequests']).toBe('1');
+      expect(document.documentElement.dataset['productConversationFixtureLiveBashRequests']).toBe('1');
+      await expect(fetch('/api/coordinator/bash/live', { method: 'POST' })).rejects.toThrow('Unexpected fixture API request');
+      await expect(fetch('/api/unexpected')).rejects.toThrow('Unexpected fixture API request');
+    } finally {
+      restore();
+    }
+    expect(globalThis.fetch).toBe(originalFetch);
   });
 
   it('preserves origin-aware navigation after mounting a continued transcript again', async () => {

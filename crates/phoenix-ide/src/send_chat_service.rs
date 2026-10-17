@@ -576,6 +576,9 @@ impl SendChatApplicationService {
                     crate::runtime::SteeringAdmissionError::QueueFull => {
                         Ok(steering_queue_full_outcome())
                     }
+                    crate::runtime::SteeringAdmissionError::ProductCreationClaimLost => {
+                        Err(SendChatServiceError::Dispatch(error.to_string()))
+                    }
                     crate::runtime::SteeringAdmissionError::Internal(error) => {
                         Err(SendChatServiceError::Dispatch(error))
                     }
@@ -996,9 +999,8 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
-        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
-            map_db_internal_error(&other)
-        }
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
+        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
     }
 }
 
@@ -1049,9 +1051,8 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
         | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
         | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
-        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
-            map_db_internal_error(&other)
-        }
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch
+        | crate::db::DbError::ProductCreationClaimLost) => map_db_internal_error(&other),
     }
 }
 

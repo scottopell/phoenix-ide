@@ -8662,6 +8662,17 @@ where
             return self.handle_spawn_agents_tool(tool).await;
         }
 
+        let legacy_tmux_conversation_id = match &self.context.resource_scope {
+            phoenix_core::work_scope::ResourceScopeKey::Work(scope_id) => {
+                self.storage
+                    .get_work_scope_legacy_conversation_id(scope_id)
+                    .await?
+            }
+            phoenix_core::work_scope::ResourceScopeKey::Unattached(id) => Some(id.clone()),
+            phoenix_core::work_scope::ResourceScopeKey::Coordinator
+            | phoenix_core::work_scope::ResourceScopeKey::GlobalTerminal => None,
+        };
+
         // REQ-WPV-002: stamp the per-tool start time into the parent
         // assistant message's `display_data.tool_starts[tool_use_id]` map
         // (unix ms, server-authoritative) and broadcast `MessageUpdated`
@@ -8748,6 +8759,7 @@ where
         }
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
+        .with_legacy_tmux_conversation_id(legacy_tmux_conversation_id)
         .with_tool_use_id(tool.id.clone())
         .with_svg_artifact_store(Arc::new(
             super::svg_artifacts::RuntimeSvgArtifactStore::new(

@@ -32,6 +32,7 @@ function makeMessage(
     ? { message_type: messageTypeOrOverrides }
     : messageTypeOrOverrides;
   return {
+    event_presentation: null,
     message_id: `msg-${sequenceId}`,
     sequence_id: sequenceId,
     conversation_id: 'conv-1',
@@ -753,6 +754,7 @@ describe('conversationReducer', () => {
         conversationId: 'conv-1',
       };
       const eagerMsg: Message = {
+        event_presentation: null,
         message_id: 'eager-1',
         origin: { kind: 'unknown_historical' },
         sequence_id: 7,
@@ -2491,6 +2493,7 @@ describe('conversationReducer', () => {
         connectionEpoch: 7,
       };
       const message: Message = {
+        event_presentation: null,
         message_id: 'msg-stale',
         sequence_id: 100,
         conversation_id: 'conv-1',
