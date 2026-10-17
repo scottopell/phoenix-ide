@@ -21,6 +21,23 @@ REAL_DIGEST = opening.shipping.digest
 
 
 class OpeningQualificationTests(unittest.TestCase):
+    def test_controlled_global_history_target_uses_retained_source_slug_not_latest(self):
+        from urllib.parse import parse_qs, urlsplit
+        ordinary = {'kind': 'ordinary', 'route': '/c/product-ordinary',
+                    'members': ['old-ordinary', 'latest-ordinary'], 'old_message': 'message:ordinary'}
+        global_ = {'kind': 'global', 'route': '/global/latest-global',
+                   'members': ['old-global', 'latest-global'], 'old_message': 'message:global'}
+        targets = opening.controlled_history_targets((ordinary, global_))
+        self.assertEqual(urlsplit(targets[0]['route']).path, ordinary['route'])
+        self.assertEqual(urlsplit(targets[1]['route']).path, '/global/old-global')
+        self.assertNotEqual(urlsplit(targets[1]['route']).path, global_['route'])
+        for fixture, target in zip((ordinary, global_), targets):
+            parsed = urlsplit(target['route'])
+            self.assertEqual(parse_qs(parsed.query), {'source_transcript': [fixture['members'][0]], 'qualification': ['retained']})
+            self.assertEqual(target['anchor'], {'persistedMessageID': fixture['old_message'], 'sourceRow': fixture['members'][0]})
+            self.assertEqual(target['composerOwner'], fixture['members'][-1])
+            self.assertEqual(parsed.fragment, 'message-' + fixture['old_message'].replace(':', '%3A'))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

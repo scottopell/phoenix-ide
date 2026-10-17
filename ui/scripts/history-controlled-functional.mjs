@@ -78,7 +78,7 @@ export function assertOwnedReport(report, inventory) {
   assert.ok(report.correlations.some(c => c.kind === 'request' && finite.some(r => r.open_id === c.id)));
 }
 
-function controlledObserver(page, network, module, identity, fixture, ownership) {
+function controlledObserver(page, network, module, identity, fixture, ownership, kind) {
   const pending = new Set(), reportTransports = new Set(), changed = new Set();
   let failure = null;
   const signal = () => { for (const notify of changed) notify(); };
@@ -93,14 +93,26 @@ function controlledObserver(page, network, module, identity, fixture, ownership)
   const finished = req => { pending.delete(req); reportTransports.delete(req); signal(); };
   const response = () => signal();
   page.on('request', request); page.on('requestfinished', finished); page.on('requestfailed', finished); page.on('response', response);
+  const diagnosticReports = () => {
+    const reports = []; let invalid_report_count = 0;
+    for (const raw of network.snapshot().reports) {
+      try { reports.push(module.captureReport(JSON.stringify(raw), [])); }
+      catch { invalid_report_count++; }
+    }
+    return { reports, invalid_report_count };
+  };
   const getReports = () => network.snapshot().reports.map(raw => {
     const report = module.captureReport(JSON.stringify(raw), []);
-    assert.equal(report.product_conversation_id, fixture.product_conversation_id);
+    if (kind === 'history' || fixture.kind !== 'global' || report.product_conversation_id !== undefined) {
+      assert.equal(report.product_conversation_id, fixture.product_conversation_id);
+    } else {
+      assert.equal(report.outcome, kind === 'pagehide' ? 'incomplete' : 'canceled', 'unresolved Global identity belongs only to the expected pending terminal report');
+    }
     assert.equal(report.frontend_source, identity.frontendSource);
     return report;
   });
   return {
-    getReports,
+    getReports, diagnosticReports,
     failureCounts: () => ({ reports: Math.min(8, network.snapshot().reports.length),
       responses: network.snapshot().statuses.map(s => s.status).slice(0, 8),
       admissions: Math.min(8, ownership.diagnostics().filter(e => e.kind === 'admission').length),
@@ -145,7 +157,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
   assert.ok(deadlineMs > 0 && deadlineMs <= 195000);
   assert.equal(fixtures.aggregates.length, 2);
   const clock = deadlineClock(deadlineMs, UNIT), trials = [], contexts = new Set();
-  let canceled = false, primaryFailure;
+  let canceled = false, primaryFailure, driverPhase = 'context_create', activeScenario = null;
   const createContext = async () => {
     assert.ok(!canceled); clock.remaining();
     const context = await browser.newContext({ viewport: { ...CONTROLLED_VIEWPORT } });
@@ -161,6 +173,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
   const bounded = (operation, ceiling) => stage(operation, clock, ceiling, UNIT, abort);
   try {
     for (const kind of rows) for (const fixture of fixtures.aggregates) {
+      driverPhase = 'context_create'; activeScenario = { route: fixture.kind, kind };
       clock.remaining();
       assert.ok(!canceled);
       const route = fixture.kind, context = await bounded(createContext, 10000);
@@ -177,7 +190,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
           if (canceled) { await page.close(); throw new Error('controlled late page creation canceled'); }
           paginationDiagnostic = installHistoryPaginationDiagnostic(page, baseURL, fixture.endpoint);
           const network = installObservedHistoryTelemetry(page, baseURL, ownership);
-          observer = controlledObserver(page, network, module, fixtures.identity, fixture, ownership);
+          observer = controlledObserver(page, network, module, fixtures.identity, fixture, ownership, kind);
           const reports = [], statuses = [];
           // Observer helpers validate network bodies before they enter any retained receipt.
           const collect = async () => {
@@ -302,12 +315,14 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
       } catch (error) {
         canceled = true;
         const failure = UNIT ? error : new Error(`controlled ${route}/${kind} failed: ${error instanceof assert.AssertionError ? 'assertion' : 'operation_or_deadline'}`);
+        const diagnostic = observer?.diagnosticReports() ?? { reports: [], invalid_report_count: 0 };
         failure.controlledReceipt = { evidence_class: CONTROLLED_CLASS, status: 'failed', trials,
           failure_location: { scope: 'scenario', route, kind, phase,
             error_kind: error instanceof assert.AssertionError ? 'assertion' : 'operation',
             counts: observer?.failureCounts() ?? null, physical: physicalDiagnostics,
-            pagination: paginationDiagnostic?.snapshot(observer?.getReports() ?? []) ?? null },
-          failed_trial: collectedTrial ? { ...collectedTrial, reports: observer.getReports(), status: 'failed_assertions' } : null,
+            pagination: paginationDiagnostic?.snapshot(diagnostic.reports) ?? null },
+          diagnostic_reports: diagnostic,
+          failed_trial: collectedTrial ? { ...collectedTrial, reports: diagnostic.reports, status: 'failed_assertions' } : null,
           overhead_clearance: false, full_acceptance: false, failure: 'controlled_scenario_failed' };
         scenarioFailure = failure;
         throw failure;
@@ -322,6 +337,7 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
         }
       }
     }
+    driverPhase = 'six_scenario_inventory'; activeScenario = null;
     return assertControlledInventory({ evidence_class: CONTROLLED_CLASS, status: 'passed_assertions',
       acceptance: 'partial_controlled_functional_collector_export_only', comparison: { overhead_clearance: false, reason: 'controlled_admission_not_stock_overhead' },
       forbidden: [],
@@ -329,8 +345,13 @@ export async function runControlledFunctional({ browser, baseURL, fixtures, conf
       runId: config.runId, serviceName: config.serviceName, identity: fixtures.identity,
       trials, journeys: trials.flatMap(t => t.journeys) });
   } catch (error) {
-    primaryFailure = error;
-    throw error;
+    const failure = error instanceof Error ? error : new Error('controlled driver operation failed');
+    failure.controlledReceipt ??= { evidence_class: CONTROLLED_CLASS, status: 'failed', trials,
+      failure_location: { scope: 'driver', phase: driverPhase, ...activeScenario,
+        error_kind: error instanceof assert.AssertionError ? 'assertion' : 'operation' },
+      overhead_clearance: false, full_acceptance: false, failure: 'controlled_driver_failed' };
+    primaryFailure = failure;
+    throw failure;
   } finally {
     canceled = true;
     const cleanup = await Promise.allSettled([...contexts].map(context => stage(() => close(context), { remaining: () => 5000 }, 5000, UNIT, abort)));

@@ -840,6 +840,19 @@ def normal_server_completion(server, case, startup, control, failures):
     return receipt
 
 
+def controlled_history_targets(aggregates):
+    targets = []
+    for owned_aggregate in aggregates:
+        source, message = owned_aggregate['members'][0], owned_aggregate['old_message']
+        source_route = ('/global/' + quote(source, safe='')
+                        if owned_aggregate['kind'] == 'global' else owned_aggregate['route'])
+        route = source_route + '?' + urlencode({'source_transcript': source, 'qualification': 'retained'}) + '#message-' + quote(message, safe='')
+        targets.append({'kind': owned_aggregate['kind'], 'route': route,
+            'anchor': {'persistedMessageID': message, 'sourceRow': source},
+            'composerOwner': owned_aggregate['members'][-1]})
+    return targets
+
+
 def qualify(app, exe, output, joint_telemetry=False, controlled=False):
     if controlled and not joint_telemetry:
         raise ValueError('controlled functional capture requires real collector/export joining')
@@ -977,13 +990,7 @@ def qualify(app, exe, output, joint_telemetry=False, controlled=False):
                                 if controlled:
                                     if artifact_admission.digest(app/'ui'/manifest_name) != artifact.manifest_sha256:
                                         raise ValueError('controlled manifest changed after admission')
-                                    targets = []
-                                    for owned_aggregate in (aggregate, other):
-                                        source, message = owned_aggregate['members'][0], owned_aggregate['old_message']
-                                        route = owned_aggregate['route'] + '?' + urlencode({'source_transcript': source, 'qualification': 'retained'}) + '#message-' + quote(message, safe='')
-                                        targets.append({'kind': owned_aggregate['kind'], 'route': route,
-                                            'anchor': {'persistedMessageID': message, 'sourceRow': source},
-                                            'composerOwner': owned_aggregate['members'][-1]})
+                                    targets = controlled_history_targets((aggregate, other))
                                     admission_path = case/'controlled-artifact-admission.json'
                                     shipping.write_json(admission_path, {'evidence_class': mode, 'sample_rate': 1,
                                         'source_sha': PIN, 'source_tree': TREE_PIN,

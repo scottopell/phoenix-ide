@@ -2684,3 +2684,61 @@ claiming a cleanup/product fix.
 One changed-candidate normal qualification is authorized to exercise this
 completion-boundary correction and then the still-unqualified pagination repair.
 Stock sampling/unsupported resume/overhead false/full acceptance false unchanged.
+
+### Global canonical source target and failure-receipt masking
+
+Run `38990862125`, shared `d01e0d04b4cd90342abe74f03d3bdadd4a9c4076`, app35f,
+passed the complete pinned UI gate (retained exit0 receipt) and entered controlled
+browser execution. Witness `117272743090` failed after45s. Rust `117272797999`
+was still running at this entry; no whole-run terminal claim is made yet.
+Original artifact `12085511636` is96,383,480 bytes. Bounded browser receipt reports
+only outer lifecycle/capture/operation; no scenario or trials survived.
+
+Independent retained OTLP receiver capture has2190 spans across9 batches with
+zero receiver errors, but only two `browser.conversation_view` exports: ordinary
+ready/sample1 and Global canceled/sample1. The Global canceled export lacks
+resolved product identity and snapshot/meaningful timestamps. These are actual
+partial facts, not proof of six reports or the underlying masked failure phase.
+The failed browser path did not establish normal app-first drain; retained drain
+reports app_stopped=false/receiver_stopped=true. No acceptance is inferred.
+
+Source investigation found two shared issues:
+
+1. The controlled target factory combined Global **latest** route with the
+   **oldest** source pin. CoordinatorPage intentionally replaces that entry with
+   `/global/<source>` preserving query/hash, changing location.key and canceling
+   the unresolved admission. The factory now enters the canonical source slug
+   directly, preserving the same exact pin, encoded message, independently
+   selected anchor and latest composer owner. Ordinary route is unchanged.
+   This avoids rewrite; it does not accept cancellation as historical ready or
+   relax original-route/single-admission assertions.
+2. Failure construction called `getReports` again, repeating fixture assertions
+   that could throw for an unresolved Global canceled report and erase the
+   original scenario evidence. Failed receipts now project through the actual
+   bounded allowlist parser without fixture assertions, count/reject invalid
+   bodies, retain completed trials and label context-creation/final-inventory
+   phases. Diagnostic-only reports cannot grant acceptance. A regression uses
+   the actual pinned captureReport parser to reject an unknown private field
+   without retaining its body.
+
+The earlier references here/handoff to a production `sourceLinks` file were
+inaccurate for the frozen app: no such file exists. Actual authorities are
+CoordinatorPage.tsx/tests, App.tsx/alias tests, and MessageComponents.tsx origin
+links. The source owner independently confirmed canonical direct Global entry;
+parent independently ran both actual route suites (43 tests pass).
+
+Global product identity is unknown at admission and supplied only after snapshot
+resolution. Thus only expected pending Global incomplete/canceled scenarios may
+truthfully omit it; any supplied identity must match the fixture. Historical
+ready and all ordinary identities remain required. No identity is fabricated;
+actual pending finite request, producer/network owner, report route, frontend,
+exact outcomes, unique admission and six-report collector/export checks remain.
+
+Cached validation:136 shared Node tests,71 Python lifecycle tests,43 actual
+CoordinatorPage/App alias tests pass; diff check passes. An intermediate new
+report-route assertion moved an existing negative failure earlier and broke its
+expected failure-label check; that unnecessary assertion was removed, retaining
+the unchanged final strict route check and original negative regression. Source
+app remains clean35f; no product edit, local browser/native/build or unchanged
+normal qualification rerun occurred for this diagnosis. Independent scoped
+read-only review found no blockers in the target/identity/diagnostic changes.

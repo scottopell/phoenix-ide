@@ -79,8 +79,12 @@ function fakeRuntime(options={}){
       }
     }
     report(outcome){
-      const report={open_id:this.open_id,route:options.wrongRoute?'foreign':this.fixture.kind,sample_rate:1,outcome,product_conversation_id:this.fixture.product_conversation_id,correlations:[{kind:'request',id:this.request_id}]};
+      const report={open_id:this.open_id,route:options.wrongRoute?'foreign':this.fixture.kind,sample_rate:options.wrongSampleRate?0.25:1,outcome,product_conversation_id:this.fixture.product_conversation_id,correlations:[{kind:'request',id:this.request_id}]};
       if(outcome==='ready'&&!options.omitHistoryRequest&&!options.omitHistoryCorrelation)report.correlations.push({kind:'request',id:this.request_id+'-older'});
+      if(options.missingGlobalIdentity&&this.fixture.kind==='global')delete report.product_conversation_id;
+      if(options.unsafeReport)report.unrecognized_private_field='PRIVATE-never-retained';
+      if(options.unresolvedPendingGlobal&&this.fixture.kind==='global'&&outcome!=='ready')delete report.product_conversation_id;
+      if(options.wrongPendingGlobalIdentity&&this.fixture.kind==='global'&&outcome!=='ready')report.product_conversation_id='UNIT-foreign-product';
       const req=this.request('/api/telemetry/conversation-view','POST',JSON.stringify(report));
       if(outcome!=='incomplete')this.emit('response',{request:()=>req,status:()=>204});
       if(outcome==='incomplete'&&options.delayedDeparture){
@@ -128,6 +132,55 @@ test('UNIT actual uncorrelated older GET at context close cannot bypass final pa
 });
 test('UNIT late context-close report is retained and fails exact inventory',async()=>{
   const runtime=fakeRuntime({lateReport:true});await assert.rejects(runControlledFunctional(runtime.input,runtime.UNIT));assert.equal(runtime.getClosed(),1);
+});
+test('UNIT six-scenario inventory failure preserves every collected trial without raw errors',async()=>{
+  const runtime=fakeRuntime({wrongSampleRate:true});
+  let failure;try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(error){failure=error;}
+  assert.equal(failure.controlledReceipt.failure_location.phase,'six_scenario_inventory');
+  assert.equal(failure.controlledReceipt.failure_location.error_kind,'assertion');
+  assert.equal(failure.controlledReceipt.trials.length,6);
+  assert.equal(failure.controlledReceipt.trials[0].reports[0].sample_rate,0.25);
+  assert.equal(Object.hasOwn(failure.controlledReceipt,'message'),false);
+});
+test('UNIT invalid Global fixture identity cannot mask scenario failure or prior ordinary evidence',async()=>{
+  const runtime=fakeRuntime({missingGlobalIdentity:true});
+  let failure;try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(error){failure=error;}
+  assert.equal(failure.controlledReceipt.failure_location.route,'global');
+  assert.equal(failure.controlledReceipt.failure_location.phase,'history_report_wait');
+  assert.equal(failure.controlledReceipt.trials.length,1);
+  assert.equal(failure.controlledReceipt.diagnostic_reports.reports.length,1);
+  assert.equal(failure.controlledReceipt.diagnostic_reports.invalid_report_count,0);
+  assert.equal(Object.hasOwn(failure.controlledReceipt.diagnostic_reports.reports[0],'product_conversation_id'),false);
+});
+test('UNIT unresolved pending Global reports omit product identity without fabricating it',async()=>{
+  const runtime=fakeRuntime({unresolvedPendingGlobal:true});
+  const result=await runControlledFunctional(runtime.input,runtime.UNIT);
+  for(const t of result.trials.filter(t=>t.route==='global'&&t.kind!=='history')){
+    assert.equal(Object.hasOwn(t.reports[0],'product_conversation_id'),false);
+    assert.ok(t.primaryRequestOpenIds.length>0);
+  }
+  assert.equal(result.trials.find(t=>t.route==='global'&&t.kind==='history').reports[0].product_conversation_id,'UNIT-global');
+});
+test('UNIT a supplied pending Global product identity must still match the independently selected fixture',async()=>{
+  const runtime=fakeRuntime({wrongPendingGlobalIdentity:true});
+  let failure;try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(error){failure=error;}
+  assert.equal(failure.controlledReceipt.failure_location.route,'global');
+  assert.equal(failure.controlledReceipt.failure_location.kind,'pagehide');
+  assert.equal(failure.controlledReceipt.diagnostic_reports.reports[0].product_conversation_id,'UNIT-foreign-product');
+});
+test('UNIT actual pinned report parser filters invalid failure bodies but retains truthful unresolved Global diagnostics',async()=>{
+  const {resolve}=await import('node:path'),{pathToFileURL}=await import('node:url');
+  const app=resolve(process.env.APP_ROOT??'target/history-hidden-geometry-repair');
+  const {captureReport}=await import(pathToFileURL(resolve(app,'ui/scripts/qualify-view-telemetry.mjs')).href);
+  for(const unsafe of [false,true]){
+    const runtime=fakeRuntime(unsafe?{unsafeReport:true}:{missingGlobalIdentity:true});
+    runtime.input.module.captureReport=captureReport;
+    let failure;try{await runControlledFunctional(runtime.input,runtime.UNIT);}catch(error){failure=error;}
+    assert.ok(failure.controlledReceipt);
+    assert.equal(failure.controlledReceipt.diagnostic_reports.invalid_report_count,unsafe?1:0);
+    assert.equal(failure.controlledReceipt.diagnostic_reports.reports.length,unsafe?0:1);
+    assert.doesNotMatch(JSON.stringify(failure.controlledReceipt),/PRIVATE-never-retained|unrecognized_private_field/);
+  }
 });
 test('UNIT controlled driver refuses injected runtime proof',async()=>{
   const runtime=fakeRuntime();runtime.input.config.unitOnly=false;
