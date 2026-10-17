@@ -20,7 +20,7 @@
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::SystemTime;
@@ -47,7 +47,9 @@ pub enum BashHandleError {
         cap: usize,
         live_handles: Vec<LiveHandleSummary>,
     },
-    #[error("this work scope is being torn down and no longer accepts bash spawns")]
+    #[error(
+        "this work scope no longer accepts bash spawns: teardown or an unverified prior launch; do not automatically retry"
+    )]
     SpawnFenced,
 }
 
@@ -98,6 +100,7 @@ pub struct RegisteredHandle {
 struct SpawnAdmission {
     pending: AtomicUsize,
     settled: Arc<Notify>,
+    unverified_launch: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -105,6 +108,7 @@ pub struct SpawnReservation {
     owner: ResourceScopeKey,
     handle_id: HandleId,
     committed: bool,
+    launched: bool,
     admission: Arc<SpawnAdmission>,
 }
 
@@ -202,6 +206,10 @@ impl SpawnReservation {
 }
 
 impl SpawnReservation {
+    pub(super) fn mark_launched(&mut self) {
+        self.launched = true;
+    }
+
     fn settle(&mut self) {
         if !self.committed {
             self.committed = true;
@@ -213,6 +221,12 @@ impl SpawnReservation {
 
 impl Drop for SpawnReservation {
     fn drop(&mut self) {
+        if self.launched && !self.committed {
+            self.admission
+                .unverified_launch
+                .store(true, Ordering::Release);
+            tracing::warn!(handle = %self.handle_id, "bash launch was not registered; descendant cleanup remains unverified");
+        }
         self.settle();
     }
 }
@@ -617,7 +631,7 @@ impl BashHandleRegistry {
     ) -> Result<SpawnReservation, BashHandleError> {
         let entry = self.get_or_create(owner).await;
         let handles = entry.write().await;
-        if handles.teardown_started {
+        if handles.teardown_started || handles.admission.unverified_launch.load(Ordering::Acquire) {
             return Err(BashHandleError::SpawnFenced);
         }
         if handles.live_count().await + handles.admission.pending.load(Ordering::Acquire)
@@ -633,6 +647,7 @@ impl BashHandleRegistry {
             owner: owner.clone(),
             handle_id: Self::allocate_handle_id(),
             committed: false,
+            launched: false,
             admission: handles.admission.clone(),
         })
     }
@@ -897,6 +912,9 @@ impl BashHandleRegistry {
         };
         let table = permit.entry.read().await;
         if table.teardown_started && table.teardown_generation == permit.generation().0 {
+            if table.admission.unverified_launch.load(Ordering::Acquire) {
+                report.scope_uncertainty = Some(BashScopeUncertainty::UnregisteredLaunch);
+            }
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
             }
@@ -1036,14 +1054,17 @@ impl BashHandleRegistry {
         }
         match verified {
             BashRetirementOutcome::Retired(verification) => {
+                report.scope_uncertainty = verification.scope_uncertainty;
                 report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::Retired(report)
             }
             BashRetirementOutcome::AbsenceVerified(verification) => {
+                report.scope_uncertainty = verification.scope_uncertainty;
                 report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::AbsenceVerified(report)
             }
             BashRetirementOutcome::StaleGeneration(verification) => {
+                report.scope_uncertainty = verification.scope_uncertainty;
                 report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::StaleGeneration(report)
             }
@@ -1087,6 +1108,11 @@ impl BashHandleRegistry {
 /// orchestrator logs at WARN; nothing here is fatal — the conversation
 /// row is removed regardless. The orchestrator already knows the
 /// `ResourceScopeKey` (it's an argument), so it is not duplicated here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashScopeUncertainty {
+    UnregisteredLaunch,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeBashReport {
     /// pids that were live at snapshot time (informational; kills target
@@ -1099,12 +1125,20 @@ pub struct CascadeBashReport {
     /// to land yet). Surfaced separately because these are the most
     /// likely D-state offenders for an operator chasing orphans.
     pub kill_pending_kernel_pids: Vec<i32>,
-    /// Per-pgid kill failures (`kill(2)` returned non-zero). Successful
-    /// kills and `ESRCH` (process already gone) do not appear here.
+    /// Scope-level uncertainty without a process identity or signal authority.
+    pub scope_uncertainty: Option<BashScopeUncertainty>,
+    /// Process-group signal/verification failures. Successful kills and `ESRCH` are absent.
     pub kill_failures: Vec<(i32, String)>,
     /// Fence identity installed by an owner-level teardown. Absent when the
     /// owner was preserved and only actor-restricted handles were removed.
     pub teardown_generation: Option<BashTeardownGeneration>,
+}
+
+impl CascadeBashReport {
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        self.scope_uncertainty.is_some() || !self.kill_failures.is_empty()
+    }
 }
 
 /// Run the bash side of the hard-delete cascade for `work_scope`
@@ -1150,7 +1184,17 @@ pub async fn cascade_bash_on_delete(
             .await
             .remove_restricted_created_by(actor.conversation_id());
         registry.remove_from_global_index(&handles).await;
-        return kill_selected_handles(registry, work_scope, handles).await;
+        let mut report = kill_selected_handles(registry, work_scope, handles).await;
+        if entry
+            .read()
+            .await
+            .admission
+            .unverified_launch
+            .load(Ordering::Acquire)
+        {
+            report.scope_uncertainty = Some(BashScopeUncertainty::UnregisteredLaunch);
+        }
+        return report;
     }
     teardown_bash_owner(registry, work_scope).await
 }
@@ -2058,11 +2102,35 @@ mod tests {
         // Inheritor resolves to the same scope → skip teardown.
         let report = cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&wt)).await;
         assert!(report.live_handle_pgids.is_empty());
-        assert!(report.kill_failures.is_empty());
+        assert!(!report.has_failures());
         // The table is preserved and the handle is still reachable.
         assert_eq!(registry.scope_count().await, 1);
         let preserved = registry.get_or_create(&wt).await;
         assert!(preserved.read().await.get(&HandleId::new("b-1")).is_some());
+    }
+
+    #[tokio::test]
+    async fn cascade_same_scope_inheritor_reports_unregistered_launch_uncertainty() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("inherited-unregistered-launch");
+        let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
+        reservation.mark_launched();
+        drop(reservation);
+
+        let report =
+            cascade_bash_on_delete(&registry, &owner, &work_actor("owner"), Some(&owner)).await;
+        assert_eq!(
+            report.scope_uncertainty,
+            Some(BashScopeUncertainty::UnregisteredLaunch)
+        );
+        assert!(report.has_failures());
+        assert!(report.live_handle_pids.is_empty());
+        assert!(report.live_handle_pgids.is_empty());
+        assert!(report.kill_failures.is_empty());
+        assert!(report.teardown_generation.is_none());
+        let entry = registry.get_existing(&owner).await.unwrap();
+        assert!(!entry.read().await.teardown_started);
+        assert!(registry.reserve_spawn(&owner).await.is_err());
     }
 
     /// A continuation that resolves to a DIFFERENT scope does not preserve;

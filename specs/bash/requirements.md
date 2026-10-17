@@ -76,6 +76,46 @@ returned."
 
 ---
 
+### REQ-BASH-017: Post-launch Identity and Registration Settlement
+
+WHEN OS process creation fails before a child is returned
+THE SYSTEM SHALL return `error: "spawn_failed"` and release spawn admission.
+
+WHEN process creation succeeds but the birth identity is unavailable or handle registration fails
+THE SYSTEM SHALL NOT report `spawn_failed`, replay the command, fabricate a birth identity, adopt a later PID observation, or signal an unknown process group
+AND SHALL establish caller-cancellation-independent custody of the owned child before awaiting registration or settlement.
+
+WHEN the owned child has a cached terminal status
+THE SYSTEM SHALL preserve its exit or signal information and captured output without requiring a controllable handle.
+
+WHILE an unregistered child is not terminal
+THE SYSTEM SHALL capture stdout/stderr into the byte-bounded ring during a bounded natural-exit grace period
+AND SHALL, after that grace, attempt termination only through the still-owned direct child API and bound the subsequent reap wait
+AND SHALL NOT interpret the caller's `wait_seconds` as this failure-path termination policy.
+
+WHEN direct-child terminal status is verified
+THE SYSTEM SHALL return `status: "unregistered_exited"` or `"unregistered_killed"` with exit/signal information, duration, label, command and ring window
+AND SHALL allow a bounded descendant-pipe drain only after direct-child termination.
+
+WHEN bounded direct-child settlement cannot verify termination
+THE SYSTEM SHALL return an error with `status: "outcome_unknown"` and `error: "launch_outcome_unknown"`
+AND SHALL state that side effects may have occurred, execution may continue, and automatic retry is prohibited
+AND SHALL omit handle, PID, process-group identity and fabricated exit information
+AND SHALL mark output capture incomplete when closing readers at the settlement deadline.
+
+WHEN any launch remains unregistered
+THE SYSTEM SHALL report `launch_error: "identity_unavailable"` or `"registration_failed"`, `descendants: "unverified"`, and `output_complete`
+AND SHALL set `output_complete: false` if reader capture is interrupted or any captured lines are evicted from the ring
+AND SHALL release pending admission after bounded settlement even on caller cancellation
+AND SHALL retain a process-local uncertainty record that fences subsequent spawns and causes teardown, including same-scope-inheritor cleanup, to report unverified shutdown rather than hang or claim resource absence
+AND SHALL delegate any unreaped direct child to the runtime's child reaper without inferring signal authority from a numeric PID
+AND SHALL preserve sandbox scratch because unverified descendants may still use it.
+
+WHEN these responses are displayed
+THE SYSTEM SHALL preserve output and the no-handle, descendant-uncertainty and incomplete-capture facts in full, compact and search projections.
+
+---
+
 ### REQ-BASH-002: Wait Semantics
 
 WHEN agent calls `bash(op="run", cmd=<command>, wait_seconds=N)`
@@ -248,10 +288,12 @@ THE SYSTEM SHALL append the bytes to a per-handle ring buffer bounded by
 AND split incoming bytes on newline boundaries to assign each complete line a
 monotonically increasing offset (line 0, 1, 2, ... since spawn)
 
-WHEN the ring buffer's retained complete-line bytes reach `RING_BUFFER_BYTES`
-and new content arrives
-THE SYSTEM SHALL evict the oldest lines until the new content fits
+WHEN inserting a complete line exceeds either `RING_BUFFER_BYTES` in retained
+complete-line content bytes or `RING_BUFFER_BYTES` in retained line count
+THE SYSTEM SHALL evict the oldest lines until both bounds are satisfied,
+retaining at least the newest line even when it alone exceeds the byte cap
 AND advance `start_offset` to the offset of the oldest still-retained line
+AND apply the line-count bound to empty lines without changing content-byte accounting
 
 THE SYSTEM SHALL track a monotonic count of total bytes the process has
 written — incremented on every append, inclusive of bytes currently held as

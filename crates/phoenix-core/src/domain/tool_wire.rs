@@ -54,9 +54,56 @@ pub enum BashResponse {
     Exited(BashRunTombstonePayload),
     /// Run-path: process was signal-terminated inside the wait window.
     Killed(BashRunTombstonePayload),
+    /// Owned child exited, but no controllable handle was registered.
+    UnregisteredExited(BashUnregisteredTerminalPayload),
+    /// Owned child was signal-terminated without a registered handle.
+    UnregisteredKilled(BashUnregisteredTerminalPayload),
+    /// A child launched but bounded settlement could not verify its outcome.
+    OutcomeUnknown(BashUnregisteredUnknownPayload),
     /// Waiter task panicked; surface as a structured response so callers
     /// don't hang. Only fields needed for diagnosis are emitted.
     WaiterPanicked(BashWaiterPanickedPayload),
+}
+
+/// Post-launch failure, distinct from an OS spawn failure.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum BashLaunchError {
+    IdentityUnavailable,
+    RegistrationFailed,
+}
+
+/// An unregistered child has no handle or PID/group control authority.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct BashUnregisteredRun {
+    pub cmd: String,
+    pub label: Option<String>,
+    pub launch_error: BashLaunchError,
+    pub descendants: String,
+    pub output_complete: bool,
+    pub duration_ms: u64,
+    #[serde(flatten)]
+    pub window: BashRingWindow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct BashUnregisteredTerminalPayload {
+    #[serde(flatten)]
+    pub run: BashUnregisteredRun,
+    pub exit_code: Option<i32>,
+    pub signal_number: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct BashUnregisteredUnknownPayload {
+    #[serde(flatten)]
+    pub run: BashUnregisteredRun,
+    pub error: String,
+    pub error_message: String,
 }
 
 /// Common ring-buffer view returned alongside any handle response

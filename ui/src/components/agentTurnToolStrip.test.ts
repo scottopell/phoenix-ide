@@ -1,3 +1,4 @@
+import { bashLaunchOutcomes } from '../testFixtures/bashLaunchOutcomes';
 import { describe, expect, it } from 'vitest';
 import type { Message } from '../api';
 import { deriveToolStripItems } from './agentTurnToolStrip';
@@ -207,4 +208,19 @@ describe('isSignificantText', () => {
   it('pins the default threshold at 280 characters', () => {
     expect(SIGNIFICANCE_THRESHOLD).toBe(280);
   });
+});
+
+it.each(bashLaunchOutcomes)('keeps compact launch uncertainty visible for $status / $launch_error', (response) => {
+  const msg = agentMessage([{ type: 'tool_use', id: 'launch', name: 'bash', input: { cmd: response.cmd } }]);
+  const [item] = deriveToolStripItems(msg, new Map([
+    ['launch', toolResult('launch', { content: JSON.stringify(response), isError: response.status === 'outcome_unknown' })],
+  ]));
+  expect(item?.finalStatus).toContain('no handle');
+  expect(item?.finalStatus).toContain('descendants unverified');
+  expect(item?.finalStatus).toContain('output incomplete');
+  expect(item?.outputTail).toBe('retained-tail');
+  if (response.status === 'outcome_unknown') {
+    expect(item?.finalStatus).toContain('do not automatically retry');
+    expect(item?.finalStatus).not.toContain('exit ');
+  }
 });

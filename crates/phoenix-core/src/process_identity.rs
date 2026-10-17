@@ -29,7 +29,15 @@ pub fn process_identity_matches(expected: ProcessIdentity) -> bool {
 
 #[cfg(target_os = "linux")]
 fn process_start_time(pid: u32) -> Option<u128> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .inspect_err(|error| {
+            tracing::debug!(
+                pid,
+                errno = error.raw_os_error(),
+                "process identity /proc read failed"
+            );
+        })
+        .ok()?;
     let close = stat.rfind(')')?;
     let tail = stat.get(close + 1..)?;
     tail.split_whitespace().nth(19)?.parse().ok()
@@ -41,6 +49,8 @@ fn process_start_time(pid: u32) -> Option<u128> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
     let rc = unsafe {
+        // proc_pidinfo may return a short result without setting errno.
+        *libc::__error() = 0;
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
@@ -49,12 +59,32 @@ fn process_start_time(pid: u32) -> Option<u128> {
             size,
         )
     };
-    if rc != size {
+    if !complete_bsdinfo_result(
+        pid,
+        rc,
+        size,
+        std::io::Error::last_os_error().raw_os_error(),
+    ) {
         return None;
     }
     u128::from(info.pbi_start_tvsec)
         .checked_mul(1_000_000)
         .and_then(|seconds| seconds.checked_add(u128::from(info.pbi_start_tvusec)))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn complete_bsdinfo_result(pid: i32, rc: i32, expected: i32, errno: Option<i32>) -> bool {
+    if rc == expected {
+        return true;
+    }
+    tracing::debug!(
+        pid,
+        rc,
+        expected,
+        errno,
+        "process identity proc_pidinfo incomplete"
+    );
+    false
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -65,6 +95,30 @@ fn process_start_time(_pid: u32) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::{current_process_identity, process_identity_matches, ProcessIdentity};
+
+    #[test]
+    fn bsdinfo_short_denied_and_missing_results_never_prove_identity() {
+        let size = 136;
+        assert!(!super::complete_bsdinfo_result(
+            123,
+            0,
+            size,
+            Some(libc::EPERM)
+        ));
+        assert!(!super::complete_bsdinfo_result(
+            123,
+            0,
+            size,
+            Some(libc::ESRCH)
+        ));
+        assert!(!super::complete_bsdinfo_result(
+            123,
+            size - 1,
+            size,
+            Some(0)
+        ));
+        assert!(super::complete_bsdinfo_result(123, size, size, Some(0)));
+    }
 
     #[test]
     fn current_process_identity_is_exact() {
