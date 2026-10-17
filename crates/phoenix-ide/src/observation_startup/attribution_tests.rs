@@ -149,7 +149,9 @@ async fn closes_associated_success_error_and_denial_before_body_drain() {
             .iter()
             .filter(|record| request_record(record))
             .next_back()
-            .unwrap();
+            .unwrap_or_else(|| {
+                panic!("missing request close record; captured records: {records:#?}")
+            });
         let id = request["span"]["request_id"].as_u64().unwrap();
         assert!(id > previous_id);
         previous_id = id;
@@ -179,48 +181,176 @@ async fn closes_associated_success_error_and_denial_before_body_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn cancellation_closes_request_and_child_without_claiming_response_ready() {
-    let capture = Capture::default();
-    let started = Arc::new(tokio::sync::Notify::new());
-    let notify = started.clone();
-    let app = Router::new()
-        .route(
-            "/attribution/:reference",
-            get(move || async move {
-                async {
-                    notify.notify_one();
-                    std::future::pending::<StatusCode>().await
-                }
-                .instrument(tracing::info_span!("observation.db.read_member"))
-                .await
+    struct AmbientRequest {
+        future: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>>,
+        >,
+        dispatch: tracing::Dispatch,
+    }
+
+    impl std::future::Future for AmbientRequest {
+        type Output = axum::response::Response;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let this = self.get_mut();
+            tracing::dispatcher::with_default(&this.dispatch, || {
+                this.future.as_mut().unwrap().as_mut().poll(cx)
+            })
+        }
+    }
+
+    impl Drop for AmbientRequest {
+        fn drop(&mut self) {
+            tracing::dispatcher::with_default(&self.dispatch, || {
+                drop(self.future.take());
+                drop(tracing::info_span!("observation.authorization"));
+            });
+        }
+    }
+
+    let application = application().await;
+    let existing = Capture::default();
+    for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
+        .into_iter()
+        .enumerate()
+    {
+        let capture = Capture::default();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let app = Router::new()
+            .route(
+                "/attribution/:reference",
+                get(move || async move {
+                    async {
+                        notify.notify_one();
+                        std::future::pending::<StatusCode>().await
+                    }
+                    .instrument(tracing::info_span!("observation.db.read_member"))
+                    .await
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                application.clone(),
+                auth_middleware,
+            ));
+        let app = with_attribution_dispatch(app, capture.dispatch());
+        // The harness keeps the outer dispatch installed during abort destruction too.
+        let task = tokio::spawn(AmbientRequest {
+            future: Some(Box::pin(async move {
+                app.oneshot(request("CANCEL_SECRET", false)).await.unwrap()
+            })),
+            dispatch: outer,
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let records = capture.records();
+        assert_private(&records);
+        let roots: Vec<_> = records
+            .iter()
+            .filter(|record| request_record(record))
+            .collect();
+        assert_eq!(roots.len(), 1, "captured records: {records:#?}");
+        let request = roots[0];
+        assert_eq!(request["span"]["response_ready"], false);
+        assert!(request["span"]["status"].is_null());
+        let id = request["span"]["request_id"].as_u64().unwrap();
+        assert!(
+            records.iter().any(|record| {
+                record["span"]["name"] == "observation.db.read_member"
+                    && record["spans"]
+                        .as_array()
+                        .is_some_and(|spans| spans.iter().any(|span| span["request_id"] == id))
             }),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            application().await,
-            auth_middleware,
-        ));
-    let app = with_attribution_dispatch(app, capture.dispatch());
-    let task = tokio::spawn(app.oneshot(request("CANCEL_SECRET", false)));
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
-        .await
-        .unwrap();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    let records = capture.records();
+            "missing associated child; captured records: {records:#?}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["span"]["name"] == "observation.authorization")
+                .count(),
+            1,
+            "post-drop sentinel leaked into private dispatch: {records:#?}"
+        );
+        let outer_records = existing.records();
+        assert_private(&outer_records);
+        assert_eq!(
+            outer_records.len(),
+            index,
+            "outer records: {outer_records:#?}"
+        );
+        if index == 1 {
+            assert_eq!(
+                outer_records[0]["span"]["name"],
+                "observation.authorization"
+            );
+            assert!(outer_records[0]["span"]["request_id"].is_null());
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropping_pending_request_restores_dispatch_and_closes_parent_references() {
+    let application = application().await;
+    let existing = Capture::default();
+    for outer in [tracing::Dispatch::none(), existing.dispatch()] {
+        let capture = Capture::default();
+        let app = with_attribution_dispatch(
+            Router::new()
+                .route(
+                    "/attribution/:reference",
+                    get(|| async {
+                        std::future::pending::<StatusCode>()
+                            .instrument(tracing::info_span!("observation.db.read_member"))
+                            .await
+                    }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    application.clone(),
+                    auth_middleware,
+                )),
+            capture.dispatch(),
+        );
+        tracing::dispatcher::with_default(&outer, || {
+            let mut future = Box::pin(app.oneshot(request("DROP_SECRET", false)));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_pending());
+            drop(future);
+            drop(tracing::info_span!("observation.authorization"));
+        });
+        let records = capture.records();
+        assert_private(&records);
+        let roots: Vec<_> = records
+            .iter()
+            .filter(|record| request_record(record))
+            .collect();
+        assert_eq!(roots.len(), 1, "captured records: {records:#?}");
+        let root = roots[0];
+        assert_eq!(root["span"]["response_ready"], false);
+        assert!(root["span"]["status"].is_null());
+        let id = root["span"]["request_id"].as_u64().unwrap();
+        assert!(
+            records.iter().any(|record| {
+                record["span"]["name"] == "observation.db.read_member"
+                    && record["spans"]
+                        .as_array()
+                        .is_some_and(|spans| spans.iter().any(|span| span["request_id"] == id))
+            }),
+            "missing associated child; captured records: {records:#?}"
+        );
+    }
+    let records = existing.records();
     assert_private(&records);
-    let request = records
-        .iter()
-        .find(|record| request_record(record))
-        .unwrap();
-    assert_eq!(request["span"]["response_ready"], false);
-    assert!(request["span"]["status"].is_null());
-    let id = request["span"]["request_id"].as_u64().unwrap();
-    assert!(records.iter().any(|record| {
-        record["span"]["name"] == "observation.db.read_member"
-            && record["spans"]
-                .as_array()
-                .is_some_and(|spans| spans.iter().any(|span| span["request_id"] == id))
-    }));
+    assert_eq!(records.len(), 1, "captured records: {records:#?}");
+    assert_eq!(records[0]["span"]["name"], "observation.authorization");
+    assert!(records[0]["span"]["request_id"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -278,7 +408,7 @@ async fn startup_dispatch_captures_actual_product_detail_without_inheriting_defa
             .iter()
             .filter(|record| request_record(record))
             .collect();
-        assert_eq!(roots.len(), 1);
+        assert_eq!(roots.len(), 1, "captured records: {records:#?}");
         let request = roots[0];
         let id = request["span"]["request_id"].as_u64().unwrap();
         assert_eq!(

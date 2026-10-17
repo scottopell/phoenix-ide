@@ -54,10 +54,38 @@ where
     )
 }
 
+struct AttributionRequest {
+    future: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>>,
+    >,
+    dispatch: tracing::Dispatch,
+}
+
+impl std::future::Future for AttributionRequest {
+    type Output = axum::response::Response;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        tracing::dispatcher::with_default(&this.dispatch, || {
+            this.future.as_mut().unwrap().as_mut().poll(cx)
+        })
+    }
+}
+
+impl Drop for AttributionRequest {
+    fn drop(&mut self) {
+        tracing::dispatcher::with_default(&self.dispatch, || drop(self.future.take()));
+    }
+}
+
 fn with_attribution_dispatch(app: axum::Router, dispatch: tracing::Dispatch) -> axum::Router {
     app.layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            next.run(request).with_subscriber(dispatch.clone())
+        move |request: axum::extract::Request, next: axum::middleware::Next| AttributionRequest {
+            future: Some(Box::pin(next.run(request))),
+            dispatch: dispatch.clone(),
         },
     ))
 }

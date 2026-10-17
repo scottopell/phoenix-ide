@@ -18,7 +18,7 @@ FUNCTIONS = {
     DB: ["get_ordinary_product_conversation", "get_product_conversation_on"],
     AUTH: ["observation_request_span", "auth_middleware"],
     ROUTES: ["resolve_reference", "require_member"],
-    STARTUP: ["attribution_subscriber", "with_attribution_dispatch", "run", "run_with_attribution", "serve"],
+    STARTUP: ["attribution_subscriber", "AttributionRequest::poll", "AttributionRequest::drop", "with_attribution_dispatch", "run", "run_with_attribution", "serve"],
     "crates/phoenix-ide/src/observation_startup/attribution_tests.rs": [],
     "docs/conversation-observation-attribution.md": [],
     "tests/devpy/test_observation_attribution_source.py": [],
@@ -182,11 +182,21 @@ class AttributionSourceTests(unittest.TestCase):
         self.assertIn(".with_subscriber(dispatch)", startup)
         helper = '''fn with_attribution_dispatch(app: axum::Router, dispatch: tracing::Dispatch) -> axum::Router {
     app.layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            next.run(request).with_subscriber(dispatch.clone())
+        move |request: axum::extract::Request, next: axum::middleware::Next| AttributionRequest {
+            future: Some(Box::pin(next.run(request))),
+            dispatch: dispatch.clone(),
         },
     ))
 }'''
+        self.assertNotIn("next.run(request).with_subscriber", startup)
+        self.assertIn('''tracing::dispatcher::with_default(&this.dispatch, || {
+            this.future.as_mut().unwrap().as_mut().poll(cx)
+        })''', startup)
+        self.assertIn('''impl Drop for AttributionRequest {
+    fn drop(&mut self) {
+        tracing::dispatcher::with_default(&self.dispatch, || drop(self.future.take()));
+    }
+}''', startup)
         self.assertIn(helper, startup)
         self.assertIn('''let app = with_attribution_dispatch(
         create_router(ApplicationState::Observation(application))
@@ -230,6 +240,40 @@ class AttributionSourceTests(unittest.TestCase):
         self.assertIn("ObservationApplication::for_target(db, &target.id)", source)
         self.assertIn("Database::open_in_memory()", source)
         self.assertEqual(re.findall(r"\.with_subscriber\(([^)]*)\)", source), ["outer"])
+        self.assertIn("async fn dropping_pending_request_restores_dispatch_and_closes_parent_references()", source)
+        self.assertIn("std::task::Context::from_waker(std::task::Waker::noop())", source)
+        cancellation = source.split("async fn cancellation_closes_request_and_child_without_claiming_response_ready()", 1)[1].split("#[tokio::test]", 1)[0]
+        self.assertIn('''for (index, outer) in [tracing::Dispatch::none(), existing.dispatch()]
+        .into_iter()
+        .enumerate()''', cancellation)
+        self.assertIn('''impl Drop for AmbientRequest {
+        fn drop(&mut self) {
+            tracing::dispatcher::with_default(&self.dispatch, || {
+                drop(self.future.take());
+                drop(tracing::info_span!("observation.authorization"));
+            });
+        }
+    }''', cancellation)
+        self.assertIn("tokio::spawn(AmbientRequest {", cancellation)
+        self.assertIn('''task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let records = capture.records();''', cancellation)
+        for expected in ['request["span"]["response_ready"], false',
+                         'request["span"]["status"].is_null()',
+                         '"observation.db.read_member"',
+                         '"missing associated child; captured records: {records:#?}"',
+                         '"post-drop sentinel leaked into private dispatch: {records:#?}"',
+                         '''assert_eq!(
+            outer_records.len(),
+            index,
+            "outer records: {outer_records:#?}"
+        )''',
+                         'outer_records[0]["span"]["request_id"].is_null()']:
+            self.assertIn(expected, cancellation)
+        for forbidden in ["sleep(", "yield_now(", "with_subscriber("]:
+            self.assertNotIn(forbidden, cancellation)
+        self.assertEqual(source.count('panic!("missing request close record; captured records: {records:#?}")'), 1)
+        self.assertEqual(source.count('assert_eq!(roots.len(), 1, "captured records: {records:#?}")'), 3)
         for forbidden in ["TcpListener", "open_read_only", "standalone_path", "set_global_default"]:
             self.assertNotIn(forbidden, source)
 
