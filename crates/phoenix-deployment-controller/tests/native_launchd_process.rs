@@ -263,11 +263,6 @@ fn child_list_issue_parent(
     )
 }
 
-fn live_guardian_snapshot(guardian: &DisposableLaunchdGuardian) -> WireSnapshot {
-    let mut client = GuardianClient::connect(&guardian.socket_dir()).unwrap();
-    client.hello().unwrap()
-}
-
 fn assert_initial_applied_ack(
     runner: &mut DisposableLaunchdRunnerJob<'_>,
     path: &std::path::Path,
