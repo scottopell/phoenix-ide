@@ -217,6 +217,22 @@ fn same_custody(current: &WireSnapshot, original: &WireSnapshot) {
     assert_eq!(current.slots, original.slots);
 }
 
+fn same_custody_after_root_exit(current: &WireSnapshot, original: &WireSnapshot) {
+    assert_eq!(current.instance, original.instance);
+    assert_eq!(current.attempt, original.attempt);
+    assert_eq!(current.deadline, original.deadline);
+    assert_eq!(current.slots, original.slots);
+    let current = current.native_binding.as_ref().unwrap();
+    let original = original.native_binding.as_ref().unwrap();
+    assert_eq!(current.guardian, original.guardian);
+    assert_eq!(current.nonce, original.nonce);
+    assert_eq!(current.slots.len(), 1);
+    assert_eq!(original.slots.len(), 1);
+    assert_eq!(current.slots[0].identity, original.slots[0].identity);
+    assert_eq!(current.slots[0].liveness, WireObservation::Exited);
+    assert_eq!(original.slots[0].liveness, WireObservation::Running);
+}
+
 fn snapshot(line: &str, prefix: &str) -> WireSnapshot {
     serde_json::from_str(line.strip_prefix(prefix).unwrap()).unwrap()
 }
@@ -710,7 +726,7 @@ fn installed_two_job_launchd_recovers_completed_unapplied_identity_without_reobs
 
     runner.kill().unwrap();
     let crashed = detached_after_root_exit(runner.guardian());
-    same_custody(&crashed, &settled_initial);
+    same_custody_after_root_exit(&crashed, &settled_initial);
     assert_eq!(crashed.retained.len(), 1);
     let retained = &crashed.retained[0];
     assert_eq!(retained.key.attempt, ATTEMPT.get());
