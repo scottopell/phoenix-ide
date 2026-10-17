@@ -2631,24 +2631,31 @@ mod tests {
             .create_conversation("ceiling-plan", "ceiling-plan", "/tmp", true, None, None)
             .await
             .unwrap();
-        let mut member = root.id.clone();
+        let mut member = root.clone();
+        let content = serde_json::to_string(&MessageContent::user("ceiling fixture")).unwrap();
         for ordinal in 0..3 {
             if ordinal > 0 {
-                member = db
-                    .continue_conversation(&member)
-                    .await
-                    .unwrap()
-                    .conversation
-                    .id;
+                db.update_conversation_state(
+                    &member.id,
+                    &ConvState::ContextExhausted {
+                        summary: "ceiling fixture continuation".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                member = match db.continue_conversation(&member.id).await.unwrap() {
+                    ContinueOutcome::Created(successor) => successor,
+                    other @ (ContinueOutcome::AlreadyContinued(_)
+                    | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                        panic!("expected ceiling fixture continuation, got {other:?}")
+                    }
+                };
             }
             for sequence in 1..=4_i64 {
-                let message = crate::Message::new_user(
-                    format!("perf-{ordinal}-{sequence}"),
-                    member.clone(),
-                    sequence,
-                    "ceiling fixture".into(),
-                );
-                db.save_message(&message, None).await.unwrap();
+                sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES (?1, ?2, ?3, 'user', ?4, '2026-01-01T00:00:00Z')")
+                    .bind(format!("perf-{ordinal}-{sequence}"))
+                    .bind(&member.id).bind(sequence).bind(&content)
+                    .execute(db.pool()).await.unwrap();
             }
         }
         (db, root)
