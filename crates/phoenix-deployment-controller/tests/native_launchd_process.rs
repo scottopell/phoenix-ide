@@ -1397,7 +1397,7 @@ fn launchd_journey(continuation: bool) {
     assert_eq!(
         raw.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        6
+        7
     );
     drop(raw);
     guardian.assert_original_parent().unwrap();
