@@ -2,6 +2,24 @@ use phoenix_core::process_identity::{process_identity_matches, ProcessIdentity};
 use std::io;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootObservation {
+    Live,
+    #[cfg(any(target_os = "macos", test))]
+    ExitPending,
+    Exited,
+}
+
+impl RootObservation {
+    fn permits_signal(self) -> bool {
+        matches!(self, Self::Live | Self::Exited)
+    }
+
+    fn permits_completion(self) -> bool {
+        self == Self::Exited
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct OwnedChromeGroup {
     root: ProcessIdentity,
@@ -27,7 +45,7 @@ impl OwnedChromeGroup {
             root,
             drained: false,
         };
-        owned.root_exited(child)?;
+        owned.observe_root(child)?;
         Ok(owned)
     }
 
@@ -54,7 +72,31 @@ impl OwnedChromeGroup {
         Ok(unsafe { status.si_pid() } == pid)
     }
 
-    pub(crate) fn root_exited(&self, child: &mut tokio::process::Child) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    fn darwin_wait_diagnostic(&self) -> String {
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        // SAFETY: another non-consuming observation, only on the error path.
+        let result = unsafe { libc::waitid(libc::P_PID, self.root.pid, &raw mut status, options) };
+        let wait_error = (result != 0).then(io::Error::last_os_error);
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action observes SIGCHLD disposition without changing it.
+        let action_result =
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &raw mut action) };
+        let action_error = (action_result != 0).then(io::Error::last_os_error);
+        format!(
+            "waitid_result={result} waitid_errno={wait_error:?} options={options} p_pid={} siginfo_size={} si_signo={} si_errno={} si_code={} si_pid={} si_uid={} si_status={} sigaction_result={action_result} sigaction_errno={action_error:?} sigchld_handler={} sigchld_flags={} sig_ign={} sa_nocldwait={}",
+            libc::P_PID, std::mem::size_of::<libc::siginfo_t>(), status.si_signo,
+            status.si_errno, status.si_code, status.si_pid, status.si_uid,
+            status.si_status, action.sa_sigaction, action.sa_flags, libc::SIG_IGN,
+            libc::SA_NOCLDWAIT,
+        )
+    }
+
+    pub(crate) fn observe_root(
+        &self,
+        child: &mut tokio::process::Child,
+    ) -> io::Result<RootObservation> {
         if child.id() != Some(self.root.pid) {
             return Err(io::Error::other(
                 "owned Chrome child was reaped or replaced",
@@ -63,32 +105,49 @@ impl OwnedChromeGroup {
         if self.waitable_exit()? {
             // A waitable, unreaped child still reserves its PID even when macOS
             // no longer supplies PROC_PIDTBSDINFO for that zombie.
-            return Ok(true);
+            return Ok(RootObservation::Exited);
         }
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
+        let observed_identity =
+            phoenix_core::process_identity::current_process_identity(self.root.pid);
         // SAFETY: getpgid only observes this candidate process; no signal here.
-        let live_matches =
-            process_identity_matches(self.root) && unsafe { libc::getpgid(pid) } == pid;
+        let observed_group = unsafe { libc::getpgid(pid) };
+        let group_error = (observed_group == -1).then(io::Error::last_os_error);
+        let live_matches = observed_identity == Some(self.root) && observed_group == pid;
         if live_matches {
-            return Ok(false);
+            return Ok(RootObservation::Live);
         }
         // Exit can occur between waitid's live observation and proc_pidinfo.
         if self.waitable_exit()? {
-            return Ok(true);
+            return Ok(RootObservation::Exited);
         }
-        Err(io::Error::other(
-            "live Chrome root birth identity or launch group changed",
-        ))
+        #[cfg(target_os = "macos")]
+        if observed_identity.is_none()
+            && observed_group == -1
+            && group_error
+                .as_ref()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+        {
+            return Ok(RootObservation::ExitPending);
+        }
+        #[cfg(target_os = "macos")]
+        eprintln!("owned_chrome_darwin_wait {}", self.darwin_wait_diagnostic());
+        Err(io::Error::other(format!(
+            "live Chrome root birth identity or launch group changed: expected={:?} observed={observed_identity:?} child_pid={:?} pgid={observed_group} pgid_error={group_error:?} waitable_exit=false",
+            self.root, child.id(),
+        )))
     }
 
-    fn signal(&self, child: &mut tokio::process::Child, signal: libc::c_int) -> io::Result<()> {
-        self.root_exited(child)?;
+    fn signal(&self, child: &mut tokio::process::Child, signal: libc::c_int) -> io::Result<bool> {
+        if !self.observe_root(child)?.permits_signal() {
+            return Ok(false);
+        }
         let pid = libc::pid_t::try_from(self.root.pid).map_err(io::Error::other)?;
         // SAFETY: the unreaped owned child anchors this isolated launch group.
         if unsafe { libc::kill(-pid, signal) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) async fn drain(
@@ -102,11 +161,11 @@ impl OwnedChromeGroup {
         let started = Instant::now();
         let deadline = started + budget;
         let escalate = started + budget.min(Duration::from_millis(250));
-        self.signal(child, libc::SIGTERM)?;
+        let mut terminated = false;
         let mut killed = false;
         loop {
-            let exited = self.root_exited(child)?;
-            if exited && !group_has_live_members(self.root.pid)? {
+            let observation = self.observe_root(child)?;
+            if observation.permits_completion() && !group_has_live_members(self.root.pid)? {
                 self.drained = true;
                 return Ok(());
             }
@@ -117,9 +176,10 @@ impl OwnedChromeGroup {
                     "Chrome launch group did not drain",
                 ));
             }
-            if !killed && now >= escalate {
-                self.signal(child, libc::SIGKILL)?;
-                killed = true;
+            if !terminated {
+                terminated = self.signal(child, libc::SIGTERM)?;
+            } else if !killed && now >= escalate {
+                killed = self.signal(child, libc::SIGKILL)?;
             }
             // This observes kernel process completion, never retries deletion.
             tokio::task::yield_now().await;
@@ -227,7 +287,17 @@ mod tests {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-    async fn sentinel() -> tokio::process::Child {
+    #[test]
+    fn pending_exit_authorizes_neither_signal_nor_completion() {
+        assert!(!RootObservation::ExitPending.permits_signal());
+        assert!(!RootObservation::ExitPending.permits_completion());
+        assert!(RootObservation::Live.permits_signal());
+        assert!(!RootObservation::Live.permits_completion());
+        assert!(RootObservation::Exited.permits_signal());
+        assert!(RootObservation::Exited.permits_completion());
+    }
+
+    fn sentinel() -> tokio::process::Child {
         tokio::process::Command::new("/bin/sh")
             .args(["-c", "exec cat >/dev/null"])
             .stdin(Stdio::piped())
@@ -236,11 +306,39 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "macos")]
+    async fn diagnose_exit_transition(group: &OwnedChromeGroup, child: &mut tokio::process::Child) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut samples = 0;
+        loop {
+            let pid = libc::pid_t::try_from(group.root.pid).unwrap();
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap();
+            // SAFETY: bounded observation of the retained owned child's PID only.
+            let read = unsafe {
+                libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+            };
+            let read_error = (read != size).then(io::Error::last_os_error);
+            // SAFETY: observes the same retained owned child's process group.
+            let pgid = unsafe { libc::getpgid(pid) };
+            let pgid_error = (pgid == -1).then(io::Error::last_os_error);
+            eprintln!("owned_chrome_transition sample={samples} child={:?} proc_rc={read} proc_errno={read_error:?} proc_status={} proc_group={} pgid={pgid} pgid_errno={pgid_error:?} {}", child.id(), info.pbi_status, info.pbi_pgid, group.darwin_wait_diagnostic());
+            samples += 1;
+            if group.waitable_exit().is_ok_and(|exited| exited)
+                || Instant::now() >= deadline
+                || samples >= 32
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn exited_root_drains_stderr_closed_writer_before_profile_removal() {
         let profile = tempfile::tempdir().unwrap();
         let path = profile.path().to_path_buf();
-        let mut unrelated = sentinel().await;
+        let mut unrelated = sentinel();
         let script = r#"
 /bin/sh -c 'trap "" TERM; exec 2>/dev/null; : > "$1/writer"; echo ready; while :; do printf x > "$1/writer"; done' writer "$1" </dev/null &
 read release
@@ -255,8 +353,6 @@ exit 0
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let identity = current_process_identity(root.id().unwrap()).unwrap();
-        let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         let mut stdout = tokio::io::BufReader::new(root.stdout.take().unwrap());
         let mut ready = String::new();
         tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut ready))
@@ -264,6 +360,8 @@ exit 0
             .unwrap()
             .unwrap();
         assert_eq!(ready.trim(), "ready");
+        let identity = current_process_identity(root.id().unwrap()).unwrap();
+        let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         root.stdin
             .take()
             .unwrap()
@@ -271,18 +369,30 @@ exit 0
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !group.root_exited(&mut root).unwrap() {
-                tokio::task::yield_now().await;
+            loop {
+                match group.observe_root(&mut root) {
+                    Ok(RootObservation::Exited) => break,
+                    Ok(RootObservation::Live | RootObservation::ExitPending) => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => {
+                        #[cfg(target_os = "macos")]
+                        diagnose_exit_transition(&group, &mut root).await;
+                        panic!("strict owned-root observation failed: {error}");
+                    }
+                }
             }
         })
         .await
         .unwrap();
-        assert!(
-            group.root_exited(&mut root).unwrap(),
+        assert_eq!(
+            group.observe_root(&mut root).unwrap(),
+            RootObservation::Exited,
             "WNOWAIT must retain the same exited-child anchor"
         );
-        assert!(
-            group.root_exited(&mut root).unwrap(),
+        assert_eq!(
+            group.observe_root(&mut root).unwrap(),
+            RootObservation::Exited,
             "observing exit must not reap the root"
         );
         assert!(path.join("writer").exists());
@@ -424,18 +534,26 @@ exit 0
     #[tokio::test]
     async fn reaped_or_mismatched_root_cannot_authorize_old_group_signals() {
         let profile = tempfile::tempdir().unwrap();
-        let mut unrelated = sentinel().await;
+        let mut unrelated = sentinel();
         let mut root = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "read release"])
+            .args(["-c", "echo ready; read release"])
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let mut stdout = tokio::io::BufReader::new(root.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
         let identity = current_process_identity(root.id().unwrap()).unwrap();
         let mut group = OwnedChromeGroup::adopt(identity, &mut root).unwrap();
         assert!(
-            group.root_exited(&mut unrelated).is_err(),
+            group.observe_root(&mut unrelated).is_err(),
             "a different child handle cannot authorize this group"
         );
         assert!(group.signal(&mut unrelated, libc::SIGTERM).is_err());
@@ -448,7 +566,7 @@ exit 0
             .unwrap();
         root.wait().await.unwrap();
         assert!(
-            group.root_exited(&mut root).is_err(),
+            group.observe_root(&mut root).is_err(),
             "reaped root must lose wait authority"
         );
         assert!(group
