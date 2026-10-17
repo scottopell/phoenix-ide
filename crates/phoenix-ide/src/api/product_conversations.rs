@@ -480,13 +480,13 @@ pub async fn get_coordinator_history(
     } else {
         tracing::Span::none()
     };
-    get_coordinator_history_snapshot(state, reference, query)
+    read_coordinator_history(&state.db, reference, query)
         .instrument(span)
         .await
 }
 
-async fn get_coordinator_history_snapshot(
-    state: AppState,
+pub(super) async fn read_coordinator_history(
+    db: &crate::db::Database,
     reference: String,
     query: CoordinatorHistoryQuery,
 ) -> Result<Json<CoordinatorConversationSnapshotView>, AppError> {
@@ -503,8 +503,7 @@ async fn get_coordinator_history_snapshot(
             })
             .collect::<Vec<_>>()
     });
-    let snapshot = state
-        .db
+    let snapshot = db
         .read_coordinator_product_conversation_snapshot(
             &reference,
             cursor.as_ref().map(|cursor| {
@@ -533,7 +532,7 @@ async fn get_coordinator_history_snapshot(
         |cursor| cursor.segment_ceilings.clone(),
     );
     let (messages, has_older, page, _) = aggregate_messages(
-        &state.db,
+        db,
         &aggregate,
         snapshot.messages,
         limit,
@@ -606,6 +605,14 @@ pub async fn get_product_conversation(
     Path(reference): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<OrdinarySnapshotResponse>, AppError> {
+    read_product_conversation(&state.db, reference, query).await
+}
+
+pub(super) async fn read_product_conversation(
+    db: &crate::db::Database,
+    reference: String,
+    query: SnapshotQuery,
+) -> Result<Json<OrdinarySnapshotResponse>, AppError> {
     let open_id = query.open_id;
     async move {
         let message_limit = message_limit(query.message_limit)?;
@@ -621,8 +628,7 @@ pub async fn get_product_conversation(
                 })
                 .collect::<Vec<_>>()
         });
-        let snapshot = state
-            .db
+        let snapshot = db
             .read_ordinary_product_conversation_snapshot(
                 &reference,
                 cursor.as_ref().map(|cursor| {
@@ -642,7 +648,7 @@ pub async fn get_product_conversation(
         }
         Ok(Json(
             snapshot_view(
-                &state,
+                db,
                 snapshot,
                 cursor,
                 message_limit,
@@ -813,7 +819,7 @@ fn close_action_view(
 
 #[allow(clippy::too_many_lines)]
 async fn snapshot_view(
-    state: &AppState,
+    db: &crate::db::Database,
     snapshot: crate::db::ProductConversationSnapshotRead,
     cursor: Option<AggregateCursor>,
     message_limit: usize,
@@ -841,9 +847,7 @@ async fn snapshot_view(
                         | CloseCompletionOutcome::CloseIncomplete
                 )
             ) {
-                state
-                    .db
-                    .list_close_cleanup_failures(projection.obligation.attempt_id().as_str())
+                db.list_close_cleanup_failures(projection.obligation.attempt_id().as_str())
                     .await
                     .map_err(db_to_app)?
             } else {
@@ -859,11 +863,10 @@ async fn snapshot_view(
         |cursor| cursor.segment_ceilings.clone(),
     );
     let (messages, has_older, page_messages, boundary_message_ids) =
-        aggregate_messages(&state.db, &aggregate, page, message_limit, representation).await;
+        aggregate_messages(db, &aggregate, page, message_limit, representation).await;
     let source = match aggregate.source.as_mut() {
         Some(source) => {
-            source.deleted = state
-                .db
+            source.deleted = db
                 .source_conversation_is_deleted(source)
                 .await
                 .map_err(db_to_app)?;
@@ -1923,6 +1926,179 @@ mod tests {
             serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(snapshot["ordinary_lifecycle"], expected);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn db_history_projections_preserve_pending_openings_boundaries_and_null_presentations() {
+        use super::super::types::ContinuationOpeningView;
+
+        for global in [false, true] {
+            let db = crate::db::Database::open_in_memory().await.unwrap();
+            let root = if global {
+                db.get_or_create_coordinator(
+                    None,
+                    phoenix_core::llm_language::LlmLanguage::default(),
+                )
+                .await
+                .unwrap()
+            } else {
+                db.create_conversation("observation", "observation", "/tmp", true, None, None)
+                    .await
+                    .unwrap()
+            };
+            db.add_message(
+                "prompt",
+                &root.id,
+                &MessageContent::user("persisted prompt"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            db.add_message(
+                "boundary",
+                &root.id,
+                &MessageContent::continuation("persisted summary"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            db.update_conversation_state(
+                &root.id,
+                &ConvState::ContextExhausted {
+                    summary: "persisted summary".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let (outcome, _) = db
+                .continue_conversation_with_intent(
+                    &root.id,
+                    crate::db::NewContinuationDispatchIntent::generated_predecessor_context(
+                        phoenix_workflow::ClientTurnKey::try_from("opening").unwrap(),
+                        "persisted summary".into(),
+                    ),
+                )
+                .await
+                .unwrap();
+            let crate::db::ContinueOutcome::Created(successor) = outcome else {
+                panic!("expected successor")
+            };
+            for accepted in [false, true] {
+                if accepted {
+                    db.add_message(
+                        "opening",
+                        &successor.id,
+                        &MessageContent::continuation("persisted summary"),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                let (opening, writable, segments, boundaries, wire) = if global {
+                    let view = read_coordinator_history(
+                        &db,
+                        root.id.clone(),
+                        CoordinatorHistoryQuery {
+                            before: None,
+                            message_limit: None,
+                            open_id: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .0;
+                    assert_eq!(view.latest_transcript_row_id, successor.id);
+                    let wire = serde_json::to_value(&view).unwrap();
+                    (
+                        view.latest_opening,
+                        view.writable_transcript_row_id,
+                        view.segments,
+                        view.boundaries,
+                        wire,
+                    )
+                } else {
+                    let OrdinarySnapshotResponse::OriginalMessages(view) =
+                        read_product_conversation(
+                            &db,
+                            root.id.clone(),
+                            SnapshotQuery {
+                                before: None,
+                                message_limit: None,
+                                open_id: None,
+                                boundary_representation: BoundaryRepresentation::OriginalMessages,
+                            },
+                        )
+                        .await
+                        .unwrap()
+                        .0
+                    else {
+                        panic!("expected original-message history")
+                    };
+                    assert_eq!(view.metadata.latest_transcript_row_id, successor.id);
+                    let wire = serde_json::to_value(&view).unwrap();
+                    (
+                        view.metadata.latest_opening,
+                        view.metadata.writable_transcript_row_id,
+                        view.segments,
+                        view.boundaries,
+                        wire,
+                    )
+                };
+                if accepted {
+                    assert!(matches!(opening, ContinuationOpeningView::Accepted {
+                        accepted_message_id, ..
+                    } if accepted_message_id == "opening"));
+                    assert_eq!(writable.as_deref(), Some(successor.id.as_str()));
+                    assert_eq!(boundaries.len(), 1);
+                    let boundary = &boundaries[0];
+                    assert_eq!(boundary.message_id, "boundary");
+                    assert_eq!(
+                        boundary.represented_successor_opening_message_id.as_deref(),
+                        Some("opening")
+                    );
+                    assert_eq!(boundary.predecessor_transcript_row_id, root.id);
+                    assert_eq!(boundary.successor_transcript_row_id, successor.id);
+                } else {
+                    assert!(matches!(opening, ContinuationOpeningView::Pending { .. }));
+                    assert!(writable.is_none());
+                }
+                assert_eq!(segments.len(), 2);
+                let messages = segments
+                    .iter()
+                    .flat_map(|segment| &segment.messages)
+                    .collect::<Vec<_>>();
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].message_id, "prompt");
+                assert_eq!(messages[1].message_id, "boundary");
+                assert_eq!(messages[1].conversation_id, root.id);
+                assert_eq!(messages[1].sequence_id, 2);
+                assert!(messages
+                    .iter()
+                    .all(|message| message.event_presentation.is_none()));
+                assert!(wire["segments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|segment| segment.get("handoff").is_none()));
+                assert!(wire["segments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|segment| segment["messages"].as_array().unwrap())
+                    .all(|message| message
+                        .get("event_presentation")
+                        .is_some_and(serde_json::Value::is_null)));
+                if global {
+                    for field in ["ordinary_lifecycle", "close", "work_identity"] {
+                        assert!(wire.get(field).is_none());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
