@@ -809,12 +809,13 @@ export function selectGlobalPrefixFault(a, snapshots, mountedUrl, latest) {
     observation_scope: 'earlier-history acquisition failure; not full fresh-tail refresh' });
 }
 
-export function retainCleanupFailure(result, stage, error) {
+export function retainCleanupFailure(result, stage, error, diagnostic) {
   result.status = 'failed';
   const failures = result.cleanup_failures ??= [];
   if (failures.length >= 8) { result.cleanup_overflow = true; return; }
   const text = String(error.stack ?? error);
-  failures.push({ stage, error: text.slice(0, 2048), truncated: text.length > 2048 });
+  failures.push({ stage, error: text.slice(0, 2048), truncated: text.length > 2048,
+    ...(diagnostic === undefined ? {} : { diagnostic }) });
 }
 
 async function run() {
@@ -830,7 +831,7 @@ async function run() {
   const checked = (name, data) => { result.checks.push(name); record('assertions.jsonl', { name, ...data }); };
   const gate = { armed: false, releaseAttempted: false, predecessor: a.members.at(-1), key: randomUUID() };
   const command = async body => { const reply = await ipc(control, body); record('ipc.jsonl', { command: body, reply }); return reply; };
-  let browser, page, continuation, recorder, historyTelemetry, finalizeHistoryTelemetry, sessionCookie;
+  let browser, page, continuation, recorder, historyTelemetry, finalizeHistoryTelemetry, diagnoseHistoryFinalization, sessionCookie;
   const snapshots = [], events = [];
   let requests = [], failed = [];
   const deadlineStarted = performance.now();
@@ -1182,6 +1183,7 @@ async function run() {
           capturePolicy({ ...a, members: [...a.members, latest] }, r.method, r.url).kind === 'required_aggregate_json').length : null });
       result.joint_telemetry = jointStage.receipt;
       finalizeHistoryTelemetry = jointStage.finalizeHistory;
+      diagnoseHistoryFinalization = jointStage.diagnoseHistoryFinalization;
       record('joint-telemetry-source-receipt.jsonl', result.joint_telemetry);
     }
     result.status = 'passed_assertions';
@@ -1197,14 +1199,16 @@ async function run() {
       if (entered.state === 'entered') await releaseOnce(gate, command);
     } } catch (error) { retainCleanupFailure(result, 'history_gate', error); record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; }
     if (jointTelemetry && browser) {
+      let finalizationDiagnostic;
       try {
         await browser.close(); browser = undefined;
         if (finalizeHistoryTelemetry) {
           const inventory = historyTelemetry.snapshot();
-          finalizeHistoryTelemetry(inventory);
+          try { finalizeHistoryTelemetry(inventory); }
+          catch (error) { finalizationDiagnostic = diagnoseHistoryFinalization(error); throw error; }
           record('observed-history-telemetry-inventory.jsonl', inventory);
         }
-      } catch (error) { retainCleanupFailure(result, 'joint_browser_cleanup', error); process.exitCode = 1; }
+      } catch (error) { retainCleanupFailure(result, 'joint_browser_cleanup', error, finalizationDiagnostic); process.exitCode = 1; }
     }
     try { await command({ command: 'stop' }); } catch (error) { retainCleanupFailure(result, 'server_stop', error); record('cleanup-errors.jsonl', { error: String(error) }); process.exitCode = 1; }
     try { updateFault(fault, { failRoster: false }); if (browser) await browser.close(); }

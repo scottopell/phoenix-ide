@@ -359,7 +359,7 @@ export async function authenticateOwnedContext(context, baseURL, env = process.e
 
 const FAILURE_PHASES = new Set(['runtime_import', 'export_admission', 'context_acquisition',
   'session_authentication', 'page_acquisition', 'module_checks', 'result_validation',
-  'context_cleanup', 'dependency_verification']);
+  'context_cleanup', 'dependency_verification', 'history_finalization']);
 
 // Explicit call sites in the two SHA256-pinned f16 sources; never discover sites in prose.
 const F16_ASSERTION_SITES = {
@@ -479,7 +479,7 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
         history_global_cache_zero_get_is_history_evidence_not_telemetry_cold_start: historyGlobalOwnedGetCount === 0 },
       ready_report_oracle: readyReportOracle };
     let finalized = false;
-    return { receipt, finalizeHistory(inventory) {
+    return { receipt, diagnoseHistoryFinalization: error => diagnose(error, 'history_finalization'), finalizeHistory(inventory) {
       assert.equal(finalized, false, 'history inventory finalizes once after browser closure'); finalized = true;
       appendObservedHistory(result, inventory, config.input.fixtures.identity, module, config.input.fixtures);
       writeFileSync(resolve(outputDir, 'telemetry/telemetry-browser-result.json'), JSON.stringify(result, null, 2));

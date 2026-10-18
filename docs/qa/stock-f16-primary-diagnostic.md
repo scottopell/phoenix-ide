@@ -235,3 +235,24 @@ Unchanged trusted Node module SHA256 pins:
 
 No full-acceptance, normal-drain, shipping, performance, physical-device or
 production claim follows from this PREPARE packet.
+
+## Final disposition and returned-finalizer diagnostic
+
+Historical disposition: **INCONCLUSIVE_MISSING_EVIDENCE**, not fixed. Retained
+samples do not establish the original first primary or cleanup-only cause. Sampled
+production collector acceptance/export/normal-drain coverage remains missing;
+the actual reporter's synthetic receiver result is not that coverage.
+
+The returned `finalizeHistory` invocation now has narrowly scoped trusted
+`history_finalization` diagnostic capture on its existing `joint_browser_cleanup`
+entry. An earlier primary remains unchanged; cleanup-only failure does not become
+a fabricated primary. The publisher independently validates the fixed source
+hash/site/phase and excludes raw errors and stacks. Offline tests exercise both
+primary-plus-finalizer and cleanup-only paths. This closes a future diagnostic
+retention gap; it neither reconstructs nor repairs the old incident.
+
+Exact actual Stage 2 red receipts remain unchanged under
+`docs/qa/results/reporter-pagehide-39148822485/`. No additional probe, Stage 2
+rerun, natural measurement, module-pin change or production correction is included.
+Publication is offline-only with both functional opt-in labels absent; the stock
+witness remains skipped under `offline-regression-only`.

@@ -150,6 +150,54 @@ class SafePublicationTests(unittest.TestCase):
         self.assertEqual(publication.joint_diagnostics({})['primary_diagnostic_boundary'], 'missing_field')
         self.assertIsNone(publication.joint_diagnostics({'primary_diagnostic': None})['primary_diagnostic'])
 
+    def test_finalizer_secondary_projection_preserves_exact_site_without_replacing_primary(self):
+        secret = 'UNIT_ONLY_FINALIZER_COOKIE_STACK_SECRET'
+        secondary = self.diagnostic(530, 'history_finalization')
+        for primary in (self.diagnostic(), None):
+            with self.subTest(primary=primary):
+                self.write('ordinary/joint-telemetry-dependency-manifest.json', {
+                    'primary_diagnostic': primary, 'primary_failure': secret if primary else None,
+                    'failure_phase': 'module_checks' if primary else None, 'secondary_diagnostics': []})
+                self.write('ordinary/browser-result.json', {
+                    **({'error': secret} if primary else {}),
+                    'cleanup_failures': [{'stage': 'joint_browser_cleanup', 'error': secret,
+                        'diagnostic': secondary | {'stack': secret, 'message': secret, 'actual': secret}}]})
+                result = publication.project(self.root)['cases']['ordinary']['diagnostics']
+                self.assertEqual(result['joint_dependency_manifest']['primary_diagnostic'], primary)
+                self.assertEqual(result['joint_dependency_manifest']['secondary_diagnostics']['items'], [])
+                self.assertEqual(result['browser']['error_present'], primary is not None)
+                self.assertEqual(result['browser']['cleanup_failures']['items'][0]['diagnostic'], secondary)
+                self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(publication.assertion_diagnostic(secondary)['resolution'], 'unknown')
+        self.assertIsNone(publication.joint_diagnostics({'primary_diagnostic': None})['primary_diagnostic'])
+
+    def test_finalizer_projection_rejects_wrong_phase_hash_site_or_freeform_diagnostics(self):
+        secret = 'UNIT_ONLY_FINALIZER_SECRET'
+        valid = self.diagnostic(530, 'history_finalization')
+        for change in ({'module_sha256': '0' * 64}, {'assertion_site_id': secret},
+                       {'module_basename': secret}, {'line': 529}, {'column': 11},
+                       {'phase': 'module_checks'}, {'phase': secret}, {'schema_version': True},
+                       {'resolution': secret}):
+            result = publication.browser_diagnostics({'cleanup_failures': [{
+                'stage': 'joint_browser_cleanup', 'error': secret, 'diagnostic': valid | change}]})
+            diagnostic = result['cleanup_failures']['items'][0]['diagnostic']
+            self.assertEqual(diagnostic['resolution'], 'unknown', change)
+            self.assertNotIn('assertion_site_id', diagnostic)
+            self.assertNotIn(secret, json.dumps(result))
+        for invalid in (secret, None, [], {'message': secret, 'stack': secret}):
+            result = publication.browser_diagnostics({'cleanup_failures': [{
+                'stage': 'joint_browser_cleanup', 'diagnostic': invalid}]})
+            self.assertEqual(result['cleanup_failures']['items'][0]['diagnostic']['resolution'], 'unknown')
+            self.assertNotIn(secret, json.dumps(result))
+        for stage in ('browser_cleanup', secret):
+            result = publication.browser_diagnostics({'cleanup_failures': [{'stage': stage, 'diagnostic': valid}]})
+            self.assertNotIn('diagnostic', result['cleanup_failures']['items'][0])
+        from unittest.mock import patch
+        with patch.object(Path, 'read_bytes', return_value=b'UNIT_ONLY_CHANGED_SOURCE'):
+            result = publication.browser_diagnostics({'cleanup_failures': [{
+                'stage': 'joint_browser_cleanup', 'diagnostic': valid}]})
+            self.assertEqual(result['cleanup_failures']['items'][0]['diagnostic']['resolution'], 'unknown')
+
     def test_source_diagnostic_unknown_fallback_rejects_malicious_or_unverified_fields(self):
         secret = 'UNIT_ONLY_SECRET'
         for change in ({'module_basename': '../' + secret}, {'module_sha256': '0' * 64},
@@ -194,18 +242,26 @@ class SafePublicationTests(unittest.TestCase):
               output.push(diagnose(error,'module_checks'));
             }
           });
-          try {assertBackgroundReport({},{});} catch(error) {output.push(diagnose(error,'module_checks'));}
+          try {assertBackgroundReport({},{});} catch(error) {
+            output.push(diagnose(error,'history_finalization'));
+            output.push(diagnose(error,'module_checks'));
+          }
           console.log(JSON.stringify(output));
         '''
         result = subprocess.run(['node', '--input-type=module', '-e', script], cwd=root,
                                 check=True, capture_output=True, text=True, timeout=10)
         diagnostics = json.loads(result.stdout)
-        self.assertEqual(len(diagnostics), 167)
+        self.assertEqual(len(diagnostics), 168)
         self.assertEqual(sum(map(len, publication.ASSERTION_SITES.values())), 166)
         self.assertEqual(diagnostics[-1], self.diagnostic())
         for diagnostic in diagnostics:
             self.assertEqual(diagnostic['resolution'], 'verified_assertion_site')
-            self.assertEqual(publication.assertion_diagnostic(diagnostic), diagnostic)
+            if diagnostic['phase'] == 'history_finalization':
+                browser = publication.browser_diagnostics({'cleanup_failures': [{
+                    'stage': 'joint_browser_cleanup', 'diagnostic': diagnostic}]})
+                self.assertEqual(browser['cleanup_failures']['items'][0]['diagnostic'], diagnostic)
+            else:
+                self.assertEqual(publication.assertion_diagnostic(diagnostic), diagnostic)
 
     def test_fixed_inventory_and_phases_are_pinned_to_actual_producers(self):
         scripts = Path(__file__).resolve().parents[2] / 'ui/scripts'

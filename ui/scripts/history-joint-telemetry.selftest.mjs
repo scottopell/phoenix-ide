@@ -409,6 +409,34 @@ test('UNIT ONLY actual returned finalizeHistory accepts existing unit inventory 
     assert.throws(() => stage.finalizeHistory(historyInventory()), /finalizes once/);
   } finally { f.cleanup(); }
 });
+test('OFFLINE UNIT ONLY actual returned finalizer retains trusted assertion via fixed-phase closure, not module primary', async () => {
+  const f = unitFiles(); try {
+    const config = { ...pinnedDiagnosticConfig(), unitOnly: true, input: input(), moduleHash: TELEMETRY_MODULE_SHA256 };
+    const actualError = pinnedAssertion();
+    const stage = await runJointTelemetryStage({ config,
+      browser: { newContext: async () => ({ newPage: async () => ({}), close: async () => {} }) },
+      outputDir: f.root, harnessPath: import.meta.filename,
+      historyPhysical: { count: 1, visible: true, persistedMessageID: 'unit-exact' },
+      UNIT: { label: UNIT_ONLY, importModule: async () => ({ ...unitModule,
+        runTelemetryChecks: async () => stock(), captureReport: () => { throw actualError; } }) } });
+    assert.throws(() => stage.finalizeHistory(historyInventory()), error => error === actualError);
+    const diagnostic = stage.diagnoseHistoryFinalization(actualError, 'module_checks');
+    assert.deepEqual(diagnostic, { ...prepareJointFailureDiagnostic(config)(actualError, 'module_checks'), phase: 'history_finalization' });
+    assert.equal(diagnostic.resolution, 'verified_assertion_site');
+    assert.equal(diagnostic.line, 530);
+    assert.equal(stage.receipt.evidence_class, 'UNIT_ONLY_not_runtime');
+    const manifest = JSON.parse(readFileSync(resolve(f.root, 'joint-telemetry-dependency-manifest.json'), 'utf8'));
+    assert.equal(manifest.primary_failure, null); assert.equal(manifest.primary_diagnostic, null);
+    assert.equal(manifest.failure_phase, null); assert.deepEqual(manifest.secondary_diagnostics, []);
+    for (const error of [new Error('UNIT_ONLY_FREEFORM_SECRET'), syntheticAssertion('UNIT_ONLY_SECRET', ['    at /unknown.mjs:530:10'])]) {
+      assert.deepEqual(stage.diagnoseHistoryFinalization(error), { schema_version: 1, phase: 'history_finalization',
+        error_code: error.code === 'ERR_ASSERTION' ? 'ERR_ASSERTION' : 'unknown', resolution: 'unknown' });
+    }
+    const wrongHash = { ...config, dependencies: { ...config.dependencies, [config.modulePath]: '0'.repeat(64) } };
+    assert.equal(prepareJointFailureDiagnostic(wrongHash)(actualError, 'history_finalization').resolution, 'unknown');
+  } finally { f.cleanup(); }
+});
+
 test('UNIT ONLY cleanup-only stage failure is not a manufactured primary diagnostic', async () => {
   const f = unitFiles(); try {
     await assert.rejects(unitReturnedStage(f, async () => { throw Error('UNIT_ONLY_cleanup'); }));

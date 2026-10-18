@@ -160,12 +160,17 @@ def browser_diagnostics(value):
     def check(item):
         return ({'name': item, 'passed': True} if type(item) is str and item in HISTORY_CHECKS
                 else {'publication_read': 'unsupported_shape'})
+    def cleanup(item):
+        item = object_value(item)
+        record = failure_record(item, BROWSER_CLEANUP_STAGES, 'error')
+        if item.get('stage') == 'joint_browser_cleanup' and 'diagnostic' in item:
+            record['diagnostic'] = assertion_diagnostic(item['diagnostic'], ('history_finalization',))
+        return record
     out = scalars(value, booleans=('cleanup_overflow',))
     out.update(failure_presence(value, ('error',)))
     out['checks'] = bounded_records(value, 'checks', len(HISTORY_CHECKS), check)
     out['checks_boundary'] = field_boundary(value, 'checks', isinstance(value.get('checks'), list))
-    out['cleanup_failures'] = bounded_records(value, 'cleanup_failures', 8,
-        lambda item: failure_record(item, BROWSER_CLEANUP_STAGES, 'error'))
+    out['cleanup_failures'] = bounded_records(value, 'cleanup_failures', 8, cleanup)
     out['cleanup_boundary'] = field_boundary(value, 'cleanup_failures', isinstance(value.get('cleanup_failures'), list))
     for key in ('application_page_errors', 'cdp_capture_errors'):
         out[key + '_count'] = inventory(value, key)
