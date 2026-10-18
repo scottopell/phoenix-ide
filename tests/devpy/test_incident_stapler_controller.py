@@ -369,7 +369,17 @@ class WorkflowTests(unittest.TestCase):
         acceptance = WORKFLOW.index("      - name: Check isolated signed-helper startup")
         upload = WORKFLOW.index("          name: desktop-preparation-")
         self.assertTrue(native_build < materialize < package < cleanup < acceptance < upload)
-        self.assertIn("        timeout-minutes: 30\n", WORKFLOW[package:cleanup])
+        timeout = re.search(
+            r"timeout-minutes: \$\{\{ needs\.gate\.outputs\.operation == '([^']+)' && (\d+) \|\| (\d+) \}\}",
+            WORKFLOW[package:cleanup],
+        )
+        self.assertIsNotNone(timeout)
+        incident_operation, incident_minutes, ordinary_minutes = timeout.groups()
+        self.assertEqual(incident_operation, controller.OPERATION)
+        for operation, expected in [(controller.OPERATION, 30), ("prepare-main", 360),
+                                    ("retry-release", 360), ("", 360), ("push", 360)]:
+            actual = int(incident_minutes if operation == incident_operation else ordinary_minutes)
+            self.assertEqual(actual, expected, operation)
         self.assertIn('git show "$CONTROLLER_COMMIT:scripts/incident_stapler_controller.py" > "$RUNNER_TEMP/incident_stapler_controller.py"', WORKFLOW)
         self.assertIn('CONTROLLER_COMMIT: ${{ github.sha }}', WORKFLOW)
         self.assertNotIn(".packaging-controller", WORKFLOW)

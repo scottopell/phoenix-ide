@@ -337,7 +337,7 @@ jobs:
           python3 "$RUNNER_TEMP/incident_stapler_controller.py" write-wrapper "$RUNNER_TEMP/incident-xcrun"
           test -z "$(git status --porcelain)"
       - name: Sign, verify, notarize, and package protected macOS assets
-        timeout-minutes: 30
+        timeout-minutes: ${{ needs.gate.outputs.operation == 'prepare-incident-237100-arm64' && 30 || 360 }}
         env:
           DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
           DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
