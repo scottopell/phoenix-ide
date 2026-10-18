@@ -1,7 +1,12 @@
+import { observeViewResponse, type ViewResponseObserver } from './hooks/conversationViewResponse';
+
+type HistoryRequestCorrelation = { open_id?: string; request_id?: never } | { request_id: string; open_id?: never };
+
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import { ContinuationOpeningSchema } from './conversation/opening';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
 import type { SqliteReportWindow } from './generated/SqliteReportWindow';
@@ -88,6 +93,10 @@ export type { ProductConversationCloseUnavailableReasonView } from './generated/
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
+export type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
+import type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
+export type { CoordinatorConversationSnapshotView } from './generated/CoordinatorConversationSnapshotView';
+import type { CoordinatorConversationSnapshotView } from './generated/CoordinatorConversationSnapshotView';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
@@ -1862,9 +1871,41 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to report product conversation open');
   },
 
+  async getCoordinatorHistory(
+    reference: string,
+    options?: { message_limit?: number; before?: string | null; onTelemetry?: ViewResponseObserver } & HistoryRequestCorrelation,
+  ): Promise<CoordinatorConversationSnapshotView> {
+    const params = new URLSearchParams();
+    if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
+    if (options?.before) params.set('before', options.before);
+    if (options?.open_id) params.set('open_id', options.open_id);
+    if (options?.request_id) params.set('request_id', options.request_id);
+    const response = await fetch(`/api/global/coordinator/history/${encodeURIComponent(reference)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
+    if (!response.ok) throw new ApiResponseError('Unable to read Global conversation history', response.status);
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
+  },
+
+  async getProductConversationHistorySnapshot(
+    productConversationId: string,
+    options?: { message_limit?: number; before?: string | null; onTelemetry?: ViewResponseObserver } & HistoryRequestCorrelation,
+  ): Promise<ProductConversationHistorySnapshotView> {
+    const params = new URLSearchParams({ boundary_representation: 'original_messages' });
+    if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
+    if (options?.before) params.set('before', options.before);
+    if (options?.open_id) params.set('open_id', options.open_id);
+    if (options?.request_id) params.set('request_id', options.request_id);
+    const response = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
+    if (!response.ok) throw new ApiResponseError('Unable to read product conversation history', response.status);
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
+  },
+
   async getProductConversationSnapshot(
     productConversationId: string,
-    options?: { message_limit?: number; before?: string | null; open_id?: string },
+    options?: { message_limit?: number; before?: string | null; open_id?: string; onTelemetry?: ViewResponseObserver },
   ): Promise<ProductConversationSnapshotViewType> {
     const params = new URLSearchParams();
     if (typeof options?.message_limit === 'number') {
@@ -1880,13 +1921,15 @@ export const api = {
     const resp = await fetch(
       `/api/product-conversations/${encodeURIComponent(productConversationId)}${query ? `?${query}` : ''}`,
     );
+    observeViewResponse(resp, options?.onTelemetry);
     if (!resp.ok) {
       const detail = resp.status === 404
         ? 'Conversation not found'
         : 'Failed to fetch product conversation snapshot';
       throw new ApiResponseError(detail, resp.status);
     }
-    return resp.json();
+    const snapshot = await resp.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {

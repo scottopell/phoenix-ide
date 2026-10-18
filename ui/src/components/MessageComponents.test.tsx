@@ -264,7 +264,7 @@ function emitInit(
   conversation: unknown = baseConversation,
   replay: { anchor: number; tip: number } = { anchor: 100, tip: 100 },
 ) {
-  source.emit('init', {
+  source.emit('init', { opening: null,
     type: 'init',
     sequence_id: 100,
     transcript_generation: 1,
@@ -3146,7 +3146,7 @@ describe('SubAgentStatus inline activity', () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
     act(() => {
       emitInit(FakeEventSource.instances[0]!, [], [], childConversation);
-      FakeEventSource.instances[0]!.emit('message', {
+      FakeEventSource.instances[0]!.emit('message', { opening: null,
         sequence_id: 101,
         message: {
           event_presentation: null,
@@ -3197,7 +3197,7 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{
+    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{ opening: null,
       type: 'message',
       sequence_id: pendingTool.sequence_id,
       message: { ...pendingTool, origin: { kind: 'unknown_historical' } },
@@ -3230,7 +3230,7 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => FakeEventSource.instances[0]!.emit('error', {
+    act(() => FakeEventSource.instances[0]!.emit('error', { opening: null,
       type: 'error',
       sequence_id: 2,
       message: 'Child auth expired',
@@ -3948,7 +3948,7 @@ describe('conversation disclosure integration', () => {
     expect(details.open).toBe(true);
   });
 
-  it('reveals only the active Mermaid disclosure and preserves a manual close on updates', async () => {
+  it('reveals only the active Mermaid disclosure and preserves a manual close on updates', () => {
     const disclosure = (title: string, language: string) => `<details><summary>${title}</summary>\n\n\`\`\`${language}\ngraph TD; A[target] --> B[target]\n\`\`\`\n\n</details>`;
     const text = [disclosure('First target', 'mermaid'), disclosure('Second', 'mermaid'), disclosure('Ordinary', 'ts')].join('\n\n');
     const blocks: ContentBlock[] = [{ type: 'text', text }, { type: 'text', text }];
@@ -3969,7 +3969,7 @@ describe('conversation disclosure integration', () => {
     expect(wrapper).not.toBeNull();
     expect(wrapper.closest('details')).toHaveAttribute('open');
     expect(wrapper).toBeVisible();
-    await waitFor(() => expect(wrapper.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull());
+    expect(wrapper.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull();
     expect(wrapper.textContent).not.toContain('[object Object]');
     details[0]!.open = false;
     rerender(view(start));

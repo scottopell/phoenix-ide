@@ -252,6 +252,10 @@ pub fn create_router(state: AppState) -> Router {
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
         .route(
+            "/api/telemetry/conversation-view",
+            post(super::view_journey::report).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route(
             "/api/telemetry/conversation-open",
             post(report_conversation_open),
         )
@@ -1055,7 +1059,7 @@ async fn resolve_coordinator_route(
         }
     };
     Ok(Json(CoordinatorRouteResponse {
-        coordinator_id: matched.then_some(coordinator_id),
+        coordinator_id: matched.then_some(root_id),
     }))
 }
 
@@ -3674,7 +3678,17 @@ where
             .get_conversation(conversation_id)
             .await
             .map_err(|e| AppError::NotFound(e.to_string()))?;
-        let value = read_value(db, conversation_id, attempt).await?;
+        let value = match read_value(db, conversation_id, attempt).await {
+            Err(AppError::TranscriptSnapshotChanged) => {
+                tracing::debug!(
+                    conversation_id,
+                    attempt,
+                    "retrying changed opening snapshot"
+                );
+                continue;
+            }
+            result => result?,
+        };
         bump_transcript_generation_for_test(db, conversation_id).await?;
         let after = db
             .get_conversation(conversation_id)
@@ -5021,7 +5035,7 @@ async fn stream_conversation(
     let stable = stable_transcript_read(db, &id, |db, id, attempt| {
         let query = query.clone();
         Box::pin(async move {
-            read_stream_init_messages_with_tail(
+            let value = read_stream_init_messages_with_tail(
                 db,
                 id,
                 &query,
@@ -5029,18 +5043,34 @@ async fn stream_conversation(
                 attempt,
                 get_stream_last_sequence_id(db, id).await,
             )
-            .await
+            .await?;
+            let generation = db
+                .get_conversation(id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .transcript_generation;
+            let opening = db
+                .read_continuation_opening_at_snapshot(id, generation, value.3)
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+            Ok((value, opening))
         })
     })
     .await?;
     let conversation = stable.conversation;
+    let (stream_value, opening) = stable.value;
     let (
         last_sequence_id,
         db_message_selection,
         messages,
         _server_message_tail,
         transcript_coverage,
-    ) = stable.value;
+    ) = stream_value;
     init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
     init_trace.record_message_count(messages.len());
     let highest_message_seq = match db_message_selection {
@@ -5141,6 +5171,7 @@ async fn stream_conversation(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
@@ -5158,7 +5189,7 @@ async fn stream_conversation(
     };
 
     Ok(sse_stream(
-        state.db.clone(),
+        state.runtime.db().clone(),
         id,
         init_event,
         broadcast_rx,
@@ -5374,7 +5405,9 @@ async fn cancel_conversation(
             | AppError::TypedBadRequest { .. }
             | AppError::Forbidden(_)
             | AppError::UnprocessableEntity(_) => ("request_error", false),
-            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+            AppError::Internal(_)
+            | AppError::TypedInternal { .. }
+            | AppError::TranscriptSnapshotChanged => ("server_error", true),
         };
         span.record("outcome", outcome);
         if is_server_error {
@@ -9482,6 +9515,7 @@ async fn get_shared_conversation(
 /// SSE stream for a shared conversation. Validates token, then subscribes.
 ///
 /// REQ-AUTH-006 + REQ-AUTH-007: Token-validated, supports multiple simultaneous viewers.
+#[allow(clippy::too_many_lines)]
 async fn shared_sse_stream(
     State(state): State<AppState>,
     Path(token): Path<String>,
@@ -9492,13 +9526,6 @@ async fn shared_sse_stream(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Invalid share token".to_string()))?;
-
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&conversation_id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     // A read-only share viewer must never *start* a runtime: `shared_sse_stream`
     // is auth-exempt (token-gated), so calling `get_or_create` here would let an
@@ -9534,17 +9561,44 @@ async fn shared_sse_stream(
     let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
         broadcast_tx.snapshot_pending();
 
-    let messages = state
-        .runtime
-        .db()
-        .get_messages(&conversation_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let transcript_coverage = latest_stream_transcript_coverage(
-        &messages,
-        get_server_message_tail(state.runtime.db(), &conversation_id).await?,
-        false,
-    );
+    let stable =
+        stable_transcript_read(state.runtime.db(), &conversation_id, |db, id, _attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                let messages = db
+                    .get_messages(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                #[cfg(test)]
+                shared_stream_snapshot_tests::change_snapshot(db, id).await?;
+                let opening = db
+                    .read_continuation_opening_at_snapshot(
+                        id,
+                        generation,
+                        messages.iter().map(|message| message.sequence_id).max(),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        crate::db::DbError::TranscriptSnapshotChanged => {
+                            AppError::TranscriptSnapshotChanged
+                        }
+                        error => AppError::Internal(error.to_string()),
+                    })?;
+                let coverage = latest_stream_transcript_coverage(
+                    &messages,
+                    get_server_message_tail(db, id).await?,
+                    false,
+                );
+                Ok((messages, coverage, opening))
+            })
+        })
+        .await?;
+    let conversation = stable.conversation;
+    let (messages, transcript_coverage, opening) = stable.value;
     let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
     let init_seq = std::cmp::max(
         std::cmp::max(last_sequence_id, highest_pending_seq),
@@ -9576,6 +9630,7 @@ async fn shared_sse_stream(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
@@ -9594,13 +9649,212 @@ async fn shared_sse_stream(
     };
 
     Ok(sse_stream(
-        state.db.clone(),
+        state.runtime.db().clone(),
         conversation_id,
         init_event,
         broadcast_rx,
         None,
         crate::api::sse::SseStreamAudience::SharedTranscript,
     ))
+}
+
+#[cfg(test)]
+mod shared_stream_snapshot_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum SnapshotChange {
+        Append,
+        Mutate,
+    }
+
+    thread_local! {
+        static CHANGE: std::cell::RefCell<Option<(String, SnapshotChange, usize)>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) async fn change_snapshot(
+        db: &crate::db::Database,
+        id: &str,
+    ) -> Result<(), AppError> {
+        let change = CHANGE.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            let (target, change, remaining) = hook.as_mut()?;
+            if target != id {
+                return None;
+            }
+            let change = *change;
+            *remaining -= 1;
+            if *remaining == 0 {
+                *hook = None;
+            }
+            Some(change)
+        });
+        match change {
+            Some(SnapshotChange::Append) => {
+                db.add_message(
+                    "shared-appended",
+                    id,
+                    &crate::db::MessageContent::user("appended"),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            Some(SnapshotChange::Mutate) => {
+                db.update_message_display_data(
+                    "shared-initial",
+                    &serde_json::json!({"race": true}),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    async fn shared_init(state: AppState, token: String) -> serde_json::Value {
+        use futures::StreamExt as _;
+        let response = shared_sse_stream(State(state), Path(token))
+            .await
+            .expect("shared stable init")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let chunk = body.next().await.expect("init chunk").expect("init bytes");
+        let chunk = std::str::from_utf8(&chunk).unwrap();
+        assert!(chunk.lines().any(|line| line == "event: init"));
+        let data = chunk
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        serde_json::from_str(data).unwrap()
+    }
+
+    async fn assert_shared_snapshot_race(change: SnapshotChange) {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let id = "shared-snapshot-race";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "shared-initial",
+                id,
+                &crate::db::MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let token = state.db.create_share_token(id).await.unwrap();
+        let before = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        CHANGE.with(|hook| *hook.borrow_mut() = Some((id.into(), change, 1)));
+        let init = shared_init(state.clone(), token).await;
+        assert!(CHANGE.with(|hook| hook.borrow().is_none()));
+        assert_eq!(init["messages"][0]["message_id"], "shared-initial");
+        assert_eq!(init["opening"], serde_json::json!({"status": "none"}));
+        assert_eq!(init["transcript_coverage"], "complete");
+        let persisted = state.db.get_messages(id).await.unwrap();
+        assert_eq!(init["messages"].as_array().unwrap().len(), persisted.len());
+        let tail = persisted
+            .iter()
+            .map(|message| message.sequence_id)
+            .max()
+            .unwrap();
+        assert_eq!(init["sequence_id"], tail);
+        assert_eq!(init["last_sequence_id"], tail);
+        let generation = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        assert_eq!(init["transcript_generation"], generation);
+        assert_eq!(init["conversation"]["transcript_generation"], generation);
+        match change {
+            SnapshotChange::Append => {
+                assert_eq!(init["messages"][1]["message_id"], "shared-appended");
+                assert_eq!(generation, before);
+            }
+            SnapshotChange::Mutate => {
+                assert_eq!(init["messages"][0]["display_data"]["race"], true);
+                assert_eq!(generation, before + 1);
+            }
+        }
+        assert!(state.runtime.try_get_handle(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_stream_retries_append_between_messages_and_opening() {
+        assert_shared_snapshot_race(SnapshotChange::Append).await;
+    }
+
+    #[tokio::test]
+    async fn shared_stream_retries_mutation_between_messages_and_opening() {
+        assert_shared_snapshot_race(SnapshotChange::Mutate).await;
+    }
+
+    #[tokio::test]
+    async fn opening_snapshot_retry_is_bounded() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let id = "shared-snapshot-exhausted";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "shared-initial",
+                id,
+                &crate::db::MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let token = state.db.create_share_token(id).await.unwrap();
+        let before = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        CHANGE.with(|hook| {
+            *hook.borrow_mut() = Some((
+                id.into(),
+                SnapshotChange::Mutate,
+                STABLE_TRANSCRIPT_READ_MAX_ATTEMPTS,
+            ));
+        });
+        let result = shared_sse_stream(State(state.clone()), Path(token)).await;
+        assert!(matches!(result, Err(AppError::Internal(_))));
+        assert!(CHANGE.with(|hook| hook.borrow().is_none()));
+        let after = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        assert_eq!(
+            after - before,
+            i64::try_from(STABLE_TRANSCRIPT_READ_MAX_ATTEMPTS).unwrap()
+        );
+        assert!(state.runtime.try_get_handle(id).await.is_none());
+    }
 }
 
 // ============================================================
@@ -9618,6 +9872,7 @@ pub(crate) enum AppError {
     /// 403 — the action is restricted to a caller on the server host.
     Forbidden(String),
     Internal(String),
+    TranscriptSnapshotChanged,
     TypedInternal {
         message: String,
         error_type: String,
@@ -9660,6 +9915,10 @@ impl IntoResponse for AppError {
             AppError::Forbidden(ref msg) => {
                 tracing::debug!(error = %msg, "403 Forbidden");
                 (StatusCode::FORBIDDEN, Json(ErrorResponse::new(msg.clone()))).into_response()
+            }
+            AppError::TranscriptSnapshotChanged => {
+                AppError::Internal("transcript changed during opening observation read".into())
+                    .into_response()
             }
             AppError::Internal(ref msg) => {
                 tracing::error!(error = %msg, "500 Internal Server Error");
@@ -12506,6 +12765,47 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn stable_read_retries_typed_opening_snapshot_mismatch() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "opening-snapshot-retry",
+            "opening-snapshot-retry",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stable = stable_transcript_read(&db, "opening-snapshot-retry", |db, id, attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                db.read_continuation_opening_at_snapshot(
+                    id,
+                    generation,
+                    if attempt == 1 { Some(1) } else { None },
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+                Ok(attempt)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(stable.attempts, 2);
+        assert_eq!(stable.value, 2);
+    }
+
+    #[tokio::test]
     async fn stable_stream_read_keeps_latest_selection_after_none_generation_race() {
         let state = make_test_state().await;
         state
@@ -13587,7 +13887,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("live message after subscribe");
         match live {
-            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
     }

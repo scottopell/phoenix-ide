@@ -295,6 +295,7 @@ pub enum SseWireEvent {
         /// event. Q3 resolution in `sse_wire.allium`.
         pending_truncated: bool,
         transcript_coverage: crate::runtime::TranscriptCoverage,
+        opening: Option<super::types::ContinuationOpeningView>,
     },
     /// A newly-persisted message joins the conversation. The envelope
     /// `sequence_id` equals `message.sequence_id` by construction.
@@ -304,10 +305,12 @@ pub enum SseWireEvent {
         /// validated against `MessageSchema` and transformed to the UI's
         /// `Message` type at the valibot boundary.
         #[ts(type = "unknown")]
-        message: EnrichedMessage,
+        message: Box<EnrichedMessage>,
+        opening: Option<super::types::ContinuationOpeningView>,
     },
     /// In-place mutation of an existing message's mutable fields.
     MessageUpdated {
+        opening: Option<super::types::ContinuationOpeningView>,
         sequence_id: i64,
         message_id: String,
         #[ts(type = "unknown | null")]
@@ -509,6 +512,7 @@ impl SseWireEvent {
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
+                opening,
             } => {
                 let (messages, transcript_coverage) = transcript.into_parts();
                 SseWireEvent::Init {
@@ -536,19 +540,22 @@ impl SseWireEvent {
                         .map(|event| Self::with_presentations(event, presentations))
                         .collect(),
                     pending_truncated,
+                    opening,
                 }
             }
-            SseEvent::Message { message } => {
+            SseEvent::Message { message, opening } => {
                 // The envelope `sequence_id` equals `message.sequence_id` —
                 // this is what the client already expects (see
                 // `ui/src/sseSchemas.ts` `SseMessageDataSchema`).
                 let sequence_id = message.sequence_id;
                 SseWireEvent::Message {
                     sequence_id,
-                    message: presentations.enrich(&message),
+                    message: Box::new(presentations.enrich(&message)),
+                    opening,
                 }
             }
             SseEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,
@@ -556,6 +563,7 @@ impl SseWireEvent {
                 content,
                 duration_ms,
             } => SseWireEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,
@@ -897,9 +905,11 @@ mod replay_payload_size_tests {
         let (db, mut messages) = super::super::event_presentation::tests::fixture(1).await;
         let event = SseEvent::Message {
             message: messages.remove(0),
+            opening: None,
         };
         let redacted: SseWireEvent = event.clone().into();
         let redacted_json = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(redacted_json.get("opening"), Some(&Value::Null));
         assert_eq!(
             redacted_json["message"]["event_presentation"]["reason"],
             "redacted"
@@ -910,6 +920,7 @@ mod replay_payload_size_tests {
         let presentations = EventPresentations::load(&db, event_messages(&event)).await;
         let projected = SseWireEvent::with_presentations(event.clone(), &presentations);
         let projected_json = serde_json::to_value(&projected).unwrap();
+        assert_eq!(projected_json.get("opening"), Some(&Value::Null));
         assert_eq!(
             projected_json["message"]["event_presentation"]["status"],
             "available"

@@ -1,3 +1,4 @@
+import { observeOwningAnchor, type ViewAnchorIntent, type ViewAnchorProbe, type ViewAnchorTerminal } from '../hooks/conversationViewAnchorProbe';
 import {
   memo,
   useState,
@@ -85,6 +86,8 @@ import type { HistoryView, RestoreBasis } from '../conversation/historyExpansion
 import {
   initialTranscriptPositioningState,
   reduceTranscriptPositioning,
+  transcriptPositioningCommandKey,
+  type TranscriptPositioningCompletion,
   type TranscriptPositioningEffect,
   type TranscriptPositioningEvent,
   type TranscriptPositioningInput,
@@ -199,13 +202,16 @@ interface MessageListProps {
    *  chapter `unitIndex` values are guaranteed to be in virtual transcript
    *  coordinate space — no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
+  onViewTailSettled?: (() => void) | undefined;
+  viewAnchorIntent?: ViewAnchorIntent | undefined;
+  onViewAnchorProbe?: ((probe: ViewAnchorProbe | null) => void) | undefined;
   hasOlderMessages?: boolean | undefined;
   onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => Promise<void>) | undefined;
   onUpdateOlderMessagesRestore?: ((restoreBasis: RestoreBasis) => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
   transcriptPositioning: TranscriptPositioningInput;
-  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryView) => void) | undefined;
+  onHistoryScrollCommandHandled?: ((completion: TranscriptPositioningCompletion) => void) | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -377,6 +383,7 @@ function renderHistoricalUnit(
       );
     case 'continuation': {
       const summary = (unit.message.content as { summary?: string })?.summary;
+      const handoff = (unit.message.display_data as ProductHistoricalHandoffDisplayData | null)?.productHistoricalHandoff;
       if (!summary) return null;
       const revealedSummary = activeHighlight?.owner === 'message-text'
         ? renderHighlightedText(summary, activeHighlight.start, activeHighlight.end)
@@ -385,6 +392,7 @@ function renderHistoricalUnit(
         <div id={`message-${unit.message.message_id}`}>
           <CompletedContinuationBoundary
             summary={summary}
+            provenance={{ predecessor: unit.message.conversation_id, messageId: unit.message.message_id, ...(handoff ? { successor: handoff.successor_transcript_row_id } : {}) }}
             revealedSummary={revealedSummary}
             revealSummary={revealedSummary !== undefined}
           />
@@ -573,6 +581,9 @@ function MessageListImpl({
   reactionDestination,
   onVisibleRangeChange,
   onChaptersChange,
+  onViewTailSettled,
+  viewAnchorIntent,
+  onViewAnchorProbe,
   hasOlderMessages = false,
   onLoadOlderMessages,
   onUpdateOlderMessagesRestore,
@@ -667,8 +678,14 @@ function MessageListImpl({
     [conversationId],
   );
   const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
-  const sourceToolId = sourceCallTarget?.toolUseId ?? null;
   const sourceMessageId = sourceCallTarget?.messageId ?? null;
+  const requestedSourceToolId = sourceCallTarget?.toolUseId ?? null;
+  const sourceToolId = useMemo(() => {
+    if (!sourceMessageId || !requestedSourceToolId) return null;
+    const owner = historicalUnits.flatMap(agentTurnsInHistoricalUnit).find(turn => turn.agent.message_id === sourceMessageId)?.agent;
+    return Array.isArray(owner?.content) && owner.content.some(block => block.type === 'tool_use' && block.id === requestedSourceToolId && block.name !== 'think')
+      ? requestedSourceToolId : null;
+  }, [historicalUnits, requestedSourceToolId, sourceMessageId]);
   const sourceRevealRequest = useMemo<AgentTextRevealRequest | null>(() => {
     const sourceUnit = sourceMessageId ? findHistoricalUnitLocationByMessageId(historicalUnits, sourceMessageId) : null;
     return sourceUnit && sourceToolId ? {
@@ -851,8 +868,23 @@ function MessageListImpl({
   const transcriptPositioningStateRef = useRef(initialTranscriptPositioningState(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
+  const authoritativePositioningKey = transcriptPositioning.kind === 'positioning'
+    && transcriptPositioning.command.view.conversationId === conversationId
+    ? transcriptPositioningCommandKey(transcriptPositioning.command)
+    : null;
   const dispatchTranscriptPositioningRef = useRef<(event: TranscriptPositioningEvent) => void>(() => {});
   const lastPhysicalSnapshotRef = useRef<VirtualTranscriptPhysicalSnapshot | null>(null);
+  const viewAnchorIntentRef = useRef(viewAnchorIntent);
+  viewAnchorIntentRef.current = viewAnchorIntent;
+  const viewAnchorTerminalRef = useRef<ViewAnchorTerminal | null>(null);
+  const viewAnchorCommandOwnerRef = useRef<{ key: string; scope: string } | null>(null);
+  useLayoutEffect(() => {
+    onViewAnchorProbe?.(() => {
+      const intent = viewAnchorIntentRef.current;
+      return intent ? observeOwningAnchor(intent, viewAnchorTerminalRef.current, transcriptPositioningStateRef.current, scrollMachineRef.current, scrollerRef.current) : { kind: 'pending' };
+    });
+    return () => onViewAnchorProbe?.(null);
+  }, [onViewAnchorProbe]);
   const transcriptPositioningViewKeyRef = useRef(historyViewKey(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
@@ -975,12 +1007,18 @@ function MessageListImpl({
     }
   }, [scheduleDomBottomWrite, scheduleTailFollow, startSettleWatch, stopSettleWatch]);
 
+  const viewTailSettledRef = useRef(onViewTailSettled);
+  viewTailSettledRef.current = onViewTailSettled;
   const dispatchScrollEvent = useCallback((event: ScrollEvent) => {
     const next = reduceScrollMachine(scrollMachineRef.current, event);
     scrollMachineRef.current = next.state;
     // REQ-VT-008: intent follows every reduction.
+
     transcriptRef.current?.setTailFollowAllowed(tailFollowGranted(next.state));
     applyScrollEffects(next.effects);
+    if (next.state.kind === 'live' && next.state.follow.kind === 'following' && next.state.geometry.atBottom && next.state.gesture.kind === 'idle') {
+      viewTailSettledRef.current?.();
+    }
   }, [applyScrollEffects]);
   dispatchScrollEventRef.current = dispatchScrollEvent;
 
@@ -1356,10 +1394,12 @@ function MessageListImpl({
       pending.conversationId !== conversationId ||
       pending.key !== key
     ) return;
+    const toolTarget = pending.toolUseId ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) : null;
+    if (pending.toolUseId && !toolTarget) return;
     pendingPulseRef.current = null;
     clearHighlight();
     const target = pending.toolUseId
-      ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) ?? row
+      ? toolTarget!
       : pending.memberMessageId
         ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
         : row.querySelector('.message') ?? row;
@@ -1377,7 +1417,7 @@ function MessageListImpl({
     clearHighlight();
   }, [clearHighlight]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     pendingPulseRef.current = null;
     clearHighlight();
   }, [conversationId, clearHighlight]);
@@ -1388,6 +1428,19 @@ function MessageListImpl({
       .find((candidate) => candidate.dataset['renderUnitKey'] === key);
     if (row) pulseMountedRow(key, row);
   }, [pulseMountedRow]);
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!sourceToolId || !scroller) return;
+    const applyPendingPulse = () => {
+      const pending = pendingPulseRef.current;
+      if (pending) pulseIfMounted(pending.key);
+    };
+    const observer = new MutationObserver(applyPendingPulse);
+    observer.observe(scroller, { childList: true, subtree: true });
+    applyPendingPulse();
+    return () => observer.disconnect();
+  }, [sourceToolId, pulseIfMounted]);
 
   const scrollToUnitIndex = useCallback((
     unitIndex: number,
@@ -1428,6 +1481,7 @@ function MessageListImpl({
   }, []);
 
   const scrollToMessageId = useCallback((messageId: string) => {
+    if (messageId === sourceMessageId && requestedSourceToolId && !sourceToolId) return false;
     const location = findHistoricalUnitLocationByMessageId(historicalUnits, messageId);
     if (!location) return false;
     const unit = historicalUnits[location.unitIndex];
@@ -1435,19 +1489,24 @@ function MessageListImpl({
     scrollToUnitIndex(
       location.unitIndex,
       grouped ? location.memberMessageId : undefined,
-      sourceToolId ?? (grouped ? location.toolUseId : undefined),
+      (messageId === sourceMessageId ? sourceToolId : null) ?? (grouped ? location.toolUseId : undefined),
     );
     return true;
-  }, [historicalUnits, scrollToUnitIndex, sourceToolId]);
+  }, [historicalUnits, requestedSourceToolId, scrollToUnitIndex, sourceMessageId, sourceToolId]);
 
   const revealedSourceRef = useRef<string | null>(null);
   useEffect(() => {
     const key = sourceMessageId && sourceToolId ? `${sourceMessageId}:${sourceToolId}` : null;
     if (!key) { revealedSourceRef.current = null; return; }
+    if (transcriptPositioning.kind === 'positioning' && transcriptPositioning.command.kind === 'jump_to_message'
+      && transcriptPositioning.command.targetMessageId === sourceMessageId) {
+      revealedSourceRef.current = key;
+      return;
+    }
     if (revealedSourceRef.current !== key && sourceMessageId && scrollToMessageId(sourceMessageId)) {
       revealedSourceRef.current = key;
     }
-  }, [sourceMessageId, sourceToolId, scrollToMessageId]);
+  }, [sourceMessageId, sourceToolId, scrollToMessageId, transcriptPositioning]);
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
@@ -1558,9 +1617,10 @@ function MessageListImpl({
     for (const effect of effects) {
       switch (effect.type) {
         case 'resolve_target': {
+          viewAnchorCommandOwnerRef.current = viewAnchorIntentRef.current ? { key: effect.commandKey, scope: viewAnchorIntentRef.current.scope } : null;
           const targetIndex = findUnitIndexByMessageId(effect.targetMessageId);
           dispatchTranscriptPositioningRef.current(
-            targetIndex < 0
+            targetIndex < 0 || (effect.command.kind === 'jump_to_message' && effect.targetMessageId === sourceMessageId && requestedSourceToolId !== null && sourceToolId === null)
               ? { type: 'target_missing', commandKey: effect.commandKey }
               : { type: 'target_resolved', commandKey: effect.commandKey, targetIndex },
           );
@@ -1568,6 +1628,7 @@ function MessageListImpl({
         }
         case 'position': {
           const command = effect.command;
+          const selectedToolId = command.kind === 'jump_to_message' && command.targetMessageId === sourceMessageId ? sourceToolId : null;
           if (command.kind === 'jump_to_message') {
             const unit = historicalUnits[effect.targetIndex];
             if (unit) {
@@ -1580,27 +1641,29 @@ function MessageListImpl({
                 ...(unit.kind === 'tool_only_agent_turn_group' && location
                   ? { memberMessageId: location.memberMessageId }
                   : {}),
-                ...((sourceToolId || (unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId))
-                  ? { toolUseId: sourceToolId ?? location!.toolUseId }
+                ...((selectedToolId || (unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId))
+                  ? { toolUseId: selectedToolId ?? location!.toolUseId }
                   : {}),
               };
               const grouped = unit.kind === 'tool_only_agent_turn_group';
-              const targetSelector = sourceToolId || (grouped && location?.toolUseId)
-                ? `[data-tool-id="${CSS.escape(sourceToolId ?? location!.toolUseId!)}"]`
+              const targetSelector = selectedToolId || (grouped && location?.toolUseId)
+                ? `[data-tool-id="${CSS.escape(selectedToolId ?? location!.toolUseId!)}"]`
                 : grouped && location
                   ? `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`
                   : undefined;
               if (targetSelector) {
-                transcriptRef.current?.scrollToIndex(
+                transcriptRef.current?.scrollToOwnedIndex(
+                  effect.commandKey,
                   effect.targetIndex,
                   effect.align,
                   effect.viewportStartOffset,
                   targetSelector,
                 );
               } else if (effect.viewportStartOffset === undefined) {
-                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align);
+                transcriptRef.current?.scrollToOwnedIndex(effect.commandKey, effect.targetIndex, effect.align);
               } else {
-                transcriptRef.current?.scrollToIndex(
+                transcriptRef.current?.scrollToOwnedIndex(
+                  effect.commandKey,
                   effect.targetIndex,
                   effect.align,
                   effect.viewportStartOffset,
@@ -1610,7 +1673,10 @@ function MessageListImpl({
             }
           } else {
             continuityRestoreInFlightRef.current = true;
-            transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+            transcriptRef.current?.scrollToOwnedIndex(
+              effect.commandKey, effect.targetIndex, effect.align, effect.viewportStartOffset, undefined,
+              'continuity',
+            );
           }
           const physicalTargetSelector = effect.command.kind === 'jump_to_message'
             ? (() => {
@@ -1619,7 +1685,7 @@ function MessageListImpl({
                   effect.command.targetMessageId,
                 );
                 const unit = historicalUnits[effect.targetIndex];
-                if (sourceToolId) return `[data-tool-id="${CSS.escape(sourceToolId)}"]`;
+                if (selectedToolId) return `[data-tool-id="${CSS.escape(selectedToolId)}"]`;
                 if (unit?.kind !== 'tool_only_agent_turn_group' || !location) return undefined;
                 return location.toolUseId
                   ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
@@ -1652,20 +1718,28 @@ function MessageListImpl({
           break;
         }
         case 'finish':
+          if (viewAnchorCommandOwnerRef.current?.key === effect.commandKey) {
+            viewAnchorTerminalRef.current = { scope: viewAnchorCommandOwnerRef.current.scope, command: effect.command, result: effect.result };
+          }
+          if (effect.result === 'applied') transcriptRef.current?.completePosition(effect.commandKey);
+          if (effect.result === 'superseded') transcriptRef.current?.cancelPosition(effect.commandKey);
           if (effect.command.kind === 'restore_after_prefix_expansion') {
             continuityRestoreInFlightRef.current = false;
           }
-          onHistoryScrollCommandHandled?.(effect.command.token, effect.result, effect.command.view);
+          onHistoryScrollCommandHandled?.({ commandKey: effect.commandKey, result: effect.result });
           break;
       }
     }
-  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted, sourceToolId]);
+  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted, requestedSourceToolId, sourceMessageId, sourceToolId]);
 
   const dispatchTranscriptPositioning = useCallback((event: TranscriptPositioningEvent) => {
+    if (event.type === 'user_interrupted' || event.type === 'executor_detached') transcriptRef.current?.interruptPosition();
+    if ((event.type === 'physical_observed' || event.type === 'position_issued' || event.type === 'target_resolved' || event.type === 'target_missing')
+      && event.commandKey !== authoritativePositioningKey) return;
     const next = reduceTranscriptPositioning(transcriptPositioningStateRef.current, event);
     transcriptPositioningStateRef.current = next.state;
     applyTranscriptPositioningEffects(next.effects);
-  }, [applyTranscriptPositioningEffects]);
+  }, [applyTranscriptPositioningEffects, authoritativePositioningKey]);
   dispatchTranscriptPositioningRef.current = dispatchTranscriptPositioning;
 
   useLayoutEffect(() => {
@@ -1867,6 +1941,10 @@ function MessageListImpl({
             key={conversationId ?? '__empty__'}
             ref={transcriptRef}
             scrollerId="messages"
+            positioningViewKey={currentHistoryViewKey}
+            positioningAuthority={authoritativePositioningKey === null
+              ? { kind: 'absent' }
+              : { kind: 'command', commandKey: authoritativePositioningKey }}
             ariaLabel="Conversation transcript"
             scrollerRef={handleScrollerRef}
             items={allUnits}

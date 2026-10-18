@@ -4,6 +4,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import * as v from 'valibot';
 import type { EventPresentation } from '../generated/EventPresentation';
+import type { SseWireEvent } from '../generated/SseWireEvent';
 import type { Message } from '../api';
 import { EventPresentationSchema, SseMessageDataSchema } from '../sseSchemas';
 import { ConversationEventCard, eventCardFragments } from './ConversationEventCard';
@@ -108,8 +109,10 @@ describe('compact conversation events', () => {
 
 describe('typed event wire retention', () => {
   it.each([400, 401])('retains flattened available payload at sequence %s', (sequence_id) => {
-    const parsed = v.parse(SseMessageDataSchema, { sequence_id, message: { ...message(available), sequence_id } });
+    const payload = { sequence_id, opening: null, message: { ...message(available), sequence_id } } satisfies Omit<Extract<SseWireEvent, {type: 'message'}>, 'type'>;
+    const parsed = v.parse(SseMessageDataSchema, payload);
     expect(parsed.message.event_presentation).toEqual(available);
+    expect(parsed.opening).toBeNull();
     expect(parsed.message.content).toEqual({ text: original });
   });
   it.each(['missing', 'lookup_failed', 'redacted'] as const)('retains %s fallback', (reason) => {
@@ -119,8 +122,12 @@ describe('typed event wire retention', () => {
   it('requires an explicit nullable field and rejects malformed outcomes rather than stripping them', () => {
     const { event_presentation, ...without } = message(null);
     expect(event_presentation).toBeNull();
-    expect(v.safeParse(SseMessageDataSchema, { sequence_id: 400, message: without }).success).toBe(false);
-    expect(v.safeParse(SseMessageDataSchema, { sequence_id: 400, message: message(null) }).success).toBe(true);
+    expect(v.safeParse(SseMessageDataSchema, { sequence_id: 400, opening: null, message: without }).success).toBe(false);
+    const combined = { sequence_id: 400, opening: null, message: message(null) } satisfies Omit<Extract<SseWireEvent, {type: 'message'}>, 'type'>;
+    expect(v.safeParse(SseMessageDataSchema, combined).success).toBe(true);
+    expect(v.parse(SseMessageDataSchema, combined).message.event_presentation).toBeNull();
+    expect(v.parse(SseMessageDataSchema, combined).opening).toBeNull();
+    expect(v.safeParse(SseMessageDataSchema, { sequence_id: 400, message: message(null) }).success).toBe(false);
     for (const outcome of [{ kind: 'failed' }, { kind: 'completed' }, { kind: 'cleanup_failed', reason: 5 }]) {
       expect(v.safeParse(EventPresentationSchema, { ...available, outcome }).success).toBe(false);
     }

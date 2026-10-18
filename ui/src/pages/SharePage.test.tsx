@@ -118,7 +118,7 @@ describe('SharePage SSE schema validation', () => {
     const base = { event_presentation: null, conversation_id: 'conv-1', origin: { kind: 'system_generated' }, created_at: '2026-01-01T00:00:00Z', display_data: null };
     const reference = { artifact_id: 'chart-1', conversation_id: 'conv-1', title: 'Shared chart', description: 'Shared directory sizes', width: 800, height: 400, validation: 'accepted_static_svg' };
     act(() => {
-      MockEventSource.instances[0]!.emit('init', {
+      MockEventSource.instances[0]!.emit('init', { opening: null,
         sequence_id: 2, transcript_generation: 1, transcript_coverage: 'complete',
         conversation: { id: 'conv-1', slug: 'test', model: 'test' },
         messages: [
@@ -175,7 +175,7 @@ describe('SharePage SSE schema validation', () => {
 
     // First, deliver a valid init so we reach the 'connected' state.
     act(() => {
-      es.emit('init', {
+      es.emit('init', { opening: null,
         sequence_id: 0,
         transcript_generation: 1,
         transcript_coverage: 'complete',
@@ -198,7 +198,7 @@ describe('SharePage SSE schema validation', () => {
     // rather than corrupting the message list.
     inProdMode(() => {
       act(() => {
-        es.emit('message', { sequence_id: 'not-a-number', message: {} });
+        es.emit('message', { opening: null, sequence_id: 'not-a-number', message: {} });
       });
     });
 

@@ -9,6 +9,12 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 
 The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-nonproject-home.md), affecting REQ-GR-006/007/013/016–018.
 
+The departing-document delivery evidence decision is [ADR-122](122_pagehide-delivery-uses-collector-and-export-evidence.md), affecting REQ-CVT-004/005/006.
+
+Complete exported span capacity is governed by [ADR-118](118_preserve-complete-span-schemas-with-bounded-capacity.md), affecting REQ-CVT-005/006/007.
+
+Controlled-functional build isolation is governed by [ADR-119](119_separate-controlled-functional-telemetry-build.md), affecting REQ-CVT-001/005/006.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |
@@ -115,7 +121,6 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [097](097_bounded-retrieval-reconciliation.md) | Bounded orphan pruning and terminal retrieval readiness | Accepted | REQ-RET-003 |
 | [098](098_retire-wake-execution-and-preserve-history.md) | Retire wake execution and preserve history | Accepted; supersedes wake execution obligations | REQ-WAKE-RETIRE-001–005; retired REQ-WAKE-001–018, REQ-DWF-WAKE-001–005, REQ-SA-009 |
 | [099](099_bounded-markdown-disclosures.md) | Recognize bounded Markdown disclosures within native parsing contexts | Accepted | REQ-CONV-025; REQ-CONV-002/019 |
-
 | [100](100_canonical-model-id-is-separate-from-request-addressing.md) | Canonical model ID is separate from request addressing | Accepted | REQ-LLM-014; `ModelSpec`, `RequestModelName`, `PHOENIX_LLM_REQUEST_MODELS` |
 | [101](101_coordinator-instance-owned-nonproject-home.md) | Coordinator owns a local non-project home through explicit WorkScope targeting | Accepted | REQ-GR-006, REQ-GR-007, REQ-GR-013, REQ-GR-016–018 |
 | [102](102_current-schema-prepared-activation-commits-at-database-write.md) | Current-schema prepared activation commits at the database-write boundary | Accepted; interval superseded by 105; protected-source restriction partially superseded by 115 | REQ-COMP-012, REQ-LDD-019–022, REQ-PD-021 |
@@ -134,6 +139,12 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
+| [118](118_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
+| [119](119_separate-controlled-functional-telemetry-build.md) | Separate controlled-functional telemetry build | Accepted | REQ-CVT-001, REQ-CVT-005, REQ-CVT-006 |
+| [120](120_successful-position-settles-geometric-anchor.md) | Successful positioning settles geometry without retaining command capability | Accepted | REQ-VT-003, REQ-VT-006, REQ-VT-007 |
+| [121](121_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
+| [122](122_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
+| [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
 
 ## For agents: which decisions bind your task
 

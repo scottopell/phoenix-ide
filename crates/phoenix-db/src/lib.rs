@@ -78,6 +78,8 @@ pub(crate) use git_repository_reconciliation::{
 };
 pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
+    ContinuationOpeningEdge, ContinuationOpeningPresentation, ContinuationOpeningRead,
+    ContinuationOpeningUpdateRead, CoordinatorConversationSnapshotRead,
     ProductConversationAggregate, ProductConversationCloseAvailability,
     ProductConversationCloseUnavailableReason, ProductConversationHandoff,
     ProductConversationListLifecycle, ProductConversationListProjection,
@@ -231,6 +233,8 @@ pub enum DbError {
     MessageConflict(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
+    #[error("transcript changed during opening observation read")]
+    TranscriptSnapshotChanged,
     #[error("Serialization error: {0}")]
     Serialization(String),
     #[error("Continuation precondition failed: {0}")]
@@ -6997,24 +7001,24 @@ impl Database {
         Ok(exists != 0)
     }
 
-    /// Returns whether a successor is still waiting for its reserved opening.
-    ///
-    /// # Errors
-    /// Returns an error when the intent query fails.
-    pub async fn has_pending_continuation_opening(&self, successor_id: &str) -> DbResult<bool> {
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(
+    pub(crate) const PENDING_CONTINUATION_OPENING_SQL: &'static str = "SELECT EXISTS(
                  SELECT 1 FROM continuation_dispatch_intents AS intent
                  WHERE intent.successor_conversation_id = ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM completed_continuation_handoffs AS completed
                        WHERE completed.predecessor_conversation_id = intent.parent_conversation_id
                    )
-             )",
-        )
-        .bind(successor_id)
-        .fetch_one(&self.pool)
-        .await?;
+             )";
+
+    /// Returns whether a successor is still waiting for its reserved opening.
+    ///
+    /// # Errors
+    /// Returns an error when the intent query fails.
+    pub async fn has_pending_continuation_opening(&self, successor_id: &str) -> DbResult<bool> {
+        let pending: i64 = sqlx::query_scalar(Self::PENDING_CONTINUATION_OPENING_SQL)
+            .bind(successor_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(pending != 0)
     }
 
@@ -21365,6 +21369,11 @@ mod tests {
     #[tokio::test]
     async fn coordinator_continuation_commit_admits_automatic_work() {
         let db = Database::open_in_memory().await.unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let home_scope = db
+            .initialize_coordinator_work_scope(home.path().to_str().unwrap())
+            .await
+            .unwrap();
         let coordinator = db
             .get_or_create_coordinator(
                 Some("test-model"),
@@ -21372,6 +21381,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            coordinator.attached_work_scope_id,
+            Some(home_scope.work_scope_id)
+        );
         db.set_auto_continue_on_context_exhaustion(
             &coordinator.product_conversation_id,
             AutoContinueOnContextExhaustion::Enabled,

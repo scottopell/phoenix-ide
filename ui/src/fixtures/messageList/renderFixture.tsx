@@ -5,7 +5,7 @@ import { ConversationStore } from '../../conversation/ConversationStore';
 import { DensityContext } from '../../hooks/useDensity';
 import { MessageList, type MessageListHandle } from '../../components/MessageList';
 import type { HistoryScrollCommand } from '../../conversation/historyExpansion';
-import type { TranscriptPositioningInput } from '../../conversation/transcriptPositioning';
+import { transcriptPositioningCommandKey, type TranscriptPositioningCompletion, type TranscriptPositioningInput } from '../../conversation/transcriptPositioning';
 import '../../index.css';
 import type { Message } from '../../api';
 import type { MessageListScenario } from './types';
@@ -149,8 +149,9 @@ export function MessageListFixture({ scenario }: Props) {
     ? { kind: 'positioning', command: historyScrollCommand }
     : { kind: 'idle', view: { conversationId: data.conversationId, generation: 1, transcriptGeneration: 1 } };
 
-  const handleHistoryCommand = (token: number) => {
-    if (token !== 1) return;
+  const handleHistoryCommand = (completion: TranscriptPositioningCompletion) => {
+    if (!historyScrollCommand || completion.commandKey !== transcriptPositioningCommandKey(historyScrollCommand)
+      || completion.result !== 'applied') return;
     requestAnimationFrame(() => requestAnimationFrame(() => {
       const pending = pendingAnchorRef.current;
       if (!pending) return;

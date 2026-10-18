@@ -67,10 +67,67 @@ pub struct OrdinaryProductConversationCitation {
     pub root_title: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuationOpeningEdge {
+    pub product_conversation_id: ProductConversationId,
+    pub predecessor_transcript_row_id: String,
+    pub successor_transcript_row_id: String,
+    pub continuation_message_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationOpeningPresentation {
+    Boundary,
+    SeparateMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuationOpeningRead {
+    None,
+    Pending {
+        edge: ContinuationOpeningEdge,
+        client_turn_key: phoenix_workflow::ClientTurnKey,
+        opening_authority: ContinuationOpeningAuthority,
+    },
+    Accepted {
+        edge: ContinuationOpeningEdge,
+        accepted_message_id: String,
+        opening_authority: ContinuationOpeningAuthority,
+        presentation: ContinuationOpeningPresentation,
+    },
+}
+
+impl ContinuationOpeningRead {
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContinuationOpeningUpdateRead {
+    Current(ContinuationOpeningRead),
+    Superseded {
+        content: MessageContent,
+        transcript_generation: i64,
+        display_data: Option<serde_json::Value>,
+        opening: ContinuationOpeningRead,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
+    pub latest_opening: ContinuationOpeningRead,
     pub close: Option<CloseProjection>,
+    pub messages: Vec<(i64, crate::Message)>,
+    pub requested_transcript_row_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinatorConversationSnapshotRead {
+    pub aggregate: ProductConversationAggregate,
+    pub latest_opening: ContinuationOpeningRead,
     pub messages: Vec<(i64, crate::Message)>,
     pub requested_transcript_row_id: String,
 }
@@ -307,10 +364,10 @@ fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> 
 
 #[cfg(test)]
 const ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
-     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = (SELECT CASE kind WHEN 'coordinator' THEN 'coordinator' ELSE 'user' END FROM product_conversations WHERE id = ?1) AND root.parent_conversation_id IS NULL
      AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
      UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
-     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = (SELECT CASE kind WHEN 'coordinator' THEN 'coordinator' ELSE 'user' END FROM product_conversations WHERE id = ?1) AND successor.parent_conversation_id IS NULL
  ), snapshot_ceiling AS (
      SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
@@ -325,11 +382,11 @@ const ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE tra
  ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6";
 
 const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
-     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = (SELECT CASE kind WHEN 'coordinator' THEN 'coordinator' ELSE 'user' END FROM product_conversations WHERE id = ?1) AND root.parent_conversation_id IS NULL
      AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
      UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
-     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
- ), snapshot_ceiling AS (
+     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = (SELECT CASE kind WHEN 'coordinator' THEN 'coordinator' ELSE 'user' END FROM product_conversations WHERE id = ?1) AND successor.parent_conversation_id IS NULL
+ ), snapshot_ceiling AS MATERIALIZED (
      SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
             json_extract(value, '$.tail_message_id') AS tail_message_id
@@ -892,6 +949,9 @@ impl Database {
             )
             .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
+            let latest_opening =
+                Self::read_continuation_opening_on(&mut tx, &aggregate.latest_transcript_row_id)
+                    .await?;
             let close = Self::get_active_close_projection_for_product_on(
                 &mut tx,
                 aggregate.product_conversation.id(),
@@ -909,6 +969,7 @@ impl Database {
             .await?;
             Ok(ProductConversationSnapshotRead {
                 aggregate,
+                latest_opening,
                 close,
                 messages,
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
@@ -925,14 +986,76 @@ impl Database {
         result
     }
 
+    /// Reads bounded Global history without ordinary lifecycle or Close authority.
+    ///
+    /// # Errors
+    /// Returns an error for absent/non-Coordinator references or invalid persisted topology.
+    pub async fn read_coordinator_product_conversation_snapshot(
+        &self,
+        reference: &str,
+        before: Option<(i64, i64, String)>,
+        segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
+        limit: usize,
+    ) -> DbResult<CoordinatorConversationSnapshotRead> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin().await?;
+        let result = async {
+            let resolved = Self::resolve_product_conversation_on(
+                &mut tx,
+                reference,
+                ProductConversationKind::Coordinator,
+            )
+            .await?;
+            let aggregate = Self::get_product_conversation_on(
+                &mut tx,
+                &resolved.product_conversation_id,
+                ProductConversationKind::Coordinator,
+            )
+            .await?;
+            let latest_opening =
+                Self::read_continuation_opening_on(&mut tx, &aggregate.latest_transcript_row_id)
+                    .await?;
+            let messages = Self::get_product_conversation_messages_page_on(
+                &mut tx,
+                aggregate.product_conversation.id(),
+                before,
+                segment_ceilings,
+                limit,
+            )
+            .await?;
+            Ok(CoordinatorConversationSnapshotRead {
+                aggregate,
+                latest_opening,
+                messages,
+                requested_transcript_row_id: resolved.requested_transcript_row_id,
+            })
+        }
+        .await;
+        tx.rollback().await?;
+        result
+    }
+
     async fn resolve_ordinary_product_conversation_on(
         connection: &mut SqliteConnection,
         reference: &str,
     ) -> DbResult<ResolvedProductConversation> {
+        Self::resolve_product_conversation_on(
+            connection,
+            reference,
+            ProductConversationKind::Ordinary,
+        )
+        .await
+    }
+
+    async fn resolve_product_conversation_on(
+        connection: &mut SqliteConnection,
+        reference: &str,
+        kind: ProductConversationKind,
+    ) -> DbResult<ResolvedProductConversation> {
         let row = sqlx::query(
             "SELECT c.product_conversation_id, c.id
              FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
-             WHERE p.kind = 'ordinary' AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
+             WHERE p.kind = ?2 AND c.runtime_role = ?3 AND c.parent_conversation_id IS NULL
                AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
                    WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')
                AND (p.id = ?1 OR c.id = ?1 OR c.slug = ?1)
@@ -940,6 +1063,11 @@ impl Database {
                       c.created_at ASC, c.id ASC LIMIT 1",
         )
         .bind(reference)
+        .bind(kind.as_str())
+        .bind(match kind {
+            ProductConversationKind::Ordinary => "user",
+            ProductConversationKind::Coordinator => "coordinator",
+        })
         .fetch_optional(&mut *connection)
         .await?;
         let Some(row) = row else {
@@ -954,10 +1082,23 @@ impl Database {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn get_ordinary_product_conversation_on(
         connection: &mut SqliteConnection,
         product_conversation_id: &ProductConversationId,
+    ) -> DbResult<ProductConversationAggregate> {
+        Self::get_product_conversation_on(
+            connection,
+            product_conversation_id,
+            ProductConversationKind::Ordinary,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_product_conversation_on(
+        connection: &mut SqliteConnection,
+        product_conversation_id: &ProductConversationId,
+        kind: ProductConversationKind,
     ) -> DbResult<ProductConversationAggregate> {
         let product =
             sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations p WHERE id = ?1
@@ -972,27 +1113,39 @@ impl Database {
             ));
         };
         if ProductConversationKind::from_db_str(&product.try_get::<String, _>("kind")?)
-            != Some(ProductConversationKind::Ordinary)
+            != Some(kind)
         {
             return Err(DbError::ConversationNotFound(
                 product_conversation_id.to_string(),
             ));
         }
-        let lifecycle = product.try_get::<String, _>("ordinary_lifecycle")?;
-        let lifecycle =
-            OrdinaryProductConversationLifecycle::from_db_str(&lifecycle).ok_or_else(|| {
-                DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
-            })?;
+        let product_conversation = match kind {
+            ProductConversationKind::Ordinary => {
+                let lifecycle = product.try_get::<String, _>("ordinary_lifecycle")?;
+                let lifecycle = OrdinaryProductConversationLifecycle::from_db_str(&lifecycle)
+                    .ok_or_else(|| {
+                        DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
+                    })?;
+                ProductConversation::ordinary(product_conversation_id.clone(), lifecycle)
+            }
+            ProductConversationKind::Coordinator => {
+                ProductConversation::coordinator(product_conversation_id.clone())
+            }
+        };
+        let runtime_role = match kind {
+            ProductConversationKind::Ordinary => "user",
+            ProductConversationKind::Coordinator => "coordinator",
+        };
         let rows = sqlx::query(
             "WITH RECURSIVE transcript(id, ordinal) AS (
                  SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1
-                   AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+                   AND root.runtime_role = ?2 AND root.parent_conversation_id IS NULL
                    AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
                  UNION ALL
                  SELECT successor.id, transcript.ordinal + 1 FROM transcript
                  JOIN conversations predecessor ON predecessor.id = transcript.id
                  JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
-                 WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+                 WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = ?2 AND successor.parent_conversation_id IS NULL
              ) SELECT transcript.id, transcript.ordinal,
                     COALESCE((SELECT MAX(message.sequence_id) FROM messages message WHERE message.conversation_id = transcript.id), 0) AS tail_sequence_id,
                     (SELECT message.message_id FROM messages message
@@ -1011,7 +1164,7 @@ impl Database {
              LEFT JOIN conversation_approved_task_objectives objective
                ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
-        ).bind(product_conversation_id.as_str()).fetch_all(&mut *connection).await?;
+        ).bind(product_conversation_id.as_str()).bind(runtime_role).fetch_all(&mut *connection).await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.try_get("id")?;
@@ -1024,7 +1177,9 @@ impl Database {
             });
         }
         let Some(root) = transcript_rows.first().cloned() else {
-            return Err(DbError::Serialization(format!("ordinary ProductConversation {product_conversation_id} has no parent transcript root")));
+            return Err(DbError::Serialization(format!(
+                "ordinary ProductConversation {product_conversation_id} has no parent transcript root"
+            )));
         };
         let mut segments = Vec::with_capacity(transcript_rows.len());
         for transcript_row in transcript_rows {
@@ -1057,10 +1212,7 @@ impl Database {
         let source =
             Self::product_conversation_source_on(connection, product_conversation_id).await?;
         Ok(ProductConversationAggregate {
-            product_conversation: ProductConversation::ordinary(
-                product_conversation_id.clone(),
-                lifecycle,
-            ),
+            product_conversation,
             root,
             latest_transcript_row_id: latest.transcript_row.conversation.id.clone(),
             updated_at,
@@ -1090,6 +1242,248 @@ impl Database {
     /// Edges recorded after migration 074 retain their acceptance-time successor
     /// message. Older edges have no such relation, but their persisted predecessor
     /// continuation remains the historical boundary; no successor message is inferred.
+    /// Reads one transcript's opening authority in a consistent read transaction.
+    ///
+    /// # Errors
+    /// Invalid persisted edges and unreadable receipts are errors, never absence.
+    pub async fn read_continuation_opening(
+        &self,
+        successor: &str,
+    ) -> DbResult<ContinuationOpeningRead> {
+        let mut tx = self.pool.begin().await?;
+        let result = Self::read_continuation_opening_on(&mut tx, successor).await;
+        tx.rollback().await?;
+        result
+    }
+
+    /// Reads an opening observation only for the exact committed receipt message.
+    ///
+    /// # Errors
+    /// Read and provenance failures remain errors.
+    pub async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> DbResult<Option<ContinuationOpeningRead>> {
+        let mut tx = self.pool.begin().await?;
+        let result = async {
+            let successor: Option<String> = sqlx::query_scalar(
+                "SELECT successor_conversation_id FROM completed_continuation_handoffs
+                 WHERE accepted_successor_message_id = ?1",
+            )
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match successor {
+                Some(successor) => Self::read_continuation_opening_on(&mut tx, &successor)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+        .await;
+        tx.rollback().await?;
+        result
+    }
+
+    /// Reads a current opening observation or a coherent committed replacement.
+    ///
+    /// # Errors
+    /// Missing/future generation, wrong current content, or invalid receipts require reconciliation.
+    pub async fn read_message_continuation_opening_at_update(
+        &self,
+        message_id: &str,
+        generation: Option<i64>,
+        content: &MessageContent,
+    ) -> DbResult<Option<ContinuationOpeningUpdateRead>> {
+        let mut tx = self.pool.begin().await?;
+        let result = async {
+            let row = sqlx::query(
+                "SELECT handoff.successor_conversation_id, conversation.transcript_generation,
+                        message.*
+                 FROM completed_continuation_handoffs handoff
+                 JOIN messages message ON message.message_id = handoff.accepted_successor_message_id
+                 JOIN conversations conversation ON conversation.id = message.conversation_id
+                 WHERE handoff.accepted_successor_message_id = ?1",
+            )
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let actual_generation: i64 = row.try_get("transcript_generation")?;
+            let actual_content = message_content_from_row(&row, "message_type", "content")?;
+            let successor: String = row.try_get("successor_conversation_id")?;
+            let mut message = super::parse_message_row(row)?;
+            message.content = actual_content;
+            super::hydrate_attachments_conn(&mut tx, std::slice::from_mut(&mut message)).await?;
+            let actual_content = message.content;
+            let Some(generation) = generation else {
+                return Err(DbError::TranscriptSnapshotChanged);
+            };
+            if generation < 0
+                || generation > actual_generation
+                || (generation == actual_generation && content != &actual_content)
+            {
+                return Err(DbError::TranscriptSnapshotChanged);
+            }
+            let opening = Self::read_continuation_opening_on(&mut tx, &successor).await?;
+            Ok(Some(if generation == actual_generation {
+                ContinuationOpeningUpdateRead::Current(opening)
+            } else {
+                ContinuationOpeningUpdateRead::Superseded {
+                    content: actual_content,
+                    transcript_generation: actual_generation,
+                    display_data: message.display_data,
+                    opening,
+                }
+            }))
+        }
+        .await;
+        tx.rollback().await?;
+        result
+    }
+
+    /// Fences an opening read against the transcript selected for SSE init.
+    ///
+    /// # Errors
+    /// Concurrent append/mutation or invalid authority cannot produce a snapshot.
+    pub async fn read_continuation_opening_at_snapshot(
+        &self,
+        successor: &str,
+        generation: i64,
+        tail: Option<i64>,
+    ) -> DbResult<ContinuationOpeningRead> {
+        let mut tx = self.pool.begin().await?;
+        let result = async {
+            let actual: (i64, Option<i64>) = sqlx::query_as(
+                "SELECT transcript_generation,
+                        (SELECT MAX(sequence_id) FROM messages WHERE conversation_id = conversations.id)
+                 FROM conversations WHERE id = ?1",
+            ).bind(successor).fetch_one(&mut *tx).await?;
+            if actual != (generation, tail) {
+                return Err(DbError::TranscriptSnapshotChanged);
+            }
+            Self::read_continuation_opening_on(&mut tx, successor).await
+        }.await;
+        tx.rollback().await?;
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn read_continuation_opening_on(
+        connection: &mut SqliteConnection,
+        successor: &str,
+    ) -> DbResult<ContinuationOpeningRead> {
+        let pending = sqlx::query(
+            "SELECT parent_conversation_id, message_id, opening_authority
+             FROM continuation_dispatch_intents WHERE successor_conversation_id = ?1",
+        )
+        .bind(successor)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let completed = sqlx::query(
+            "SELECT predecessor_conversation_id, continuation_message_id,
+                    accepted_successor_message_id, opening_authority
+             FROM completed_continuation_handoffs WHERE successor_conversation_id = ?1",
+        )
+        .bind(successor)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let predecessor: String = if let Some(row) = &completed {
+            row.try_get("predecessor_conversation_id")?
+        } else if let Some(row) = &pending {
+            row.try_get("parent_conversation_id")?
+        } else {
+            return Ok(ContinuationOpeningRead::None);
+        };
+        let product_id: Option<String> = sqlx::query_scalar(
+            "SELECT child.product_conversation_id FROM conversations child
+             JOIN conversations parent ON parent.id = ?1
+             WHERE child.id = ?2 AND parent.continued_in_conv_id = child.id
+               AND child.product_conversation_id = parent.product_conversation_id",
+        )
+        .bind(&predecessor)
+        .bind(successor)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let product_conversation_id = product_id.ok_or_else(|| {
+            DbError::Serialization(
+                "opening receipt/intent has invalid continuation topology".into(),
+            )
+        })?;
+        let product_conversation_id = ProductConversationId::parse(&product_conversation_id)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let authority = |row: &sqlx::sqlite::SqliteRow| -> DbResult<ContinuationOpeningAuthority> {
+            ContinuationOpeningAuthority::from_db_str(
+                &row.try_get::<String, _>("opening_authority")?,
+            )
+            .ok_or_else(|| DbError::Serialization("unknown opening authority".into()))
+        };
+        if let Some(receipt) = completed {
+            let continuation_message_id: String = receipt.try_get("continuation_message_id")?;
+            let accepted_message_id: String = receipt.try_get("accepted_successor_message_id")?;
+            let opening_authority = authority(&receipt)?;
+            if let Some(intent) = pending {
+                let key: String = intent.try_get("message_id")?;
+                if intent.try_get::<String, _>("parent_conversation_id")? != predecessor
+                    || authority(&intent)? != opening_authority
+                    || (accepted_message_id != key
+                        && accepted_message_id != format!("{successor}:{key}"))
+                {
+                    return Err(DbError::Serialization(
+                        "opening intent conflicts with completed receipt".into(),
+                    ));
+                }
+            }
+            let handoff =
+                Self::continuation_handoff_on(connection, &predecessor, successor).await?;
+            let Some(ProductConversationHandoff::Completed {
+                accepted_is_duplicate_summary,
+                ..
+            }) = handoff
+            else {
+                return Err(DbError::Serialization(
+                    "completed opening lacks exact persisted messages".into(),
+                ));
+            };
+            return Ok(ContinuationOpeningRead::Accepted {
+                edge: ContinuationOpeningEdge {
+                    product_conversation_id,
+                    predecessor_transcript_row_id: predecessor,
+                    successor_transcript_row_id: successor.into(),
+                    continuation_message_id,
+                },
+                accepted_message_id,
+                opening_authority,
+                presentation: if accepted_is_duplicate_summary {
+                    ContinuationOpeningPresentation::Boundary
+                } else {
+                    ContinuationOpeningPresentation::SeparateMessage
+                },
+            });
+        }
+        let intent = pending.expect("pending or completed selected predecessor");
+        let key: String = intent.try_get("message_id")?;
+        let client_turn_key = phoenix_workflow::ClientTurnKey::try_from(key)
+            .map_err(|error| DbError::Serialization(error.into()))?;
+        let continuation_message_id: String = sqlx::query_scalar(
+            "SELECT message_id FROM messages WHERE conversation_id = ?1 AND message_type = 'continuation'
+             ORDER BY sequence_id DESC, message_id DESC LIMIT 1",
+        ).bind(&predecessor).fetch_optional(&mut *connection).await?
+            .ok_or_else(|| DbError::Serialization("pending opening lacks persisted boundary".into()))?;
+        Ok(ContinuationOpeningRead::Pending {
+            edge: ContinuationOpeningEdge {
+                product_conversation_id,
+                predecessor_transcript_row_id: predecessor,
+                successor_transcript_row_id: successor.into(),
+                continuation_message_id,
+            },
+            client_turn_key,
+            opening_authority: authority(&intent)?,
+        })
+    }
+
     async fn continuation_handoff_on(
         connection: &mut SqliteConnection,
         predecessor: &str,
@@ -1104,8 +1498,10 @@ impl Database {
              FROM completed_continuation_handoffs handoff
              JOIN messages continuation
                ON continuation.message_id = handoff.continuation_message_id
+              AND continuation.conversation_id = handoff.predecessor_conversation_id
              JOIN messages accepted
                ON accepted.message_id = handoff.accepted_successor_message_id
+              AND accepted.conversation_id = handoff.successor_conversation_id
              WHERE handoff.predecessor_conversation_id = ?1
                AND handoff.successor_conversation_id = ?2",
         )
@@ -1117,26 +1513,29 @@ impl Database {
             let summary = continuation_summary(&row, "continuation_content")?;
             let accepted_content =
                 message_content_from_row(&row, "accepted_message_type", "accepted_content")?;
-            let accepted_is_duplicate_summary = match accepted_content {
-                MessageContent::User(user) => user.text == summary,
-                MessageContent::Continuation(continuation) => continuation.summary == summary,
-                MessageContent::Agent(_)
-                | MessageContent::Tool(_)
-                | MessageContent::System(_)
-                | MessageContent::Error(_)
-                | MessageContent::Skill(_) => false,
-            };
+            let opening_authority = ContinuationOpeningAuthority::from_db_str(
+                &row.try_get::<String, _>("opening_authority")?,
+            )
+            .ok_or_else(|| {
+                DbError::Serialization("unknown continuation opening authority".to_string())
+            })?;
+            let accepted_is_duplicate_summary = opening_authority
+                == ContinuationOpeningAuthority::GeneratedPredecessorContext
+                && match accepted_content {
+                    MessageContent::User(user) => user.text == summary,
+                    MessageContent::Continuation(continuation) => continuation.summary == summary,
+                    MessageContent::Agent(_)
+                    | MessageContent::Tool(_)
+                    | MessageContent::System(_)
+                    | MessageContent::Error(_)
+                    | MessageContent::Skill(_) => false,
+                };
             return Ok(Some(ProductConversationHandoff::Completed {
                 predecessor_transcript_row_id: predecessor.to_string(),
                 successor_transcript_row_id: successor.to_string(),
                 continuation_message_id: row.try_get("continuation_message_id")?,
                 accepted_successor_message_id: row.try_get("accepted_successor_message_id")?,
-                opening_authority: ContinuationOpeningAuthority::from_db_str(
-                    &row.try_get::<String, _>("opening_authority")?,
-                )
-                .ok_or_else(|| {
-                    DbError::Serialization("unknown continuation opening authority".to_string())
-                })?,
+                opening_authority,
                 summary,
                 accepted_is_duplicate_summary,
             }));
@@ -1455,7 +1854,13 @@ mod tests {
         let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
         // This isolated SQL fixture permits sequence ties without weakening the production schema.
         sqlx::raw_sql(
-            "CREATE TABLE conversations (
+            "CREATE TABLE product_conversations (
+                id TEXT PRIMARY KEY NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator'))
+             );
+             INSERT INTO product_conversations VALUES
+                ('product', 'ordinary'), ('empty-product', 'ordinary'), ('other-product', 'ordinary');
+             CREATE TABLE conversations (
                 id TEXT PRIMARY KEY, product_conversation_id TEXT NOT NULL,
                 runtime_role TEXT NOT NULL, parent_conversation_id TEXT, continued_in_conv_id TEXT
              );
@@ -1546,32 +1951,41 @@ mod tests {
             Some(serde_json::to_string(&partial_ceilings).unwrap()),
             Some(serde_json::to_string(&null_tail_ceiling).unwrap()),
         ];
-        for product in ["product", "empty-product", "missing-product"] {
-            for cursor in &cursors {
-                for ceiling in &ceilings {
-                    for limit in [0, 1, 2, 5, 51] {
-                        let expected = full_message_page_rows(
-                            &mut connection,
-                            ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
-                            product,
-                            cursor.as_ref(),
-                            ceiling.as_deref(),
-                            limit,
-                        )
-                        .await;
-                        let actual = full_message_page_rows(
-                            &mut connection,
-                            PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
-                            product,
-                            cursor.as_ref(),
-                            ceiling.as_deref(),
-                            limit,
-                        )
-                        .await;
-                        assert_eq!(
-                            actual, expected,
-                            "product={product} cursor={cursor:?} ceiling={ceiling:?} limit={limit}"
-                        );
+        for (kind, role) in [("ordinary", "user"), ("coordinator", "coordinator")] {
+            sqlx::query("UPDATE product_conversations SET kind = ?1")
+                .bind(kind)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE conversations SET runtime_role = ?1 WHERE runtime_role IN ('user', 'coordinator')")
+                .bind(role).execute(&mut connection).await.unwrap();
+            for product in ["product", "empty-product", "missing-product"] {
+                for cursor in &cursors {
+                    for ceiling in &ceilings {
+                        for limit in [0, 1, 2, 5, 51] {
+                            let expected = full_message_page_rows(
+                                &mut connection,
+                                ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                                product,
+                                cursor.as_ref(),
+                                ceiling.as_deref(),
+                                limit,
+                            )
+                            .await;
+                            let actual = full_message_page_rows(
+                                &mut connection,
+                                PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                                product,
+                                cursor.as_ref(),
+                                ceiling.as_deref(),
+                                limit,
+                            )
+                            .await;
+                            assert_eq!(
+                                actual, expected,
+                                "kind={kind} product={product} cursor={cursor:?} ceiling={ceiling:?} limit={limit}"
+                            );
+                        }
                     }
                 }
             }
@@ -2128,6 +2542,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_page_materializes_bound_snapshot_ceiling_once_with_result_parity() {
+        let (db, root) = bound_ceiling_fixture().await;
+        let mut connection = db.pool.acquire().await.unwrap();
+        let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        eprintln!("bound_snapshot_ceiling_sqlite_version={sqlite_version}");
+        let all = full_message_page_rows(
+            &mut connection,
+            PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+            root.product_conversation_id.as_str(),
+            None,
+            None,
+            100,
+        )
+        .await;
+        let ceilings: Vec<_> = all
+            .iter()
+            .filter(|row| row["message_id"].as_str().unwrap().ends_with("-2"))
+            .map(|row| ProductConversationSegmentCeiling {
+                transcript_row_id: row["conversation_id"].as_str().unwrap().to_owned(),
+                tail_sequence_id: 2,
+                tail_message_id: Some(row["message_id"].as_str().unwrap().to_owned()),
+            })
+            .collect();
+        assert_eq!(ceilings.len(), 3);
+        assert_eq!(all.len(), 12);
+        let ceiling = serde_json::to_string(&ceilings).unwrap();
+        let previous = PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL.replacen(
+            "snapshot_ceiling AS MATERIALIZED (",
+            "snapshot_ceiling AS (",
+            1,
+        );
+        assert_ne!(previous, PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL);
+        for boundary in [None, Some(ceiling.as_str()), Some("[]")] {
+            let mut cursor = None;
+            let mut pages = 0;
+            let mut rows = 0;
+            loop {
+                let actual = full_message_page_rows(
+                    &mut connection,
+                    PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+                    root.product_conversation_id.as_str(),
+                    cursor.as_ref(),
+                    boundary,
+                    2,
+                )
+                .await;
+                let expected = full_message_page_rows(
+                    &mut connection,
+                    &previous,
+                    root.product_conversation_id.as_str(),
+                    cursor.as_ref(),
+                    boundary,
+                    2,
+                )
+                .await;
+                assert_eq!(actual, expected);
+                rows += actual.len();
+                let Some(last) = actual.last() else {
+                    break;
+                };
+                cursor = Some((
+                    last["ordinal"].as_i64().unwrap(),
+                    last["sequence_id"].as_i64().unwrap(),
+                    last["message_id"].as_str().unwrap().to_owned(),
+                ));
+                pages += 1;
+                assert!(pages <= all.len(), "cursor must advance to exhaustion");
+            }
+            assert_eq!(
+                rows,
+                match boundary {
+                    None => all.len(),
+                    Some("[]") => 0,
+                    Some(_) => 6,
+                }
+            );
+        }
+        assert_materialized_ceiling_plan(
+            &mut connection,
+            root.product_conversation_id.as_str(),
+            &ceiling,
+        )
+        .await;
+    }
+
+    async fn bound_ceiling_fixture() -> (Database, crate::Conversation) {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("ceiling-plan", "ceiling-plan", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut member = root.clone();
+        let content = serde_json::to_string(&MessageContent::user("ceiling fixture")).unwrap();
+        for ordinal in 0..3 {
+            if ordinal > 0 {
+                db.update_conversation_state(
+                    &member.id,
+                    &ConvState::ContextExhausted {
+                        summary: "ceiling fixture continuation".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                member = match db.continue_conversation(&member.id).await.unwrap() {
+                    ContinueOutcome::Created(successor) => successor,
+                    other @ (ContinueOutcome::AlreadyContinued(_)
+                    | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                        panic!("expected ceiling fixture continuation, got {other:?}")
+                    }
+                };
+            }
+            for sequence in 1..=4_i64 {
+                sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES (?1, ?2, ?3, 'user', ?4, '2026-01-01T00:00:00Z')")
+                    .bind(format!("perf-{ordinal}-{sequence}"))
+                    .bind(&member.id).bind(sequence).bind(&content)
+                    .execute(db.pool()).await.unwrap();
+            }
+        }
+        (db, root)
+    }
+
+    async fn assert_materialized_ceiling_plan(
+        connection: &mut SqliteConnection,
+        product_id: &str,
+        ceiling: &str,
+    ) {
+        let explain = format!("EXPLAIN QUERY PLAN {PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL}");
+        let plan = sqlx::query(sqlx::AssertSqlSafe(explain.as_str()))
+            .bind(product_id)
+            .bind(ceiling)
+            .bind(2_i64)
+            .bind(2_i64)
+            .bind("perf-2-3")
+            .bind(2_i64)
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap();
+        let details: Vec<String> = plan
+            .iter()
+            .map(|row| row.try_get("detail").unwrap())
+            .collect();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("MATERIALIZE snapshot_ceiling"))
+                .count(),
+            1,
+            "{details:?}"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("json_each VIRTUAL TABLE"))
+                .count(),
+            1,
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("MATERIALIZE selected")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("messages_conversation_sequence")),
+            "{details:?}"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "diagnostic scale fixture; run explicitly and retain raw samples"]
     async fn product_conversation_snapshot_scale_diagnostic() {
         let (db, root) = performance_fixture(23, 1_020).await;
@@ -2138,9 +2727,331 @@ mod tests {
         eprintln!("product_conversation_snapshot_stage_micros={samples:?}");
     }
 
+    async fn opening_fixture(
+        generated: bool,
+    ) -> (Database, crate::Conversation, crate::Conversation) {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("opening-root", "opening-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "opening-boundary",
+            &root.id,
+            &MessageContent::Continuation(ContinuationContent {
+                summary: "exact opening context".into(),
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "exact opening context".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let key = ClientTurnKey::try_from("reserved:key").unwrap();
+        let intent = if generated {
+            NewContinuationDispatchIntent::generated_predecessor_context(
+                key,
+                "exact opening context".into(),
+            )
+        } else {
+            NewContinuationDispatchIntent::user_authorized(
+                key,
+                "exact opening context".into(),
+                None,
+            )
+        };
+        let (outcome, _) = db
+            .continue_conversation_with_intent(&root.id, intent)
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected created successor")
+        };
+        (db, root, successor)
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn resolves_member_identity_and_reads_typed_handoff() {
+    async fn opening_read_pending_to_accepted_authority_and_identity_matrix() {
+        for generated in [false, true] {
+            for canonical in [false, true] {
+                let (db, root, successor) = opening_fixture(generated).await;
+                assert_eq!(
+                    db.read_continuation_opening(&root.id).await.unwrap(),
+                    ContinuationOpeningRead::None
+                );
+                let pending = db.read_continuation_opening(&successor.id).await.unwrap();
+                assert!(
+                    matches!(&pending, ContinuationOpeningRead::Pending { edge, client_turn_key, .. }
+                    if client_turn_key.as_str() == "reserved:key" && edge.continuation_message_id == "opening-boundary"
+                    && edge.predecessor_transcript_row_id == root.id && edge.successor_transcript_row_id == successor.id)
+                );
+                let content = if generated {
+                    MessageContent::Continuation(ContinuationContent {
+                        summary: "exact opening context".into(),
+                    })
+                } else {
+                    MessageContent::user("exact opening context")
+                };
+                db.add_message("wrong-id", &successor.id, &content, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    db.read_message_continuation_opening("wrong-id")
+                        .await
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    db.read_continuation_opening(&successor.id).await.unwrap(),
+                    pending
+                );
+                let id = if canonical {
+                    format!("{}:reserved:key", successor.id)
+                } else {
+                    "reserved:key".into()
+                };
+                db.add_message(&id, &successor.id, &content, None, None)
+                    .await
+                    .unwrap();
+                let accepted = db.read_continuation_opening(&successor.id).await.unwrap();
+                assert!(
+                    matches!(&accepted, ContinuationOpeningRead::Accepted { accepted_message_id, presentation, .. }
+                    if accepted_message_id == &id && *presentation == if generated { ContinuationOpeningPresentation::Boundary } else { ContinuationOpeningPresentation::SeparateMessage })
+                );
+                assert_eq!(
+                    db.read_message_continuation_opening(&id).await.unwrap(),
+                    Some(accepted.clone())
+                );
+                let snapshot = db
+                    .read_ordinary_product_conversation_snapshot(&root.id, None, None, 10)
+                    .await
+                    .unwrap();
+                assert_eq!(snapshot.latest_opening, accepted);
+                sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = ?2")
+                    .bind(
+                        serde_json::to_string(
+                            &if generated {
+                                MessageContent::Continuation(ContinuationContent {
+                                    summary: "edited".into(),
+                                })
+                            } else {
+                                MessageContent::user("edited")
+                            }
+                            .to_stored_json(),
+                        )
+                        .unwrap(),
+                    )
+                    .bind(&id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    db.read_continuation_opening(&successor.id).await.unwrap(),
+                    ContinuationOpeningRead::Accepted {
+                        presentation: ContinuationOpeningPresentation::SeparateMessage,
+                        ..
+                    }
+                ));
+                // An older pending value is retained by value; it cannot change the durable receipt.
+                assert!(pending.is_pending());
+                assert!(!db
+                    .read_continuation_opening(&successor.id)
+                    .await
+                    .unwrap()
+                    .is_pending());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_update_reconciles_superseded_edits_and_rejects_wrong_current_generation() {
+        let (db, _, successor) = opening_fixture(true).await;
+        let restored = MessageContent::Continuation(ContinuationContent {
+            summary: "exact opening context".into(),
+        });
+        db.add_message("reserved:key", &successor.id, &restored, None, None)
+            .await
+            .unwrap();
+        let edited = MessageContent::Continuation(ContinuationContent {
+            summary: "edit A".into(),
+        });
+        for (generation, content) in [(1, &edited), (2, &restored)] {
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = 'reserved:key'")
+                .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE conversations SET transcript_generation = ?1 WHERE id = ?2")
+                .bind(generation)
+                .bind(&successor.id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        for (generation, content) in [
+            (Some(2), &edited),
+            (Some(3), &restored),
+            (Some(-1), &restored),
+            (None, &restored),
+        ] {
+            assert!(matches!(
+                db.read_message_continuation_opening_at_update("reserved:key", generation, content)
+                    .await,
+                Err(DbError::TranscriptSnapshotChanged)
+            ));
+        }
+        assert!(matches!(
+            db.read_message_continuation_opening_at_update("reserved:key", Some(2), &restored)
+                .await
+                .unwrap(),
+            Some(ContinuationOpeningUpdateRead::Current(
+                ContinuationOpeningRead::Accepted {
+                    presentation: ContinuationOpeningPresentation::Boundary,
+                    ..
+                }
+            ))
+        ));
+        for content in [&edited, &restored] {
+            assert!(matches!(
+                db.read_message_continuation_opening_at_update("reserved:key", Some(1), content).await.unwrap(),
+                Some(ContinuationOpeningUpdateRead::Superseded {
+                    content,
+                    transcript_generation: 2,
+                    opening: ContinuationOpeningRead::Accepted {
+                        presentation: ContinuationOpeningPresentation::Boundary, ..
+                    }, ..
+                }) if content == restored
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_read_rollback_and_conflicting_stale_intent_are_not_acceptance() {
+        let (db, root, successor) = opening_fixture(true).await;
+        let pending = db.read_continuation_opening(&successor.id).await.unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("INSERT INTO messages(message_id, conversation_id, sequence_id, message_type, content, created_at)
+                     VALUES (?1, ?2, 1, 'continuation', ?3, '2026-01-01T00:00:00Z')")
+            .bind("reserved:key").bind(&successor.id).bind(r#"{"summary":"exact opening context"}"#)
+            .execute(&mut *tx).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM completed_continuation_handoffs")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            db.read_continuation_opening(&successor.id).await.unwrap(),
+            pending
+        );
+        assert_eq!(
+            db.read_message_continuation_opening("reserved:key")
+                .await
+                .unwrap(),
+            None
+        );
+        db.add_message(
+            "reserved:key",
+            &successor.id,
+            &MessageContent::Continuation(ContinuationContent {
+                summary: "exact opening context".into(),
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO continuation_dispatch_intents(parent_conversation_id, successor_conversation_id, message_id, handoff, opening_authority, created_at)
+                     VALUES (?1, ?2, 'conflicting-key', 'exact opening context', 'generated_predecessor_context', '2026-01-01T00:00:00Z')")
+            .bind(&root.id).bind(&successor.id).execute(db.pool()).await.unwrap();
+        assert!(db.read_continuation_opening(&successor.id).await.is_err());
+        assert!(db
+            .read_message_continuation_opening("reserved:key")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn opening_snapshot_rejects_old_transcript_tail_and_wrong_edge() {
+        let (db, root, successor) = opening_fixture(true).await;
+        let (generation, tail): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT transcript_generation,
+                    (SELECT MAX(sequence_id) FROM messages WHERE conversation_id = conversations.id)
+             FROM conversations WHERE id = ?1",
+        )
+        .bind(&successor.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .read_continuation_opening_at_snapshot(&successor.id, generation, tail)
+            .await
+            .unwrap()
+            .is_pending());
+        db.add_message(
+            "other",
+            &successor.id,
+            &MessageContent::user("different message"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (current_generation, current_tail): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT transcript_generation,
+                    (SELECT MAX(sequence_id) FROM messages WHERE conversation_id = conversations.id)
+             FROM conversations WHERE id = ?1",
+        )
+        .bind(&successor.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(current_generation, generation);
+        assert_ne!(current_tail, tail);
+        assert!(matches!(
+            db.read_continuation_opening_at_snapshot(&successor.id, generation, tail)
+                .await,
+            Err(DbError::TranscriptSnapshotChanged)
+        ));
+        assert!(db
+            .read_continuation_opening_at_snapshot(&successor.id, current_generation, current_tail)
+            .await
+            .unwrap()
+            .is_pending());
+        let invalid_edge =
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = NULL WHERE id = ?1")
+                .bind(&root.id)
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        let sqlx::Error::Database(constraint) = invalid_edge else {
+            panic!("expected continuation edge constraint rejection");
+        };
+        assert_eq!(constraint.code().as_deref(), Some("1811"));
+        assert_eq!(
+            constraint.message(),
+            "continuation must connect parent transcripts in one ProductConversation"
+        );
+        assert!(db
+            .read_continuation_opening_at_snapshot(&successor.id, current_generation, current_tail)
+            .await
+            .unwrap()
+            .is_pending());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn resolves_member_identity_and_preserves_equal_text_user_authorized_handoff() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
             .create_conversation("root", "root-slug", "/tmp", true, None, None)
@@ -2159,7 +3070,7 @@ mod tests {
                 &root.id,
                 NewContinuationDispatchIntent::user_authorized(
                     ClientTurnKey::try_from("opening").unwrap(),
-                    "accepted opening handoff".to_string(),
+                    "exact handoff".to_string(),
                     None,
                 ),
             )
@@ -2186,7 +3097,7 @@ mod tests {
         db.add_message(
             "opening",
             &successor.id,
-            &MessageContent::user("accepted opening handoff"),
+            &MessageContent::user("exact handoff"),
             None,
             None,
         )
@@ -2254,6 +3165,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    async fn populate_coordinator_history(
+        db: &Database,
+        root: &crate::Conversation,
+    ) -> (Vec<String>, crate::Conversation) {
+        let mut member = root.clone();
+        let mut expected = Vec::new();
+        for ordinal in 0..3 {
+            for index in 0..3 {
+                let id = format!("global-{ordinal}-{index}");
+                db.add_message(
+                    &id,
+                    &member.id,
+                    &MessageContent::user(id.clone()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                expected.push(id);
+            }
+            if ordinal < 2 {
+                let id = format!("global-boundary-{ordinal}");
+                db.add_message(
+                    &id,
+                    &member.id,
+                    &MessageContent::Continuation(ContinuationContent {
+                        summary: format!("summary {ordinal}"),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                expected.push(id);
+                db.update_conversation_state(
+                    &member.id,
+                    &ConvState::ContextExhausted {
+                        summary: format!("summary {ordinal}"),
+                    },
+                )
+                .await
+                .unwrap();
+                member = match db.continue_conversation(&member.id).await.unwrap() {
+                    ContinueOutcome::Created(next) => next,
+                    ContinueOutcome::AlreadyContinued(_) => {
+                        panic!("unexpected existing continuation")
+                    }
+                    ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                        panic!("unexpected parent state {state_variant}")
+                    }
+                };
+            }
+        }
+        (expected, member)
+    }
+
+    #[tokio::test]
+    async fn coordinator_history_pages_across_three_members_without_ordinary_lifecycle() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let (expected, member) = populate_coordinator_history(&db, &root).await;
+        let mut connection = db.pool.acquire().await.unwrap();
+        let optimized = full_message_page_rows(
+            &mut connection,
+            PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+            root.product_conversation_id.as_str(),
+            None,
+            None,
+            20,
+        )
+        .await;
+        let oracle = full_message_page_rows(
+            &mut connection,
+            ORIGINAL_PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL,
+            root.product_conversation_id.as_str(),
+            None,
+            None,
+            20,
+        )
+        .await;
+        assert!(!optimized.is_empty());
+        assert_eq!(optimized, oracle);
+        drop(connection);
+        let mut before = None;
+        let mut actual = Vec::new();
+        loop {
+            let page = db
+                .read_coordinator_product_conversation_snapshot(&root.id, before, None, 2)
+                .await
+                .unwrap();
+            assert!(matches!(
+                page.aggregate.product_conversation,
+                ProductConversation::Coordinator { .. }
+            ));
+            assert_eq!(page.aggregate.latest_transcript_row_id, member.id);
+            assert_eq!(page.aggregate.segments.len(), 3);
+            if page.messages.is_empty() {
+                break;
+            }
+            let (ordinal, last) = page.messages.last().unwrap();
+            before = Some((*ordinal, last.sequence_id, last.message_id.clone()));
+            actual.extend(
+                page.messages
+                    .into_iter()
+                    .map(|(_, message)| message.message_id),
+            );
+        }
+        actual.reverse();
+        assert_eq!(actual, expected);
+        assert!(db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, None, 2)
+            .await
+            .is_err());
+        let ordinary = db
+            .create_conversation("ordinary", "ordinary", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert!(db
+            .read_coordinator_product_conversation_snapshot(&ordinary.id, None, None, 2)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

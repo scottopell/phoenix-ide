@@ -10,6 +10,15 @@ mod protocol;
 
 #[cfg(unix)]
 fn main() {
+    if let Err(error) = phoenix_browser::process_group::enter_chrome_exec() {
+        eprintln!("Chrome exec failed: {error}");
+        std::process::exit(1);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Err(error) = phoenix_browser::process_group::ChromeExecShim::install() {
+        eprintln!("Chrome exec capability failed: {error}");
+        std::process::exit(1);
+    }
     if std::env::args().nth(1).as_deref() == Some("__daemon") {
         if let Err(error) = daemon::close_inherited_descriptors() {
             eprintln!("daemon descriptor cleanup failed: {error}");
