@@ -204,7 +204,7 @@ jobs:
         with:
           node-version: '26'
       - name: Compiler-free probe controls
-        run: node --test ui/scripts/context-close-probe.test.mjs
+        run: node --test ui/scripts/context-close-probe.selftest.mjs
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: ui/package.json
@@ -243,7 +243,7 @@ jobs:
         with:
           node-version: '26'
       - name: Compiler-free Stage 2 and joint UNIT ONLY controls
-        run: node --test ui/scripts/reporter-pagehide-probe.test.mjs ui/scripts/history-joint-telemetry.selftest.mjs
+        run: node --test ui/scripts/reporter-pagehide-probe.selftest.mjs ui/scripts/history-joint-telemetry.selftest.mjs
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: ui/package.json
@@ -792,8 +792,8 @@ jobs:
       - name: Offline lifecycle and stock-publication regressions (not runtime qualification)
         run: |
           node --test ui/scripts/lifecycle-close-drain.selftest.mjs
-          node --test ui/scripts/context-close-probe.test.mjs
-          node --test ui/scripts/reporter-pagehide-probe.test.mjs ui/scripts/history-joint-telemetry.selftest.mjs
+          node --test ui/scripts/context-close-probe.selftest.mjs
+          node --test ui/scripts/reporter-pagehide-probe.selftest.mjs ui/scripts/history-joint-telemetry.selftest.mjs
           python3 -B tests/e2e/history_stock_prepare.test.py
           python3 -B tests/e2e/history_runtime_publication.test.py
           python3 -B tests/e2e/history_controlled_artifact.test.py

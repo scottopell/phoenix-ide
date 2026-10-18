@@ -398,7 +398,7 @@ test('source guard: hosted probe requires exact owned same-repo PR + label, no o
   assert.match(job, /pnpm install --frozen-lockfile --ignore-scripts/);
   assert.match(job, /pnpm exec playwright install --with-deps chromium/);
   assert.match(job, /timeout --signal=TERM --kill-after=5s 65s node ui\/scripts\/context-close-probe.cli.mjs/);
-  assert.match(job, /run: node --test ui\/scripts\/context-close-probe.test.mjs/);
+  assert.match(job, /run: node --test ui\/scripts\/context-close-probe.selftest.mjs/);
   assert.doesNotMatch(job, /cargo|dev.py|history_opening|continue-on-error|workflow_dispatch|pull_request_target/);
   const paths = job.split('          path: |\n')[1].trim().split('\n').map(s => s.trim());
   assert.deepEqual(paths, ['context-close-evidence/result.json', 'docs/qa/context-close-probe.schema.json', 'docs/qa/context-close-probe.md']);

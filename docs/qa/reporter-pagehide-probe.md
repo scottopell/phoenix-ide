@@ -1,8 +1,9 @@
 # PREPARE Stage 2: actual reporter/lifecycle pagehide functional probe
 
 Prepared from `404651fbc` (Stage 1 observations retained) and its cleanup-only
-predecessor `0b4bc78ae`. **No Stage 2 hosted result is claimed.** Parent review is
-required before one hosted execution, after the current CI invocation terminates.
+predecessor `0b4bc78ae`, with review corrections to `a293a794c`.
+**No Stage 2 hosted result is claimed.** Parent exact-head review is required
+before any push or hosted execution; the parent reports that prior CI terminated.
 This worker neither sets labels nor pushes/runs CI. Roadmap/network context was
 not queried under the explicit no-network preparation boundary.
 
@@ -46,10 +47,16 @@ The actual reporter serializes and sends its real fetch with `keepalive: true`
 and its real three-second `AbortController` behavior. This does not establish
 that its abort timer runs after the old document is destroyed.
 
-Each hosted control passes the **actual Chromium Browser** to the unchanged
+Each hosted control delegates context creation to the **actual Chromium Browser**
+through an observation-only wrapper, then calls the unchanged
 `runPendingPagehideCheck`, with **attempts: 1** and a 20-second absolute case
-budget. Its existing diagnostic binding, admission/request attribution,
-cross-document navigation, bounded observation and context drain are retained.
+budget. The wrapper attaches exact-Request terminal-event observers; it does not
+synthesize browser actions/events or replace the actual contexts/pages. The pinned
+qualifier's diagnostic binding, admission/request attribution, bounded observation
+and context drain are retained. Its cross-document `about:blank` navigation runs
+only for the **three sampled pagehide controls**. The unsampled branch bypasses
+that navigation and is **one `ADMISSION_ONLY` negative**, not pagehide coverage.
+No additional driver navigation or fake pagehide event is added.
 The 120-second process envelope is a kill fence, not an expanded qualifier
 cohort/deadline or benchmark. There are exactly four controls, each owning a
 separate browser and loopback synthetic collector:
@@ -59,7 +66,7 @@ separate browser and loopback synthetic collector:
 | `normal204` | Receive full actual telemetry POST body, then attempt 204 immediately |
 | `deferred204` | Await **both** that actual POST body and the entry's explicit real pagehide-trigger POST, then attempt 204; no blind sleep |
 | `never204` | Receive body but never end the telemetry response; socket teardown is cleanup only |
-| `unsampled` | Existing reporter admission chooses unsampled; no telemetry report/POST allowed |
+| `unsampled` (`ADMISSION_ONLY`) | Existing reporter admission chooses unsampled; no telemetry report/POST allowed; no qualifier pagehide navigation |
 
 The synthetic collector is an **owned delivery oracle**, not Phoenix's
 schema/auth/export acceptance. It receives only this synthetic bundle's traffic.
@@ -75,6 +82,11 @@ The safe JSON separates:
 - server 204 **attempt** versus server `finish` (neither proves client receipt);
 - page 204 versus context 204 joined by the qualifier to the original Request
   object (context telemetry ordinal zero); `client204` is their union;
+- four independent booleans: `pageRequestFailed`, `pageRequestFinished`,
+  `contextRequestFailed`, `contextRequestFinished`. Each joins by identity to the
+  exact first telemetry POST Request object, not a same-URL foreign request.
+  These events may coexist with client 204; `requestfailed` never proves
+  non-delivery and is not used to negate `deliveryConfirmed`;
 - `deliveryConfirmed`: matched body + attempted/finished server 204 + observed
   page/context client 204. This is synthetic transport delivery, **not** Phoenix
   collector/export acceptance;
@@ -86,17 +98,21 @@ The safe JSON separates:
 
 **`never204` may legitimately return qualifier-provisional with zero page
 statuses.** That is not a qualifier negative. Its independent delivery flag must
-remain false. Normal/deferred functional controls require matched body and
-attempted/finished server 204, but missing browser receipt stays explicitly
-`deliveryConfirmed: false`; a green functional job does not assert every delivery
-succeeded. Unsampled requires no report/body/response. All controls require the
+remain false. Normal/deferred positive functional controls require
+**`deliveryConfirmed: true`**, including matched body, attempted/finished server
+204 **and observed page/context client 204**. Zero client statuses cannot qualify
+those positives even when the server finished. Raw capture, body and server-finish
+observations remain separately visible on failed positives. Unsampled requires
+no report/body/response; it is an admission negative only. All three sampled cases
+require the real pagehide-trigger receipt. All four controls require the
 qualifier's context closure and no primary/cleanup error. No stock module is
 changed to tighten its zero-status rule.
 
 The surfaced qualifier primary is projected using the existing independently
 hashed trusted assertion-site map. Unknown Playwright/nonassertion errors stay
 unknown; raw messages/stacks/URLs are not published. Stage 2-owned errors use only
-two fixed causes (`collector_contract`, `observation_timeout`) and a fixed module
+fixed causes (`collector_contract`, `observation_timeout`, `setup_failure`,
+`suite_failure`) and a fixed module
 name/current source hash, **not** an invented assertion stack location. Primary
 projection happens before outer browser/collector cleanup; cleanup diagnostics
 are separate. If the immutable qualifier promotes a cleanup-only error, the
@@ -106,8 +122,26 @@ as `ambiguousQualifierFailure`, primary remains null, and independently known
 cleanup failure is recorded separately with unknown cause. Identical-message
 primary/cleanup collisions therefore cannot erase the surfaced diagnostic or
 claim a known cleanup-only role. Discarded internal Error objects cannot be
-reconstructed. Setup failures before
-the first browser case can exit without a receipt and are not functional passes.
+reconstructed.
+
+Setup, browser launch, collector acquisition/listen and final pin checking are
+bounded. All acquired browsers/collectors are guarded by `try/finally`; a collector
+setup failure still closes its already-owned browser. A browser/collector promise
+arriving after its acquisition deadline is disposed by its retained ownership
+handler. Collector listen itself has a five-second deadline and closes both on
+failure and on a late listen callback. CLI exit sets `exitCode` rather than
+terminating before late cleanup can settle; the existing hosted process kill
+fence remains in force. Cleanup attempts are bounded, not guarantees against an
+unresponsive process or resources arriving after the process is killed.
+
+The CLI suite's `finally` publishes the allowlisted receipt even after early setup
+failure, later launch/listen failure, or final pin failure. Completed cases are
+retained. Fixed setup/suite phase and cause fields contain no raw errors. Receipts
+have `status: complete|partial`, suite `primary`/`cleanup`, and case diagnostics.
+Missing or invalid provenance produces `provenance: null` in an explicitly partial
+failure receipt, never invented full provenance. Such setup/suite failures cannot
+qualify. Late resources are still closed after receipt publication; a timeout
+receipt does not claim that later cleanup succeeded.
 
 `safeJSON` is the executable allowlist: exact keys, fixed enums/booleans, bounded
 counts and approved version/hash fields only. Receipt provenance binds Node,
@@ -167,8 +201,9 @@ parent review and the single authorized hosted execution.
 
 ### Validation actually run in preparation
 
-On Node `v26.8.2`, **163/163** compiler-free Node controls pass: 23 Stage 2,
-82 joint UNIT ONLY, 41 Stage 1, and 17 lifecycle-close-drain controls. The five
+Original preparation on Node `v26.8.2`: **163/163** compiler-free Node controls
+passed (23 Stage 2, 82 joint UNIT ONLY, 41 Stage 1, and 17 lifecycle-close-drain).
+Review correction validation is recorded below. The five
 added joint controls exercise the existing fixtures/actual validator and returned
 finalization closure; they do not add hosted integration credit.
 
@@ -191,3 +226,22 @@ passed. The first Ruby shell-check helper required adjustment for this host's ol
 Ruby (`filter_map` unavailable); the corrected helper passed all 42 blocks.
 No local build/browser/listener/network/install/runtime/SQL or hosted execution
 was performed. These are preparation checks, not a Stage 2 runtime result.
+
+### Review correction validation actually run
+
+On Node `v26.8.2`, **183/183** compiler-free Node controls pass: **43 Stage 2**
+(the original 23 plus 20 review regressions), 82 joint UNIT ONLY, 41 Stage 1,
+and 17 lifecycle-close-drain. New controls use fake resource objects only:
+missing positive client 204, exact-Request terminal booleans (including failure
+alongside 204), three sampled pagehide controls plus the admission-only negative,
+later setup/pin failures retaining cases, browser ownership when collector setup
+fails, bounded/late acquisition and fake-listen cleanup, safe missing-provenance
+fallback, cleanup-only failure and first-primary preservation.
+
+The three edited `.mjs` files pass `node --check`; Python static stock preparation
+**20/20** and artifact admission **8/8** pass. `git diff --check` passes. CI workflow,
+stock-skip predicates, opt-in labels, the synthetic entry, five app-source pins,
+four module pins, package/lock files, and Stage 1 evidence are unchanged from
+`a293a794c`. No build, actual probe/browser/listener, install, network, SQL,
+CI execution or push was performed. Exact-head parent review is still required;
+these UNIT ONLY checks confer no hosted pagehide or Phoenix qualification credit.

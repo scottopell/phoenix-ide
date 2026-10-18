@@ -159,10 +159,10 @@ retroactive attribution to the older terminal-delivery/cleanup failure.
 ## Compiler-free validation (local, no browser or server)
 
 ```sh
-node --test ui/scripts/context-close-probe.test.mjs
+node --test ui/scripts/context-close-probe.selftest.mjs
 node --check ui/scripts/context-close-probe.mjs
 node --check ui/scripts/context-close-probe.cli.mjs
-node --check ui/scripts/context-close-probe.test.mjs
+node --check ui/scripts/context-close-probe.selftest.mjs
 python3 -B tests/e2e/history_stock_prepare.test.py
 ```
 

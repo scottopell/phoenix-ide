@@ -26,8 +26,28 @@ export const sha256 = value => createHash('sha256').update(value).digest('hex');
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const ownBasename = 'reporter-pagehide-probe.mjs';
 const ownHash = sha256(readFileSync(new URL(import.meta.url)));
-const phases = ['qualifier', 'collector', 'context_cleanup', 'browser_cleanup', 'collector_cleanup'];
-const causes = ['unknown', 'ERR_ASSERTION', 'collector_contract', 'observation_timeout'];
+const phases = ['qualifier', 'collector', 'context_cleanup', 'browser_cleanup', 'collector_cleanup',
+  'setup_provenance', 'setup_bundle', 'browser_launch', 'collector_listen', 'suite', 'suite_pins'];
+const causes = ['unknown', 'ERR_ASSERTION', 'collector_contract', 'observation_timeout', 'setup_failure', 'suite_failure'];
+export const SCOPE = 'synthetic_actual_reporter_lifecycle_not_Phoenix_joint_acceptance';
+export const emptyResult = () => ({ version: 1, scope: SCOPE, status: 'partial', provenance: null, primary: null, cleanup: [], cases: [] });
+export const emptyTransport = () => ({ pageRequestFailed: false, pageRequestFinished: false,
+  contextRequestFailed: false, contextRequestFinished: false });
+
+// Only the exact first telemetry Request object owns these terminal observations.
+export function observeTransport(context, origin, facts) {
+  let owner;
+  const claim = request => {
+    if (!owner && request.method() === 'POST' && request.url() === `${origin}/api/telemetry/conversation-view`) owner = request;
+  };
+  const observe = (emitter, prefix) => {
+    emitter.on('request', claim);
+    emitter.on('requestfailed', request => { if (owner && request === owner) facts[`${prefix}RequestFailed`] = true; });
+    emitter.on('requestfinished', request => { if (owner && request === owner) facts[`${prefix}RequestFinished`] = true; });
+  };
+  observe(context, 'context');
+  context.on('page', page => observe(page, 'page'));
+}
 export class ProbeError extends Error {
   constructor(code) { super('reporter pagehide probe failure'); assert.ok(causes.slice(2).includes(code)); this.code = code; }
 }
@@ -41,8 +61,9 @@ const diagnosePinned = prepareJointFailureDiagnostic({ modulePath, dependencies:
 export function diagnostic(error, phase) {
   assert.ok(phases.includes(phase));
   const pinned = diagnosePinned(error, 'module_checks');
-  return { phase, cause: error instanceof ProbeError ? error.code : pinned.error_code,
-    location: error instanceof ProbeError ? { module_basename: ownBasename, module_sha256: ownHash, site: `stage2-${error.code}` }
+  const ownedCode = error instanceof ProbeError && causes.slice(2).includes(error.code) ? error.code : null;
+  return { phase, cause: ownedCode ?? pinned.error_code,
+    location: ownedCode ? { module_basename: ownBasename, module_sha256: ownHash, site: `stage2-${ownedCode}` }
       : pinned.resolution === 'verified_assertion_site' ? { module_basename: pinned.module_basename, module_sha256: pinned.module_sha256, site: pinned.assertion_site_id } : null };
 }
 function gate() {
@@ -54,6 +75,40 @@ async function bounded(promise, ms = 5000) {
   let timer;
   try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new ProbeError('observation_timeout')), ms); })]); }
   finally { clearTimeout(timer); }
+}
+
+// A timed-out acquisition retains ownership of a value that arrives later.
+export async function acquireOwned(start, dispose, ms, onLateCleanup = () => {}) {
+  let expired = false;
+  const pending = Promise.resolve().then(start).then(async value => {
+    if (expired) {
+      try { await bounded(Promise.resolve().then(() => dispose(value)), ms); }
+      catch (error) { onLateCleanup(error); }
+      throw new ProbeError('observation_timeout');
+    }
+    return value;
+  });
+  try { return await bounded(pending, ms); }
+  catch (error) { expired = true; throw error; }
+}
+
+export async function listenCollector(server, sockets, ms = 5000) {
+  const stop = () => {
+    for (const socket of sockets) socket.destroy();
+    return bounded(new Promise((done, reject) => server.close(error =>
+      error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : done())), ms);
+  };
+  try {
+    await acquireOwned(() => new Promise((done, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => done(server));
+    }), stop, ms);
+    return stop;
+  } catch (error) {
+    // close before listen completes, and acquireOwned closes again on a late callback.
+    try { await stop(); } catch { /* Preserve the listen failure. */ }
+    throw error;
+  }
 }
 
 // Owned synthetic collector, not Phoenix auth/schema/export/DB acceptance.
@@ -102,12 +157,11 @@ export async function startCollector(name, bundle) {
     res.writeHead(404); res.end();
   });
   server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
-  await new Promise((resolveListen, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolveListen); });
-  return { origin: `http://127.0.0.1:${server.address().port}`, facts, received: received.promise,
-    async stop() { for (const socket of sockets) socket.destroy(); await bounded(new Promise((done, reject) => server.close(error => error ? reject(error) : done()))); } };
+  const stop = await listenCollector(server, sockets);
+  return { origin: `http://127.0.0.1:${server.address().port}`, facts, received: received.promise, stop };
 }
 
-export function projectTrial(name, trial, facts, qualifierStatus = 'failed') {
+export function projectTrial(name, trial, facts, qualifierStatus = 'failed', transport = emptyTransport()) {
   const reports = trial?.reports ?? [], statuses = trial?.statuses ?? [];
   let bodyMatches = false;
   if (facts.body && reports.length === 1) {
@@ -116,17 +170,24 @@ export function projectTrial(name, trial, facts, qualifierStatus = 'failed') {
   const page204 = statuses.length === 1 && statuses[0] === 204;
   const context204 = (trial?.transport_facts ?? []).some(fact => fact.kind === 'context_response' && fact.status === 204 && fact.ordinal === 0);
   const client204 = page204 || context204;
-  return { name, qualifierStatus, trialStatus: trial?.status ?? 'failed', sampled: trial?.sampled ?? null,
+  return { name, controlScope: name === 'unsampled' ? 'ADMISSION_ONLY' : 'SAMPLED_PAGEHIDE',
+    ...transport, qualifierStatus, trialStatus: trial?.status ?? 'failed', sampled: trial?.sampled ?? null,
     reportCaptured: reports.length === 1, bodyReceived: facts.bodyReceived, bodyMatches,
     server204Attempted: facts.server204Attempted, serverFinished: facts.serverFinished,
     client204, page204, context204, pageStatusCount: statuses.length, pagehideTrigger: facts.trigger,
     deliveryConfirmed: bodyMatches && facts.server204Attempted && facts.serverFinished && client204,
     contextClosed: trial?.context_close_returned === true, primary: null, ambiguousQualifierFailure: null, cleanup: [] };
 }
-export async function runCase({ name, browser, collector }) {
+export async function runCase({ name, browser, collector, cleanupResources }) {
   let trial, stage, primary = null, ambiguousQualifierFailure = null;
+  const transport = emptyTransport();
+  const observedBrowser = { newContext: async options => {
+    const context = await browser.newContext(options);
+    observeTransport(context, collector.origin, transport);
+    return context;
+  } };
   try {
-    stage = await runPendingPagehideCheck({ browser, storageState: {}, baseURL: collector.origin, route: `/probe/${name}`,
+    stage = await runPendingPagehideCheck({ browser: observedBrowser, storageState: {}, baseURL: collector.origin, route: `/probe/${name}`,
       attempts: 1, budgetMs: 20000, onTrial: value => { trial = value; } });
   } catch (error) {
     // Frozen trial strings cannot distinguish identical primary/cleanup messages.
@@ -141,62 +202,131 @@ export async function runCase({ name, browser, collector }) {
   primary ??= collectorPrimary ? diagnostic(collectorPrimary, 'collector') : null;
   const cleanup = [];
   if (trial?.cleanup_failure) cleanup.push(diagnostic(null, 'context_cleanup'));
-  try { await bounded(browser.close()); } catch (error) { cleanup.push(diagnostic(error, 'browser_cleanup')); }
-  try { await collector.stop(); } catch (error) { cleanup.push(diagnostic(error, 'collector_cleanup')); }
-  const result = projectTrial(name, trial, collector.facts, stage?.status ?? 'failed');
+  await cleanupResources(cleanup);
+  const result = projectTrial(name, trial, collector.facts, stage?.status ?? 'failed', transport);
   result.primary = primary;
   result.ambiguousQualifierFailure = ambiguousQualifierFailure;
   if (!collectorPrimary && collector.facts.error) cleanup.push(diagnostic(collector.facts.error, 'collector_cleanup'));
   result.cleanup = cleanup;
   return result;
 }
+
+export async function runSuite({ prepare, checkPins, launch, collect = startCollector, execute = runCase,
+  publish, setupMs = 10000, result = emptyResult() }) {
+  let phase = 'setup_provenance';
+  const fixedFailure = error => diagnostic(error instanceof ProbeError ? error
+    : new ProbeError(phase.startsWith('setup_') || ['browser_launch', 'collector_listen'].includes(phase)
+      ? 'setup_failure' : 'suite_failure'), phase);
+  const cleanup = async (resource, dispose, cleanupPhase, target) => {
+    if (!resource) return;
+    try { await bounded(Promise.resolve().then(() => dispose(resource)), setupMs); }
+    catch (error) { target.push(diagnostic(error, cleanupPhase)); }
+  };
+  try {
+    const prepared = await bounded(Promise.resolve().then(() => prepare(value => { phase = value; })), setupMs);
+    result.provenance = prepared.provenance;
+    try { safeJSON(result); } catch (error) { result.provenance = null; phase = 'setup_provenance'; throw error; }
+    for (const name of CASES) {
+      let browser, collector, completed, disposed = false;
+      const cleanupResources = async target => {
+        if (disposed) return;
+        disposed = true;
+        await cleanup(browser, value => value.close(), 'browser_cleanup', target);
+        await cleanup(collector, value => value.stop(), 'collector_cleanup', target);
+      };
+      try {
+        phase = 'browser_launch';
+        browser = await acquireOwned(() => launch(prepared), value => value.close(), setupMs,
+          error => result.cleanup.push(diagnostic(error, 'browser_cleanup')));
+        result.provenance.chromiumVersion = browser.version();
+        phase = 'setup_provenance';
+        try { safeJSON(result); } catch (error) { result.provenance = null; throw error; }
+        phase = 'collector_listen';
+        collector = await acquireOwned(() => collect(name, prepared.bundle), value => value.stop(), setupMs,
+          error => result.cleanup.push(diagnostic(error, 'collector_cleanup')));
+        phase = 'suite';
+        completed = await execute({ name, browser, collector, cleanupResources });
+        result.cases.push(completed);
+      } catch (error) {
+        result.primary ??= fixedFailure(error);
+        break;
+      } finally {
+        await cleanupResources(completed?.cleanup ?? result.cleanup);
+      }
+    }
+    if (!result.primary) {
+      phase = 'suite_pins';
+      await bounded(Promise.resolve().then(checkPins), setupMs);
+      result.status = 'complete';
+    }
+  } catch (error) {
+    result.primary ??= fixedFailure(error);
+  } finally {
+    // No unvalidated partial provenance is published, even when setup never completed.
+    if (!result.provenance && !result.primary) result.primary = diagnostic(new ProbeError('setup_failure'), 'setup_provenance');
+    await publish(safeJSON(result));
+  }
+  return result;
+}
 export function functionalPass(result) {
-  return result.cases.length === 4 && CASES.every(name => result.cases.filter(c => c.name === name).length === 1)
+  return result.status === 'complete' && result.provenance !== null && !result.primary && !result.cleanup.length
+    && result.cases.length === 4 && CASES.every(name => result.cases.filter(c => c.name === name).length === 1)
     && result.cases.every(c => !c.primary && !c.ambiguousQualifierFailure && !c.cleanup.length && c.contextClosed && (c.name === 'unsampled'
-      ? c.sampled === false && c.trialStatus === 'unsampled' && c.qualifierStatus === 'inconclusive_sampling_budget' && !c.reportCaptured && !c.bodyReceived && !c.client204
-      : c.sampled === true && c.qualifierStatus === 'provisional_incomplete_collector_export_pending' && c.trialStatus === c.qualifierStatus
+      ? c.controlScope === 'ADMISSION_ONLY' && c.sampled === false && c.trialStatus === 'unsampled' && c.qualifierStatus === 'inconclusive_sampling_budget' && !c.reportCaptured && !c.bodyReceived && !c.client204
+      : c.controlScope === 'SAMPLED_PAGEHIDE' && c.sampled === true && c.qualifierStatus === 'provisional_incomplete_collector_export_pending' && c.trialStatus === c.qualifierStatus
         && c.reportCaptured && c.bodyMatches && c.pagehideTrigger && (c.name === 'never204'
           ? !c.deliveryConfirmed && !c.server204Attempted && !c.serverFinished && !c.client204
-          : c.server204Attempted && c.serverFinished)));
+          : c.deliveryConfirmed && c.client204 && c.server204Attempted && c.serverFinished)));
 }
 function keys(value, expected) { assert.deepEqual(Object.keys(value).sort(), expected.split(' ').sort()); }
 function hash(value) { assert.match(value, /^[a-f0-9]{64}$/); }
 export function safeJSON(result) {
-  keys(result, 'version scope provenance cases'); assert.equal(result.version, 1);
-  assert.equal(result.scope, 'synthetic_actual_reporter_lifecycle_not_Phoenix_joint_acceptance');
+  keys(result, 'version scope status provenance primary cleanup cases'); assert.equal(result.version, 1);
+  assert.equal(result.scope, SCOPE);
+  assert.ok(['partial', 'complete'].includes(result.status));
+  assert.ok(Array.isArray(result.cleanup) && result.cleanup.length <= 8);
+  if (result.status === 'complete') assert.equal(result.primary, null);
+  const diagnostics = [result.primary, ...result.cleanup];
   const p = result.provenance;
-  keys(p, 'node playwright chromiumRevision chromiumVersion sourceCommit appPin lockSha256 bundleSha256 sourceHashes moduleHashes');
-  assert.match(p.node, /^v26\.\d+\.\d+$/); assert.equal(p.playwright, '1.61.0');
-  assert.match(p.chromiumRevision, /^\d{1,8}$/);
-  if (p.chromiumVersion === null) assert.equal(result.cases.length, 0);
-  else assert.match(p.chromiumVersion, /^\d+(\.\d+){1,3}$/);
-  assert.match(p.sourceCommit, /^[a-f0-9]{40}$/); assert.equal(p.appPin, APP_PIN);
-  hash(p.lockSha256); hash(p.bundleSha256);
-  for (const [value, pins] of [[p.sourceHashes, SOURCE_PINS], [p.moduleHashes, MODULE_PINS]]) {
-    assert.deepEqual(value, pins);
+  if (p === null) {
+    assert.equal(result.status, 'partial'); assert.notEqual(result.primary, null);
+  } else {
+    keys(p, 'node playwright chromiumRevision chromiumVersion sourceCommit appPin lockSha256 bundleSha256 sourceHashes moduleHashes');
+    assert.match(p.node, /^v26\.\d+\.\d+$/); assert.equal(p.playwright, '1.61.0');
+    assert.match(p.chromiumRevision, /^\d{1,8}$/);
+    if (p.chromiumVersion === null) assert.equal(result.cases.length, 0);
+    else assert.match(p.chromiumVersion, /^\d+(\.\d+){1,3}$/);
+    assert.match(p.sourceCommit, /^[a-f0-9]{40}$/); assert.equal(p.appPin, APP_PIN);
+    hash(p.lockSha256); hash(p.bundleSha256);
+    for (const [value, pins] of [[p.sourceHashes, SOURCE_PINS], [p.moduleHashes, MODULE_PINS]]) {
+      assert.deepEqual(value, pins);
+    }
   }
   assert.ok(Array.isArray(result.cases) && result.cases.length <= 4);
   for (const c of result.cases) {
-    keys(c, 'name qualifierStatus trialStatus sampled reportCaptured bodyReceived bodyMatches server204Attempted serverFinished client204 page204 context204 pageStatusCount pagehideTrigger deliveryConfirmed contextClosed primary ambiguousQualifierFailure cleanup');
+    keys(c, 'name controlScope pageRequestFailed pageRequestFinished contextRequestFailed contextRequestFinished qualifierStatus trialStatus sampled reportCaptured bodyReceived bodyMatches server204Attempted serverFinished client204 page204 context204 pageStatusCount pagehideTrigger deliveryConfirmed contextClosed primary ambiguousQualifierFailure cleanup');
     assert.ok(CASES.includes(c.name));
+    assert.equal(c.controlScope, c.name === 'unsampled' ? 'ADMISSION_ONLY' : 'SAMPLED_PAGEHIDE');
+    for (const value of Object.keys(emptyTransport())) assert.equal(typeof c[value], 'boolean');
     assert.ok(['failed', 'inconclusive_sampling_budget', 'provisional_incomplete_collector_export_pending'].includes(c.qualifierStatus));
     assert.ok(['failed', 'unsampled', 'sampled_already_ready', 'provisional_incomplete_collector_export_pending'].includes(c.trialStatus));
     assert.ok(c.sampled === null || typeof c.sampled === 'boolean');
     for (const key of ['reportCaptured', 'bodyReceived', 'bodyMatches', 'server204Attempted', 'serverFinished', 'client204', 'page204', 'context204', 'pagehideTrigger', 'deliveryConfirmed', 'contextClosed']) assert.equal(typeof c[key], 'boolean');
     assert.ok(Number.isInteger(c.pageStatusCount) && c.pageStatusCount >= 0 && c.pageStatusCount <= 2);
     assert.ok(Array.isArray(c.cleanup) && c.cleanup.length <= 4);
-    for (const d of [c.primary, c.ambiguousQualifierFailure, ...c.cleanup].filter(d => d !== null)) {
-      keys(d, 'phase cause location'); assert.ok(phases.includes(d.phase)); assert.ok(causes.includes(d.cause));
-      if (d.location !== null) {
-        keys(d.location, 'module_basename module_sha256 site');
-        const l = d.location;
-        if (l.module_basename === ownBasename) {
-          assert.equal(l.module_sha256, ownHash); assert.ok(causes.slice(2).some(code => l.site === `stage2-${code}`));
-        } else {
-          const path = `ui/scripts/${l.module_basename}`;
-          assert.ok(Object.hasOwn(MODULE_PINS, path)); assert.equal(l.module_sha256, MODULE_PINS[path]);
-          assert.match(l.site, /^f16-(qualify-view-telemetry|view-telemetry-diagnostics)-L\d{1,4}-C\d{1,4}$/);
-        }
+    diagnostics.push(c.primary, c.ambiguousQualifierFailure, ...c.cleanup);
+  }
+  for (const d of diagnostics.filter(d => d !== null)) {
+    keys(d, 'phase cause location'); assert.ok(phases.includes(d.phase)); assert.ok(causes.includes(d.cause));
+    if (d.location !== null) {
+      keys(d.location, 'module_basename module_sha256 site');
+      const l = d.location;
+      if (l.module_basename === ownBasename) {
+        assert.equal(l.module_sha256, ownHash); assert.ok(causes.slice(2).some(code => l.site === `stage2-${code}`));
+      } else {
+        const path = `ui/scripts/${l.module_basename}`;
+        assert.ok(Object.hasOwn(MODULE_PINS, path)); assert.equal(l.module_sha256, MODULE_PINS[path]);
+        assert.match(l.site, /^f16-(qualify-view-telemetry|view-telemetry-diagnostics)-L\d{1,4}-C\d{1,4}$/);
       }
     }
   }
