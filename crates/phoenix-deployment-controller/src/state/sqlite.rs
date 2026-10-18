@@ -55,9 +55,9 @@ pub use native_reconciliation::{
 mod native_sampling;
 mod resources;
 pub use native_sampling::{
-    NativeSamplingCompletion, NativeSamplingDispatch, NativeSamplingFailureSettlementCandidate,
-    NativeSamplingIssue, NativeSamplingRecoveryCandidate, NativeSamplingStatus,
-    VerifiedNativeSamplingAckConfirmation, VerifiedNativeSamplingCompletion,
+    NativeSamplingCompletion, NativeSamplingContinuationStatus, NativeSamplingDispatch,
+    NativeSamplingFailureSettlementCandidate, NativeSamplingIssue, NativeSamplingRecoveryCandidate,
+    NativeSamplingStatus, VerifiedNativeSamplingAckConfirmation, VerifiedNativeSamplingCompletion,
     VerifiedNativeSamplingFailureAckConfirmation, VerifiedNativeSamplingFailureSettlement,
     VerifiedRecoveredNativeSampling,
 };

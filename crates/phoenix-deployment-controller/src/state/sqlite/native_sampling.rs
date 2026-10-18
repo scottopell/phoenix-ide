@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
@@ -300,6 +300,14 @@ impl VerifiedNativeSamplingFailureAckConfirmation {
             self.confirming_session_generation,
         )
     }
+}
+
+/// Non-authoritative classification of sampling evidence for workflow selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSamplingContinuationStatus {
+    SoleSuccessfulAckPending { confirmed: usize },
+    SuccessfulAcksConfirmed { count: NonZeroUsize },
+    Unavailable,
 }
 
 /// Durable diagnostic classification; loading it never reconstructs authority.
@@ -941,6 +949,73 @@ impl ControllerSqliteStore {
             drop(statement);
             tx.commit()?;
             Ok(pending)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Classifies whether normalized sampling evidence can continue the successful workflow.
+    /// # Errors
+    /// Any malformed, missing, or ambiguous native row poisons this handle.
+    pub fn native_sampling_continuation_status(
+        &mut self,
+        attempt: crate::AttemptId,
+    ) -> Result<NativeSamplingContinuationStatus> {
+        self.ensure_usable()?;
+        let result = (|| {
+            let tx = self.connection.transaction()?;
+            check_authority(&tx)?;
+            let mut statement = tx.prepare(
+                "SELECT dispatch_revision, ordinal FROM native_sampling_issues WHERE attempt_id=?1",
+            )?;
+            let rows = statement.query_map(params![key(attempt)], |row| {
+                Ok((row.get::<_, Word>(0)?.0, row.get::<_, i64>(1)?))
+            })?;
+            let mut issue_count = 0usize;
+            let mut pending_successful_ack = 0usize;
+            let mut unavailable = false;
+            for row in rows {
+                let (revision, ordinal) = row?;
+                let dispatch = DispatchKey::from_committed_parts(
+                    attempt,
+                    binding_revision(revision)?,
+                    usize::try_from(ordinal)
+                        .map_err(|_| ControllerStoreError::Malformed("invalid native ordinal"))?,
+                );
+                issue_count = issue_count
+                    .checked_add(1)
+                    .ok_or(ControllerStoreError::RevisionExhausted)?;
+                match read_status(&tx, dispatch)? {
+                    Some(NativeSamplingStatus::SampleAckConfirmed { .. }) => {}
+                    Some(NativeSamplingStatus::AppliedPendingAck { .. }) => {
+                        pending_successful_ack = pending_successful_ack
+                            .checked_add(1)
+                            .ok_or(ControllerStoreError::RevisionExhausted)?;
+                    }
+                    Some(_) => unavailable = true,
+                    None => return malformed("missing native issue"),
+                }
+            }
+            drop(statement);
+            if pending_successful_ack > 1 {
+                return malformed("multiple pending native ACKs");
+            }
+            let status = if unavailable || issue_count == 0 {
+                NativeSamplingContinuationStatus::Unavailable
+            } else if pending_successful_ack == 0 {
+                NativeSamplingContinuationStatus::SuccessfulAcksConfirmed {
+                    count: NonZeroUsize::new(issue_count)
+                        .ok_or(ControllerStoreError::RevisionConflict)?,
+                }
+            } else {
+                NativeSamplingContinuationStatus::SoleSuccessfulAckPending {
+                    confirmed: issue_count - 1,
+                }
+            };
+            tx.commit()?;
+            Ok(status)
         })();
         if result.is_err() {
             self.poisoned = true;

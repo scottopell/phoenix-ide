@@ -272,6 +272,12 @@ impl LoadedAttempt {
         }
     }
 
+    /// Reports whether this crash-loaded checkpoint can resume resource sampling.
+    #[must_use]
+    pub fn is_interrupted_resource_sampling(&self) -> bool {
+        self.interrupted_sampling_sequence().is_some()
+    }
+
     pub(crate) fn interrupted_native_root_scan(&self, parent: ProcessIdentity) -> bool {
         matches!(&self.checkpoint, DeploymentAttempt::Interrupted(_))
             && self.checkpoint.native_root_scan(parent)

@@ -1758,6 +1758,12 @@ mod native_sampling_tests {
                 generation,
             )
         };
+        assert_eq!(
+            store
+                .native_sampling_continuation_status(crate::AttemptId::new(9))
+                .unwrap(),
+            crate::NativeSamplingContinuationStatus::SoleSuccessfulAckPending { confirmed: 0 }
+        );
         let confirmed = store.confirm_native_sampling_ack(proof()).unwrap();
         assert_eq!(
             confirmed,
@@ -1771,6 +1777,14 @@ mod native_sampling_tests {
         assert_eq!(
             store.load_native_sampling_status(issue.key()).unwrap(),
             Some(confirmed)
+        );
+        assert_eq!(
+            store
+                .native_sampling_continuation_status(crate::AttemptId::new(9))
+                .unwrap(),
+            crate::NativeSamplingContinuationStatus::SuccessfulAcksConfirmed {
+                count: std::num::NonZeroUsize::MIN,
+            }
         );
         assert!(matches!(
             store.confirm_native_sampling_ack(proof()),

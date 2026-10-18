@@ -322,6 +322,13 @@ fn failure_ack_is_revision_neutral_immediate_or_fresh_and_remains_historical() {
     for failure in FAILURES {
         for later in [false, true] {
             let mut fixture = FailureFixture::new(failure);
+            assert_eq!(
+                fixture
+                    .store
+                    .native_sampling_continuation_status(fixture.issue.key().attempt_id())
+                    .unwrap(),
+                NativeSamplingContinuationStatus::Unavailable
+            );
             let pending = fixture.settle();
             if later {
                 fixture.reconnect();
@@ -332,6 +339,13 @@ fn failure_ack_is_revision_neutral_immediate_or_fresh_and_remains_historical() {
                     .load_native_sampling_status(fixture.issue.key())
                     .unwrap(),
                 Some(pending)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .native_sampling_continuation_status(fixture.issue.key().attempt_id())
+                    .unwrap(),
+                NativeSamplingContinuationStatus::Unavailable
             );
             let before = fixture.checkpoint();
             let tables = unchanged_tables(&fixture.store);
@@ -367,6 +381,13 @@ fn failure_ack_is_revision_neutral_immediate_or_fresh_and_remains_historical() {
                     .load_native_sampling_status(fixture.issue.key())
                     .unwrap(),
                 Some(confirmed)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .native_sampling_continuation_status(fixture.issue.key().attempt_id())
+                    .unwrap(),
+                NativeSamplingContinuationStatus::Unavailable
             );
             assert_eq!(
                 fixture

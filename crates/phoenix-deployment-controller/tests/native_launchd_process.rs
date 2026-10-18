@@ -7,7 +7,7 @@ mod native_sampling;
 
 use launchd::{
     bounded_text, poll_pause, private_file, CleanupFailures, DisposableLaunchdGuardian,
-    DisposableLaunchdInstallation, DisposableLaunchdRunnerJob, ATTEMPT,
+    DisposableLaunchdInstallation, DisposableLaunchdRunnerJob, ReadyWorkflowSelection, ATTEMPT,
 };
 use native_sampling::{sampling_rows, sampling_runner_command, settled_sampling_keys};
 use phoenix_deployment_controller::{
@@ -417,7 +417,10 @@ fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signa
     let fenced = detached(runner.guardian());
     assert_fenced_sample(&fenced, key.revision().get(), deadline);
     runner.assert_initial_generation_evidence().unwrap();
-    runner.recover_applied_ack().unwrap();
+    assert_eq!(
+        runner.advance_ready_workflow().unwrap(),
+        ReadyWorkflowSelection::RecoverAppliedSamplingAck
+    );
     runner.assert_archived_generation(1).unwrap();
     assert_eq!(runner.label(), label);
     runner.assert_live().unwrap();
@@ -462,7 +465,10 @@ fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signa
     );
     runner.assert_witnesses().unwrap();
 
-    runner.recover_finish_and_ready().unwrap();
+    assert_eq!(
+        runner.advance_ready_workflow().unwrap(),
+        ReadyWorkflowSelection::ContinueToReady
+    );
     runner.assert_archived_generation(2).unwrap();
     assert_eq!(runner.label(), label);
     runner.assert_live().unwrap();
@@ -614,6 +620,10 @@ fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signa
         fenced_native.slots[0].identity
     );
     assert_eq!(final_native.slots[0].liveness, WireObservation::Exited);
+    assert_eq!(
+        runner.advance_ready_workflow().unwrap(),
+        ReadyWorkflowSelection::Complete
+    );
     runner.finish().unwrap();
     installation.assert_witnesses().unwrap();
     drop((store, db));

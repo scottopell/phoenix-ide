@@ -1,7 +1,8 @@
 #![cfg(target_os = "macos")]
 
 use phoenix_deployment_controller::{
-    AttemptId, BirthToken, ControllerSqliteStore, MonotonicTick, ProcessId, ProcessIdentity,
+    AttemptId, BirthToken, CleanupOutcome, ControllerSqliteStore, MonotonicTick,
+    NativeSamplingContinuationStatus, Phase, ProcessId, ProcessIdentity,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -733,6 +734,13 @@ fn stage_binary(source: &Path, target: &Path) -> io::Result<ByteWitness> {
     Ok(witness)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReadyWorkflowSelection {
+    RecoverAppliedSamplingAck,
+    ContinueToReady,
+    Complete,
+}
+
 pub(super) struct DisposableLaunchdInstallation {
     guardian: DisposableLaunchdGuardian,
     finished: bool,
@@ -803,6 +811,62 @@ impl DisposableLaunchdInstallation {
 
     pub(super) fn guardian(&mut self) -> &mut DisposableLaunchdGuardian {
         &mut self.guardian
+    }
+
+    fn ready_workflow_selection(&self) -> io::Result<ReadyWorkflowSelection> {
+        let mut store = ControllerSqliteStore::open_read_only(self.guardian.store())
+            .map_err(io::Error::other)?;
+        let attempt = store
+            .load_attempt(ATTEMPT)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("installed workflow attempt is missing"))?;
+        let sampling = store
+            .native_sampling_continuation_status(ATTEMPT)
+            .map_err(io::Error::other)?;
+        let pending_child_list = store
+            .pending_native_child_list_ack(ATTEMPT)
+            .map_err(io::Error::other)?
+            .is_some();
+        let pending_identity = store
+            .pending_native_identity_observation_ack(ATTEMPT)
+            .map_err(io::Error::other)?
+            .is_some();
+        match (
+            attempt.phase(),
+            attempt.cleanup_outcome(),
+            attempt.is_interrupted_resource_sampling(),
+            sampling,
+            pending_child_list,
+            pending_identity,
+        ) {
+            (
+                Phase::ResourceSampling,
+                CleanupOutcome::NotStarted,
+                false,
+                NativeSamplingContinuationStatus::SoleSuccessfulAckPending { confirmed: 0 },
+                false,
+                false,
+            ) => Ok(ReadyWorkflowSelection::RecoverAppliedSamplingAck),
+            (
+                Phase::Interrupted,
+                CleanupOutcome::NotStarted,
+                true,
+                NativeSamplingContinuationStatus::SuccessfulAcksConfirmed { count },
+                false,
+                false,
+            ) if count.get() == 1 => Ok(ReadyWorkflowSelection::ContinueToReady),
+            (
+                Phase::ReadyForDisruption,
+                CleanupOutcome::VerifiedClean,
+                false,
+                NativeSamplingContinuationStatus::SuccessfulAcksConfirmed { count },
+                false,
+                false,
+            ) if count.get() == 2 => Ok(ReadyWorkflowSelection::Complete),
+            _ => Err(io::Error::other(
+                "installed workflow has no exact non-mutating runner stage",
+            )),
+        }
     }
 
     pub(super) fn assert_witnesses(&self) -> io::Result<()> {
@@ -1474,6 +1538,16 @@ impl<'a> DisposableLaunchdRunnerJob<'a> {
             archive_initial_file(&self.spec, &source, &archive)?;
         }
         File::open(&self.spec.root)?.sync_all()
+    }
+
+    pub(super) fn advance_ready_workflow(&mut self) -> io::Result<ReadyWorkflowSelection> {
+        let selection = self.installation.ready_workflow_selection()?;
+        match selection {
+            ReadyWorkflowSelection::RecoverAppliedSamplingAck => self.recover_applied_ack()?,
+            ReadyWorkflowSelection::ContinueToReady => self.recover_finish_and_ready()?,
+            ReadyWorkflowSelection::Complete => {}
+        }
+        Ok(selection)
     }
 
     pub(super) fn recover_applied_ack(&mut self) -> io::Result<()> {

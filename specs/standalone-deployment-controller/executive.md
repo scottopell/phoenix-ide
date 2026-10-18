@@ -363,7 +363,10 @@ The completed-but-unapplied nonterminal recovery unit passes exact-head macOS ru
 The staged two-job disposable lifecycle passes exact-head macOS run `39027451788` and full
 CI `39027454259` at `5c8526f561659afa206f5a406c05cffeb4107074`. It demonstrates
 private staging, launchd start, causal runner termination, same-label ACK recovery, and exact
-stop/uninstall for fake resources; it does not demonstrate application deployment.
+stop/uninstall for fake resources. A successor journey derives ACK-only recovery,
+continuation-to-readiness, and terminal completion from durable controller state inside the
+same disposable installation owner; exact-head hosted qualification is pending. Neither journey
+demonstrates application deployment.
 
 The remaining replacement gaps are explicit:
 
@@ -371,9 +374,10 @@ The remaining replacement gaps are explicit:
   --current-schema-upgrade` and its immutable manifest/retained Python helper. It has no safe
   disposable-root switch, and the Rust controller does not invoke or replace its signature,
   claim, ledger, application-DB, migration, publication, health, or forward-recovery authority.
-- Launchd owns both disposable jobs only inside the test fixture. No installed controller
-  selects initial versus recovery modes, exclusively owns the production controller store,
-  supervises finite runners, or installs/removes production jobs.
+- Launchd owns both disposable jobs only inside the test fixture. The disposable installation
+  selects its bounded recovery/continuation runner stages from durable state, but no production
+  controller exclusively owns the production controller store, supervises finite runners, or
+  installs/removes production jobs.
 - Native durable dispatch covers resource sampling, exact-root `ListChildren`, and
   policy-issued exact-root `ObserveIdentity`. The natural-exit path reaches
   `ReadyForDisruption` with `VerifiedClean` and no signal; replacement ACK recovery remains
