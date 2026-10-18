@@ -57,32 +57,37 @@
     "helper_source_rule": "clean full controller head distinct from candidate.source_commit"
   },
   "bundle": {
-    "sha256_observation": "pending_reconciled_hosted_qualification",
+    "sha256_observation": {
+      "head": "7d8ed9567b2dd1e515a42eae2fc06a915ff2e467",
+      "workflow_run_id": 39159177954,
+      "job_id": 117768652335,
+      "result": "all five hashes reported before intentional unsealed-manifest failure"
+    },
     "files": [
       {
         "name": "phoenix_ide-aarch64-apple-darwin-prepared-23badb8be4bc",
         "role": "standalone_payload",
-        "sha256": null
+        "sha256": "31d299686fc891754e2a29d089405cfa9279f32491d32f338a4824547c801cc7"
       },
       {
         "name": "Phoenix-macos-aarch64-apple-darwin-prepared-23badb8be4bc.zip",
         "role": "app_archive_payload",
-        "sha256": null
+        "sha256": "38900a0ccb224006dbf92aa201c368dab2d87a08f4cda2f839ee619b45a18b81"
       },
       {
         "name": "PREPARATION-SHA256SUMS-aarch64-apple-darwin",
         "role": "payload_checksum_manifest",
-        "sha256": null
+        "sha256": "02c426035f7ba887ae2ff8ec1c1eaa5dff60f8f5755104868aef712c1b8873a4"
       },
       {
         "name": "PREPARATION-RECEIPT-aarch64-apple-darwin.json",
         "role": "preparation_receipt",
-        "sha256": null
+        "sha256": "42e5eb1ec7406464ccf45715cce4c9d84e00bd782e13c656cc69ac16dc80992b"
       },
       {
         "name": "HEADLESS-ACCEPTANCE-aarch64-apple-darwin.json",
         "role": "headless_acceptance_proof",
-        "sha256": null
+        "sha256": "9653e4a68d89327f6a1fc736f9d957dd1e2671df5642033da17aaa98419e2a24"
       }
     ]
   },
