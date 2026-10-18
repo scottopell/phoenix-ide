@@ -2,27 +2,30 @@
 
 ## Delivery boundary
 
-This is staged v0.14 backend/spec work, not deployed behavior. Migration 129 is a new forward name-authority transformation; it does not expand or alter any qualified migration-128 production/incident registry, controller, recovery, or deployment admission. UI source integration is included. Compiled Rust qualification, genuine code generation, and rendered acceptance remain pending.
+The single-name implementation is delivered as source in [PR #951](https://github.com/scottopell/phoenix-ide/pull/951) for v0.14, not deployed behavior or a v0.13 release gate. Migration 129 is a new forward name-authority transformation; it does not expand any qualified migration-128 production/incident controller, recovery, or deployment admission. Backend/UI integration and genuine generated contracts are included. Final exact-head hosted qualification is tracked by PR checks; merge, release and rendered acceptance remain separate gates. The design decision is [ADR-129](../adrs/129_single-conversation-name-and-allocated-slug.md).
 
 ## Implementation
 
-The root transcript `title` is the sole name authority. Migration 129 folds effective root names into it, drops persisted `chain_name`, releases all migrating root slugs before allocating in `(created_at, id)` order, and retains message and identity data. `conversation_name::allocate_slug_tx` allocates Unicode projections against shared transcript slugs and actual transcript/product identities. Ordinary rename, low-level root creation, legacy creation-shell publication, and product/fork insertion use the same projection rule in their write transaction. Creation claims and ordinary History/Close admission remain authoritative.
+The root transcript `title` is the sole name authority. Migration 129 folds effective root names into it, drops persisted `chain_name`, releases migrating root slugs before deterministic reallocation, and retains messages and identities. The shared allocator checks transcript slugs and actual/reserved transcript/product identities. Rename, low-level creation, legacy shell metadata, approved-task handoff, product publication and fork insertion use that allocator within their write transactions. Generated naming captures an immutable target and name baseline. Creation claims and ordinary History/Close admission remain authoritative.
 
-`canonical_route`, list projection, creation status, and ordinary Global reference output publish the encoded readable route. Product UUIDs remain API/cache identity. Exact transcript links remain explicitly pinned. Legacy chain-name endpoints write the same root title; the old response slot is null rather than another authority.
+`canonical_route`, list/snapshot/status responses and ordinary Global navigation publish encoded readable routes. Product UUIDs remain API/cache identity. Exact evidence links use permanent identity plus explicit transcript/message selection. Legacy chain-name endpoints write the same root title; their old response slot is null rather than another authority. UI naming uses authoritative presentation; delayed rename completion preserves the live route, transcript pin, search and anchor.
 
-## Verification coverage
+## Executable regression coverage
 
-| Requirement | Authored coverage | Qualification |
-|---|---|---|
-| REQ-CID-001 | Legacy name round trips, prose generator tests, duplicate human-name rename/publication | Rust execution pending |
-| REQ-CID-002 | Two-handle concurrent rename; deterministic numeric suffixes; actual ID collision; duplicate publication; low-level creation collision | Rust execution pending |
-| REQ-CID-003 | Readable canonical list/snapshot/status routes and Unicode path-component encoding | Rust execution pending; UI acceptance pending |
-| REQ-CID-004 | Stable ID aliases after rename, released-route reuse, existing exact-transcript tests | Rust execution pending |
-| REQ-CID-005 | History/active Close fences, stale generated-name baseline, and stale creation-claim name/slug nonmutation | Rust execution pending |
-| REQ-CID-006 | Effective-name migration, cross-root old-slug occupancy, column removal, stable message/continuation evidence; historical migration-005 checks | Rust execution pending |
+| Requirement | Coverage |
+|---|---|
+| REQ-CID-001 | Legacy name round trips, prose generator output, duplicate names, authoritative UI presentation |
+| REQ-CID-002 | Concurrent allocation, deterministic suffixes, actual/reserved ID collisions, creation/publication and approved-task shell allocation |
+| REQ-CID-003 | Readable canonical routes, Unicode encoding, emitted-route/current-scope round trip, delayed rename navigation |
+| REQ-CID-004 | Permanent UUID resolution, released-slug reuse, exact transcript/message selection and stable evidence links |
+| REQ-CID-005 | History/Close/claim fences; stale regeneration and valid-claim legacy metadata preserve newer human names |
+| REQ-CID-006 | Effective-name migration, release-before-reallocate ordering, column removal, stable message/continuation identities and historical schema fixtures |
 
-Local `./dev.py check --lanes tsc,vitest` passes, including deferred rename-navigation regression coverage. Compiler-free `tests/devpy` discovery passes: 1,026 tests, one skipped. Hosted `./dev.py codegen` succeeded at source `041b35f89771cf7a9dddd482cb351f63022c2c31` (CI run 39169104230); its `ChainView.ts` output was collected from the generated-contract artifact without hand edits. The temporary branch-scoped collection step was then removed.
+## Qualification record
 
-Independent review of that source found canonical-slug Global resolution selecting the root rather than current scope, and a suspended rename callback using stale route state. Both have source fixes and focused regressions; final exact-head hosted qualification and review remain pending. Initial hosted Clippy diagnostics and a UUID-only E2E route assertion have also been corrected. These checks do not substitute for rendered acceptance.
-
-The local Allium executable reported parser errors in unchanged LLM specs; the hosted pinned Allium lane passed at the initial source, so this is a local-tool discrepancy rather than a naming-spec blocker. The incident controller remains hard-pinned to 128; historical unit fixtures isolate that contract and separately assert rejection of the feature registry.
+- Local `./dev.py check --lanes tsc,ui-lint,vitest` passes. Compiler-free `tests/devpy` discovery after main integration passes: 1,056 tests, one skipped.
+- Hosted `./dev.py codegen` succeeded at source `041b35f89771cf7a9dddd482cb351f63022c2c31`, run 39169104230. Its generated `ChainView.ts` was collected without hand edits. The temporary collection step was removed.
+- Independent integrated-source review of `95fca6cc8..7c9db305a` reported no actionable findings. Earlier findings in allocation, asynchronous naming, exact links and live navigation were corrected. Later changes repair test fixtures and remove diagnostic workflow scaffolding, without changing production naming behavior.
+- Full Rust collection at `7c9db305a` ran 4,884 tests: 4,874 passed, ten failed, 185 skipped. Those failures exposed a stale title expectation, a delivery-visibility assumption, and eight uses of a synthetic schema missing a Coordinator-trigger prerequisite. Fixtures were corrected without weakening migration or lifecycle contracts. The focused owning workflow module and two naming regressions then passed (67 tests), run 39174656205. Final ordinary full-suite results are authoritative in PR checks; no failing run is represented as success.
+- The local Allium executable rejected unchanged LLM-spec syntax; the hosted pinned Allium lane passed. This is a local-tool discrepancy, not a naming-spec acceptance claim.
+- Historical controller fixtures explicitly isolate migration 128 and assert rejection of the feature registry. No production deployment, release, or merge was performed by this task.
