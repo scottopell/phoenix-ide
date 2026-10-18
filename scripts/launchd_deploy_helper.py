@@ -95,6 +95,135 @@ PREPARED_SOURCE114_COMMIT = "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
 PREPARED_SOURCE114_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
 
 
+CURRENT_REPAIR_COMMIT = "237100c79d9ce672867b284167a099fa0b7a2bcf"
+CURRENT_REPAIR_VERSION = "0.13.0-rc.4"
+CURRENT_REPAIR_REGISTRY_SHA256 = PREPARED_SOURCE114_REGISTRY_SHA256
+CURRENT_REPAIR_DIRECTORY = "current-schema-repair"
+CURRENT_REPAIR_RUNTIME_FENCE_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class CurrentRepairRuntimeFence:
+    target_binary: Path
+    target_plist: Path
+
+
+def current_repair_runtime_fence(parent: Manifest) -> CurrentRepairRuntimeFence:
+    return CurrentRepairRuntimeFence(Path(parent.target_binary), Path(parent.target_plist))
+
+
+def validate_current_repair_runtime_fence_source(parent: Manifest) -> CurrentRepairRuntimeFence:
+    fence = current_repair_runtime_fence(parent)
+    _regular_nosymlink(fence.target_binary, "installed original candidate")
+    target_digest = sha256(fence.target_binary)
+    if target_digest not in {parent.candidate_binary_sha256, CURRENT_REPAIR_RUNTIME_FENCE_SHA256}:
+        raise ActivationError("installed runtime is neither the exact original candidate nor the stopped repair fence")
+    if os.path.lexists(fence.target_plist):
+        _regular_nosymlink(fence.target_plist, "published original plist")
+        verify_staged(str(fence.target_plist), parent.candidate_plist_sha256, "published original plist")
+    return fence
+
+
+def install_current_repair_runtime_fence(parent: Manifest) -> None:
+    fence = validate_current_repair_runtime_fence_source(parent)
+    require_launchd_absence(parent.label, parent.uid)
+    try:
+        if sha256(fence.target_binary) != CURRENT_REPAIR_RUNTIME_FENCE_SHA256:
+            atomic_write(fence.target_binary, b"", 0o600)
+        _regular_nosymlink(fence.target_binary, "stopped repair runtime fence")
+        if sha256(fence.target_binary) != CURRENT_REPAIR_RUNTIME_FENCE_SHA256 or fence.target_binary.stat().st_mode & 0o111:
+            raise ActivationError("stopped repair runtime fence is not durable")
+        if os.path.lexists(fence.target_plist):
+            fence.target_plist.unlink()
+            fsync_dir(fence.target_plist.parent)
+        require_launchd_absence(parent.label, parent.uid)
+    except BaseException as exc:
+        try:
+            Launchctl(parent).stop()
+            require_launchd_absence(parent.label, parent.uid)
+        except Exception as teardown_exc:
+            raise ActivationError(f"stopped repair runtime fence failed and teardown is unconfirmed: {teardown_exc}") from exc
+        raise
+
+
+@dataclasses.dataclass(frozen=True)
+class CurrentSchemaRepairManifest:
+    protocol_version: int
+    parent_manifest_path: str
+    parent_manifest_sha256: str
+    parent_status_sha256: str
+    parent_proof_sha256: str
+    source_commit: str
+    version: str
+    controller_source_commit: str
+    helper_sha256: str
+    candidate_sha256: str
+    registry_sha256: str
+    plist_sha256: str
+    receipt_sha256: str
+    helper_label: str
+
+    @classmethod
+    def load(cls, path: Path) -> CurrentSchemaRepairManifest:
+        try:
+            repair = _manifest_record(cls, _repair_json(path))
+            if repair.protocol_version != 1:
+                raise ValueError("unsupported repair protocol")
+            if (repair.source_commit, repair.version, repair.registry_sha256) != (
+                CURRENT_REPAIR_COMMIT, CURRENT_REPAIR_VERSION, CURRENT_REPAIR_REGISTRY_SHA256
+            ):
+                raise ValueError("unqualified repair candidate")
+            if not FULL_GIT_SHA_RE.fullmatch(repair.controller_source_commit) or repair.controller_source_commit == repair.source_commit:
+                raise ValueError("repair requires a separate exact controller")
+            for field in dataclasses.fields(cls):
+                if field.name.endswith("sha256") and not re.fullmatch(r"[0-9a-f]{64}", getattr(repair, field.name)):
+                    raise ValueError("invalid repair evidence digest")
+            parent = Path(repair.parent_manifest_path)
+            if not parent.is_absolute() or parent != parent.resolve() or parent.name != "manifest.json":
+                raise ValueError("invalid repair parent path")
+            if path != parent.parent / CURRENT_REPAIR_DIRECTORY / "manifest.json":
+                raise ValueError("repair must use the single deterministic child")
+            _private_transaction_dir(parent.parent)
+            _private_transaction_dir(path.parent)
+            return repair
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            raise ActivationError(f"invalid sealed current-schema repair: {exc}") from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class CurrentSchemaRepairStatus:
+    protocol_version: int
+    manifest_sha256: str
+    state: str
+    resume_from: Optional[str]
+    proof_sha256: Optional[str]
+    finalization_pending: bool
+    failure: Optional[str]
+
+    @classmethod
+    def load(cls, path: Path, manifest_hash: str) -> CurrentSchemaRepairStatus:
+        try:
+            status = _manifest_record(cls, _repair_json(path))
+            phases = {"prepared", "reconciliation_started", "target_verified", "start_attempted", "committed"}
+            failed = status.state in {"failed_stopped", "stop_unconfirmed"}
+            phase = status.resume_from if failed else status.state
+            if (status.protocol_version != 1 or status.manifest_sha256 != manifest_hash
+                    or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash) or phase not in phases):
+                raise ValueError("repair status identity/state mismatch")
+            if (not failed and status.resume_from is not None) or failed != (status.failure is not None):
+                raise ValueError("repair failure checkpoint mismatch")
+            verified = phase in {"target_verified", "start_attempted", "committed"}
+            if verified != (status.proof_sha256 is not None):
+                raise ValueError("repair proof/state mismatch")
+            if status.proof_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", status.proof_sha256):
+                raise ValueError("repair proof digest malformed")
+            if status.finalization_pending and (status.state != "committed" or failed):
+                raise ValueError("repair finalization/state mismatch")
+            return status
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            raise ActivationError(f"invalid current-schema repair status: {exc}") from exc
+
+
 @dataclasses.dataclass(frozen=True)
 class PreparedSource114Upgrade(CurrentSchemaUpgrade):
     prepared_source_baseline: int
@@ -2123,6 +2252,7 @@ def activate(manifest: Manifest) -> str:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another deployment is already activating") from exc
 
+        refuse_selected_current_repair(manifest)
         require_fresh_prepared_activation(manifest)
 
         prepared_installs: list[Path] = []
@@ -2588,7 +2718,473 @@ def cleanup_precondition_capacity(manifest: Manifest, *, current_schema: bool) -
         return "precondition_failed"
 
 
+def _repair_private(path: Path) -> None:
+    _regular_nosymlink(path, "current-schema repair evidence")
+    if path != path.resolve() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+        raise ActivationError("repair evidence must be private, owned and canonical")
+
+
+def _repair_json(path: Path) -> dict:
+    _repair_private(path)
+    if path.stat().st_size > MAX_DATABASE_PROOF_BYTES:
+        raise ActivationError("repair evidence exceeds bounded size")
+    try:
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate evidence key")
+                result[key] = value
+            return result
+        value = json.loads(path.read_text(), object_pairs_hook=unique)
+        if not isinstance(value, dict):
+            raise ValueError("evidence must be an object")
+        return value
+    except (ValueError, OSError) as exc:
+        raise ActivationError("repair evidence is unreadable or malformed") from exc
+
+
+def current_repair_entry(parent: Manifest) -> Path:
+    return Path(parent.candidate_binary).parent / CURRENT_REPAIR_DIRECTORY / "manifest.json"
+
+
+def refuse_selected_current_repair(parent: Manifest) -> None:
+    entry = current_repair_entry(parent)
+    if os.path.lexists(entry) or entry.parent.is_symlink():
+        raise ActivationError(
+            f"current-schema repair evidence fences original activation; use prod resume-current-repair {parent.transaction_id}"
+        )
+
+
+def require_launchd_absence(label: str, uid: int) -> None:
+    result = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"], capture_output=True, text=True)
+    if result.returncode == 0 or not service_absence_confirmed(result.stdout + "\n" + result.stderr, label, uid):
+        raise ActivationError("exact launchd service/helper absence is unconfirmed")
+
+
+def _current_repair_parent_records(parent_path: Path, status_path: Path) -> tuple[Manifest, dict]:
+    raw = _repair_json(parent_path)
+    if set(raw) - {field.name for field in dataclasses.fields(Manifest)}:
+        raise ActivationError("repair parent manifest has unknown fields")
+    parent = Manifest.load(parent_path)
+    validate_manifest_identities(parent)
+    validate_prepared_source114(parent)
+    upgrade = parent.current_schema_upgrade
+    if (parent.source_kind != "prepared_artifact" or parent.source_commit != PREPARED_SOURCE114_COMMIT
+            or not isinstance(upgrade, PreparedSource114Upgrade)
+            or parent.helper_label != f"{DEPLOY_HELPER_LABEL_PREFIX}.{parent.transaction_id}"
+            or parent.uid != os.getuid()):
+        raise ActivationError("repair requires the exact original prepared current-schema parent")
+    if parent_path != Path(parent.candidate_binary).parent / "manifest.json":
+        raise ActivationError("repair parent transaction path mismatch")
+    _private_transaction_dir(parent_path.parent)
+    if _paired_path_context(parent)[3] != parent_path.parent:
+        raise ActivationError("repair snapshot is outside the original parent transaction")
+    if Path(upgrade.controller_helper_path).parent != parent_path.parent or Path(upgrade.migration_registry_path).parent != parent_path.parent:
+        raise ActivationError("repair parent helper/registry path crosswire")
+    for path, digest in (
+        (parent.candidate_plist, parent.candidate_plist_sha256),
+        (upgrade.controller_helper_path, upgrade.controller_helper_sha256),
+        (upgrade.migration_registry_path, upgrade.migration_registry_sha256),
+    ):
+        _repair_private(Path(path))
+        verify_staged(path, digest, "original repair parent evidence")
+    paths = [Path(getattr(parent, name)) for name in (
+        "candidate_binary", "candidate_plist", "target_binary", "target_plist", "active_path",
+        "status_path", "deployed_sha_path", "lock_path", "claim_lock_path",
+    )] + [Path(getattr(upgrade, name)) for name in (
+        "database_path", "backup_path", "proof_path", "controller_helper_path", "migration_registry_path",
+    )]
+    if (any(not item.is_absolute() or item != item.resolve() for item in paths)
+            or len(set(paths)) != len(paths)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", parent.transaction_id)
+            or not re.fullmatch(r"[A-Za-z0-9._-]+", parent.label)):
+        raise ActivationError("repair parent paths or routing are malformed")
+    status = _repair_json(status_path)
+    expected_status = {
+        "transaction_id": parent.transaction_id, "state": "committed", "source_kind": parent.source_kind,
+        "source_commit": parent.source_commit, "release_tag": None, "release_commit": None,
+        "expected_version": parent.expected.version, "expected_git_sha": parent.expected.git_sha,
+        "created_at": parent.created_at, "finalization_pending": True, "prepared_mode": "current_schema",
+        "failure": None, "rollback_failure": None, "cleanup_failure": None,
+        "precondition_cleanup_completed": False, "recovery_mode": None,
+    }
+    if (set(status) != set(expected_status) | {"updated_at", "committed_diagnostic"}
+            or any(type(status[key]) is not type(value) or status[key] != value for key, value in expected_status.items())
+            or not isinstance(status["updated_at"], str) or not status["updated_at"]
+            or (status["committed_diagnostic"] is not None and not isinstance(status["committed_diagnostic"], str))):
+        raise ActivationError("repair requires exact original committed/pending status shape")
+    validate_status_manifest_mode(parent, status)
+    proof = _repair_json(Path(upgrade.proof_path))
+    target = [list(item) for item in migration_registry(_current_schema_registry(parent))]
+    expected_proof = {
+        "transaction_id": parent.transaction_id, "source_commit": parent.source_commit,
+        "database": upgrade.database_path, "candidate_binary_sha256": parent.candidate_binary_sha256,
+        "candidate_plist_sha256": parent.candidate_plist_sha256,
+        "previous_binary_sha256": parent.rollback_binary_sha256, "previous_plist_sha256": parent.rollback_plist_sha256,
+        "controller_source_commit": upgrade.controller_source_commit, "controller_helper_sha256": upgrade.controller_helper_sha256,
+        "database_mode": "current_schema", "migration_registry_sha256": upgrade.migration_registry_sha256,
+        "prepared_source_qualification": prepared_source_qualification(parent), "target_ledger": target, "migrated_ledger": target,
+    }
+    digest_keys = {"sha256", "source_logical_digest", "backup_logical_digest", "migrated_logical_digest"}
+    if (set(proof) != set(expected_proof) | digest_keys | {"source_ledger", "migration_committed_at"}
+            or any(json.dumps(proof[key], sort_keys=True) != json.dumps(value, sort_keys=True) for key, value in expected_proof.items())
+            or any(not isinstance(proof[key], str) or not re.fullmatch(r"[0-9a-f]{64}", proof[key]) for key in digest_keys)
+            or proof["backup_logical_digest"] != proof["source_logical_digest"]
+            or json.dumps(proof["source_ledger"]) not in (json.dumps(target), json.dumps([item for item in target if item[0] <= 114]))
+            or not isinstance(proof["migration_committed_at"], str) or not proof["migration_committed_at"]):
+        raise ActivationError("repair requires the parent's exact committed target128 proof shape")
+    return parent, proof
+
+
+def _require_current_repair_claim(parent: Manifest) -> None:
+    _repair_private(Path(parent.active_path))
+    if Path(parent.active_path).read_text().strip() != parent.transaction_id:
+        raise ActivationError("repair requires the exact retained parent claim")
+
+
+def validate_current_repair_parent(parent_path: Path, *, require_claim: bool = True,
+                                   status_path: Path | None = None) -> tuple[Manifest, dict]:
+    parent = Manifest.load(parent_path)
+    parent, proof = _current_repair_parent_records(parent_path, status_path or Path(parent.status_path))
+    if require_claim:
+        _require_current_repair_claim(parent)
+    if _snapshot_proof(parent) != proof:
+        raise ActivationError("repair parent proof changed during full validation")
+    return parent, proof
+
+
+def _repair_runtime(parent: Manifest, repair: CurrentSchemaRepairManifest, directory: Path) -> Manifest:
+    return dataclasses.replace(
+        parent, source_commit=repair.source_commit, expected=Identity(repair.version, repair.source_commit),
+        candidate_binary=str(directory / "candidate"), candidate_binary_sha256=repair.candidate_sha256,
+        candidate_plist=str(directory / "candidate.plist"), candidate_plist_sha256=repair.plist_sha256,
+        helper_label=repair.helper_label,
+    )
+
+
+def classify_current_repair(path: Path) -> tuple[CurrentSchemaRepairManifest, Manifest, CurrentSchemaRepairStatus]:
+    repair = CurrentSchemaRepairManifest.load(path)
+    directory = path.parent
+    status = CurrentSchemaRepairStatus.load(directory / "status.json", sha256(path))
+    for name in ("candidate", "candidate.plist", "helper.py", "migrations.rs", "receipt.json"):
+        _repair_private(directory / name)
+    terminal = status.state == "committed" and not status.finalization_pending
+    parent, proof = _current_repair_parent_records(Path(repair.parent_manifest_path), directory / "parent-status.json")
+    upgrade = parent.current_schema_upgrade
+    for evidence, digest in (
+        (Path(repair.parent_manifest_path), repair.parent_manifest_sha256),
+        (directory / "parent-status.json", repair.parent_status_sha256),
+        (Path(upgrade.proof_path), repair.parent_proof_sha256),
+    ):
+        _repair_private(evidence)
+        verify_staged(str(evidence), digest, "sealed repair evidence")
+    if repair.helper_label != f"{parent.helper_label}.current-schema-repair":
+        raise ActivationError("repair child helper label mismatch")
+    if not terminal:
+        _repair_private(Path(parent.status_path))
+        verify_staged(parent.status_path, repair.parent_status_sha256, "live original repair parent status")
+        _require_current_repair_claim(parent)
+    if status.proof_sha256 is not None:
+        repair_proof = _repair_json(directory / "proof.json")
+        expected_proof = {
+            "protocol_version": 1, "manifest_sha256": sha256(path),
+            "parent_proof_sha256": repair.parent_proof_sha256, "source_commit": repair.source_commit,
+            "registry_sha256": repair.registry_sha256, "target_ledger": proof["target_ledger"],
+        }
+        if (sha256(directory / "proof.json") != status.proof_sha256
+                or json.dumps(repair_proof, sort_keys=True) != json.dumps(expected_proof, sort_keys=True)):
+            raise ActivationError("repair target proof mismatch")
+    return repair, parent, status
+
+
+def validate_current_repair_staging(
+    repair: CurrentSchemaRepairManifest,
+    parent: Manifest,
+    proof: dict,
+    directory: Path,
+    *,
+    running_helper: bool,
+) -> None:
+    upgrade = parent.current_schema_upgrade
+    if running_helper and Path(__file__).resolve() != directory / "helper.py":
+        raise ActivationError("repair must execute its retained controller helper")
+    for evidence, digest in (
+        (directory / "helper.py", repair.helper_sha256),
+        (directory / "candidate", repair.candidate_sha256),
+        (directory / "candidate.plist", repair.plist_sha256),
+        (directory / "migrations.rs", repair.registry_sha256),
+        (directory / "receipt.json", repair.receipt_sha256),
+    ):
+        _repair_private(evidence)
+        verify_staged(str(evidence), digest, "sealed repair artifact")
+    if plistlib.loads((directory / "candidate.plist").read_bytes()) != plistlib.loads(Path(parent.candidate_plist).read_bytes()):
+        raise ActivationError("repair configuration differs from the parent's captured private plist")
+    plist = plistlib.loads((directory / "candidate.plist").read_bytes())
+    if (plist.get("Label") != parent.label or plist.get("ProgramArguments") != [parent.target_binary]
+            or plist.get("EnvironmentVariables", {}).get("PHOENIX_DB_PATH") != upgrade.database_path):
+        raise ActivationError("repair private plist executable/database mismatch")
+    if [list(item) for item in migration_registry(directory / "migrations.rs")] != proof["target_ledger"]:
+        raise ActivationError("repair registry differs from original target128")
+    receipt = _repair_json(directory / "receipt.json")
+    checks = receipt.get("checks")
+    expected_checks = {"developer_id_signature": "verified", "hardened_runtime": "verified", "notarization": "accepted", "stapled_ticket": "validated", "gatekeeper": "accepted", "embedded_helper_bytes": "identical"}
+    target = receipt.get("target")
+    digests = receipt.get("sha256")
+    submission = checks.get("notarization_submission_id") if isinstance(checks, dict) else None
+    if not isinstance(submission, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", submission):
+        raise ActivationError("retained repair receipt submission UUID mismatch")
+    if (type(receipt.get("schema")) is not int or receipt.get("schema") != 1 or receipt.get("operation") != "prepare-main"
+            or receipt.get("commit") != repair.source_commit or receipt.get("version") != repair.version
+            or not isinstance(target, str) or target not in {"aarch64-apple-darwin", "x86_64-apple-darwin"}
+            or not isinstance(checks, dict) or any(checks.get(key) != value for key, value in expected_checks.items())
+            or not isinstance(digests, dict)
+            or digests.get(f"phoenix_ide-{target}-prepared-{repair.source_commit[:12]}") != repair.candidate_sha256):
+        raise ActivationError("retained repair receipt identity/signature/checksum mismatch")
+
+
+def validate_current_repair(path: Path, *, running_helper: bool = True) -> tuple[CurrentSchemaRepairManifest, Manifest, CurrentSchemaRepairStatus]:
+    repair, parent, status = classify_current_repair(path)
+    directory = path.parent
+    parent, proof = validate_current_repair_parent(
+        Path(repair.parent_manifest_path), require_claim=not (status.state == "committed" and not status.finalization_pending),
+        status_path=directory / "parent-status.json",
+    )
+    validate_current_repair_staging(
+        repair,
+        parent,
+        proof,
+        directory,
+        running_helper=running_helper,
+    )
+    return repair, parent, status
+
+
+def _write_repair_status(path: Path, status: CurrentSchemaRepairStatus) -> None:
+    atomic_write(path.parent / "status.json", (json.dumps(dataclasses.asdict(status), sort_keys=True) + "\n").encode())
+    CurrentSchemaRepairStatus.load(path.parent / "status.json", sha256(path))
+
+
+def _repair_capacity(parent: Manifest, *, reservation_required: bool) -> None:
+    upgrade = parent.current_schema_upgrade
+    restore = _restore_capacity_path(parent, Path(upgrade.database_path))
+    if reservation_required:
+        required = _source_capacity_bytes(Path(upgrade.database_path))
+        _repair_private(restore)
+        if restore.stat().st_size < required or restore.stat().st_blocks * 512 < required:
+            raise ActivationError("repair live database exceeds retained restore capacity")
+    # The repair adds a second bounded evidence lifecycle on the same pool.
+    for directory in {Path(upgrade.database_path).parent, Path(upgrade.backup_path).parent,
+                      Path(parent.target_binary).parent, Path(parent.target_plist).parent}:
+        if shutil.disk_usage(directory).free < MINIMUM_FREE_AFTER_RESERVATION_BYTES + CURRENT_SCHEMA_EVIDENCE_BUDGET_BYTES:
+            raise ActivationError("repair capacity cannot preserve safety floor and evidence allowance")
+
+
+def _repair_verify_database(parent: Manifest, directory: Path) -> None:
+    assert_database_exclusive(parent)
+    registry = directory / "migrations.rs"
+    repair_upgrade = dataclasses.replace(
+        parent.current_schema_upgrade,
+        migration_registry_path=str(registry),
+        migration_registry_sha256=CURRENT_REPAIR_REGISTRY_SHA256,
+    )
+    repair_validation_parent = dataclasses.replace(parent, current_schema_upgrade=repair_upgrade)
+    validate_current_schema_database(
+        Path(parent.current_schema_upgrade.database_path),
+        registry,
+        source_kind=parent.source_kind,
+        manifest=repair_validation_parent,
+        migrated=True,
+    )
+
+
+def _repair_verify_installed(runtime: Manifest) -> None:
+    verify_staged(runtime.target_binary, runtime.candidate_binary_sha256, "installed repair candidate")
+    result = subprocess.run([runtime.target_binary, "--build-identity"], capture_output=True, text=True, timeout=30, check=True)
+    try:
+        identity = json.loads(result.stdout)
+    except ValueError as exc:
+        raise ActivationError("installed repair build identity unreadable") from exc
+    if not isinstance(identity, dict) or identity.get("version") != runtime.expected.version or identity.get("git_sha") != runtime.expected.git_sha:
+        raise ActivationError("installed repair identity mismatch")
+
+
+def _repair_publication_path(parent: Manifest) -> Path:
+    target = Path(parent.target_plist)
+    return target.parent / f".{target.name}.current-schema-repair-{parent.transaction_id}"
+
+
+def _publish_current_repair(runtime: Manifest, parent: Manifest) -> None:
+    publication = _repair_publication_path(parent)
+    if os.path.lexists(publication):
+        _repair_private(publication)
+        verify_staged(str(publication), runtime.candidate_plist_sha256, "owned repair publication")
+        publication.unlink()
+        fsync_dir(publication.parent)
+    os.link(runtime.candidate_plist, publication)
+    fsync_dir(publication.parent)
+    commit_atomic_install(publication, Path(runtime.target_plist))
+
+
+def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Launchctl) -> None:
+    stopped = False
+    try:
+        launchctl.stop()
+    except Exception:
+        pass
+    try:
+        require_launchd_absence(parent.label, parent.uid)
+        stopped = True
+    except Exception:
+        stopped = False
+    truth = "failed_stopped" if stopped else "stop_unconfirmed"
+    print(f"current-schema repair teardown: {truth}; original claim retained", file=sys.stderr, flush=True)
+    try:
+        durable = CurrentSchemaRepairStatus.load(path.parent / "status.json", sha256(path))
+    except Exception:
+        # No valid checkpoint exists from which to construct a resumable status.
+        print("child status malformed; preserved unchanged, no terminal/checkpoint fabricated", file=sys.stderr, flush=True)
+        return
+    failed = dataclasses.replace(durable, state=truth, resume_from=durable.resume_from or durable.state,
+                                 finalization_pending=False, failure="repair failed; parent claim retained")
+    _write_repair_status(path, failed)
+
+
+def _current_repair_routing(path: Path) -> tuple[CurrentSchemaRepairManifest, Manifest]:
+    repair = CurrentSchemaRepairManifest.load(path)
+    parent_path = Path(repair.parent_manifest_path)
+    _repair_private(parent_path)
+    verify_staged(str(parent_path), repair.parent_manifest_sha256, "original repair parent manifest")
+    parent = Manifest.load(parent_path)
+    validate_manifest_identities(parent)
+    if (parent.helper_label != f"{DEPLOY_HELPER_LABEL_PREFIX}.{parent.transaction_id}" or parent.uid != os.getuid()
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", parent.transaction_id)
+            or not re.fullmatch(r"[A-Za-z0-9._-]+", parent.label)
+            or parent_path != Path(parent.candidate_binary).parent / "manifest.json"):
+        raise ActivationError("repair parent routing identity mismatch")
+    for name in ("lock_path", "active_path"):
+        route = Path(getattr(parent, name))
+        if not route.is_absolute() or route != route.resolve():
+            raise ActivationError("repair parent lock/claim routing mismatch")
+    _regular_nosymlink(Path(parent.lock_path), "parent operation lock", required=False)
+    return repair, parent
+
+
+def stop_invalid_current_repair(path: Path) -> None:
+    _repair, parent = _current_repair_routing(path)
+    with Path(parent.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another operation owns current-schema repair") from exc
+        _require_current_repair_claim(parent)
+        _record_current_repair_failure(path, parent, Launchctl(parent))
+
+
+def activate_current_repair(path: Path) -> str:
+    repair, parent = _current_repair_routing(path)
+    with Path(parent.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another operation owns current-schema repair") from exc
+        try:
+            repair, parent, status = validate_current_repair(path)
+        except Exception:
+            # Only the original owner can authorize teardown using hash-bound routing.
+            _require_current_repair_claim(parent)
+            _record_current_repair_failure(path, parent, Launchctl(parent))
+            raise
+        runtime = _repair_runtime(parent, repair, path.parent)
+        launchctl = Launchctl(runtime)
+        phase = status.resume_from or status.state
+        terminal = status.state == "committed" and not status.finalization_pending
+        try:
+            require_launchd_absence(parent.helper_label, parent.uid)
+            pending_running = False
+            if status.state == "committed" and status.finalization_pending:
+                observed, pid = launchctl.inspect()
+                pending_running = observed in {"running", "active"} and pid is not None
+                if not pending_running and observed != "not_loaded":
+                    raise ActivationError("pending repair runtime state is ambiguous")
+            if terminal or pending_running:
+                _repair_verify_installed(runtime)
+                require_loaded_plist(runtime, launchctl, Path(runtime.candidate_plist))
+                wait_for_identity(runtime, runtime.expected)
+                if terminal:
+                    if sha256(Path(runtime.target_plist)) != repair.plist_sha256 or Path(runtime.deployed_sha_path).read_text().strip() != repair.source_commit:
+                        raise ActivationError("terminal repair publication drift")
+                    owner = Path(parent.active_path).read_text().strip() if Path(parent.active_path).exists() else None
+                    if owner == parent.transaction_id and not release_claim(parent):
+                        raise ActivationError("terminal repair claim release failed")
+                    return "committed"
+            else:
+                if phase == "prepared":
+                    require_launchd_absence(parent.label, parent.uid)
+                else:
+                    launchctl.stop()
+                    require_launchd_absence(parent.label, parent.uid)
+                _repair_verify_database(parent, path.parent)
+                _repair_capacity(parent, reservation_required=phase != "committed")
+                atomic_install(Path(runtime.candidate_binary), Path(runtime.target_binary), 0o755)
+                _repair_verify_installed(runtime)
+                require_launchd_absence(parent.label, parent.uid)
+                assert_database_exclusive(parent)
+                if phase in {"prepared", "reconciliation_started"}:
+                    status = dataclasses.replace(status, state="reconciliation_started", resume_from=None, failure=None)
+                    _write_repair_status(path, status)
+                    phase = "reconciliation_started"
+                    environment = os.environ.copy()
+                    environment.update(plistlib.loads(Path(runtime.candidate_plist).read_bytes())["EnvironmentVariables"])
+                    result = subprocess.run([runtime.target_binary, "--migrate-only"], env=environment,
+                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                            timeout=7200, check=False)
+                    if result.returncode != 0:
+                        raise ActivationError("exact repair reconciliation failed")
+                    _repair_verify_database(parent, path.parent)
+                    _repair_capacity(parent, reservation_required=True)
+                    proof = {"protocol_version": 1, "manifest_sha256": sha256(path),
+                             "parent_proof_sha256": repair.parent_proof_sha256, "source_commit": repair.source_commit,
+                             "registry_sha256": repair.registry_sha256,
+                             "target_ledger": [list(item) for item in migration_registry(path.parent / "migrations.rs")]}
+                    atomic_write(path.parent / "proof.json", _encode_database_proof(proof))
+                    status = dataclasses.replace(status, state="target_verified", proof_sha256=sha256(path.parent / "proof.json"))
+                    _write_repair_status(path, status)
+                    phase = "target_verified"
+                _repair_verify_database(parent, path.parent)
+                _repair_verify_installed(runtime)
+                if phase != "committed":
+                    status = dataclasses.replace(status, state="start_attempted", resume_from=None, failure=None)
+                    _write_repair_status(path, status)
+                    phase = "start_attempted"
+                launchctl.start(None, plist_path=runtime.candidate_plist)
+                require_loaded_plist(runtime, launchctl, Path(runtime.candidate_plist))
+                wait_for_identity(runtime, runtime.expected)
+            status = dataclasses.replace(status, state="committed", resume_from=None, failure=None, finalization_pending=True)
+            _write_repair_status(path, status)
+            phase = "committed"
+            _repair_capacity(parent, reservation_required=False)
+            atomic_write(Path(runtime.deployed_sha_path), (repair.source_commit + "\n").encode())
+            _publish_current_repair(runtime, parent)
+            restore = _restore_capacity_path(parent, Path(parent.current_schema_upgrade.database_path))
+            _regular_nosymlink(restore, "original restore reservation", required=False)
+            restore.unlink(missing_ok=True)
+            fsync_dir(restore.parent)
+            status = dataclasses.replace(status, finalization_pending=False)
+            _write_repair_status(path, status)
+            terminal = True
+            if not release_claim(parent):
+                raise ActivationError("repair completed but exact original claim release failed")
+            return "committed"
+        except Exception:
+            if terminal:
+                raise
+            _record_current_repair_failure(path, parent, launchctl)
+            raise
+
+
 def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
+    refuse_selected_current_repair(manifest)
     with Path(manifest.lock_path).open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2599,6 +3195,7 @@ def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
         upgrade = prepared_database_upgrade(manifest)
         if upgrade is None:
             raise ActivationError("finalization requires a prepared database transaction")
+        refuse_selected_current_repair(manifest)
         if current_schema != (manifest.current_schema_upgrade is not None):
             raise ActivationError("finalization command does not match prepared database mode")
         status = read_status(manifest)
@@ -2729,6 +3326,7 @@ def resume_forward(manifest: Manifest) -> str:
 
 
 def recover_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
+    refuse_selected_current_repair(manifest)
     with Path(manifest.lock_path).open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2810,6 +3408,8 @@ def recover_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
 
 
 def status_is_durable_terminal(manifest: Manifest) -> bool:
+    if os.path.lexists(current_repair_entry(manifest)) or current_repair_entry(manifest).parent.is_symlink():
+        return False  # Only the child terminal path may release the original claim.
     try:
         status = read_status(manifest)
         return (
@@ -2839,6 +3439,8 @@ def main() -> int:
             "finalize-paired",
             "finalize-current",
             "resume-forward",
+            "activate-current-repair",
+            "resume-current-repair",
         ],
     )
     parser.add_argument("--protocol-version", action="store_true")
@@ -2855,6 +3457,27 @@ def main() -> int:
         return 0 if result.returncode != 0 and service_absence_confirmed(result.stdout + "\n" + result.stderr, args.probe_service_absence, args.uid) else 1
     if args.manifest is None or args.helper_label is None or args.uid is None:
         parser.error("activation requires --manifest, --helper-label, and --uid")
+    if args.command in {"activate-current-repair", "resume-current-repair"}:
+        verified_repair_label = None
+        try:
+            repair, parent = _current_repair_routing(args.manifest)
+            expected_label = f"{DEPLOY_HELPER_LABEL_PREFIX}.{parent.transaction_id}.current-schema-repair"
+            if (repair.helper_label != expected_label or args.helper_label != expected_label
+                    or args.uid != parent.uid or args.uid != os.getuid()):
+                raise ActivationError("repair helper invocation identity mismatch")
+            verified_repair_label = expected_label
+            state = activate_current_repair(args.manifest)
+            print(state, flush=True)
+            return 0
+        except Exception as exc:
+            print(f"current-schema repair refused/failed: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            if verified_repair_label is not None:
+                try:
+                    request_helper_bootout(args.uid, verified_repair_label)
+                except Exception:
+                    pass
     manifest = None
     verified_helper_label: Optional[str] = None
     try:
