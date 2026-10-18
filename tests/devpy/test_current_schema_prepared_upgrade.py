@@ -94,11 +94,24 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         rollback_binary.write_text("old")
         candidate_plist = self.root / "candidate.plist"
         rollback_plist = self.root / "rollback.plist"
-        plist = plistlib.dumps(
-            {"EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)}}
+        candidate_plist.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "test.phoenix",
+                    "ProgramArguments": [str(candidate_binary)],
+                    "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
+                }
+            )
         )
-        candidate_plist.write_bytes(plist)
-        rollback_plist.write_bytes(plist)
+        rollback_plist.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "test.phoenix",
+                    "ProgramArguments": [str(rollback_binary)],
+                    "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
+                }
+            )
+        )
         registry = transaction / "migrations.rs"
         registry.write_bytes(self.registry.read_bytes())
         copied_helper = transaction / "helper.py"
