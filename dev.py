@@ -10461,10 +10461,27 @@ def _deploy_manifest_kind(transaction: Path) -> DeployManifestKind:
             "database_path", "helper_path", "helper_sha256",
         } | registry_fields,
     }
+    prepared_source114_fields = required_fields[DeployManifestKind.CURRENT_SCHEMA] | {
+        "prepared_source_baseline", "candidate_registry_expected_sha256",
+    }
     for kind, value in mode_payloads.items():
-        if value is not None and (
-            not isinstance(value, dict)
-            or value.keys() != required_fields[kind]
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            return DeployManifestKind.UNKNOWN
+        if kind is DeployManifestKind.CURRENT_SCHEMA and value.keys() == prepared_source114_fields:
+            if (
+                type(value["prepared_source_baseline"]) is not int
+                or value["prepared_source_baseline"] != 114
+                or any(
+                    not isinstance(field, str) or not field.strip()
+                    for key, field in value.items()
+                    if key != "prepared_source_baseline"
+                )
+            ):
+                return DeployManifestKind.UNKNOWN
+        elif (
+            value.keys() != required_fields[kind]
             or any(not isinstance(field, str) or not field.strip() for field in value.values())
         ):
             return DeployManifestKind.UNKNOWN

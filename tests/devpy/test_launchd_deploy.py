@@ -4821,6 +4821,45 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
                             admission("new-operation")
                         self.assertEqual(self.active.read_text(), "protected\n")
 
+    def test_classifier_accepts_only_complete_typed_prepared_source114_evidence(self):
+        qualified = mode_evidence(self.staging, "current_schema_upgrade") | {
+            "prepared_source_baseline": 114,
+            "candidate_registry_expected_sha256": self.dev.PREPARED_SOURCE114_REGISTRY_SHA256,
+        }
+        self.manifest.write_text(json.dumps({
+            "source_kind": "prepared_artifact",
+            "current_schema_upgrade": qualified,
+        }))
+        self.assertIs(
+            self.dev._deploy_manifest_kind(self.staging),
+            self.dev.DeployManifestKind.CURRENT_SCHEMA,
+        )
+        loadable = self.staging / "qualified-loadable.json"
+        loadable.write_text(json.dumps(dataclasses.asdict(make_manifest(self.staging)) | {
+            "source_kind": "prepared_artifact",
+            "current_schema_upgrade": qualified,
+        }))
+        loaded = helper.Manifest.load(loadable)
+        self.assertIsInstance(loaded.current_schema_upgrade, helper.PreparedSource114Upgrade)
+
+        for changed in (
+            qualified | {"prepared_source_baseline": 113},
+            qualified | {"prepared_source_baseline": "114"},
+            qualified | {"candidate_registry_expected_sha256": ""},
+            {key: value for key, value in qualified.items() if key != "prepared_source_baseline"},
+            qualified | {"unexpected": "field"},
+        ):
+            with self.subTest(changed=changed):
+                self.manifest.write_text(json.dumps({
+                    "source_kind": "prepared_artifact",
+                    "current_schema_upgrade": changed,
+                }))
+                self.assertIs(
+                    self.dev._deploy_manifest_kind(self.staging),
+                    self.dev.DeployManifestKind.UNKNOWN,
+                )
+                self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+
     def test_controller_admission_rejects_status_source_mode_cross_matrix(self):
         for mode in ("paired_database_upgrade", "current_schema_upgrade"):
             current = mode == "current_schema_upgrade"
