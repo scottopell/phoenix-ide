@@ -365,7 +365,8 @@ CI `39027454259` at `5c8526f561659afa206f5a406c05cffeb4107074`. It demonstrates
 private staging, launchd start, causal runner termination, same-label ACK recovery, and exact
 stop/uninstall for fake resources. A successor journey derives ACK-only recovery,
 continuation-to-readiness, and terminal completion from durable controller state inside the
-same disposable installation owner; exact-head hosted qualification is pending. Neither journey
+same disposable installation owner; it passes exact-head macOS run `39086283270` and full CI
+run `39086281970` at `0e89075198623f01c414ebffeaa6fa433e55c562`. Neither journey
 demonstrates application deployment.
 
 The remaining replacement gaps are explicit:
