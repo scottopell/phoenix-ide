@@ -2,6 +2,7 @@
 """Synthetic filesystem tests only: no SQL, HTTP, browser, or app execution."""
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -120,6 +121,148 @@ class SafePublicationTests(unittest.TestCase):
         self.assertEqual(value['identity']['evidence_class'], 'instrumented_cfg_test_library_not_shipping_runtime')
         self.assertEqual(value['ui_artifacts']['stock_natural']['manifest_sha256'], 'c' * 64)
         self.assertEqual(case['publication_gates']['long_tasks'], 'not_emitted_by_pinned_driver')
+
+    def test_fixed_inventory_and_phases_are_pinned_to_actual_producers(self):
+        scripts = Path(__file__).resolve().parents[2] / 'ui/scripts'
+        browser = (scripts / 'qualify-history-opening-realserver.mjs').read_text()
+        checks = set(re.findall(r"checked\('([^']+)'", browser))
+        checks.update(re.findall(r"sameAnchor\(before, '([^']+)'", browser))
+        self.assertEqual(set(publication.HISTORY_CHECKS), checks)
+        self.assertEqual(len(publication.HISTORY_CHECKS), len(checks))
+        joint = (scripts / 'history-joint-telemetry.mjs').read_text().split('export async function runJointTelemetryStage', 1)[1]
+        self.assertEqual(set(publication.JOINT_PHASES), set(re.findall(r"phase = '([^']+)'", joint)))
+        cleanup = set(re.findall(r"retainCleanupFailure\(result, '([^']+)'", browser))
+        self.assertEqual(set(publication.BROWSER_CLEANUP_STAGES), cleanup)
+        producer = (Path(__file__).parent / 'history_opening_browser.py').read_text()
+        stages = set(re.findall(r'remember_(?:primary|cleanup)\("([^"]+)"', producer))
+        stages.update(re.findall(r'\), "(receiver|server|preview|browser)"\) as', producer))
+        # receiver_context is passed directly rather than wrapped in owned_process().
+        stages.add('receiver')
+        self.assertEqual(set(publication.LIFECYCLE_STAGES), stages)
+
+    def test_failed_nine_checks_and_known_phase_survive_secret_mutations(self):
+        previous = None
+        for secret in ('UNIT_ONLY_cookie_abc', 'https://private.invalid/path?token=UNIT_ONLY_def'):
+            nested = {'message': secret, 'headers': {'Authorization': secret}, 'path': secret,
+                      'url': secret, 'database': secret, 'raw_otlp': secret}
+            self.write('result.json', {'status': 'failed', 'error': secret, 'aggregation_errors': [nested]})
+            self.write('ordinary/browser-result.json', {'status': 'failed',
+                'checks': list(publication.HISTORY_CHECKS[:9]), 'error': secret,
+                'cleanup_failures': [{'stage': 'browser_cleanup', 'error': secret, 'truncated': False,
+                                      'network': nested}], 'cleanup_overflow': False,
+                'application_page_errors': [nested], 'cdp_capture_errors': [secret], 'network': nested})
+            self.write('ordinary/joint-telemetry-dependency-manifest.json', {
+                'failure_phase': 'module_checks', 'context_acquired': True,
+                'primary_failure': secret, 'authentication_response_cleanup_failure': secret,
+                'cleanup_failures': [secret], 'before': nested, 'after': nested})
+            self.write('ordinary/lifecycle-failures.json', {'primary': {'stage': 'browser',
+                'type': secret, 'message': secret, 'message_truncated': False},
+                'cleanup': [{'stage': 'server_control_stop', 'message': secret, 'network': nested}],
+                'cleanup_overflow': False})
+            value = publication.project(self.root)
+            serialized = json.dumps(value)
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn('Authorization', serialized)
+            self.assertNotIn('raw_otlp', serialized)
+            if previous is not None:
+                self.assertEqual(value, previous)
+            previous = value
+            diag = value['cases']['ordinary']['diagnostics']
+            self.assertEqual(diag['browser']['checks']['items'], [
+                {'name': name, 'passed': True} for name in publication.HISTORY_CHECKS[:9]])
+            self.assertEqual(diag['joint_dependency_manifest']['failure_phase'], 'module_checks')
+            self.assertTrue(diag['joint_dependency_manifest']['context_acquired'])
+            self.assertTrue(diag['joint_dependency_manifest']['primary_failure_present'])
+            self.assertEqual(diag['joint_dependency_manifest']['cleanup_failure_count'], 1)
+            self.assertEqual(diag['lifecycle_failures']['primary']['stage'], 'browser')
+            self.assertTrue(diag['lifecycle_failures']['primary']['message_present'])
+            self.assertEqual(diag['browser']['cleanup_failures']['items'][0]['stage'], 'browser_cleanup')
+        for phase in publication.JOINT_PHASES:
+            self.assertEqual(publication.joint_diagnostics({'failure_phase': phase})['failure_phase'], phase)
+        unknown = publication.joint_diagnostics({'failure_phase': 'UNIT_ONLY_secret',
+                                                 'primary_failure': 'module_checks'})
+        self.assertNotIn('failure_phase', unknown)
+        self.assertEqual(unknown['phase_boundary'], 'unsupported_shape')
+
+    def test_diagnostic_missing_artifact_unsupported_shape_and_field_mismatch_are_distinct(self):
+        case = publication.project(self.root)['cases']['ordinary']
+        self.assertEqual(case['diagnostics']['browser']['checks_boundary'], 'missing_artifact')
+        self.assertEqual(case['diagnostics']['joint_dependency_manifest']['phase_boundary'], 'missing_artifact')
+        self.assertEqual(case['correlation_boundaries']['exported'], 'missing_artifact')
+        self.write('ordinary/browser-result.json', {'checks': {'UNIT_ONLY_secret': True}})
+        self.assertEqual(publication.project(self.root)['cases']['ordinary']['diagnostics']['browser']['checks_boundary'], 'unsupported_shape')
+        self.write('ordinary/browser-result.json', {'checks': ['UNIT_ONLY_secret']})
+        check = publication.project(self.root)['cases']['ordinary']['diagnostics']['browser']['checks']['items'][0]
+        self.assertEqual(check, {'publication_read': 'unsupported_shape'})
+        rid = 'history-ordinary-' + 'a' * 16
+        self.write('ordinary/telemetry/telemetry-browser-result.json', {'run_id': rid})
+        self.write('ordinary/telemetry-delivery.json', {'runId': rid, 'retrieved': []})
+        self.write('ordinary/telemetry-final.json', {'exported': []})
+        boundaries = publication.project(self.root)['cases']['ordinary']['correlation_boundaries']
+        for key in ('browser_runId', 'delivery_run_id', 'exported', 'final_retrieved'):
+            self.assertEqual(boundaries[key], 'field_name_mismatch')
+        self.assertEqual(boundaries['collector_acceptances'], 'missing_field')
+        self.assertEqual(publication.correlation({'kind': 'request', 'request_id': 'a'})['id_boundary'], 'field_name_mismatch')
+        for value in (None, [], 'UNIT_ONLY_secret', {'nested': 'UNIT_ONLY_secret'}):
+            self.assertEqual(publication.joint_diagnostics({'failure_phase': value})['phase_boundary'],
+                             'present' if value is None else 'unsupported_shape')
+
+    def test_actual_uuid_inventory_locations_remain_joinable_without_network_strings(self):
+        uid = '12345678-1234-4234-8234-123456789abc'
+        request = '22345678-1234-4234-8234-123456789abc'
+        stream = '32345678-1234-4234-8234-123456789abc'
+        rid = 'history-ordinary-' + 'a' * 16
+        secret = 'UNIT_ONLY_NETWORK_HEADER_PATH'
+        self.write('ordinary/telemetry/telemetry-browser-result.json', {
+            'runId': rid, 'journeys': [{'open_id': uid, 'correlations': [
+                {'kind': 'request', 'id': request}, {'kind': 'sse', 'id': stream}],
+                'expected': {'server.instance_id': uid, 'server.backend_source': 'b' * 40}}],
+            'trials': [{'reports': [{'open_id': uid}],
+                'statuses': [{'open_id': uid, 'status': 204, 'headers': secret}],
+                'request_facts': [{'kind': 'snapshot', 'open_id': request, 'response_status': 200,
+                                   'url': secret}],
+                'requestRecords': [{'kind': 'request', 'open_id': request, 'trace_id': 'c' * 32,
+                                    'pathname': secret}],
+                'requestOwners': [{'journey_id': uid, 'request_id': request, 'path': secret}],
+                'streamOwners': [{'journey_id': uid, 'stream_id': stream, 'Cookie': secret}]}]})
+        accepted = {'schema_version': 1, 'open_id': uid, 'server_instance_id': uid,
+                    'backend_source': 'b' * 40, 'status': 204}
+        exported = {'open_id': uid, 'trace_id': 'd' * 32, 'outcome': 'ready'}
+        self.write('ordinary/telemetry-delivery.json', {'run_id': rid,
+            'collector_acceptances': [accepted], 'exported': [exported], 'service_name': secret})
+        self.write('ordinary/telemetry-final.json', {'run_id': rid, 'retrieved': [exported], 'network': secret})
+        case = publication.project(self.root)['cases']['ordinary']
+        self.assertNotIn(secret, json.dumps(case))
+        self.assertEqual(case['collector_acceptances']['items'], [accepted])
+        self.assertEqual(case['exported']['items'], [exported])
+        self.assertEqual(case['final_export']['items'], [exported])
+        self.assertTrue(all(state == 'present' for state in case['correlation_boundaries'].values()))
+        self.assertEqual(case['publication_gates']['delivery'], 'typed_inventory_present_not_revalidated')
+        trial = case['natural_trials'][0]
+        self.assertEqual(trial['reports']['items'][0]['open_id'], accepted['open_id'])
+        self.assertEqual(trial['statuses']['items'][0]['open_id'], exported['open_id'])
+        self.assertEqual(trial['request_facts']['items'][0]['open_id'], request)
+        self.assertEqual(trial['requestRecords']['items'][0]['open_id'], request)
+        self.assertEqual(trial['requestOwners']['items'][0], {'journey_id': uid, 'request_id': request})
+        self.assertEqual(trial['streamOwners']['items'][0], {'journey_id': uid, 'stream_id': stream})
+        # The final receipt can exist before a delivery seal: never relabel it as delivery.
+        (self.root / 'ordinary/telemetry-delivery.json').unlink()
+        case = publication.project(self.root)['cases']['ordinary']
+        self.assertEqual(case['final_export']['items'], [exported])
+        self.assertEqual(case['correlation_boundaries']['exported'], 'missing_artifact')
+
+    def test_cleanup_and_check_overflow_remain_bounded(self):
+        browser = publication.browser_diagnostics({'checks': list(publication.HISTORY_CHECKS) * 2,
+            'cleanup_failures': [{'stage': 'browser_cleanup', 'error': 'UNIT_ONLY_secret'}] * 10,
+            'cleanup_overflow': True})
+        self.assertEqual(browser['checks']['count'], 24)
+        self.assertTrue(browser['checks']['overflow'])
+        self.assertEqual(len(browser['checks']['items']), 12)
+        self.assertEqual(len(browser['cleanup_failures']['items']), 8)
+        self.assertEqual(browser['cleanup_failures']['count'], 10)
+        self.assertTrue(browser['cleanup_failures']['overflow'])
+        self.assertTrue(browser['cleanup_overflow'])
+        self.assertNotIn('UNIT_ONLY_secret', json.dumps(browser))
 
     def test_missing_malformed_and_symlinked_receipts_are_not_success_or_payload(self):
         value = publication.project(self.root)

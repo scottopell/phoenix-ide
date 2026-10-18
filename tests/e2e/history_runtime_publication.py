@@ -73,6 +73,30 @@ REPORT_BOOLS = ('standalone', 'frontend_source_dirty', 'visible', 'timeline_satu
                 'background_open', 'observer_scan_limited', 'counters_saturated')
 
 
+# qualify-history-opening-realserver.mjs checked() records completed assertions only.
+HISTORY_CHECKS = (
+    'manual equal-text accepted opening remains separate',
+    'Global earlier-history acquisition failed while Pending before release',
+    'Global declared postfault physical historical baseline while Pending',
+    'committed Pending: browser/HTTP/new SSE init available, opening deferred and composer readonly',
+    'acceptance retains physical anchor',
+    'actual successor chat ACK receipt',
+    'accepted SSE unblocks exact successor composer despite actual aggregate GET failure',
+    'reconnect retains physical anchor',
+    'same-page transport SSE drop/reconnect preserves accepted full-edge identity',
+    'ordinary chapter ownedGuard acquisition uses restored real aggregate transport',
+    'Global cache-backed chapter selection with observed browser request slice',
+    'accepted manual opening renders once with exact persisted identity after real chapter click',
+)
+JOINT_PHASES = ('runtime_import', 'export_admission', 'context_acquisition',
+    'session_authentication', 'page_acquisition', 'module_checks', 'result_validation')
+BROWSER_CLEANUP_STAGES = ('authentication_response', 'recorder_drain', 'history_gate',
+    'joint_browser_cleanup', 'server_stop', 'browser_cleanup', 'recorder_final')
+LIFECYCLE_STAGES = ('receiver', 'server', 'preview', 'browser', 'server_body', 'case',
+    'normal_completion', 'normal_completion_receipt', 'server_control_stop',
+    'failure_receipt', 'failure_drain')
+
+
 def object_value(value):
     return value if isinstance(value, dict) else {}
 
@@ -107,11 +131,78 @@ def bounded_records(value, key, limit, projector):
             'items': [projector(item) for item in items[:limit]]}
 
 
+def field_boundary(value, key, valid, *, aliases=()):
+    value = object_value(value)
+    read = scalars(value).get('publication_read')
+    if read:
+        return 'missing_artifact' if read == 'missing' else read
+    if key not in value:
+        return 'field_name_mismatch' if any(alias in value for alias in aliases) else 'missing_field'
+    return 'present' if valid else 'unsupported_shape'
+
+
+def failure_presence(value, keys):
+    value = object_value(value)
+    return {key + '_present': key in value and value[key] is not None for key in keys}
+
+
+def failure_record(value, stages, text_key):
+    value = object_value(value)
+    out = scalars(value, booleans=('truncated', 'message_truncated'), enums={'stage': stages})
+    out.update(failure_presence(value, (text_key,)))
+    out['stage_boundary'] = field_boundary(value, 'stage', 'stage' in out)
+    return out
+
+
+def browser_diagnostics(value):
+    value = object_value(value)
+    def check(item):
+        return ({'name': item, 'passed': True} if type(item) is str and item in HISTORY_CHECKS
+                else {'publication_read': 'unsupported_shape'})
+    out = scalars(value, booleans=('cleanup_overflow',))
+    out.update(failure_presence(value, ('error',)))
+    out['checks'] = bounded_records(value, 'checks', len(HISTORY_CHECKS), check)
+    out['checks_boundary'] = field_boundary(value, 'checks', isinstance(value.get('checks'), list))
+    out['cleanup_failures'] = bounded_records(value, 'cleanup_failures', 8,
+        lambda item: failure_record(item, BROWSER_CLEANUP_STAGES, 'error'))
+    out['cleanup_boundary'] = field_boundary(value, 'cleanup_failures', isinstance(value.get('cleanup_failures'), list))
+    for key in ('application_page_errors', 'cdp_capture_errors'):
+        out[key + '_count'] = inventory(value, key)
+    return out
+
+
+def joint_diagnostics(value):
+    value = object_value(value)
+    out = scalars(value, booleans=('context_acquired',), enums={'failure_phase': JOINT_PHASES})
+    if 'failure_phase' in value and value['failure_phase'] is None:
+        out['failure_phase'] = None
+    out['phase_boundary'] = field_boundary(value, 'failure_phase', 'failure_phase' in out)
+    out.update(failure_presence(value, ('primary_failure', 'authentication_response_cleanup_failure')))
+    out['cleanup_failure_count'] = inventory(value, 'cleanup_failures')
+    out['cleanup_boundary'] = field_boundary(value, 'cleanup_failures', isinstance(value.get('cleanup_failures'), list))
+    return out
+
+
+def lifecycle_diagnostics(value):
+    value = object_value(value)
+    out = scalars(value, booleans=('cleanup_overflow',))
+    out['primary'] = (None if value.get('primary') is None else
+                      failure_record(value['primary'], LIFECYCLE_STAGES, 'message'))
+    out['primary_boundary'] = field_boundary(value, 'primary', value.get('primary') is None
+                                            or isinstance(value.get('primary'), dict))
+    out['cleanup'] = bounded_records(value, 'cleanup', 8,
+        lambda item: failure_record(item, LIFECYCLE_STAGES, 'message'))
+    out['cleanup_boundary'] = field_boundary(value, 'cleanup', isinstance(value.get('cleanup'), list))
+    return out
+
+
 def correlation(value):
     value = object_value(value)
     out = scalars(value, enums={'kind': ('request', 'sse', 'trace')})
     out.update(identifiers(value, traces=('id',)) if value.get('kind') == 'trace'
                else identifiers(value, uuids=('id',)))
+    out['id_boundary'] = field_boundary(value, 'id', 'id' in out,
+                                        aliases=('request_id', 'stream_id', 'trace_id'))
     return out
 
 
@@ -158,6 +249,14 @@ def metric(value):
     return out if set(out) == {'name', 'value'} else {'publication_read': 'invalid_metric'}
 
 
+def request_fact(value):
+    return (scalars(value, booleans=('request_failed', 'has_before', 'finished', 'failed'),
+                    numbers=('ordinal', 'response_status', 'status'),
+                    enums={'kind': ('report', 'snapshot', 'global_history', 'request', 'sse'),
+                           'observed_phase': ('open', 'closing')})
+            | identifiers(value, uuids=('open_id',), traces=('trace_id',)))
+
+
 def trial(value):
     value = object_value(value)
     out = scalars(value, booleans=('sampled', 'warmup', 'context_closed', 'metric_reset'),
@@ -187,6 +286,16 @@ def trial(value):
                  'admitted_count', 'sampled_count', 'transport_dropped_count', 'transport_failed_count'))
     out['reports'] = bounded_records(value, 'reports', 16, report)
     out['producer_events'] = bounded_records(value, 'producer_events', 64, producer_event)
+    # qualify-view-telemetry and the appended history inventory use distinct field names.
+    out['statuses'] = bounded_records(value, 'statuses', 16,
+        lambda item: (scalars(item, numbers=('status',)) | identifiers(item, uuids=('open_id',)))
+        if isinstance(item, dict) else scalars({'status': item}, numbers=('status',)))
+    out['request_facts'] = bounded_records(value, 'request_facts', 32, request_fact)
+    out['requestRecords'] = bounded_records(value, 'requestRecords', 128, request_fact)
+    for key, id_key in (('requestOwners', 'request_id'), ('streamOwners', 'stream_id')):
+        out[key] = bounded_records(value, key, 512,
+            lambda item, id_key=id_key: identifiers(item, uuids=('journey_id', id_key)))
+    out.update(failure_presence(value, ('ownershipFailure', 'callback_failure', 'persistence_failure')))
     out['response_statuses'] = bounded_records(value, 'response_statuses', 16,
                                                lambda item: scalars({'status': item}, numbers=('status',)))
     return out
@@ -225,6 +334,8 @@ def project(root):
         'schema_version': 1,
         'scope': 'stock-only typed raw distributions, not raw payloads or shipping/overhead clearance',
         'full_acceptance': False, 'overhead_clearance': False,
+        'failure_presence': failure_presence(result, ('error',)),
+        'aggregation_error_count': inventory(result, 'aggregation_errors'),
         'result': scalars(result, booleans=('runtime_executed', 'joint_telemetry'),
                           numbers=('elapsed_seconds',), enums={'status': ('failed', 'passed_assertions'),
                           'telemetry_evidence_class': ('stock_natural', 'controlled_functional')}),
@@ -240,6 +351,8 @@ def project(root):
         completion = read('server-completion.json')
         failures = read('lifecycle-failures.json')
         delivery = read('telemetry-delivery.json')
+        final = read('telemetry-final.json')
+        joint = read('joint-telemetry-dependency-manifest.json')
         case = {
             'authentication': scalars(read('authentication.json'),
                                       booleans=('auth_required', 'parent_authenticated')),
@@ -248,6 +361,9 @@ def project(root):
                 enums={'status': ('success', 'failed', 'timeout', 'cleanup_failed', 'nonzero_exit',
                                   'signal_exit', 'force_cleanup_required', 'stop_request_failed')}),
             'browser': scalars(browser, enums={'status': ('failed', 'passed_assertions')}),
+            'diagnostics': {'browser': browser_diagnostics(browser),
+                            'joint_dependency_manifest': joint_diagnostics(joint),
+                            'lifecycle_failures': lifecycle_diagnostics(failures)},
             'browser_check_count': inventory(browser, 'checks'),
             'lifecycle_failure_present': failures.get('primary') is not None if 'primary' in failures else None,
             'cleanup_failure_count': inventory(failures, 'cleanup'),
@@ -260,12 +376,23 @@ def project(root):
                                     hashes=('appSource', 'frontendSource')),
             'telemetry_failure_present': 'failure' in telemetry,
             'telemetry_cleanup_failure_present': 'cleanup_failure' in telemetry,
+            'telemetry_context_cleanup_failure_present': 'context_cleanup_failure' in telemetry,
             'telemetry_evidence': scalars(telemetry, enums={'evidence_class': ('stock_natural',),
                 'status': ('failed', 'passed_assertions')}),
             'run_correlation': run_correlation(telemetry),
             'delivery_correlation': run_correlation(delivery),
             'collector_acceptances': bounded_records(delivery, 'collector_acceptances', 64, acceptance),
             'exported': bounded_records(delivery, 'exported', 64, acceptance),
+            'final_export': bounded_records(final, 'retrieved', 64, acceptance),
+            'export_correlation': run_correlation(final),
+            'correlation_boundaries': {
+                'browser_runId': field_boundary(telemetry, 'runId', 'runId' in run_correlation(telemetry), aliases=('run_id',)),
+                'delivery_run_id': field_boundary(delivery, 'run_id', 'run_id' in run_correlation(delivery), aliases=('runId',)),
+                'final_run_id': field_boundary(final, 'run_id', 'run_id' in run_correlation(final), aliases=('runId',)),
+                'collector_acceptances': field_boundary(delivery, 'collector_acceptances', isinstance(delivery.get('collector_acceptances'), list)),
+                'exported': field_boundary(delivery, 'exported', isinstance(delivery.get('exported'), list), aliases=('retrieved',)),
+                'final_retrieved': field_boundary(final, 'retrieved', isinstance(final.get('retrieved'), list), aliases=('exported',)),
+            },
             'journeys': bounded_records(telemetry, 'journeys', 64, journey),
             'stages': {stage: bounded_records(object_value(telemetry.get(stage)), 'trials', 64, trial)
                        for stage in ('terminal', 'lifecycle')},
