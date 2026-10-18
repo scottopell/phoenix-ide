@@ -134,6 +134,7 @@ The local Coordinator home decision is [ADR-101](101_coordinator-instance-owned-
 | [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
+| [118](118_public-literal-chat-uses-a-dedicated-fail-closed-route.md) | Public literal chat uses a dedicated fail-closed route | Accepted | REQ-API-030, REQ-COMP-015; built-in API guidance |
 
 ## For agents: which decisions bind your task
 

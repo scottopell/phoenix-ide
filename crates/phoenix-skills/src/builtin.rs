@@ -309,7 +309,15 @@ mod tests {
         assert!(reference.contains("conversation.state.type == \"context_exhausted\""));
         assert!(!reference.contains("verified as `ContextExhausted`"));
         assert!(reference.contains("send_conversation_message"));
-        assert!(reference.contains("Do not use `POST /api/conversations/{id}/chat`"));
+        assert!(reference
+            .contains("Do not use omitted/default `expand_references` mode for literal steering"));
+        assert!(reference.contains("GET /api/version"));
+        assert!(reference.contains("`chat_literal_text_v1` field is boolean `true`"));
+        assert!(reference.contains("stop before POST"));
+        assert!(reference.contains("no redirects"));
+        assert!(reference.contains("Never probe support with a chat POST"));
+        assert!(reference.contains("same original destination/transcript"));
+        assert!(skill.contains("chat_literal_text_v1"));
         assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
         assert!(reference.contains("same original predecessor, message identity, and intent"));
         assert!(

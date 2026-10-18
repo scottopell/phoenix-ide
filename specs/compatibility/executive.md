@@ -45,3 +45,10 @@ Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as
 ## Next work
 
 Task 44016 should enforce the offline downgrade boundary and make runtime-artifact rollback messaging truthful. A wider compatibility effort should inventory existing guarantees, classify accidental compatibility, remove machinery that serves unsupported scenarios, and audit feature-owned migration data policies.
+
+
+## Public literal chat
+
+REQ-COMP-015 and ADR-118 bound the new `chat_literal_text_v1` contract to complete capability discovery plus the dedicated `/chat/literal` route, never a field-only `/chat` request. Unsupported/malformed capability stops before POST; an older route refusal after discovery does not permit fallback. Transcript-only historical replay remains accepted only for default expanding intent; nondefault literal replay requires policy-bearing durable evidence. No database migration, downgrade, mixed-version ownership, live-replacement or deployment guarantee is added.
+
+Offline preflight self-tests and source/guidance drift checks cover the failure boundary without contacting a destination. Rust replay/router and real-binary E2E regressions are authored but unexecuted locally under the no-build constraint. No deployed contract is asserted.

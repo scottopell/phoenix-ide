@@ -205,3 +205,22 @@ At or after the marker, THE SYSTEM SHALL NOT restore the backup or predecessor r
 THE SYSTEM SHALL NOT infer support for any other release, baseline, target registry, prepared/local source, bare-Linux backend, downgrade, or generic rollback facility from this exception. Ordinary systemd activation through the controller enforcing REQ-PD-026 SHALL reject observed pending migrations before handoff; for an existing database it SHALL derive the complete target by executing the exact candidate's `--migrate-only` on an isolated empty DB, not source-registry parsing, and fail closed on derivation/hash/integrity/FK/ledger verification failure. A missing configured database with any installed predecessor artifact or runtime identity SHALL reject before handoff; only a true first install without predecessor evidence MAY omit the database. The helper SHALL mirror this refusal for a captured predecessor or rollback artifact. This controller-side preflight SHALL leave the protocol-v1 ordinary helper manifest unchanged; exact-target/no-pending ordinary activation remains supported. This requirement SHALL NOT establish a guarantee for historical controllers that lack that gate.
 
 This feature-scoped backup retention does not establish a project-wide backup retention or disaster recovery service.
+
+
+### REQ-COMP-015 — Public Literal Chat Fails Closed Across Capability Loss
+
+The public literal-chat contract is identified only by boolean `chat_literal_text_v1: true` on `GET /api/version` and the dedicated `POST /api/conversations/{id}/chat/literal` route defined by `specs/api/requirements.md` REQ-API-030. A release number, local source, or an unknown request field accepted by a server SHALL NOT establish support.
+
+WHEN capability is missing, false, malformed, redirected, or otherwise uncertain
+THE public literal-chat recipe SHALL stop before sending a chat POST
+AND SHALL NOT fall back to `/chat` or an expanding policy.
+
+WHEN a receiver without the dedicated literal route handles a request after capability discovery
+THE client SHALL treat route refusal as failure, not permission to use `/chat`
+AND SHALL NOT claim that a request field on `/chat` prevents a historical receiver from ignoring it.
+
+WHEN replay evidence consists only of matching historical transcript content without policy-bearing acceptance evidence
+THE SYSTEM SHALL retain default `expand_references` replay semantics
+AND SHALL reject nondefault-policy replay as an idempotency conflict.
+
+This guarantee is bounded to fail-closed client guidance, the dedicated public endpoint and policy-proven replay. It SHALL NOT establish database downgrade, historical binary support, mixed-version database ownership, runtime replacement, deployment, or automatic recovery guarantees. Capability discovery SHALL NOT authorize an operation or replace destination authentication, TLS verification, active WorkScope or lifecycle admission.

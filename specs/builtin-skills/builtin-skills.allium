@@ -246,6 +246,20 @@ rule PhoenixApiDestinationAuthority {
     ensures: action.remote_continue_depends_on_federated_messaging = false
 
     @guidance
+        -- Public literal chat requires complete GET /api/version JSON from
+        -- the exact authenticated verified-TLS destination without redirects:
+        -- chat_literal_text_v1 must be boolean true before each POST or retry.
+        -- Missing, false, malformed or uncertain capability means zero POSTs.
+        -- Use only POST /api/conversations/{original_transcript_id}/chat/literal
+        -- with explicit expansion_policy: "literal_text"; never fall back to
+        -- /chat, including after 404/405 or receiver replacement. A request
+        -- field alone cannot fence a historical receiver that ignores it.
+        -- Resolve Open and the writable transcript freshly, then pin that exact
+        -- original target, once-generated message_id and exact policy/text/
+        -- attachments/user_agent for any retry. Acceptance is not completion.
+        -- Preserve destination authority, normal admission and the local-only
+        -- send_conversation_message boundary. See ../api/requirements.md
+        -- REQ-API-030 and ../compatibility/requirements.md REQ-COMP-015.
         -- For a user-authorized question response, freshly resolve the target
         -- and GET its exact transcript. Require awaiting_user_response and
         -- the opaque current request_id, never the provider tool_use_id.

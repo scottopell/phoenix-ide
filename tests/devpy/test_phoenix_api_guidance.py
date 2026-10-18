@@ -130,6 +130,49 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
         builtin = (ROOT / "crates/phoenix-skills/src/builtin.rs").read_text()
         self.assertNotIn('assert!(reference.contains("Current APIs do not provide"))', builtin)
 
+    def test_literal_recipe_requires_capability_and_dedicated_route(self):
+        recipe = self.reference.split("## Capability-gated public literal chat\n", 1)[1].split(
+            "## Respond to a pending structured question", 1
+        )[0]
+        self.assertIn('"/api/conversations/:id/chat/literal",', self.handlers)
+        self.assertIn("post(send_literal_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES))", self.handlers)
+        self.assertIn("POST /api/conversations/{original_transcript_id}/chat/literal", recipe)
+        body = json.loads(re.search(r"```json\s+(.*?)\s+```", recipe, re.S).group(1))
+        self.assertEqual(body["expansion_policy"], "literal_text")
+        self.assertEqual(set(body), {"text", "message_id", "expansion_policy", "images", "files", "user_agent"})
+        self.assertEqual(body["images"], [])
+        self.assertEqual(body["files"], [])
+        for text in ("`chat_literal_text_v1` field is boolean `true`", "stop before POST",
+                     "no redirects", "never fall back to `/chat`", "same original destination/transcript",
+                     "historical receiver", "not itself proof of owner authentication"):
+            self.assertIn(text, recipe)
+        self.assertLess(recipe.index("GET /api/version"), recipe.index("4. POST once"))
+        skill = (REFERENCE.parent.parent / "SKILL.md").read_text()
+        self.assertIn("/api/conversations/{original_transcript_id}/chat/literal", skill)
+        self.assertIn("never fall back to `/chat`", skill)
+
+    def test_literal_handler_validates_before_shared_admission_and_closed_policy(self):
+        handler = self.handlers.split("async fn send_literal_chat(", 1)[1].split("async fn send_chat(", 1)[0]
+        self.assertLess(handler.index("req.expansion_policy != ChatExpansionPolicy::LiteralText"),
+                        handler.index("send_chat(state, id, Json(req)).await"))
+        self.assertIn("AppError::BadRequest", handler)
+        types = (ROOT / "crates/phoenix-ide/src/api/types.rs").read_text()
+        policy = types.split("pub enum ChatExpansionPolicy {", 1)[1].split("}", 1)[0]
+        self.assertEqual(re.findall(r"^\s+(\w+),$", policy, re.M), ["ExpandReferences", "LiteralText"])
+        self.assertIn("#[default]\n    ExpandReferences", policy)
+        self.assertIn('"chat_literal_text_v1": true', self.handlers)
+        service = (ROOT / "crates/phoenix-ide/src/send_chat_service.rs").read_text()
+        replay = service.split("async fn lookup_durable_steering_replay(", 1)[1].split(
+            "async fn lookup_persisted_message_replay(", 1
+        )[0]
+        self.assertIn("} else if req.expansion_policy != MessageExpansionPolicy::ExpandReferences {", replay)
+        self.assertIn("Err(SendChatServiceError::IdempotencyConflict)", replay)
+        for path in ("specs/api/requirements.md", "specs/builtin-skills/builtin-skills.allium",
+                     "specs/compatibility/requirements.md"):
+            text = (ROOT / path).read_text()
+            self.assertIn("chat_literal_text_v1", text)
+            self.assertIn("/chat/literal", text)
+
     def test_non_exhaustive_policy_keeps_public_contract_and_scope_boundaries(self):
         skill = (REFERENCE.parent.parent / "SKILL.md").read_text()
         prompt = (ROOT / "crates/phoenix-ide/src/system_prompt.rs").read_text().split(

@@ -237,10 +237,64 @@ pub struct UpgradeModelRequest {
     pub service_tier: Option<phoenix_core::domain::llm_types::ServiceTier>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatExpansionPolicy {
+    #[default]
+    ExpandReferences,
+    LiteralText,
+}
+
+impl From<ChatExpansionPolicy> for crate::send_chat_service::MessageExpansionPolicy {
+    fn from(value: ChatExpansionPolicy) -> Self {
+        match value {
+            ChatExpansionPolicy::ExpandReferences => Self::ExpandReferences,
+            ChatExpansionPolicy::LiteralText => Self::LiteralText,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn chat_expansion_policy_is_closed_and_defaults_to_references() {
+    let request = |policy: Option<serde_json::Value>| {
+        let mut body = serde_json::json!({"text": "/literal @file:missing", "message_id": "m"});
+        if let Some(policy) = policy {
+            body["expansion_policy"] = policy;
+        }
+        serde_json::from_value::<ChatRequest>(body)
+    };
+    assert_eq!(
+        request(None).unwrap().expansion_policy,
+        ChatExpansionPolicy::ExpandReferences
+    );
+    for (wire, expected) in [
+        ("expand_references", ChatExpansionPolicy::ExpandReferences),
+        ("literal_text", ChatExpansionPolicy::LiteralText),
+    ] {
+        assert_eq!(
+            request(Some(serde_json::json!(wire)))
+                .unwrap()
+                .expansion_policy,
+            expected
+        );
+    }
+    for invalid in [
+        serde_json::json!("generated_predecessor_context"),
+        serde_json::json!("future"),
+        serde_json::Value::Null,
+        serde_json::json!(true),
+    ] {
+        assert!(request(Some(invalid)).is_err());
+    }
+}
+
 /// Request to send a chat message
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub text: String,
+    #[serde(default)]
+    pub expansion_policy: ChatExpansionPolicy,
     /// Client-generated UUID - the canonical identifier for this message
     /// Enables idempotent retries (sending same `message_id` twice = no duplicate)
     pub message_id: String,

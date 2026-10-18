@@ -1345,7 +1345,7 @@ export const api = {
     return resp.json();
   },
 
-  async getVersion(): Promise<{ version: string; git_sha: string; socket_activated: boolean }> {
+  async getVersion(): Promise<{ version: string; git_sha: string; socket_activated: boolean; chat_literal_text_v1?: boolean }> {
     const resp = await fetch('/api/version');
     if (!resp.ok) throw new Error('Failed to load version');
     return resp.json();

@@ -76,9 +76,11 @@ WHEN client sends chat message while conversation is idle or in error state
 THE SYSTEM SHALL forward message to state machine for processing
 AND return acknowledgment immediately
 
-WHEN client sends chat message while agent is busy
-THE SYSTEM SHALL return error indicating agent is busy
-AND inform user they can cancel current operation
+WHEN client sends chat message while agent is busy and accepts steering
+THE SYSTEM SHALL durably queue the message as steering and report that admission outcome
+
+WHEN the target cannot accept direct input or steering
+THE SYSTEM SHALL return the applicable admission refusal without claiming delivery
 
 WHEN client sends chat message with inline images
 THE SYSTEM SHALL accept base64-encoded image data in message payload
@@ -87,7 +89,7 @@ WHEN client requests cancellation
 THE SYSTEM SHALL forward cancel event to state machine
 AND return acknowledgment
 
-**Rationale:** Users interact with agent via messages and can interrupt operations. Rejecting messages while busy simplifies the state machine and makes message ordering explicit.
+**Rationale:** Users interact with the agent via messages and can interrupt operations. Direct delivery, steering admission, and refusal are distinct outcomes.
 
 ---
 
@@ -322,3 +324,36 @@ AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, 
 AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
 
 **Rationale:** Automatic continuation configuration is aggregate-scoped so a continuation cannot silently replace the configured identity, and its write response does not claim that existing exhausted work was scheduled.
+
+
+### REQ-API-030: Explicit Public Literal Chat
+
+WHEN an authorized client sends `POST /api/conversations/{id}/chat`
+THE SYSTEM SHALL accept only `expand_references` and `literal_text` as the public `expansion_policy` values
+AND SHALL use `expand_references` when the field is omitted
+AND SHALL reject unknown, null, or non-string policy values rather than mapping them to a default
+AND SHALL NOT expose internal generated-predecessor-context policy.
+
+WHEN an authorized client sends `POST /api/conversations/{id}/chat/literal`
+THE SYSTEM SHALL require explicit `expansion_policy: "literal_text"` in the same `ChatRequest` payload
+AND SHALL reject omitted or `expand_references` policy with HTTP 400 before shared send admission
+AND SHALL reject unknown, null, or non-string policy values during request decoding
+AND SHALL use the same public authentication, body limits, mutation admission and send application service as `/chat`.
+
+WHEN literal text is admitted for direct delivery or steering
+THE SYSTEM SHALL preserve the decoded text unchanged for display and model input
+AND SHALL perform no slash-command, skill, @ mention or file-reference expansion
+AND SHALL create no skill invocation or expanded-text overlay
+AND SHALL preserve normal attachment validation, UserApi provenance, close/history fences and direct-versus-steering routing.
+
+WHEN the client retries an admitted message identity
+THE SYSTEM SHALL compare expansion policy as part of exact submitted intent along with original transcript, text, ordered attachments, origin and user agent
+AND SHALL return HTTP 409 `idempotency_conflict` for changed policy
+AND SHALL require durable policy-bearing evidence for nondefault-policy replay rather than inferring it from transcript content alone
+AND SHALL preserve historical transcript-only replay only for default `expand_references` intent with matching content and provenance.
+
+WHEN the server reports `GET /api/version`
+THE SYSTEM SHALL advertise boolean `chat_literal_text_v1: true` only for the complete dedicated `/api/conversations/{id}/chat/literal` contract above, including policy validation, idle and steering semantics, and exact replay
+AND SHALL preserve the version response's other fields.
+
+Public literal-chat guidance SHALL require that exact boolean capability in complete HTTP-200 JSON from the selected authenticated verified-TLS destination, with no redirects, before each POST or exact retry. Missing, false, malformed or uncertain capability SHALL stop before POST. The guidance SHALL use only `/chat/literal` with exact `literal_text`, never fall back to `/chat`, and retain the original transcript and message identity for uncertain retries. Capability discovery grants no additional destination authority or deployment compatibility; see `specs/compatibility/requirements.md` REQ-COMP-015.

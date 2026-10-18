@@ -18,6 +18,9 @@
 //! - `[[stall:after_n,ms]]` — emit `after_n` chunks, sleep `ms`,
 //!   then continue. Drives the heartbeat watchdog (REQ-WPV-004)
 //!   without ending the turn.
+//! - `[[stream-gate:PORT]]` — connect to a loopback test listener before
+//!   streaming, then wait for its `R` byte (30s failure deadline). Lets E2E
+//!   hold an actual in-flight request until steering evidence is observed.
 //! - `[[retry:KIND,N]]` — first N calls for this conversation
 //!   return `LlmError::<KIND>` where KIND ∈ {`rate_limit`,
 //!   `server_error`, `network`}; (N+1)th call succeeds. Drives
@@ -468,6 +471,37 @@ fn parse_retry(request: &LlmRequest) -> Option<(crate::LlmErrorKind, u32)> {
     };
     let n = n_str.trim().parse::<u32>().ok()?.min(MAX_RETRY_N);
     Some((kind, n))
+}
+
+fn parse_stream_gate(request: &LlmRequest) -> Option<u16> {
+    let text = latest_user_text(request)?;
+    let rest = text.split_once("[[stream-gate:")?.1;
+    rest.split_once("]]")?
+        .0
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+}
+
+async fn wait_for_stream_gate(port: u16) -> Result<(), LlmError> {
+    use tokio::io::AsyncReadExt as _;
+    let wait = async {
+        let mut stream =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        let mut release = [0];
+        stream.read_exact(&mut release).await?;
+        if release != [b'R'] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid stream gate release",
+            ));
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), wait)
+        .await
+        .map_err(|_| LlmError::timed_out("mock stream gate was not released".to_string()))?
+        .map_err(|error| LlmError::network(format!("mock stream gate failed: {error}")))
 }
 
 /// Slow-tool marker (REQ-WPV-002 visual driver): a user message
@@ -979,6 +1013,10 @@ impl LlmService for MockLlmService {
             // attempt > fail_n: fall through to the normal scenario.
         }
 
+        if let Some(port) = parse_stream_gate(request) {
+            wait_for_stream_gate(port).await?;
+        }
+
         let scenario = Scenario::from_message(request);
         let (content, streamable_text) = if let Some(seconds) = parse_slow_tool(request) {
             build_slow_tool_response(seconds)
@@ -1241,6 +1279,39 @@ mod tests {
         assert_eq!(parse_stall(&user_req("[[stall:5]]")), None);
         assert_eq!(parse_stall(&user_req("[[stall:abc,def]]")), None);
         assert_eq!(parse_stall(&user_req("no marker")), None);
+    }
+
+    #[test]
+    fn stream_gate_marker_only_accepts_nonzero_ports() {
+        assert_eq!(
+            parse_stream_gate(&user_req("[[stream-gate:12345]]")),
+            Some(12345)
+        );
+        for text in [
+            "[[stream-gate:0]]",
+            "[[stream-gate:65536]]",
+            "[[stream-gate:host]]",
+            "no marker",
+        ] {
+            assert_eq!(parse_stream_gate(&user_req(text)), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_gate_requires_explicit_release() {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gate = tokio::spawn(wait_for_stream_gate(port));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(
+            !gate.is_finished(),
+            "connection alone must not release the mock"
+        );
+        stream.write_all(b"R").await.unwrap();
+        gate.await.unwrap().unwrap();
     }
 
     #[test]
