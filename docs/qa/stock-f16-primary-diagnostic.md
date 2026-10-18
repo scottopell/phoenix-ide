@@ -1,9 +1,13 @@
 # PREPARE: exact-f16 stock primary-assertion diagnostic
 
-Offline follow-up from harness023: [lifecycle close-drain proof and actual-023
-coverage boundary](stock-f16-lifecycle-offline-proof.md). It reproduces a sampled
-cleanup scheduling defect and tests an isolated three-line proposal; it neither
-attributes the earlier incident nor changes the pinned app/live driver.
+Offline follow-up from harness023: [conditional lifecycle close-drain model and
+actual-023 coverage boundary](stock-f16-lifecycle-offline-proof.md). It demonstrates
+immediate comparison failure under a modeled cleanup schedule and tests an
+isolated three-line proposal. Installed-Playwright source review does not establish
+that schedule's real API reachability; no harness bug or fix is validated. The
+proposal is unapplied and conditional on a real contract/reproducer and admission
+review. It neither attributes the earlier incident nor changes the pinned app/live
+driver.
 
 ## Scope and prior outcome
 

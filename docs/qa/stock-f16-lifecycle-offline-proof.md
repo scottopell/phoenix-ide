@@ -1,4 +1,4 @@
-# Exact-f16 lifecycle: offline close-drain proof and coverage boundary
+# Exact-f16 lifecycle: conditional offline close-drain model and coverage boundary
 
 ## Scope / identities
 
@@ -79,7 +79,7 @@ cannot turn missing/ambiguous/foreign evidence into false or pick the first
 admission` independently rejects missing and multiple admissions, route mismatch
 and foreign evidence; the source branch map applies only after that validation.
 
-## Concrete A: deterministic RED / GREEN on the real function
+## Concrete A: modeled-schedule RED / GREEN on the real function
 
 `ui/scripts/lifecycle-close-drain.selftest.mjs` imports the **unchanged real**
 `runLifecycleQualificationStage` for RED. Its dedicated fake browser has separate
@@ -100,14 +100,18 @@ RED retains the actual Node assertion at
    snapshot retains the failure and cleanup failure; the next fake task really
    emits the matching 204 **after** failure.
 
-This proves an exact-source harness scheduling defect under the fake-Playwright
-event schedule; it is **not historical-incident causal closure**. It does not
-identify that site as the old incident's actual assertion or prove that
-Playwright will deliver a response event after a real context closes.
-`BrowserContext.close()` may cancel an in-flight request: keepalive does not
-guarantee a 204 or an observable response after close. The proposal only observes
-for a bounded interval and then fails if responses remain missing; it cannot
-force delivery, preserve a canceled request, or turn a non204 into success.
+This **demonstrates immediate comparison failure under the modeled schedule**
+using the exact-source harness function; it does **not** validate a harness bug.
+The fake context does not implement Playwright's close-channel, close-event or
+dispatcher-disposal barriers. Its next-task response after close has not been
+shown API-reachable; the installed-source review below gives evidence against
+that simple schedule on the normal in-process close path. This is **not
+historical-incident causal closure** and does not identify the old incident's
+actual assertion. `BrowserContext.close()` may cancel an in-flight request:
+keepalive does not guarantee a 204 or an observable response after close. The
+proposal only observes for a bounded interval and then fails if responses remain
+missing; it cannot force delivery, preserve a canceled request, or turn a non204
+into success.
 
 GREEN applies only `stock-f16-lifecycle-close-drain.proposed.patch` to the full
 source **in memory**, with one exact hunk and a checksum guard. Only the relative
@@ -119,7 +123,7 @@ simplified lifecycle implementation. The proposed three added lines, after close
 - retain the existing final count, unique-open-ID, BFCache count, owner/correlation
   and capture assertions; additionally require final observed statuses all204.
 
-All six fake readiness-first trials complete without the timing false failure,
+All six fake readiness-first trials complete without the modeled timing failure,
 **remaining inconclusive**, never claiming lifecycle/delivery/overhead acceptance.
 Negative controls still reject never204, duplicate report, wrong journey owner,
 wrong response request object and non204. Never204 is bounded at the existing
@@ -127,6 +131,71 @@ five-second cap; a 100ms stage deadline is not extended. No-POST and explicit
 unsampled trials remain inconclusive. Both original and proposal preserve a
 primary Error's identity while retaining a distinct context-close error.
 All fake-clock loops are explicitly bounded; there is no wall-clock sleep.
+
+## Offline installed-Playwright contract review
+
+### Source provenance (not an actual-run installation attestation)
+
+This read-only follow-up starts at commit
+`f626bada79a954db37010840fd7bfc4019129671`, tree
+`f2f8c5fec51b60a3fd7990148d92078a9d56be28`. From this worktree, the existing cache
+package root is the relative path:
+
+```text
+../../../.phoenix/current-task-attribution/ui/node_modules/.pnpm/playwright-core@1.61.0/node_modules/playwright-core
+```
+
+Its `package.json` declares **1.61.0**. Exact-f16 and this checkout's
+`ui/pnpm-lock.yaml` both resolve `playwright` and `playwright-core` to **1.61.0**;
+`ui/package.json` requests `playwright: ^1.57.0`, not an installed 1.57.0 pin.
+The lockfile has no diff against exact-f16. Thus the inspected cache version
+matches the pinned resolution, but no actual-023 host dependency manifest or
+installed-package hash was supplied. This is not proof of which bytes that run
+loaded, nor of its browser build or launch environment.
+
+SHA256 identities of the inspected/read files:
+
+| File | SHA256 |
+|---|---|
+| Cache package `lib/coreBundle.js` | `6bc8db3d485266f1e0b62d18494849dce89c03479220b1784d96625ab8eb9cc0` |
+| Cache package `package.json` | `eb05f2eefbe2bc56258cc44cdc117c90ed3c9086835f3cdb729df77476f29a17` |
+| Checkout `ui/pnpm-lock.yaml` | `42552207bd7922e4bc35f75f18fc3091c3f8917d8d996a6206e533f4514dedd0` |
+
+The package's `index.js` selects `require('./lib/coreBundle').inprocess.playwright`.
+The client/server JavaScript is bundled, not a separate `lib/client/` tree. The
+anchors below are source-section comments **inside `lib/coreBundle.js`**, relative
+to `packages/playwright-core/src/`, followed by symbols; they are not claims that
+those TypeScript files are installed separately. The emitter section is named
+`client/eventEmitter.ts`, not `asyncEventEmitter.ts` in these bytes.
+
+### Close, dispatch and listener ordering
+
+| Bundled section / symbol anchor | Source finding |
+|---|---|
+| `client/browserContext.ts`: `BrowserContext2` / `_BrowserContext`, constructor, `close`, `_onClose` | On the normal not-already-closed path, `close` awaits request-context disposal, before-close instrumentation, HAR export, **`this._channel.close(options)` and then `this._closedPromise`**. The constructor's once-close listener resolves `_closedPromise`; `_onClose` marks the context closed and emits that event. It is not just a fire-and-forget close request. |
+| `client/connection.ts`: `Connection.dispatch`; `client/browserContext.ts`: `_onResponse` | Command replies resolve/reject their stored callback. An event instead validates and immediately calls `object._channel.emit(...)`. The context's response channel listener calls `_onResponse`, which emits the context response and then the page response in the same call stack. |
+| `client/eventEmitter.ts`: `EventEmitter3.emit`, `_callHandler`, `removeAllListeners`, `_waitFor` | Listener invocation uses `Reflect.apply` immediately, in listener order; `emit` does not await returned promises. Returned `Promise`s are tracked for explicit `removeAllListeners(..., {behavior:'wait'})`. `BrowserContext.close` does not call that wait. Asynchronous listener continuations can outlive invocation, but the lifecycle stage's page-response listener is synchronous: it checks `posts`, calls `request()` / `status()` and pushes directly into `trial.statuses`, with no `await`. Tracking promises does not postpone that push to a later task. |
+| `server/browserContext.ts`: `BrowserContext.close`, `_didCloseInternal`; `server/chromium/crBrowser.ts`: `CRBrowserContext.doClose` | Server close awaits tracing/screencast cleanup and its custom handler or `doClose`, deletes downloads/temp dirs, and awaits `_closePromise`. The normal Chromium owned-context path awaits `Target.disposeBrowserContext`. `_didCloseInternal` fulfills the server close promise and emits context Close. These are shutdown barriers, **not a wait for every telemetry POST to receive 204**. |
+| `server/dispatchers/browserContextDispatcher.ts`: constructor Close/Response listeners, `close`; `server/dispatchers/dispatcher.ts`: `Dispatcher._dispatchEvent`, `_disposeRecursively`, `DispatcherConnection.dispatch` | The close method awaits server context close. On context Close, the dispatcher sends `close` and immediately disposes itself, removing object listeners recursively. A disposed dispatcher refuses event dispatch. The command reply is sent only after the awaited command and after-call instrumentation finish. A later server response is not simply forwarded through that disposed context dispatcher. |
+| `inprocess.ts`: `createInProcessPlaywright`; `client/connection.ts`: `Connection.dispatch` | After initialization, each direction schedules dispatch with `setImmediate`. Response events sent before context Close are queued before close/dispose and the close-command reply. With this ordinary ordered in-process delivery, their synchronous page listeners run before a successful `context.close()` returns. A response dispatched earlier does not acquire a separate delayed callback turn through this emitter. |
+
+**Reachability conclusion:** this source review does not establish a real
+next-task response after successful context close for this synchronous listener.
+The normal in-process close/dispose ordering instead argues against the fake
+schedule: a response forwarded before shutdown is processed before close returns;
+a response arriving only after dispatcher disposal is not newly forwarded by
+that dispatcher. This is a bounded source conclusion, not browser execution or a
+universal assertion about all transports, exceptional close paths, custom close
+handlers or other versions. No actual bundled Connection/EventEmitter execution
+was needed or performed; no replacement model is offered as proof of reachability.
+
+The earlier offline RED/GREEN remains **conditional only** on its modeled event
+schedule. Any correction for Global or ordinary lifecycle qualification still
+needs a demonstrated real API contract/reproducer permitting the missing response
+to become observable after close, plus parent admission review. A missing response
+could instead reflect cancellation/non-delivery; waiting after close cannot
+promise recovery or a guaranteed 204. The proposal remains unapplied, is not a
+validated fix, and does not close the historical cause, which remains unknown.
 
 ## Pin / policy gate: proposal not admitted
 
@@ -144,8 +213,9 @@ parent/owner review and an explicitly owned harness override with its source
 hash, exact diff, dependency manifest and diagnostic-site trust review (the
 insertion shifts later assertion positions), or a separately admitted app
 successor. None is implemented or authorized for execution by this packet. No
-pin guard is relaxed. The bounded reproducer plus minimal diff is the deliverable;
-a deployed fix and candidate requalification remain separate integration work.
+pin guard is relaxed. The conditional unit reproducer and unvalidated proposal
+are retained as data; real API reachability and any runtime adoption remain
+separate review/integration work.
 
 ## Validation actually run
 
@@ -168,8 +238,9 @@ All four Python module pins were independently rehashed and matched.
 `git apply --check` validates applicability only; it does not apply the patch.
 No full `./dev.py check`, app/receiver build, runtime rerun, production tracing,
 hosted/physical-device acceptance or performance clearance was attempted.
-The untouched live harness still contains the reproduced defect; green refers
-only to the explicitly isolated proposal.
+The untouched live harness still contains the immediate comparison exercised by
+the conditional model; no API-reachable scheduling defect has been established.
+Green refers only to the explicitly isolated proposal under the modeled schedule.
 
 ### Actual-reporter follow-up validation
 
@@ -195,3 +266,15 @@ UUID production sources still have no diff against f16. The three-line proposal
 is still unapplied. The earlier 170/12/8 results above belong to the original
 packet, not new follow-up executions. No install, network, browser, build,
 server, GET, SQL, CI or universal-platform runtime claim accompanies these tests.
+
+### Documentation / installed-source clarification validation
+
+The follow-up from `f626bada79a954db37010840fd7bfc4019129671` changes only this
+Markdown packet and its diagnostic-packet cross-reference. Offline static checks
+verified the three SHA256 identities above, installed/locked version 1.61.0 and
+the eight bundled source-section anchors. `git diff --check` passes; the lockfile
+still has no diff against exact-f16, and no tracked non-document file changed.
+No unit suites were rerun for this documentation-only clarification; the counts
+above are retained prior results, not new execution evidence. No Playwright
+module was executed, and no browser, network, service, install, build, SQL, CI or
+push was used. Roadmap context remains unverified under the offline restriction.
