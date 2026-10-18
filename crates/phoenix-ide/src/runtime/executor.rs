@@ -6951,7 +6951,7 @@ where
 
             AuthoritativeEffect::PersistState => self.persist_state_effect(true, admitted).await,
 
-            AuthoritativeEffect::RequestLlm => self.dispatch_llm_request(admitted).await,
+            AuthoritativeEffect::RequestLlm => Box::pin(self.dispatch_llm_request(admitted)).await,
 
             AuthoritativeEffect::MaterializeCreation {
                 job_id,
@@ -7514,6 +7514,12 @@ where
             );
         }
 
+        tracing::debug!(
+            conversation_id = %self.context.conversation_id,
+            message_count = committed_messages.len(),
+            "Steering drain committed"
+        );
+
         for (index, message) in committed_messages.into_iter().enumerate() {
             let status = statuses
                 .get(index)
@@ -7566,6 +7572,10 @@ where
                         self.state_updated_at,
                     );
                 self.publish_live_state_admitted();
+                tracing::debug!(
+                    conversation_id = %self.context.conversation_id,
+                    "Dispatching LLM request after steering drain"
+                );
                 match Box::pin(self.execute_authoritative_effect(
                     AuthoritativeEffect::RequestLlm,
                     admitted,
@@ -21540,6 +21550,97 @@ mod steer_drain_detector_tests {
             1
         );
         assert!(storage.get_steering_queue(conversation_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_end_drain_dispatches_latest_literal_once_and_settles_idle() {
+        let conversation_id = "conv-steering-literal-settlement";
+        let literal = "/literal @missing.rs\n[[scenario:plain_text]] [[ttft:0]]\nπ unchanged";
+        let mut entry = mk_entry("literal-steer", literal);
+        entry.origin = phoenix_core::domain::db_schema::InputOrigin::UserApi;
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, ConvState::Idle, vec![]);
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+        rt.parent_tool_cycle_cap = 1;
+        for text in ["first response", "literal response"] {
+            rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text(text)],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+        }
+        rt.process_event(Event::UserMessage {
+            text: "first request".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "first-user".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        })
+        .await
+        .expect("first request starts");
+
+        storage.set_steering_queue(conversation_id, vec![entry.clone()]);
+        rt.process_event(Event::SteeringQueueChanged)
+            .await
+            .expect("durable queue notification while first request is in flight");
+        assert_eq!(storage.get_steering_queue(conversation_id).len(), 1);
+
+        let (generation, outcome) =
+            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+                .await
+                .expect("first provider response arrives")
+                .expect("LLM outcome channel remains open");
+        rt.process_generation_tagged_llm_outcome(generation, outcome)
+            .await;
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert_eq!(
+            rt.parent_tool_cycle_count, 1,
+            "drain resets the cycle budget"
+        );
+        let materialized = storage.get_all_messages(conversation_id);
+        let delivered: Vec<_> = materialized
+            .iter()
+            .filter(|message| message.message_id == entry.message_id)
+            .collect();
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            matches!(&delivered[0].content, MessageContent::User(content)
+            if content.text == literal && content.llm_text.is_none())
+        );
+
+        let (generation, outcome) =
+            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+                .await
+                .expect("second provider response arrives")
+                .expect("LLM outcome channel remains open");
+        let requests = rt.llm_client.recorded_requests();
+        assert_eq!(requests.len(), 2, "one dispatch per turn");
+        let latest_user = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == phoenix_llm::types::MessageRole::User)
+            .expect("second request includes the drained user message");
+        assert!(
+            matches!(latest_user.content.as_slice(), [ContentBlock::Text { text }]
+            if text.as_bytes() == literal.as_bytes())
+        );
+        rt.process_generation_tagged_llm_outcome(generation, outcome)
+            .await;
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(
+            storage.get_current_state(conversation_id),
+            Some(ConvState::Idle)
+        );
+        assert!(rt.llm_task_handle.is_none());
+        assert_eq!(rt.llm_client.recorded_requests().len(), 2);
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert_eq!(storage.get_all_messages(conversation_id).len(), 4);
     }
 
     #[tokio::test]

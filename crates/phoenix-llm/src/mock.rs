@@ -1298,6 +1298,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_literal_plain_text_does_not_reuse_earlier_stream_gate() {
+        let mut request = user_req("[[scenario:bash]] [[stream-gate:12345]]");
+        let literal = "/literal @missing.rs\n[[scenario:plain_text]] [[ttft:0]]\nπ unchanged";
+        request.messages.extend(user_req(literal).messages);
+
+        assert_eq!(latest_user_text(&request).as_deref(), Some(literal));
+        assert_eq!(parse_stream_gate(&request), None);
+        assert!(matches!(
+            Scenario::from_message(&request),
+            Scenario::PlainText
+        ));
+        let (chunk_tx, _chunk_rx) = mpsc::channel(256);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            MockLlmService.complete_streaming(&request, &chunk_tx),
+        )
+        .await
+        .expect("latest message must finish without an earlier gate release")
+        .expect("latest message selects a text response");
+        assert!(response.end_turn);
+        assert!(response
+            .content
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Text { .. })));
+    }
+
+    #[tokio::test]
     async fn stream_gate_requires_explicit_release() {
         use tokio::io::AsyncWriteExt as _;
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
