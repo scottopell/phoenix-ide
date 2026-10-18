@@ -338,7 +338,7 @@ The Python `LifecycleFailures` object tracks the **whole outer case**, not just
 `lifecycle_failure_present: true` therefore establishes a retained outer-case
 primary exception, not a lifecycle-module throw. All six retained old lifecycle
 attempts were explicitly unsampled and inconclusive. The modeled sampled
-close/response schedule is a poor fit for that incident and is not its cause.
+close/response schedule is a poor fit for that incident and is not established as its cause.
 
 Artifact `12122620564` retains a different concrete fact: one sampled terminal
 pagehide attempt captured an incomplete report and producer submission states
@@ -355,7 +355,7 @@ The lost original stack and incomplete published journey inventory prevent that
 assertion-level attribution. The historical failure phase may be module checks,
 result validation, or later history finalization; it remains unknown.
 
-The new primary diagnostic catches errors inside `runJointQualification`.
+The new primary diagnostic catches errors inside `runJointTelemetryStage`.
 Its returned `finalizeHistory` callback executes later, outside that catch. An
 error there is a specific remaining capture boundary, not evidence that it threw
 in the historical run. No capture expansion, production fix, module-pin change,
