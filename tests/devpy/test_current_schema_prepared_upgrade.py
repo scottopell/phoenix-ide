@@ -933,7 +933,12 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         growth_bytes: int = 0,
     ) -> None:
         target = Path(manifest.target_binary)
-        baseline = 114 if manifest.source_kind == "published_release" else 123
+        baseline = (
+            114
+            if manifest.source_kind == "published_release"
+            or manifest.current_schema_upgrade.prepared_source_114 is not None
+            else 123
+        )
         pending = [item for item in compiled_ledger() if item[0] > baseline]
         migrations = pending[:1] if partial else pending
         growth = (
