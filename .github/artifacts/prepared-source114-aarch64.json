@@ -58,6 +58,32 @@
     "ci_receipt_head_run": 39153475900,
     "helper_source_rule": "clean full controller head distinct from candidate.source_commit"
   },
+  "reconciled_validation": {
+    "pre_hardening": {
+      "code_head": "6330246f2c383bda060bafbe33d3ea86c6e284b1",
+      "macos_run": 39159257402,
+      "ci_run": 39159257367
+    },
+    "hardened_code_head": {
+      "code_head": "efd277b6051c8096973d26dff501d1ecaee80d3f",
+      "manual_macos_run": 39164280946,
+      "ci_run": 39164278998,
+      "workflow_event": "workflow_dispatch",
+      "workflow_inputs": {
+        "validate_prepared_source114": true
+      },
+      "observed_database_ledger_entries": 113,
+      "observed_effects": {
+        "claim": 0,
+        "stop": 0,
+        "backup": 0,
+        "migrate": 0,
+        "publish": 0,
+        "activate": 0,
+        "cleanup": 0
+      }
+    }
+  },
   "bundle": {
     "sha256_observation": {
       "head": "7d8ed9567b2dd1e515a42eae2fc06a915ff2e467",
