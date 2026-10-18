@@ -373,6 +373,52 @@ test('source stage remains after sealed physical history and before server stop;
   assert.match(source.slice(stage), /harnessPath: fileURLToPath\(import.meta.url\)/);
 });
 
+test('UNIT ONLY terminal incomplete inventory cannot satisfy the actual ready-report validator', () => {
+  const result = stock();
+  result.trials[0].reports[0].outcome = 'incomplete';
+  result.trials[0].reports[0].anchor_result = null;
+  result.journeys[0].expected['browser.outcome'] = 'incomplete';
+  assert.throws(() => validateTelemetryResult(result), /accepted ready browser report required/);
+});
+
+async function unitReturnedStage(f, close = async () => {}) {
+  mkdirSync(resolve(f.root, 'telemetry'), { recursive: true });
+  const config = prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT });
+  return runJointTelemetryStage({ config, browser: { newContext: async () => ({ newPage: async () => ({}), close }) },
+    outputDir: f.root, harnessPath: import.meta.filename,
+    historyPhysical: { count: 1, visible: true, persistedMessageID: 'unit-exact' },
+    UNIT: { label: UNIT_ONLY, importModule: async () => ({ ...unitModule, runTelemetryChecks: async () => stock() }) } });
+}
+for (const [name, mutate] of Object.entries({
+  wrong_owner: i => { i.requestOwners[0].journey_id = 'foreign'; },
+  duplicate: i => { i.reports.push(structuredClone(i.reports[0])); },
+})) test(`UNIT ONLY actual returned finalizeHistory rejects ${name}, then rejects reentry`, async () => {
+  const f = unitFiles(); try {
+    const stage = await unitReturnedStage(f), inventory = historyInventory();
+    assert.equal(stage.receipt.evidence_class, 'UNIT_ONLY_not_runtime');
+    mutate(inventory);
+    assert.throws(() => stage.finalizeHistory(inventory));
+    assert.throws(() => stage.finalizeHistory(historyInventory()), /finalizes once/);
+  } finally { f.cleanup(); }
+});
+test('UNIT ONLY actual returned finalizeHistory accepts existing unit inventory once, then rejects reentry', async () => {
+  const f = unitFiles(); try {
+    const stage = await unitReturnedStage(f);
+    stage.finalizeHistory(historyInventory());
+    assert.equal(stage.receipt.additional_history.reports, 1);
+    assert.throws(() => stage.finalizeHistory(historyInventory()), /finalizes once/);
+  } finally { f.cleanup(); }
+});
+test('UNIT ONLY cleanup-only stage failure is not a manufactured primary diagnostic', async () => {
+  const f = unitFiles(); try {
+    await assert.rejects(unitReturnedStage(f, async () => { throw Error('UNIT_ONLY_cleanup'); }));
+    const manifest = JSON.parse(readFileSync(resolve(f.root, 'joint-telemetry-dependency-manifest.json'), 'utf8'));
+    assert.equal(manifest.primary_diagnostic, null);
+    assert.equal(manifest.failure_phase, null);
+    assert.equal(manifest.secondary_diagnostics[0].phase, 'context_cleanup');
+  } finally { f.cleanup(); }
+});
+
 function detailRecord(open_id, trace_id = null) {
   return {kind: 'request', method: 'GET', pathname: '/api/product-conversations/ordinary-product', status: 200, finished: true, failed: false, open_id, trace_id};
 }

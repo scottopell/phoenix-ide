@@ -21,7 +21,8 @@ The explicitly authorized isolated hosted job in the existing CI workflow is
 
 - `pull_request`, with head repository equal to this repository;
 - exactly `prepare/exact-f16-stock-admission` as head branch;
-- PR event label snapshot containing `offline-regression-only`.
+- PR event label snapshot containing both `offline-regression-only` and
+  the explicit Stage 1 opt-in `context-close-probe`.
 
 The stock `qualify-history-realserver` job retains its exact **negative** label
 guard and is **SKIPPED**, not passed, on that labeled PR. Other existing CI gates
@@ -173,7 +174,10 @@ source guards for the exact positive probe gate and unchanged negative stock
 gate. These are not actual Playwright observations. CI YAML and inline shell
 syntax must also be checked without running shell commands embedded in it.
 
-Stage 2 (actual reporter/Phoenix collector) is **out of scope**. Stage 1 results
+Stage 2 is **out of scope for this bare-fetch probe**. The separate
+[reporter pagehide preparation](reporter-pagehide-probe.md) imports the actual
+reporter/lifecycle but still does not run the Phoenix collector or joint history
+integration. Stage 1 results
 may motivate a separately authorized reporter-specific test, but cannot
 establish reporter lifecycle behavior, repair f16, explain the older incident,
 or justify changes to its application source, module pins or lockfile.

@@ -387,11 +387,11 @@ test('library and CLI imports are inert (no Playwright resolution, autolaunch, o
 });
 
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
-const job = workflow.split('  context-close-functional-probe:\n')[1].split('\n  qualify-history-realserver:')[0];
+const job = workflow.split('  context-close-functional-probe:\n')[1].split('\n  reporter-pagehide-functional-probe:')[0];
 const stock = workflow.split('  qualify-history-realserver:\n')[1].split('\n  check-ui:')[0];
 test('source guard: hosted probe requires exact owned same-repo PR + label, no opt-outs', () => {
   const gate = job.split('\n').find(line => line.startsWith('    if:'));
-  assert.equal(gate, "    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'prepare/exact-f16-stock-admission' && contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}");
+  assert.equal(gate, "    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'prepare/exact-f16-stock-admission' && contains(github.event.pull_request.labels.*.name, 'offline-regression-only') && contains(github.event.pull_request.labels.*.name, 'context-close-probe') }}");
   assert.match(job, /ref: \$\{\{ github.event.pull_request.head.sha \}\}/);
   assert.match(job, /persist-credentials: false/);
   assert.match(job, /uses: pnpm\/action-setup@v4\n        with:\n          package_json_file: ui\/package.json/);

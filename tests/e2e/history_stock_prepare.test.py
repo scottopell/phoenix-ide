@@ -42,7 +42,7 @@ class StockPrepareTests(unittest.TestCase):
         self.assertIn('369305dcd94862d4ee12e7af9fd463d5da14d808', LANE)
         self.assertIn('persist-credentials: false', LANE)
 
-    def test_offline_label_excludes_stock_runtime_and_only_admits_bare_probe(self):
+    def test_offline_label_excludes_stock_runtime_and_probes_require_separate_opt_in(self):
         guard = next(line.strip() for line in LANE.splitlines() if line.startswith('    if:'))
         self.assertEqual(guard, "if: ${{ github.event_name == 'pull_request' && "
                          "github.event.pull_request.head.repo.full_name == github.repository && "
@@ -50,14 +50,17 @@ class StockPrepareTests(unittest.TestCase):
                          "github.head_ref == 'integration/v013-history-current-main' || "
                          "github.head_ref == 'prepare/exact-f16-stock-admission') && "
                          "!contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}")
-        probe = WORKFLOW.split('  context-close-functional-probe:\n', 1)[1].split('\n  qualify-history-realserver:', 1)[0]
+        probe = WORKFLOW.split('  context-close-functional-probe:\n', 1)[1].split('\n  reporter-pagehide-functional-probe:', 1)[0]
         self.assertEqual(next(line.strip() for line in probe.splitlines() if line.startswith('    if:')),
                          "if: ${{ github.event_name == 'pull_request' && "
                          "github.event.pull_request.head.repo.full_name == github.repository && "
                          "github.head_ref == 'prepare/exact-f16-stock-admission' && "
-                         "contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}")
+                         "contains(github.event.pull_request.labels.*.name, 'offline-regression-only') && "
+                         "contains(github.event.pull_request.labels.*.name, 'context-close-probe') }}")
         outside_runtime = WORKFLOW.replace('  qualify-history-realserver:\n' + LANE, '')
         outside_owned_jobs = outside_runtime.replace('  context-close-functional-probe:\n' + probe, '')
+        reporter = WORKFLOW.split('  reporter-pagehide-functional-probe:\n', 1)[1].split('\n  qualify-history-realserver:', 1)[0]
+        outside_owned_jobs = outside_owned_jobs.replace('  reporter-pagehide-functional-probe:\n' + reporter, '')
         self.assertNotIn('offline-regression-only', outside_owned_jobs)
         triggers = WORKFLOW.split('\non:\n', 1)[1].split('\nconcurrency:', 1)[0]
         self.assertIn('  pull_request:\n', triggers)
