@@ -2278,9 +2278,17 @@ mod tests {
             } else {
                 crate::db::MessageContent::user(&req.text)
             };
-            db.add_message(&req.message_id, &req.conversation_id, &content, None, None)
-                .await
-                .unwrap();
+            db.add_message_with_seq_and_origin(
+                &req.message_id,
+                &req.conversation_id,
+                1,
+                &content,
+                None,
+                None,
+                &req.origin,
+            )
+            .await
+            .unwrap();
             assert!(db
                 .get_steering_acceptance_fingerprint(&req.conversation_id, &req.message_id)
                 .await
