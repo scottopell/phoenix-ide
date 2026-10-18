@@ -5,8 +5,8 @@ import {
   subscribeProductConversationListRevision,
   subscribeProductConversationSnapshotChanged,
 } from '../notifications';
-import { render, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { act, render, fireEvent, waitFor } from '@testing-library/react';
+import { Link, MemoryRouter, useLocation } from 'react-router-dom';
 import { ApiResponseError, ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
@@ -459,6 +459,38 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).toBeNull());
+  });
+
+  it('does not navigate back when a rename completes after leaving its route', async () => {
+    const original = makeProductConversation('pc-rename', {
+      canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'Old Product' },
+    });
+    const renamed = { ...original, canonical_route: '/c/new-product' };
+    let finishRename!: (row: ProductConversationListRow) => void;
+    apiMock.renameProductConversation.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRename = resolve;
+    }));
+    apiMock.listProductConversations.mockResolvedValue({ product_conversations: [original] });
+    function NavigationProbe() {
+      const location = useLocation();
+      return <><Link to="/c/other?viewer=else#message-other">Leave conversation</Link>
+        <output data-testid="current-location">{location.pathname}{location.search}{location.hash}</output></>;
+    }
+    const { getByRole, findByRole, getByTestId } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-rename']}>
+        <NavigationProbe />
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-rename" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await findByRole('button', { name: 'Actions for conversation Old Product' }));
+    fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
+    fireEvent.change(getByRole('textbox'), { target: { value: 'New Product' } });
+    fireEvent.click(getByRole('button', { name: 'Rename' }));
+    await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalled());
+    fireEvent.click(getByRole('link', { name: 'Leave conversation' }));
+    expect(getByTestId('current-location')).toHaveTextContent('/c/other?viewer=else#message-other');
+    await act(async () => { finishRename(renamed); });
+    expect(getByTestId('current-location')).toHaveTextContent('/c/other?viewer=else#message-other');
   });
 
   it('publishes the successful authoritative title to the active aggregate snapshot', async () => {

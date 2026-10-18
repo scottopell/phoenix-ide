@@ -111,6 +111,8 @@ export function Sidebar({
 }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const currentLocation = useRef(location);
+  currentLocation.current = location;
   const conversationStore = useContext(ConversationContext);
   const { theme, toggleTheme } = useTheme();
   const [codexPreflight, setCodexPreflight] = useState<CodexLoginPreflight | null>(null);
@@ -339,10 +341,11 @@ export function Sidebar({
     if (!productRenameTarget) return;
     try {
       const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      const latestLocation = currentLocation.current;
       const activeRoute = renamedProductConversationLocation(
-        location.pathname, location.search, location.hash, productRenameTarget, renamed,
+        latestLocation.pathname, latestLocation.search, latestLocation.hash, productRenameTarget, renamed,
       );
-      if (activeRoute) navigate(activeRoute, { replace: true, state: location.state });
+      if (activeRoute) navigate(activeRoute, { replace: true, state: latestLocation.state });
       setProductConversations((rows) => rows.map((row) =>
         row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
       notifyProductConversationSnapshotChanged(renamed.product_conversation_id);

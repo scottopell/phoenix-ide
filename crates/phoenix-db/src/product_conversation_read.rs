@@ -481,6 +481,9 @@ impl Database {
 
     /// Commits an asynchronously generated name only if the canonical root still has its baseline.
     /// Returns `Ok(None)` when a human or newer naming operation changed it while generation ran.
+    ///
+    /// # Errors
+    /// Returns an identity, admission, or database error.
     pub async fn set_ordinary_product_conversation_title_if_unchanged(
         &self,
         reference: &str,

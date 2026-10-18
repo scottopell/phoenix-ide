@@ -10847,9 +10847,9 @@ impl Database {
                         }
                     }
                     tx.commit().await?;
-                    return Ok(());
+                    Ok(())
                 }
-                Err(e) => return Err(DbError::Sqlx(e)),
+                Err(e) => Err(DbError::Sqlx(e)),
             }
         }
     }
@@ -11071,9 +11071,9 @@ impl Database {
                         return Ok(CreationCasOutcome::ClaimLost);
                     }
                     tx.commit().await?;
-                    return Ok(CreationCasOutcome::Applied);
+                    Ok(CreationCasOutcome::Applied)
                 }
-                Err(e) => return Err(DbError::Sqlx(e)),
+                Err(e) => Err(DbError::Sqlx(e)),
             }
         }
     }
@@ -11628,7 +11628,7 @@ impl Database {
         }
     }
 
-    /// Rename the owning ordinary ProductConversation, preserving transcript identity.
+    /// Rename the owning ordinary `ProductConversation`, preserving transcript identity.
     ///
     /// # Errors
     /// Returns a database, identity, or admission error.
@@ -15126,30 +15126,7 @@ async fn insert_conversation_tx(
             .fetch_one(&mut **tx)
             .await?
             != 0;
-    let mut projected = conv.clone();
-    if !conversation_exists
-        && conv.user_initiated
-        && conv.runtime_role == RuntimeRole::User
-        && conv.parent_conversation_id.is_none()
-    {
-        let has_predecessor: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM conversations WHERE product_conversation_id = ?1 AND continued_in_conv_id = ?2)",
-        )
-        .bind(conv.product_conversation_id.as_str())
-        .bind(&conv.id)
-        .fetch_one(&mut **tx)
-        .await?;
-        if !has_predecessor {
-            let name = conv
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or("Conversation");
-            projected.slug = Some(conversation_name::allocate_slug_tx(tx, name, &conv.id).await?);
-            projected.title = Some(name.to_string());
-        }
-    }
+    let projected = project_conversation_name_tx(tx, conv, conversation_exists).await?;
     let conv = &projected;
     let generated_scope = if conv.runtime_role == RuntimeRole::Coordinator
         || conv.attached_work_scope_id.is_some()
@@ -15222,6 +15199,38 @@ async fn insert_conversation_tx(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+async fn project_conversation_name_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conv: &Conversation,
+    conversation_exists: bool,
+) -> DbResult<Conversation> {
+    let mut projected = conv.clone();
+    if !conversation_exists
+        && conv.user_initiated
+        && conv.runtime_role == RuntimeRole::User
+        && conv.parent_conversation_id.is_none()
+    {
+        let has_predecessor: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE product_conversation_id = ?1 AND continued_in_conv_id = ?2)",
+        )
+        .bind(conv.product_conversation_id.as_str())
+        .bind(&conv.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !has_predecessor {
+            let name = conv
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Conversation");
+            projected.slug = Some(conversation_name::allocate_slug_tx(tx, name, &conv.id).await?);
+            projected.title = Some(name.to_string());
+        }
+    }
+    Ok(projected)
 }
 
 /// Fold a tool result's `duration_ms` into its `display_data` JSON, mirroring

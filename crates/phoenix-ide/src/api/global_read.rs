@@ -1253,9 +1253,8 @@ pub(crate) async fn format_global_search_hits(
                     );
                     let stable_reference =
                         citation.as_ref().map(|(id, _, _)| format!("@conv:{id}"));
-                    let href = Some(if let Some((id, slug, _)) = citation {
-                        let base =
-                            crate::api::product_conversations::product_route(slug.as_deref(), &id);
+                    let href = Some(if let Some((id, _, _)) = citation {
+                        let base = crate::api::product_conversations::product_route(None, &id);
                         let pin = format!("{base}?source_transcript={}", conv.id);
                         if message_type_has_rendered_anchor(hit.message_type) {
                             format!("{pin}#message-{}", hit.message_id)
@@ -1955,11 +1954,7 @@ async fn resolve_web_reference(
             && (fragment.is_none() || fragment.and_then(message_id_fragment).is_none())
         {
             if let Ok(product) = &product {
-                if product.product_conversation_id.as_str() == id
-                    || reference.starts_with("/product-conversations/")
-                {
-                    canonical_product = Some(product.product_conversation_id.to_string());
-                }
+                canonical_product = Some(product.product_conversation_id.to_string());
             }
         }
         if canonical_product.is_none() {
@@ -2077,12 +2072,11 @@ async fn resolve_reference_impl(
             kind: "product_conversation".to_string(),
             id: typed_id.to_string(),
             href: Some(super::product_conversations::canonical_route(&aggregate)),
-            title: aggregate
+            title: aggregate.root.conversation.title.clone().or(aggregate
                 .root
                 .conversation
-                .title
-                .clone()
-                .or(aggregate.root.conversation.slug.clone()),
+                .slug
+                .clone()),
             work_scope: current.work_scope,
             summary: format!(
                 "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
@@ -2337,11 +2331,11 @@ async fn resolve_chain(
     Ok(ResolveGlobalReferenceResponse {
         kind: "chain".to_string(),
         id: root_id.to_string(),
-        href: Some(crate::api::product_conversations::product_route(root.slug.as_deref(), root.product_conversation_id.as_str())),
-        title: root
-            .title
-            .clone()
-            .or(root.slug.clone()),
+        href: Some(crate::api::product_conversations::product_route(
+            root.slug.as_deref(),
+            root.product_conversation_id.as_str(),
+        )),
+        title: root.title.clone().or(root.slug.clone()),
         work_scope,
         summary: format!(
             "legacy chain rooted at @transcript:{root_id} with {} member(s); current/latest {}; ordered members: {}",
@@ -3557,7 +3551,7 @@ mod tests {
                 .unwrap();
             assert!(search.contains(&format!("@conv:{}", conv.product_conversation_id)));
             let product_route = crate::api::product_conversations::product_route(
-                conv.slug.as_deref(),
+                None,
                 conv.product_conversation_id.as_str(),
             );
             assert!(
@@ -3877,6 +3871,7 @@ mod tests {
             }
         );
         for reference in [
+            stable.href.clone().unwrap(),
             format!("/c/{product_id}"),
             format!("/c/{product_id}?viewer=inspect"),
             format!("/product-conversations/{product_id}"),

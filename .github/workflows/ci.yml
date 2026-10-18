@@ -103,16 +103,6 @@ jobs:
           git config --global user.name "Phoenix CI"
       - name: Install musl compiler
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Generate typed contracts on hosted runner
-        if: ${{ github.head_ref == 'feat/conversation-name-slug' }}
-        run: ./dev.py codegen
-      - name: Retain generated contracts for resource-constrained source owner
-        if: ${{ always() && github.head_ref == 'feat/conversation-name-slug' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: conversation-name-codegen-${{ github.event.pull_request.head.sha }}
-          path: ui/src/generated/
-          retention-days: 3
       - name: ./dev.py check (rust,cargo-fmt)
         run: ./dev.py check --lanes rust,cargo-fmt
       - name: Check production feature on musl
