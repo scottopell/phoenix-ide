@@ -1,6 +1,7 @@
 """Current-schema prepared-artifact installer regressions."""
 
 import dataclasses
+import contextlib
 import importlib.util
 import itertools
 import json
@@ -323,6 +324,29 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         path.write_text(json.dumps(payload))
         loaded = helper.Manifest.load(path)
         self.assertIsInstance(loaded.current_schema_upgrade, helper.PreparedSource114Upgrade)
+        original = path.read_text()
+        duplicate_manifests = (
+            original.replace(
+                '"source_commit":',
+                '"source_commit":"0000000000000000000000000000000000000000",'
+                '"source_commit":',
+                1,
+            ),
+            original.replace(
+                '"current_schema_upgrade":',
+                '"current_schema_upgrade":null,"current_schema_upgrade":',
+                1,
+            ),
+            original.replace(
+                '"current_schema_upgrade": {',
+                '"current_schema_upgrade": {"prepared_source_baseline":114,',
+                1,
+            ),
+        )
+        for duplicate in duplicate_manifests:
+            path.write_text(duplicate)
+            with self.assertRaises(helper.ActivationError):
+                helper.Manifest.load(path)
         for key in ("prepared_source_baseline", "candidate_registry_expected_sha256"):
             changed = json.loads(json.dumps(payload))
             del changed["current_schema_upgrade"][key]
@@ -3109,6 +3133,858 @@ connection.close()
             with self.assertRaisesRegex(helper.ActivationError, "20 GiB"):
                 helper.reserve_database_capacity(manifest)
         self.assertEqual(allocations, [])
+
+
+
+
+class CurrentSchemaRepairTests(unittest.TestCase):
+    """Exact forward replacement; no production or real launchctl invocation."""
+
+    setUp = CurrentSchemaPreparedUpgradeTests.setUp
+    database = CurrentSchemaPreparedUpgradeTests.database
+
+    def sealed(self):
+        database = self.database(through=128)
+        parent = CurrentSchemaPreparedUpgradeTests.manifest(self, database)
+        directory = Path(parent.current_schema_upgrade.proof_path).parent
+        helper.atomic_write(directory / "original-candidate", b"original", 0o700)
+        plist = plistlib.dumps({"Label": parent.label, "ProgramArguments": [str(self.root / "installed")],
+                               "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database), "CAPTURED": "exact"}})
+        helper.atomic_write(directory / "candidate.plist", plist)
+        current = helper.PreparedSource114Upgrade(**dataclasses.asdict(parent.current_schema_upgrade),
+                                                prepared_source_baseline=114,
+                                                candidate_registry_expected_sha256=helper.PREPARED_SOURCE114_REGISTRY_SHA256)
+        parent = dataclasses.replace(parent, source_commit=helper.PREPARED_SOURCE114_COMMIT,
+                                     expected=helper.Identity(helper.CURRENT_REPAIR_VERSION, helper.PREPARED_SOURCE114_COMMIT),
+                                     candidate_binary=str(directory / "original-candidate"),
+                                     candidate_binary_sha256=helper.sha256(directory / "original-candidate"),
+                                     candidate_plist=str(directory / "candidate.plist"), candidate_plist_sha256=helper.sha256(directory / "candidate.plist"),
+                                     current_schema_upgrade=current, target_binary=str(self.root / "installed"))
+        helper.atomic_write(Path(parent.target_binary), (directory / "original-candidate").read_bytes(), 0o755)
+        helper.atomic_write(Path(parent.target_plist), plist)
+        for name in ("helper.py", "migrations.rs"):
+            (directory / name).chmod(0o600)
+        backup = Path(current.backup_path)
+        shutil.copyfile(database, backup)
+        backup.chmod(0o600)
+        proof = json.loads(helper._database_proof_bytes(parent, database, backup_sha256=helper.sha256(backup),
+                                                      source_logical_digest=helper.database_logical_digest(database),
+                                                      backup_logical_digest=helper.database_logical_digest(backup)))
+        proof.update(migration_committed_at="2026-10-18T00:00:00+00:00", migrated_ledger=compiled_ledger(),
+                     migrated_logical_digest=helper.database_logical_digest(database))
+        helper.atomic_write(Path(current.proof_path), helper._encode_database_proof(proof))
+        helper.atomic_write(directory / "manifest.json", json.dumps(dataclasses.asdict(parent)).encode())
+        helper.write_status(parent, "committed", finalization_pending=True)
+        helper.atomic_write(Path(parent.active_path), (parent.transaction_id + "\n").encode())
+        restore = helper._restore_capacity_path(parent, database)
+        helper._allocate_private_sqlite(restore, database.stat().st_size * 2)
+        child = directory / helper.CURRENT_REPAIR_DIRECTORY
+        child.mkdir(mode=0o700)
+        helper.atomic_write(child / "candidate", b"repair", 0o700)
+        helper.atomic_write(child / "candidate.plist", plist)
+        helper.atomic_write(child / "parent-status.json", Path(parent.status_path).read_bytes())
+        helper.atomic_write(child / "helper.py", Path(helper.__file__).read_bytes())
+        helper.atomic_write(child / "migrations.rs", self.registry.read_bytes())
+        target = "aarch64-apple-darwin"
+        receipt = {"schema": 1, "operation": "prepare-main", "target": target,
+                   "commit": helper.CURRENT_REPAIR_COMMIT, "version": helper.CURRENT_REPAIR_VERSION,
+                   "checks": {"developer_id_signature": "verified", "hardened_runtime": "verified", "notarization": "accepted",
+                              "stapled_ticket": "validated", "gatekeeper": "accepted", "embedded_helper_bytes": "identical",
+                              "notarization_submission_id": "00000000-0000-0000-0000-000000000001"},
+                   "sha256": {f"phoenix_ide-{target}-prepared-{helper.CURRENT_REPAIR_COMMIT[:12]}": helper.sha256(child / "candidate")}}
+        helper.atomic_write(child / "receipt.json", json.dumps(receipt).encode())
+        repair = helper.CurrentSchemaRepairManifest(
+            1, str(directory / "manifest.json"), helper.sha256(directory / "manifest.json"),
+            helper.sha256(Path(parent.status_path)), helper.sha256(Path(current.proof_path)),
+            helper.CURRENT_REPAIR_COMMIT, helper.CURRENT_REPAIR_VERSION, "d" * 40,
+            helper.sha256(child / "helper.py"), helper.sha256(child / "candidate"), helper.sha256(child / "migrations.rs"),
+            helper.sha256(child / "candidate.plist"), helper.sha256(child / "receipt.json"), f"{parent.helper_label}.current-schema-repair")
+        path = child / "manifest.json"
+        helper.atomic_write(path, json.dumps(dataclasses.asdict(repair)).encode())
+        status = helper.CurrentSchemaRepairStatus(1, helper.sha256(path), "prepared", None, None, False, None)
+        helper._write_repair_status(path, status)
+        helper.atomic_write(Path(parent.target_binary), b"", 0o600)
+        Path(parent.target_plist).unlink()
+        self.parent, self.repair, self.path = parent, repair, path
+        return path
+
+    def environment(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        self.events = []
+        self.launchctl = mock.Mock()
+        self.launchctl.stop.side_effect = lambda: self.events.append("stop")
+        self.launchctl.start.side_effect = lambda *a, **kw: self.events.append(("start", kw["plist_path"]))
+        stack.enter_context(mock.patch.object(helper, "__file__", str(self.path.parent / "helper.py")))
+        stack.enter_context(mock.patch.object(helper, "Launchctl", return_value=self.launchctl))
+        stack.enter_context(mock.patch.object(helper, "assert_database_exclusive", side_effect=lambda p: self.events.append("exclusive")))
+        stack.enter_context(mock.patch.object(helper, "require_launchd_absence", side_effect=lambda *a: self.events.append(("absent", a[0]))))
+        stack.enter_context(mock.patch.object(helper, "require_loaded_plist", side_effect=lambda *a: self.events.append("loaded")))
+        stack.enter_context(mock.patch.object(helper, "wait_for_identity", side_effect=lambda p, i: self.events.append(("identity", i.git_sha))))
+
+        def run(args, **kwargs):
+            self.events.append(tuple(args))
+            if args[-1] == "--build-identity":
+                return subprocess.CompletedProcess(args, 0, json.dumps({"version": helper.CURRENT_REPAIR_VERSION, "git_sha": helper.CURRENT_REPAIR_COMMIT}), "")
+            if args[-1] == "--migrate-only":
+                status = helper.CurrentSchemaRepairStatus.load(self.path.parent / "status.json", helper.sha256(self.path))
+                self.assertEqual(status.state, "reconciliation_started")
+                self.assertEqual(helper.sha256(Path(args[0])), self.repair.candidate_sha256)
+                self.assertEqual(kwargs["env"]["CAPTURED"], "exact")
+                return subprocess.CompletedProcess(args, 0)
+            raise AssertionError(f"unexpected subprocess {args}")
+        self.run = stack.enter_context(mock.patch.object(helper.subprocess, "run", side_effect=run))
+        self.restore = stack.enter_context(mock.patch.object(helper, "restore", side_effect=AssertionError("predecessor forbidden")))
+        self.restore_db = stack.enter_context(mock.patch.object(helper, "restore_database", side_effect=AssertionError("snapshot replay forbidden")))
+        return stack
+
+    def status(self):
+        return helper.CurrentSchemaRepairStatus.load(self.path.parent / "status.json", helper.sha256(self.path))
+
+    def test_exact_success_parent_immutable_and_terminal_release_last(self):
+        self.sealed()
+        immutable = {p: p.read_bytes() for p in (Path(self.repair.parent_manifest_path), Path(self.parent.status_path), Path(self.parent.current_schema_upgrade.proof_path))}
+        self.environment()
+        release = helper.release_claim
+        def release_checked(parent):
+            self.assertEqual(self.status().state, "committed")
+            self.assertFalse(self.status().finalization_pending)
+            self.assertEqual(Path(parent.deployed_sha_path).read_text().strip(), helper.CURRENT_REPAIR_COMMIT)
+            self.assertEqual(helper.sha256(Path(parent.target_plist)), self.repair.plist_sha256)
+            self.assertFalse(helper._restore_capacity_path(parent).exists())
+            self.assertTrue((self.path.parent / "proof.json").is_file())
+            self.assertTrue(Path(parent.current_schema_upgrade.backup_path).is_file())
+            self.events.append("release")
+            return release(parent)
+        with mock.patch.object(helper, "release_claim", side_effect=release_checked):
+            self.assertEqual(helper.activate_current_repair(self.path), "committed")
+        self.assertEqual(self.events[-1], "release")
+        self.assertFalse(Path(self.parent.active_path).exists())
+        for path, content in immutable.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual([e for e in self.events if isinstance(e, tuple) and e[-1] == "--migrate-only"], [(self.parent.target_binary, "--migrate-only")])
+        self.assertIn(("start", str(self.path.parent / "candidate.plist")), self.events)
+        self.restore.assert_not_called()
+        self.restore_db.assert_not_called()
+
+    def test_terminal_resume_is_runtime_and_database_mutation_free(self):
+        self.sealed()
+        self.environment()
+        helper.activate_current_repair(self.path)
+        self.events.clear()
+        with mock.patch.object(helper, "atomic_install", side_effect=AssertionError("terminal install")), mock.patch.object(helper, "_repair_verify_database", side_effect=AssertionError("terminal database")):
+            self.assertEqual(helper.activate_current_repair(self.path), "committed")
+        self.launchctl.stop.assert_not_called()
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+
+    def test_parent_claim_status_and_proof_admission(self):
+        self.sealed()
+        parent_path = Path(self.repair.parent_manifest_path)
+        helper.validate_current_repair_parent(parent_path)
+        for key, value in (("state", "migration_started"), ("finalization_pending", False), ("finalization_pending", 1), ("expected_git_sha", "a" * 40)):
+            with self.subTest(key=key, value=value):
+                old = Path(self.parent.status_path).read_bytes()
+                raw = json.loads(old)
+                raw[key] = value
+                helper.atomic_write(Path(self.parent.status_path), json.dumps(raw).encode())
+                with self.assertRaises(helper.ActivationError):
+                    helper.validate_current_repair_parent(parent_path)
+                helper.atomic_write(Path(self.parent.status_path), old)
+        helper.atomic_write(Path(self.parent.active_path), b"other\n")
+        with self.assertRaises(helper.ActivationError):
+            helper.validate_current_repair_parent(parent_path)
+
+    def test_sealed_evidence_crosswires_fail_closed(self):
+        self.sealed()
+        for filename in ("candidate", "helper.py", "receipt.json", "migrations.rs", "candidate.plist", "parent-status.json"):
+            with self.subTest(filename=filename):
+                path = self.path.parent / filename
+                old = path.read_bytes()
+                helper.atomic_write(path, b"crosswired")
+                with self.assertRaises(helper.ActivationError):
+                    helper.validate_current_repair(self.path, running_helper=False)
+                helper.atomic_write(path, old, 0o700 if filename == "candidate" else 0o600)
+        for filename in ("candidate", "helper.py", "receipt.json"):
+            with self.subTest(symlink=filename):
+                path = self.path.parent / filename
+                old = path.read_bytes()
+                path.unlink()
+                path.symlink_to(Path(self.parent.candidate_binary))
+                with self.assertRaises(helper.ActivationError):
+                    helper.validate_current_repair(self.path, running_helper=False)
+                path.unlink()
+                helper.atomic_write(path, old)
+
+    def test_manifest_closed_types_candidate_and_controller_pin(self):
+        self.sealed()
+        original = json.loads(self.path.read_text())
+        for key, value in (("protocol_version", True), ("extra", "forbidden"), ("source_commit", helper.PREPARED_SOURCE114_COMMIT),
+                           ("controller_source_commit", helper.CURRENT_REPAIR_COMMIT), ("registry_sha256", "0" * 64),
+                           ("parent_manifest_path", "relative/manifest.json")):
+            with self.subTest(key=key):
+                raw = dict(original, **{key: value})
+                helper.atomic_write(self.path, json.dumps(raw).encode())
+                with self.assertRaises(helper.ActivationError):
+                    helper.CurrentSchemaRepairManifest.load(self.path)
+        helper.atomic_write(self.path, json.dumps(original).encode())
+
+    def test_status_closed_state_consistency(self):
+        self.sealed()
+        for fields in ({"extra": 1}, {"state": "other"}, {"state": "target_verified"}, {"finalization_pending": True},
+                       {"state": "failed_stopped"}, {"resume_from": "prepared"}, {"protocol_version": True},
+                       {"manifest_sha256": "0" * 64}, {"proof_sha256": "a" * 64}):
+            with self.subTest(fields=fields):
+                raw = dict(dataclasses.asdict(self.status()), **fields)
+                helper.atomic_write(self.path.parent / "status.json", json.dumps(raw).encode())
+                with self.assertRaises(helper.ActivationError):
+                    self.status()
+                helper._write_repair_status(self.path, helper.CurrentSchemaRepairStatus(1, helper.sha256(self.path), "prepared", None, None, False, None))
+
+    def test_selected_child_blocks_original_finalize_and_recovery(self):
+        self.sealed()
+        with mock.patch.object(helper, "Launchctl") as launchctl:
+            for operation in (helper.finalize_paired, helper.recover_paired):
+                with self.assertRaisesRegex(helper.ActivationError, "resume-current-repair"):
+                    operation(self.parent, current_schema=True)
+            self.assertFalse(helper.status_is_durable_terminal(self.parent))
+            launchctl.assert_not_called()
+        helper.atomic_write(self.path, b"malformed")
+        with self.assertRaises(helper.ActivationError):
+            helper.finalize_paired(self.parent, current_schema=True)
+
+    def test_install_failure_stops_retains_and_retries_same_child(self):
+        self.sealed()
+        self.environment()
+        with mock.patch.object(helper, "atomic_install", side_effect=OSError("install failed")):
+            with self.assertRaises(OSError):
+                helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("failed_stopped", "prepared"))
+        self.assertTrue(Path(self.parent.active_path).exists())
+        self.assertEqual(helper.activate_current_repair(self.path), "committed")
+
+    def test_migration_failure_keeps_irreversible_checkpoint(self):
+        self.sealed()
+        self.environment()
+        original_run = self.run.side_effect
+        self.run.side_effect = lambda args, **kwargs: subprocess.CompletedProcess(args, 9) if args[-1] == "--migrate-only" else original_run(args, **kwargs)
+        with self.assertRaises(helper.ActivationError):
+            helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("failed_stopped", "reconciliation_started"))
+        self.assertTrue(Path(self.parent.active_path).exists())
+        self.restore.assert_not_called()
+        self.restore_db.assert_not_called()
+
+    def test_start_failure_resume_does_not_repeat_reconciliation(self):
+        self.sealed()
+        self.environment()
+        self.launchctl.start.side_effect = helper.ActivationError("start")
+        with self.assertRaises(helper.ActivationError):
+            helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("failed_stopped", "start_attempted"))
+        self.launchctl.start.side_effect = None
+        self.events.clear()
+        helper.activate_current_repair(self.path)
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+
+    def test_health_and_teardown_uncertainty_retains_claim(self):
+        self.sealed()
+        self.environment()
+        stopped = [False]
+        def stop():
+            stopped[0] = True
+            raise helper.ActivationError("teardown uncertain")
+        def absence(label, uid):
+            if stopped[0] and label == self.parent.label:
+                raise helper.ActivationError("absence uncertain")
+        self.launchctl.stop.side_effect = stop
+        with mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("health")), \
+             mock.patch.object(helper, "require_launchd_absence", side_effect=absence):
+            with self.assertRaises(helper.ActivationError):
+                helper.activate_current_repair(self.path)
+        self.assertEqual(self.status().state, "stop_unconfirmed")
+        self.assertEqual(self.status().resume_from, "start_attempted")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_database_target_verification_is_required_after_reconciliation(self):
+        self.sealed()
+        self.environment()
+        original_run = self.run.side_effect
+        def run(args, **kwargs):
+            result = original_run(args, **kwargs)
+            if args[-1] == "--migrate-only":
+                with sqlite3.connect(self.parent.current_schema_upgrade.database_path) as connection:
+                    connection.execute("DELETE FROM _migrations WHERE version = 128")
+            return result
+        self.run.side_effect = run
+        with self.assertRaises(helper.ActivationError):
+            helper.activate_current_repair(self.path)
+        self.assertEqual(self.status().resume_from, "reconciliation_started")
+        self.launchctl.start.assert_not_called()
+
+    def test_publication_failure_stops_then_resumes_without_reconciliation(self):
+        self.sealed()
+        self.environment()
+        with mock.patch.object(helper, "_publish_current_repair", side_effect=OSError("publication")):
+            with self.assertRaises(OSError):
+                helper.activate_current_repair(self.path)
+        self.assertEqual(self.status().resume_from, "committed")
+        self.events.clear()
+        helper.activate_current_repair(self.path)
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+
+    def test_claim_parent_fsync_failure_restores_exact_owner_and_retries_after_cleanup(self):
+        self.sealed()
+        self.environment()
+        real_fsync = helper.fsync_dir
+        fail_once = [True]
+        def fsync(directory):
+            if directory == Path(self.parent.active_path).parent and not Path(self.parent.active_path).exists() and fail_once[0]:
+                fail_once[0] = False
+                raise OSError("claim-parent fsync")
+            return real_fsync(directory)
+        with mock.patch.object(helper, "fsync_dir", side_effect=fsync):
+            with self.assertRaises(OSError):
+                helper.activate_current_repair(self.path)
+        self.assertEqual(Path(self.parent.active_path).read_text().strip(), self.parent.transaction_id)
+        status = self.status()
+        self.assertEqual((status.state, status.resume_from, status.finalization_pending), ("committed", None, False))
+        self.assertFalse(helper._restore_capacity_path(self.parent).exists())
+        helper.activate_current_repair(self.path)
+        self.assertFalse(Path(self.parent.active_path).exists())
+
+    def test_stale_original_helper_never_invokes_candidate(self):
+        self.sealed()
+        self.environment()
+        with mock.patch.object(helper, "require_launchd_absence", side_effect=helper.ActivationError("helper still loaded")):
+            with self.assertRaises(helper.ActivationError):
+                helper.activate_current_repair(self.path)
+        self.run.assert_not_called()
+        self.launchctl.start.assert_not_called()
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_captured_plist_drift_refuses_even_if_child_digest_is_resealed(self):
+        self.sealed()
+        altered = plistlib.loads((self.path.parent / "candidate.plist").read_bytes())
+        altered["EnvironmentVariables"]["CAPTURED"] = "ambient"
+        helper.atomic_write(self.path.parent / "candidate.plist", plistlib.dumps(altered))
+        repair = dataclasses.replace(self.repair, plist_sha256=helper.sha256(self.path.parent / "candidate.plist"))
+        helper.atomic_write(self.path, json.dumps(dataclasses.asdict(repair)).encode())
+        helper._write_repair_status(self.path, helper.CurrentSchemaRepairStatus(1, helper.sha256(self.path), "prepared", None, None, False, None))
+        with self.assertRaisesRegex(helper.ActivationError, "configuration differs"):
+            helper.validate_current_repair(self.path, running_helper=False)
+
+    def controller(self):
+        spec = importlib.util.spec_from_file_location("repair_devpy_test", ROOT / "dev.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_stopped_runtime_fence_preserves_private_parent_and_blocks_old_checksum(self):
+        self.sealed()
+        self.assertEqual(Path(self.parent.candidate_binary).read_bytes(), b"original")
+        self.assertEqual(helper.sha256(Path(self.parent.candidate_plist)), self.parent.candidate_plist_sha256)
+        self.assertEqual(helper.sha256(Path(self.parent.target_binary)), helper.CURRENT_REPAIR_RUNTIME_FENCE_SHA256)
+        self.assertFalse(Path(self.parent.target_binary).stat().st_mode & 0o111)
+        self.assertFalse(Path(self.parent.target_plist).exists())
+        with self.assertRaises(helper.ActivationError):
+            helper.verify_staged(self.parent.target_binary, self.parent.candidate_binary_sha256, "historical finalizer target")
+
+    def test_runtime_fence_write_failure_attempts_exact_service_teardown(self):
+        self.sealed()
+        helper.atomic_write(Path(self.parent.target_binary), Path(self.parent.candidate_binary).read_bytes(), 0o755)
+        helper.atomic_write(Path(self.parent.target_plist), Path(self.parent.candidate_plist).read_bytes())
+        launchctl = mock.Mock()
+        with mock.patch.object(helper, "require_launchd_absence"), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "atomic_write", side_effect=OSError("fence write")):
+            with self.assertRaisesRegex(OSError, "fence write"):
+                helper.install_current_repair_runtime_fence(self.parent)
+        launchctl.stop.assert_called_once()
+
+    def test_repeat_repair_command_classifies_child_before_full_admission(self):
+        self.sealed()
+        dev = self.controller()
+        with mock.patch.object(dev, "_current_repair_path", return_value=self.path), \
+             mock.patch.object(dev, "_current_repair_module", return_value=helper), \
+             mock.patch.object(helper, "validate_current_repair_parent", side_effect=AssertionError("full parent admission")), \
+             mock.patch.object(helper, "validate_current_schema_database", side_effect=AssertionError("live database admission")), \
+             mock.patch.object(dev, "_prepare_prepared_artifact", side_effect=AssertionError("ambient artifact")):
+            with self.assertRaisesRegex(SystemExit, "already sealed"):
+                dev.cmd_prod_repair_current(self.parent.transaction_id, self.root / "unused", helper.CURRENT_REPAIR_COMMIT)
+
+    def test_preparation_seals_before_handoff_and_uses_candidate_git_object(self):
+        self.sealed()
+        dev = self.controller()
+        artifact = self.root / "prepared"
+        artifact.mkdir()
+        shutil.copyfile(self.path.parent / "candidate", artifact / "standalone")
+        receipt = artifact / "PREPARATION-RECEIPT-aarch64-apple-darwin.json"
+        shutil.copyfile(self.path.parent / "receipt.json", receipt)
+        self.path.unlink()  # Unsealed staging has no activation authority.
+        (self.path.parent / "status.json").unlink()
+        helper.atomic_write(Path(self.parent.target_binary), Path(self.parent.candidate_binary).read_bytes(), 0o755)
+        helper.atomic_write(Path(self.parent.target_plist), Path(self.parent.candidate_plist).read_bytes())
+        prepared = dev.PreparedCandidate(binary=artifact / "standalone", source_kind=dev.ProdSourceKind.PREPARED_ARTIFACT,
+                                         source_commit=helper.CURRENT_REPAIR_COMMIT,
+                                         identity=dev.RuntimeIdentity(helper.CURRENT_REPAIR_VERSION, helper.CURRENT_REPAIR_COMMIT))
+        events = []
+        real_atomic = helper.atomic_write
+        def write(path, data, mode=0o600):
+            events.append(path.name)
+            return real_atomic(path, data, mode)
+        def source(commit, name, destination, kind):
+            self.assertEqual(commit, helper.CURRENT_REPAIR_COMMIT)
+            self.assertEqual(name, "crates/phoenix-db/src/migrations.rs")
+            self.assertEqual(kind, "local_head")
+            destination.write_bytes(self.registry.read_bytes())
+        def handoff(path, **kwargs):
+            events.append("handoff-enter")
+            self.assertEqual(helper.validate_current_repair(path, running_helper=False)[2].state, "prepared")
+            self.assertFalse(kwargs["resume"])
+            events.append("handoff")
+        real_validate_staging = helper.validate_current_repair_staging
+        def validate_staging(*args, **kwargs):
+            events.append("validate-staging")
+            return real_validate_staging(*args, **kwargs)
+        with mock.patch.object(dev, "_current_repair_path", return_value=self.path), \
+             mock.patch.object(dev, "_current_repair_module", return_value=helper), \
+             mock.patch.object(dev, "_prepare_prepared_artifact", return_value=prepared), \
+             mock.patch.object(dev.platform, "machine", return_value="arm64"), \
+             mock.patch.object(helper, "require_launchd_absence"), mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(dev.subprocess, "run", side_effect=lambda args, **kw: subprocess.CompletedProcess(args, 0, "d" * 40 if args[1] == "rev-parse" else "", "")), \
+             mock.patch.object(dev, "_materialize_helper", side_effect=lambda commit, destination, kind: destination.write_bytes(Path(helper.__file__).read_bytes())), \
+             mock.patch.object(dev, "_materialize_source_file", side_effect=source), \
+             mock.patch.object(helper, "validate_current_repair_staging", side_effect=validate_staging), \
+             mock.patch.object(helper, "atomic_write", side_effect=write), mock.patch.object(dev, "_handoff_current_repair", side_effect=handoff):
+            dev.cmd_prod_repair_current(self.parent.transaction_id, artifact, helper.CURRENT_REPAIR_COMMIT)
+        self.assertEqual(events[-1], "handoff")
+        self.assertLess(events.index("validate-staging"), events.index("status.json"))
+        self.assertLess(events.index("status.json"), events.index("installed"))
+        self.assertLess(events.index("installed"), events.index("manifest.json"))
+        self.assertLess(events.index("manifest.json"), events.index("handoff-enter"))
+        self.assertEqual(Path(self.parent.target_binary).read_bytes(), b"")
+        self.assertFalse(Path(self.parent.target_binary).stat().st_mode & 0o111)
+        self.assertFalse(Path(self.parent.target_plist).exists())
+
+    def test_unsealed_cleanup_refuses_any_repair_checkpoint_or_unknown_path(self):
+        self.sealed()
+        dev = self.controller()
+        self.path.unlink()
+        status = json.loads((self.path.parent / "status.json").read_text())
+        status["state"] = "reconciliation_started"
+        helper.atomic_write(self.path.parent / "status.json", json.dumps(status).encode())
+        with self.assertRaises(SystemExit):
+            dev._clean_unsealed_current_repair(self.path.parent, helper)
+        self.assertTrue((self.path.parent / "candidate").exists())
+        status["state"] = "prepared"
+        helper.atomic_write(self.path.parent / "status.json", json.dumps(status).encode())
+        helper.atomic_write(self.path.parent / "not-owned", b"keep")
+        with self.assertRaises(SystemExit):
+            dev._clean_unsealed_current_repair(self.path.parent, helper)
+        self.assertTrue((self.path.parent / "not-owned").exists())
+
+    def test_unsealed_partial_has_no_selection_and_malformed_seal_fences_classifiers(self):
+        self.sealed()
+        dev = self.controller()
+        transaction = self.path.parent.parent
+        self.path.unlink()
+        self.assertIsNone(dev._current_repair_resolution(transaction))
+        helper.atomic_write(self.path, b"invalid")
+        with mock.patch.object(dev, "LAUNCHD_DEPLOY_DIR", transaction.parent.parent), \
+             mock.patch.object(dev, "_current_repair_module", return_value=helper):
+            self.assertFalse(dev._current_repair_resolution(transaction))
+        with mock.patch.object(dev, "_current_repair_resolution", return_value=False):
+            self.assertIn("resume-current-repair", dev._paired_recovery_refusal(self.parent.transaction_id))
+            self.assertFalse(dev._markerless_status_is_resolved(json.loads(Path(self.parent.status_path).read_text())))
+            self.assertFalse(dev._status_is_terminal_for_owner(dev.LAUNCHD_DEPLOY_STATUS_PATH, self.parent.transaction_id, {"committed"}))
+
+    def test_resume_uses_retained_handoff_without_preparation(self):
+        self.sealed()
+        dev = self.controller()
+        with mock.patch.object(dev, "_current_repair_path", return_value=self.path), \
+             mock.patch.object(dev, "_handoff_current_repair") as handoff, \
+             mock.patch.object(dev, "_prepare_prepared_artifact", side_effect=AssertionError("ambient artifact")), \
+             mock.patch.object(dev, "_materialize_helper", side_effect=AssertionError("ambient helper")), \
+             mock.patch.object(dev, "_materialize_source_file", side_effect=AssertionError("ambient registry")):
+            dev.cmd_prod_resume_current_repair(self.parent.transaction_id)
+        handoff.assert_called_once_with(self.path, resume=True)
+
+    def test_reconciliation_checkpoint_fsync_failure_prevents_candidate_invocation(self):
+        self.sealed()
+        self.environment()
+        real_write = helper._write_repair_status
+        def write(path, status):
+            if status.state == "reconciliation_started":
+                raise OSError("checkpoint durability")
+            return real_write(path, status)
+        with mock.patch.object(helper, "_write_repair_status", side_effect=write):
+            with self.assertRaises(OSError):
+                helper.activate_current_repair(self.path)
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+        self.assertEqual(self.status().resume_from, "prepared")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_database_foreign_key_damage_prevents_install_or_start(self):
+        self.sealed()
+        self.environment()
+        with sqlite3.connect(self.parent.current_schema_upgrade.database_path) as connection:
+            connection.execute("INSERT INTO conversations VALUES ('broken', 'missing')")
+        with mock.patch.object(helper, "atomic_install") as install:
+            with self.assertRaises(helper.ActivationError):
+                helper.activate_current_repair(self.path)
+        install.assert_not_called()
+        self.launchctl.start.assert_not_called()
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_parent_status_and_proof_byte_drift_refuse_after_seal(self):
+        self.sealed()
+        for path in (Path(self.parent.status_path), Path(self.parent.current_schema_upgrade.proof_path)):
+            old = path.read_bytes()
+            helper.atomic_write(path, old + b"\n")
+            with self.assertRaises(helper.ActivationError):
+                helper.validate_current_repair(self.path, running_helper=False)
+            helper.atomic_write(path, old)
+
+    def test_proof_incomplete_or_uncommitted_parent_refuses(self):
+        self.sealed()
+        path = Path(self.parent.current_schema_upgrade.proof_path)
+        original = json.loads(path.read_text())
+        for key, value in (("migrated_ledger", compiled_ledger(127)), ("migration_committed_at", None), ("target_ledger", compiled_ledger(127))):
+            with self.subTest(key=key):
+                helper.atomic_write(path, json.dumps(dict(original, **{key: value})).encode())
+                with self.assertRaises(helper.ActivationError):
+                    helper.validate_current_repair_parent(Path(self.repair.parent_manifest_path))
+        helper.atomic_write(path, json.dumps(original).encode())
+
+    def test_capacity_loss_stops_retains_without_reconciliation(self):
+        self.sealed()
+        self.environment()
+        capacity = shutil.disk_usage(self.root)._replace(free=0)
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=capacity):
+            with self.assertRaises(helper.ActivationError):
+                helper.activate_current_repair(self.path)
+        self.assertEqual(self.status().state, "failed_stopped")
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_parent_service_absence_is_required_before_first_install(self):
+        self.sealed()
+        self.environment()
+        def absence(label, uid):
+            if label == self.parent.label:
+                raise helper.ActivationError("service present")
+        with mock.patch.object(helper, "require_launchd_absence", side_effect=absence), mock.patch.object(helper, "atomic_install") as install:
+            with self.assertRaises(helper.ActivationError):
+                helper.activate_current_repair(self.path)
+        install.assert_not_called()
+        self.assertEqual(self.status().state, "stop_unconfirmed")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def reseal(self, **fields):
+        self.repair = dataclasses.replace(self.repair, **fields)
+        helper.atomic_write(self.path, json.dumps(dataclasses.asdict(self.repair)).encode())
+        helper._write_repair_status(self.path, helper.CurrentSchemaRepairStatus(
+            1, helper.sha256(self.path), "prepared", None, None, False, None))
+
+    def pending_commit(self):
+        with mock.patch.object(helper, "_publish_current_repair", side_effect=KeyboardInterrupt("crash after pending commit")):
+            with self.assertRaises(KeyboardInterrupt):
+                helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().finalization_pending), ("committed", True))
+
+    def test_pending_running_commit_only_retries_health_publication_and_cleanup(self):
+        self.sealed()
+        self.environment()
+        self.pending_commit()
+        self.launchctl.inspect.return_value = ("running", 4321)
+        self.launchctl.start.reset_mock()
+        self.events.clear()
+        proof = (self.path.parent / "proof.json").read_bytes()
+        with mock.patch.object(helper, "atomic_install", side_effect=AssertionError("pending install")), \
+             mock.patch.object(helper, "_repair_verify_database", side_effect=AssertionError("live database inspection")), \
+             mock.patch.object(helper, "_source_capacity_bytes", side_effect=AssertionError("live database capacity inspection")):
+            self.assertEqual(helper.activate_current_repair(self.path), "committed")
+        self.launchctl.start.assert_not_called()
+        self.launchctl.stop.assert_not_called()
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+        self.assertEqual((self.path.parent / "proof.json").read_bytes(), proof)
+
+    def test_pending_stopped_commit_restarts_only_repair_without_reconciliation(self):
+        self.sealed()
+        self.environment()
+        self.pending_commit()
+        self.launchctl.inspect.return_value = ("not_loaded", None)
+        self.events.clear()
+        self.assertEqual(helper.activate_current_repair(self.path), "committed")
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+        self.assertEqual(self.status().finalization_pending, False)
+
+    def test_cleanup_fsync_failure_retries_after_restore_reservation_is_gone(self):
+        self.sealed()
+        self.environment()
+        restore = helper._restore_capacity_path(self.parent)
+        real_fsync = helper.fsync_dir
+        fail = [True]
+        def fsync(directory):
+            if directory == restore.parent and not restore.exists() and fail[0]:
+                fail[0] = False
+                raise OSError("restore cleanup fsync")
+            return real_fsync(directory)
+        with mock.patch.object(helper, "fsync_dir", side_effect=fsync):
+            with self.assertRaises(OSError):
+                helper.activate_current_repair(self.path)
+        self.assertEqual(self.status().resume_from, "committed")
+        self.assertTrue(Path(self.parent.active_path).exists())
+        self.assertFalse(restore.exists())
+        self.events.clear()
+        self.assertEqual(helper.activate_current_repair(self.path), "committed")
+        self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
+
+    def test_ambiguous_publication_temporary_is_preserved(self):
+        self.sealed()
+        self.environment()
+        publication = helper._repair_publication_path(self.parent)
+        helper.atomic_write(publication, b"unrecognized publication")
+        with self.assertRaisesRegex(helper.ActivationError, "owned repair publication"):
+            helper.activate_current_repair(self.path)
+        self.assertEqual(publication.read_bytes(), b"unrecognized publication")
+        self.assertEqual(self.status().resume_from, "committed")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_matching_orphan_publication_is_cleaned_and_published(self):
+        self.sealed()
+        self.environment()
+        publication = helper._repair_publication_path(self.parent)
+        os.link(self.path.parent / "candidate.plist", publication)
+        self.assertEqual(helper.activate_current_repair(self.path), "committed")
+        self.assertFalse(publication.exists())
+        self.assertTrue(os.path.samefile(self.path.parent / "candidate.plist", self.parent.target_plist))
+
+    def test_classifier_never_scans_database_or_backup_but_full_admission_does(self):
+        self.sealed()
+        dev = self.controller()
+        real_hash = helper.sha256
+        forbidden = {Path(self.parent.current_schema_upgrade.database_path), Path(self.parent.current_schema_upgrade.backup_path)}
+        def digest(path):
+            if path in forbidden:
+                raise AssertionError("classifier scanned database/backup")
+            return real_hash(path)
+        with mock.patch.object(helper, "sha256", side_effect=digest), \
+             mock.patch.object(helper, "_snapshot_proof", side_effect=AssertionError("full parent proof scan")), \
+             mock.patch.object(helper, "validate_current_schema_database", side_effect=AssertionError("database validation")), \
+             mock.patch.object(helper, "database_logical_digest", side_effect=AssertionError("logical scan")), \
+             mock.patch.object(dev, "_current_repair_module", return_value=helper):
+            self.assertEqual(helper.classify_current_repair(self.path)[2].state, "prepared")
+            self.assertFalse(dev._current_repair_resolution(self.path.parent.parent))
+            with self.assertRaisesRegex(AssertionError, "full parent proof scan"):
+                helper.validate_current_repair(self.path, running_helper=False)
+
+    def test_terminal_child_remains_unresolved_until_exact_parent_claim_release(self):
+        self.sealed()
+        status = helper.CurrentSchemaRepairStatus(
+            1, helper.sha256(self.path), "committed", None, "a" * 64, False, None
+        )
+        proof = {
+            "protocol_version": 1,
+            "manifest_sha256": helper.sha256(self.path),
+            "parent_proof_sha256": self.repair.parent_proof_sha256,
+            "source_commit": self.repair.source_commit,
+            "registry_sha256": self.repair.registry_sha256,
+            "target_ledger": compiled_ledger(),
+        }
+        helper.atomic_write(self.path.parent / "proof.json", helper._encode_database_proof(proof))
+        status = dataclasses.replace(status, proof_sha256=helper.sha256(self.path.parent / "proof.json"))
+        helper._write_repair_status(self.path, status)
+        dev = self.controller()
+        with mock.patch.object(dev, "_current_repair_module", return_value=helper):
+            self.assertFalse(dev._current_repair_resolution(self.path.parent.parent))
+            Path(self.parent.active_path).unlink()
+            self.assertTrue(dev._current_repair_resolution(self.path.parent.parent))
+
+    def test_terminal_audit_uses_snapshot_after_global_status_and_runtime_replacement(self):
+        self.sealed()
+        self.environment()
+        helper.activate_current_repair(self.path)
+        snapshot = (self.path.parent / "parent-status.json").read_bytes()
+        helper.atomic_write(Path(self.parent.status_path), b'{"transaction_id":"later","state":"prepared"}')
+        helper.atomic_write(Path(self.parent.target_binary), b"later legitimate deployment", 0o755)
+        dev = self.controller()
+        with mock.patch.object(helper, "_snapshot_proof", side_effect=AssertionError("historical backup scan")), \
+             mock.patch.object(dev, "_current_repair_module", return_value=helper):
+            self.assertEqual(helper.classify_current_repair(self.path)[2].state, "committed")
+            self.assertTrue(dev._current_repair_resolution(self.path.parent.parent))
+        self.assertEqual((self.path.parent / "parent-status.json").read_bytes(), snapshot)
+        helper.atomic_write(self.path.parent / "parent-status.json", snapshot + b"\n")
+        with self.assertRaises(helper.ActivationError):
+            helper.classify_current_repair(self.path)
+
+    def test_nonterminal_classifier_crosschecks_live_global_status(self):
+        self.sealed()
+        helper.atomic_write(Path(self.parent.status_path), b'{"transaction_id":"later"}')
+        with self.assertRaises(helper.ActivationError):
+            helper.classify_current_repair(self.path)
+
+    def test_classifier_rejects_rebound_parent_status_or_proof_unknown_fields(self):
+        self.sealed()
+        for path, digest_field in ((self.path.parent / "parent-status.json", "parent_status_sha256"),
+                                   (Path(self.parent.current_schema_upgrade.proof_path), "parent_proof_sha256")):
+            with self.subTest(path=path.name):
+                original = path.read_bytes()
+                record = json.loads(original)
+                record["unknown"] = True
+                helper.atomic_write(path, json.dumps(record).encode())
+                self.reseal(**{digest_field: helper.sha256(path)})
+                with self.assertRaises(helper.ActivationError):
+                    helper.classify_current_repair(self.path)
+                helper.atomic_write(path, original)
+                self.reseal(**{digest_field: helper.sha256(path)})
+
+    def test_malformed_status_stops_with_hash_bound_routing_without_fabricating_checkpoint(self):
+        self.sealed()
+        self.environment()
+        parent_status = Path(self.parent.status_path).read_bytes()
+        child_status = self.path.parent / "status.json"
+        helper.atomic_write(child_status, b'{"state":"committed"')
+        for stop_confirmed in (True, False):
+            with self.subTest(stop_confirmed=stop_confirmed):
+                self.launchctl.stop.reset_mock()
+                absence = None if stop_confirmed else helper.ActivationError("absence unknown")
+                with mock.patch.object(helper, "require_launchd_absence", side_effect=absence), \
+                     mock.patch.object(helper, "print", create=True) as output:
+                    with self.assertRaises(helper.ActivationError):
+                        helper.activate_current_repair(self.path)
+                self.launchctl.stop.assert_called_once()
+                message = " ".join(str(call) for call in output.call_args_list)
+                self.assertIn("failed_stopped" if stop_confirmed else "stop_unconfirmed", message)
+                self.assertIn("no terminal/checkpoint fabricated", message)
+                self.assertEqual(child_status.read_bytes(), b'{"state":"committed"')
+                self.assertEqual(Path(self.parent.status_path).read_bytes(), parent_status)
+                self.assertTrue(Path(self.parent.active_path).exists())
+                self.launchctl.start.assert_not_called()
+
+    def test_malformed_status_cannot_stop_another_owner(self):
+        self.sealed()
+        self.environment()
+        helper.atomic_write(self.path.parent / "status.json", b"malformed")
+        helper.atomic_write(Path(self.parent.active_path), b"other-owner\n")
+        with self.assertRaises(helper.ActivationError):
+            helper.activate_current_repair(self.path)
+        self.launchctl.stop.assert_not_called()
+        self.assertEqual(Path(self.parent.active_path).read_bytes(), b"other-owner\n")
+
+    def test_malformed_retained_receipt_shapes_stop_before_install(self):
+        self.sealed()
+        self.environment()
+        receipt = self.path.parent / "receipt.json"
+        original = json.loads(receipt.read_text())
+        for fields in ({"sha256": []}, {"checks": []}, {"target": []}, {"schema": True}):
+            with self.subTest(fields=fields):
+                helper.atomic_write(receipt, json.dumps(dict(original, **fields)).encode())
+                self.reseal(receipt_sha256=helper.sha256(receipt))
+                with mock.patch.object(helper, "atomic_install") as install:
+                    with self.assertRaises(helper.ActivationError):
+                        helper.activate_current_repair(self.path)
+                install.assert_not_called()
+                self.assertEqual(self.status().resume_from, "prepared")
+                self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_handoff_import_failure_attempts_stop_and_retains_claim(self):
+        self.sealed()
+        self.environment()
+        dev = self.controller()
+        def module(source=None):
+            if source is not None:
+                raise SyntaxError("retained helper import failed")
+            return helper
+        with mock.patch.object(dev, "_current_repair_module", side_effect=module):
+            with self.assertRaises(SyntaxError):
+                dev._handoff_current_repair(self.path, resume=True)
+        self.launchctl.stop.assert_called_once()
+        self.assertEqual(self.status().resume_from, "prepared")
+        self.assertTrue(Path(self.parent.active_path).exists())
+        self.launchctl.start.assert_not_called()
+
+    def test_handoff_malformed_status_attempts_stop_without_bootstrap_or_rewrite(self):
+        self.sealed()
+        self.environment()
+        dev = self.controller()
+        status_path = self.path.parent / "status.json"
+        helper.atomic_write(status_path, b"malformed")
+        with mock.patch.object(dev, "_current_repair_module", return_value=helper):
+            with self.assertRaises(helper.ActivationError):
+                dev._handoff_current_repair(self.path, resume=True)
+        self.launchctl.stop.assert_called_once()
+        self.run.assert_not_called()
+        self.assertEqual(status_path.read_bytes(), b"malformed")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_invalid_parent_routing_hash_never_authorizes_teardown(self):
+        self.sealed()
+        self.environment()
+        parent_path = Path(self.repair.parent_manifest_path)
+        raw = json.loads(parent_path.read_text())
+        raw["label"] = "another.service"
+        helper.atomic_write(parent_path, json.dumps(raw).encode())
+        helper.atomic_write(self.path.parent / "status.json", b"malformed")
+        with self.assertRaises(helper.ActivationError):
+            helper.activate_current_repair(self.path)
+        self.launchctl.stop.assert_not_called()
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_retained_restore_capacity_loss_prevents_install(self):
+        self.sealed()
+        self.environment()
+        helper._restore_capacity_path(self.parent).write_bytes(b"")
+        with mock.patch.object(helper, "atomic_install") as install:
+            with self.assertRaisesRegex(helper.ActivationError, "retained restore capacity"):
+                helper.activate_current_repair(self.path)
+        install.assert_not_called()
+        self.assertEqual(self.status().resume_from, "prepared")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_helper_import_uses_source_without_bytecode_cache(self):
+        dev = self.controller()
+        source = self.root / "source-helper.py"
+        source.write_text("VALUE = 'source'\n")
+        with mock.patch.object(importlib.machinery.SourceFileLoader, "get_code", side_effect=AssertionError("cached loader")):
+            self.assertEqual(dev._current_repair_module(source).VALUE, "source")
+        self.assertFalse((source.parent / "__pycache__").exists())
+
+    def test_failed_helper_import_restores_previous_module_registration(self):
+        dev = self.controller()
+        broken = self.root / "broken-helper.py"
+        broken.write_text("raise RuntimeError('import failed')\n")
+        name = "phoenix_current_repair_controller"
+        previous = object()
+        with mock.patch.dict(sys.modules, {name: previous}):
+            with self.assertRaisesRegex(RuntimeError, "import failed"):
+                dev._current_repair_module(broken)
+            self.assertIs(sys.modules[name], previous)
+
+    def test_unsealed_cleanup_rejects_status_shape_before_any_unlink(self):
+        self.sealed()
+        dev = self.controller()
+        self.path.unlink()
+        status_path = self.path.parent / "status.json"
+        raw = json.loads(status_path.read_text())
+        helper.atomic_write(status_path, json.dumps(dict(raw, unknown=True)).encode())
+        with self.assertRaises(SystemExit):
+            dev._clean_unsealed_current_repair(self.path.parent, helper)
+        self.assertTrue((self.path.parent / "parent-status.json").is_file())
+        self.assertTrue((self.path.parent / "candidate").is_file())
+
+    def test_pending_commit_capacity_loss_stops_and_keeps_committed_resume_boundary(self):
+        self.sealed()
+        self.environment()
+        self.pending_commit()
+        self.launchctl.inspect.return_value = ("running", 4321)
+        capacity = shutil.disk_usage(self.root)._replace(free=0)
+        with mock.patch.object(helper.shutil, "disk_usage", return_value=capacity):
+            with self.assertRaises(helper.ActivationError):
+                helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("failed_stopped", "committed"))
+        self.assertTrue(Path(self.parent.active_path).exists())
 
 
 if __name__ == "__main__":

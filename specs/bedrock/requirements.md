@@ -381,6 +381,15 @@ WHEN server restarts
 THE SYSTEM SHALL restore an ordinary interrupted provider request with no independently recoverable durable obligation to idle state
 AND preserve complete message history
 
+WHEN a conversation runtime successfully settles startup in a terminal state
+THE SYSTEM SHALL acknowledge startup settlement before the runtime exits so recovery of other conversations can continue
+AND the acknowledgement SHALL mean startup settlement, not completion of an LLM request
+AND an interrupted or failed startup settlement SHALL NOT be acknowledged as successful
+
+WHEN startup recovery selects a persisted `ContextExhausted` conversation because it retains queued steering
+THE SYSTEM SHALL preserve its terminal state and queued steering without dispatching a provider request
+AND SHALL acknowledge its settled startup without requiring user input or provider completion
+
 WHEN server restarts after an active materialized direct turn has durably committed a complete tool-result round but before its next model step settles
 THE SYSTEM SHALL use that exact accepted-turn identity and generation as the sole recovery baton
 AND SHALL dispatch the next model step without browser, SSE, or user-message activity

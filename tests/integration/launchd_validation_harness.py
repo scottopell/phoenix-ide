@@ -171,9 +171,11 @@ def validate_receipt(dev, receipt) -> None:
         item for item in full_root_baseline if item[0] != manifest_relative
     )
 
-    def reject_manifest(wrong: dict, reason: str, *, reject_classifier: bool = False) -> None:
+    def reject_manifest_bytes(
+        wrong: bytes, reason: str, *, reject_classifier: bool = False
+    ) -> None:
         try:
-            receipt.manifest_path.write_text(json.dumps(wrong))
+            receipt.manifest_path.write_bytes(wrong)
             if reject_classifier:
                 assert (
                     dev._deploy_manifest_kind(receipt.transaction_path)
@@ -202,6 +204,11 @@ def validate_receipt(dev, receipt) -> None:
                 assert (
                     dev._disposable_validation_tree_witness(receipt.root) == full_root_baseline
                 ), f"{reason} did not restore the full root"
+
+    def reject_manifest(wrong: dict, reason: str, *, reject_classifier: bool = False) -> None:
+        reject_manifest_bytes(
+            json.dumps(wrong).encode(), reason, reject_classifier=reject_classifier
+        )
 
     def exercise_plist_negatives(
         *, plist_field: str, sha_field: str, staged_binary_field: str, description: str
@@ -272,6 +279,33 @@ def validate_receipt(dev, receipt) -> None:
         staged_binary_field="rollback_binary",
         description="rollback plist",
     )
+
+    duplicate_cases = {
+        "duplicate source_commit": original_manifest_bytes.replace(
+            b'"source_commit":',
+            b'"source_commit":"0000000000000000000000000000000000000000",'
+            b'"source_commit":',
+            1,
+        ),
+        "duplicate transition_timeout_secs": original_manifest_bytes.replace(
+            b'"transition_timeout_secs":',
+            b'"transition_timeout_secs":31,' b'"transition_timeout_secs":',
+            1,
+        ),
+        "duplicate current_schema_upgrade": original_manifest_bytes.replace(
+            b'"current_schema_upgrade":',
+            b'"current_schema_upgrade":null,' b'"current_schema_upgrade":',
+            1,
+        ),
+        "duplicate nested prepared_source_baseline": original_manifest_bytes.replace(
+            b'"current_schema_upgrade": {',
+            b'"current_schema_upgrade": {"prepared_source_baseline":114,',
+            1,
+        ),
+    }
+    for reason, raw in duplicate_cases.items():
+        assert raw != original_manifest_bytes
+        reject_manifest_bytes(raw, reason, reject_classifier=True)
 
     for wrong_label in (
         "test.disposable.phoenix.validation.helper",

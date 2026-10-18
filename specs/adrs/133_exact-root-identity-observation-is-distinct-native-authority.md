@@ -1,4 +1,4 @@
-# ADR-131: Exact-root identity observation is distinct native authority
+# ADR-133: Exact-root identity observation is distinct native authority
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-130 admits one bounded `ListChildren` operation for the exact guardian-owned root
+ADR-132 admits one bounded `ListChildren` operation for the exact guardian-owned root
 and deliberately stops at `CleaningOwnedTree`. An empty child list closes discovery but
 does not prove that the root is absent. Reaching `ReadyForDisruption` requires fresh
 PID-plus-birth observation of every acquired identity and no unresolved discovery.
@@ -80,3 +80,11 @@ A later decision may admit discovered child identities or process mutation only 
 birth-token acquisition and exact-parent evidence create owned identities, every native
 operation has its own durable authority, and fresh reconciliation prevents stale or
 caller-selected identity from becoming mutation authority.
+
+
+## References
+
+- [ADR-132](132_owned-root-child-enumeration-is-distinct-native-authority.md)
+- [Standalone deployment controller requirements](../standalone-deployment-controller/requirements.md)
+- [Standalone deployment controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium)
+- [Standalone deployment controller status](../standalone-deployment-controller/executive.md)

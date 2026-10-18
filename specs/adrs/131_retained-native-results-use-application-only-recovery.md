@@ -1,4 +1,4 @@
-# ADR-129: Retained native results use application-only recovery
+# ADR-131: Retained native results use application-only recovery
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-126, ADR-127, and ADR-128 establish controller durability, disconnect fencing,
+ADR-128, ADR-129, and ADR-130 establish controller durability, disconnect fencing,
 and same-build native IPC. This decision refines those boundaries.
 
 A native sampling runner can die after the guardian has executed and retained
@@ -91,3 +91,11 @@ correct-by-construction owner that can preserve application authority across
 runner replacement without making diagnostics executable. Any superseding ADR
 must preserve non-replay, same-live provenance, absolute-deadline enforcement,
 and explicit compatibility boundaries.
+
+
+## References
+
+- [ADR-130](130_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
+- [Standalone deployment controller requirements](../standalone-deployment-controller/requirements.md)
+- [Standalone deployment controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium)
+- [Standalone deployment controller status](../standalone-deployment-controller/executive.md)

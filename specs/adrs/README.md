@@ -147,15 +147,17 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
 | [124](124_public-literal-chat-uses-known-receiver-verification.md) | Public literal chat uses known-receiver verification | Accepted | REQ-API-031; built-in API guidance |
 | [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
-| [126](126_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
-| [127](127_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
-| [128](128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
-| [129](129_retained-native-results-use-application-only-recovery.md) | Retained native results use application-only recovery | Accepted | REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–020; completed-but-unapplied native sampling recovery |
-| [130](130_owned-root-child-enumeration-is-distinct-native-authority.md) | Owned-root child enumeration is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–021; native `ListChildren`, schema v6, protocol v6 |
-| [131](131_exact-root-identity-observation-is-distinct-native-authority.md) | Exact-root identity observation is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–022; native `ObserveIdentity`, schema v7, protocol v8 |
-| [132](132_retained-exact-root-identity-results-use-application-only-recovery.md) | Retained exact-root identity results use application-only recovery | Accepted | REQ-SDC-018, REQ-SDC-022; completed-before-application native `ObserveIdentity`, schema v7, protocol v9 |
-| [133](133_already-durable-native-sampling-failures-use-explicit-custody-settlement.md) | Already-durable native sampling failures use explicit custody settlement | Accepted | REQ-SDC-018–020; native sampling failure custody, schema v8, protocol v10 |
-| [134](134_disposable-launchd-validation-precedes-installer-adoption.md) | Disposable launchd validation precedes installer adoption | Accepted | REQ-SDC-023; exact PreparedSource114 handoff validation without activation authority |
+| [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
+| [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
+| [128](128_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
+| [129](129_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
+| [130](130_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
+| [131](131_retained-native-results-use-application-only-recovery.md) | Retained native results use application-only recovery | Accepted | REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–020; completed-but-unapplied native sampling recovery |
+| [132](132_owned-root-child-enumeration-is-distinct-native-authority.md) | Owned-root child enumeration is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–021; native `ListChildren`, schema v6, protocol v6 |
+| [133](133_exact-root-identity-observation-is-distinct-native-authority.md) | Exact-root identity observation is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–022; native `ObserveIdentity`, schema v7, protocol v8 |
+| [134](134_retained-exact-root-identity-results-use-application-only-recovery.md) | Retained exact-root identity results use application-only recovery | Accepted | REQ-SDC-018, REQ-SDC-022; completed-before-application native `ObserveIdentity`, schema v7, protocol v9 |
+| [135](135_already-durable-native-sampling-failures-use-explicit-custody-settlement.md) | Already-durable native sampling failures use explicit custody settlement | Accepted | REQ-SDC-018–020; native sampling failure custody, schema v8, protocol v10 |
+| [136](136_disposable-launchd-validation-precedes-installer-adoption.md) | Disposable launchd validation precedes installer adoption | Accepted | REQ-SDC-023; exact PreparedSource114 handoff validation without activation authority |
 
 ## For agents: which decisions bind your task
 
@@ -210,9 +212,11 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying post-tool direct-turn restart recovery or bounded owed-baton settlement | 074, then 024, 020, 014 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
+| Repairing protected packaging for the exact ARM forward-replacement candidate | 127; fixed candidate, separate controller, no generic selection or compatibility expansion |
+| Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
 | Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
-| Specifying standalone controller durability, surviving guardian custody, native runner IPC, owned-root child enumeration, exact-root identity observation, retained-result application recovery, failed-result custody settlement, or disposable installer validation | 125, 126, 127, 128, 129, 130, 131, 132, 133, 134; 034 for compatibility limits |
+| Specifying standalone controller durability, surviving guardian custody, native runner IPC, owned-root child enumeration, exact-root identity observation, retained-result application recovery, failed-result custody settlement, or disposable installer validation | 125, 128, 129, 130, 131, 132, 133, 134, 135, 136; 034 for compatibility limits |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -255,7 +259,9 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │           └── ADR-114 (Admit exact target ledger as a prepared source; retain 105 target and 102 boundary)
       │   │               └── ADR-115 (Protect exact 114-to-128 published release; independent controller, same lifecycle; retain 114 prepared admissions)
       │   │                   └── ADR-125 (Qualify exact PreparedSource114 candidate)
-      │   │                       └── ADR-134 (Disposable validation; also extends ADR-126 and ADR-128)
+      │   │                       ├── ADR-126 (Seal exact current-schema forward replacement)
+      │   │                       │   └── ADR-127 (Bind exact ARM packaging repair to a separate controller)
+      │   │                       └── ADR-136 (Disposable validation; also extends controller ADR-128 and ADR-130)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
       │   ├── ADR-082 (Legacy AUQ waits retain identity absence)
       │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
@@ -271,14 +277,14 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │           └── ADR-065 (Release candidates share the stable artifact path)
       │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
       │   ├── ADR-050 (launchd restart preserves installed state through an independent helper)
-      │   └── ADR-126 (Standalone controller owns durability and child supervision)
-      │       └── ADR-127 (Controller loss detaches and fences the surviving guardian)
-      │           └── ADR-128 (Same-build pre-adoption native guardian IPC and runner)
-      │               └── ADR-129 (Retained native results use application-only recovery)
-      │                   ├── ADR-130 (Owned-root child enumeration is distinct native authority)
-      │                   │   └── ADR-131 (Exact-root identity observation is distinct native authority)
-      │                   │       └── ADR-132 (Retained exact-root identity results use application-only recovery)
-      │                   └── ADR-133 (Already-durable native sampling failures use explicit custody settlement)
+      │   └── ADR-128 (Standalone controller owns durability and child supervision)
+      │       └── ADR-129 (Controller loss detaches and fences the surviving guardian)
+      │           └── ADR-130 (Same-build pre-adoption native guardian IPC and runner)
+      │               └── ADR-131 (Retained native results use application-only recovery)
+      │                   ├── ADR-132 (Owned-root child enumeration is distinct native authority)
+      │                   │   └── ADR-133 (Exact-root identity observation is distinct native authority)
+      │                   │       └── ADR-134 (Retained exact-root identity results use application-only recovery)
+      │                   └── ADR-135 (Already-durable native sampling failures use explicit custody settlement)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)

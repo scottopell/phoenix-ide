@@ -55,8 +55,8 @@ survival, IPC correctness, or production orchestration.
 
 ## Native architecture contract
 
-[ADR-128](../adrs/128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
-extends ADR-127 without changing its detach-and-fence decision. REQ-SDC-015–022
+[ADR-130](../adrs/130_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
+extends ADR-129 without changing its detach-and-fence decision. REQ-SDC-015–022
 specify separate same-build guardian and runner executables, owner-only Unix socket
 IPC with bounded length-prefixed typed JSON, and explicit wire DTOs that cannot
 materialize internal affine authority. The guardian mints one-use dispatch admissions
@@ -394,9 +394,12 @@ The remaining replacement gaps are explicit:
   boundary validates preparation but cannot acquire a production claim or activate it, and the
   Rust controller does not invoke or replace its signature, claim, application-DB mutation,
   migration, publication, health, or forward-recovery authority.
-- The exact prepared candidate is retained as Actions artifact `12122737139` through
-  2026-11-01. Recurring qualification after that expiry requires durable publication of the same
-  immutable bytes or a newly reviewed exact artifact; name/run substitution is not accepted.
+- `.github/artifacts/prepared-source114-aarch64.json` records ephemeral artifact
+  `12122737139`, its API digest, exact producer identity, and expiry on 2026-11-01. No same-byte
+  retention, download, republication, or public release is authorized. After expiry, an
+  owner-authorized rerun of the pinned historical workflow or equivalently pinned reproduction
+  creates a new artifact and new evidence identity that requires a new manifest, real byte
+  admission, review, and qualification; it must never impersonate artifact `12122737139`.
 - Launchd owns both disposable jobs only inside the test fixture. The disposable installation
   selects its bounded recovery/continuation runner stages from durable state, but no production
   controller exclusively owns the production controller store, supervises finite runners, or
@@ -416,7 +419,7 @@ The remaining replacement gaps are explicit:
 The next controller-owned work is successful-terminal and unapplied-failure settlement,
 child-list failure settlement, discovered-child identity acquisition, signal
 mutation, general continuing orchestration, and the remaining process-death matrix. Those
-surfaces must extend REQ-SDC-015–022 and ADR-128–133 while preserving ADR-127
+surfaces must extend REQ-SDC-015–022 and ADR-130–135 while preserving ADR-129
 **detach-and-fence**, exact-instance
 recovery, the original absolute deadline, retained results, monotonic reconciliation generations,
 and whole-round signal-result reservation.

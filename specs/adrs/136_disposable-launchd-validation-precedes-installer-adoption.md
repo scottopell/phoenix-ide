@@ -1,9 +1,9 @@
-# ADR-134: Disposable launchd validation precedes installer adoption
+# ADR-136: Disposable launchd validation precedes installer adoption
 
 - **Status:** Accepted
 - **Date:** 2026-10-18
 - **Affects:** REQ-SDC-023; exact PreparedSource114 launchd installer validation
-- **Extends:** [ADR-125](125_qualify-exact-prepared-source114-candidate.md), [ADR-126](126_standalone-controller-owns-durability-and-supervision.md), [ADR-128](128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
+- **Extends:** [ADR-125](125_qualify-exact-prepared-source114-candidate.md), [ADR-128](128_standalone-controller-owns-durability-and-supervision.md), [ADR-130](130_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
 
 ## Context
 
@@ -67,3 +67,13 @@ Rejected because production claim and helper orchestration are not parameterized
 ### Move installer-owned migration or publication authority into the controller
 
 Rejected because this milestone validates the boundary; it does not transfer ownership of irreversible installer operations.
+
+
+## References
+
+- [ADR-125](125_qualify-exact-prepared-source114-candidate.md)
+- [ADR-128](128_standalone-controller-owns-durability-and-supervision.md)
+- [ADR-130](130_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
+- [Standalone deployment controller requirements](../standalone-deployment-controller/requirements.md)
+- [Standalone deployment controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium)
+- [Standalone deployment controller status](../standalone-deployment-controller/executive.md)

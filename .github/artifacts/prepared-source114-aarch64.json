@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "record_kind": "prepared_source114_actions_artifact_provenance",
+  "repository": {
+    "id": 1152151096,
+    "full_name": "scottopell/phoenix-ide"
+  },
+  "artifact": {
+    "id": 12122737139,
+    "name": "desktop-preparation-aarch64-apple-darwin-23badb8be4bc8d05a7e1c49c5367ceb14ebccd92",
+    "size_in_bytes": 44634849,
+    "api_digest": "sha256:d9b46faf39fd838b0f029c8e421b23c4741b5204ebb3aed4c0e014dc91c4762a",
+    "created_at": "2026-10-18T02:37:45Z",
+    "expires_at": "2026-11-01T02:37:41Z",
+    "retention": {
+      "kind": "ephemeral_actions_artifact",
+      "disposition": "deterministic_reproduction_after_expiry",
+      "byte_identical_owner_copy_authorized": false,
+      "republish_authorized": false,
+      "note": "A regenerated artifact is new evidence and must never reuse this artifact identity."
+    }
+  },
+  "producer": {
+    "workflow_file": ".github/workflows/release.yml",
+    "workflow_commit": "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92",
+    "workflow_run_id": 39089498019,
+    "workflow_run_attempt": 1,
+    "workflow_run_event": "workflow_dispatch",
+    "workflow_run_branch": "main",
+    "workflow_run_display_title": "prepare-main",
+    "workflow_run_conclusion": "failure",
+    "operation": "prepare-main",
+    "inputs": {
+      "operation": "prepare-main"
+    },
+    "qualified_job": {
+      "id": 117563040072,
+      "name": "build-macos (aarch64-apple-darwin, macos-14, aarch64-apple-darwin, false)",
+      "conclusion": "success"
+    },
+    "note": "The matrix run failed in the unrelated Intel job; the exact ARM preparation job succeeded and uploaded this artifact."
+  },
+  "candidate": {
+    "source_commit": "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92",
+    "target": "aarch64-apple-darwin",
+    "prepared_source_baseline": 114,
+    "candidate_registry_sha256": "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+  },
+  "controller_validation": {
+    "code_head": "4a73b7ad3f64ad55b99de2d0093c2be62a762a07",
+    "receipt_head": "63a26b6f1b2544e85160e52fc7011b61eadf188a",
+    "workflow_file": ".github/workflows/deployment-controller-macos.yml",
+    "macos_code_head_run": 39150739258,
+    "ci_code_head_run": 39150737450,
+    "macos_receipt_head_run": 39153477397,
+    "ci_receipt_head_run": 39153475900,
+    "helper_source_rule": "clean full controller head distinct from candidate.source_commit"
+  },
+  "bundle": {
+    "sha256_observation": "pending_reconciled_hosted_qualification",
+    "files": [
+      {
+        "name": "phoenix_ide-aarch64-apple-darwin-prepared-23badb8be4bc",
+        "role": "standalone_payload",
+        "sha256": null
+      },
+      {
+        "name": "Phoenix-macos-aarch64-apple-darwin-prepared-23badb8be4bc.zip",
+        "role": "app_archive_payload",
+        "sha256": null
+      },
+      {
+        "name": "PREPARATION-SHA256SUMS-aarch64-apple-darwin",
+        "role": "payload_checksum_manifest",
+        "sha256": null
+      },
+      {
+        "name": "PREPARATION-RECEIPT-aarch64-apple-darwin.json",
+        "role": "preparation_receipt",
+        "sha256": null
+      },
+      {
+        "name": "HEADLESS-ACCEPTANCE-aarch64-apple-darwin.json",
+        "role": "headless_acceptance_proof",
+        "sha256": null
+      }
+    ]
+  },
+  "expected_validation": {
+    "runner_architecture": "arm64",
+    "harness_prefix": "launchd-validation-only: PASS",
+    "database_ledger_entries": 113,
+    "effects": {
+      "claim": 0,
+      "stop": 0,
+      "backup": 0,
+      "migrate": 0,
+      "publish": 0,
+      "activate": 0,
+      "cleanup": 0
+    },
+    "real_admission_required": true,
+    "artifact_size_or_api_digest_is_authenticity": false
+  },
+  "reproduction": {
+    "result_identity": "new_evidence_not_artifact_12122737139",
+    "preferred_exact_workflow": "rerun workflow run 39089498019 after separate owner authorization while GitHub still permits rerunning it",
+    "fallback": "owner-authorized pinned regeneration and requalification using the workflow file at workflow_commit with operation prepare-main; current-main dispatch is not equivalent",
+    "public_release_authorized": false,
+    "broad_download_or_build_authorized": false
+  }
+}

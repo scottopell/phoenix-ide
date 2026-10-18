@@ -1,4 +1,4 @@
-# ADR-127: Controller loss detaches and fences the surviving guardian
+# ADR-129: Controller loss detaches and fences the surviving guardian
 
 - **Status:** Accepted
 - **Date:** 2026-10-15
@@ -81,3 +81,11 @@ continuity of the process that retains the child.
   interpretation.
 - Production adoption remains blocked until the guardian protocol and disposable
   controller-death qualification are implemented.
+
+
+## References
+
+- [ADR-128](128_standalone-controller-owns-durability-and-supervision.md)
+- [Standalone deployment controller requirements](../standalone-deployment-controller/requirements.md)
+- [Standalone deployment controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium)
+- [Standalone deployment controller status](../standalone-deployment-controller/executive.md)

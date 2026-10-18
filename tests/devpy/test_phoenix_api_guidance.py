@@ -176,7 +176,9 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
             self.assertIn("literal steering smoke test", text)
             self.assertNotIn("/chat/literal", text)
             self.assertNotIn("chat_literal_text_v1", text)
-        self.assertNotIn("REQ-COMP-015", (ROOT / "specs/compatibility/requirements.md").read_text())
+        compatibility = (ROOT / "specs/compatibility/requirements.md").read_text()
+        self.assertNotIn("/chat/literal", compatibility)
+        self.assertNotIn("chat_literal_text_v1", compatibility)
 
     def test_non_exhaustive_policy_keeps_public_contract_and_scope_boundaries(self):
         skill = (REFERENCE.parent.parent / "SKILL.md").read_text()

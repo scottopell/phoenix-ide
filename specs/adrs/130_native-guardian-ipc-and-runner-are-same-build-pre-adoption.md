@@ -1,4 +1,4 @@
-# ADR-128: Native guardian IPC and runner are same-build pre-adoption surfaces
+# ADR-130: Native guardian IPC and runner are same-build pre-adoption surfaces
 
 - **Status:** Accepted
 - **Date:** 2026-10-15
@@ -9,7 +9,7 @@
 The standalone controller has a qualified in-process policy loop, affine effect
 dispatch, guardian custody, and a safe status/closeout CLI. Those tests cannot prove
 that the native parent survives runner death or that a wire protocol preserves the
-authority boundaries. ADR-127 selects detach-and-fence under controller loss and
+authority boundaries. ADR-129 selects detach-and-fence under controller loss and
 requires the same living guardian for recovery; it does not select IPC framing or a
 runnable executable surface.
 
@@ -37,7 +37,7 @@ controller stores or to integrate production installation.
 
 ## Decision
 
-Choose option 2, refining rather than superseding ADR-127.
+Choose option 2, refining rather than superseding ADR-129.
 
 - Keep `phoenix-deployment-controller` status/closeout only. Provide separate runner
   and guardian executables built together. The runner owns the policy loop and store
@@ -97,7 +97,7 @@ Choose option 2, refining rather than superseding ADR-127.
 - [Standalone controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium), `DisposableNativeGuardianRunner` and its contracts.
 - [Standalone controller status](../standalone-deployment-controller/executive.md).
 - [ADR-034: Explicit compatibility guarantees](034_compatibility-guarantees-are-explicit-and-data-aware.md).
-- [ADR-126: Controller durability and supervision](126_standalone-controller-owns-durability-and-supervision.md).
-- [ADR-127: Detach-and-fence](127_controller-loss-detaches-and-fences-surviving-guardian.md).
+- [ADR-128: Controller durability and supervision](128_standalone-controller-owns-durability-and-supervision.md).
+- [ADR-129: Detach-and-fence](129_controller-loss-detaches-and-fences-surviving-guardian.md).
 - [Compatibility requirements](../compatibility/requirements.md), REQ-COMP-001 and REQ-COMP-005.
 - [Production deployment requirements](../production-deployment/requirements.md) and [launchd deployment requirements](../launchd-deployment/requirements.md) retain their separate activation boundaries.

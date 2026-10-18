@@ -1,4 +1,4 @@
-# ADR-130: Owned-root child enumeration is distinct native authority
+# ADR-132: Owned-root child enumeration is distinct native authority
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-126 through ADR-129 establish controller durability, surviving-guardian fencing,
+ADR-128 through ADR-131 establish controller durability, surviving-guardian fencing,
 same-build native IPC, and application-only recovery for retained sampling results.
 Resource admission already produces an affine `ListChildren` successor, but the native
 path admitted only resource sampling. The wire representation of a PID and birth token
@@ -84,3 +84,11 @@ A later decision may extend native traversal to adopted child identities or resu
 cleanup after runner replacement only if each new parent has exact owned-identity
 provenance, diagnostic rows remain non-executable, retained results cannot replay, and
 fresh identity reconciliation precedes mutation.
+
+
+## References
+
+- [ADR-131](131_retained-native-results-use-application-only-recovery.md)
+- [Standalone deployment controller requirements](../standalone-deployment-controller/requirements.md)
+- [Standalone deployment controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium)
+- [Standalone deployment controller status](../standalone-deployment-controller/executive.md)

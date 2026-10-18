@@ -2724,6 +2724,9 @@ where
 
         if matches!(self.state.step_result(), StepResult::Terminal(_)) {
             self.emit_terminal_lifecycle_event().await;
+            if let Some(ack) = self.startup_llm_recovery_ack.take() {
+                let _ = ack.send(Ok(()));
+            }
             return RuntimeExitDisposition::Terminal;
         }
 
@@ -20329,6 +20332,48 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn startup_context_exhausted_with_queue_acknowledges_terminal_without_dispatch() {
+        let conversation_id = "startup-terminal-with-queue";
+        let terminal_state = ConvState::ContextExhausted {
+            summary: "preserved terminal summary".to_string(),
+        };
+        let queue = vec![mk_entry("retained-steer", "preserve for explicit recovery")];
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            terminal_state.clone(),
+            queue.clone(),
+        );
+        storage
+            .update_state(conversation_id, &terminal_state, rt.state_updated_at)
+            .await
+            .unwrap();
+        let llm = Arc::clone(&rt.llm_client);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let rt = rt.with_startup_llm_recovery_ack(ack_tx);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rt.run())
+                .await
+                .expect("terminal startup exits without waiting for input"),
+            RuntimeExitDisposition::Terminal
+        );
+        assert_eq!(
+            ack_rx.await.expect("terminal startup sends its receipt"),
+            Ok(())
+        );
+        assert_eq!(
+            storage.get_current_state(conversation_id),
+            Some(terminal_state)
+        );
+        assert_eq!(
+            serde_json::to_value(storage.get_steering_queue(conversation_id)).unwrap(),
+            serde_json::to_value(queue).unwrap()
+        );
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        assert!(llm.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn startup_idle_queue_commits_before_starting_llm() {
         let conversation_id = "startup-idle-drain";
         let (rt, storage) = build_runtime_with_state_and_queue(
@@ -24887,7 +24932,8 @@ mod retry_timer_epoch_tests {
 
     #[tokio::test]
     async fn startup_expired_subagent_overload_persists_and_exits_terminal() {
-        let mut rt = runtime_requesting_with_role(true);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let mut rt = runtime_requesting_with_role(true).with_startup_llm_recovery_ack(ack_tx);
         let storage = Arc::clone(&rt.storage);
         let now = Utc::now();
         rt.state = ConvState::ServerOverloadRetrying {
@@ -24938,6 +24984,12 @@ mod retry_timer_epoch_tests {
                 .expect("terminalized startup runtime exits")
                 .expect("runtime task joins"),
             RuntimeExitDisposition::Terminal
+        );
+        assert_eq!(
+            ack_rx
+                .await
+                .expect("expired terminal startup sends its receipt"),
+            Ok(())
         );
     }
 
