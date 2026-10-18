@@ -52,8 +52,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import os
+import re
 try:
     import resource
 except ImportError:  # Windows: profiling unavailable; normal E2E remains usable.
@@ -64,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from unittest import mock
 import uuid
@@ -1043,6 +1046,115 @@ def _user_message_images(message: dict) -> list[dict]:
 # ----------------------- scenarios -----------------------
 
 
+def scenario_coordinator_home(_base_url: str) -> None:
+    """Disposable server: actual scoped tool dispatch and persistent home, no worker bootstrap."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory(prefix="phoenix-coordinator-home-") as directory:
+        root = Path(directory)
+        env = _server_env(root)
+        proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+        def stop():
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            log_file.close()
+        def binding():
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                row = db.execute("SELECT s.id,s.cwd FROM coordinator_work_scope c JOIN work_scopes s ON s.id=c.work_scope_id WHERE s.environment_kind='coordinator_home' AND s.lifecycle='active'").fetchone()
+                assert row is not None
+                return row
+        try:
+            scope, cwd = binding()
+            assert Path(cwd) == (root / "data" / "coordinator").resolve()
+            with sqlite3.connect(f"file:{env['PHOENIX_DB_PATH']}?mode=ro", uri=True) as db:
+                assert db.execute("SELECT COUNT(*) FROM product_conversation_work_scopes").fetchone()[0] == 0
+            response = httpx.post(f"{base_url}/api/global/coordinator", timeout=10)
+            response.raise_for_status()
+            coordinator = response.json()['conversation']
+            assert coordinator['cwd'] == cwd
+            conv_id = coordinator['id']
+            inspected = httpx.get(f"{base_url}/api/conversations/{conv_id}/system-prompt", timeout=10)
+            inspected.raise_for_status()
+            assert f'active work_scope_id={scope}' in inspected.json()['system_prompt']
+            assert f'server directory={cwd}' in inspected.json()['system_prompt']
+            _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
+            _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages), 'Coordinator home Bash completed', timeout=SCENARIO_TIMEOUT_SECONDS)
+            final = _get_conv(base_url, conv_id)
+            results = [m.get('content', {}) for m in final['messages'] if m.get('message_type') == 'tool']
+            assert any(r.get('is_error') is False and cwd in str(r) for r in results), results
+            read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
+            read.raise_for_status()
+            assert read.json()['content'] == 'coordinator-home-proof'
+            listing = httpx.get(f"{base_url}/api/files/list", params={'path': cwd}, timeout=10)
+            listing.raise_for_status()
+            assert 'e2e-home-evidence.txt' in listing.text
+            for bad in ['missing', 'not-an-active-scope']:
+                before = len(_get_conv(base_url, conv_id)['messages'])
+                _send_chat_and_stream(base_url, conv_id, f"[[coordinator_home_bash:{bad}]]", SCENARIO_TIMEOUT_SECONDS)
+                _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' for m in messages[before:]), 'invalid scope rejected', timeout=SCENARIO_TIMEOUT_SECONDS)
+                results = [m.get('content', {}) for m in _get_conv(base_url, conv_id)['messages'][before:] if m.get('message_type') == 'tool']
+                assert any(r.get('is_error') is True for r in results), results
+            exhausted_chat = httpx.post(f'{base_url}/api/conversations/{conv_id}/chat', json={'text':'[[scenario:context_window_exceeded]] exhaust Coordinator for continuation','images':[], 'message_id':str(uuid.uuid4())}, timeout=10)
+            exhausted_chat.raise_for_status()
+            _wait_for_sse_signal(base_url, conv_id, _context_exhausted_event, SCENARIO_TIMEOUT_SECONDS)
+            handoff = f"[[scenario:plain_text]] Continue local proof. Retained historical pointer: {cwd}/e2e-home-evidence.txt. Refresh runtime evidence; file is not authority."
+            continued = httpx.post(f"{base_url}/api/conversations/{conv_id}/continue", json={'handoff':handoff, 'message_id':str(uuid.uuid4())}, timeout=10)
+            continued.raise_for_status()
+            predecessor = conv_id
+            conv_id = continued.json()['conversation_id']
+            _poll_to_idle_with_messages(base_url, conv_id, lambda m: 'analyzed the situation' in _agent_text(m), 'continued Coordinator', timeout=SCENARIO_TIMEOUT_SECONDS)
+            assert binding() == (scope, cwd)
+            assert _get_conv(base_url, predecessor)['conversation']['work_scope_id'] == scope
+            assert _get_conv(base_url, conv_id)['conversation']['work_scope_id'] == scope
+            assert _get_conv(base_url, conv_id)['conversation']['cwd'] == cwd
+            worker_root = root / 'ordinary-worker'
+            worker_root.mkdir()
+            worker_root = worker_root.resolve()
+            sentinel = worker_root / 'worker-sentinel.txt'
+            sentinel.write_text('separate-worker-bytes')
+            worker = _new_conv_in(base_url, str(worker_root), '[[scenario:plain_text]] separate ordinary work')
+            _poll_to_idle_with_messages(base_url, worker['id'], lambda m: 'analyzed the situation' in _agent_text(m), 'separate worker', timeout=SCENARIO_TIMEOUT_SECONDS)
+            assert worker['cwd'] != cwd
+            stop()
+            proc, base_url, log_path, log_file = _start_server_with_retries(env, root)
+            assert binding() == (scope, cwd)
+            response = httpx.get(f"{base_url}/api/global/coordinator", timeout=10)
+            response.raise_for_status()
+            assert response.json()['conversation']['id'] == conv_id
+            read = httpx.get(f"{base_url}/api/files/read", params={'path': str(Path(cwd) / 'e2e-home-evidence.txt')}, timeout=10)
+            read.raise_for_status()
+            assert read.json()['content'] == 'coordinator-home-proof'
+            before = len(_get_conv(base_url, conv_id)['messages'])
+            _send_chat_and_stream(base_url, conv_id, "[[coordinator_home_bash:discover]]", SCENARIO_TIMEOUT_SECONDS)
+            _poll_to_idle_with_messages(base_url, conv_id, lambda messages: any(m.get('message_type') == 'tool' and m.get('content', {}).get('is_error') is False for m in messages[before:]), 'restarted successor rediscovers owned scope from system context', timeout=SCENARIO_TIMEOUT_SECONDS)
+            worker_cwd_after_restart = _get_conv(base_url, worker['id'])['conversation']['cwd']
+            assert worker_cwd_after_restart == str(worker_root), (worker_cwd_after_restart, str(worker_root))
+            closed = httpx.post(f"{base_url}/api/conversations/{worker['id']}/archive", timeout=10)
+            closed.raise_for_status()
+            deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+            while not _get_conv(base_url, worker['id'])['conversation'].get('archived'):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('ordinary Close did not commit History')
+                time.sleep(0.05)
+            assert binding() == (scope, cwd)
+            assert sentinel.read_text() == 'separate-worker-bytes'
+            deleted = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
+            deleted.raise_for_status()
+            assert binding() == (scope, cwd)
+            assert Path(cwd, 'e2e-home-evidence.txt').read_text() == 'coordinator-home-proof'
+            outside = root / 'data' / 'outside.txt'
+            outside.write_text('not in home')
+            denied = httpx.get(f"{base_url}/api/files/read", params={'path': str(outside)}, timeout=10)
+            assert denied.status_code == 404, denied.text
+            assert sentinel.read_text() == 'separate-worker-bytes'
+        finally:
+            stop()
+
+
 def scenario_text_streaming(base_url: str) -> None:
     word_count = 8
     conv_id = _new_conv_and_stream(
@@ -1060,6 +1172,156 @@ def scenario_text_streaming(base_url: str) -> None:
     assert actual_word_count == word_count, (
         f"expected {word_count} persisted streamed words, got {actual_word_count}"
     )
+
+
+def _post_public_literal_chat(
+    base_url: str, conv_id: str, body: dict, expected_receiver_sha: str,
+) -> httpx.Response:
+    """Expected SHA comes from the inspected fixture source, never the receiver read."""
+    assert re.fullmatch(r"[0-9a-f]{40}", expected_receiver_sha), "full expected receiver SHA required"
+    version = httpx.get(f"{base_url}/api/version", follow_redirects=False, timeout=10.0)
+    assert version.status_code == 200, "receiver version read failed"
+    identity = version.json()
+    assert isinstance(identity, dict) and identity.get("git_sha") == expected_receiver_sha, "unknown or mismatched receiver"
+    assert body.get("expansion_policy") == "literal_text", "literal policy required"
+    return httpx.post(
+        f"{base_url}/api/conversations/{conv_id}/chat",
+        json=body, follow_redirects=False, timeout=10.0,
+    )
+
+
+async def _post_literal_chat_observing_queue_async(
+    base_url: str, conv_id: str, body: dict, expected_receiver_sha: str,
+) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        async with asyncio.timeout(10.0):
+            async with aconnect_sse(client, "GET", f"{base_url}/api/conversations/{conv_id}/stream") as source:
+                source.response.raise_for_status()
+                events = source.aiter_sse()
+                init = await anext(events)
+                assert init.event == "init", f"expected init, got {init.event!r}"
+                response = _post_public_literal_chat(base_url, conv_id, body, expected_receiver_sha)
+                assert response.status_code == 200 and response.json().get("steering") is True, response.text
+                async for event in events:
+                    if event.event != "steer_message_queued":
+                        continue
+                    entry = json.loads(event.data)["message"]
+                    if entry.get("message_id") != body["message_id"]:
+                        continue
+                    assert entry["text"] == body["text"], entry
+                    assert entry["origin"] == {"kind": "user_api"}, entry
+                    assert not entry.get("llm_text") and not entry.get("skill_invocation"), entry
+                    return response
+                raise AssertionError("SSE closed before literal queue event")
+
+
+def _queue_literal_behind_gated_turn(
+    base_url: str, conv_id: str, body: dict, expected_receiver_sha: str,
+) -> httpx.Response:
+    # The mock cannot finish this request until we observe the queue event and release it.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10.0)
+        port = listener.getsockname()[1]
+        print("[public_literal_chat:running] gated setup POST", flush=True)
+        setup = httpx.post(f"{base_url}/api/conversations/{conv_id}/chat", json={
+            "text": f"[[scenario:plain_text]] [[stream-gate:{port}]] literal queue setup",
+            "message_id": str(uuid.uuid4()),
+        }, follow_redirects=False, timeout=10.0)
+        assert setup.status_code == 200 and setup.json().get("steering", False) is False, setup.text
+        print("[public_literal_chat:running] setup accepted; waiting for mock gate connection", flush=True)
+        connection, _ = listener.accept()
+        with connection:
+            print("[public_literal_chat:running] mock gate connected; observing literal queue admission", flush=True)
+            try:
+                response = asyncio.run(_post_literal_chat_observing_queue_async(base_url, conv_id, body, expected_receiver_sha))
+                print("[public_literal_chat:running] matching live queue event observed", flush=True)
+            finally:
+                print("[public_literal_chat:running] releasing mock gate", flush=True)
+                connection.sendall(b"R")
+    return response
+
+
+def scenario_public_literal_chat(base_url: str) -> None:
+    try:
+        _scenario_public_literal_chat(base_url)
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        raise
+
+
+def _scenario_public_literal_chat(base_url: str) -> None:
+    """Real compiled HEAD: independent source identity, smoke, then idle/running literal bytes."""
+    print("[public_literal_chat] source identity preflight", flush=True)
+    expected_receiver_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert not dirty, "public_literal_chat requires a clean committed build fixture; commit before building/running it"
+    for running in (False, True):
+        phase = "running" if running else "idle"
+        print(f"[public_literal_chat:{phase}] create conversation and await setup completion", flush=True)
+        conv_id = _new_conv_and_stream(
+            base_url, "[[scenario:plain_text]] literal idle setup", SCENARIO_TIMEOUT_SECONDS
+        )
+        smoke = {
+            "text": "literal steering smoke test", "message_id": str(uuid.uuid4()),
+            "expansion_policy": "literal_text",
+        }
+        print(f"[public_literal_chat:{phase}] harmless literal smoke POST", flush=True)
+        accepted = _post_public_literal_chat(base_url, conv_id, smoke, expected_receiver_sha)
+        assert accepted.status_code == 200 and accepted.json().get("steering", False) is False, accepted.text
+        print(f"[public_literal_chat:{phase}] await smoke materialization", flush=True)
+        smoke_id = f"{conv_id}:{smoke['message_id']}"
+        materialized = _poll_to_idle_with_messages(
+            base_url, conv_id,
+            lambda messages: any(m.get("message_id") == smoke_id for m in _user_messages(messages)),
+            "harmless literal smoke materialization", timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        smoke_messages = [m for m in _user_messages(materialized["messages"]) if m.get("message_id") == smoke_id]
+        assert len(smoke_messages) == 1 and smoke_messages[0]["content"]["text"] == smoke["text"], smoke_messages
+        text = "/spears @Cargo.toml @file:missing @someone\n  café exact bytes  \n[[scenario:plain_text]]"
+        body = {
+            "text": text,
+            "message_id": str(uuid.uuid4()),
+            "expansion_policy": "literal_text",
+            "images": [], "files": [], "user_agent": None,
+        }
+        print(f"[public_literal_chat:{phase}] literal admission", flush=True)
+        if running:
+            response = _queue_literal_behind_gated_turn(base_url, conv_id, body, expected_receiver_sha)
+        else:
+            response = _post_public_literal_chat(base_url, conv_id, body, expected_receiver_sha)
+        assert response.status_code == 200, f"literal POST failed: {response.status_code} {response.text}"
+        assert response.json().get("queued") is True
+        assert response.json().get("steering", False) is running, response.json()
+
+        materialized_id = body["message_id"] if running else f"{conv_id}:{body['message_id']}"
+
+        def has_literal(messages: list[dict]) -> bool:
+            return any(m.get("message_id") == materialized_id for m in _user_messages(messages))
+
+        print(f"[public_literal_chat:{phase}] await literal materialization", flush=True)
+        final = _poll_to_idle_with_messages(
+            base_url, conv_id, has_literal, "literal message materialization",
+            timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        matches = [m for m in _user_messages(final["messages"]) if m.get("message_id") == materialized_id]
+        assert len(matches) == 1, f"literal message was not materialized once: {matches!r}"
+        assert matches[0]["content"]["text"] == text, matches[0]
+        assert not matches[0]["content"].get("llm_text"), "unexpected expansion overlay"
+        print(f"[public_literal_chat:{phase}] exact replay POST", flush=True)
+        retry = _post_public_literal_chat(base_url, conv_id, body, expected_receiver_sha)
+        assert retry.status_code == 200 and retry.json().get("already_persisted") is True
+        changed = {**body, "expansion_policy": "expand_references"}
+        print(f"[public_literal_chat:{phase}] changed-policy conflict POST", flush=True)
+        conflict = httpx.post(f"{base_url}/api/conversations/{conv_id}/chat", json=changed,
+                              follow_redirects=False, timeout=10.0)
+        assert conflict.status_code == 409 and conflict.json().get("error_type") == "idempotency_conflict"
+        print(f"[public_literal_chat:{phase}] complete", flush=True)
 
 
 def scenario_multi_tool(base_url: str) -> None:
@@ -1144,6 +1406,7 @@ def scenario_continuation(base_url: str) -> None:
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
     worktrees_before = _git_worktree_inventory()
     with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
+        request_id = str(uuid.uuid4())
         create = httpx.post(
             f"{base_url}/api/product-conversations/new",
             json={
@@ -1151,15 +1414,36 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
                 "model": _default_model(base_url),
                 "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
                 "images": [],
-                "request_id": str(uuid.uuid4()),
+                "request_id": request_id,
             },
             timeout=10.0,
         )
         create.raise_for_status()
-        created = create.json()
-        product_conversation_id = created["product_conversation_id"]
-        canonical_route = created["canonical_route"]
-        root_conv_id = created["transcript_row_id"]
+        assert create.status_code == 202, f"unexpected creation acceptance: {create.status_code}"
+        accepted = create.json()
+        product_conversation_id = accepted["product_conversation_id"]
+        assert accepted["request_id"] == request_id
+
+        deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+        while True:
+            status_response = httpx.get(
+                f"{base_url}/api/product-conversations/creation/{request_id}",
+                timeout=10.0,
+            )
+            status_response.raise_for_status()
+            creation = status_response.json()
+            kind = creation["kind"]
+            if kind == "published":
+                break
+            if kind in {"failed", "cancelled"}:
+                raise AssertionError(f"product creation did not publish: {creation!r}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for product publication: {creation!r}")
+            time.sleep(0.05)
+
+        assert creation["product_conversation_id"] == product_conversation_id
+        canonical_route = creation["canonical_route"]
+        root_conv_id = creation["transcript_row_id"]
 
         assert canonical_route == f"/c/{product_conversation_id}", (
             f"unexpected canonical route: {canonical_route!r}"
@@ -1183,6 +1467,14 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
             "root row should not yet point at a continuation"
         )
 
+        original_scope = exhausted['conversation']['work_scope_id']
+        assert original_scope, 'non-Git creation must own a persisted WorkScope'
+        assert exhausted['conversation']['conv_mode']['mode'] == 'Direct'
+        original_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{root_conv_id}'}, timeout=10)
+        original_resolution.raise_for_status()
+        original_environment = original_resolution.json()['work_scope']
+        assert original_environment['work_scope_id'] == original_scope
+        assert original_environment['environment_kind'] == 'unowned_cwd'
         handoff = "Continue with the same ProductConversation after natural context exhaustion."
         continue_response = httpx.post(
             f"{base_url}/api/conversations/{root_conv_id}/continue",
@@ -1218,6 +1510,11 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
         assert successor["conversation"].get("continued_in_conv_id") is None, (
             "successor should be the latest leaf row"
         )
+        assert successor['conversation']['work_scope_id'] == original_scope
+        assert successor['conversation']['cwd'] == exhausted['conversation']['cwd']
+        successor_resolution = httpx.post(f'{base_url}/api/global/resolve', json={'reference':f'@transcript:{successor_id}'}, timeout=10)
+        successor_resolution.raise_for_status()
+        assert successor_resolution.json()['work_scope'] == original_environment
         successor_state = _state_str(successor["conversation"]["state"])
         assert successor_state == "idle", f"successor not idle after handoff: {successor_state}"
         successor_agent_messages = [
@@ -1579,8 +1876,10 @@ def scenario_perf_stream(base_url: str) -> None:
 
 
 SCENARIOS = [
+    ("coordinator_home", scenario_coordinator_home),
     ("list_models", scenario_list_models),
     ("text_streaming", scenario_text_streaming),
+    ("public_literal_chat", scenario_public_literal_chat),
     ("multi_tool", scenario_multi_tool),
     ("think_tool", scenario_think_tool),
     ("read_file", scenario_read_file),
@@ -1879,6 +2178,193 @@ class StreamReadinessTests(unittest.TestCase):
         self.assertFalse(_is_llm_first_byte_witness("init", {"pending_events": [{}]}))
 
 
+class PublicLiteralChatPreflightTests(unittest.TestCase):
+    def test_scenario_matches_exact_materialized_ids_and_retries_original_client_ids(self):
+        submitted = {}
+        last_post = {}
+        polls = []
+        retries = []
+
+        def post(base_url, conv_id, body, expected_receiver_sha):
+            self.assertEqual(expected_receiver_sha, "a" * 40)
+            key = (conv_id, body["message_id"])
+            snapshot = json.loads(json.dumps(body))
+            last_post[conv_id] = snapshot
+            if key in submitted:
+                self.assertEqual(body, submitted[key])
+                retries.append(key)
+                return httpx.Response(200, json={"queued": True, "already_persisted": True})
+            submitted[key] = snapshot
+            return httpx.Response(200, json={"queued": True})
+
+        def queue(base_url, conv_id, body, expected_receiver_sha):
+            post(base_url, conv_id, body, expected_receiver_sha)
+            return httpx.Response(200, json={"queued": True, "steering": True})
+
+        def poll(base_url, conv_id, predicate, description, **kwargs):
+            body = last_post[conv_id]
+            client_id = body["message_id"]
+            steering = conv_id == "running-conv" and description == "literal message materialization"
+            expected_id = client_id if steering else f"{conv_id}:{client_id}"
+
+            def message(message_id, message_type="user", text="wrong message"):
+                return {"message_id": message_id, "message_type": message_type, "content": {"text": text}}
+
+            decoys = [
+                message(f"other-conv:{client_id}"),
+                message(f"prefix:{expected_id}"),
+                message(expected_id, "agent"),
+                message(f"{conv_id}:{client_id}" if steering else client_id),
+            ]
+            self.assertFalse(predicate(decoys), description)
+            messages = [*decoys, message(expected_id, text=body["text"])]
+            self.assertTrue(predicate(messages), description)
+            polls.append((conv_id, expected_id))
+            return {"messages": messages}
+
+        conflict = httpx.Response(409, json={"error_type": "idempotency_conflict"})
+        with mock.patch.dict(globals(), {
+            "_new_conv_and_stream": mock.Mock(side_effect=["idle-conv", "running-conv"]),
+            "_post_public_literal_chat": post,
+            "_queue_literal_behind_gated_turn": mock.Mock(side_effect=queue),
+            "_poll_to_idle_with_messages": poll,
+        }), mock.patch("subprocess.run", side_effect=[
+            mock.Mock(stdout="a" * 40), mock.Mock(stdout=""),
+        ]), mock.patch("uuid.uuid4", side_effect=["smoke-idle", "literal-idle", "smoke-running", "literal-running"]), \
+                mock.patch("httpx.post", return_value=conflict) as changed_policy:
+            scenario_public_literal_chat("http://local.test")
+
+        self.assertEqual(polls, [
+            ("idle-conv", "idle-conv:smoke-idle"),
+            ("idle-conv", "idle-conv:literal-idle"),
+            ("running-conv", "running-conv:smoke-running"),
+            ("running-conv", "literal-running"),
+        ])
+        self.assertEqual(len(submitted), 4)
+        self.assertEqual(retries, [("idle-conv", "literal-idle"), ("running-conv", "literal-running")])
+        self.assertEqual(changed_policy.call_count, 2)
+        for call, (conv_id, client_id) in zip(changed_policy.call_args_list, [
+            ("idle-conv", "literal-idle"), ("running-conv", "literal-running"),
+        ]):
+            body = call.kwargs["json"]
+            self.assertEqual(body, {**submitted[(conv_id, client_id)], "expansion_policy": "expand_references"})
+            self.assertEqual(call.args[0], f"http://local.test/api/conversations/{conv_id}/chat")
+
+    def test_scenario_failure_prints_causal_stage_and_traceback_then_reraises(self):
+        error = httpx.ReadError("connection reset by peer")
+        output = io.StringIO()
+        with mock.patch.dict(globals(), {
+            "_new_conv_and_stream": mock.Mock(side_effect=error),
+        }), mock.patch("subprocess.run", side_effect=[
+            mock.Mock(stdout="a" * 40), mock.Mock(stdout=""),
+        ]), contextlib.redirect_stdout(output):
+            with self.assertRaises(httpx.ReadError) as raised:
+                scenario_public_literal_chat("http://local.test")
+        self.assertIs(raised.exception, error)
+        self.assertIn("[public_literal_chat:idle] create conversation", output.getvalue())
+        self.assertIn("Traceback (most recent call last):", output.getvalue())
+        self.assertIn("_new_conv_and_stream", output.getvalue())
+        self.assertIn("ReadError: connection reset by peer", output.getvalue())
+
+    def test_running_gate_diagnostics_distinguish_setup_post_from_gate_accept(self):
+        output = io.StringIO()
+        with mock.patch("socket.socket") as socket_mock, \
+                mock.patch("httpx.post", return_value=httpx.Response(200, json={"queued": True})), \
+                contextlib.redirect_stdout(output):
+            listener = socket_mock.return_value.__enter__.return_value
+            listener.getsockname.return_value = ("127.0.0.1", 12345)
+            listener.accept.side_effect = TimeoutError("mock did not connect")
+            with self.assertRaisesRegex(TimeoutError, "mock did not connect"):
+                _queue_literal_behind_gated_turn("http://local.test", "conv", {}, "a" * 40)
+        stages = output.getvalue()
+        self.assertLess(stages.index("gated setup POST"), stages.index("setup accepted; waiting"))
+        self.assertNotIn("mock gate connected", stages)
+
+    def test_running_literal_subscribes_before_post_and_consumes_live_queue_event(self):
+        order = []
+        body = {"message_id": "literal-id", "text": "/spears @missing\n café  \n", "expansion_policy": "literal_text"}
+
+        async def events():
+            order.append("init")
+            yield mock.Mock(event="init", data="{}")
+            self.assertEqual(order, ["init", "post"])
+            yield mock.Mock(event="steer_message_queued", data=json.dumps({"message": {
+                "message_id": f"conv:{body['message_id']}", "text": "wrong namespaced queue entry",
+            }}))
+            order.append("queue")
+            yield mock.Mock(event="steer_message_queued", data=json.dumps({"message": {
+                "message_id": body["message_id"], "text": body["text"], "origin": {"kind": "user_api"},
+                "llm_text": None, "skill_invocation": None,
+            }}))
+
+        @contextlib.asynccontextmanager
+        async def source(*args, **kwargs):
+            yield mock.Mock(response=mock.Mock(), aiter_sse=events)
+
+        def post(base_url, conv_id, submitted, expected_receiver_sha):
+            self.assertEqual(order, ["init"])
+            self.assertEqual(submitted, body)
+            order.append("post")
+            return httpx.Response(200, json={"queued": True, "steering": True})
+
+        with mock.patch.dict(globals(), {"aconnect_sse": source, "_post_public_literal_chat": post}):
+            response = asyncio.run(_post_literal_chat_observing_queue_async("http://local.test", "conv", body, "a" * 40))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(order, ["init", "post", "queue"])
+
+    def test_running_literal_fails_if_stream_closes_without_queue_evidence(self):
+        async def events():
+            yield mock.Mock(event="init", data="{}")
+
+        @contextlib.asynccontextmanager
+        async def source(*args, **kwargs):
+            yield mock.Mock(response=mock.Mock(), aiter_sse=events)
+
+        with mock.patch.dict(globals(), {
+            "aconnect_sse": source,
+            "_post_public_literal_chat": mock.Mock(return_value=httpx.Response(200, json={"steering": True})),
+        }):
+            with self.assertRaisesRegex(AssertionError, "closed before literal queue event"):
+                asyncio.run(_post_literal_chat_observing_queue_async("http://local.test", "conv", {
+                    "message_id": "id", "text": "literal",
+                }, "a" * 40))
+
+    def test_missing_malformed_mismatched_or_redirected_receiver_never_posts(self):
+        expected_receiver_sha = "a" * 40
+        fixtures = [
+            (200, "{}"), (200, '{"git_sha": null}'), (200, '{"git_sha": 1}'),
+            (200, '{"git_sha": "unknown"}'), (200, '{"git_sha": "aaaaaaa"}'),
+            (200, json.dumps({"git_sha": "b" * 40})),
+            (200, json.dumps({"git_sha": expected_receiver_sha + "-dirty"})),
+            (200, "null"), (200, "[]"), (200, '{"git_sha":'),
+            (302, json.dumps({"git_sha": expected_receiver_sha})), (401, "{}"),
+        ]
+        for status, text in fixtures:
+            with self.subTest(status=status, text=text), \
+                    mock.patch("httpx.get", return_value=httpx.Response(status, text=text)) as get, \
+                    mock.patch("httpx.post") as post:
+                with self.assertRaises((AssertionError, ValueError)):
+                    _post_public_literal_chat("https://destination.test", "original", {
+                        "message_id": "same-id", "text": "/spears @file", "expansion_policy": "literal_text",
+                    }, expected_receiver_sha)
+                get.assert_called_once_with("https://destination.test/api/version", follow_redirects=False, timeout=10.0)
+                post.assert_not_called()
+
+    def test_known_receiver_is_rechecked_for_each_exact_retry_without_fallback(self):
+        expected_receiver_sha = "a" * 40
+        with mock.patch("httpx.get", side_effect=[
+            httpx.Response(200, json={"git_sha": expected_receiver_sha}),
+            httpx.Response(200, json={"git_sha": "b" * 40}),
+        ]) as get, mock.patch("httpx.post", return_value=httpx.Response(200)) as post:
+            body = {"message_id": "same-id", "text": "literal steering smoke test", "expansion_policy": "literal_text"}
+            _post_public_literal_chat("https://destination.test", "original", body, expected_receiver_sha)
+            with self.assertRaisesRegex(AssertionError, "mismatched receiver"):
+                _post_public_literal_chat("https://destination.test", "original", body, expected_receiver_sha)
+            self.assertEqual(get.call_count, 2)
+            post.assert_called_once_with("https://destination.test/api/conversations/original/chat",
+                                         json=body, follow_redirects=False, timeout=10.0)
+
+
 class ScenarioSelectorTests(unittest.TestCase):
     def test_select_scenarios_defaults_to_all(self):
         self.assertEqual([name for name, _ in SCENARIOS], [name for name, _ in _select_scenarios([])])
@@ -1949,6 +2435,7 @@ def _run_self_tests() -> int:
             CpuProfilingTests,
             StartupRetryTests,
             StreamReadinessTests,
+            PublicLiteralChatPreflightTests,
             ScenarioSelectorTests,
         )
     )

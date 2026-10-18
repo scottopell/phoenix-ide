@@ -942,13 +942,16 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::ConversationAlreadyExists(_)
         | crate::DbError::MessageNotFound(_)
         | crate::DbError::MessageConflict(_)
+        | crate::DbError::TranscriptSnapshotChanged
         | crate::DbError::SlugExists(_)
+        | crate::DbError::CoordinatorWorkScope(_)
         | crate::DbError::Serialization(_)
         | crate::DbError::ContinuationPrecondition(_)
         | crate::DbError::CloseFoundationConflict(_)
         | crate::DbError::CloseAdmissionFenced(_)
         | crate::DbError::ProductConversationUnavailable(_)
         | crate::DbError::SteeringQueueFull
+        | crate::DbError::ProductCreationClaimLost
         | crate::DbError::CloseFoundationPrecondition(_)
         | crate::DbError::CloseFoundationStaleLatest { .. }
         | crate::DbError::CloseFoundationRepairRequired(_)
@@ -1505,6 +1508,12 @@ mod tests {
     use crate::Database;
     use phoenix_core::domain::db_schema::MessageContent;
     use std::collections::HashSet;
+
+    #[test]
+    #[should_panic(expected = "retrieval telemetry closure only returns SQLx errors")]
+    fn snapshot_mismatch_is_not_a_sql_error_from_retrieval_telemetry() {
+        sqlx_from_db_error(crate::DbError::TranscriptSnapshotChanged);
+    }
 
     fn global_request(query: &str) -> RetrievalRequest {
         RetrievalRequest::natural_language(query, RetrievalScope::Global, 10)

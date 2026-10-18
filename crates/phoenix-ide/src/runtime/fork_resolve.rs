@@ -1639,7 +1639,9 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         DbError::Sqlx(_)
         | DbError::MessageNotFound(_)
         | DbError::MessageConflict(_)
+        | DbError::TranscriptSnapshotChanged
         | DbError::SlugExists(_)
+        | DbError::CoordinatorWorkScope(_)
         | DbError::Serialization(_)
         | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)
@@ -1647,6 +1649,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::CloseAdmissionFenced(_)
         | DbError::ProductConversationUnavailable(_)
         | DbError::SteeringQueueFull
+        | DbError::ProductCreationClaimLost
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationStaleLatest { .. }
         | DbError::CloseFoundationRepairRequired(_)

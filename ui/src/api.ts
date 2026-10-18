@@ -1,7 +1,12 @@
+import { observeViewResponse, type ViewResponseObserver } from './hooks/conversationViewResponse';
+
+type HistoryRequestCorrelation = { open_id?: string; request_id?: never } | { request_id: string; open_id?: never };
+
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import { ContinuationOpeningSchema } from './conversation/opening';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
 import type { SqliteReportWindow } from './generated/SqliteReportWindow';
@@ -88,10 +93,17 @@ export type { ProductConversationCloseUnavailableReasonView } from './generated/
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
+export type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
+import type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
+export type { CoordinatorConversationSnapshotView } from './generated/CoordinatorConversationSnapshotView';
+import type { CoordinatorConversationSnapshotView } from './generated/CoordinatorConversationSnapshotView';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
+import type { ProductConversationCreateAcceptedResponse } from './generated/ProductConversationCreateAcceptedResponse';
+import type { ProductConversationCreationStatusResponse } from './generated/ProductConversationCreationStatusResponse';
 export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
+export type { ProductCreationProvisioningStage } from './generated/ProductCreationProvisioningStage';
 export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
 export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
 import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
@@ -178,6 +190,8 @@ export interface Conversation {
   project_name?: string | null;
   parent_conversation_id?: string | null;
   product_conversation_id?: string;
+  runtime_role?: 'user' | 'sub_agent' | 'coordinator';
+  work_scope_id?: string | null;
   /** Slug of the sub-agent's parent conversation, resolved server-side for the
    *  breadcrumb link (mirrors `seed_parent_slug`). `null`/absent when this is
    *  not a sub-agent or the parent has been deleted; the UI renders unlinked
@@ -668,6 +682,8 @@ export interface ToolCall {
 
 export type { InputOrigin } from './generated/InputOrigin';
 import type { InputOrigin } from './generated/InputOrigin';
+import type { EventPresentation } from './generated/EventPresentation';
+export type { EventPresentation } from './generated/EventPresentation';
 
 export interface Message {
   message_id: string;
@@ -676,6 +692,7 @@ export interface Message {
   message_type: 'user' | 'agent' | 'tool' | 'system' | 'error' | 'continuation' | 'skill';
   /** Synthetic UI messages may lack origin; authoritative wire messages require it. */
   origin?: InputOrigin;
+  event_presentation: EventPresentation | null;
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
@@ -778,10 +795,9 @@ export interface CreateProductConversationRequest {
   images?: ImageData[];
 }
 
-export interface CreateProductConversationResponse {
-  product_conversation_id: string;
-  canonical_route: string;
-}
+export type CreateProductConversationResponse = ProductConversationCreateAcceptedResponse;
+
+export type ProductConversationCreationObservation = ProductConversationCreationStatusResponse;
 
 export interface RecentManagementRootSuggestion {
   path: string;
@@ -1630,15 +1646,10 @@ export const api = {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
-      if (err.error_type === 'product_creation_retry_scheduled') {
-        const retryable = new Error(err.error || 'Product creation will retry') as Error & { retryable?: boolean };
-        retryable.retryable = true;
-        throw retryable;
-      }
       if (resp.status === 422) {
         throw new ExpansionError(err as ExpansionErrorDetail);
       }
-      throw new Error(err.error || 'Failed to create product conversation');
+      throw new ApiResponseError(err.error || 'Failed to create product conversation', resp.status, err.error_type);
     }
     return resp.json();
   },
@@ -1798,6 +1809,21 @@ export const api = {
     return resp.json();
   },
 
+  async getProductConversationCreation(
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<ProductConversationCreationObservation> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}`, {
+      ...(signal ? { signal } : {}),
+      cache: 'no-store',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      throw new ApiResponseError(err.error || 'Failed to fetch product conversation creation', resp.status);
+    }
+    return resp.json();
+  },
+
   async listProductConversationCreations(cursor?: string | null): Promise<ProductConversationCreationRecoveryResponseType> {
     const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
     const resp = await fetch(`/api/product-conversations/creation${query}`);
@@ -1845,9 +1871,41 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to report product conversation open');
   },
 
+  async getCoordinatorHistory(
+    reference: string,
+    options?: { message_limit?: number; before?: string | null; onTelemetry?: ViewResponseObserver } & HistoryRequestCorrelation,
+  ): Promise<CoordinatorConversationSnapshotView> {
+    const params = new URLSearchParams();
+    if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
+    if (options?.before) params.set('before', options.before);
+    if (options?.open_id) params.set('open_id', options.open_id);
+    if (options?.request_id) params.set('request_id', options.request_id);
+    const response = await fetch(`/api/global/coordinator/history/${encodeURIComponent(reference)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
+    if (!response.ok) throw new ApiResponseError('Unable to read Global conversation history', response.status);
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
+  },
+
+  async getProductConversationHistorySnapshot(
+    productConversationId: string,
+    options?: { message_limit?: number; before?: string | null; onTelemetry?: ViewResponseObserver } & HistoryRequestCorrelation,
+  ): Promise<ProductConversationHistorySnapshotView> {
+    const params = new URLSearchParams({ boundary_representation: 'original_messages' });
+    if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
+    if (options?.before) params.set('before', options.before);
+    if (options?.open_id) params.set('open_id', options.open_id);
+    if (options?.request_id) params.set('request_id', options.request_id);
+    const response = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
+    if (!response.ok) throw new ApiResponseError('Unable to read product conversation history', response.status);
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
+  },
+
   async getProductConversationSnapshot(
     productConversationId: string,
-    options?: { message_limit?: number; before?: string | null; open_id?: string },
+    options?: { message_limit?: number; before?: string | null; open_id?: string; onTelemetry?: ViewResponseObserver },
   ): Promise<ProductConversationSnapshotViewType> {
     const params = new URLSearchParams();
     if (typeof options?.message_limit === 'number') {
@@ -1863,13 +1921,15 @@ export const api = {
     const resp = await fetch(
       `/api/product-conversations/${encodeURIComponent(productConversationId)}${query ? `?${query}` : ''}`,
     );
+    observeViewResponse(resp, options?.onTelemetry);
     if (!resp.ok) {
       const detail = resp.status === 404
         ? 'Conversation not found'
         : 'Failed to fetch product conversation snapshot';
       throw new ApiResponseError(detail, resp.status);
     }
-    return resp.json();
+    const snapshot = await resp.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {

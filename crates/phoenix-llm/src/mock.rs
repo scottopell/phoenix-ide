@@ -18,6 +18,9 @@
 //! - `[[stall:after_n,ms]]` — emit `after_n` chunks, sleep `ms`,
 //!   then continue. Drives the heartbeat watchdog (REQ-WPV-004)
 //!   without ending the turn.
+//! - `[[stream-gate:PORT]]` — connect to a loopback test listener before
+//!   streaming, then wait for its `R` byte (30s failure deadline). Lets E2E
+//!   hold an actual in-flight request until steering evidence is observed.
 //! - `[[retry:KIND,N]]` — first N calls for this conversation
 //!   return `LlmError::<KIND>` where KIND ∈ {`rate_limit`,
 //!   `server_error`, `network`}; (N+1)th call succeeds. Drives
@@ -64,6 +67,9 @@ enum Scenario {
     Markdown,
     Mermaid,
     BashToolCall,
+    CoordinatorHomeBash {
+        scope: String,
+    },
     ReadFileToolCall,
     ThinkThenRespond,
     MultiToolCall,
@@ -167,6 +173,30 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
                 .collect::<String>()
         })
     })?;
+    if let Some(scope) = text
+        .split("[[coordinator_home_bash:")
+        .nth(1)
+        .and_then(|s| s.split("]]").next())
+    {
+        let scope = if scope == "discover" {
+            request
+                .system
+                .iter()
+                .find_map(|block| {
+                    block
+                        .text
+                        .split("Authoritative local Coordinator home: active work_scope_id=")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                })
+                .unwrap_or("missing-home-context")
+        } else {
+            scope
+        };
+        return Some(Scenario::CoordinatorHomeBash {
+            scope: scope.to_string(),
+        });
+    }
     parse_scenario_text(&text).or_else(|| {
         request
             .messages
@@ -443,6 +473,37 @@ fn parse_retry(request: &LlmRequest) -> Option<(crate::LlmErrorKind, u32)> {
     Some((kind, n))
 }
 
+fn parse_stream_gate(request: &LlmRequest) -> Option<u16> {
+    let text = latest_user_text(request)?;
+    let rest = text.split_once("[[stream-gate:")?.1;
+    rest.split_once("]]")?
+        .0
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+}
+
+async fn wait_for_stream_gate(port: u16) -> Result<(), LlmError> {
+    use tokio::io::AsyncReadExt as _;
+    let wait = async {
+        let mut stream =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        let mut release = [0];
+        stream.read_exact(&mut release).await?;
+        if release != [b'R'] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid stream gate release",
+            ));
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), wait)
+        .await
+        .map_err(|_| LlmError::timed_out("mock stream gate was not released".to_string()))?
+        .map_err(|error| LlmError::network(format!("mock stream gate failed: {error}")))
+}
+
 /// Slow-tool marker (REQ-WPV-002 visual driver): a user message
 /// containing `[[slow-tool:N]]` makes the mock emit a `bash` `tool_use`
 /// whose command is `sleep N && echo done`, so the real bash tool's
@@ -585,6 +646,20 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
             )
         }
 
+        Scenario::CoordinatorHomeBash { scope } => {
+            let mut input = serde_json::json!({"op":"run", "cmd":"pwd; printf coordinator-home-proof > e2e-home-evidence.txt", "wait_seconds":10});
+            if scope != "missing" {
+                input["work_scope_id"] = serde_json::json!(scope);
+            }
+            (
+                vec![ContentBlock::ToolUse {
+                    id: tool_use_id(),
+                    name: "bash".into(),
+                    input,
+                }],
+                "Coordinator home Bash proof".into(),
+            )
+        }
         Scenario::ReadFileToolCall => {
             let text =
                 "I'll read the configuration file to understand the current setup.".to_string();
@@ -938,6 +1013,10 @@ impl LlmService for MockLlmService {
             // attempt > fail_n: fall through to the normal scenario.
         }
 
+        if let Some(port) = parse_stream_gate(request) {
+            Box::pin(wait_for_stream_gate(port)).await?;
+        }
+
         let scenario = Scenario::from_message(request);
         let (content, streamable_text) = if let Some(seconds) = parse_slow_tool(request) {
             build_slow_tool_response(seconds)
@@ -1015,6 +1094,18 @@ mod tests {
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
+    }
+
+    #[test]
+    fn coordinator_home_tool_fixture_discovers_only_system_owned_scope() {
+        let mut request = user_req("[[coordinator_home_bash:discover]]");
+        assert!(
+            matches!(parse_scenario(&request), Some(Scenario::CoordinatorHomeBash { scope }) if scope == "missing-home-context")
+        );
+        request.system.push(crate::types::SystemContent::new("Authoritative local Coordinator home: active work_scope_id=owned-id ; server directory=/home"));
+        assert!(
+            matches!(parse_scenario(&request), Some(Scenario::CoordinatorHomeBash { scope }) if scope == "owned-id")
+        );
     }
 
     #[test]
@@ -1188,6 +1279,91 @@ mod tests {
         assert_eq!(parse_stall(&user_req("[[stall:5]]")), None);
         assert_eq!(parse_stall(&user_req("[[stall:abc,def]]")), None);
         assert_eq!(parse_stall(&user_req("no marker")), None);
+    }
+
+    #[test]
+    fn stream_gate_marker_only_accepts_nonzero_ports() {
+        assert_eq!(
+            parse_stream_gate(&user_req("[[stream-gate:12345]]")),
+            Some(12345)
+        );
+        for text in [
+            "[[stream-gate:0]]",
+            "[[stream-gate:65536]]",
+            "[[stream-gate:host]]",
+            "no marker",
+        ] {
+            assert_eq!(parse_stream_gate(&user_req(text)), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_literal_plain_text_does_not_reuse_earlier_stream_gate() {
+        let mut request = user_req("[[scenario:bash]] [[stream-gate:12345]]");
+        let literal = "/literal @missing.rs\n[[scenario:plain_text]] [[ttft:0]]\nπ unchanged";
+        request.messages.extend(user_req(literal).messages);
+
+        assert_eq!(latest_user_text(&request).as_deref(), Some(literal));
+        assert_eq!(parse_stream_gate(&request), None);
+        assert!(matches!(
+            Scenario::from_message(&request),
+            Scenario::PlainText
+        ));
+        let (chunk_tx, _chunk_rx) = mpsc::channel(256);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            MockLlmService.complete_streaming(&request, &chunk_tx),
+        )
+        .await
+        .expect("latest message must finish without an earlier gate release")
+        .expect("latest message selects a text response");
+        assert!(response.end_turn);
+        assert!(response
+            .content
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Text { .. })));
+    }
+
+    #[tokio::test]
+    async fn stream_gate_requires_explicit_release() {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let request = user_req(&format!(
+            "[[scenario:plain_text]] [[ttft:0]] [[stream-gate:{port}]]"
+        ));
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(256);
+        let gate =
+            tokio::spawn(
+                async move { MockLlmService.complete_streaming(&request, &chunk_tx).await },
+            );
+        let (mut stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .expect("streaming mock must connect to the gate")
+                .unwrap();
+        assert!(
+            !gate.is_finished(),
+            "connection alone must not release the mock"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), chunk_rx.recv())
+                .await
+                .is_err(),
+            "streaming began or closed before release"
+        );
+        stream.write_all(b"R").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate)
+            .await
+            .expect("released mock must finish streaming")
+            .unwrap()
+            .unwrap();
+        assert!(
+            chunk_rx.try_recv().is_ok(),
+            "released mock must emit chunks"
+        );
     }
 
     #[test]

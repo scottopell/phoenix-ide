@@ -1,4 +1,4 @@
-import type { ChainView, ProductConversationSnapshotView } from '../../api';
+import type { ChainView, ProductConversationHistorySnapshotView as ProductConversationSnapshotView, CoordinatorConversationSnapshotView } from '../../api';
 
 export const productConversationScenarioDefinitions = [
 
@@ -68,6 +68,10 @@ export const productConversationScenarioDefinitions = [
     viewport: 'desktop',
     state: 'ready',
   },
+  { id: 'ordinary-lazy-history', title: 'Ordinary three-member lazy history', viewport: 'desktop', state: 'ready' },
+  { id: 'global-lazy-history', title: 'Global three-member lazy history', viewport: 'desktop', state: 'ready' },
+  { id: 'compact-events-ordinary', title: 'Compact ordinary events', viewport: 'desktop', state: 'ready' },
+  { id: 'compact-events-global', title: 'Compact Global events', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-global', title: 'One-click Global source send', viewport: 'desktop', state: 'ready' },
   { id: 'source-call-ordinary', title: 'One-click historical ordinary source send', viewport: 'desktop', state: 'ready' },
 ] as const satisfies readonly {
@@ -79,7 +83,8 @@ export const productConversationScenarioDefinitions = [
 
 export type ProductConversationScenarioId = (typeof productConversationScenarioDefinitions)[number]['id'];
 
-export interface ProductConversationScenario {
+interface ScenarioCommon {
+  initialEntry?: string;
   sourceSnapshot?: ProductConversationSnapshotView;
   sourceIsGlobal?: boolean;
   initialDraft?: string;
@@ -87,15 +92,21 @@ export interface ProductConversationScenario {
   title: string;
   viewport: 'desktop' | 'mobile';
   state: 'ready' | 'loading' | 'error';
-  snapshot?: ProductConversationSnapshotView;
   /** Complete aligned latest-row projection emitted by the embedded ordinary SSE init. */
   alignedLatestMessages?: import('../../api').Message[];
   steeringMessages?: import('../../api').QueuedSteeringMessage[];
   latestConversationState?: import('../../api').ConversationState;
   /** A real cursor page returned only when the page requests snapshot.before. */
-  olderSnapshot?: ProductConversationSnapshotView;
   /** Initial requests fail this many times, allowing the real Retry control to recover. */
   initialSnapshotFailures?: number;
   chain?: ChainView;
   snapshotError?: string;
 }
+
+export type ProductConversationScenario = ScenarioCommon & (
+  | { kind?: 'ordinary'; snapshot?: ProductConversationSnapshotView; olderSnapshot?: ProductConversationSnapshotView; olderPages?: Record<string, ProductConversationSnapshotView> }
+  | { kind: 'coordinator'; snapshot: CoordinatorConversationSnapshotView; olderSnapshot?: CoordinatorConversationSnapshotView; olderPages?: Record<string, CoordinatorConversationSnapshotView> }
+);
+
+export type OrdinaryProductConversationScenario = Exclude<ProductConversationScenario, { kind: 'coordinator' }>;
+export type GlobalProductConversationScenario = Extract<ProductConversationScenario, { kind: 'coordinator' }>;

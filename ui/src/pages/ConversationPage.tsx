@@ -1,3 +1,4 @@
+import { conversationGroundingContext } from '../components/FileExplorer/groundingContext';
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData } from '../api';
@@ -25,10 +26,9 @@ import {
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
-  type HistoryScrollCommand,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
-import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { transcriptPositioningCommandKey, transcriptPositioningInputFromHistoryExpansion, type TranscriptPositioningCompletion } from '../conversation/transcriptPositioning';
 import { transcriptCoverageAfterInit } from '../conversation/atom';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import {
@@ -206,6 +206,7 @@ interface EmbeddedConversationHostProps {
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   onCloseCompleted?: () => void;
+  onStreamAttempt?: ((conversationId: string, openId: string, retryAttempt: number) => void) | undefined;
 }
 
 interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
@@ -233,6 +234,7 @@ export function EmbeddedConversationPage({
   onProjectionChange,
   suppressMessageViewerOwner = false,
   onCloseCompleted,
+  onStreamAttempt,
   suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
@@ -270,6 +272,7 @@ export function EmbeddedConversationPage({
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
+        onStreamAttempt={onStreamAttempt}
         {...(onProjectionChange ? { onProjectionChange } : {})}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
@@ -307,6 +310,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner,
   suppressTaskApprovalOwner,
   onCloseCompleted,
+  onStreamAttempt,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
@@ -321,6 +325,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner: boolean;
   suppressTaskApprovalOwner: boolean;
   onCloseCompleted?: () => void;
+  onStreamAttempt?: ((conversationId: string, openId: string, retryAttempt: number) => void) | undefined;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -774,6 +779,7 @@ function ConversationPageContent({
   }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
 
   const connectionInfo = useConnection({
+    ...(onStreamAttempt ? { onStreamAttempt } : {}),
     conversationId: navigator.onLine ? resolvedRouteConversationId ?? undefined : undefined,
     dispatch,
     getLastAppliedEventSeq: () => atomRef.current.conversationId === resolvedRouteConversationId
@@ -1150,14 +1156,16 @@ function ConversationPageContent({
     }
   }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessagesForIntent]);
 
-  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => {
+  const handleHistoryScrollCommand = useCallback((completion: TranscriptPositioningCompletion) => {
+    const command = historyExpansion.pendingCommand;
+    if (!command || transcriptPositioningCommandKey(command) !== completion.commandKey) return;
     dispatchHistoryExpansion({
       type: 'command_acknowledged',
-      commandToken: token,
-      view,
-      result,
+      commandToken: command.token,
+      view: command.view,
+      result: completion.result,
     });
-  }, []);
+  }, [historyExpansion.pendingCommand]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
@@ -1876,9 +1884,11 @@ function ConversationPageContent({
     }
   }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const fileRootPath = routePrefix === '/global' || isArchived || !conversation
+  const grounding = conversationGroundingContext(conversation, routePrefix === '/global');
+  const isCoordinatorHome = grounding.kind === 'coordinator_home';
+  const fileRootPath = isArchived || !conversation
     ? null
-    : (conversation.worktree_path ?? conversation.cwd);
+    : (isCoordinatorHome ? conversation.cwd : (conversation.worktree_path ?? conversation.cwd));
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
@@ -2435,7 +2445,7 @@ function ConversationPageContent({
           </button>
         </div>
       )}
-      {!isArchived && <WorkControlBar
+      {!isArchived && !isCoordinatorHome && <WorkControlBar
         mutationEnabled={mutationEnabled}
         conversationId={conversation.id}
         convModeLabel={conversation.conv_mode_label}
@@ -2708,6 +2718,7 @@ function ConversationPageContent({
       {/* Mobile file browser overlay */}
       {fileRootPath && (
         <FileBrowserOverlay
+          grounding={grounding}
           isOpen={showFileBrowser}
           rootPath={fileRootPath}
           conversationId={conversation.id}

@@ -120,6 +120,8 @@ entity ConversationAtom {
     messages: List<Message>
     -- Server-authoritative persisted steering queue in FIFO order.
     steeringMessages: List<SteeringMessage>
+    -- For one conversation owner, applied SSE observations never decrease
+    -- this fence. A different owner starts from its own observed generation.
     transcriptGeneration: Integer?
     transcriptCoverage: TranscriptCoverage
     streamIncarnation: String?
@@ -172,6 +174,14 @@ actor ClientReducer {
 -- Allium has no formal helper declarations. This block defines every
 -- bare helper identifier used by the reducer rules.
 --
+--   generation_after_observation(local, incoming) -> Integer?
+--       Absent incoming retains local; absent local adopts incoming; otherwise
+--       return max(local, incoming). This is an invalidation fence, not a
+--       per-message revision or writable opening authority.
+--   generation_after_init(atom, payload) -> Integer?
+--       For the same conversation owner, apply generation_after_observation
+--       to local and incoming generation. For a different owner, adopt its
+--       incoming generation without carrying the previous owner's fence.
 --   apply_pending_in_order(atom, events) -> ConversationAtom
 --       Fold events through their ordinary reducers in list order.
 --   reconcile_transcript(existing, incoming, coverage,
@@ -281,6 +291,7 @@ rule SseInitFreshConnect {
     -- their normal applyIfNewer guard.
     ensures: atom.messages = reconcile_transcript(atom.messages, payload.messages, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
     ensures: atom.transcriptCoverage = coverage_after_init(atom.transcriptCoverage, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.transcriptGeneration = generation_after_init(atom, payload)
     ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.steeringMessages = without_delivered(payload.steering_messages, payload.messages)
     ensures: atom.phase = payload.phase
@@ -353,6 +364,7 @@ rule SseInitReconnectMerge {
     -- else, because the turn ended while disconnected.
     ensures: atom.messages = reconcile_transcript(atom.messages, payload.messages, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
     ensures: atom.transcriptCoverage = coverage_after_init(atom.transcriptCoverage, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.transcriptGeneration = generation_after_init(atom, payload)
     ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.steeringMessages = without_delivered(payload.steering_messages, atom.messages)
     ensures: atom.phase = payload.phase
@@ -513,11 +525,14 @@ rule SseMessageReplayDropped {
     ensures: atom = atom
 }
 
--- `message_updated` — in-place mutation of existing message fields
--- (display_data, content). Target must exist; a missing target is a
--- silent no-op (the update cannot land before its message, but a
--- reconnect race could reorder — tolerating the no-op is safer than
--- erroring).
+-- `message_updated` — in-place mutation of existing message fields.
+-- Generation observations are monotonic for the owning conversation across
+-- init, live, and pending replay. A newer conversation generation invalidates
+-- acquired transcript coverage; it does not supersede updates to other message
+-- identities. Lower-generation events still apply their owed fields and cursor
+-- through the ordinary per-message patch ordering. Message envelopes without a
+-- generation observation leave this fence unchanged. Changing conversation
+-- owner starts a distinct fence, not a maximum across unrelated conversations.
 rule SseMessageUpdatedApplied {
     when: SseMessageUpdatedDispatched(atom, messageId, seq, transcriptGeneration)
 
@@ -527,8 +542,7 @@ rule SseMessageUpdatedApplied {
     ensures: atom.messages = replace_message(atom.messages, messageId)
     ensures: atom.lastSequenceId = seq
     ensures: atom.streamingBuffer = atom.streamingBuffer
-    ensures: transcriptGeneration != null implies atom.transcriptGeneration = transcriptGeneration
-    ensures: transcriptGeneration = null implies atom.transcriptGeneration = atom.transcriptGeneration
+    ensures: atom.transcriptGeneration = generation_after_observation(atom.transcriptGeneration, transcriptGeneration)
 }
 
 rule SseMessageUpdatedUnknownTarget {
@@ -539,8 +553,7 @@ rule SseMessageUpdatedUnknownTarget {
 
     ensures: atom.messages = atom.messages
     ensures: atom.lastSequenceId = seq
-    ensures: transcriptGeneration != null implies atom.transcriptGeneration = transcriptGeneration
-    ensures: transcriptGeneration = null implies atom.transcriptGeneration = atom.transcriptGeneration
+    ensures: atom.transcriptGeneration = generation_after_observation(atom.transcriptGeneration, transcriptGeneration)
 }
 
 -- `state_change` — phase transition from the server.

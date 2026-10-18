@@ -66,6 +66,11 @@ use tokio::sync::{
 };
 use tracing::Instrument;
 
+#[cfg(not(test))]
+const CREATION_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const CREATION_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Shared slot carrying the trace identity of whatever triggered a
 /// conversation's next turn: the HTTP request span that delivered the user
 /// event, or the parent's `conversation.turn` span for sub-agents. Written by
@@ -547,6 +552,8 @@ impl Drop for AdmittedOperation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SteeringAdmissionError {
+    #[error("product creation delivery claim was lost")]
+    ProductCreationClaimLost,
     #[error("conversation is fenced by an active Close attempt")]
     CloseAdmissionFenced,
     #[error("conversation is permanently unavailable in History")]
@@ -561,6 +568,11 @@ impl From<String> for SteeringAdmissionError {
     fn from(error: String) -> Self {
         Self::Internal(error)
     }
+}
+
+enum SteeringAppendAuthority<'a> {
+    Ordinary,
+    ProductCreation(&'a crate::db::ClaimedProductCreationJob),
 }
 
 pub struct RuntimeManager {
@@ -609,6 +621,10 @@ pub struct RuntimeManager {
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    creation_worker_idle_signal: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    product_creation_claim_guard_policy: Mutex<Option<creation_worker::ClaimGuardPolicy>>,
     #[cfg(test)]
     terminal_cleanup_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -1014,18 +1030,15 @@ impl ReplayRing {
         Some((self.anchor_seq, false, highest_present, replayed))
     }
 
-    /// Aggregate serialised JSON byte length across current ring entries.
-    /// Lazy / on-demand — iterates and serialises each entry via the
-    /// `SseWireEvent` conversion (matching the production wire path).
+    /// Aggregate base/redacted JSON byte length across current ring entries.
+    /// Lazy / on-demand; excludes database-backed private presentations and
+    /// SSE framing, so approximates delivery size.
     /// NOT a hot-path metric: call from the truncation log line or the
     /// `replay_ring_bytes()` ops accessor, not from per-event append.
     fn total_bytes(&self) -> usize {
         self.entries
             .iter()
-            .map(|e| {
-                let wire: crate::api::wire::SseWireEvent = e.event.clone().into();
-                serde_json::to_vec(&wire).map(|v| v.len()).unwrap_or(0)
-            })
+            .map(|e| crate::api::wire::SseWireEvent::replay_payload_size(&e.event).unwrap_or(0))
             .sum()
     }
 }
@@ -1189,13 +1202,55 @@ impl AdmittedPublication<'_> {
     pub(crate) fn persisted_message(self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.broadcaster.observe_seq(seq);
-        self.send(SseEvent::Message { message }, seq, RingOp::Anchor)
+        self.send(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Anchor,
+        )
+    }
+
+    pub(crate) async fn persisted_opening_message<S: traits::MessageStore + ?Sized>(
+        self,
+        storage: &S,
+        message: crate::db::Message,
+    ) -> Result<usize, String> {
+        let opening = match storage
+            .read_message_continuation_opening(&message.message_id)
+            .await
+        {
+            Ok(opening) => opening.map(crate::api::ContinuationOpeningView::from),
+            Err(error) => {
+                tracing::error!(message_id = %message.message_id, %error, "committed opening projection read failed");
+                let _ = self.event(|sequence_id| SseEvent::Error {
+                    sequence_id,
+                    error: user_facing_error::UserFacingError::with_action(
+                        "read the committed continuation opening",
+                    ),
+                });
+                return Err(error);
+            }
+        };
+        let seq = message.sequence_id;
+        self.broadcaster.observe_seq(seq);
+        Ok(self
+            .send(SseEvent::Message { message, opening }, seq, RingOp::Anchor)
+            .unwrap_or(0))
     }
 
     pub(crate) fn assistant_message(self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.broadcaster.observe_seq(seq);
-        self.send(SseEvent::Message { message }, seq, RingOp::Append)
+        self.send(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Append,
+        )
     }
 
     pub(crate) fn message_updated(
@@ -1208,6 +1263,7 @@ impl AdmittedPublication<'_> {
         let seq = self.broadcaster.next_seq();
         self.send(
             SseEvent::MessageUpdated {
+                opening: None,
                 sequence_id: seq,
                 message_id,
                 transcript_generation,
@@ -1607,7 +1663,14 @@ impl SseBroadcaster {
     pub fn send_persisted_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Anchor)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Anchor,
+        )
     }
 
     /// Backward-compatible alias for [`SseBroadcaster::send_persisted_message`].
@@ -1634,7 +1697,14 @@ impl SseBroadcaster {
     pub fn send_ephemeral_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Append)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                opening: None,
+            },
+            seq,
+            RingOp::Append,
+        )
     }
 
     pub(crate) fn admitted_publication<'a>(
@@ -2001,6 +2071,7 @@ pub enum SseEvent {
         /// renders the DB snapshot and waits for the next live event to
         /// repopulate the in-flight UI.
         pending_truncated: bool,
+        opening: Option<crate::api::ContinuationOpeningView>,
     },
     /// A newly-persisted message joins the conversation. Uses `message.sequence_id`
     /// as its envelope `sequence_id` — no separate field needed because
@@ -2008,12 +2079,14 @@ pub enum SseEvent {
     /// [`SseBroadcaster::send_message`], folds into the broadcaster's counter.
     Message {
         message: crate::db::Message,
+        opening: Option<crate::api::ContinuationOpeningView>,
     },
     /// An existing message's mutable fields changed. Carries only the delta —
     /// `message_id` is the target; `sequence_id` is the envelope id used by
     /// the client reducer for dedup (task 02675). The message's persistent
     /// `sequence_id` is immutable and not repeated here.
     MessageUpdated {
+        opening: Option<crate::api::ContinuationOpeningView>,
         sequence_id: i64,
         message_id: String,
         /// Conversation transcript generation after a persisted mutation commits.
@@ -2255,6 +2328,9 @@ pub(crate) async fn conversation_retains_work_scope(
 }
 
 fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
+    if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        return Some(ResourceScopeKey::Coordinator);
+    }
     match conv.attached_work_scope_id.clone() {
         Some(scope) => Some(ResourceScopeKey::Work(scope)),
         None if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent => {
@@ -2436,6 +2512,10 @@ impl RuntimeManager {
             browser_retirement_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             hard_delete_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            creation_worker_idle_signal: Mutex::new(None),
+            #[cfg(test)]
+            product_creation_claim_guard_policy: Mutex::new(None),
             #[cfg(test)]
             terminal_cleanup_barrier: AsyncMutex::new(None),
             #[cfg(test)]
@@ -3623,30 +3703,41 @@ impl RuntimeManager {
                         Some(chrono::Utc::now() + chrono::Duration::seconds(1))
                     }
                 };
-                if let Some(deadline) = next_deadline {
-                    let delay = (deadline - chrono::Utc::now())
+                #[cfg(test)]
+                let no_deadline = next_deadline.is_none();
+                let delay = next_deadline.map_or(CREATION_RECONCILE_INTERVAL, |deadline| {
+                    (deadline - chrono::Utc::now())
                         .to_std()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    tokio::select! {
-                        biased;
-                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
+                        .unwrap_or(std::time::Duration::ZERO)
+                        .min(CREATION_RECONCILE_INTERVAL)
+                });
+                let reconcile_sleep = tokio::time::sleep(delay);
+                #[cfg(test)]
+                let reconcile_sleep = async {
+                    let mut sleep = std::pin::pin!(reconcile_sleep);
+                    std::future::poll_fn(|cx| {
+                        let result = std::future::Future::poll(sleep.as_mut(), cx);
+                        // The biased select polls this only after fatal/kick waits are pending.
+                        if result.is_pending() && no_deadline {
+                            if let Some(idle) =
+                                manager.creation_worker_idle_signal.lock().unwrap().take()
+                            {
+                                let _ = idle.send(());
                             }
                         }
-                        () = tokio::time::sleep(delay) => {}
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
+                        result
+                    })
+                    .await;
+                };
+                tokio::select! {
+                    biased;
+                    _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
                         }
                     }
+                    () = reconcile_sleep => {}
                 }
             }
             tracing::info!("Conversation creation worker stopped");
@@ -6611,6 +6702,43 @@ impl RuntimeManager {
         event: Event,
         request_fingerprint: &str,
     ) -> Result<(), SteeringAdmissionError> {
+        self.enqueue_steer_message_with_authority(
+            conversation_id,
+            event,
+            request_fingerprint,
+            SteeringAppendAuthority::Ordinary,
+        )
+        .await
+    }
+
+    pub async fn enqueue_product_creation_steer_message(
+        self: &Arc<Self>,
+        delivery: &crate::db::ClaimedProductCreationJob,
+        event: Event,
+        request_fingerprint: &str,
+    ) -> Result<(), SteeringAdmissionError> {
+        let conversation_id = delivery
+            .job
+            .published_conversation_id
+            .as_deref()
+            .ok_or(SteeringAdmissionError::ProductCreationClaimLost)?;
+        self.enqueue_steer_message_with_authority(
+            conversation_id,
+            event,
+            request_fingerprint,
+            SteeringAppendAuthority::ProductCreation(delivery),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn enqueue_steer_message_with_authority(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+        request_fingerprint: &str,
+        authority: SteeringAppendAuthority<'_>,
+    ) -> Result<(), SteeringAdmissionError> {
         let Event::SteerMessage {
             ref text,
             ref origin,
@@ -6626,6 +6754,11 @@ impl RuntimeManager {
                 "enqueue_steer_message expects Event::SteerMessage".into(),
             ));
         };
+
+        #[cfg(test)]
+        crate::opening_qualifier::before_reserved_message(&self.db, conversation_id, message_id)
+            .await
+            .map_err(SteeringAdmissionError::Internal)?;
 
         // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
@@ -6670,22 +6803,37 @@ impl RuntimeManager {
                 continue;
             }
 
-            let queue_position = self
-                .db()
-                .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
-                .await
-                .map_err(|error| match error {
-                    crate::db::DbError::CloseAdmissionFenced(_) => {
-                        SteeringAdmissionError::CloseAdmissionFenced
-                    }
-                    crate::db::DbError::ProductConversationUnavailable(_) => {
-                        SteeringAdmissionError::HistoryUnavailable
-                    }
-                    crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
-                    error => SteeringAdmissionError::Internal(format!(
-                        "Failed to persist steering queue before enqueue: {error}"
-                    )),
-                })?;
+            let append_result = match &authority {
+                SteeringAppendAuthority::Ordinary => {
+                    self.db()
+                        .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
+                        .await
+                }
+                SteeringAppendAuthority::ProductCreation(delivery) => {
+                    self.db()
+                        .append_product_creation_steering_entry(
+                            delivery,
+                            &new_entry,
+                            request_fingerprint,
+                        )
+                        .await
+                }
+            };
+            let queue_position = append_result.map_err(|error| match error {
+                crate::db::DbError::ProductCreationClaimLost => {
+                    SteeringAdmissionError::ProductCreationClaimLost
+                }
+                crate::db::DbError::CloseAdmissionFenced(_) => {
+                    SteeringAdmissionError::CloseAdmissionFenced
+                }
+                crate::db::DbError::ProductConversationUnavailable(_) => {
+                    SteeringAdmissionError::HistoryUnavailable
+                }
+                crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
+                error => SteeringAdmissionError::Internal(format!(
+                    "Failed to persist steering queue before enqueue: {error}"
+                )),
+            })?;
             let _ = handle.broadcast_tx.send_live_projection(|sequence_id| {
                 SseEvent::SteerMessageQueued {
                     sequence_id,
@@ -7899,11 +8047,11 @@ mod broadcaster_tests {
 
         assert!(matches!(
             first,
-            SseEvent::Message { ref message } if message.message_id == "reserved-1"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-1"
         ));
         assert!(matches!(
             second,
-            SseEvent::Message { ref message } if message.message_id == "reserved-2"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-2"
         ));
         assert!(matches!(
             queued,
@@ -7948,7 +8096,7 @@ mod broadcaster_tests {
 
         assert!(matches!(
             rx.try_recv().expect("reserved message arrives first"),
-            SseEvent::Message { ref message }
+            SseEvent::Message { ref message, .. }
                 if message.message_id == "persisted" && message.sequence_id == 43
         ));
         assert!(matches!(
@@ -8220,7 +8368,7 @@ mod broadcaster_tests {
         assert_eq!(highest, 3, "highest_seq covers the eager message at seq 3");
         assert_eq!(events.len(), 2, "token + eager message both in ring");
         match &events[1] {
-            SseEvent::Message { message } => assert_eq!(message.message_id, "eager"),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, "eager"),
             other => panic!("expected Message, got {other:?}"),
         }
     }
@@ -10609,6 +10757,86 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn committed_opening_publication_carries_receipt_without_aggregate_get() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation(
+                "opening-publication",
+                "opening-publication",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let boundary = crate::db::MessageContent::Continuation(crate::db::ContinuationContent {
+            summary: "exact context".into(),
+        });
+        db.add_message("live-boundary", &root.id, &boundary, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "exact context".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let (outcome, _) = db
+            .continue_conversation_with_intent(
+                &root.id,
+                crate::db::NewContinuationDispatchIntent::generated_predecessor_context(
+                    phoenix_workflow::ClientTurnKey::try_from("live-key").unwrap(),
+                    "exact context".into(),
+                ),
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected successor")
+        };
+        let message = db
+            .add_message(
+                &format!("{}:live-key", successor.id),
+                &successor.id,
+                &boundary,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let storage = traits::DatabaseStorage::new(db);
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut receiver = broadcaster.subscribe();
+        let mut admitted = fence.try_acquire().unwrap();
+        broadcaster
+            .admitted_publication(&mut admitted)
+            .persisted_opening_message(&storage, message.clone())
+            .await
+            .unwrap();
+        let event = receiver.try_recv().unwrap();
+        let crate::api::wire::SseWireEvent::Message {
+            sequence_id,
+            opening: Some(opening),
+            ..
+        } = event.into()
+        else {
+            panic!("missing committed opening observation")
+        };
+        assert_eq!(sequence_id, message.sequence_id);
+        let json = serde_json::to_value(opening).unwrap();
+        assert_eq!(json["status"], "accepted");
+        assert_eq!(json["accepted_message_id"], message.message_id);
+        assert_eq!(json["presentation"], "boundary");
+        assert_eq!(json["edge"]["continuation_message_id"], "live-boundary");
+        assert!(json.get("summary").is_none());
+    }
+
+    #[tokio::test]
     async fn queued_admitted_assistant_retains_owner_until_reserved_range_release() {
         let fence = FatalLocalAuthorityFence::new();
         let broadcaster =
@@ -10648,7 +10876,7 @@ mod scope_liveness_tests {
         drop(reservation);
 
         assert!(
-            matches!(receiver.try_recv(), Ok(SseEvent::Message { message }) if message.sequence_id == queued_seq)
+            matches!(receiver.try_recv(), Ok(SseEvent::Message { message, .. }) if message.sequence_id == queued_seq)
         );
         assert_eq!(fence.owner_count(), 0);
     }
@@ -10719,7 +10947,7 @@ mod scope_liveness_tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(SseEvent::Message { message }) if message.sequence_id == admitted_seq
+            Ok(SseEvent::Message { message, .. }) if message.sequence_id == admitted_seq
         ));
         assert_eq!(fence.owner_count(), 0);
     }
@@ -11054,7 +11282,9 @@ mod scope_liveness_tests {
             .expect("enqueue reaches the replacement runtime");
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let SseEvent::Message { message } = events.recv().await.expect("runtime event") {
+                if let SseEvent::Message { message, .. } =
+                    events.recv().await.expect("runtime event")
+                {
                     if message.message_id == "survives-eviction" {
                         break;
                     }
@@ -12082,7 +12312,8 @@ mod scope_liveness_tests {
         .await
         .expect("persist and broadcast marker");
 
-        let SseEvent::Message { message } = receiver.try_recv().expect("message broadcast") else {
+        let SseEvent::Message { message, .. } = receiver.try_recv().expect("message broadcast")
+        else {
             panic!("expected persisted message event");
         };
         let persisted = mgr
@@ -15168,6 +15399,108 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn startup_terminal_with_retained_steering_does_not_abort_other_recovery() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let terminal_id = "startup-a-terminal-with-queue";
+        let recovering_id = "startup-z-interrupted-request";
+        manager.start_sub_agent_handler().await;
+        materialize_restart_direct_turn(&manager, recovering_id).await;
+        manager.db().reset_all_to_idle().await.unwrap();
+        manager
+            .db()
+            .create_conversation(terminal_id, "terminal", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let terminal_state = ConvState::ContextExhausted {
+            summary: "terminal context and retained direction".to_string(),
+        };
+        manager
+            .db()
+            .update_conversation_state(terminal_id, &terminal_state)
+            .await
+            .unwrap();
+        let entry = crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            text: "retained direction".to_string(),
+            llm_text: Some("expanded retained direction".to_string()),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "terminal-retained-steer".to_string(),
+            user_agent: Some("startup-regression".to_string()),
+            skill_invocation: None,
+        };
+        manager
+            .db()
+            .append_steering_entry(terminal_id, &entry, "terminal-retained-fingerprint")
+            .await
+            .unwrap();
+        let state_before: (String, String) =
+            sqlx::query_as("SELECT state, state_updated_at FROM conversations WHERE id = ?1")
+                .bind(terminal_id)
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        let queue_before = manager.db().get_steering_queue(terminal_id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&queue_before).unwrap(),
+            serde_json::to_value(vec![entry]).unwrap()
+        );
+        assert_eq!(
+            manager
+                .startup_llm_recovery_conversation_ids()
+                .await
+                .unwrap(),
+            vec![terminal_id.to_string(), recovering_id.to_string()],
+            "the terminal row is selected from queued steering before the interrupted row"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            manager.settle_persisted_llm_requests(),
+        )
+        .await
+        .expect("terminal startup acknowledges settlement without waiting for a provider")
+        .expect("a legitimate terminal row must not abort the startup recovery pass");
+
+        let terminal = manager.db().get_conversation(terminal_id).await.unwrap();
+        assert_eq!(terminal.state, terminal_state);
+        let state_after: (String, String) =
+            sqlx::query_as("SELECT state, state_updated_at FROM conversations WHERE id = ?1")
+                .bind(terminal_id)
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(state_after, state_before);
+        assert_eq!(
+            serde_json::to_value(manager.db().get_steering_queue(terminal_id).await.unwrap())
+                .unwrap(),
+            serde_json::to_value(queue_before).unwrap()
+        );
+        assert!(manager
+            .db()
+            .get_messages(terminal_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(recovering_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle,
+            "startup continues to settle the later interrupted request"
+        );
+        assert!(!manager.db().has_owed_baton(recovering_id).await.unwrap());
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn startup_settlement_isolates_one_uninitializable_conversation() {
         let manager = Arc::new(test_manager().await);
         let bad_id = "restart-bad-model";
@@ -16073,6 +16406,73 @@ mod scope_liveness_tests {
             "HandedOff permanently transfers ownership; a terminal successor leaves \
              the scope unowned and eligible for cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn actual_direct_handoff_keeps_resource_scope_live_until_successor_terminates() {
+        let mgr = test_manager().await;
+        let parent = mgr
+            .db()
+            .create_conversation_with_project(
+                "direct-cleanup",
+                "direct-cleanup",
+                "/tmp",
+                false,
+                None,
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let scope = ResourceScopeKey::Work(parent.attached_work_scope_id.clone().unwrap());
+        mgr.db()
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::ContextExhausted {
+                    summary: "continue".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(child) =
+            mgr.db().continue_conversation(&parent.id).await.unwrap()
+        else {
+            panic!();
+        };
+        mgr.db()
+            .update_conversation_state(
+                &parent.id,
+                &ConvState::HandedOff {
+                    successor_conv_id: child.id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(conversation_resource_scope(&child), Some(scope.clone()));
+        assert!(mgr
+            .scope_has_live_conversation_excluding(&scope, &parent.id)
+            .await
+            .unwrap());
+        assert!(!mgr
+            .scope_has_live_conversation_excluding(&scope, &child.id)
+            .await
+            .unwrap());
+        mgr.db()
+            .update_conversation_state(
+                &child.id,
+                &ConvState::Failed {
+                    error: "finished".into(),
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!mgr.scope_has_live_conversation(&scope).await.unwrap());
     }
 
     #[tokio::test]

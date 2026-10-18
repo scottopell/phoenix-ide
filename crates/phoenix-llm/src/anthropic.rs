@@ -540,26 +540,21 @@ pub(crate) fn is_official_anthropic_route(base_url_override: Option<&str>) -> bo
 /// effective service tier is Fast, the model supports Fast, and the route is
 /// the official Claude API. Effort and speed are independent.
 fn is_fast_mode(spec: &ModelSpec, base_url_override: Option<&str>, request: &LlmRequest) -> bool {
-    spec.api_name == "claude-opus-5-5"
+    spec.id == "claude-opus-5-5"
         && request.service_tier == super::types::EffectiveServiceTier::Fast
         && is_official_anthropic_route(base_url_override)
 }
 
 fn supports_thinking_binding(spec: &ModelSpec, base_url_override: Option<&str>) -> bool {
-    matches!(
-        spec.api_name.as_str(),
-        "claude-opus-5-5" | "claude-sonnet-5-5"
-    ) && is_official_anthropic_route(base_url_override)
+    matches!(spec.id.as_str(), "claude-opus-5-5" | "claude-sonnet-5-5")
+        && is_official_anthropic_route(base_url_override)
 }
 
 const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
 
 fn supports_native_tool_changes(spec: &ModelSpec, base_url_override: Option<&str>) -> bool {
     is_official_anthropic_route(base_url_override)
-        && matches!(
-            spec.api_name.as_str(),
-            "claude-opus-5-5" | "claude-sonnet-5-5"
-        )
+        && matches!(spec.id.as_str(), "claude-opus-5-5" | "claude-sonnet-5-5")
 }
 
 #[cfg(feature = "test-support")]
@@ -608,6 +603,7 @@ fn anthropic_beta_tokens(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
     spec: &ModelSpec,
+    request_name: &super::models::RequestModelName,
     auth: &super::ResolvedAuth,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -633,6 +629,7 @@ pub async fn complete_streaming(
         thinking_binding,
         native_tool_changes,
     )?;
+    anthropic_request.model = request_name.as_str().to_owned();
     anthropic_request.stream = Some(true);
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
@@ -729,6 +726,7 @@ pub async fn complete_streaming(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete(
     spec: &ModelSpec,
+    request_name: &super::models::RequestModelName,
     auth: &super::ResolvedAuth,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
@@ -758,6 +756,7 @@ pub async fn complete(
         thinking_binding,
         native_tool_changes,
     )?;
+    anthropic_request.model = request_name.as_str().to_owned();
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
     }
@@ -923,7 +922,7 @@ fn translate_request_with_tool_policy(
     }
 
     Ok(AnthropicRequest {
-        model: spec.api_name.clone(),
+        model: spec.default_request_name.as_str().to_owned(),
         thinking: thinking_binding.then_some(AnthropicThinkingConfig {
             r#type: "adaptive",
             block_binding: AnthropicBlockBinding {
@@ -1848,7 +1847,7 @@ mod tests {
     fn test_spec(supports_tool_search: bool) -> ModelSpec {
         ModelSpec {
             id: "test-model".into(),
-            api_name: "test-model-api".into(),
+            default_request_name: "test-model-api".into(),
             backend: ModelBackend::Anthropic,
             family: "Anthropic".into(),
             description: "test".into(),
@@ -1918,7 +1917,7 @@ mod tests {
     #[test]
     fn native_tool_changes_require_known_model_and_official_route() {
         let mut spec = test_spec(true);
-        spec.api_name = "claude-opus-5-5".into();
+        spec.id = "claude-opus-5-5".into();
         assert!(supports_native_tool_changes(&spec, None));
         assert!(supports_native_tool_changes(
             &spec,
@@ -1928,9 +1927,9 @@ mod tests {
             &spec,
             Some("https://proxy.example/v1/messages")
         ));
-        spec.api_name = "claude-sonnet-5-5".into();
+        spec.id = "claude-sonnet-5-5".into();
         assert!(supports_native_tool_changes(&spec, None));
-        spec.api_name = "claude-sonnet-5".into();
+        spec.id = "claude-sonnet-5".into();
         assert!(!supports_native_tool_changes(&spec, None));
     }
 

@@ -1347,7 +1347,7 @@ mod tests {
             SkillAudience::GlobalCoordinator,
         );
         assert_eq!(tampered.len(), 1);
-        assert_eq!(tampered[0].description, "Use supported Phoenix HTTP APIs for user-authorized Global Coordinator lifecycle actions.");
+        assert_eq!(tampered[0].description, "Use supported Phoenix HTTP APIs for user-authorized Global Coordinator actions with non-exhaustive best-practice recipes.");
 
         let authenticated = AuthenticatedCoordinatorSkillCatalog::discover(Some(&extract_dir))
             .expect("authenticated coordinator catalog");
@@ -1384,10 +1384,15 @@ mod tests {
             "creation_cwd_b64=",
             "leading/trailing-whitespace WorkScope path is unsupported",
             "objective.trim()",
-            "Reject larger text objectives before UUID generation",
+            "Stop this recipe for larger text objectives before UUID generation",
+            "verified supported alternative transport requires separate contract inspection and user authority",
             "INTENT_B64",
+            "HTTP 202 proves durable acceptance",
             "repeat the step-3 POST at most once",
-            "GET /api/product-conversations/creation",
+            "GET /api/product-conversations/creation/{request_id}",
+            "A `published` response",
+            "transient replay response remains ambiguous",
+            "changed explicit `llm_language`",
             "product_conversation_id",
             "root `transcript_row_id`",
             "current `latest_transcript_row_id`",
@@ -1404,7 +1409,11 @@ mod tests {
             "--max-time 30",
             "no_proxy='*'",
             "NO_PROXY='*'",
-            "same Phoenix server that owns that WorkScope",
+            "active local WorkScope authorizes local execution only",
+            "selected destination's identity, authentication, current target, and lifecycle state",
+            "destination cwd provenance only when the operation consumes cwd",
+            "user-identified credential source",
+            "existing lifecycle, target-resolution, and retry rules regardless of transport",
             "llm_language",
             "ordered `images` collection",
             "requires exactly `images: []`",
@@ -1412,9 +1421,6 @@ mod tests {
             "HTTP 408, 425, 429",
             "60-second lockout window",
             "`no_op` is omitted when false",
-            "stored normalized language always wins",
-            "`llm_language` is the explicit exception",
-            "only runtime commands required are `curl`, `base64`, and `od`",
         ] {
             assert!(
                 trusted.contains(required),
@@ -1441,7 +1447,9 @@ mod tests {
             !trusted.contains("jq "),
             "supported recipe must not require jq"
         );
-        assert!(trusted.contains("Do not use `POST /api/conversations/{id}/chat`"));
+        assert!(trusted.contains("Public literal chat with a known receiver"));
+        assert!(trusted.contains("Smoke HTTP success alone does not prove policy support"));
+        assert!(trusted.contains("Do not use omitted/default `expand_references` mode"));
         for forbidden in [
             "UPDATE conversations",
             "INSERT INTO conversations",

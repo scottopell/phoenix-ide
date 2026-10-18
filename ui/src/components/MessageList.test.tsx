@@ -6,12 +6,12 @@ import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScop
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import { GESTURE_STALE_MS } from './VirtualTranscript';
-import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
+import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange, VirtualTranscriptPositioningAuthority } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
 import { MessageList } from './MessageList';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
-import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
+import { transcriptPositioningCommandKey, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
@@ -131,6 +131,10 @@ vi.mock('./MessageContextMenu', () => ({
 // `handleTotalListHeightChanged` test group).
 const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
+  scrollToOwnedIndex: vi.fn(),
+  completePosition: vi.fn(),
+  interruptPosition: vi.fn(),
+  cancelPosition: vi.fn(),
   scrollToTail: vi.fn(),
   setTailFollowAllowed: vi.fn(),
   isProgrammaticScroll: vi.fn(),
@@ -143,6 +147,8 @@ const virtualTranscriptMock = {
   totalExtentChanged: null as ((height: number) => void) | null,
   pinnedChanged: null as ((pinned: boolean) => void) | null,
   rangeChanged: null as ((snapshot: VirtualTranscriptRangeChange) => void) | null,
+  publishDuringLayout: false,
+  positioningAuthority: { kind: 'absent' } as VirtualTranscriptPositioningAuthority,
   currentSnapshot: { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 1, targetMeasured: false } as VirtualTranscriptPhysicalSnapshot,
   renderedIndices: null as Set<number> | null,
 };
@@ -153,9 +159,13 @@ function indexOrZero(index: number): number {
 
 beforeEach(() => {
   virtualTranscriptMock.scrollToIndex = vi.fn();
+  virtualTranscriptMock.scrollToOwnedIndex = vi.fn((_owner: string, ...args: unknown[]) => virtualTranscriptMock.scrollToIndex(...args));
+  virtualTranscriptMock.cancelPosition = vi.fn();
   virtualTranscriptMock.scrollToTail = vi.fn();
   virtualTranscriptMock.setTailFollowAllowed = vi.fn();
   virtualTranscriptMock.isProgrammaticScroll = vi.fn(() => false);
+  virtualTranscriptMock.completePosition = vi.fn();
+  virtualTranscriptMock.interruptPosition = vi.fn();
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.preserveViewportOnNextItemsChange = vi.fn();
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
@@ -168,6 +178,8 @@ beforeEach(() => {
   virtualTranscriptMock.totalExtentChanged = null;
   virtualTranscriptMock.pinnedChanged = null;
   virtualTranscriptMock.rangeChanged = null;
+  virtualTranscriptMock.publishDuringLayout = false;
+  virtualTranscriptMock.positioningAuthority = { kind: 'absent' };
   virtualTranscriptMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
@@ -188,6 +200,7 @@ vi.mock('./VirtualTranscript', async () => {
       onPinnedChange,
       onRangeChange,
       header,
+      positioningAuthority,
       empty,
     }: {
       items: readonly T[];
@@ -198,10 +211,12 @@ vi.mock('./VirtualTranscript', async () => {
       onTotalExtentChange?: (height: number) => void;
       onPinnedChange?: (pinned: boolean) => void;
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
+      positioningAuthority?: VirtualTranscriptPositioningAuthority;
       header?: React.ReactNode;
       empty?: React.ReactNode;
     }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; setTailFollowAllowed: (allowed: boolean) => void; isProgrammaticScroll: (scrollTop: number) => boolean; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
+      virtualTranscriptMock.positioningAuthority = positioningAuthority ?? { kind: 'absent' };
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
       }
@@ -216,6 +231,10 @@ vi.mock('./VirtualTranscript', async () => {
       }
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
+        scrollToOwnedIndex: virtualTranscriptMock.scrollToOwnedIndex,
+        completePosition: virtualTranscriptMock.completePosition,
+        interruptPosition: virtualTranscriptMock.interruptPosition,
+        cancelPosition: virtualTranscriptMock.cancelPosition,
         scrollToTail: virtualTranscriptMock.scrollToTail,
         setTailFollowAllowed: virtualTranscriptMock.setTailFollowAllowed,
         isProgrammaticScroll: virtualTranscriptMock.isProgrammaticScroll,
@@ -226,6 +245,12 @@ vi.mock('./VirtualTranscript', async () => {
         layoutRevision: virtualTranscriptMock.layoutRevision,
         physicalSnapshot: virtualTranscriptMock.physicalSnapshot,
       }), []);
+      useLayoutEffect(() => {
+        if (virtualTranscriptMock.publishDuringLayout) {
+          virtualTranscriptMock.publishDuringLayout = false;
+          onRangeChange?.(virtualTranscriptMock.currentSnapshot);
+        }
+      });
       useLayoutEffect(() => {
         scrollerRef?.(containerRef.current);
         return () => scrollerRef?.(null);
@@ -255,6 +280,7 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
     ? { tool_use_id: `tool-${sequence_id}`, content: 'tool result', is_error: false }
     : { text: `message ${sequence_id}` };
   return {
+    event_presentation: null,
     message_id: `msg-${sequence_id}`,
     sequence_id,
     message_type,
@@ -886,7 +912,7 @@ describe('MessageList', () => {
     expect(getComputedStyle(messagesScroller!).overflowY).toBe('auto');
   });
 
-  it('sizes wide markdown tables from the non-scrolling chat boundary', () => {
+  it('keeps streaming and finalized markdown tables within the readable message width', () => {
     const chatViewRule = appCss.match(/#chat-view\.view\.active\s*{[^}]*}/s)?.[0];
     const tableFallbackRule = appCss.match(/\.markdown-table-scroll\s*{[^}]*}/s)?.[0];
     const tableBreakoutRule = appCss.match(/(\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll)\s*{([^}]*)}/s);
@@ -898,12 +924,9 @@ describe('MessageList', () => {
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
     expect(tableFallbackRule).toMatch(/max-width:\s*100%/);
     expect(tableFallbackRule).toMatch(/overflow-x:\s*auto/);
-    expect(tableBreakoutRule?.[1]).toBe('.message.agent > .message-content > .agent-text-block > .markdown-table-scroll');
-    expect(tableBreakoutRule?.[2]).toMatch(/width:\s*calc\(100cqw\s*-\s*16px\)/);
-    expect(tableBreakoutRule?.[2]).toMatch(/margin-inline:\s*calc\(\(100%\s*-\s*\(100cqw\s*-\s*16px\)\)\s*\/\s*2\)/);
-    expect(tableBreakoutRule?.[2]).not.toMatch(/transform|position|left:/);
-    expect(tableBreakoutTableRule).toMatch(/min-width:\s*min\(100%,\s*784px\)/);
-    expect(tableBreakoutTableRule).toMatch(/margin-inline:\s*auto/);
+    expect(tableBreakoutRule).toBeNull();
+    expect(tableBreakoutTableRule).toBeUndefined();
+    expect(appCss).not.toMatch(/100cqw/);
     expect(markdownTableRule).toMatch(/background:\s*var\(--bg-secondary\)/);
     expect(tableFallbackRule).not.toMatch(/background/);
     expect(tableCodeRule).toMatch(/font-size:\s*inherit/);
@@ -982,6 +1005,19 @@ describe('MessageList', () => {
     }
   });
 
+  it('uses only the admitted command and pulses the exact source tool when its disclosure mounts', async () => {
+    const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
+    const view = { conversationId: 'aggregate-owner', generation: 1, transcriptGeneration: 1 };
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="aggregate-owner" transcriptPositioning={{ kind: 'positioning', command: { kind: 'jump_to_message', token: 1, requestToken: 1, view, targetMessageId: source.message_id } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(0, 'start', undefined, '[data-tool-id="source-tool"]');
+    const tool = document.createElement('div');
+    tool.dataset['toolId'] = 'source-tool';
+    document.querySelector('[data-render-unit-key="msg-1"]')!.append(tool);
+    await waitFor(() => expect(tool).toHaveClass('jump-highlight'));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+  });
+
   it('positions an admitted source call even when ordinary history positioning is idle', () => {
     const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
     render(withConvContext(<MessageList streamingRequestId={null} messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source-member', generation: 1, transcriptGeneration: 1 } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
@@ -1054,6 +1090,32 @@ describe('MessageList', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps terminal probe ownership at issuance when a selected segment changes before finish', () => {
+    const message = makeMessage(1, 'user');
+    const view = { conversationId: 'probe-product', generation: 2, transcriptGeneration: 3 };
+    const command: HistoryScrollCommand = { kind: 'jump_to_message', token: 4, requestToken: 0, view, targetMessageId: message.message_id };
+    let probe: import('../hooks/conversationViewAnchorProbe').ViewAnchorProbe | null = null;
+    const register = (next: typeof probe) => { probe = next; };
+    virtualTranscriptMock.currentSnapshot = { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 1, targetMeasured: false };
+    const list = (scope: string) => withConvContext(<MessageList
+      streamingRequestId={null} messages={[message]} pendingMessages={[]} convState={idleState}
+      onRetry={vi.fn()} onOpenFile={undefined} conversationId="probe-product"
+      transcriptPositioning={{ kind: 'positioning', command }}
+      viewAnchorIntent={{ scope, command }} onViewAnchorProbe={register}
+    />);
+    const { rerender } = render(list('original-segment'));
+    expect(probe!()).toEqual({ kind: 'pending' });
+    virtualTranscriptMock.currentSnapshot = { renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: 2, targetMeasured: true };
+    rerender(list('new-segment'));
+    act(() => virtualTranscriptMock.rangeChanged?.(virtualTranscriptMock.currentSnapshot));
+    const calls = virtualTranscriptMock.physicalSnapshot.mock.calls.length;
+    expect(probe!()).toEqual({ kind: 'pending' });
+    expect(virtualTranscriptMock.physicalSnapshot).toHaveBeenCalledTimes(calls);
+    rerender(list('original-segment'));
+    expect(probe!()).toEqual({ kind: 'target', messageId: message.message_id, disposition: 'applied' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+  });
+
   it('does not apply a pending highlight to a new conversation reusing the same row key', () => {
     const listRef = createRef<React.ElementRef<typeof MessageList>>();
     const messages = [makeMessage(1, 'user')];
@@ -1121,6 +1183,41 @@ describe('MessageList', () => {
 });
 
 describe('history scroll acknowledgement + continuity suppression', () => {
+  it.each(['nonexistent', 'other-member', 'user-message', 'thinking-aside'])('finishes an exact source-tool jump as missing for %s instead of waiting for nonexistent geometry', kind => {
+    const first = { ...makeMessage(1, kind === 'user-message' ? 'user' : 'agent'), content: [{ type: 'tool_use', id: 'own-tool', name: kind === 'thinking-aside' ? 'think' : 'read_file', input: {} }] } as Message;
+    const second = { ...makeMessage(2, 'agent'), content: [{ type: 'tool_use', id: 'other-tool', name: 'search', input: {} }] } as Message;
+    const command = makeJumpToMessageCommand({ targetMessageId: first.message_id });
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[first, second]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      sourceCallTarget={{ messageId: first.message_id, toolUseId: kind === 'other-member' ? 'other-tool' : kind === 'user-message' || kind === 'thinking-aside' ? 'own-tool' : 'gone' }}
+      transcriptPositioning={{ kind: 'positioning', command }} onHistoryScrollCommandHandled={handled} />));
+    expect(handled.mock.calls).toEqual([[{ commandKey: transcriptPositioningCommandKey(command), result: 'target_missing' }]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it('restores a valid reader anchor despite a stale source-tool refinement in the URL', () => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[makeMessage(1), makeMessage(2)]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      sourceCallTarget={{ messageId: 'msg-2', toolUseId: 'stale' }}
+      transcriptPositioning={transcriptPositioningForCommand(command)} onHistoryScrollCommandHandled={handled} />));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
+    expect(handled).not.toHaveBeenCalledWith(expect.objectContaining({ result: 'target_missing' }));
+  });
+
+  it('reports the full owning key and truthful missing result when no render unit owns the target', () => {
+    const command = makeJumpToMessageCommand({ targetMessageId: 'orphan-message' });
+    const handled = vi.fn();
+    render(withConvContext(<MessageList streamingRequestId={null} messages={[makeMessage(1)]} pendingMessages={[]}
+      convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="conv-history"
+      transcriptPositioning={{ kind: 'positioning', command }} onHistoryScrollCommandHandled={handled} />));
+    expect(handled.mock.calls).toEqual([[{ commandKey: transcriptPositioningCommandKey(command), result: 'target_missing' }]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex).not.toHaveBeenCalled();
+  });
+
   it('acknowledges restore commands exactly once after geometric continuity is verified', () => {
     const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
     const onHistoryScrollCommandHandled = vi.fn();
@@ -1143,7 +1240,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       ),
     );
 
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
@@ -1155,7 +1252,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 1, endIndex: 1 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 1, targetOffset: -22.5 }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(3);
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
@@ -1230,7 +1327,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         });
     rerender(renderList(makeRestoreAfterPrefixExpansionCommand()));
 
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24, undefined, 'continuity');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     virtualTranscriptMock.physicalSnapshot.mockImplementation((targetIndex?: number) => targetIndex === undefined
@@ -1254,10 +1351,55 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetMeasured: true }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['idle', 'view-reset', 'replacement'] as const)('rejects child-layout settlement from the old render authority (%s)', (transition) => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const handled = vi.fn();
+    const props = { streamingRequestId: null, messages: [makeMessage(1), makeMessage(2), makeMessage(3)], pendingMessages: [],
+      convState: idleState, onRetry: vi.fn(), onOpenFile: undefined, conversationId: 'conv-history', onHistoryScrollCommandHandled: handled };
+    const mounted = render(withConvContext(<MessageList {...props} transcriptPositioning={{ kind: 'positioning', command }} />));
+    expect(handled).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.positioningAuthority).toEqual({ kind: 'command', commandKey: transcriptPositioningCommandKey(command) });
+    virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-24);
+    virtualTranscriptMock.currentSnapshot = { renderedRange: { startIndex: 1, endIndex: 1 }, visibleRange: { startIndex: 1, endIndex: 1 },
+      viewportTop: 100, layoutRevision: 2, targetMeasured: true };
+    virtualTranscriptMock.publishDuringLayout = true;
+    const next: TranscriptPositioningInput = transition === 'replacement'
+      ? { kind: 'positioning', command: { ...command, token: 2 } }
+      : { kind: 'idle', view: { ...command.view, transcriptGeneration: transition === 'view-reset' ? 2 : 1 } };
+    mounted.rerender(withConvContext(<MessageList {...props} transcriptPositioning={next} />));
+    expect(handled.mock.calls).toEqual(transition === 'replacement'
+      ? [[{ commandKey: transcriptPositioningCommandKey(command), result: 'superseded' }], [{ commandKey: transcriptPositioningCommandKey({ ...command, token: 2 }), result: 'applied' }]] : [[{ commandKey: transcriptPositioningCommandKey(command), result: 'superseded' }]]);
+    expect(virtualTranscriptMock.positioningAuthority).toEqual(next.kind === 'positioning'
+      ? { kind: 'command', commandKey: transcriptPositioningCommandKey(next.command) } : { kind: 'absent' });
+  });
+
+  it.each(['idle', 'user-interrupted', 'replacement'] as const)('cancels only the finished physical owner before acknowledging supersession (%s)', (transition) => {
+    const command = makeRestoreAfterPrefixExpansionCommand();
+    const owner = transcriptPositioningCommandKey(command);
+    const onHistoryScrollCommandHandled = vi.fn(() => {
+      expect(virtualTranscriptMock.cancelPosition).toHaveBeenCalledWith(owner);
+    });
+    const props = {
+      streamingRequestId: null, messages: [makeMessage(1), makeMessage(2), makeMessage(3)], pendingMessages: [],
+      convState: idleState, onRetry: vi.fn(), onOpenFile: undefined, conversationId: 'conv-history', onHistoryScrollCommandHandled,
+    };
+    const { container, rerender } = render(withConvContext(<MessageList {...props} transcriptPositioning={{ kind: 'positioning', command }} />));
+    if (transition === 'user-interrupted') fireEvent.wheel(container.querySelector('#messages')!, { deltaY: 10 });
+    else rerender(withConvContext(<MessageList {...props} transcriptPositioning={transition === 'idle'
+      ? { kind: 'idle', view: command.view }
+      : { kind: 'positioning', command: { ...command, token: 2 } }} />));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(command), result: 'superseded' });
+    expect(virtualTranscriptMock.cancelPosition.mock.calls).toEqual([[owner]]);
+    expect(virtualTranscriptMock.scrollToOwnedIndex.mock.calls[0]?.[0]).toBe(owner);
+    if (transition === 'replacement') {
+      expect(virtualTranscriptMock.scrollToOwnedIndex.mock.calls.at(-1)?.[0]).toBe(transcriptPositioningCommandKey({ ...command, token: 2 }));
+    }
   });
 
   it('suppresses continuity until user input releases it before machine interaction dispatch', () => {
@@ -1288,7 +1430,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.wheel(scroller, { deltaY: 10 });
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
 
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 0, endIndex: 0 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
@@ -1321,7 +1463,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
   });
 
   it('uses one atomic snapshot when scrollTop changes during suppressed-scroll observation', () => {
@@ -1353,7 +1495,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
 
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
     expect(virtualTranscriptMock.measureOffsetForIndexAtSnapshot).not.toHaveBeenCalled();
   });
 
@@ -1460,7 +1602,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     }));
 
     expect(virtualTranscriptMock.physicalSnapshot).toHaveBeenCalledWith(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
   });
 
   it('reports only the true positive-area visible range when rendered and visible ranges differ', () => {
@@ -1550,9 +1692,11 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     virtualTranscriptMock.physicalSnapshot.mockReturnValueOnce({ renderedRange: { startIndex: 2, endIndex: 2 }, visibleRange: { startIndex: 2, endIndex: 2 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 2, targetOffset: -24, targetMeasured: true });
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 2, endIndex: 2 }, visibleRange: { startIndex: 2, endIndex: 2 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 2, targetOffset: -24, targetMeasured: true }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 2, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }, messageId: 'msg-3' })), result: 'applied' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24, undefined, 'continuity');
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledWith(transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 2, view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }, messageId: 'msg-3' })));
   });
 
   it('does not acknowledge jump until the visible target is measured, then finishes exactly once', () => {
@@ -1586,6 +1730,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     render(renderList(command));
 
+    expect(virtualTranscriptMock.completePosition).not.toHaveBeenCalled();
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
@@ -1610,7 +1755,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(command), result: 'applied' });
 
     act(() => virtualTranscriptMock.rangeChanged?.({
       renderedRange: { startIndex: 0, endIndex: 1 },
@@ -1622,6 +1767,8 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       targetMeasured: true,
     }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.completePosition).toHaveBeenCalledWith(transcriptPositioningCommandKey(command));
   });
 
   it('supersedes an active restore when its command disappears', () => {
@@ -1647,7 +1794,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     rerender(renderList(null));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view })), result: 'superseded' });
   });
 
   it('supersedes a genuinely unmounted active owner exactly once', async () => {
@@ -1674,7 +1821,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     await flushMicrotasks();
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view })), result: 'superseded' });
   });
 
   it('reconciles transcript positioning in layout before sibling passive effects observe it', async () => {
@@ -1735,7 +1882,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 1 }, visibleRange: { startIndex: 1, endIndex: 1 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision(), targetIndex: 1, targetOffset: -24, targetMeasured: true }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(command), result: 'applied' });
   });
 
   it('supersedes a pending jump exactly once when a newer jump replaces it', () => {
@@ -1761,7 +1908,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view })));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })), result: 'superseded' });
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start');
 
     rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view })));
@@ -1792,7 +1939,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     rerender(renderList(null));
     rerender(renderList(null));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })), result: 'superseded' });
   });
 
   it('supersedes a pending jump exactly once on user interaction', () => {
@@ -1819,7 +1966,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.pointerDown(scroller);
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })), result: 'superseded' });
   });
 
   it('clears suppressed continuity on conversation change', () => {
@@ -1850,11 +1997,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(
-      1,
-      'superseded',
-      { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 },
-    );
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 } })), result: 'superseded' });
   });
 
   it('does not let a stale history range callback acknowledge a new conversation with overlapping indices', () => {
@@ -1882,11 +2025,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     rerender(renderList('conv-history-b', 2));
     act(() => virtualTranscriptMock.rangeChanged?.({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: virtualTranscriptMock.layoutRevision() }));
 
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalledWith(
-      1,
-      'applied',
-      { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 },
-    );
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalledWith({ commandKey: transcriptPositioningCommandKey(makeRestoreAfterPrefixExpansionCommand({ token: 1, view: { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 } })), result: 'applied' });
   });
 
   it('keeps suppressed continuity local to the unmounted lifecycle', () => {
@@ -3844,6 +3983,7 @@ describe('handleTotalListHeightChanged', () => {
     // stayed in its positioning phase and the arrival was refused.
     act(() => listRef.current?.scrollToUnitIndex(0));
     fireEvent.keyDown(scroller, { key: 'PageDown' });
+    expect(virtualTranscriptMock.interruptPosition).toHaveBeenCalled();
     setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
     fireEvent.scroll(scroller);
 

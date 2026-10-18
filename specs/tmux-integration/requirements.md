@@ -25,15 +25,15 @@ session by default when one exists.
 
 ## Requirements
 
-### REQ-TMUX-001: Per-Conversation Tmux Server (Socket Isolation)
+### REQ-TMUX-001: Persisted-Scope Tmux Server (Socket Isolation)
 
-WHEN any tmux operation occurs for a conversation (agent calls the `tmux`
-tool, or the in-app terminal is opened)
-THE SYSTEM SHALL invoke the tmux binary with `-S <absolute-socket-path>`
-where `<absolute-socket-path>` is the conversation's dedicated socket
-AND `<absolute-socket-path>` SHALL be
-`<phoenix-data-dir>/tmux-sockets/conv-<conversation_id>.sock`
-(default: `~/.phoenix-ide/tmux-sockets/conv-<conversation_id>.sock`)
+WHEN any tmux operation occurs for an ordinary conversation (agent tool or in-app terminal)
+THE SYSTEM SHALL invoke tmux with `-S <absolute-socket-path>` derived from its persisted `work_scope_id`, not its transcript ID or cwd
+AND SHALL derive the filename `wt-<digest>.sock` beneath the configured tmux socket directory, where `digest` is the first eight SHA-256 bytes of the scope ID rendered as sixteen lowercase hexadecimal characters
+AND SHALL share the same server across continuation transcripts retaining that WorkScope
+AND SHALL keep distinct persisted scopes isolated even when their cwd matches.
+
+Unattached conversations without a persisted WorkScope use the fallback `conv-<conversation_id>.sock`; this fallback is not ordinary Direct continuation ownership. The Coordinator and Global terminal retain separate resource identities.
 
 THE SYSTEM SHALL ensure that the socket directory exists with 0700
 permissions before any tmux invocation for any conversation, creating it
@@ -169,6 +169,12 @@ THE SYSTEM SHALL probe whether the server is alive by issuing
 WHEN the probe succeeds
 THE SYSTEM SHALL re-use the existing server (no spawn)
 
+WHEN existing legacy conversation-named tmux adoption is needed for an ordinary scope
+THE SYSTEM SHALL resolve the legacy transcript hint from persisted ordinary ownership and continuation topology restricted to that exact scope
+AND SHALL use the earliest ordinary transcript attached to that same scope rather than the current successor actor ID or a different historically owned scope
+AND SHALL share that resolution between agent tools, terminal attachment and durable retirement discovery.
+This does not coalesce scopes by cwd, move socket files, repair historical database ownership or expand cross-version compatibility guarantees.
+
 **Rationale:** This is the core value-prop of going through tmux: long-
 running work survives `./dev.py restart`, crashes, and graceful shutdowns.
 Phoenix needs no per-restart bookkeeping; the OS keeps the tmux server
@@ -261,8 +267,9 @@ contracts for the matching API and orchestrator requirements.
 ### REQ-TMUX-009: Tool Description Communicates Two-Tier Persistence Model
 
 THE `tmux` tool's description SHALL state explicitly:
-- The tool runs against a per-conversation tmux server with kernel-level
-  isolation from other conversations.
+- The tool runs against the selected persisted WorkScope's tmux server.
+  Continuation transcripts retaining that scope share the server; distinct
+  persisted scopes and host tmux servers remain isolated.
 - Processes started inside this tmux server survive Phoenix process
   restarts (but not system reboots).
 - The full tmux CLI is available; common subcommands include
@@ -474,11 +481,11 @@ remains available for detailed tmux operations.
 
 Phoenix MUST key tmux server ownership by the conversation's opaque persisted `work_scope_id`. Tool execution, inventory, cleanup, and SSE routing MUST consume that same identity rather than deriving a resource key from a conversation id, working directory, or worktree path. Filesystem paths belong to the scope's environment and MUST NOT determine whether two scopes share a tmux server.
 
-### REQ-TMUX-WS-002: Continuation Sharing Within Worktree Scope
+### REQ-TMUX-WS-002: Continuation Sharing Within Persisted Scope
 
-Continuations that retain the same persisted `work_scope_id` MUST share the same tmux socket/session. A continuation assigned a fresh `work_scope_id` MUST use a distinct server even when its environment points at the same filesystem path.
+Ordinary continuations MUST retain their selected parent's exact persisted `work_scope_id` and share the same tmux socket/session, including Direct/non-Git continuations. Distinct historical scopes remain distinct even when their environments point at the same filesystem path; they are not coalesced by cwd.
 
-The cleanup cascade MUST decide preservation by whether a DISTINCT still-open ProductConversation other than the one being torn down resolves to the same persisted `work_scope_id`: skip the kill/unlink iff Phoenix can prove such a distinct open product aggregate exists, or iff conflicting identity evidence prevents Phoenix from proving whether such a distinct aggregate exists. Same-aggregate continuation rows and subordinate execution conversations that belong to the very same ProductConversation MUST NOT count as separate preservers even when they also resolve to that scope. A distinct still-open ProductConversation here is one whose product-lifecycle state remains Open; runtime handles are irrelevant. A non-terminal aggregate with no runtime handle (after a server restart or runtime eviction) is still a preserving owner when it is distinct and Open. Archival or predecessor-row status inside the same product aggregate does not create an independent preserving owner. A continuation with a fresh persisted identity is a different scope, so preservation is determined by identity equality without mode- or path-specific case analysis.
+The cleanup cascade MUST decide preservation by whether a DISTINCT still-open ProductConversation other than the one being torn down resolves to the same persisted `work_scope_id`: skip the kill/unlink iff Phoenix can prove such a distinct open product aggregate exists, or iff conflicting identity evidence prevents Phoenix from proving whether such a distinct aggregate exists. Same-aggregate continuation rows and subordinate execution conversations that belong to the very same ProductConversation MUST NOT count as separate preservers even when they also resolve to that scope. A distinct still-open ProductConversation here is one whose product-lifecycle state remains Open; runtime handles are irrelevant. A non-terminal aggregate with no runtime handle (after a server restart or runtime eviction) is still a preserving owner when it is distinct and Open. Archival or predecessor-row status inside the same product aggregate does not create an independent preserving owner. Distinct historical persisted scope identities remain separate; preservation is determined by identity equality without mode- or path-specific case analysis.
 
 ### REQ-TMUX-015: Companion Refresh on Reuse
 

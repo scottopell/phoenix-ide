@@ -301,19 +301,159 @@ mod tests {
 
         assert!(skill.contains("audience: global-coordinator"));
         assert!(skill.contains("user has authorized"));
-        assert!(skill.contains("never print, persist"));
+        assert!(skill.contains("never serialize credentials"));
         assert!(skill.contains("acceptance, not proof"));
         assert!(reference.contains("GET /api/auth/status"));
         assert!(reference.contains("writable_transcript_row_id"));
-        assert!(reference.contains("/{latest_transcript_row_id}/continue"));
+        assert!(reference.contains("/{original_predecessor_id}/continue"));
         assert!(reference.contains("conversation.state.type == \"context_exhausted\""));
         assert!(!reference.contains("verified as `ContextExhausted`"));
         assert!(reference.contains("send_conversation_message"));
-        assert!(reference.contains("Do not use `POST /api/conversations/{id}/chat`"));
+        assert!(reference
+            .contains("Do not use omitted/default `expand_references` mode for literal steering"));
+        assert!(reference.contains("GET /api/version"));
+        assert!(reference.contains("full `git_sha`"));
+        assert!(reference.contains("immutable commit independently verified"));
+        assert!(reference.contains("stop before POST"));
+        assert!(reference.contains("no redirects"));
+        assert!(reference.contains("Smoke HTTP success alone does not prove policy support"));
+        assert!(reference.contains("materialized text bytes"));
+        assert!(reference.contains("same original destination/transcript"));
+        assert!(skill.contains("literal steering smoke test"));
+        assert!(skill.contains("each retry"));
         assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
-        assert!(reference.contains("Reuse the same `message_id`"));
-        assert!(reference.contains("Current APIs do not provide"));
+        assert!(reference.contains("same original predecessor, message identity, and intent"));
+        assert!(
+            reference.contains("illustrative inventory qualified by inspected deployment/source")
+        );
+        assert!(!reference.contains("Current APIs do not provide"));
+        assert!(reference
+            .contains("Verified supported alternatives and bounded state reads remain available"));
         assert!(!reference.contains("NEVER call Phoenix HTTP API through Bash"));
+    }
+
+    #[test]
+    fn phoenix_api_recipes_are_non_exhaustive_and_source_grounded() {
+        let skill = embedded_skill("phoenix-api").unwrap();
+        let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
+        for content in [&skill, &reference] {
+            assert!(content.contains("non-exhaustive, not an endpoint allowlist"));
+            assert!(content.contains("inspected current deployment/source contracts"));
+            assert!(content.contains("user's authority"));
+            assert!(!content.contains("Inspect source only when"));
+        }
+        assert!(reference.contains("local source alone does not prove deployed behavior"));
+        assert!(
+            reference.contains("a private handler or database path is not a supported public API")
+        );
+    }
+
+    #[test]
+    fn phoenix_api_skill_allows_delegated_decisions_and_verified_alternatives() {
+        let skill = embedded_skill("phoenix-api").unwrap();
+        for permission in [
+            "exact user-provided answers or decisions made within explicit delegated decision scope",
+            "Verified supported alternatives and bounded state reads remain available",
+            "illustrative inventory qualified by inspected deployment/source",
+        ] {
+            assert!(skill.contains(permission), "missing permission: {permission}");
+        }
+        assert!(skill.contains("inspect or unblock work is not decision authority"));
+        assert!(skill.contains("Never fabricate approvals or extend delegation"));
+        assert!(skill.contains("Never invent guarantees or receipts"));
+        assert!(skill.contains("or create background monitors"));
+    }
+
+    #[test]
+    fn phoenix_api_question_recipe_requires_decision_authority_and_single_attempt() {
+        let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
+        for boundary in [
+            "exact user-provided answers or decisions made within explicit delegated decision scope",
+            "Never fabricate approvals or extend delegation",
+            "choose the test runner for this task",
+            "not approving deployment",
+            "does not authorize choosing its answers",
+            "GET /api/conversations/{id}",
+            "conversation.state.type == \"awaiting_user_response\"",
+            "conversation.state.request_id",
+            "not `tool_use_id`",
+            "every exact full question text",
+            "exact selected option `label` or user-authorized custom text",
+            "one comma-space string",
+            "backend does not enforce answer completeness",
+            "Immediately before submission, re-read the same original transcript",
+            "POST once",
+            "POST /api/conversations/{id}/respond",
+            "freshness guard, not an idempotency key",
+            "do not automatically POST again",
+            "not success",
+            "never transplant answers to a new request identity or successor transcript",
+            "Submitted annotation `preview` is not used",
+            "changed state alone does not prove these answers were accepted",
+        ] {
+            assert!(reference.contains(boundary), "missing boundary: {boundary}");
+        }
+    }
+
+    #[test]
+    fn phoenix_api_separates_execution_from_destination_authority() {
+        let skill = embedded_skill("phoenix-api").unwrap();
+        let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
+
+        assert!(skill.contains("active local WorkScope authorizes local execution only"));
+        assert!(skill.contains(
+            "selected destination's identity, authentication, current target, and lifecycle state"
+        ));
+        assert!(skill.contains("user-identified credential source"));
+        assert!(skill.contains("bound to that destination"));
+        assert!(skill.contains("authenticated encryption for nonlocal transport"));
+        assert!(skill.contains("When authentication requires a credential"));
+        assert!(skill.contains("retained original predecessor and exact intent"));
+        assert!(skill.contains(
+            "Copyable curl recipes, local-only tools, and local cwd target only the local destination"
+        ));
+        assert!(skill.contains(
+            "nonlocal API calls must execute in the destination context with any required credential supplied without serialization"
+        ));
+        assert!(skill.contains("destination cwd provenance only when the operation consumes cwd"));
+        assert!(skill.contains(
+            "existing lifecycle, target-resolution, and retry rules regardless of transport"
+        ));
+        assert!(reference.contains("WorkScope authorizes local execution only"));
+        assert!(reference.contains(
+            "selected destination's identity, authentication, current `ProductConversation` or transcript, and lifecycle state"
+        ));
+        assert!(reference.contains("user-identified credential source"));
+        assert!(
+            reference.contains("destination cwd provenance only when the operation consumes cwd")
+        );
+        assert!(reference.contains("Transport grants no destination authority"));
+        assert!(reference.contains("user-authorized, authenticated encrypted transport"));
+        assert!(reference.contains("credential source bound to the selected destination"));
+        assert!(reference.contains("The copyable curl recipes are local-only"));
+        assert!(reference.contains(
+            "origin and ambient `PHOENIX_PASSWORD` belong to the Phoenix server owning the active WorkScope"
+        ));
+        assert!(reference.contains("execute in the destination context"));
+        assert!(reference.contains("without serializing it into the Bash command"));
+        assert!(reference.contains("If auth is disabled, send no credential"));
+        assert!(reference.contains("any required destination credential"));
+        assert!(reference.contains("This creation recipe is local-only"));
+        assert!(reference.contains("never send the local executor's `$PWD` as a remote cwd"));
+        assert!(reference.contains("base64-of-the-local-workscope-origin"));
+        assert!(reference.contains("It resolves only on the local Phoenix instance"));
+        assert!(reference.contains("never substitute it for remote steering"));
+        assert!(reference.contains(
+            "Remote Continue executes that existing API in the selected destination's context and is independent of federated message steering"
+        ));
+        assert!(reference.contains("Retain that transcript as the original predecessor"));
+        assert!(reference.contains(
+            "same original predecessor, message identity, and intent; never retarget a newly current successor"
+        ));
+        assert!(reference.contains("^https?://"));
+        assert!(reference.contains(
+            "operation-specific lifecycle, target-resolution, retry, and outcome rules unchanged"
+        ));
     }
 
     #[test]

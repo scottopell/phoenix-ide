@@ -21,6 +21,7 @@ pub mod pr_display_state;
 pub mod pr_feedback_status;
 pub mod process_inspection;
 pub mod product_conversation;
+pub mod product_creation;
 pub mod provider_replay;
 pub mod quota_details;
 pub mod responses_replay;

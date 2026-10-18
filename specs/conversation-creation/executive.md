@@ -6,7 +6,11 @@ Conversation creation accepts one durable job per request before filesystem, Git
 
 ## Current Reality
 
-The branch includes the shell-first API and UI flow, but production persistence and worker orchestration still use earlier staged and phase-update behavior rather than the full simplified request-bound publication contract. The durable protocol vocabulary, pure transition function, `CreationClaim`/`CompleteCreation` state-machine hooks, and deterministic operation-sequence tests are present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`). Ordinary web creation enters through a directory-first typed ProductConversation request and provisions Git-backed conversations in detached-default worktrees without Project, mode, or branch inputs. Publication records the allocated worktree on `WorkScope` and retains the repository root and exact checkout OID as creation-job staging facts; it does not mint hidden `GitRepository` identity, attach `WorkScope.repository`, or write repository locator observations. Under ADR-035 and REQ-GITREP-009, legacy `Project` remains the sole live repository authority. Hidden `GitRepository` identity and attachment, request-id job identity, immutable starting-pin persistence, atomic publication, and durable typed unresolved default-branch evidence remain normative targets rather than shipped authority.
+Ordinary web creation enters through a directory-first typed ProductConversation request and provisions Git-backed conversations in detached-default worktrees without Project, mode, or branch inputs. The implementation contains request-bound durable acceptance, claim-fenced provisioning checkpoints, and a staged delivery lifecycle: `commit_metadata` atomically stages the aggregate as hidden `delivery_pending` at `bootstrap_initial_turn`; durable objective acceptance precedes ready publication (`published` in persistence) at `finalize_publication`. Delivery claims renew during asynchronous work. Delivery failures retain the same aggregate and objective identity for bounded automatic retry or eligible explicit retry; they do not offer creation Delete or Start over. Exact-request browser recovery stores complete intent in IndexedDB, activates a tab-scoped pointer only after durable storage, and navigates only after published observation.
+
+Cancellation includes `delivery_pending` only before durable objective acceptance. The enqueue sink and cancellation share persistence write authority: cancellation-first fences enqueue; receipt-first excludes cancellation even after queue drain. Cleanup removes only an exactly owned hidden staged ProductConversation/transcript/WorkScope aggregate and safely reconciled owned resources, preserving unowned working-directory segments. The exact-request recovery surface remains available while normal conversation routes and lists hide staged work. Its advertised pending Cancel action is revalidated by the cancellation transaction rather than granting authority after acceptance.
+
+The Allium model records these delivery states, optional whole claim fields, heartbeat fencing, acceptance receipts, cancellation linearization, and identity-preserving retry. The separate pure protocol vocabulary and generated operation-sequence tests remain present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`); their coverage must not be treated as qualification of the production delivery path. Hidden `GitRepository` identity and `WorkScope.repository` attachment remain separate normative targets; under ADR-035 and REQ-GITREP-009, legacy `Project` remains the live repository authority.
 
 Ordinary creation with omitted model uses the registry product default independently of workspace mode; explicit model/effort/speed selections remain unchanged (REQ-CCR-011). Cheap auxiliary work retains its separate selector.
 
@@ -15,18 +19,25 @@ Ordinary creation with omitted model uses the registry product default independe
 | Requirement | Status | Verification |
 | --- | --- | --- |
 | REQ-CCR-011 Ordinary Creation Model Default | Implemented | Registry preference and creation model-resolution tests; browser remembered-selection regression |
-| REQ-CCR-001 Durable Acceptance | Partial | Existing shell/job transaction exists, but request-id replay and no-partial-publication cutover remain incomplete |
-| REQ-CCR-002 Exclusive Authority | Modelled | Pure claim/generation transition and stale-result tests; request-id-as-job-identity not fully implemented |
-| REQ-CCR-003 Crash Reconciliation | Modelled | Expired-claim takeover emits reconciliation rather than blind replay; explicit cleanup ambiguity remains unimplemented |
-| REQ-CCR-004 Bounded Retry | Modelled | Pure four-attempt policy and generated operation schedules |
-| REQ-CCR-005 Repository Serialization | Not implemented | Real Git locking and ownership-safe ambiguous-cleanup handling required |
-| REQ-CCR-005A Immutable Starting Pin Selection | Specified only | Origin-vs-no-origin pin persistence and pin immutability are not yet shipped |
-| REQ-CCR-006 Runtime Bootstrap | Partial | Current claim-bound bootstrap work exists, but broader idempotent bootstrap and recovery remain incomplete |
-| REQ-CCR-006A Atomic Publication | Specified only | Production still contains staged/early publication behavior rather than one atomic ready publication boundary |
-| REQ-CCR-007 Cancellation | Modelled | Claim revocation and visible cancelled-state test |
-| REQ-CCR-008 Deletion | Modelled | Hidden deletion-pending tombstone test; explicit ambiguity retention remains unimplemented |
-| REQ-CCR-009 Durable Scheduling | Not implemented | Deadline-aware production scheduler required |
-| REQ-CCR-010 Deterministic Verification | Partial | Generated protocol schedules exist, but immutable-pin and atomic-publication coverage still need implementation |
+| REQ-CCR-001 Durable Acceptance | Implemented; qualified | Request-bound HTTP 202 acceptance/replay, exact-request status, browser uncertain-response replay, and published-only navigation regressions. |
+| REQ-CCR-002 Exclusive Authority | Implemented; qualified | Allium claim rules plus live heartbeat, replaced-claim, cancellation, and lease-expiry worker regressions. |
+| REQ-CCR-003 Crash Reconciliation | Implemented; qualified | Startup and periodic durable reconciliation reclaim accepted or expired work without relying on process-local wakes. |
+| REQ-CCR-004 Bounded Retry | Implemented; qualified | Queue, objective-expansion, automatic-budget exhaustion, and eligible explicit-delivery retry regressions preserve aggregate identity. |
+| REQ-CCR-005 Repository Serialization | Implemented; qualified | Bounded repository mutation locking and ownership-safe ambiguity retention are covered by lock-timeout and cleanup tests. |
+| REQ-CCR-005A Immutable Starting Pin Selection | Implemented; qualified | Pin persistence, detached exact-OID worktree materialization, and no commit/tag/local-branch mutations are covered by behavioral and source-contract checks. |
+| REQ-CCR-006 Runtime Bootstrap | Implemented; qualified | Claim-fenced objective expansion/enqueue, durable receipt replay, and exact-fingerprint completion avoid duplicate acceptance. |
+| REQ-CCR-006A Atomic Publication | Implemented; qualified | Hidden aggregate staging and `complete_product_creation_delivery` publish identities atomically after durable objective acceptance. |
+| REQ-CCR-007 Cancellation | Implemented; qualified | Cancellation and enqueue share transactional authority; cancel-first/enqueue-first, heartbeat, and owned-aggregate cleanup regressions cover both linearizations. |
+| REQ-CCR-008 Deletion | Implemented; qualified | Hidden aggregate deletion and ownership ambiguity retention are verified; cleanup ambiguity remains visible for retry or local-only browser release without unsafe deletion. |
+| REQ-CCR-009 Durable Scheduling | Implemented; qualified | Immediate kicks provide latency while periodic reconciliation and persisted retry deadlines provide correctness after lost wakes. |
+| REQ-CCR-010 Deterministic Verification | Implemented; qualified | Generated protocol schedules, focused persistence/worker/UI tests, and ProductConversation E2E exact-request polling run in hosted checks. |
+| REQ-CCR-012 Provisioning-Stage Migration | Implemented; qualified | `MIGRATION_128` backfill/constraint regression and exact current-schema 126/127/128 qualification run in hosted checks. Policy: ADR-104 and ADR-105. |
+
+Exact-head hosted qualification runs the Rust, cargo-fmt, clippy, UI/spec, task, E2E, musl production-feature, and macOS helper suites. The conversation-creation Allium model parses with zero error-severity diagnostics. Final immutable-range adversarial review reported no actionable findings.
+
+## Provisioning Checkpoint Follow-Up
+
+`Database::advance_product_creation_provisioning_stage` and the product worker checkpoint helper enforce exact-next-stage, live-claim fencing, monotonic stage timestamps, retry floors, and direct-path no-op stage traversal. Publication and delivery completion require their immediate predecessor stages. Database, worker, migration, browser, and E2E regressions are part of exact-head hosted qualification.
 
 ## Rehomed Project Requirements
 
@@ -34,4 +45,4 @@ REQ-PROJ-000, REQ-PROJ-001, REQ-PROJ-002, REQ-PROJ-005, REQ-PROJ-005A, REQ-PROJ-
 
 ## Merge Gate
 
-The async creation feature is not ready to merge until the production database, worker, Git/resource adapters, runtime bootstrap, and recovery UI conform to the normative protocol and pass deterministic, adapter, and end-to-end verification.
+The implementation satisfies the authored merge gate through exact-head hosted deterministic, adapter, browser, migration, and end-to-end verification plus immutable-range adversarial review. Merge and deployment remain separate user-authorized operations; this qualification does not authorize either.

@@ -5,6 +5,7 @@ import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { MessageViewer } from './MessageViewer';
 function agentTextMessage(sequenceId: number, text: string): Message {
   return {
+    event_presentation: null,
     message_id: `agent-${sequenceId}`,
     sequence_id: sequenceId,
     conversation_id: 'conv-1',

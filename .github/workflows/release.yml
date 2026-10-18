@@ -4,7 +4,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'prepare-main' && 'preparation' || 'release' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && (inputs.operation == 'prepare-main' || inputs.operation == 'prepare-incident-237100-arm64') && 'preparation' || 'release' }}
   cancel-in-progress: false
 
 on:
@@ -21,6 +21,7 @@ on:
         type: choice
         options:
           - prepare-main
+          - prepare-incident-237100-arm64
           - retry-release
       tag:
         description: Existing immutable release tag (retry-release only)
@@ -37,6 +38,7 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     outputs:
+      browser_cli: ${{ steps.capability.outputs.browser_cli }}
       preparation: ${{ steps.ver.outputs.preparation }}
       release: ${{ steps.ver.outputs.release }}
       create_tag: ${{ steps.ver.outputs.create_tag }}
@@ -44,6 +46,8 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       channel: ${{ steps.ver.outputs.channel }}
       commit: ${{ steps.ver.outputs.commit }}
+      macos_matrix: ${{ steps.macos.outputs.matrix }}
+      operation: ${{ steps.macos.outputs.operation }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -57,6 +61,14 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" = workflow_dispatch ]]; then
             case "$OPERATION" in
+              prepare-incident-237100-arm64)
+                [[ -z "$RETRY_TAG" ]] || {
+                  echo "Incident preparation does not accept a release tag" >&2
+                  exit 1
+                }
+                python3 scripts/incident_stapler_controller.py gate >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
               prepare-main)
                 [[ -z "$RETRY_TAG" ]] || {
                   echo "prepare-main does not accept a release tag" >&2
@@ -154,6 +166,35 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Select protected macOS architecture matrix
+        id: macos
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo "operation=$OPERATION" >> "$GITHUB_OUTPUT"
+          else
+            echo "operation=" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$OPERATION" == prepare-incident-237100-arm64 ]]; then
+            echo 'matrix={"include":[{"runner":"macos-15","target":"aarch64-apple-darwin","asset":"phoenix_ide-aarch64-apple-darwin"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix={"include":[{"runner":"macos-15","target":"aarch64-apple-darwin","asset":"phoenix_ide-aarch64-apple-darwin"},{"runner":"macos-15-intel","target":"x86_64-apple-darwin","asset":"phoenix_ide-x86_64-apple-darwin"}]}' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve browser CLI from immutable source
+        id: capability
+        env:
+          SOURCE_COMMIT: ${{ steps.ver.outputs.commit }}
+          RELEASE: ${{ steps.ver.outputs.release }}
+        run: |
+          browser_cli=false
+          if [[ "$RELEASE" == true ]] && git cat-file -e "$SOURCE_COMMIT:crates/phoenix-tools/src/bin/phoenix-browser.rs" 2>/dev/null; then
+            browser_cli=true
+          fi
+          echo "browser_cli=$browser_cli" >> "$GITHUB_OUTPUT"
+
   tag-release:
     needs: gate
     if: needs.gate.outputs.create_tag == 'true'
@@ -228,24 +269,34 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
           CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+      - name: Build and smoke native Linux browser CLI
+        if: needs.gate.outputs.browser_cli == 'true'
+        run: |
+          cargo build --locked -p phoenix-tools --bin phoenix-browser --profile release-min --target "${{ matrix.target }}"
+          browser="target/${{ matrix.target }}/release-min/phoenix-browser"
+          case "${{ matrix.target }}" in
+            x86_64-*) file "$browser" | grep -E 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' ;;
+            aarch64-*) file "$browser" | grep -E 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)' ;;
+          esac
+          "$browser" --help
+          "$browser" --json schema snapshot
+          cp "$browser" "phoenix-browser-${{ matrix.target }}"
+        env:
+          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ matrix.target }}-release-assets
-          path: phoenix_ide-${{ matrix.target }}*
+          path: |
+            phoenix_ide-${{ matrix.target }}*
+            phoenix-browser-${{ matrix.target }}
 
   build-macos:
     environment: macos-release-signing
     needs: [gate, tag-release]
     if: ${{ !cancelled() && needs.gate.result == 'success' && (needs.gate.outputs.preparation == 'true' || (needs.gate.outputs.release == 'true' && (needs.tag-release.result == 'success' || needs.tag-release.result == 'skipped'))) }}
     strategy:
-      matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            asset: phoenix_ide-aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: phoenix_ide-x86_64-apple-darwin
+      matrix: ${{ fromJSON(needs.gate.outputs.macos_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -275,7 +326,25 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release-assets"
           cargo build --profile release-min --features phoenix_ide/datadog-tracing --target "${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release-min/phoenix_ide" "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
+      - name: Build native macOS browser CLI
+        if: needs.gate.outputs.release == 'true' && needs.gate.outputs.browser_cli == 'true'
+        run: |
+          cargo build --locked -p phoenix-tools --bin phoenix-browser --profile release-min --target "${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release-min/phoenix-browser" "$RUNNER_TEMP/release-assets/phoenix-browser-${{ matrix.target }}"
+      - name: Materialize exact incident packaging controller outside candidate source
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'prepare-incident-237100-arm64'
+        env:
+          CONTROLLER_COMMIT: ${{ github.sha }}
+        run: |
+          umask 077
+          test "$(git rev-parse HEAD)" = '237100c79d9ce672867b284167a099fa0b7a2bcf'
+          test -z "$(git status --porcelain)"
+          git show "$CONTROLLER_COMMIT:scripts/incident_stapler_controller.py" > "$RUNNER_TEMP/incident_stapler_controller.py"
+          python3 "$RUNNER_TEMP/incident_stapler_controller.py" gate > "$RUNNER_TEMP/incident-gate.txt"
+          python3 "$RUNNER_TEMP/incident_stapler_controller.py" write-wrapper "$RUNNER_TEMP/incident-xcrun"
+          test -z "$(git status --porcelain)"
       - name: Sign, verify, notarize, and package protected macOS assets
+        timeout-minutes: ${{ needs.gate.outputs.operation == 'prepare-incident-237100-arm64' && 30 || 360 }}
         env:
           DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
           DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
@@ -322,11 +391,19 @@ jobs:
           codesign --force --sign "$MACOS_SIGNING_IDENTITY" --options runtime --timestamp "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
           codesign --verify --strict --verbose=2 "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
           export MACOS_SIGNING_IDENTITY APPLE_TEAM_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_API_KEY_PATH
+          if [[ "${{ needs.gate.outputs.release }}" == true && "${{ needs.gate.outputs.browser_cli }}" == true ]]; then
+            bash scripts/sign-notarize-browser-cli.sh \
+              "$RUNNER_TEMP/release-assets/phoenix-browser-${{ matrix.target }}" "${{ matrix.target }}"
+          fi
           receipt_args=()
           if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
             receipt_args+=("$RUNNER_TEMP/release-assets/PREPARATION-RECEIPT-${{ matrix.target }}.json")
           fi
-          macos/Phoenix/scripts/package-desktop-release.sh \
+          package_env=()
+          if [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.operation }}" == prepare-incident-237100-arm64 ]]; then
+            package_env=(env "XCRUN=$RUNNER_TEMP/incident-xcrun")
+          fi
+          "${package_env[@]}" macos/Phoenix/scripts/package-desktop-release.sh \
             "$RUNNER_TEMP/release-assets/${{ matrix.asset }}" \
             "${{ matrix.target }}" \
             "v${{ needs.gate.outputs.version }}" \
@@ -367,6 +444,11 @@ jobs:
           receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
           fi
+      - name: Record separate incident controller provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'prepare-incident-237100-arm64'
+        run: |
+          python3 "$RUNNER_TEMP/incident_stapler_controller.py" provenance \
+            > "$RUNNER_TEMP/release-assets/INCIDENT-CONTROLLER-PROVENANCE-aarch64-apple-darwin.json"
       - name: Remove protected material
         if: always()
         run: |
@@ -378,6 +460,8 @@ jobs:
             security delete-keychain "$KEYCHAIN_PATH" || cleanup_failed=1
           fi
           rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/phoenix-notary-api-key.p8" || cleanup_failed=1
+          rm -rf "$RUNNER_TEMP"/phoenix-browser-notary.* || cleanup_failed=1
+          rm -f "$RUNNER_TEMP/incident-xcrun" "$RUNNER_TEMP/incident_stapler_controller.py" "$RUNNER_TEMP/incident-gate.txt" || cleanup_failed=1
           [[ ! -e "$KEYCHAIN_PATH" ]]
           [[ ! -e "$RUNNER_TEMP/developer-id.p12" ]]
           [[ ! -e "$RUNNER_TEMP/phoenix-notary-api-key.p8" ]]
@@ -444,6 +528,7 @@ jobs:
           name: macos-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/release-assets/${{ matrix.asset }}
+            ${{ runner.temp }}/release-assets/phoenix-browser-${{ matrix.target }}
             ${{ runner.temp }}/release-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -488,6 +573,14 @@ jobs:
             Phoenix-macos-x86_64-apple-darwin-${{ needs.gate.outputs.tag }}.zip
             Phoenix-macos-aarch64-apple-darwin-${{ needs.gate.outputs.tag }}.zip
           )
+          if [[ "${{ needs.gate.outputs.browser_cli }}" == true ]]; then
+            required+=(
+              phoenix-browser-x86_64-unknown-linux-musl
+              phoenix-browser-aarch64-unknown-linux-musl
+              phoenix-browser-x86_64-apple-darwin
+              phoenix-browser-aarch64-apple-darwin
+            )
+          fi
           for asset in "${required[@]}"; do
             test -f "$asset" || { echo "missing required release asset: $asset"; exit 1; }
           done

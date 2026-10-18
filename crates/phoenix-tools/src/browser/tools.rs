@@ -9,8 +9,11 @@
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, RemoteObjectType};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    EvaluateParams, ExceptionDetails, RemoteObjectSubtype, RemoteObjectType,
+};
 use chromiumoxide::page::ScreenshotParams;
+use phoenix_browser::snapshot::BrowserTarget;
 use phoenix_browser::BrowserSession;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,7 +22,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Parse duration from string like "15s", "1m", "500ms"
-fn parse_duration(s: &str) -> Option<Duration> {
+#[must_use]
+pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if let Some(ms) = s.strip_suffix("ms") {
         ms.trim().parse().ok().map(Duration::from_millis)
@@ -29,7 +33,8 @@ fn parse_duration(s: &str) -> Option<Duration> {
         m.trim()
             .parse::<u64>()
             .ok()
-            .map(|m| Duration::from_secs(m * 60))
+            .and_then(|m| m.checked_mul(60))
+            .map(Duration::from_secs)
     } else {
         s.parse().ok().map(Duration::from_secs)
     }
@@ -96,7 +101,7 @@ impl Tool for BrowserNavigateTool {
     }
 
     fn description(&self) -> String {
-        "Navigate the browser to a URL and wait for the page to load. The browser session persists across tool calls — cookies, JS state, and DOM are preserved until the conversation ends. Call this before any other browser interaction with a new URL. Prefer browser tools over bash curl/wget when you need a rendered page or JS-driven content.".to_string()
+        "Navigate the browser to a URL and wait for the page to load. Opening the current URL reloads the document; fragment navigation follows native browser behavior. Cookies and origin storage persist across calls, while full navigation replaces the page DOM and JavaScript state. Call this before interacting with a new URL. Prefer browser tools over bash curl/wget when you need a rendered page or JS-driven content.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -117,6 +122,15 @@ impl Tool for BrowserNavigateTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserNavigateTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: NavigateInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -129,7 +143,7 @@ impl Tool for BrowserNavigateTool {
             .unwrap_or(DEFAULT_TIMEOUT);
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -141,12 +155,12 @@ impl Tool for BrowserNavigateTool {
         let result = operation_phase(
             BrowserOperationPhase::Navigation,
             timeout,
-            guard.page.goto(&input.url),
+            guard.navigate(&input.url),
         )
         .await;
 
         match result {
-            Ok(Ok(_)) => {
+            Ok(Ok(())) => {
                 // Detect React and enrich the navigate result with __phoenix hints
                 let react_info = match operation_phase(
                     BrowserOperationPhase::Evaluation,
@@ -167,7 +181,7 @@ impl Tool for BrowserNavigateTool {
                     ToolOutput::success(format!("done\n\n{react_info}"))
                 }
             }
-            Ok(Err(e)) => ToolOutput::error(format!("Navigation failed: {e}")),
+            Ok(Err(e)) => ToolOutput::error(e.to_string()),
             Err(error) => ToolOutput::error(error),
         }
     }
@@ -224,92 +238,266 @@ impl Tool for BrowserEvalTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        let input: EvalInput = match serde_json::from_value(input) {
-            Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
-        };
+        Self::run_browser(input, &ctx).await
+    }
+}
 
+/// The value produced by one JavaScript evaluation, before harness-specific rendering.
+#[derive(Debug)]
+pub enum BrowserEvaluation {
+    Json(Value),
+    Undefined,
+    Unserializable(String),
+    JsonArtifact(SavedEvaluationArtifact),
+    UnserializableArtifact(SavedEvaluationArtifact),
+}
+
+/// A result artifact successfully written by the evaluator.
+#[derive(Debug)]
+pub struct SavedEvaluationArtifact(String);
+
+impl SavedEvaluationArtifact {
+    #[must_use]
+    pub fn into_path(self) -> String {
+        self.0
+    }
+}
+
+impl BrowserEvaluation {
+    fn into_tool_output(self) -> ToolOutput {
+        let text = match self {
+            Self::Json(value) => {
+                serde_json::to_string_pretty(&value).expect("JSON values serialize")
+            }
+            Self::Undefined => "undefined".into(),
+            Self::Unserializable(value) => value,
+            Self::JsonArtifact(artifact) | Self::UnserializableArtifact(artifact) => {
+                let path = artifact.into_path();
+                return ToolOutput::success(format!(
+                    "Output written to {path} (use `cat` to view)"
+                ))
+                .with_display(json!({"artifact_path": path}));
+            }
+        };
+        ToolOutput::success(format!("<javascript_result>{text}</javascript_result>"))
+    }
+}
+
+async fn save_evaluation_output(
+    text: &str,
+    extension: &str,
+) -> Result<SavedEvaluationArtifact, String> {
+    let path = format!(
+        "/tmp/phoenix-js-result-{}.{extension}",
+        uuid::Uuid::new_v4()
+    );
+    tokio::fs::write(&path, text)
+        .await
+        .map_err(|error| format!("Failed to write large output: {error}"))?;
+    Ok(SavedEvaluationArtifact(path))
+}
+
+/// An evaluation failure retaining the browser's exception context until rendering.
+#[derive(Debug)]
+pub enum BrowserEvaluationError {
+    Javascript(Box<ExceptionDetails>),
+    Message(String),
+}
+
+impl From<String> for BrowserEvaluationError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl std::error::Error for BrowserEvaluationError {}
+
+fn concise_line(text: &str, max_bytes: usize) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    phoenix_browser::truncate_unicode_safe(line, max_bytes)
+}
+
+fn exception_description(description: &str) -> String {
+    description
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with("at "))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl std::fmt::Display for BrowserEvaluationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let details = match self {
+            Self::Javascript(details) => details,
+            Self::Message(message) => return formatter.write_str(message),
+        };
+        let message = details.exception.as_ref().map_or_else(
+            || details.text.clone(),
+            |object| {
+                if let Some(value) = &object.unserializable_value {
+                    return value.inner().clone();
+                }
+                if object.subtype == Some(RemoteObjectSubtype::Null) {
+                    return "null".into();
+                }
+                if let (Some(RemoteObjectSubtype::Error), Some(description)) =
+                    (&object.subtype, &object.description)
+                {
+                    return exception_description(description);
+                }
+                if let Some(value) = &object.value {
+                    return value.to_string();
+                }
+                if object.r#type == RemoteObjectType::Undefined {
+                    return "undefined".into();
+                }
+                object.description.as_ref().map_or_else(
+                    || details.text.clone(),
+                    |description| exception_description(description),
+                )
+            },
+        );
+        let frame = details
+            .stack_trace
+            .as_ref()
+            .and_then(|trace| trace.call_frames.first());
+        let url = frame
+            .map(|frame| frame.url.as_str())
+            .filter(|url| !url.is_empty())
+            .or(details.url.as_deref().filter(|url| !url.is_empty()))
+            .unwrap_or("<eval>");
+        let line = frame.map_or(details.line_number, |frame| frame.line_number);
+        let column = frame.map_or(details.column_number, |frame| frame.column_number);
+        let location = concise_line(url, 120);
+        let location = if line >= 0 && column >= 0 {
+            format!(
+                "{location}:{}:{}",
+                line.saturating_add(1),
+                column.saturating_add(1)
+            )
+        } else {
+            location
+        };
+        write!(
+            formatter,
+            "JavaScript error: {} ({location})",
+            concise_line(&message, 300)
+        )
+    }
+}
+
+impl BrowserEvaluationError {
+    #[must_use]
+    pub fn exception(&self) -> Option<&ExceptionDetails> {
+        match self {
+            Self::Javascript(details) => Some(details),
+            Self::Message(_) => None,
+        }
+    }
+
+    fn into_tool_output(self) -> ToolOutput {
+        let output = ToolOutput::error(self.to_string());
+        match self {
+            Self::Javascript(details) => output.with_display(json!(details)),
+            Self::Message(_) => output,
+        }
+    }
+}
+
+impl BrowserEvalTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
+        match Self::evaluate(input, access).await {
+            Ok(value) => value.into_tool_output(),
+            Err(error) => error.into_tool_output(),
+        }
+    }
+
+    /// Evaluate once and retain the JavaScript value's type for the calling harness.
+    ///
+    /// # Errors
+    /// Returns input, browser, evaluation, or output-file errors.
+    pub async fn evaluate(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> Result<BrowserEvaluation, BrowserEvaluationError> {
+        let input: EvalInput =
+            serde_json::from_value(input).map_err(|error| format!("Invalid input: {error}"))?;
         let timeout = input
             .timeout
             .as_deref()
             .and_then(parse_duration)
             .unwrap_or(DEFAULT_TIMEOUT);
-
-        // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
-            Ok(s) => s,
-            Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
-        };
-
+        let session = access
+            .browser()
+            .await
+            .map_err(|error| format!("Failed to get browser: {error}"))?;
         let mut guard = session.write().await;
         guard.last_activity = std::time::Instant::now();
-
-        // Evaluate JavaScript with timeout.
-        // Use EvaluateParams directly instead of wrapping in an async IIFE —
-        // the IIFE approach returns a Promise that CDP must await AND serialize,
-        // which may silently fail on complex pages. Direct evaluation with
-        // await_promise set via CDP is more reliable and explicit.
         let params = EvaluateParams::builder()
             .expression(&input.expression)
             .await_promise(input.r#await)
             .build()
-            .unwrap();
-
+            .map_err(|error| format!("Invalid evaluation parameters: {error}"))?;
         let result = operation_phase(
             BrowserOperationPhase::Evaluation,
             timeout,
             guard.page.evaluate(params),
         )
-        .await;
-
-        match result {
-            Ok(Ok(eval_result)) => {
-                let json_str = if let Some(v) = eval_result.value() {
-                    serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".to_string())
-                } else {
-                    // Log the full RemoteObject so we can diagnose why value is None
-                    let obj = eval_result.object();
-                    tracing::warn!(
-                        r#type = ?obj.r#type,
-                        subtype = ?obj.subtype,
-                        class_name = ?obj.class_name,
-                        description = ?obj.description,
-                        has_object_id = obj.object_id.is_some(),
-                        expression = %input.expression,
-                        await_mode = input.r#await,
-                        "browser_eval: value() returned None"
-                    );
-                    if obj.r#type == RemoteObjectType::Function {
-                        return ToolOutput::error(format!(
-                            "Expression evaluated to a function object, not a value. \
-                             The expression `{}` defines a function but does not call it. \
-                             To get a value, either write the expression directly \
-                             (e.g. `typeof window.__phoenix`) or wrap it as an IIFE \
-                             (e.g. `(() => typeof window.__phoenix)()`). \
-                             Playwright-style `() => expr` syntax does not work with browser_eval.",
-                            input.expression
-                        ));
-                    }
-                    "undefined".to_string()
-                };
-
-                // Check if output is large
-                if json_str.len() > 4096 {
-                    // Write to temp file
-                    let path = format!("/tmp/phoenix-js-result-{}.json", uuid::Uuid::new_v4());
-                    if let Err(e) = tokio::fs::write(&path, &json_str).await {
-                        return ToolOutput::error(format!("Failed to write large output: {e}"));
-                    }
-                    ToolOutput::success(format!("Output written to {path} (use `cat` to view)"))
-                } else {
-                    ToolOutput::success(format!(
-                        "<javascript_result>{json_str}</javascript_result>"
-                    ))
-                }
+        .await?
+        .map_err(|error| {
+            if let chromiumoxide::error::CdpError::JavascriptException(details) = error {
+                BrowserEvaluationError::Javascript(details)
+            } else {
+                BrowserEvaluationError::Message(format!("JavaScript error: {error}"))
             }
-            Ok(Err(e)) => ToolOutput::error(format!("JavaScript error: {e}")),
-            Err(error) => ToolOutput::error(error),
+        })?;
+        let object = result.object();
+        if object.r#type == RemoteObjectType::Function {
+            return Err(format!(
+                "Expression evaluated to a function object, not a value. \
+                 The expression `{}` defines a function but does not call it. \
+                 To get a value, either write the expression directly \
+                 (e.g. `typeof window.__phoenix`) or wrap it as an IIFE \
+                 (e.g. `(() => typeof window.__phoenix)()`). \
+                 Playwright-style `() => expr` syntax does not work with browser_eval.",
+                input.expression
+            )
+            .into());
         }
+        if let Some(value) = &object.unserializable_value {
+            let text = value.inner().clone();
+            return if text.len() > 4096 {
+                Ok(BrowserEvaluation::UnserializableArtifact(
+                    save_evaluation_output(&text, "txt").await?,
+                ))
+            } else {
+                Ok(BrowserEvaluation::Unserializable(text))
+            };
+        }
+        if let Some(value) = result.value() {
+            let text = serde_json::to_string_pretty(value)
+                .map_err(|error| format!("Failed to serialize JavaScript result: {error}"))?;
+            if text.len() > 4096 {
+                return Ok(BrowserEvaluation::JsonArtifact(
+                    save_evaluation_output(&text, "json").await?,
+                ));
+            }
+            return Ok(BrowserEvaluation::Json(value.clone()));
+        }
+        if object.subtype == Some(RemoteObjectSubtype::Null) {
+            return Ok(BrowserEvaluation::Json(Value::Null));
+        }
+        if object.r#type == RemoteObjectType::Undefined {
+            return Ok(BrowserEvaluation::Undefined);
+        }
+        Err(format!(
+            "JavaScript result cannot be represented as JSON: {:?}",
+            object.r#type
+        )
+        .into())
     }
 }
 
@@ -318,7 +506,35 @@ impl Tool for BrowserEvalTool {
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
+#[serde(try_from = "String")]
+struct ScreenshotPath(String);
+
+impl TryFrom<String> for ScreenshotPath {
+    type Error = String;
+
+    fn try_from(path: String) -> Result<Self, Self::Error> {
+        if path.is_empty() || path.contains('\0') || !std::path::Path::new(&path).is_absolute() {
+            return Err(
+                "screenshot path must be a nonempty absolute path without NUL bytes".into(),
+            );
+        }
+        Ok(Self(path))
+    }
+}
+
+impl ScreenshotPath {
+    fn temporary() -> Self {
+        Self(format!(
+            "/tmp/phoenix-screenshot-{}.png",
+            uuid::Uuid::new_v4()
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct ScreenshotInput {
+    #[serde(default)]
+    path: Option<ScreenshotPath>,
     #[serde(default)]
     selector: Option<String>,
     #[serde(default)]
@@ -339,13 +555,17 @@ impl Tool for BrowserTakeScreenshotTool {
     }
 
     fn description(&self) -> String {
-        "Capture a screenshot of the current page or a specific element. The image is saved to a temp file path returned in the result. To view the screenshot content yourself, follow up with read_image on that path.".to_string()
+        "Capture a screenshot of the current page or a specific element. The PNG image is saved to the optional absolute path (overwriting an existing regular file) or a generated temp path returned in the result. To view the screenshot content yourself, follow up with read_image on that path.".to_string()
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute output file path. Existing regular files are overwritten; the parent directory must exist. Defaults to a generated temp PNG."
+                },
                 "selector": {
                     "type": "string",
                     "description": "CSS selector for the element to screenshot (optional)"
@@ -359,6 +579,33 @@ impl Tool for BrowserTakeScreenshotTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+async fn save_screenshot(path: &ScreenshotPath, png: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options.open(&path.0).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "screenshot output must be a regular file",
+        ));
+    }
+    file.set_len(0).await?;
+    file.write_all(png).await?;
+    file.flush().await
+}
+
+impl BrowserTakeScreenshotTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: ScreenshotInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -371,7 +618,7 @@ impl Tool for BrowserTakeScreenshotTool {
             .unwrap_or(DEFAULT_TIMEOUT);
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -409,13 +656,14 @@ impl Tool for BrowserTakeScreenshotTool {
 
         match result {
             Ok(Ok(png_data)) => {
-                // Save to file
-                let filename = format!("phoenix-screenshot-{}.png", uuid::Uuid::new_v4());
-                let path = format!("/tmp/{filename}");
-
-                if let Err(e) = tokio::fs::write(&path, &png_data).await {
-                    return ToolOutput::error(format!("Failed to save screenshot: {e}"));
+                let path = input.path.unwrap_or_else(ScreenshotPath::temporary);
+                if let Err(error) = save_screenshot(&path, &png_data).await {
+                    return ToolOutput::error(format!(
+                        "Failed to save screenshot to {}: {error}",
+                        path.0
+                    ));
                 }
+                let path = path.0;
 
                 // Carry the base64 payload via the typed `images` channel so it
                 // reaches the LLM. `display_data` is UI-only and is never threaded
@@ -424,12 +672,12 @@ impl Tool for BrowserTakeScreenshotTool {
                 let base64_data =
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
 
-                ToolOutput::success(format!("Screenshot taken (saved as {path})")).with_images(
-                    vec![crate::ToolImage {
+                ToolOutput::success(format!("Screenshot taken (saved as {path})"))
+                    .with_display(json!({"artifact_path": path}))
+                    .with_images(vec![crate::ToolImage {
                         media_type: "image/png".to_string(),
                         data: base64_data,
-                    }],
-                )
+                    }])
             }
             Ok(Err(e)) => ToolOutput::error(format!("Screenshot failed: {e}")),
             Err(_) => ToolOutput::error(format!("Timeout after {timeout:?}")),
@@ -486,13 +734,22 @@ impl Tool for BrowserRecentConsoleLogsTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserRecentConsoleLogsTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: ConsoleLogsInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -537,6 +794,7 @@ impl Tool for BrowserRecentConsoleLogsTool {
                 return ToolOutput::error(format!("Failed to write logs: {e}"));
             }
             ToolOutput::success(format!("Logs written to {path} (use `cat` to view)"))
+                .with_display(json!({"artifact_path": path}))
         } else {
             ToolOutput::success(json_str)
         }
@@ -566,9 +824,18 @@ impl Tool for BrowserClearConsoleLogsTool {
         })
     }
 
-    async fn run(&self, _input: Value, ctx: ToolContext) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserClearConsoleLogsTool {
+    pub(super) async fn run_browser(
+        _input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -631,6 +898,15 @@ impl Tool for BrowserResizeTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserResizeTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 
         let input: ResizeInput = match serde_json::from_value(input) {
@@ -649,7 +925,7 @@ impl Tool for BrowserResizeTool {
             .unwrap_or(DEFAULT_TIMEOUT);
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -736,6 +1012,15 @@ impl Tool for BrowserWaitForSelectorTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserWaitForSelectorTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: WaitForSelectorInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -748,7 +1033,7 @@ impl Tool for BrowserWaitForSelectorTool {
             .unwrap_or(Duration::from_secs(30));
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
@@ -844,8 +1129,8 @@ impl Tool for BrowserWaitForSelectorTool {
 
 #[derive(Debug, Deserialize)]
 struct ClickInput {
-    /// CSS selector for element to click
-    selector: String,
+    #[serde(flatten)]
+    target: BrowserTarget,
     /// If true, wait for element to appear before clicking (default: false)
     #[serde(default)]
     wait: bool,
@@ -863,7 +1148,7 @@ impl Tool for BrowserClickTool {
     }
 
     fn description(&self) -> String {
-        "Click an element by CSS selector using CDP-level mouse events. Prefer this over browser_eval for clicks — CDP events reliably trigger React/Vue/Angular handlers. Set wait:true to automatically wait for the element to appear before clicking.".to_string()
+        "Click using CDP mouse events. Provide exactly one of selector (CSS) or ref (from browser_snapshot). Set wait:true to wait for a selector. A stale ref requires a new snapshot and is never retargeted.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -874,6 +1159,7 @@ impl Tool for BrowserClickTool {
                     "type": "string",
                     "description": "CSS selector for the element to click"
                 },
+                "ref": {"type":"string", "description":"Opaque element ref from browser_snapshot; alternative to selector."},
                 "wait": {
                     "type": "boolean",
                     "description": "If true, wait for element to appear before clicking (default: false)"
@@ -882,12 +1168,20 @@ impl Tool for BrowserClickTool {
                     "type": "string",
                     "description": "Timeout for waiting (default: 30s)"
                 }
-            },
-            "required": ["selector"]
+            }
         })
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserClickTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: ClickInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -900,18 +1194,34 @@ impl Tool for BrowserClickTool {
             .unwrap_or(Duration::from_secs(30));
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
 
-        let guard = session.read().await;
+        let mut guard = session.write().await;
+        guard.last_activity = std::time::Instant::now();
+        let selector = match &input.target {
+            BrowserTarget::Selector(selector) => selector,
+            BrowserTarget::Reference(reference) => {
+                let result = tokio::time::timeout(timeout, guard.click_reference(reference)).await;
+                guard.last_activity = std::time::Instant::now();
+                return match result {
+                    Ok(Ok(())) => ToolOutput::success(format!("Clicked {reference}")),
+                    Ok(Err(error)) => ToolOutput::error(error.to_string()),
+                    Err(_) => ToolOutput::error(format!(
+                        "Reference click timed out after {timeout:?}; the click may already have happened. Inspect page state before retrying; do not blindly replay the click. Take a new browser_snapshot for fresh refs."
+                    )),
+                };
+            }
+        };
 
+        let _input = guard.lock_native_input().await;
         // Optionally wait for element
         if input.wait {
             let check_script = format!(
                 "document.querySelector({}) !== null",
-                serde_json::to_string(&input.selector).unwrap()
+                serde_json::to_string(selector).unwrap()
             );
             let poll_interval = Duration::from_millis(100);
             let start = std::time::Instant::now();
@@ -931,36 +1241,29 @@ impl Tool for BrowserClickTool {
                     }
                     Err(_) => {
                         return ToolOutput::error(format!(
-                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{}'",
-                            input.selector
+                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{selector}'"
                         ));
                     }
                     _ => {}
                 }
                 if start.elapsed() >= timeout {
-                    return ToolOutput::error(format!(
-                        "Timeout waiting for element '{}'",
-                        input.selector
-                    ));
+                    return ToolOutput::error(format!("Timeout waiting for element '{selector}'"));
                 }
                 tokio::time::sleep(poll_interval).await;
             }
         }
 
         // Find the element
-        let element = match guard.page.find_element(&input.selector).await {
+        let element = match guard.page.find_element(selector).await {
             Ok(el) => el,
             Err(e) => {
-                return ToolOutput::error(format!(
-                    "Could not find element '{}': {}",
-                    input.selector, e
-                ));
+                return ToolOutput::error(format!("Could not find element '{selector}': {e}"));
             }
         };
 
         // Click using CDP (works with React, Vue, etc.)
         match element.click().await {
-            Ok(_) => ToolOutput::success(format!("Clicked element '{}'", input.selector)),
+            Ok(_) => ToolOutput::success(format!("Clicked element '{selector}'")),
             Err(e) => ToolOutput::error(format!("Click failed: {e}")),
         }
     }
@@ -972,8 +1275,8 @@ impl Tool for BrowserClickTool {
 
 #[derive(Debug, Deserialize)]
 struct TypeInput {
-    /// CSS selector for input element
-    selector: String,
+    #[serde(flatten)]
+    target: BrowserTarget,
     /// Text to type
     text: String,
     /// If true, clear existing text before typing (default: false)
@@ -1032,7 +1335,7 @@ impl Tool for BrowserTypeTool {
     }
 
     fn description(&self) -> String {
-        "Type text into an input element using CDP-level keyboard events. Prefer this over browser_eval for form input — CDP events fire the key events that React/Vue/Angular listen to. Set clear:true to replace existing text instead of appending.".to_string()
+        "Type text using CDP keyboard input. Provide exactly one of selector (CSS) or ref (from browser_snapshot). Set clear:true to replace existing text instead of appending. Stale refs require a new snapshot.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -1043,6 +1346,7 @@ impl Tool for BrowserTypeTool {
                     "type": "string",
                     "description": "CSS selector for the input element"
                 },
+                "ref": {"type":"string", "description":"Opaque element ref from browser_snapshot; alternative to selector."},
                 "text": {
                     "type": "string",
                     "description": "Text to type into the element"
@@ -1056,11 +1360,20 @@ impl Tool for BrowserTypeTool {
                     "description": "Timeout (default: 30s)"
                 }
             },
-            "required": ["selector", "text"]
+            "required": ["text"]
         })
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserTypeTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: TypeInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -1073,100 +1386,129 @@ impl Tool for BrowserTypeTool {
             .unwrap_or(Duration::from_secs(30));
 
         // Get browser session
-        let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+        let session: Arc<RwLock<BrowserSession>> = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
 
-        let guard = session.read().await;
-        let Some(deadline) = checked_deadline(timeout) else {
-            return ToolOutput::error(
-                "Invalid timeout: duration exceeds the supported deadline range",
-            );
-        };
-
-        let selector = serde_json::to_string(&input.selector).unwrap();
-        let element = match focus_element_until(&guard.page, &input.selector, deadline).await {
-            Ok(element) => element,
-            Err(message) => return ToolOutput::error(message),
-        };
-
-        // Clear existing text if requested
-        if input.clear {
-            match operation_phase(
-                BrowserOperationPhase::TypeClear,
-                deadline.saturating_duration_since(std::time::Instant::now()),
-                guard
-                    .page
-                    .evaluate(format!("document.querySelector({selector}).select()")),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return ToolOutput::error(format!("Failed to select text: {error}"));
-                }
-                Err(message) => return ToolOutput::error(message),
-            }
-            match operation_phase(
-                BrowserOperationPhase::TypeClear,
-                deadline.saturating_duration_since(std::time::Instant::now()),
-                element.press_key("Backspace"),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return ToolOutput::error(format!("Failed to clear text: {error}"));
-                }
-                Err(message) => return ToolOutput::error(message),
-            }
-        }
-
-        // Type the text using CDP keyboard events
-        // Handle newlines specially since type_str doesn't support them
-        let parts: Vec<&str> = input.text.split('\n').collect();
-        for (i, part) in parts.iter().enumerate() {
-            // Type the text part
-            if !part.is_empty() {
-                match operation_phase(
-                    BrowserOperationPhase::TypeInput,
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                    element.type_str(part),
+        let mut guard = session.write().await;
+        guard.last_activity = std::time::Instant::now();
+        let selector = match &input.target {
+            BrowserTarget::Selector(selector) => selector,
+            BrowserTarget::Reference(reference) => {
+                let result = tokio::time::timeout(
+                    timeout,
+                    guard.type_reference(reference, &input.text, input.clear),
                 )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return ToolOutput::error(format!("Type failed: {error}"));
-                    }
-                    Err(message) => return ToolOutput::error(message),
-                }
+                .await;
+                guard.last_activity = std::time::Instant::now();
+                return match result {
+                    Ok(Ok(())) => ToolOutput::success(format!(
+                        "Typed {} characters into {reference}",
+                        input.text.len()
+                    )),
+                    Ok(Err(error)) => ToolOutput::error(error.to_string()),
+                    Err(_) => ToolOutput::error(format!(
+                        "Reference typing timed out after {timeout:?}; focus, clearing, and partial text insertion may already have happened. Inspect the actual field value before retrying; do not append the full text blindly. Take a new browser_snapshot for fresh refs."
+                    )),
+                };
             }
-            // Add Enter between parts (not after last)
-            if i < parts.len() - 1 {
-                match operation_phase(
-                    BrowserOperationPhase::TypeInput,
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                    element.press_key("Enter"),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return ToolOutput::error(format!("Failed to press Enter: {error}"));
-                    }
-                    Err(message) => return ToolOutput::error(message),
-                }
-            }
-        }
-
-        ToolOutput::success(format!(
-            "Typed {} characters into '{}'",
-            input.text.len(),
-            input.selector
-        ))
+        };
+        let _input = guard.lock_native_input().await;
+        type_selector(&guard.page, selector, &input.text, input.clear, timeout).await
     }
+}
+
+async fn type_selector(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    text: &str,
+    clear: bool,
+    timeout: Duration,
+) -> ToolOutput {
+    let Some(deadline) = checked_deadline(timeout) else {
+        return ToolOutput::error("Invalid timeout: duration exceeds the supported deadline range");
+    };
+
+    let selector_json = serde_json::to_string(selector).unwrap();
+    let element = match focus_element_until(page, selector, deadline).await {
+        Ok(element) => element,
+        Err(message) => return ToolOutput::error(message),
+    };
+
+    // Clear existing text if requested
+    if clear {
+        match operation_phase(
+            BrowserOperationPhase::TypeClear,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            page.evaluate(format!("document.querySelector({selector_json}).select()")),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return ToolOutput::error(format!("Failed to select text: {error}"));
+            }
+            Err(message) => return ToolOutput::error(message),
+        }
+        match operation_phase(
+            BrowserOperationPhase::TypeClear,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            element.press_key("Backspace"),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return ToolOutput::error(format!("Failed to clear text: {error}"));
+            }
+            Err(message) => return ToolOutput::error(message),
+        }
+    }
+
+    // Type the text using CDP keyboard events
+    // Handle newlines specially since type_str doesn't support them
+    let parts: Vec<&str> = text.split('\n').collect();
+    for (i, part) in parts.iter().enumerate() {
+        // Type the text part
+        if !part.is_empty() {
+            match operation_phase(
+                BrowserOperationPhase::TypeInput,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.type_str(part),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Type failed: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
+            }
+        }
+        // Add Enter between parts (not after last)
+        if i < parts.len() - 1 {
+            match operation_phase(
+                BrowserOperationPhase::TypeInput,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.press_key("Enter"),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Failed to press Enter: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
+            }
+        }
+    }
+
+    ToolOutput::success(format!(
+        "Typed {} characters into '{}'",
+        text.len(),
+        selector
+    ))
 }
 
 // ============================================================================
@@ -1316,6 +1658,15 @@ impl Tool for BrowserKeyPressTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        Self::run_browser(input, &ctx).await
+    }
+}
+
+impl BrowserKeyPressTool {
+    pub(super) async fn run_browser(
+        input: Value,
+        access: &(impl super::BrowserAccess + ?Sized),
+    ) -> ToolOutput {
         let input: KeyPressInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -1341,12 +1692,13 @@ impl Tool for BrowserKeyPressTool {
             None
         };
 
-        let session = match ctx.browser().await {
+        let session = match access.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
         };
         let guard = session.read().await;
 
+        let _input = guard.lock_native_input().await;
         let chord = if input.modifiers.is_empty() {
             input.key.clone()
         } else {
@@ -1466,6 +1818,49 @@ async fn dispatch_key_cdp(
 #[cfg(test)]
 mod phase_tests {
     use super::*;
+
+    #[test]
+    fn evaluation_errors_are_concise_and_keep_full_browser_context() {
+        let details: ExceptionDetails = serde_json::from_value(json!({
+            "exceptionId":1,"text":"Uncaught","lineNumber":0,"columnNumber":6,
+            "exception":{"type":"object","subtype":"error","className":"TypeError","value":{},"description":"TypeError: first line\nsecond line\n    at fail (http://example.test/app.js:5:9)"},
+            "stackTrace":{"callFrames":[{"functionName":"fail","scriptId":"1","url":"http://example.test/app.js","lineNumber":4,"columnNumber":8}]}
+        })).unwrap();
+        let error = BrowserEvaluationError::Javascript(Box::new(details.clone()));
+        assert_eq!(
+            error.to_string(),
+            "JavaScript error: TypeError: first line second line (http://example.test/app.js:5:9)"
+        );
+        let output = error.into_tool_output();
+        assert_eq!(output.display_data(), Some(&json!(details)));
+        assert!(!output.output().contains("ExceptionDetails"));
+        let mut long = details.clone();
+        long.exception.as_mut().unwrap().description = Some(format!(
+            "Error: {}\nsecond line\n    at fail",
+            "界".repeat(1000)
+        ));
+        long.stack_trace.as_mut().unwrap().call_frames[0].url =
+            format!("data:text/javascript,{}", "界".repeat(1000));
+        let error = BrowserEvaluationError::Javascript(Box::new(long.clone()));
+        let summary = error.to_string();
+        assert!(summary.len() < 500, "{summary}");
+        assert!(summary.contains('…'));
+        assert!(!summary.contains('\n'));
+        assert_eq!(error.into_tool_output().display_data(), Some(&json!(long)));
+        let mut primitive = details;
+        primitive.stack_trace = None;
+        primitive.exception = Some(
+            serde_json::from_value(json!({"type":"object","subtype":"null","value":null})).unwrap(),
+        );
+        assert_eq!(
+            BrowserEvaluationError::Javascript(Box::new(primitive)).to_string(),
+            "JavaScript error: null (<eval>:1:7)"
+        );
+        let message =
+            BrowserEvaluationError::Message("existing transport error".into()).into_tool_output();
+        assert_eq!(message.output(), "existing transport error");
+        assert!(message.display_data().is_none());
+    }
 
     #[test]
     fn typing_deadline_rejects_unrepresentable_duration() {

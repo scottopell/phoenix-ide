@@ -11,6 +11,7 @@ function lifecycleSnapshot(
   return {
     product_conversation_id: 'product-alpha',
     close: null,
+    latest_opening: { status: 'none' },
     canonical_route: '/c/product-alpha',
     requested_transcript_row_id: 'row-root',
     canonical_root: { transcript_row_id: 'row-root', slug: 'root-slug', title: null },
@@ -33,11 +34,12 @@ function transcriptInit(rowId: string, transcriptCoverage: InitPayload['transcri
   return {
     conversation: makeConv('display-slug', { id: rowId }),
     messages: [{
+      event_presentation: null,
       message_id: 'current-message', conversation_id: rowId, sequence_id: 1,
       message_type: 'user', content: { text: 'Current transcript' },
       created_at: '2024-06-01T00:00:00Z',
     }],
-    steeringMessages: [],
+    opening: null, steeringMessages: [],
     phase: { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: 1,
@@ -376,10 +378,11 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     // Simulate live SSE state as if a ConversationPage had mounted.
     store.dispatch('alpha', { type: 'connection_opened', epoch: 1 });
     store.dispatch('alpha', {
-      type: 'sse_message',
+      type: 'sse_message', opening: null,
       epoch: 1,
       sequenceId: 1,
       message: {
+        event_presentation: null,
         message_id: 'msg-1',
         sequence_id: 1,
         conversation_id: 'conv-alpha',
@@ -452,6 +455,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
         updated_at: '2024-06-01T00:00:00Z',
       }),
       messages: [{
+        event_presentation: null,
         message_id: 'msg-1',
         sequence_id: 1,
         conversation_id: 'conv-shared',
@@ -647,6 +651,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
         updated_at: '2024-06-01T00:00:00Z',
       }),
       messages: [{
+        event_presentation: null,
         message_id: 'msg-1',
         sequence_id: 1,
         conversation_id: 'conv-shared',
@@ -888,6 +893,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
         updated_at: '2024-06-02T00:00:00Z',
       }),
       messages: [{
+        event_presentation: null,
         message_id: 'msg-1',
         sequence_id: 1,
         conversation_id: 'conv-new',
@@ -920,6 +926,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
         updated_at: '2024-06-01T00:00:00Z',
       }),
       messages: [{
+        event_presentation: null,
         message_id: 'msg-1',
         sequence_id: 1,
         conversation_id: 'conv-doomed',
@@ -1016,6 +1023,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
         updated_at: '2024-06-01T00:00:00Z',
       }),
       messages: [{
+        event_presentation: null,
         message_id: 'msg-1',
         sequence_id: 1,
         conversation_id: 'conv-1',

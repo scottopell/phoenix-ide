@@ -209,8 +209,76 @@ rule PhoenixApiCreationRecipe {
         -- staged active scoped Bash calls for discovery, UUID generation, POST,
         -- ambiguity reconciliation, and independent verification. Each shell
         -- call receives data through encoded literals; credentials stay out of
-        -- argv/output. Source inspection is a version-mismatch diagnostic, not
-        -- a normal API workflow.
+        -- argv/output. Recipes are non-exhaustive best practices, not an
+        -- endpoint allowlist. Other supported public APIs require inspected
+        -- current deployment/source contracts applicable to the destination
+        -- and user authority. Source inspection establishes contract facts,
+        -- not permission or proof that local source is deployed. Preserve
+        -- destination auth, transport, credentials, explicit active WorkScope,
+        -- immutable targets/intent, endpoint-specific idempotency, fresh reads
+        -- and server enforcement; never bypass with private handlers/DB writes.
+        -- Gap inventories are illustrative and qualified by inspected
+        -- deployment/source, not denylists. Permit verified supported
+        -- alternatives and bounded, deadline-limited state reads within user
+        -- authority. Never invent guarantees/receipts or create background
+        -- monitors to substitute for missing server semantics.
+}
+
+rule PhoenixApiDestinationAuthority {
+    when: CoordinatorDestinationApiActionAuthorized(action, work_scope_id)
+
+    requires: ActiveWorkScope(work_scope_id)
+
+    ensures: action.local_work_scope_authorizes_execution_only = true
+    ensures: action.destination_identity_is_authoritative = true
+    ensures: action.destination_authentication_is_authoritative = true
+    ensures: action.authentication_requires_unsatisfied_credential = false or action.destination_credential_is_bound_to_selected_destination = true
+    ensures: action.authentication_requires_unsatisfied_credential = false or action.destination_credential_is_nonserialized = true
+    ensures: action.authentication_requires_unsatisfied_credential = true or action.credential_is_sent = false
+    ensures: action.is_ambiguous_continue_retry = true or action.destination_target_and_state_are_current = true
+    ensures: action.is_ambiguous_continue_retry = false or action.continue_target_is_original_predecessor = true
+    ensures: action.is_ambiguous_continue_retry = false or action.continue_intent_is_exactly_reused = true
+    ensures: action.destination_is_nonlocal = false or action.nonlocal_transport_is_authenticated_and_encrypted = true
+    ensures: action.destination_is_nonlocal = false or action.api_executes_in_destination_context = true
+    ensures: action.local_curl_recipe_used_for_nonlocal_destination = false
+    ensures: action.consumes_destination_cwd = false or action.destination_cwd_is_authoritative = true
+    ensures: action.uses_local_message_tool_for_remote_destination = false
+    ensures: action.remote_continue_depends_on_federated_messaging = false
+
+    @guidance
+        -- Public literal chat uses existing POST /api/conversations/{id}/chat
+        -- with explicit expansion_policy: "literal_text". First require full
+        -- git_sha in complete GET /api/version JSON from the exact authenticated
+        -- verified-TLS destination without redirects, matching an independently
+        -- verified immutable supporting commit or source-inspected accepted
+        -- descendant; re-read immediately before use and every exact retry.
+        -- Unknown/malformed/mismatched receiver means stop before POST, no
+        -- expandable probe or default-policy fallback. Then confirm one harmless
+        -- "literal steering smoke test" on the authorized idle target with a
+        -- retained message ID and materialized bytes; HTTP success alone cannot
+        -- prove policy support. Pin original target/identity/intent for retries.
+        -- Preserve authority, admission and local-only send_conversation_message.
+        -- See ../api/requirements.md REQ-API-031; no live-replacement guarantee.
+        -- For a user-authorized question response, freshly resolve the target
+        -- and GET its exact transcript. Require awaiting_user_response and
+        -- the opaque current request_id, never the provider tool_use_id.
+        -- For every full question text, permit exact user-provided answers or
+        -- decisions made within explicit delegated decision scope; map to
+        -- exact option labels or authorized custom text. Generic inspect/unblock
+        -- instructions are not decision authority. Never fabricate approvals
+        -- or extend delegation; ask the user when authority is missing.
+        -- UI multiSelect is a comma-space
+        -- string. Require complete answers without claiming backend validation.
+        -- Re-read original identity/questions immediately before one POST to
+        -- /api/conversations/{id}/respond with request_id and answers, then
+        -- re-read that original transcript and answer evidence. Optional
+        -- annotations carry user notes; submitted preview is not consumed.
+        -- request_id guards freshness, not idempotency. An uncertain response
+        -- requires original-identity observation, never automatic replay,
+        -- successor retargeting or answer transplantation to a new request.
+        -- A 409 conflict is not success. API acceptance is not execution.
+        -- See ../ask-user-question/requirements.md REQ-AUQ-009 and
+        -- ../global-recall/requirements.md REQ-GR-007.
 }
 
 ------------------------------------------------------------

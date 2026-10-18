@@ -9,11 +9,13 @@ use phoenix_core::domain::tool_result_identity::{
 mod close_foundation;
 mod coordinator_query;
 mod coordinator_watches;
+mod coordinator_work_scope;
 mod federation_enrollment;
 mod federation_peers;
 pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
-    PendingWatchEvent, WatchEventRoute, WatchOutcome, WatchSnapshot,
+    PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
+    WatchSnapshot,
 };
 pub use federation_peers::{FederationPeerConnection, FederationPeerSelectionError};
 mod ddl;
@@ -77,6 +79,8 @@ pub(crate) use git_repository_reconciliation::{
 };
 pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
+    ContinuationOpeningEdge, ContinuationOpeningPresentation, ContinuationOpeningRead,
+    ContinuationOpeningUpdateRead, CoordinatorConversationSnapshotRead,
     ProductConversationAggregate, ProductConversationCloseAvailability,
     ProductConversationCloseUnavailableReason, ProductConversationHandoff,
     ProductConversationListLifecycle, ProductConversationListProjection,
@@ -216,6 +220,8 @@ impl std::error::Error for ProjectSeedIdError {}
 
 #[derive(Error, Debug)]
 pub enum DbError {
+    #[error("Coordinator WorkScope: {0}")]
+    CoordinatorWorkScope(String),
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("Conversation not found: {0}")]
@@ -228,6 +234,8 @@ pub enum DbError {
     MessageConflict(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
+    #[error("transcript changed during opening observation read")]
+    TranscriptSnapshotChanged,
     #[error("Serialization error: {0}")]
     Serialization(String),
     #[error("Continuation precondition failed: {0}")]
@@ -242,6 +250,8 @@ pub enum DbError {
     ),
     #[error("steering queue is full")]
     SteeringQueueFull,
+    #[error("product creation delivery claim was lost or is required")]
+    ProductCreationClaimLost,
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
     #[error("Close foundation latest transcript changed: expected {expected}, found {actual}")]
@@ -1945,6 +1955,7 @@ impl Database {
         context: EnvironmentContext,
         now: &str,
     ) -> DbResult<()> {
+        Self::reject_coordinator_scope_mutation_tx(tx, scope_id).await?;
         let (kind, cwd, worktree_path, branch_name, base_branch) =
             Self::environment_columns(context);
         let observed_fingerprint = worktree_path
@@ -2058,6 +2069,9 @@ impl Database {
                 branch_name,
                 base_branch,
             ),
+            EnvironmentContext::CoordinatorHome { cwd } => {
+                ("coordinator_home", Some(cwd), None, None, None)
+            }
             EnvironmentContext::UnownedCwd { cwd } => ("unowned_cwd", Some(cwd), None, None, None),
             EnvironmentContext::None => ("none", None, None, None, None),
         }
@@ -2243,6 +2257,18 @@ impl Database {
         }
         let scope_id = precondition.scope_id();
         let mut tx = self.pool.begin().await?;
+        let coordinator_owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_work_scope WHERE work_scope_id = ?1)",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if coordinator_owned {
+            tx.rollback().await?;
+            return Ok(WorkScopeRetirementOutcome::Blocked(
+                WorkScopeRetirementBlocker::CoordinatorOwned,
+            ));
+        }
         if let Some(attempt_id) = close_attempt_id {
             let authorized: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
@@ -4554,6 +4580,10 @@ impl Database {
     ) -> DbResult<Conversation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result: DbResult<String> = async {
+            let owned = Self::coordinator_work_scope_tx(&mut tx).await?;
+            if let Some(owned) = owned {
+                Self::reconcile_coordinator_work_scope_tx(&mut tx, &owned.work_scope_id).await?;
+            }
             if let Some(id) = sqlx::query_scalar(
                 "SELECT id FROM conversations WHERE coordinator_head = 1",
             )
@@ -4579,7 +4609,7 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
                 "INSERT INTO conversations (id, product_conversation_id, slug, title, coordinator_head, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
-                 VALUES (?1, ?8, ?2, 'Coordinator', 1, 0, ?3, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
+                 VALUES (?1, ?8, ?2, 'Coordinator', 1, 0, ?3, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', (SELECT work_scope_id FROM coordinator_work_scope WHERE singleton = 1))",
             )
             .bind(&id)
             .bind(slug)
@@ -4791,7 +4821,12 @@ impl Database {
               AND NOT (c.archived = 1 AND EXISTS (\
                   SELECT 1 FROM conversation_creation_jobs j \
                   WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-              ))",
+              )) \
+              AND NOT EXISTS (\
+                  SELECT 1 FROM product_creation_jobs product_job \
+                  WHERE product_job.product_conversation_id = c.product_conversation_id \
+                    AND product_job.status <> 'published'\
+              )",
         );
 
         let rows = query.build().fetch_all(&self.pool).await?;
@@ -4877,7 +4912,12 @@ impl Database {
                AND NOT (c.archived = 1 AND EXISTS (\
                    SELECT 1 FROM conversation_creation_jobs j \
                    WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-               ))",
+               )) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM product_creation_jobs product_job \
+                   WHERE product_job.product_conversation_id = c.product_conversation_id \
+                     AND product_job.status <> 'published'\
+               )",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -5138,6 +5178,11 @@ impl Database {
                AND NOT EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
                    WHERE j.conversation_id = c.id AND j.status <> 'ready'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM product_creation_jobs product_job
+                   WHERE product_job.product_conversation_id = c.product_conversation_id
+                     AND product_job.status <> 'published'
                )
              ORDER BY c.updated_at DESC",
         )
@@ -6957,24 +7002,24 @@ impl Database {
         Ok(exists != 0)
     }
 
-    /// Returns whether a successor is still waiting for its reserved opening.
-    ///
-    /// # Errors
-    /// Returns an error when the intent query fails.
-    pub async fn has_pending_continuation_opening(&self, successor_id: &str) -> DbResult<bool> {
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(
+    pub(crate) const PENDING_CONTINUATION_OPENING_SQL: &'static str = "SELECT EXISTS(
                  SELECT 1 FROM continuation_dispatch_intents AS intent
                  WHERE intent.successor_conversation_id = ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM completed_continuation_handoffs AS completed
                        WHERE completed.predecessor_conversation_id = intent.parent_conversation_id
                    )
-             )",
-        )
-        .bind(successor_id)
-        .fetch_one(&self.pool)
-        .await?;
+             )";
+
+    /// Returns whether a successor is still waiting for its reserved opening.
+    ///
+    /// # Errors
+    /// Returns an error when the intent query fails.
+    pub async fn has_pending_continuation_opening(&self, successor_id: &str) -> DbResult<bool> {
+        let pending: i64 = sqlx::query_scalar(Self::PENDING_CONTINUATION_OPENING_SQL)
+            .bind(successor_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(pending != 0)
     }
 
@@ -7508,6 +7553,17 @@ impl Database {
     ) -> DbResult<()> {
         let now = Utc::now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let staged: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM product_creation_jobs creation
+             JOIN conversations c ON c.product_conversation_id = creation.product_conversation_id
+             WHERE c.id = ?1 AND creation.status <> 'published')",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if staged {
+            return Err(DbError::ProductCreationClaimLost);
+        }
         require_product_conversation_admission_tx(&mut tx, id).await?;
         if queue.len() > MAX_STEERING_QUEUE_DEPTH {
             tx.rollback().await?;
@@ -7599,7 +7655,6 @@ impl Database {
         entry: &phoenix_core::domain::sm_event::SteerEntry,
         request_fingerprint: &str,
     ) -> DbResult<usize> {
-        let now = Utc::now();
         #[cfg(test)]
         if let Some(latch) = &self.steering_begin_test_latch {
             latch.before_begin.notify_waiters();
@@ -7607,14 +7662,41 @@ impl Database {
             latch.begin_called.notify_waiters();
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        require_product_conversation_admission_tx(&mut tx, id).await?;
+        let requires_claim: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM product_creation_jobs creation
+             JOIN conversations c ON c.product_conversation_id = creation.product_conversation_id
+             WHERE c.id = ?2
+               AND (creation.status <> 'published'
+                    OR (creation.published_conversation_id = c.id AND creation.request_id = ?1)))",
+        )
+        .bind(&entry.message_id)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if requires_claim {
+            return Err(DbError::ProductCreationClaimLost);
+        }
+        let position = self
+            .append_steering_entry_tx(&mut tx, id, entry, request_fingerprint)
+            .await?;
+        tx.commit().await?;
+        Ok(position)
+    }
+
+    async fn append_steering_entry_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
+    ) -> DbResult<usize> {
+        require_product_conversation_admission_tx(tx, id).await?;
 
         #[cfg(any(test, feature = "test-support"))]
         if self
             .steering_capacity_test_control
             .conversation_is_blocked(id)
         {
-            tx.rollback().await?;
             return Err(DbError::SteeringQueueFull);
         }
 
@@ -7624,13 +7706,12 @@ impl Database {
              WHERE conversation_id = ?1",
         )
         .bind(id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
         let queue_depth = usize::try_from(queue_position)
             .map_err(|_| DbError::Serialization("steering queue depth overflow".to_string()))?;
         if queue_depth >= MAX_STEERING_QUEUE_DEPTH {
-            tx.rollback().await?;
             return Err(DbError::SteeringQueueFull);
         }
 
@@ -7642,15 +7723,14 @@ impl Database {
         .bind(id)
         .bind(&entry.message_id)
         .bind(request_fingerprint)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        insert_steering_entry_tx(&mut tx, id, ordinal, entry).await?;
+        insert_steering_entry_tx(tx, id, ordinal, entry).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(now.to_rfc3339())
+            .bind(Utc::now().to_rfc3339())
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        tx.commit().await?;
 
         usize::try_from(queue_position)
             .map_err(|_| DbError::Serialization("steering queue position overflow".to_string()))
@@ -8382,6 +8462,7 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let cm = conv_mode_columns(mode);
         let mut tx = self.pool.begin().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut tx, id).await?;
         let row = sqlx::query(
             "SELECT c.work_scope_id AS work_scope_id, e.cwd
              FROM conversations c
@@ -8396,6 +8477,8 @@ impl Database {
         let cwd = new_cwd.unwrap_or(&persisted_cwd);
         let scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
             .map_err(|error| DbError::Serialization(error.to_string()))?;
+
+        Self::reject_coordinator_scope_mutation_tx(&mut tx, &scope_id).await?;
 
         let result = sqlx::query(
             "UPDATE conversations
@@ -8505,6 +8588,54 @@ impl Database {
         Ok(rows)
     }
 
+    /// Earliest ordinary user transcript attached to this exact persisted scope.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] when persisted lineage or ownership cannot be read.
+    pub async fn get_work_scope_legacy_conversation_id(
+        &self,
+        work_scope_id: &WorkScopeId,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "WITH RECURSIVE transcript(id, product_conversation_id, ordinal) AS (
+                 SELECT root.id, root.product_conversation_id, 0
+                 FROM product_conversation_work_scopes owner
+                 JOIN product_conversations product ON product.id = owner.product_conversation_id
+                 JOIN conversations root ON root.product_conversation_id = product.id
+                 WHERE owner.work_scope_id = ?1
+                   AND product.kind = 'ordinary'
+                   AND root.runtime_role = 'user'
+                   AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations predecessor
+                       WHERE predecessor.product_conversation_id = root.product_conversation_id
+                         AND predecessor.continued_in_conv_id = root.id
+                   )
+                 UNION ALL
+                 SELECT successor.id, successor.product_conversation_id, transcript.ordinal + 1
+                 FROM transcript
+                 JOIN conversations predecessor ON predecessor.id = transcript.id
+                 JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+                 WHERE successor.product_conversation_id = transcript.product_conversation_id
+                   AND successor.runtime_role = 'user'
+                   AND successor.parent_conversation_id IS NULL
+             )
+             SELECT conversation.id
+             FROM transcript
+             JOIN conversations conversation ON conversation.id = transcript.id
+             JOIN product_conversation_work_scopes owner
+               ON owner.work_scope_id = conversation.work_scope_id
+              AND owner.product_conversation_id = conversation.product_conversation_id
+             WHERE conversation.work_scope_id = ?1
+             ORDER BY transcript.ordinal, conversation.id
+             LIMIT 1",
+        )
+        .bind(work_scope_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// List conversations that share one persisted work-scope identity.
     ///
     /// # Errors
@@ -8553,6 +8684,8 @@ impl Database {
             );
         }
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut tx, id).await?;
         let result = sqlx::query(
             "UPDATE work_scopes
              SET cwd = ?1, updated_at = ?2
@@ -8561,11 +8694,12 @@ impl Database {
         .bind(cwd)
         .bind(&now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -8663,6 +8797,11 @@ impl Database {
                 })?,
                 branch_name,
                 base_branch,
+            },
+            "coordinator_home" => EnvironmentContext::CoordinatorHome {
+                cwd: cwd.ok_or_else(|| {
+                    DbError::CoordinatorWorkScope("Coordinator home is missing cwd".to_string())
+                })?,
             },
             "unowned_cwd" => EnvironmentContext::UnownedCwd {
                 cwd: cwd.ok_or_else(|| {
@@ -9350,30 +9489,16 @@ impl Database {
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
 
-        let mapped_product_work_scope_id: Option<String> = sqlx::query_scalar(
-            "SELECT work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
-        )
-        .bind(parent.product_conversation_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
-        let mapped_product_work_scope_id = mapped_product_work_scope_id
-            .map(|scope_id| {
-                scope_id.parse::<WorkScopeId>().map_err(|error| {
-                    DbError::Serialization(format!(
-                        "invalid mapped work scope for product conversation {}: {error}",
-                        parent.product_conversation_id
-                    ))
-                })
-            })
-            .transpose()?;
-        let continuation_work_scope_id = if matches!(parent.conv_mode, ConvMode::Direct) {
-            let (scope_id, authority_kind, environment) =
-                Self::new_scope_for_conversation(&parent.cwd, &cm);
-            Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
-                .await?;
-            Some(scope_id)
-        } else if let Some(mapped_scope_id) = mapped_product_work_scope_id {
-            Some(mapped_scope_id)
+        let continuation_work_scope_id = if parent.runtime_role == RuntimeRole::Coordinator {
+            let owned = Self::coordinator_work_scope_tx(&mut tx)
+                .await?
+                .map(|record| record.work_scope_id);
+            if owned != parent.attached_work_scope_id {
+                return Err(DbError::CoordinatorWorkScope(
+                    "Coordinator continuation must retain its owned scope".to_string(),
+                ));
+            }
+            owned
         } else {
             parent.attached_work_scope_id.clone()
         };
@@ -10652,6 +10777,9 @@ impl Database {
         id: &str,
         update: &ConversationCreationMetadataUpdate,
     ) -> DbResult<()> {
+        let mut connection = self.pool.acquire().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut connection, id).await?;
+        drop(connection);
         let base_slug = update.slug.clone();
         let mut candidate_slug = base_slug.clone();
         let mut attempts = 0u8;
@@ -10748,6 +10876,9 @@ impl Database {
         expected_stage: CreationStage,
         next_stage: CreationStage,
     ) -> DbResult<CreationCasOutcome> {
+        let mut connection = self.pool.acquire().await?;
+        Self::reject_coordinator_conversation_mutation_conn(&mut connection, id).await?;
+        drop(connection);
         let cm = conv_mode_columns(mode);
         let base_slug = update.slug.clone();
         let mut candidate_slug = base_slug.clone();
@@ -11068,6 +11199,17 @@ impl Database {
         connection: &mut sqlx::SqliteConnection,
         work_scope_id: &str,
     ) -> DbResult<()> {
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_work_scope WHERE work_scope_id = ?1)",
+        )
+        .bind(work_scope_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if owned {
+            return Err(DbError::CoordinatorWorkScope(
+                "Coordinator-owned WorkScope cannot be deleted".to_string(),
+            ));
+        }
         sqlx::query(
             "DELETE FROM product_conversation_work_scopes
              WHERE work_scope_id = ?1
@@ -11152,6 +11294,7 @@ impl Database {
         observer: sqlite_telemetry::ParentSqliteObserver<'_>,
         creation_cleanup_claim: Option<(&CreationCleanupJob, i64, &str)>,
     ) -> DbResult<Option<String>> {
+        Self::reject_coordinator_conversation_mutation_conn(connection, conversation_id).await?;
         let membership: Option<String> =
             sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id = ?1")
                 .bind(conversation_id)
@@ -21227,6 +21370,11 @@ mod tests {
     #[tokio::test]
     async fn coordinator_continuation_commit_admits_automatic_work() {
         let db = Database::open_in_memory().await.unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let home_scope = db
+            .initialize_coordinator_work_scope(home.path().to_str().unwrap())
+            .await
+            .unwrap();
         let coordinator = db
             .get_or_create_coordinator(
                 Some("test-model"),
@@ -21234,6 +21382,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            coordinator.attached_work_scope_id,
+            Some(home_scope.work_scope_id)
+        );
         db.set_auto_continue_on_context_exhaustion(
             &coordinator.product_conversation_id,
             AutoContinueOnContextExhaustion::Enabled,
@@ -27546,7 +27698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_continuation_gets_fresh_work_scope() {
+    async fn direct_continuation_retains_work_scope_and_environment() {
         let db = Database::open_in_memory().await.unwrap();
         let parent =
             setup_exhausted_parent(&db, "direct-root", "direct", "/tmp", &ConvMode::Direct).await;
@@ -27559,8 +27711,200 @@ mod tests {
             }
         };
 
-        assert_ne!(child.attached_work_scope_id, parent.attached_work_scope_id);
+        assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
+        assert_eq!(
+            child.product_conversation_id,
+            parent.product_conversation_id
+        );
         assert_eq!(child.cwd, parent.cwd);
+        assert_eq!(
+            db.get_conversation_work_scope_context(&child.id)
+                .await
+                .unwrap(),
+            db.get_conversation_work_scope_context(&parent.id)
+                .await
+                .unwrap(),
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn direct_continuation_keeps_legacy_socket_owner_on_exact_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root =
+            setup_exhausted_parent(&db, "legacy-root", "legacy-root", "/tmp", &ConvMode::Direct)
+                .await;
+        let scope = root.attached_work_scope_id.clone().unwrap();
+        let ContinueOutcome::Created(first) = db.continue_conversation(&root.id).await.unwrap()
+        else {
+            panic!();
+        };
+        db.update_conversation_state(
+            &first.id,
+            &ConvState::ContextExhausted {
+                summary: "again".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ContinueOutcome::Created(second) = db.continue_conversation(&first.id).await.unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(second.attached_work_scope_id.as_ref(), Some(&scope));
+        assert_eq!(
+            db.get_work_scope_legacy_conversation_id(&scope)
+                .await
+                .unwrap(),
+            Some(root.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_continuation_concurrent_requests_and_replay_keep_one_scope() {
+        let mut db = Database::open_in_memory().await.unwrap();
+        db.continuation_test_hook = Some(std::sync::Arc::new(
+            ContinuationTestHook::PreReservationBarrier(std::sync::Arc::new(
+                tokio::sync::Barrier::new(2),
+            )),
+        ));
+        let parent =
+            setup_exhausted_parent(&db, "direct-race", "direct-race", "/tmp", &ConvMode::Direct)
+                .await;
+        let (left, right) = tokio::join!(
+            db.continue_conversation(&parent.id),
+            db.continue_conversation(&parent.id)
+        );
+        let mut created = 0;
+        let mut successor = None;
+        for result in [left.unwrap(), right.unwrap()] {
+            let child = match result {
+                ContinueOutcome::Created(child) => {
+                    created += 1;
+                    child
+                }
+                ContinueOutcome::AlreadyContinued(child) => child,
+                other @ ContinueOutcome::ParentNotContextExhausted { .. } => {
+                    panic!("unexpected outcome: {other:?}")
+                }
+            };
+            assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
+            assert_eq!(
+                child.product_conversation_id,
+                parent.product_conversation_id
+            );
+            if let Some(previous) = &successor {
+                assert_eq!(previous, &child.id);
+            }
+            successor = Some(child.id);
+        }
+        assert_eq!(created, 1);
+        db.continuation_test_hook = None;
+        let ContinueOutcome::AlreadyContinued(replayed) =
+            db.continue_conversation(&parent.id).await.unwrap()
+        else {
+            panic!("expected replay");
+        };
+        assert_eq!(Some(replayed.id), successor);
+        assert_eq!(
+            replayed.attached_work_scope_id,
+            parent.attached_work_scope_id
+        );
+        let scopes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let owners: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((scopes, owners), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn continuation_retains_exact_parent_scope_when_product_owns_multiple_scopes() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = setup_exhausted_parent(
+            &db,
+            "multi-root",
+            "multi-root",
+            "/old/environment",
+            &ConvMode::Direct,
+        )
+        .await;
+        let ContinueOutcome::Created(first) = db.continue_conversation(&root.id).await.unwrap()
+        else {
+            panic!();
+        };
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO work_scopes (id,authority_kind,lifecycle,environment_kind,cwd,created_at,updated_at) VALUES ('z-current-scope','work','active','unowned_cwd','/different/environment',?1,?1)")
+            .bind(now).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE conversations SET work_scope_id='z-current-scope' WHERE id=?1")
+            .bind(&first.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &first.id,
+            &ConvState::ContextExhausted {
+                summary: "again".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let selected = db.get_conversation(&first.id).await.unwrap();
+        let environment = db
+            .get_conversation_work_scope_context(&first.id)
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(next) = db.continue_conversation(&first.id).await.unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(next.attached_work_scope_id, selected.attached_work_scope_id);
+        assert_eq!(next.cwd, "/different/environment");
+        assert_eq!(
+            db.get_conversation_work_scope_context(&next.id)
+                .await
+                .unwrap(),
+            environment
+        );
+        assert_eq!(
+            db.get_conversation(&root.id)
+                .await
+                .unwrap()
+                .attached_work_scope_id,
+            root.attached_work_scope_id
+        );
+        let scopes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let owners: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversation_work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((scopes, owners), (2, 2));
+        assert_eq!(
+            db.get_work_scope_legacy_conversation_id(root.attached_work_scope_id.as_ref().unwrap())
+                .await
+                .unwrap(),
+            Some(root.id)
+        );
+        assert_eq!(
+            db.get_work_scope_legacy_conversation_id(
+                selected.attached_work_scope_id.as_ref().unwrap()
+            )
+            .await
+            .unwrap(),
+            Some(first.id)
+        );
     }
 
     /// Sequential slugs: first continuation is `{root}-2`, multi-level chains

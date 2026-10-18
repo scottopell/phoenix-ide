@@ -850,7 +850,7 @@ fn start_io_tasks(
     tokio::spawn(async move {
         run_waiter(
             h,
-            child,
+            async move { child.wait().await },
             stdout_join,
             stderr_join,
             WaiterContext {
@@ -1106,16 +1106,18 @@ impl LiveBashProgressReporter {
     }
 }
 
-async fn run_waiter(
+async fn run_waiter<F>(
     handle: Arc<Handle>,
-    mut child: tokio::process::Child,
+    child_exit: F,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     context: WaiterContext,
-) {
+) where
+    F: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+{
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
-    let exit_status = child.wait().await;
+    let exit_status = child_exit.await;
 
     let cause = match exit_status {
         Ok(status) => exit_status_to_cause(status),
@@ -1127,6 +1129,34 @@ async fn run_waiter(
 
     let finished_at = SystemTime::now();
 
+    drain_then_transition_to_terminal(
+        &handle,
+        stdout_join,
+        stderr_join,
+        cause,
+        started_at,
+        finished_at,
+        &context,
+    )
+    .await;
+
+    if let Some(dir) = context.sandbox_scratch_dir {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
+        }
+    }
+    panic_guard.disarm();
+}
+
+async fn drain_then_transition_to_terminal(
+    handle: &Arc<Handle>,
+    stdout_join: Option<tokio::task::JoinHandle<()>>,
+    stderr_join: Option<tokio::task::JoinHandle<()>>,
+    cause: FinalCause,
+    started_at: Instant,
+    finished_at: SystemTime,
+    context: &WaiterContext,
+) {
     // Drain the reader tasks BEFORE transitioning to terminal so the
     // ring captures any final chunk the kernel buffered between the
     // child's last write and its exit. Without this, the tombstone
@@ -1142,7 +1172,7 @@ async fn run_waiter(
     };
     let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await;
     if let Some(reporter) = &context.progress_reporter {
-        reporter.maybe_emit_handle(&handle, true).await;
+        reporter.maybe_emit_handle(handle, true).await;
         reporter.deactivate();
     }
 
@@ -1174,12 +1204,6 @@ async fn run_waiter(
             }
         }
     }
-    if let Some(dir) = context.sandbox_scratch_dir {
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
-        }
-    }
-    panic_guard.disarm();
 }
 
 #[cfg(unix)]
@@ -1945,6 +1969,7 @@ mod tests {
     use crate::bash::registry::BashLifecyclePhase;
     use crate::bash::ring::{RingBuffer, PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
     use phoenix_core::work_scope::ResourceScopeKey;
+    use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
@@ -2319,6 +2344,138 @@ mod tests {
 
         task.abort();
     }
+
+    /// A reader whose completion is gated by a oneshot signal the test
+    /// fires explicitly, rather than by real elapsed time. Models the
+    /// kernel-buffer race directly: the final chunk (including an
+    /// unterminated tail with no trailing newline) is already "in the
+    /// pipe" when the gate is constructed, standing in for bytes the
+    /// kernel buffered before the child exited; the test controls
+    /// exactly when the reader is allowed to observe it.
+    struct GatedReader {
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        chunk: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for GatedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(gate) = self.gate.as_mut() {
+                match Pin::new(gate).poll(cx) {
+                    Poll::Ready(_) => self.gate = None,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            if let Some(chunk) = self.chunk.take() {
+                buf.put_slice(&chunk);
+            }
+            // Gate released and chunk (if any) already delivered: EOF.
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_cannot_terminalize_before_reader_drains_unterminated_tail() {
+        use std::future::Future as _;
+        let handle = live_handle();
+        let marker = b"final-marker-unterminated".to_vec();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let reader = GatedReader {
+            gate: Some(release_rx),
+            chunk: Some(marker.clone()),
+        };
+
+        let reader_handle = handle.clone();
+        let stdout_join = tokio::spawn(async move {
+            read_pipe_to_ring(reader, reader_handle, None).await;
+        });
+
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        let mut finalize = Box::pin(run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            Some(stdout_join),
+            None,
+            context,
+        ));
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(finalize.as_mut().poll(cx).is_pending())
+        })
+        .await;
+        assert!(pending, "finalization must wait for the gated reader");
+        assert!(!handle.state().await.is_terminal());
+        release_tx.send(()).expect("reader still awaits its gate");
+        finalize.await;
+
+        let state = handle.state().await;
+        let HandleState::Tombstoned(tomb) = state.as_ref() else {
+            panic!("expected Tombstoned after drain, got {state:?}");
+        };
+        assert!(
+            tomb.final_tail
+                .iter()
+                .any(|l| l.bytes.ends_with(marker.as_slice())),
+            "tombstone tail missing final unterminated marker; tail: {:?}",
+            tomb.final_tail
+                .iter()
+                .map(|l| String::from_utf8_lossy(&l.bytes).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_bounds_reader_drain_when_a_descendant_keeps_pipe_open() {
+        use std::future::Future as _;
+        let handle = live_handle();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let reader_handle = handle.clone();
+        let reader = tokio::spawn(async move {
+            read_pipe_to_ring(
+                GatedReader {
+                    gate: Some(gate),
+                    chunk: Some(b"late".to_vec()),
+                },
+                reader_handle,
+                None,
+            )
+            .await;
+        });
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        let mut waiter = Box::pin(run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            Some(reader),
+            None,
+            context,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                waiter.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert!(!handle.state().await.is_terminal());
+        tokio::time::advance(READER_DRAIN_TIMEOUT).await;
+        waiter.await;
+        assert!(handle.state().await.is_terminal());
+        drop(release);
+    }
+
     #[tokio::test]
     async fn background_run_returns_live_handle() {
         let ctx = test_context(&scope("conv-process"));

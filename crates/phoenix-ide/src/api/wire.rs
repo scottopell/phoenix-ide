@@ -3,7 +3,7 @@
 //! This module is the single Rust-side source of truth for the shape of SSE
 //! events on the wire. `SseWireEvent` (internally tagged by `type`) replaces
 //! the hand-rolled `json!()` macros that used to live in [`super::sse`]: every
-//! broadcast [`crate::runtime::SseEvent`] is `From`-converted into an
+//! broadcast [`crate::runtime::SseEvent`] is projected into an
 //! `SseWireEvent`, then `serde_json::to_string`'d into the SSE `data:` line.
 //!
 //! The typed path doubles as the codegen source: `#[derive(ts_rs::TS)]` +
@@ -95,6 +95,7 @@ impl ErrorPresentation {
 pub struct EnrichedMessage {
     pub message_id: String,
     pub origin: InputOrigin,
+    pub event_presentation: Option<super::event_presentation::EventPresentation>,
     pub conversation_id: String,
     pub sequence_id: i64,
     pub message_type: MessageType,
@@ -106,12 +107,16 @@ pub struct EnrichedMessage {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<&Message> for EnrichedMessage {
-    fn from(msg: &Message) -> Self {
+impl EnrichedMessage {
+    pub(crate) fn new(
+        msg: &Message,
+        presentations: &super::event_presentation::EventPresentations,
+    ) -> Self {
         let content = enrich_content(msg);
         Self {
             message_id: msg.message_id.clone(),
             origin: msg.origin.clone(),
+            event_presentation: presentations.for_message(msg),
             conversation_id: msg.conversation_id.clone(),
             sequence_id: msg.sequence_id,
             message_type: msg.message_type,
@@ -120,12 +125,6 @@ impl From<&Message> for EnrichedMessage {
             usage_data: msg.usage_data.clone(),
             created_at: msg.created_at,
         }
-    }
-}
-
-impl From<Message> for EnrichedMessage {
-    fn from(msg: Message) -> Self {
-        Self::from(&msg)
     }
 }
 
@@ -232,8 +231,8 @@ fn merge_bash_displays_into_content(content: &mut Value, display_data: &Value) {
 
 /// Wire-format `SseEvent`. Single source of truth for what each variant looks
 /// like on the `data:` line of an SSE frame. Every broadcast-side
-/// [`SseEvent`] goes through `From<SseEvent>` into `SseWireEvent` and then
-/// through `serde_json::to_string`.
+/// [`SseEvent`] is explicitly projected with event presentations into
+/// `SseWireEvent`, then serialized through `serde_json::to_string`.
 ///
 /// `#[serde(tag = "type", rename_all = "snake_case")]` puts the discriminant
 /// on the wire as the `type` field — matches the old `json!()` shape and what
@@ -296,6 +295,7 @@ pub enum SseWireEvent {
         /// event. Q3 resolution in `sse_wire.allium`.
         pending_truncated: bool,
         transcript_coverage: crate::runtime::TranscriptCoverage,
+        opening: Option<super::types::ContinuationOpeningView>,
     },
     /// A newly-persisted message joins the conversation. The envelope
     /// `sequence_id` equals `message.sequence_id` by construction.
@@ -305,10 +305,12 @@ pub enum SseWireEvent {
         /// validated against `MessageSchema` and transformed to the UI's
         /// `Message` type at the valibot boundary.
         #[ts(type = "unknown")]
-        message: EnrichedMessage,
+        message: Box<EnrichedMessage>,
+        opening: Option<super::types::ContinuationOpeningView>,
     },
     /// In-place mutation of an existing message's mutable fields.
     MessageUpdated {
+        opening: Option<super::types::ContinuationOpeningView>,
         sequence_id: i64,
         message_id: String,
         #[ts(type = "unknown | null")]
@@ -477,9 +479,23 @@ impl SseWireEvent {
     }
 }
 
-impl From<SseEvent> for SseWireEvent {
+impl SseWireEvent {
+    /// Observability-only JSON size of the base event with redacted presentations.
+    /// Excludes database-backed private presentation data and SSE framing; this is
+    /// an approximation of delivery size, not a sendable wire projection.
+    pub(crate) fn replay_payload_size(event: &SseEvent) -> Result<usize, serde_json::Error> {
+        let wire = Self::with_presentations(
+            event.clone(),
+            &super::event_presentation::EventPresentations::redacted(),
+        );
+        serde_json::to_vec(&wire).map(|bytes| bytes.len())
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn from(event: SseEvent) -> Self {
+    pub(crate) fn with_presentations(
+        event: SseEvent,
+        presentations: &super::event_presentation::EventPresentations,
+    ) -> Self {
         match event {
             SseEvent::Init {
                 sequence_id,
@@ -496,12 +512,16 @@ impl From<SseEvent> for SseWireEvent {
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
+                opening,
             } => {
                 let (messages, transcript_coverage) = transcript.into_parts();
                 SseWireEvent::Init {
                     sequence_id,
                     conversation,
-                    messages: messages.iter().map(EnrichedMessage::from).collect(),
+                    messages: messages
+                        .iter()
+                        .map(|message| presentations.enrich(message))
+                        .collect(),
                     steering_messages: steering_messages
                         .iter()
                         .map(QueuedSteeringMessage::from)
@@ -515,21 +535,27 @@ impl From<SseEvent> for SseWireEvent {
                     transcript_generation,
                     transcript_coverage,
                     pending_anchor_sequence_id,
-                    pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
+                    pending_events: pending_events
+                        .into_iter()
+                        .map(|event| Self::with_presentations(event, presentations))
+                        .collect(),
                     pending_truncated,
+                    opening,
                 }
             }
-            SseEvent::Message { message } => {
+            SseEvent::Message { message, opening } => {
                 // The envelope `sequence_id` equals `message.sequence_id` —
                 // this is what the client already expects (see
                 // `ui/src/sseSchemas.ts` `SseMessageDataSchema`).
                 let sequence_id = message.sequence_id;
                 SseWireEvent::Message {
                     sequence_id,
-                    message: EnrichedMessage::from(message),
+                    message: Box::new(presentations.enrich(&message)),
+                    opening,
                 }
             }
             SseEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,
@@ -537,6 +563,7 @@ impl From<SseEvent> for SseWireEvent {
                 content,
                 duration_ms,
             } => SseWireEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,
@@ -841,3 +868,64 @@ mod chain_wire_tests {
 // onto them without depending on `api`. The `tools` layer and the ts-rs
 // codegen both source them from phoenix-core directly, so `api::wire` does not
 // re-export them.
+
+#[cfg(test)]
+impl From<&Message> for EnrichedMessage {
+    fn from(message: &Message) -> Self {
+        super::event_presentation::EventPresentations::redacted().enrich(message)
+    }
+}
+#[cfg(test)]
+impl From<SseEvent> for SseWireEvent {
+    fn from(event: SseEvent) -> Self {
+        Self::with_presentations(
+            event,
+            &super::event_presentation::EventPresentations::redacted(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod replay_payload_size_tests {
+    use super::*;
+    use crate::api::event_presentation::{event_messages, EventPresentations};
+
+    #[test]
+    fn base_event_size_matches_serialized_fixture() {
+        let event = SseEvent::AgentDone { sequence_id: 17 };
+        let fixture: SseWireEvent = event.clone().into();
+        assert_eq!(
+            SseWireEvent::replay_payload_size(&event).unwrap(),
+            serde_json::to_vec(&fixture).unwrap().len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn accounting_excludes_private_projection_without_changing_event() {
+        let (db, mut messages) = super::super::event_presentation::tests::fixture(1).await;
+        let event = SseEvent::Message {
+            message: messages.remove(0),
+            opening: None,
+        };
+        let redacted: SseWireEvent = event.clone().into();
+        let redacted_json = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(redacted_json.get("opening"), Some(&Value::Null));
+        assert_eq!(
+            redacted_json["message"]["event_presentation"]["reason"],
+            "redacted"
+        );
+        let size = SseWireEvent::replay_payload_size(&event).unwrap();
+        assert_eq!(size, serde_json::to_vec(&redacted).unwrap().len());
+
+        let presentations = EventPresentations::load(&db, event_messages(&event)).await;
+        let projected = SseWireEvent::with_presentations(event.clone(), &presentations);
+        let projected_json = serde_json::to_value(&projected).unwrap();
+        assert_eq!(projected_json.get("opening"), Some(&Value::Null));
+        assert_eq!(
+            projected_json["message"]["event_presentation"]["status"],
+            "available"
+        );
+        assert_ne!(size, serde_json::to_vec(&projected).unwrap().len());
+        assert_eq!(size, SseWireEvent::replay_payload_size(&event).unwrap());
+    }
+}
