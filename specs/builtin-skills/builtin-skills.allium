@@ -258,7 +258,7 @@ rule PhoenixApiDestinationAuthority {
         -- retained message ID and materialized bytes; HTTP success alone cannot
         -- prove policy support. Pin original target/identity/intent for retries.
         -- Preserve authority, admission and local-only send_conversation_message.
-        -- See ../api/requirements.md REQ-API-030; no live-replacement guarantee.
+        -- See ../api/requirements.md REQ-API-031; no live-replacement guarantee.
         -- For a user-authorized question response, freshly resolve the target
         -- and GET its exact transcript. Require awaiting_user_response and
         -- the opaque current request_id, never the provider tool_use_id.
