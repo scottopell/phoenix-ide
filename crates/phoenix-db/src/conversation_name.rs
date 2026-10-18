@@ -49,6 +49,9 @@ pub(crate) async fn allocate_slug_tx(
 }
 
 pub(crate) async fn migrate_name_authority(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
+    sqlx::query("ALTER TABLE conversations ADD COLUMN name_revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(name_revision) = 'integer' AND name_revision >= 0)")
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "UPDATE conversations AS root
          SET title = COALESCE(NULLIF(root.chain_name, ''), NULLIF(root.title, ''),
@@ -272,6 +275,10 @@ mod tests {
             .create_conversation("generation-id", "original-name", "/tmp", true, None, None)
             .await
             .unwrap();
+        let baseline = db
+            .capture_conversation_name_baseline(&root.id)
+            .await
+            .unwrap();
         db.rename_conversation(&root.id, "Human Selected Name")
             .await
             .unwrap();
@@ -279,8 +286,7 @@ mod tests {
             .set_ordinary_product_conversation_title_if_unchanged(
                 root.product_conversation_id.as_str(),
                 "Stale Generated Name",
-                root.title.as_deref(),
-                root.slug.as_deref(),
+                &baseline,
             )
             .await
             .unwrap();
@@ -288,12 +294,30 @@ mod tests {
         let current = db.get_conversation(&root.id).await.unwrap();
         assert_eq!(current.title.as_deref(), Some("Human Selected Name"));
         assert_eq!(current.slug.as_deref(), Some("human-selected-name"));
+        db.rename_conversation(&root.id, root.title.as_deref().unwrap())
+            .await
+            .unwrap();
+        let restored = db.get_conversation(&root.id).await.unwrap();
+        assert_eq!(restored.title, root.title);
+        assert_eq!(restored.slug, root.slug);
+        assert!(db
+            .set_ordinary_product_conversation_title_if_unchanged(
+                root.product_conversation_id.as_str(),
+                "Stale ABA Name",
+                &baseline,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let fresh_baseline = db
+            .capture_conversation_name_baseline(&root.id)
+            .await
+            .unwrap();
         assert!(db
             .set_ordinary_product_conversation_title_if_unchanged(
                 root.product_conversation_id.as_str(),
                 "Fresh Generated Name",
-                current.title.as_deref(),
-                current.slug.as_deref(),
+                &fresh_baseline,
             )
             .await
             .unwrap()

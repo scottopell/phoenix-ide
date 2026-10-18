@@ -1,4 +1,5 @@
 import { useDesktopRouteOwner } from './useDesktopRouteOwner';
+import { extractProductRouteReference } from './desktopRouteReference';
 import { conversationGroundingContext } from './FileExplorer/groundingContext';
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
@@ -245,10 +246,9 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     };
   }, [showInfo]);
 
-  const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
-  const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
-  const routeSlug = slugMatch?.[1] ?? null;
-  const productConversationId = productMatch?.[1] ?? routeSlug;
+  const productRouteReference = extractProductRouteReference(location.pathname);
+  const routeSlug = productRouteReference?.routeSlug ?? null;
+  const productConversationId = productRouteReference?.productConversationId ?? null;
   const ordinaryActiveSlug = useDesktopRouteOwner(productConversationId, routeSlug, location.search);
   const globalMatch = location.pathname.match(/^\/global\/([^/?#]+)/);
   const activeSlug = globalMatch?.[1] ?? ordinaryActiveSlug;

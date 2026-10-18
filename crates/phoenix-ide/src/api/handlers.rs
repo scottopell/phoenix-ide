@@ -7672,18 +7672,23 @@ async fn rename_conversation(
     Path(id): Path<String>,
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
+    if req.slug.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "conversation name must not be empty".to_string(),
+        ));
+    }
     let resolved = state
         .runtime
         .db()
         .resolve_ordinary_product_conversation(&id)
         .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
+        .map_err(super::product_conversations::db_to_app)?;
     let id = state
         .runtime
         .db()
         .get_ordinary_product_conversation(&resolved.product_conversation_id)
         .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?
+        .map_err(super::product_conversations::db_to_app)?
         .root
         .conversation
         .id;
@@ -7721,8 +7726,11 @@ async fn regenerate_conversation_name(
         .root
         .conversation;
     let id = root.id.clone();
-    let baseline_title = root.title.clone();
-    let baseline_slug = root.slug.clone();
+    let name_baseline = state
+        .db
+        .capture_conversation_name_baseline(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     let opening = state
         .runtime
         .db()
@@ -7770,8 +7778,7 @@ async fn regenerate_conversation_name(
         .set_ordinary_product_conversation_title_if_unchanged(
             resolved.product_conversation_id.as_str(),
             &generated,
-            baseline_title.as_deref(),
-            baseline_slug.as_deref(),
+            &name_baseline,
         )
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -17243,6 +17250,54 @@ mod regenerate_conversation_name_tests {
             .await
             .expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-fail"));
+    }
+
+    #[tokio::test]
+    async fn legacy_rename_preserves_bad_request_and_history_conflict_statuses() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Unused"),
+        ))))
+        .await;
+        seed_conversation(&state, "rename-history", "history-name").await;
+        let empty = rename_conversation(
+            State(state.clone()),
+            Path("rename-history".to_string()),
+            Json(RenameRequest {
+                slug: "  ".to_string(),
+            }),
+        )
+        .await;
+        let Err(error) = empty else {
+            panic!("empty name must be rejected");
+        };
+        assert_eq!(
+            axum::response::IntoResponse::into_response(error).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let root = state.db.get_conversation("rename-history").await.unwrap();
+        sqlx::query("UPDATE product_conversations SET lifecycle = 'history' WHERE id = ?1")
+            .bind(root.product_conversation_id.as_str())
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let closed = rename_conversation(
+            State(state.clone()),
+            Path(root.id.clone()),
+            Json(RenameRequest {
+                slug: "Must Not Replace History".to_string(),
+            }),
+        )
+        .await;
+        let Err(error) = closed else {
+            panic!("History rename must be rejected");
+        };
+        assert_eq!(
+            axum::response::IntoResponse::into_response(error).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+        let retained = state.db.get_conversation(&root.id).await.unwrap();
+        assert_eq!(retained.title, root.title);
+        assert_eq!(retained.slug, root.slug);
     }
 
     #[tokio::test]

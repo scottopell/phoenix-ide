@@ -54,7 +54,7 @@ THE SYSTEM SHALL apply existing History, active Close, and creation-claim admiss
 
 WHEN name generation or another asynchronous operation starts from a route reference, THE SYSTEM SHALL pin the owning immutable identity before awaiting external work and recheck admission at commit, rather than resolve a possibly reassigned slug at commit.
 
-WHEN an asynchronous generated name is ready, THE SYSTEM SHALL commit it only if the root name and projection still match the baseline captured before generation; a newer naming operation SHALL NOT be overwritten by that stale result.
+WHEN an asynchronous generated name is ready, THE SYSTEM SHALL commit it only if the root naming revision still matches the immutable-owner baseline captured before generation; a newer naming operation SHALL NOT be overwritten by that stale result.
 
 WHEN metadata publication loses its creation claim, THE SYSTEM SHALL commit neither a name nor a slug from that stale worker.
 

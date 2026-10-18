@@ -1477,7 +1477,7 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
-fn db_to_app(error: DbError) -> AppError {
+pub(super) fn db_to_app(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
         DbError::ProductConversationUnavailable(id) => {

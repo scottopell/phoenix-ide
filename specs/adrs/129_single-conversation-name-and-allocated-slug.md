@@ -22,7 +22,7 @@ Use `BEGIN IMMEDIATE` for ordinary rename and creation publication, and allocate
 
 Existing title, presentation, slug, and canonical-route wire fields carry the contract; no parallel product-name field is introduced. Compatibility endpoints delegate to the same title mutation. Clearing a legacy override resets the single name to `Conversation`; it cannot reveal an obsolete hidden name after the override authority is retired.
 
-Permanent product UUIDs and exact evidence references remain stable. Former slugs are neither reserved nor retained as aliases. Async generators capture an immutable identity and the root name/projection baseline, then recheck existing admission and that baseline in the committing transaction. A stale generated result cannot overwrite a newer selected name. Continuation does not create a new product name.
+Permanent product UUIDs and exact evidence references remain stable. Former slugs are neither reserved nor retained as aliases. Async generators capture an immutable identity and the root naming revision baseline, then recheck existing admission and that monotonic revision in the committing transaction. Every naming operation advances the revision, including a return to the same name; a stale generated result cannot overwrite a newer selected name. The revision is an internal concurrency token, not another name authority. Continuation does not create a new product name.
 
 ## Consequences
 

@@ -685,8 +685,8 @@ pub struct ConversationCreationMetadataUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationNameBaseline {
-    pub title: Option<String>,
-    pub slug: Option<String>,
+    owner: phoenix_core::domain::product_conversation::ProductConversationId,
+    revision: i64,
 }
 
 use phoenix_workflow::ClientTurnKey;
@@ -10786,7 +10786,8 @@ impl Database {
             let now = Utc::now().to_rfc3339();
             let result = sqlx::query(
                 "UPDATE conversations
-                 SET slug = COALESCE(?1, slug),
+                 SET name_revision = name_revision + CASE WHEN ?1 IS NOT NULL OR ?2 = 1 THEN 1 ELSE 0 END,
+                     slug = COALESCE(?1, slug),
                      title = CASE
                          WHEN ?2 = 1 THEN ?3
                          ELSE title
@@ -10885,14 +10886,15 @@ impl Database {
             let now = Utc::now().to_rfc3339();
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             crate::close_foundation::require_product_conversation_admission_tx(&mut tx, id).await?;
-            let current_name: (Option<String>, Option<String>) =
-                sqlx::query_as("SELECT title, slug FROM conversations WHERE id = ?1")
-                    .bind(id)
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let current_name: (String, i64) = sqlx::query_as(
+                "SELECT product_conversation_id, name_revision FROM conversations WHERE id = ?1",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
             let apply_name = name_changed
-                && current_name.0 == name_baseline.title
-                && current_name.1 == name_baseline.slug;
+                && current_name.0 == name_baseline.owner.as_str()
+                && current_name.1 == name_baseline.revision;
             let candidate_slug = if apply_name {
                 Some(conversation_name::allocate_slug_tx(&mut tx, name, id).await?)
             } else {
@@ -10900,7 +10902,8 @@ impl Database {
             };
             let result = sqlx::query(
                 "UPDATE conversations
-                 SET slug = COALESCE(?1, slug),
+                 SET name_revision = name_revision + CASE WHEN ?1 IS NOT NULL OR ?2 = 1 THEN 1 ELSE 0 END,
+                     slug = COALESCE(?1, slug),
                      title = CASE
                          WHEN ?2 = 1 THEN ?3
                          ELSE title
@@ -17630,11 +17633,10 @@ mod tests {
             worktree_path: NonEmptyString::new("/tmp/worktree-environment").unwrap(),
             base_branch: NonEmptyString::new("main").unwrap(),
         };
-        let baseline_conversation = db.get_conversation("conv-mode-environment").await.unwrap();
-        let name_baseline = ConversationNameBaseline {
-            title: baseline_conversation.title,
-            slug: baseline_conversation.slug,
-        };
+        let name_baseline = db
+            .capture_conversation_name_baseline("conv-mode-environment")
+            .await
+            .unwrap();
 
         let outcome = db
             .update_conversation_creation_metadata_and_mode(
@@ -17702,15 +17704,18 @@ mod tests {
         let CreationStatus::Claimed(claim) = job.protocol.status else {
             panic!("expected claim authority");
         };
-        let baseline_conversation = db.get_conversation("conv-name-race").await.unwrap();
-        let baseline = ConversationNameBaseline {
-            title: baseline_conversation.title,
-            slug: baseline_conversation.slug,
-        };
+        let baseline = db
+            .capture_conversation_name_baseline("conv-name-race")
+            .await
+            .unwrap();
+        let original = db.get_conversation("conv-name-race").await.unwrap();
         db.rename_conversation("conv-name-race", "Human title")
             .await
             .unwrap();
 
+        db.rename_conversation("conv-name-race", original.title.as_deref().unwrap())
+            .await
+            .unwrap();
         let outcome = db
             .update_conversation_creation_metadata_and_mode(
                 "job-name-race",
@@ -17734,8 +17739,8 @@ mod tests {
         assert_eq!(outcome, CreationCasOutcome::Applied);
 
         let conversation = db.get_conversation("conv-name-race").await.unwrap();
-        assert_eq!(conversation.title.as_deref(), Some("Human title"));
-        assert_eq!(conversation.slug.as_deref(), Some("human-title"));
+        assert_eq!(conversation.title, original.title);
+        assert_eq!(conversation.slug, original.slug);
         assert_eq!(conversation.cwd, "/tmp/name-race");
         assert_eq!(conversation.desired_base_branch.as_deref(), Some("main"));
         assert_eq!(conversation.model.as_deref(), Some("name-race-model"));
@@ -17781,10 +17786,9 @@ mod tests {
                 "job-stale-metadata",
                 &claim,
                 "conv-stale-metadata",
-                &ConversationNameBaseline {
-                    title: before.title.clone(),
-                    slug: before.slug.clone(),
-                },
+                &db.capture_conversation_name_baseline("conv-stale-metadata")
+                    .await
+                    .unwrap(),
                 &ConversationCreationMetadataUpdate {
                     slug: Some("stale-slug".to_string()),
                     title: Some(Some("stale title".to_string())),

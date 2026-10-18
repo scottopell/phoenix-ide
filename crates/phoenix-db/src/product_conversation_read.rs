@@ -462,6 +462,35 @@ impl Database {
         })
     }
 
+    /// Captures the owning aggregate and monotonic naming revision before external generation.
+    ///
+    /// # Errors
+    /// Returns an identity or database error when the ordinary root cannot be read.
+    pub async fn capture_conversation_name_baseline(
+        &self,
+        reference: &str,
+    ) -> DbResult<crate::ConversationNameBaseline> {
+        let resolved = self
+            .resolve_ordinary_product_conversation(reference)
+            .await?;
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT root.name_revision FROM conversations root
+             WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user'
+               AND root.user_initiated = 1 AND root.parent_conversation_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM conversations predecessor
+                 WHERE predecessor.product_conversation_id = root.product_conversation_id
+                   AND predecessor.continued_in_conv_id = root.id)
+             ORDER BY root.id LIMIT 1",
+        )
+        .bind(resolved.product_conversation_id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(crate::ConversationNameBaseline {
+            owner: resolved.product_conversation_id,
+            revision,
+        })
+    }
+
     /// Sets the user-visible title on the canonical root transcript row for one ordinary aggregate.
     ///
     /// # Errors
@@ -488,15 +517,10 @@ impl Database {
         &self,
         reference: &str,
         title: &str,
-        baseline_title: Option<&str>,
-        baseline_slug: Option<&str>,
+        baseline: &crate::ConversationNameBaseline,
     ) -> DbResult<Option<ProductConversationId>> {
-        self.mutate_ordinary_product_conversation_title_authority(
-            reference,
-            title,
-            Some((baseline_title, baseline_slug)),
-        )
-        .await
+        self.mutate_ordinary_product_conversation_title_authority(reference, title, Some(baseline))
+            .await
     }
 
     /// Compatibility route for the ordinary aggregate name.
@@ -528,7 +552,7 @@ impl Database {
         &self,
         reference: &str,
         title: &str,
-        baseline: Option<(Option<&str>, Option<&str>)>,
+        baseline: Option<&crate::ConversationNameBaseline>,
     ) -> DbResult<Option<ProductConversationId>> {
         let mut connection = self.pool.acquire().await?;
         let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
@@ -563,15 +587,14 @@ impl Database {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             };
             let root_id: String = row.try_get("id")?;
-            if let Some((baseline_title, baseline_slug)) = baseline {
-                let current = sqlx::query("SELECT title, slug FROM conversations WHERE id = ?1")
-                    .bind(&root_id)
-                    .fetch_one(&mut *transaction)
-                    .await?;
-                let current_title: Option<String> = current.try_get("title")?;
-                let current_slug: Option<String> = current.try_get("slug")?;
-                if current_title.as_deref() != baseline_title
-                    || current_slug.as_deref() != baseline_slug
+            if let Some(baseline) = baseline {
+                let revision: i64 =
+                    sqlx::query_scalar("SELECT name_revision FROM conversations WHERE id = ?1")
+                        .bind(&root_id)
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                if baseline.owner != resolved.product_conversation_id
+                    || baseline.revision != revision
                 {
                     return Ok(None);
                 }
@@ -587,7 +610,7 @@ impl Database {
                     .await?;
             let result = sqlx::query(
                 "UPDATE conversations
-                 SET title = ?1, slug = ?4, updated_at = ?2
+                 SET title = ?1, slug = ?4, updated_at = ?2, name_revision = name_revision + 1
                  WHERE id = ?3",
             )
             .bind(title)

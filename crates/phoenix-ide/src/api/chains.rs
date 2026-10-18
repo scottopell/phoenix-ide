@@ -273,7 +273,7 @@ pub async fn regenerate_chain_name(
     validate_chain_root(&state, &root_id).await?;
     let baseline = state
         .db
-        .get_conversation(&root_id)
+        .capture_conversation_name_baseline(&root_id)
         .await
         .map_err(db_to_app)?;
 
@@ -355,8 +355,7 @@ pub async fn regenerate_chain_name(
             normalized
                 .as_deref()
                 .expect("empty generated name rejected"),
-            baseline.title.as_deref(),
-            baseline.slug.as_deref(),
+            &baseline,
         )
         .await
         .map_err(db_to_app)?;
