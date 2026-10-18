@@ -14,22 +14,23 @@ The target plist path can also contain unknown or mismatched bytes. Deleting tho
 
 1. Treat process absence as sufficient stopped truth. Rejected because persistent launchd registration can reactivate the process after login or reboot.
 2. Unlink the target path after hashing it in place. Rejected because a pathname replacement between hash and unlink can destroy unknown evidence.
-3. Atomically isolate the directory entry, validate through a no-follow descriptor, and distinguish exact cleanup from unknown evidence. Chosen because removal authority and stopped truth remain structurally coupled.
+3. Use bounded atomic quarantine passes, fsync target-path absence, and defer bounded no-follow evidence validation to resume admission. Chosen because stopped truth no longer depends on interpreting untrusted bytes, resume authority remains bound to the sealed child, and a same-user writer cannot hold the controller lock indefinitely by continually recreating the target.
 
 ## Decision
 
 Treat process absence and persistent auto-start absence as separate facts. Repair failure settlement reports `failed_stopped` only after both facts are established.
 
-When the target plist appears absent, failure settlement fsyncs its containing directory and confirms absence again before treating persistent auto-start absence as durable. When a target exists, settlement atomically renames that directory entry into a transaction-owned quarantine before hashing it. Exact sealed repair bytes are removed and fsynced; unknown bytes remain quarantined as evidence and select `stop_unconfirmed`. Lookup errors, symlinks, unreadable state, and removal or fsync ambiguity also select `stop_unconfirmed`. Resume accepts only confirmed absence or the exact sealed repair plist and refuses while quarantine evidence remains. Publication uses a no-replace commit and rechecks the target after directory fsync, so bytes appearing after admission are never overwritten either.
+Failure settlement uses a bounded sequence of atomic renames to move each target entry observed during settlement into transaction-owned quarantine without reading or deleting it, fsyncs the containing directory, stops and confirms process absence, then repeats the bounded quarantine/fsync step to close changes made during teardown and reconfirms process absence after that final persistence pass. It reports `failed_stopped` when the auto-loaded target path is durably absent, regardless of quarantined content; inability to isolate, fsync or confirm target absence, including target recreation through the attempt bound, or process reappearance selects `stop_unconfirmed`. After the sealed child has been authenticated, resume bounds quarantine count and aggregate bytes and validates quarantines through size-bounded no-follow nonblocking descriptors, requires stable file identity, type, size, and change metadata for the complete read, verifies that each pathname remains bound to the read descriptor, retains and revalidates each accepted file's metadata token at admission close, and rejects changes across repeated complete quarantine enumerations or the containing directory's change token. Exact repair evidence is admissible, while unknown, mutable, replaced, newly added, oversized, nonregular, or unreadable evidence refuses resume and remains untouched. Publication uses a no-replace commit and rechecks the target after directory fsync, so bytes appearing after admission are never overwritten. Its temporary is atomically retired into retained transaction-owned quarantine and authenticated there rather than pathname-deleted, so a replacement is preserved and blocks success.
 
 Both failure states retain the exact original claim, sealed child evidence, parent evidence, and last durable resume checkpoint. This decision does not alter terminal successful repair behavior or the completed production transaction that exposed the review question.
 
 ## Consequences
 
 - Login and reboot cannot silently reactivate an exact repair reported as `failed_stopped`.
-- A target-plist unlink or directory-fsync ambiguity remains explicitly non-terminal and recoverable as `stop_unconfirmed`.
-- Failure settlement removes only bytes already owned by the sealed repair identity.
-- Resume continues to use the sealed child and republishes its exact plist only after full retained admission.
+- Target isolation, repeated recreation through the bounded attempts, or directory-fsync ambiguity remains explicitly non-terminal and recoverable as `stop_unconfirmed`.
+- Failure settlement never parses or deletes quarantined evidence.
+- Publication retirement preserves exact evidence on success and preserves mismatched replacement evidence on failure instead of deleting either by pathname.
+- Resume continues to use the sealed child and republishes its exact plist only after bounded validation of retained target evidence.
 
 ## References
 
