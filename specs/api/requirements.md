@@ -339,6 +339,7 @@ THE SYSTEM SHALL preserve the decoded text unchanged for display and model input
 AND SHALL perform no slash-command, skill, @ mention or file-reference expansion
 AND SHALL create no skill invocation or expanded-text overlay
 AND SHALL preserve normal attachment validation, UserApi provenance, close/history fences and direct-versus-steering routing.
+AND for a reserved continuation opening SHALL reject an already-transcript-prefixed client identity or changed submitted text/user agent before canonicalization, retaining the original raw reserved identity.
 
 WHEN the client retries an admitted message identity
 THE SYSTEM SHALL compare expansion policy as part of exact submitted intent along with original transcript, text, ordered attachments, origin and user agent

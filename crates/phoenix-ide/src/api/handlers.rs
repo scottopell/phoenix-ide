@@ -18300,9 +18300,13 @@ mod chat_authority_tests {
                 "text": text, "message_id": message_id, "expansion_policy": "literal_text",
                 "user_agent": "original-agent",
             });
-            for (field, value) in [("text", "changed text"), ("user_agent", "changed-agent")] {
-                let mut changed = body.clone();
-                changed[field] = serde_json::json!(value);
+            let mut conflicts = vec![body.clone(), body.clone()];
+            conflicts[0]["text"] = serde_json::json!("changed text");
+            conflicts[1]["user_agent"] = serde_json::json!("changed-agent");
+            if namespaced {
+                conflicts.push(body.clone());
+            }
+            for changed in conflicts {
                 let response = public_chat_post(&state, &successor.id, &changed).await;
                 assert_eq!(response.status(), StatusCode::CONFLICT);
                 assert_eq!(
@@ -18337,6 +18341,9 @@ mod chat_authority_tests {
                     Some(intent.clone())
                 );
             }
+            if namespaced {
+                continue;
+            }
             assert_eq!(
                 public_chat_post(&state, &successor.id, &body)
                     .await
@@ -18352,6 +18359,7 @@ mod chat_authority_tests {
                 .expect("exact manual opening accepted");
             let payload =
                 PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+            assert_eq!(payload.submitted.message_id, intent.message_id.as_str());
             assert_eq!(payload.submitted.text, text);
             assert_eq!(payload.delivery.text, text);
             assert_eq!(

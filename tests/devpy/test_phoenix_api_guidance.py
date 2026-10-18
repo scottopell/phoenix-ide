@@ -150,6 +150,9 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
             self.assertIn(text, recipe)
         self.assertLess(recipe.index("GET /api/version"), recipe.index("literal steering smoke test"))
         self.assertLess(recipe.index("literal steering smoke test"), recipe.index("4. Recheck"))
+        for identity_rule in ("{original_transcript_id}:{client_message_id}", "Retain the original raw UUID for retries",
+                              "omitted `steering` means false", "drained steering messages retain the raw"):
+            self.assertIn(identity_rule, recipe)
         self.assertNotRegex(recipe, r"[0-9a-f]{40}")
 
     def test_literal_policy_stays_closed_and_needs_no_extra_endpoint_or_version_field(self):

@@ -353,7 +353,9 @@ impl SendChatApplicationService {
             })
         {
             if req.expansion_policy == MessageExpansionPolicy::LiteralText
-                && (req.text != intent.handoff || req.user_agent != intent.user_agent)
+                && (req.message_id != intent.message_id.as_str()
+                    || req.text != intent.handoff
+                    || req.user_agent != intent.user_agent)
             {
                 return Ok(SendChatOutcome::Rejected {
                     message: "reserved continuation opening payload does not match".to_string(),
