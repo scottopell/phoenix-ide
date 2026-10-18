@@ -35,7 +35,7 @@
     },
     "qualified_job": {
       "id": 117563040072,
-      "name": "build-macos (aarch64-apple-darwin, macos-14, aarch64-apple-darwin, false)",
+      "name": "build-macos (macos-15, aarch64-apple-darwin, phoenix_ide-aarch64-apple-darwin)",
       "conclusion": "success"
     },
     "note": "The matrix run failed in the unrelated Intel job; the exact ARM preparation job succeeded and uploaded this artifact."
