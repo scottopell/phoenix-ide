@@ -65,17 +65,23 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "postCount",
         "requestOwned",
         "collectorOwned",
         "responseJoined",
+        "pageResponseJoined",
         "failureJoined",
+        "clientStatus",
+        "pageStatus",
         "releaseWhileClosePending",
+        "browserClosed",
+        "responseEndAttempted",
+        "responseEndCallback",
+        "responseEndCallbackError",
+        "writeAvailable",
         "serverFinished",
         "serverClosed",
-        "forcedSocketDisposal",
-        "postCount",
-        "clientStatus",
-        "writeAvailable"
+        "forcedSocketDisposal"
       ],
       "properties": {
         "requestOwned": {
@@ -120,6 +126,32 @@
             true,
             false
           ]
+        },
+        "pageResponseJoined": {
+          "type": "boolean"
+        },
+        "pageStatus": {
+          "enum": [
+            null,
+            204,
+            "other"
+          ]
+        },
+        "browserClosed": {
+          "type": "boolean"
+        },
+        "responseEndAttempted": {
+          "type": "boolean"
+        },
+        "responseEndCallback": {
+          "type": "boolean"
+        },
+        "responseEndCallbackError": {
+          "enum": [
+            null,
+            true,
+            false
+          ]
         }
       }
     },
@@ -137,11 +169,15 @@
             "collector_received",
             "close_begin",
             "response_release",
+            "response_end_attempt",
+            "response_end_callback",
             "server_response_finish",
             "server_response_close",
             "client_response",
+            "page_response",
             "request_failed",
-            "close_resolve"
+            "close_resolve",
+            "browser_close_resolve"
           ]
         },
         "atMs": {
@@ -219,10 +255,11 @@
           "items": {
             "enum": [
               "context_cleanup",
-              "server_cleanup"
+              "server_cleanup",
+              "browser_cleanup"
             ]
           },
-          "maxItems": 2,
+          "maxItems": 3,
           "uniqueItems": true
         },
         "events": {
@@ -240,7 +277,7 @@
             "not_observed",
             "response_after_close",
             "response_before_close_resolve",
-            "request_cancelled",
+            "request_failed_observed",
             "no_response_observed"
           ]
         }

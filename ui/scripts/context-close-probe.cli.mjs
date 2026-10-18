@@ -3,7 +3,7 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
-import { deadline, functionalPass, ProbeError, runProbe, safeJSON } from './context-close-probe.mjs';
+import { functionalPass, ProbeError, runProbe, safeJSON } from './context-close-probe.mjs';
 
 // This entry point is hosted-only. Importing it does not resolve Playwright or launch anything.
 export async function main() {
@@ -20,23 +20,13 @@ export async function main() {
     browserRevision: manifest.browsers.find(b => b.name === 'chromium')?.revision,
     sourceCommit: process.env.PROBE_SOURCE_COMMIT,
   };
-  let result = { version: 1, runId: randomUUID(), provenance, cases: [], suiteError: null, cleanupErrors: [] };
-  safeJSON(result); // Reject unexpected provenance before starting a browser.
-  let browser, stopped = false;
-  const operation = (async () => {
-    const { chromium } = require('playwright');
-    browser = await chromium.launch({ headless: true, timeout: 10000 });
-    if (stopped) { await deadline(browser.close(), 1000); return; }
-    result = await runProbe({ browser, provenance, runId: result.runId, suiteMs: 48000 });
-  })();
-  try { await deadline(operation, 60000); }
-  catch (error) {
-    result.suiteError ??= error instanceof ProbeError ? error.code : 'operation_failed';
-    if (browser) {
-      try { await deadline(browser.close(), 1000); }
-      catch { if (!result.cleanupErrors.includes('browser_cleanup')) result.cleanupErrors.push('browser_cleanup'); }
-    }
-  } finally { stopped = true; }
+  const initial = { version: 1, runId: randomUUID(), provenance, cases: [], suiteError: null, cleanupErrors: [] };
+  safeJSON(initial); // Reject unexpected provenance before starting a browser.
+  const { chromium } = require('playwright');
+  const result = await runProbe({
+    createBrowser: () => chromium.launch({ headless: true, timeout: 10000 }),
+    provenance, runId: initial.runId, suiteMs: 48000,
+  });
   await mkdir('context-close-evidence', { recursive: true });
   await writeFile('context-close-evidence/result.json', safeJSON(result), { flag: 'wx' });
   return functionalPass(result) ? 0 : 1;

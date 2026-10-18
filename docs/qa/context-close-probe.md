@@ -3,7 +3,8 @@
 ## Question and authority
 
 Can a response event joined to the **exact original Playwright Request object**
-be observed after that owned context's `close()` promise resolves? A response
+be observed after that owned context's `close()` promise resolves, independently
+on the context and page response listeners? A response
 while `close()` is merely pending is a different observation. This is a bounded
 functional question, **not** a performance test, reporter test, Phoenix collector
 qualification, or explanation of a historical failure.
@@ -28,8 +29,8 @@ are not waived or repaired here. The parent owns label verification, publication
 and hosted execution. Label before the next synchronize event: default PR
 activity types do not start a run on label changes, and a later label cannot
 retroactively cancel an already-started stock job. No local browser, server,
-network/GET, install, build, Cargo, DB/SQL, or push is authorized by this packet.
-Roadmap context was not refreshed because local network is prohibited.
+runtime/GET, install, build, Cargo, DB/SQL, or push is authorized by this preparation packet.
+GitHub read-only coordination is permitted; this offline preparation did not refresh the roadmap.
 
 ## Hosted setup and isolation
 
@@ -39,8 +40,9 @@ uses Node 26 and `pnpm/action-setup@v4` reading the repository's pinned
 `pnpm install --frozen-lockfile --ignore-scripts`. The existing lockfile resolves
 Playwright **1.61.0**. A normal hosted `playwright install --with-deps chromium`
 installs its Chromium; there is no local or protected browser connection. The CLI
-checks both Playwright and playwright-core versions before launching. One fresh
-owned headless browser contains four fresh nonpersistent contexts, used serially.
+checks both Playwright and playwright-core versions before launching. Each of the
+four serial cases owns a separately launched headless browser and one fresh
+nonpersistent context; no browser or context is reused across cases.
 No Phoenix application, reporter, auth, production endpoint, telemetry sampling,
 48-trial cohort, history fixture, or random sample decision participates. UUIDs
 come from `crypto.randomUUID`, not `Math.random`.
@@ -57,19 +59,24 @@ The collector's receipt barrier resolves after the complete small body validates
 ## Four schedules and observed boundaries
 
 All schedules await **both** the browser request event and the collector's full
-request barrier before closing. The observer remains attached through owned
-context and server cleanup. Cases run once each, with no retries.
+request barrier before closing. Both context and page response listeners are
+attached before issuing the POST and remain attached through context cleanup,
+server/socket cleanup, and **awaited owned browser.close() resolution**. Only
+then are they detached and the record classified/copied. Cases run once each,
+with no retries. No sleep or event-loop continuation is an observation barrier.
 
 | Case | Choreography | What is and is not guaranteed |
 | --- | --- | --- |
-| BEFORE | Release 204; await exact-request client response; then call and await context close. | Positive control requires observed client status 204 before `close_begin`. |
+| BEFORE | Release 204; await exact-request responses on **both context and page** listeners; then call and await context close. | Positive control requires both independently observed statuses 204 before `close_begin`. |
 | DURING | Call context close; on the next explicit Promise continuation, record that its promise is still pending and release 204; await close. | Release must fall strictly between `close_begin` and `close_resolve`. Actual response delivery while closing is **not guaranteed**; retain its observed partial order or classified absence. A close already resolved at release fails the schedule barrier. |
-| AFTER | Await context close resolution; then attempt release 204. | Socket may already be destroyed. Retain write availability, server finish/close, client response/failure independently. No response is an observation, not a failure alone. |
-| NEVER | Await context close; force-dispose any remaining owned held response/socket; do not release a response. | No response is expected. Correct joined cancellation or explicit `no_response_observed` passes; any response/release/server finish fails. Disposal records an action, even if the socket already closed. |
+| AFTER | Await context close resolution; then attempt release 204, including calling `end` on an unwritable response. | Socket may already be destroyed. Retain write availability, end attempt/callback, server finish/close, and each listener response independently. No response is an observation, not a failure alone. |
+| NEVER | Await context close; force-dispose any remaining owned held response/socket; do not release a response. Then await server cleanup and actual browser close before finalizing. | No response is expected. Correct joined cancellation or explicit `no_response_observed` passes; a response on **either listener**, release/end attempt, or server finish fails. Disposal records an action, even if the socket already closed. |
 
 Event names are closed: `request_emit`, `collector_received`, `close_begin`,
-`response_release`, `server_response_finish`, `server_response_close`,
-`client_response`, `request_failed`, `close_resolve`. `request_emit` means the
+`response_release`, `response_end_attempt`, `response_end_callback`,
+`server_response_finish`, `server_response_close`, `client_response`,
+`page_response`, `request_failed`, `close_resolve`, `browser_close_resolve`.
+`request_emit` means the
 host's Playwright request callback, not a producer timestamp. All timestamps are
 monotonic host `performance.now()` offsets from the case start; they are event
 ordering facts, **not performance measurements**. At most 24 events per case
@@ -77,36 +84,54 @@ are retained; overflow is a functional failure, not silently accepted evidence.
 
 `collector_received` **does not mean accepted 204**, client response, export,
 or reporter success. `response_release` records an attempted server action.
-`writeAvailable` is the server response/socket check at that action;
-`server_response_finish` is a Node server write completion, **not** client
-receipt. Only `client_response` plus the exact object join and `clientStatus: 204`
-proves a Playwright-observed 204 in this synthetic exchange. Server `close` may
+`writeAvailable` is the server response/socket check at that action, not a gate
+on the end attempt. `responseEndAttempted`/`response_end_attempt` record the
+actual `end` call attempt even if unwritable. `responseEndCallback` and
+`responseEndCallbackError` record callback presence and only a fixed boolean
+error (null until callback), never raw error text. Neither an attempt nor its
+callback implies server finish or client receipt. `server_response_finish` is
+a Node server write completion, **not** client receipt.
+
+`client_response`/`responseJoined`/`clientStatus` describe only the context
+listener. `page_response`/`pageResponseJoined`/`pageStatus` describe only the
+page listener, synchronously joined to the same original Request object.
+Each observed 204 is established by its own listener's exact-request join and
+status, not inferred from the other listener. Equality is required only by the
+BEFORE positive control; DURING/AFTER retain any observed divergence. Server `close` may
 precede release, follow finish, or arrive during cleanup. No ordering between
 browser callback and collector receipt is assumed beyond the two close barriers.
 
-`response_after_close` means the exact client-response callback was observed
+The legacy-named `outcome` is **context-listener-only**: `response_after_close`
+means the exact context client-response callback was observed
 **after `close_resolve`**. `response_before_close_resolve` includes delivery
 before closing or while closing; inspect `close_begin` to distinguish them.
-`request_cancelled` means an exact-request `requestfailed` event, not a diagnosis
+`request_failed_observed` means an exact-request `requestfailed` event, not a diagnosis
 from raw failure text. `no_response_observed` is limited to this owned observation
-window (through cleanup plus an explicit event-loop continuation); it is not a
-universal impossibility claim. AFTER or DURING observing no response does not
+window ending at actual owned `browser.close()` resolution, recorded as
+`browserClosed`/`browser_close_resolve`; it is not a timer-based absence or a
+universal impossibility claim. Inspect `page_response` relative to
+`close_resolve` to answer the independent page-listener question. A page-only
+response does not rewrite the context-only outcome. AFTER or DURING observing no response does not
 fail just to force a desired outcome. Conversely, wrong ownership, multiple
 POSTs, non-204 response, missing schedule barriers or hangs fail the real probe.
 
 ## Deadlines, errors, cleanup, safe evidence
 
-Every case has a 10-second operation deadline, then independently bounded
-one-second context cleanup and one-second server/socket cleanup attempts. The
-case suite has a 48-second deadline and one-second browser cleanup; the CLI caps
-launch plus suite at 60 seconds (launch itself at 10 seconds), then bounded
-emergency browser cleanup. The hosted process has a 65-second TERM deadline,
+Every case has a 10-second operation deadline **including browser launch**, then
+independently bounded one-second context cleanup, one-second server/socket
+cleanup, and one-second browser-close attempts. Launch also has its own
+10-second Playwright timeout. The entire case suite has a 48-second deadline,
+plus a one-second emergency close of its active owned browser. Browser close is
+idempotently shared with case cleanup, not invoked twice. The hosted process
+has a 65-second TERM deadline,
 five-second KILL grace and five-minute job limit covering dependency setup.
 These are bounds, not measured durations. The server tracks all owned sockets,
 destroys them at cleanup, and awaits server close. A stalled operation cannot
 start a later case after suite deadline; late-acquired contexts/collectors are
-closed rather than reused. A case cleanup failure stops further cases before
-closing the owned browser. The CLI exits nonzero on any functional/cleanup error
+closed rather than reused. Late-launched browsers are likewise closed, not
+reused. A case cleanup failure stops further cases; browser-close failure or
+timeout means the transport barrier was **not** established and cannot qualify
+an absence. The CLI exits nonzero on any functional/cleanup error
 or incomplete suite. If setup, a hard kill, or schema validation prevents a
 result file, missing runtime evidence remains missing; schema/docs alone are not
 success. No process logs are uploaded as a substitute.
@@ -155,8 +180,8 @@ or justify changes to its application source, module pins or lockfile.
 
 ### Preparation validation actually run
 
-Offline on Node `v26.8.2`: **27/27** new probe controls and **17/17** existing
-lifecycle controls pass (44 combined); stock-preparation **20/20**, publication
+Offline on Node `v26.8.2`: **41/41** probe controls and **17/17** existing
+lifecycle controls pass (58 combined); stock-preparation **20/20**, publication
 **12/12**, and artifact-admission **8/8** Python regressions pass. All three new
 `.mjs` files pass `node --check`. Ruby parsed CI YAML; all **39** inline `run`
 blocks pass `bash -n` after replacing GitHub expressions with a syntax placeholder.
@@ -166,4 +191,18 @@ with `5d2a62905` and is unchanged (SHA-256
 Application source, `ui/package.json`, lockfile and existing module pins are
 unchanged. Full `dev.py check`, hosted CI and actual Playwright were **not run**;
 no local browser, listener, network/GET, install, build, DB/SQL or push occurred.
+The bounded self-review after `f1834789c` replaced the shared browser with
+per-case ownership and removed the event-loop-drain cutoff. Added fake controls
+hold browser close unresolved, deliver independent context/page events during
+close, reject responses in NEVER, detach both listeners after the barrier, and
+verify unwritable end attempts with callback errors separate from finish/close.
+The closed result keeps `outcome` context-only; page response ordering is read
+from its separate fact/event. Real Playwright ordering and Node HTTP end-callback
+behavior on a destroyed socket remain unobserved locally; only the separately
+authorized hosted run can provide that runtime evidence.
 This is a clean preparation/validation packet, not Stage 1 runtime evidence.
+
+The synthetic POST uses `keepalive: true`, matching the reporter transport option.
+This is still bare fetch: no reporter AbortController, pagehide callback, report
+serialization, sampling, Phoenix collector, or export pipeline is exercised.
+`request_failed_observed` does not establish cancellation or its cause.
