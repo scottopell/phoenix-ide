@@ -1014,7 +1014,7 @@ impl LlmService for MockLlmService {
         }
 
         if let Some(port) = parse_stream_gate(request) {
-            wait_for_stream_gate(port).await?;
+            Box::pin(wait_for_stream_gate(port)).await?;
         }
 
         let scenario = Scenario::from_message(request);
@@ -1304,14 +1304,39 @@ mod tests {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let gate = tokio::spawn(wait_for_stream_gate(port));
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = user_req(&format!(
+            "[[scenario:plain_text]] [[ttft:0]] [[stream-gate:{port}]]"
+        ));
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(256);
+        let gate =
+            tokio::spawn(
+                async move { MockLlmService.complete_streaming(&request, &chunk_tx).await },
+            );
+        let (mut stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .expect("streaming mock must connect to the gate")
+                .unwrap();
         assert!(
             !gate.is_finished(),
             "connection alone must not release the mock"
         );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), chunk_rx.recv())
+                .await
+                .is_err(),
+            "streaming began or closed before release"
+        );
         stream.write_all(b"R").await.unwrap();
-        gate.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate)
+            .await
+            .expect("released mock must finish streaming")
+            .unwrap()
+            .unwrap();
+        assert!(
+            chunk_rx.try_recv().is_ok(),
+            "released mock must emit chunks"
+        );
     }
 
     #[test]

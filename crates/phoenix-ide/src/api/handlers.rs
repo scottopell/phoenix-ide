@@ -18400,16 +18400,24 @@ mod chat_authority_tests {
             assert_eq!(error["reference"], "@nonexistent-literal-chat-file.txt");
         }
         let mut body = serde_json::json!({"text": "plain text", "message_id": "m"});
-        for policy in [
-            serde_json::json!("generated_predecessor_context"),
-            serde_json::json!("unknown"),
-            serde_json::Value::Null,
-            serde_json::json!(1),
+        for (policy, expected_status) in [
+            (
+                serde_json::json!("generated_predecessor_context"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!("unknown"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (serde_json::Value::Null, StatusCode::BAD_REQUEST),
+            (serde_json::json!(1), StatusCode::BAD_REQUEST),
         ] {
             body["expansion_policy"] = policy;
             assert_eq!(
                 public_chat_post(&state, "expand", &body).await.status(),
-                StatusCode::UNPROCESSABLE_ENTITY
+                expected_status,
+                "expansion_policy={}",
+                body["expansion_policy"]
             );
         }
     }
