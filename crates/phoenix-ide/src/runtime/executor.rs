@@ -20347,7 +20347,7 @@ mod steer_drain_detector_tests {
             .update_state(conversation_id, &terminal_state, rt.state_updated_at)
             .await
             .unwrap();
-        let llm = Arc::clone(&rt.llm);
+        let llm = Arc::clone(&rt.llm_client);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let rt = rt.with_startup_llm_recovery_ack(ack_tx);
 
