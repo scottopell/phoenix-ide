@@ -31,7 +31,7 @@
     "workflow_run_display_title": "Release",
     "workflow_run_conclusion": "failure",
     "operation": "prepare-main",
-    "operation_log_marker": "if [[ \"prepare-main\" != \"prepare-main\" ]]; then",
+    "operation_log_marker": "if [[ \"true\" == true ]]; then",
     "inputs": {
       "operation": "prepare-main"
     },
