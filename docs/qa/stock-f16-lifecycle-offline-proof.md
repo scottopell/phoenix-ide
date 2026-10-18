@@ -330,3 +330,33 @@ CI YAML parsed with Ruby YAML; all **36** inline run blocks passed `bash -n`
 with GitHub expressions substituted; `git diff --check` passes. Full
 `./dev.py check` and hosted CI were not run. No network/roadmap refresh, install,
 app build, browser, server, measurement, label change or push was performed.
+
+## Historical evidence correction: terminal delivery is not lifecycle attribution
+
+The Python `LifecycleFailures` object tracks the **whole outer case**, not just
+`runLifecycleQualificationStage`. The old publication's
+`lifecycle_failure_present: true` therefore establishes a retained outer-case
+primary exception, not a lifecycle-module throw. All six retained old lifecycle
+attempts were explicitly unsampled and inconclusive. The modeled sampled
+close/response schedule is a poor fit for that incident and is not its cause.
+
+Artifact `12122620564` retains a different concrete fact: one sampled terminal
+pagehide attempt captured an incomplete report and producer submission states
+`attempted` then `failed`, both without an HTTP status. These are distinct
+boundaries: capturing a POST/report is not receiving an accepted 204, and neither
+alone proves collector acceptance or completed export. The evidence does not
+identify a network cause, browser abort, or server rejection.
+
+The pinned `appendTerminalInventory` iterates **all captured trial reports** and
+adds `journeyExpectation` records regardless of submission success. Consequently,
+a failed submission alone does not imply a missing journey, nor prove that the
+`validateTelemetryResult` report/journey-count assertion rejected this run.
+The lost original stack and incomplete published journey inventory prevent that
+assertion-level attribution. The historical failure phase may be module checks,
+result validation, or later history finalization; it remains unknown.
+
+The new primary diagnostic catches errors inside `runJointQualification`.
+Its returned `finalizeHistory` callback executes later, outside that catch. An
+error there is a specific remaining capture boundary, not evidence that it threw
+in the historical run. No capture expansion, production fix, module-pin change,
+or natural-sampling retry is included in this offline publication.
