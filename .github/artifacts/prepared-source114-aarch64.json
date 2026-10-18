@@ -27,7 +27,7 @@
     "workflow_run_attempt": 1,
     "workflow_run_event": "workflow_dispatch",
     "workflow_run_branch": "main",
-    "workflow_run_display_title": "prepare-main",
+    "workflow_run_display_title": "Release",
     "workflow_run_conclusion": "failure",
     "operation": "prepare-main",
     "inputs": {
