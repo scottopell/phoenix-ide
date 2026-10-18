@@ -5,7 +5,8 @@ use crate::api::handlers::{
     BranchWorktreeInfo, ManagedWorktreeError,
 };
 use crate::db::{
-    ConvMode, ConversationCreationMetadataUpdate, CreationClaimOutcome, ErrorKind, NonEmptyString,
+    ConvMode, ConversationCreationMetadataUpdate, ConversationNameBaseline, CreationClaimOutcome,
+    ErrorKind, NonEmptyString,
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
@@ -2196,6 +2197,15 @@ async fn provision_conversation(
         .await
         .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
 
+    let baseline_conversation = manager
+        .db()
+        .get_conversation(&job.conversation_id)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+    let name_baseline = ConversationNameBaseline {
+        title: baseline_conversation.title,
+        slug: baseline_conversation.slug,
+    };
     let seed_title = intent.seed_label.clone().filter(|s| !s.trim().is_empty());
     let mut title_source = intent.text.trim().to_string();
     if !images.is_empty() {
@@ -2322,6 +2332,7 @@ async fn provision_conversation(
                 &job.id,
                 &claim,
                 &job.conversation_id,
+                &name_baseline,
                 &ConversationCreationMetadataUpdate {
                     slug: Some(slug.clone()),
                     title: Some(title.clone()),

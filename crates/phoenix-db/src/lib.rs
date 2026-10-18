@@ -683,6 +683,12 @@ pub struct ConversationCreationMetadataUpdate {
     pub desired_base_branch: Option<Option<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationNameBaseline {
+    pub title: Option<String>,
+    pub slug: Option<String>,
+}
+
 use phoenix_workflow::ClientTurnKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10865,6 +10871,7 @@ impl Database {
         job_id: &str,
         claim: &CreationClaim,
         id: &str,
+        name_baseline: &ConversationNameBaseline,
         update: &ConversationCreationMetadataUpdate,
         mode: &ConvMode,
         model: &str,
@@ -10892,7 +10899,15 @@ impl Database {
             let now = Utc::now().to_rfc3339();
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             crate::close_foundation::require_product_conversation_admission_tx(&mut tx, id).await?;
-            let candidate_slug = if name_changed {
+            let current_name: (Option<String>, Option<String>) =
+                sqlx::query_as("SELECT title, slug FROM conversations WHERE id = ?1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let apply_name = name_changed
+                && current_name.0 == name_baseline.title
+                && current_name.1 == name_baseline.slug;
+            let candidate_slug = if apply_name {
                 Some(conversation_name::allocate_slug_tx(&mut tx, name, id).await?)
             } else {
                 None
@@ -10928,7 +10943,7 @@ impl Database {
                    )",
             )
             .bind(candidate_slug.as_deref())
-            .bind(name_changed)
+            .bind(apply_name)
             .bind(name)
             .bind(update.project_id.is_some())
             .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
@@ -17629,12 +17644,18 @@ mod tests {
             worktree_path: NonEmptyString::new("/tmp/worktree-environment").unwrap(),
             base_branch: NonEmptyString::new("main").unwrap(),
         };
+        let baseline_conversation = db.get_conversation("conv-mode-environment").await.unwrap();
+        let name_baseline = ConversationNameBaseline {
+            title: baseline_conversation.title,
+            slug: baseline_conversation.slug,
+        };
 
         let outcome = db
             .update_conversation_creation_metadata_and_mode(
                 "job-mode-environment",
                 &claim,
                 "conv-mode-environment",
+                &name_baseline,
                 &ConversationCreationMetadataUpdate {
                     slug: None,
                     title: None,
@@ -17677,6 +17698,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_generated_name_does_not_overwrite_human_rename() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-name-race", "conv-name-race").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-name-race".into()),
+                &CreationClaimToken("token-name-race".into()),
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        let baseline_conversation = db.get_conversation("conv-name-race").await.unwrap();
+        let baseline = ConversationNameBaseline {
+            title: baseline_conversation.title,
+            slug: baseline_conversation.slug,
+        };
+        db.rename_conversation("conv-name-race", "Human title")
+            .await
+            .unwrap();
+
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-name-race",
+                &claim,
+                "conv-name-race",
+                &baseline,
+                &ConversationCreationMetadataUpdate {
+                    slug: Some("generated-title".to_string()),
+                    title: Some(Some("Generated title".to_string())),
+                    cwd: Some("/tmp/name-race".to_string()),
+                    project_id: Some(None),
+                    desired_base_branch: Some(Some("main".to_string())),
+                },
+                &ConvMode::Direct,
+                "name-race-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreationCasOutcome::Applied);
+
+        let conversation = db.get_conversation("conv-name-race").await.unwrap();
+        assert_eq!(conversation.title.as_deref(), Some("Human title"));
+        assert_eq!(conversation.slug.as_deref(), Some("human-title"));
+        assert_eq!(conversation.cwd, "/tmp/name-race");
+        assert_eq!(conversation.desired_base_branch.as_deref(), Some("main"));
+        assert_eq!(conversation.model, "name-race-model");
+        let stage: String = sqlx::query_scalar(
+            "SELECT stage FROM conversation_creation_jobs WHERE id = 'job-name-race'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stage,
+            creation_stage_db_str(CreationStage::ResolveRepository)
+        );
+    }
+
+    #[tokio::test]
     async fn stale_claim_cannot_commit_creation_metadata() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
@@ -17706,6 +17795,10 @@ mod tests {
                 "job-stale-metadata",
                 &claim,
                 "conv-stale-metadata",
+                &ConversationNameBaseline {
+                    title: before.title.clone(),
+                    slug: before.slug.clone(),
+                },
                 &ConversationCreationMetadataUpdate {
                     slug: Some("stale-slug".to_string()),
                     title: Some(Some("stale title".to_string())),
