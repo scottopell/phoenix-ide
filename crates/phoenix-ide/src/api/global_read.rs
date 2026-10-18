@@ -950,7 +950,7 @@ impl GlobalReadService {
         let (work_scope_id, worktree_path, cwd) = row;
         let (owner_name, owner_product_conversation_id, project_path) =
             sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            "SELECT COALESCE(NULLIF(root.chain_name, ''), NULLIF(root.title, ''), NULLIF(root.slug, ''), 'Untitled conversation'), owner.product_conversation_id, project.canonical_path
+            "SELECT COALESCE(NULLIF(root.title, ''), NULLIF(root.slug, ''), 'Untitled conversation'), owner.product_conversation_id, project.canonical_path
              FROM conversations owner
              LEFT JOIN projects project ON project.id = owner.project_id
              LEFT JOIN product_conversations product ON product.id = owner.product_conversation_id
@@ -1129,10 +1129,9 @@ impl GlobalReadService {
             .map_err(|error| error.to_string())?;
         let root = aggregate.root.conversation;
         let display_name = root
-            .chain_name
+            .title
             .clone()
             .filter(|name| !name.trim().is_empty())
-            .or_else(|| root.title.clone().filter(|title| !title.trim().is_empty()))
             .or_else(|| root.slug.clone().filter(|slug| !slug.trim().is_empty()))
             .unwrap_or_else(|| "Untitled conversation".to_string());
         Ok(serde_json::json!({
@@ -1207,13 +1206,14 @@ async fn resolve_conversation_read_target(
 async fn ordinary_product_citation(
     db: &crate::db::Database,
     conv: &Conversation,
-) -> Result<Option<(String, String)>, DbError> {
+) -> Result<Option<(String, Option<String>, String)>, DbError> {
     Ok(db
         .ordinary_product_conversation_citation(&conv.product_conversation_id)
         .await?
         .map(|citation| {
             (
                 citation.product_conversation_id.to_string(),
+                citation.root_slug,
                 citation.root_title,
             )
         }))
@@ -1226,7 +1226,7 @@ pub(crate) async fn format_global_search_hits(
     let mut out = String::new();
     let mut citations = std::collections::HashMap::<
         phoenix_core::domain::product_conversation::ProductConversationId,
-        Option<(String, String)>,
+        Option<(String, Option<String>, String)>,
     >::new();
     let mut sender_kinds = std::collections::HashMap::new();
     for hit in hits {
@@ -1249,13 +1249,22 @@ pub(crate) async fn format_global_search_hits(
                                 .or(conv.slug.clone())
                                 .unwrap_or_else(|| conv.id.clone())
                         },
-                        |(_, title)| title.clone(),
+                        |(_, _, title)| title.clone(),
                     );
-                    let stable_reference = citation.map(|(id, _)| format!("@conv:{id}"));
-                    let href = Some(conversation_message_href(
-                        &conv,
-                        Some((&hit.message_id, hit.message_type)),
-                    ));
+                    let stable_reference =
+                        citation.as_ref().map(|(id, _, _)| format!("@conv:{id}"));
+                    let href = Some(if let Some((id, slug, _)) = citation {
+                        let base =
+                            crate::api::product_conversations::product_route(slug.as_deref(), &id);
+                        let pin = format!("{base}?source_transcript={}", conv.id);
+                        if message_type_has_rendered_anchor(hit.message_type) {
+                            format!("{pin}#message-{}", hit.message_id)
+                        } else {
+                            pin
+                        }
+                    } else {
+                        conversation_message_href(&conv, Some((&hit.message_id, hit.message_type)))
+                    });
                     (title, stable_reference, href)
                 }
                 Err(DbError::ConversationNotFound(_)) => (hit.conversation_id.clone(), None, None),
@@ -1291,8 +1300,9 @@ async fn read_conversation_page(
     evidence_label: &str,
 ) -> Result<String, DbError> {
     let stable = ordinary_product_citation(db, conv).await?;
-    let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
-        format!("Conversation @conv:{id}\nconversation link: /c/{id}\n")
+    let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
+        let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
+        format!("Conversation @conv:{id}\nconversation link: {route}\n")
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -1301,7 +1311,7 @@ async fn read_conversation_page(
                 .or(conv.slug.as_deref())
                 .unwrap_or(&conv.id)
         },
-        |(_, title)| title.as_str(),
+        |(_, _, title)| title.as_str(),
     );
     let mut header = format!(
         "{stable_header}{evidence_label}: @transcript:{} — {}\nupdated: {}\n---\n",
@@ -1337,8 +1347,9 @@ async fn read_conversation_around_message(
     messages.extend(after);
 
     let stable = ordinary_product_citation(db, conv).await?;
-    let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
-        format!("Conversation @conv:{id}\nconversation link: /c/{id}\n")
+    let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
+        let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
+        format!("Conversation @conv:{id}\nconversation link: {route}\n")
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -1347,7 +1358,7 @@ async fn read_conversation_around_message(
                 .or(conv.slug.as_deref())
                 .unwrap_or(&conv.id)
         },
-        |(_, title)| title.as_str(),
+        |(_, _, title)| title.as_str(),
     );
     let mut out = format!(
         "{stable_header}exact evidence: @transcript:{} — {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
@@ -2065,13 +2076,12 @@ async fn resolve_reference_impl(
         return Ok(ResolveGlobalReferenceResponse {
             kind: "product_conversation".to_string(),
             id: typed_id.to_string(),
-            href: Some(format!("/c/{typed_id}")),
+            href: Some(super::product_conversations::canonical_route(&aggregate)),
             title: aggregate
                 .root
                 .conversation
-                .chain_name
+                .title
                 .clone()
-                .or(aggregate.root.conversation.title.clone())
                 .or(aggregate.root.conversation.slug.clone()),
             work_scope: current.work_scope,
             summary: format!(
@@ -2327,11 +2337,10 @@ async fn resolve_chain(
     Ok(ResolveGlobalReferenceResponse {
         kind: "chain".to_string(),
         id: root_id.to_string(),
-        href: Some(format!("/chains/{root_id}")),
+        href: Some(crate::api::product_conversations::product_route(root.slug.as_deref(), root.product_conversation_id.as_str())),
         title: root
-            .chain_name
+            .title
             .clone()
-            .or(root.title.clone())
             .or(root.slug.clone()),
         work_scope,
         summary: format!(
@@ -2382,16 +2391,13 @@ async fn resolve_work(
         members.push(root.clone());
     }
     let current = members.last().unwrap_or(&root);
-    let is_chain = members.len() >= 2;
-    let href = if is_chain {
-        format!("/chains/{}", root.id)
-    } else {
-        conversation_href(current)
-    };
+    let href = crate::api::product_conversations::product_route(
+        root.slug.as_deref(),
+        root.product_conversation_id.as_str(),
+    );
     let title = root
-        .chain_name
+        .title
         .clone()
-        .or(root.title.clone())
         .or(current.title.clone())
         .or(current.slug.clone())
         .unwrap_or_else(|| current.id.clone());
@@ -3550,6 +3556,14 @@ mod tests {
                 .await
                 .unwrap();
             assert!(search.contains(&format!("@conv:{}", conv.product_conversation_id)));
+            let product_route = crate::api::product_conversations::product_route(
+                conv.slug.as_deref(),
+                conv.product_conversation_id.as_str(),
+            );
+            assert!(
+                search.contains(&format!("{product_route}?source_transcript={}", conv.id)),
+                "{search}"
+            );
             assert!(search.contains(&format!(
                 "@transcript:{}#message-{}",
                 hit.conversation_id, hit.message_id
@@ -3613,7 +3627,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET chain_name = 'Effective Rename' WHERE id = 'root'")
+        sqlx::query("UPDATE conversations SET title = 'Effective Rename' WHERE id = 'root'")
             .execute(db.pool())
             .await
             .unwrap();
@@ -3872,7 +3886,7 @@ mod tests {
             let canonical = service.resolve_reference(&reference).await.unwrap();
             assert_eq!(canonical.id, stable.id);
             assert_eq!(canonical.work_scope, stable.work_scope);
-            assert_eq!(canonical.href, Some(format!("/c/{product_id}")));
+            assert_eq!(canonical.href.as_deref(), Some("/c/root-scope-2"));
         }
         let stable_json = serde_json::to_value(&stable).unwrap();
         assert_eq!(stable_json["work_scope"]["status"], "available");

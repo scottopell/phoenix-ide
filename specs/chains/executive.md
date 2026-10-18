@@ -18,7 +18,7 @@ clear only the matching question through `chainReducer`; failure preserves only
 the last attempt's partial text. Coverage includes the denied-call QA event
 sequence, request-budget exhaustion, wire serialization, and reducer isolation.
 
-Chains remain a derived layer over `conversations.continued_in_conv_id` plus persisted `chain_name` and `chain_qa` data. The chain page still resolves work identity from the active member, and chain-scoped SSE/Q&A remain separate from ordinary conversation SSE.
+The staged v0.14 naming change removes persisted `chain_name` in migration 129 and routes legacy naming endpoints to the root title authority; `chain_qa` remains persisted. This is not deployed or compiled qualification. The chain page still resolves work identity from the active member, and chain-scoped SSE/Q&A remain separate from ordinary conversation SSE.
 
 ## Status Summary
 
@@ -30,7 +30,7 @@ Chains remain a derived layer over `conversations.continued_in_conv_id` plus per
 | **REQ-CHN-004:** Lineage Q&A Streams on the Normal Conversation Surface | 🟡 Partial | Streaming lineage Q&A is shipped on the legacy chain page, not the normal ProductConversation surface. |
 | **REQ-CHN-005:** Q&A History Persists With the Product Conversation | 🟡 Partial | `chain_qa` persistence remains root-row/chain keyed rather than aggregate-owned. |
 | **REQ-CHN-006:** Independent Q&A Quality As History Accumulates | ✅ Complete (legacy current reality) | Stateless per-question invocation remains shipped. |
-| **REQ-CHN-007:** Conversation Title Belongs to the ProductConversation Aggregate | Not implemented | Editable/regenerated `chain_name` remains a separate shipped authority. |
+| **REQ-CHN-007:** Conversation Title Belongs to the ProductConversation Aggregate | Staged backend implementation | Root title is sole name authority; migration 129 and focused regressions authored. Compiled and UI qualification remain pending; see `specs/conversation-identity/executive.md`. |
 | **REQ-CHN-008:** The Normal Conversation Surface Shows Work Identity for the Live Attached Scope | 🟡 Partial | Work identity is shipped on the legacy chain page rather than the normal ProductConversation surface. |
 | **REQ-CHN-009:** Lineage Q&A Is a Read-Only Agentic Loop Scoped to One Product Conversation | 🟡 Partial | The retrieval-backed loop is shipped but remains bound to root-keyed chain identity. |
 | **REQ-CHN-010:** No Separate Chain-Specific Lifecycle or Management Actions | Not implemented | Dedicated chain naming, archive/delete, and management endpoints remain shipped. |

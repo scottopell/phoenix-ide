@@ -3,7 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { ApiResponseError, ConflictError, api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
-import { productConversationPresentationIndicator } from './ConversationList.presentation';
+import { productConversationPresentationIndicator, renamedProductConversationLocation } from './ConversationList.presentation';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
 import { SettingsDropdown } from './SettingsDropdown';
@@ -339,6 +339,10 @@ export function Sidebar({
     if (!productRenameTarget) return;
     try {
       const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      const activeRoute = renamedProductConversationLocation(
+        location.pathname, location.search, location.hash, productRenameTarget, renamed,
+      );
+      if (activeRoute) navigate(activeRoute, { replace: true, state: location.state });
       setProductConversations((rows) => rows.map((row) =>
         row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
       notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
@@ -350,7 +354,7 @@ export function Sidebar({
     } catch (err) {
       setProductRenameError(err instanceof Error ? err.message : 'Failed to rename');
     }
-  }, [productRenameTarget, onConversationCreated]);
+  }, [productRenameTarget, onConversationCreated, location, navigate]);
 
   const handleGenerateRename = useCallback(async () => {
     if (!renameTarget) return;
@@ -715,7 +719,7 @@ export function Sidebar({
       />
       <RenameDialog
         visible={productRenameTarget !== null}
-        currentName={productRenameTarget?.canonical_root.title ?? productRenameTarget?.presentation.display_name ?? ''}
+        currentName={productRenameTarget?.presentation.display_name ?? ''}
         error={productRenameError ?? undefined}
         onRename={handleProductRename}
         normalizeInput={(value) => value}

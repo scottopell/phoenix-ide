@@ -2195,7 +2195,7 @@ mod product_creation_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
         }
@@ -3255,6 +3255,57 @@ mod product_creation_tests {
             expired
         );
         assert_eq!(expired.claim_generation, claimed.claim.generation);
+    }
+
+    #[tokio::test]
+    async fn publication_allocates_duplicate_human_names_without_publishing_input_slugs() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (request, expected) in [("name-one", "über-東京"), ("name-two", "über-東京-2")] {
+            db.accept_product_creation(request, &intent("/tmp", "name projection"))
+                .await
+                .unwrap();
+            let claimed = db
+                .claim_product_creation(
+                    request,
+                    "worker",
+                    "token",
+                    Utc::now(),
+                    chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            advance_to_metadata(&db, request, &claimed.claim).await;
+            let mut conversation = published_conversation(
+                request,
+                claimed.job.product_conversation_id.clone(),
+                WorkScopeId::new(),
+                "/tmp",
+            );
+            conversation.title = Some("  Über 東京  ".to_string());
+            conversation.slug = Some("unrelated-input-slug".to_string());
+            let published = db
+                .publish_product_creation_atomically(&ProductCreationPublishInput {
+                    request_id: request.to_string(),
+                    claim: claimed.claim,
+                    conversation,
+                    authority_kind: AuthorityKind::Direct,
+                    environment: EnvironmentContext::UnownedCwd {
+                        cwd: "/tmp".to_string(),
+                    },
+                    git_publication: None,
+                })
+                .await
+                .unwrap();
+            assert!(published);
+            let stored = db.get_conversation(request).await.unwrap();
+            assert_eq!(stored.title.as_deref(), Some("Über 東京"));
+            assert_eq!(stored.slug.as_deref(), Some(expected));
+            assert_eq!(
+                stored.product_conversation_id,
+                claimed.job.product_conversation_id
+            );
+        }
     }
 
     #[tokio::test]

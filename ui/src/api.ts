@@ -221,11 +221,6 @@ export interface Conversation {
    *  action belongs on the continuation, enforced server-side with a 409
    *  `error_type = "continuation_exists"`). */
   continued_in_conv_id?: string | null;
-  /** User-set name for the chain rooted at this conversation (REQ-CHN-007).
-   *  Only meaningful on the root of a chain; non-root members will have
-   *  this absent or null. The sidebar falls back to the root conversation's
-   *  slug when this is null/absent. */
-  chain_name?: string | null;
   /** Server-computed presentation mode: idle | working | needs_action | error | done.
    *  Single source of truth for which visual indicator to render. */
   presentation_mode?: string;

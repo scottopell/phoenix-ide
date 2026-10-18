@@ -407,7 +407,7 @@ async fn process_claimed_product_creation(
         seed_parent_id: None,
         seed_label: None,
         continued_in_conv_id: None,
-        chain_name: None,
+
         llm_language: job.intent.llm_language,
         spawned_from_conversation_id: None,
     };
@@ -2871,7 +2871,7 @@ mod product_creation_delivery_replay_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
         }

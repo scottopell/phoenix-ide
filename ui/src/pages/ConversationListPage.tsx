@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { ApiResponseError, ConflictError, api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
 import type { Conversation, CodexLoginPreflight, ProductConversationListRow } from '../api';
@@ -11,6 +11,7 @@ import {
 import { NewConversationPage } from './NewConversationPage';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { ConversationList } from '../components/ConversationList';
+import { renamedProductConversationLocation } from '../components/ConversationList.presentation';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
@@ -52,6 +53,7 @@ function projectProductConversationHistory(
 
 export function ConversationListPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const isDesktop = useIsDesktop();
   const { theme, toggleTheme } = useTheme();
 
@@ -370,6 +372,10 @@ export function ConversationListPage() {
     if (!productRenameTarget) return;
     try {
       const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      const activeRoute = renamedProductConversationLocation(
+        location.pathname, location.search, location.hash, productRenameTarget, renamed,
+      );
+      if (activeRoute) navigate(activeRoute, { replace: true, state: location.state });
       setProductConversations((rows) => rows.map((row) =>
         row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
       notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
@@ -598,7 +604,7 @@ export function ConversationListPage() {
       />
       <RenameDialog
         visible={productRenameTarget !== null}
-        currentName={productRenameTarget?.canonical_root.title ?? productRenameTarget?.presentation.display_name ?? ''}
+        currentName={productRenameTarget?.presentation.display_name ?? ''}
         error={productRenameError}
         onRename={handleProductRename}
         normalizeInput={(value) => value}

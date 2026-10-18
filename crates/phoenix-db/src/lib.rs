@@ -33,6 +33,7 @@ pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
     PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
+mod conversation_name;
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -4369,17 +4370,13 @@ impl Database {
             RuntimeRole::User
         };
 
-        // Retry with a random suffix on slug collision (UNIQUE constraint).
+        let root_name = schema::title_from_slug(slug);
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
         let preserve_unattached_parent =
             matches!(expected_parent_scope, ExpectedParentScope::Snapshot(None));
         let (created_work_scope_id, inherited_effort, product_conversation_id) = loop {
-            let title_str = schema::title_from_slug(&actual_slug);
-            let mut tx = match &expected_parent_scope {
-                ExpectedParentScope::NotChecked => self.pool.begin().await?,
-                ExpectedParentScope::Snapshot(_) => self.pool.begin_with("BEGIN IMMEDIATE").await?,
-            };
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let (inherited_scope, inherited_effort, inherited_product_conversation_id) =
                 match &expected_parent_scope {
                     ExpectedParentScope::NotChecked => unchecked_parent_values
@@ -4432,6 +4429,14 @@ impl Database {
                     .await?;
                     product_conversation_id
                 };
+            if parent_id.is_none() && user_initiated {
+                actual_slug = conversation_name::allocate_slug_tx(&mut tx, &root_name, id).await?;
+            }
+            let title_str = if parent_id.is_none() && user_initiated {
+                root_name.clone()
+            } else {
+                schema::title_from_slug(&actual_slug)
+            };
             let generated_scope =
                 (inherited_scope.is_none() && !preserve_unattached_parent).then(|| {
                     let (scope_id, authority_kind, environment) =
@@ -4533,7 +4538,11 @@ impl Database {
             }
         };
 
-        let title = schema::title_from_slug(&actual_slug);
+        let title = if parent_id.is_none() && user_initiated {
+            root_name
+        } else {
+            schema::title_from_slug(&actual_slug)
+        };
         Ok(Conversation {
             id: id.to_string(),
             product_conversation_id,
@@ -4561,8 +4570,6 @@ impl Database {
             seed_label: seed_label.map(String::from),
             // REQ-BED-030: fresh conversations have not been continued.
             continued_in_conv_id: None,
-            // REQ-CHN-007: fresh conversations have no user-set chain name.
-            chain_name: None,
             llm_language,
             spawned_from_conversation_id: None,
         })
@@ -4744,7 +4751,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.id = ?1",
         )
@@ -4777,7 +4784,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.slug = ?1",
         )
@@ -4941,7 +4948,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
@@ -5085,7 +5092,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, attachment.work_scope_id, c.transcript_generation,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              JOIN conversation_work_scope_attachments attachment
@@ -5114,7 +5121,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
@@ -5141,7 +5148,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
@@ -5169,7 +5176,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
@@ -5265,7 +5272,7 @@ impl Database {
         let now_str = now.to_rfc3339();
         let intent_json = serde_json::to_string(&job.intent)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let (created_work_scope_id, authority_kind, environment) =
             Self::new_scope_for_conversation(cwd, &cm);
         let product_conversation_id =
@@ -5286,10 +5293,11 @@ impl Database {
         )
         .await?;
 
-        let mut actual_slug = slug.to_string();
+        let root_name = schema::title_from_slug(slug);
+        let mut actual_slug = conversation_name::allocate_slug_tx(&mut tx, &root_name, id).await?;
         let mut attempts = 0u8;
         loop {
-            let title_str = schema::title_from_slug(&actual_slug);
+            let title_str = root_name.clone();
             let result = sqlx::query(
                 "INSERT INTO conversations (id, product_conversation_id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
                  VALUES (?1, ?19, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'user', ?18)",
@@ -5357,7 +5365,7 @@ impl Database {
         insert_creation_job_images_tx(&mut tx, job).await?;
 
         tx.commit().await?;
-        let title = schema::title_from_slug(&actual_slug);
+        let title = root_name;
         Ok(Conversation {
             id: id.to_string(),
             product_conversation_id,
@@ -5383,7 +5391,7 @@ impl Database {
             seed_parent_id: seed_parent_id.map(String::from),
             seed_label: seed_label.map(String::from),
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language,
             spawned_from_conversation_id: None,
             transcript_generation: 1,
@@ -8571,7 +8579,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
@@ -8649,7 +8657,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
@@ -9637,9 +9645,6 @@ impl Database {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            // Continuations are not chain roots — chain_name lives on the
-            // root only (REQ-CHN-007).
-            chain_name: None,
             // Inherit language from the parent so the whole chain speaks the
             // same way.
             llm_language: parent.llm_language,
@@ -9793,7 +9798,7 @@ impl Database {
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                   c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                   c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
             FROM conversations c
             JOIN chain ON c.id = chain.id
@@ -9860,27 +9865,13 @@ impl Database {
         }
     }
 
-    /// Set or clear the `chain_name` on a conversation (REQ-CHN-007).
-    ///
-    /// Phase 2 owns the column write; the API layer (Phase 4) is responsible
-    /// for validating that `root_conv_id` is actually a chain root before
-    /// calling this. Writing to a non-root row is structurally permitted but
-    /// has no UI effect (`parse_conversation_row` only reads `chain_name`
-    /// from the root).
+    /// Compatibility entry point for the single aggregate name authority.
     ///
     /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    #[allow(dead_code)] // Wired via API handlers in Phase 4 (task 02690)
-    pub async fn set_chain_name(&self, root_conv_id: &str, name: Option<&str>) -> DbResult<()> {
-        let result = sqlx::query("UPDATE conversations SET chain_name = ?1 WHERE id = ?2")
-            .bind(name)
-            .bind(root_conv_id)
-            .execute(&self.pool)
+    /// Returns a database, identity, or admission error.
+    pub async fn set_chain_name(&self, reference: &str, name: Option<&str>) -> DbResult<()> {
+        self.set_ordinary_product_conversation_title(reference, name.unwrap_or("Conversation"))
             .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(root_conv_id.to_string()));
-        }
         Ok(())
     }
 
@@ -10607,7 +10598,7 @@ impl Database {
             }
         };
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         sqlx::query(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -10779,10 +10770,27 @@ impl Database {
         let mut connection = self.pool.acquire().await?;
         Self::reject_coordinator_conversation_mutation_conn(&mut connection, id).await?;
         drop(connection);
-        let base_slug = update.slug.clone();
-        let mut candidate_slug = base_slug.clone();
-        let mut attempts = 0u8;
-        loop {
+        let name = update
+            .title
+            .as_ref()
+            .and_then(|title| title.as_deref())
+            .or(update.slug.as_deref())
+            .unwrap_or("Conversation")
+            .trim();
+        if name.is_empty() {
+            return Err(DbError::Serialization(
+                "conversation name must not be empty".to_string(),
+            ));
+        }
+        let name_changed = update.title.is_some() || update.slug.is_some();
+        {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            crate::close_foundation::require_product_conversation_admission_tx(&mut tx, id).await?;
+            let candidate_slug = if name_changed {
+                Some(conversation_name::allocate_slug_tx(&mut tx, name, id).await?)
+            } else {
+                None
+            };
             let now = Utc::now().to_rfc3339();
             let result = sqlx::query(
                 "UPDATE conversations
@@ -10803,8 +10811,8 @@ impl Database {
                  WHERE id = ?10",
             )
             .bind(candidate_slug.as_deref())
-            .bind(update.title.is_some())
-            .bind(update.title.as_ref().and_then(|v| v.as_deref()))
+            .bind(name_changed)
+            .bind(name)
             .bind(update.cwd.as_deref())
             .bind(update.project_id.is_some())
             .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
@@ -10817,7 +10825,7 @@ impl Database {
             )
             .bind(&now)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await;
             match result {
                 Ok(result) => {
@@ -10832,26 +10840,14 @@ impl Database {
                         .bind(cwd)
                         .bind(&now)
                         .bind(id)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await?;
                         if updated.rows_affected() == 0 {
                             return Err(DbError::ConversationNotFound(id.to_string()));
                         }
                     }
+                    tx.commit().await?;
                     return Ok(());
-                }
-                Err(sqlx::Error::Database(ref e))
-                    if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
-                {
-                    attempts += 1;
-                    let slug = base_slug.as_deref().unwrap_or_default();
-                    if attempts >= 10 {
-                        let uuid_str = uuid::Uuid::new_v4().to_string();
-                        candidate_slug =
-                            Some(format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str)));
-                    } else {
-                        candidate_slug = Some(format!("{slug}-{:04x}", rand::random::<u16>()));
-                    }
                 }
                 Err(e) => return Err(DbError::Sqlx(e)),
             }
@@ -10879,12 +10875,28 @@ impl Database {
         Self::reject_coordinator_conversation_mutation_conn(&mut connection, id).await?;
         drop(connection);
         let cm = conv_mode_columns(mode);
-        let base_slug = update.slug.clone();
-        let mut candidate_slug = base_slug.clone();
-        let mut attempts = 0u8;
-        loop {
+        let name = update
+            .title
+            .as_ref()
+            .and_then(|title| title.as_deref())
+            .or(update.slug.as_deref())
+            .unwrap_or("Conversation")
+            .trim();
+        if name.is_empty() {
+            return Err(DbError::Serialization(
+                "conversation name must not be empty".to_string(),
+            ));
+        }
+        let name_changed = update.title.is_some() || update.slug.is_some();
+        {
             let now = Utc::now().to_rfc3339();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            crate::close_foundation::require_product_conversation_admission_tx(&mut tx, id).await?;
+            let candidate_slug = if name_changed {
+                Some(conversation_name::allocate_slug_tx(&mut tx, name, id).await?)
+            } else {
+                None
+            };
             let result = sqlx::query(
                 "UPDATE conversations
                  SET slug = COALESCE(?1, slug),
@@ -10916,8 +10928,8 @@ impl Database {
                    )",
             )
             .bind(candidate_slug.as_deref())
-            .bind(update.title.is_some())
-            .bind(update.title.as_ref().and_then(|v| v.as_deref()))
+            .bind(name_changed)
+            .bind(name)
             .bind(update.project_id.is_some())
             .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
             .bind(update.desired_base_branch.is_some())
@@ -11061,19 +11073,6 @@ impl Database {
                     tx.commit().await?;
                     return Ok(CreationCasOutcome::Applied);
                 }
-                Err(sqlx::Error::Database(ref e))
-                    if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
-                {
-                    attempts += 1;
-                    let slug = base_slug.as_deref().unwrap_or_default();
-                    if attempts >= 10 {
-                        let uuid_str = uuid::Uuid::new_v4().to_string();
-                        candidate_slug =
-                            Some(format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str)));
-                    } else {
-                        candidate_slug = Some(format!("{slug}-{:04x}", rand::random::<u16>()));
-                    }
-                }
                 Err(e) => return Err(DbError::Sqlx(e)),
             }
         }
@@ -11091,7 +11090,7 @@ impl Database {
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
@@ -11629,38 +11628,13 @@ impl Database {
         }
     }
 
-    /// Rename conversation (update slug)
+    /// Rename the owning ordinary ProductConversation, preserving transcript identity.
     ///
     /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn rename_conversation(&self, id: &str, new_slug: &str) -> DbResult<()> {
-        let now = Utc::now();
-
-        // Check if slug already exists
-        let row =
-            sqlx::query("SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1 AND id != ?2)")
-                .bind(new_slug)
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
-        let exists: bool = row.get(0);
-
-        if exists {
-            return Err(DbError::SlugExists(new_slug.to_string()));
-        }
-
-        let result =
-            sqlx::query("UPDATE conversations SET slug = ?1, updated_at = ?2 WHERE id = ?3")
-                .bind(new_slug)
-                .bind(now.to_rfc3339())
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(id.to_string()));
-        }
+    /// Returns a database, identity, or admission error.
+    pub async fn rename_conversation(&self, id: &str, name: &str) -> DbResult<()> {
+        self.set_ordinary_product_conversation_title(id, name)
+            .await?;
         Ok(())
     }
 
@@ -14773,9 +14747,6 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     let continued_in_conv_id: Option<String> = row
         .try_get::<Option<String>, _>("continued_in_conv_id")
         .unwrap_or(None);
-    let chain_name: Option<String> = row
-        .try_get::<Option<String>, _>("chain_name")
-        .unwrap_or(None);
     let spawned_from_conversation_id: Option<String> = row
         .try_get::<Option<String>, _>("spawned_from_conversation_id")
         .unwrap_or(None);
@@ -14839,7 +14810,6 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         seed_parent_id,
         seed_label,
         continued_in_conv_id,
-        chain_name,
         llm_language,
         spawned_from_conversation_id,
     })
@@ -15134,13 +15104,7 @@ async fn insert_steering_entry_tx(
     Ok(())
 }
 
-/// finds the deterministic child id already present is a no-op (REQ-PROJ-034
-/// recovery model) — but a UNIQUE `slug` collision with a DIFFERENT conversation
-/// is NOT swallowed; it surfaces as an error rather than silently skipping the
-/// insert (which would FK-fail the following seed-message insert and roll back
-/// the whole resolve). The caller owns id uniqueness; the fork slug is derived
-/// from the deterministic conv id (see `build_child_conversation`) so it cannot
-/// realistically clash with a distinct conversation.
+/// Inserts a transcript idempotently by primary key, projecting fresh ordinary root names.
 async fn insert_conversation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conv: &Conversation,
@@ -15162,6 +15126,31 @@ async fn insert_conversation_tx(
             .fetch_one(&mut **tx)
             .await?
             != 0;
+    let mut projected = conv.clone();
+    if !conversation_exists
+        && conv.user_initiated
+        && conv.runtime_role == RuntimeRole::User
+        && conv.parent_conversation_id.is_none()
+    {
+        let has_predecessor: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE product_conversation_id = ?1 AND continued_in_conv_id = ?2)",
+        )
+        .bind(conv.product_conversation_id.as_str())
+        .bind(&conv.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !has_predecessor {
+            let name = conv
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Conversation");
+            projected.slug = Some(conversation_name::allocate_slug_tx(tx, name, &conv.id).await?);
+            projected.title = Some(name.to_string());
+        }
+    }
+    let conv = &projected;
     let generated_scope = if conv.runtime_role == RuntimeRole::Coordinator
         || conv.attached_work_scope_id.is_some()
         || conversation_exists
@@ -15193,11 +15182,11 @@ async fn insert_conversation_tx(
             id, product_conversation_id, slug, title, parent_conversation_id, user_initiated, state, state_kind,
             state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id,
             desired_base_branch, seed_parent_id, seed_label,
-            continued_in_conv_id, chain_name, llm_language,
+            continued_in_conv_id, llm_language,
             spawned_from_conversation_id,
             cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
             runtime_role, work_scope_id, service_tier
-        ) VALUES (?1, ?31, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+        ) VALUES (?1, ?30, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -15220,7 +15209,6 @@ async fn insert_conversation_tx(
     .bind(&conv.seed_parent_id)
     .bind(&conv.seed_label)
     .bind(&conv.continued_in_conv_id)
-    .bind(&conv.chain_name)
     .bind(conv.llm_language.as_str())
     .bind(&conv.spawned_from_conversation_id)
     .bind(cm.kind)
@@ -17703,6 +17691,7 @@ mod tests {
             .await
             .unwrap();
 
+        let before = db.get_conversation("conv-stale-metadata").await.unwrap();
         let outcome = db
             .update_conversation_creation_metadata_and_mode(
                 "job-stale-metadata",
@@ -17725,7 +17714,8 @@ mod tests {
 
         assert_eq!(outcome, CreationCasOutcome::ClaimLost);
         let conversation = db.get_conversation("conv-stale-metadata").await.unwrap();
-        assert_ne!(conversation.slug.as_deref(), Some("stale-slug"));
+        assert_eq!(conversation.slug, before.slug);
+        assert_eq!(conversation.title, before.title);
         assert_ne!(conversation.cwd, "/stale");
         assert!(matches!(
             conversation.state,
@@ -26931,7 +26921,8 @@ mod tests {
             second_slug.starts_with("my-slug-"),
             "Expected suffix, got: {second_slug}"
         );
-        assert_ne!(second_slug, "my-slug");
+        assert_eq!(second_slug, "my-slug-2");
+        assert_eq!(second.title, first.title);
 
         // Both are retrievable by ID
         assert_eq!(
@@ -28343,8 +28334,7 @@ mod tests {
         assert_eq!(job.intent.approved_task.unwrap().plan, approval.plan);
     }
 
-    /// REQ-CHN-007: a `chain_name` set on the root round-trips through
-    /// INSERT (raw UPDATE) and SELECT, and the unset case stays NULL.
+    /// The legacy naming entry point uses the sole title authority in all readers.
     #[tokio::test]
     async fn test_chain_name_round_trips() {
         let db = Database::open_in_memory().await.unwrap();
@@ -28353,28 +28343,25 @@ mod tests {
             .create_conversation("conv-unset", "slug-unset", "/tmp", true, None, None)
             .await
             .unwrap();
-        assert_eq!(unset.chain_name, None);
+        assert_eq!(unset.title.as_deref(), Some("Slug Unset"));
 
         let fetched_unset = db.get_conversation("conv-unset").await.unwrap();
-        assert_eq!(fetched_unset.chain_name, None);
+        assert_eq!(fetched_unset.title, unset.title);
 
         db.create_conversation("conv-named", "slug-named", "/tmp", true, None, None)
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET chain_name = ?1 WHERE id = ?2")
-            .bind("auth refactor")
-            .bind("conv-named")
-            .execute(&db.pool)
+        db.set_chain_name("conv-named", Some("auth refactor"))
             .await
             .unwrap();
 
         let fetched_named = db.get_conversation("conv-named").await.unwrap();
-        assert_eq!(fetched_named.chain_name, Some("auth refactor".to_string()));
+        assert_eq!(fetched_named.title, Some("auth refactor".to_string()));
 
         // List queries also project the column.
         let listed = db.list_conversations().await.unwrap();
         let named = listed.iter().find(|c| c.id == "conv-named").unwrap();
-        assert_eq!(named.chain_name, Some("auth refactor".to_string()));
+        assert_eq!(named.title, Some("auth refactor".to_string()));
     }
 
     /// REQ-CHN-002: `chain_members_forward` returns members in chain order
@@ -28686,17 +28673,18 @@ mod tests {
             .await
             .unwrap();
         let conv = db.get_conversation("scn-root").await.unwrap();
-        assert_eq!(conv.chain_name, Some("auth refactor".to_string()));
+        assert_eq!(conv.title, Some("auth refactor".to_string()));
 
         db.set_chain_name("scn-root", Some("auth-refactor-v2"))
             .await
             .unwrap();
         let conv = db.get_conversation("scn-root").await.unwrap();
-        assert_eq!(conv.chain_name, Some("auth-refactor-v2".to_string()));
+        assert_eq!(conv.title, Some("auth-refactor-v2".to_string()));
 
         db.set_chain_name("scn-root", None).await.unwrap();
         let conv = db.get_conversation("scn-root").await.unwrap();
-        assert_eq!(conv.chain_name, None);
+        assert_eq!(conv.title.as_deref(), Some("Conversation"));
+        assert_eq!(conv.slug.as_deref(), Some("conversation"));
 
         // Missing conversation surfaces as a typed error, not silent no-op.
         let err = db.set_chain_name("ghost", Some("x")).await.unwrap_err();
@@ -28810,8 +28798,7 @@ mod tests {
         );
     }
 
-    /// Renaming to a slug already used by another conversation returns
-    /// `DbError::SlugExists` and leaves the original row untouched.
+    /// Duplicate human names allocate distinct projections rather than rejecting the name.
     #[tokio::test]
     async fn test_rename_conversation_duplicate_slug() {
         let db = Database::open_in_memory().await.unwrap();
@@ -28822,14 +28809,18 @@ mod tests {
             .await
             .unwrap();
 
-        match db.rename_conversation("rc-b", "slug-taken").await {
-            Err(DbError::SlugExists(slug)) => assert_eq!(slug, "slug-taken"),
-            other => panic!("expected SlugExists, got {other:?}"),
-        }
-
-        // rc-b's slug is unchanged after the rejected rename.
+        db.rename_conversation("rc-a", "Shared Human Name")
+            .await
+            .unwrap();
+        db.rename_conversation("rc-b", "Shared Human Name")
+            .await
+            .unwrap();
+        let a = db.get_conversation("rc-a").await.unwrap();
         let b = db.get_conversation("rc-b").await.unwrap();
-        assert_eq!(b.slug.as_deref(), Some("slug-b"));
+        assert_eq!(a.title, b.title);
+        assert_eq!(a.title.as_deref(), Some("Shared Human Name"));
+        assert_eq!(a.slug.as_deref(), Some("shared-human-name"));
+        assert_eq!(b.slug.as_deref(), Some("shared-human-name-2"));
     }
 
     /// Renaming a conversation whose slug already equals the target is a
@@ -30569,6 +30560,7 @@ mod tests {
             id: "conv-b".to_string(),
             product_conversation_id: colliding_product_conversation_id,
             slug: Some("fork-collide".to_string()),
+            user_initiated: false,
             ..conv_a
         };
         let mut tx = db.pool.begin().await.unwrap();

@@ -64,6 +64,7 @@ pub struct ProductConversationListProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrdinaryProductConversationCitation {
     pub product_conversation_id: ProductConversationId,
+    pub root_slug: Option<String>,
     pub root_title: String,
 }
 
@@ -473,98 +474,59 @@ impl Database {
         reference: &str,
         title: &str,
     ) -> DbResult<ProductConversationId> {
-        self.mutate_ordinary_product_conversation_title_authority(reference, title)
-            .await
+        self.mutate_ordinary_product_conversation_title_authority(reference, title, None)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(reference.to_string()))
     }
 
-    /// Sets the compatibility chain-name override without replacing the aggregate title fallback.
+    /// Commits an asynchronously generated name only if the canonical root still has its baseline.
+    /// Returns `Ok(None)` when a human or newer naming operation changed it while generation ran.
+    pub async fn set_ordinary_product_conversation_title_if_unchanged(
+        &self,
+        reference: &str,
+        title: &str,
+        baseline_title: Option<&str>,
+        baseline_slug: Option<&str>,
+    ) -> DbResult<Option<ProductConversationId>> {
+        self.mutate_ordinary_product_conversation_title_authority(
+            reference,
+            title,
+            Some((baseline_title, baseline_slug)),
+        )
+        .await
+    }
+
+    /// Compatibility route for the ordinary aggregate name.
     ///
     /// # Errors
-    ///
-    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
-    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
-    /// and a database or decode error when persisted aggregate data is invalid.
+    /// Returns an identity, admission, or database error.
     pub async fn set_ordinary_product_conversation_legacy_title(
         &self,
         reference: &str,
         title: &str,
     ) -> DbResult<ProductConversationId> {
-        self.mutate_ordinary_product_conversation_legacy_title_authority(reference, Some(title))
+        self.set_ordinary_product_conversation_title(reference, title)
             .await
     }
 
-    /// Clears the legacy name override while preserving the aggregate title.
+    /// Compatibility clear resets the single name, rather than exposing an older override.
     ///
     /// # Errors
-    ///
-    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
-    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
-    /// and a database or decode error when persisted aggregate data is invalid.
+    /// Returns an identity, admission, or database error.
     pub async fn clear_ordinary_product_conversation_legacy_title(
         &self,
         reference: &str,
     ) -> DbResult<ProductConversationId> {
-        self.mutate_ordinary_product_conversation_legacy_title_authority(reference, None)
+        self.set_ordinary_product_conversation_title(reference, "Conversation")
             .await
-    }
-
-    async fn mutate_ordinary_product_conversation_legacy_title_authority(
-        &self,
-        reference: &str,
-        title: Option<&str>,
-    ) -> DbResult<ProductConversationId> {
-        let mut connection = self.pool.acquire().await?;
-        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
-        let now = chrono::Utc::now();
-        let result = async {
-            let resolved =
-                Self::resolve_ordinary_product_conversation_on(&mut transaction, reference).await?;
-            crate::close_foundation::require_product_conversation_admission_tx(
-                &mut transaction,
-                &resolved.requested_transcript_row_id,
-            )
-            .await?;
-            let result = sqlx::query(
-                "UPDATE conversations
-                 SET chain_name = ?1, updated_at = ?2
-                 WHERE product_conversation_id = ?3
-                   AND user_initiated = 1
-                   AND runtime_role = 'user'
-                   AND parent_conversation_id IS NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM conversations predecessor
-                       WHERE predecessor.product_conversation_id = conversations.product_conversation_id
-                         AND predecessor.continued_in_conv_id = conversations.id
-                   )",
-            )
-            .bind(title)
-            .bind(now.to_rfc3339())
-            .bind(resolved.product_conversation_id.as_str())
-            .execute(&mut *transaction)
-            .await?;
-            if result.rows_affected() == 0 {
-                return Err(DbError::ConversationNotFound(reference.to_string()));
-            }
-            Ok::<ProductConversationId, DbError>(resolved.product_conversation_id)
-        }
-        .await;
-        match result {
-            Ok(product_conversation_id) => {
-                transaction.commit().await?;
-                Ok(product_conversation_id)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     async fn mutate_ordinary_product_conversation_title_authority(
         &self,
         reference: &str,
         title: &str,
-    ) -> DbResult<ProductConversationId> {
+        baseline: Option<(Option<&str>, Option<&str>)>,
+    ) -> DbResult<Option<ProductConversationId>> {
         let mut connection = self.pool.acquire().await?;
         let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
         let now = chrono::Utc::now();
@@ -598,20 +560,43 @@ impl Database {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             };
             let root_id: String = row.try_get("id")?;
+            if let Some((baseline_title, baseline_slug)) = baseline {
+                let current = sqlx::query("SELECT title, slug FROM conversations WHERE id = ?1")
+                    .bind(&root_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                let current_title: Option<String> = current.try_get("title")?;
+                let current_slug: Option<String> = current.try_get("slug")?;
+                if current_title.as_deref() != baseline_title
+                    || current_slug.as_deref() != baseline_slug
+                {
+                    return Ok(None);
+                }
+            }
+            let title = title.trim();
+            if title.is_empty() {
+                return Err(DbError::Serialization(
+                    "conversation name must not be empty".into(),
+                ));
+            }
+            let slug =
+                crate::conversation_name::allocate_slug_tx(&mut transaction, title, &root_id)
+                    .await?;
             let result = sqlx::query(
                 "UPDATE conversations
-                 SET title = ?1, chain_name = NULL, updated_at = ?2
+                 SET title = ?1, slug = ?4, updated_at = ?2
                  WHERE id = ?3",
             )
             .bind(title)
             .bind(now.to_rfc3339())
             .bind(&root_id)
+            .bind(&slug)
             .execute(&mut *transaction)
             .await?;
             if result.rows_affected() == 0 {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             }
-            Ok::<ProductConversationId, DbError>(resolved.product_conversation_id)
+            Ok::<Option<ProductConversationId>, DbError>(Some(resolved.product_conversation_id))
         }
         .await;
         match result {
@@ -684,7 +669,7 @@ impl Database {
              )
              SELECT product.id AS product_conversation_id, product.ordinary_lifecycle,
                     root.id AS root_transcript_row_id, root.slug AS root_slug,
-                    COALESCE(root.chain_name, root.title) AS root_title,
+                    root.title AS root_title,
                     latest.id AS latest_transcript_row_id, latest.state AS latest_state,
                     latest.continued_in_conv_id AS latest_continued_in_conv_id,
                     activity.updated_at, activity.has_awaiting_task_approval,
@@ -718,8 +703,8 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<Option<OrdinaryProductConversationCitation>> {
         let row = sqlx::query(
-            "SELECT product.id AS product_conversation_id, \
-                    COALESCE(root.chain_name, root.title, root.slug, root.id) AS root_title \
+            "SELECT product.id AS product_conversation_id, root.slug AS root_slug, \
+                    COALESCE(root.title, root.slug, root.id) AS root_title \
              FROM product_conversations product \
              JOIN conversations root ON root.product_conversation_id = product.id \
              WHERE product.id = ?1 AND product.kind = 'ordinary' \
@@ -740,6 +725,7 @@ impl Database {
                     row.try_get::<String, _>("product_conversation_id")?,
                 )
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
+                root_slug: row.try_get("root_slug")?,
                 root_title: row.try_get("root_title")?,
             })
         })
@@ -1229,7 +1215,7 @@ impl Database {
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier, c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id, c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.id = ?1",
         ).bind(id).try_map(super::parse_conversation_row).fetch_one(&mut *connection).await.map_err(|error| {
@@ -3489,7 +3475,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET title = 'Aggregate Title', chain_name = 'Legacy Override' WHERE id = ?1")
+        sqlx::query("UPDATE conversations SET title = 'Aggregate Title' WHERE id = ?1")
             .bind(&conversation.id)
             .execute(db.pool())
             .await
@@ -3629,27 +3615,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_title_clear_restores_original_title_fallback() {
+    async fn legacy_title_clear_resets_the_single_name() {
         let db = Database::open_in_memory().await.unwrap();
         let conversation = db
             .create_conversation("legacy-title", "original-title", "/tmp", true, None, None)
             .await
             .unwrap();
-        let original_title = conversation.title.clone();
 
         db.set_ordinary_product_conversation_legacy_title(&conversation.id, "Temporary Override")
             .await
             .unwrap();
         let renamed = db.get_conversation(&conversation.id).await.unwrap();
-        assert_eq!(renamed.chain_name.as_deref(), Some("Temporary Override"));
-        assert_eq!(renamed.title, original_title);
+        assert_eq!(renamed.title.as_deref(), Some("Temporary Override"));
+        assert_eq!(renamed.slug.as_deref(), Some("temporary-override"));
 
         db.clear_ordinary_product_conversation_legacy_title(&conversation.id)
             .await
             .unwrap();
         let cleared = db.get_conversation(&conversation.id).await.unwrap();
-        assert_eq!(cleared.chain_name, None);
-        assert_eq!(cleared.title, original_title);
+        assert_eq!(cleared.title.as_deref(), Some("Conversation"));
+        assert_eq!(cleared.slug.as_deref(), Some("conversation"));
     }
 
     #[tokio::test]
@@ -3659,13 +3644,11 @@ mod tests {
             .create_conversation("rename-history", "rename-history", "/tmp", true, None, None)
             .await
             .unwrap();
-        sqlx::query(
-            "UPDATE conversations SET title = 'Original', chain_name = 'Legacy' WHERE id = ?1",
-        )
-        .bind(&conversation.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
+        sqlx::query("UPDATE conversations SET title = 'Original' WHERE id = ?1")
+            .bind(&conversation.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query(
             "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
         )
@@ -3684,7 +3667,7 @@ mod tests {
             Err(DbError::ProductConversationUnavailable(id))
                 if id == conversation.product_conversation_id
         ));
-        let row = sqlx::query("SELECT title, chain_name FROM conversations WHERE id = ?1")
+        let row = sqlx::query("SELECT title, slug FROM conversations WHERE id = ?1")
             .bind(&conversation.id)
             .fetch_one(db.pool())
             .await
@@ -3696,10 +3679,8 @@ mod tests {
             Some("Original")
         );
         assert_eq!(
-            row.try_get::<Option<String>, _>("chain_name")
-                .unwrap()
-                .as_deref(),
-            Some("Legacy")
+            row.try_get::<Option<String>, _>("slug").unwrap().as_deref(),
+            conversation.slug.as_deref()
         );
     }
 

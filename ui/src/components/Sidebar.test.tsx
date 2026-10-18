@@ -71,7 +71,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   lifecycle: { state: 'open', close_action: { availability: 'available' } },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
-  presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
+  presentation: { kind: 'state', display_name: overrides.canonical_root?.title ?? `Root ${id}`, presentation_mode: 'idle' },
   ...overrides,
 });
 
@@ -156,7 +156,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => {
-      expect(container.querySelector('[aria-label="Open Display pc-open"]')).toHaveClass('active');
+      expect(container.querySelector('[aria-label="Open Open Root"]')).toHaveClass('active');
     });
 
     fireEvent.click(getByRole('button', { name: /Expand sidebar/ }));

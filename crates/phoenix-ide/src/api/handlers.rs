@@ -2079,12 +2079,24 @@ async fn get_product_conversation_creation(
     } else {
         false
     };
-    product_creation_status_response(job, delivery_retryable).map(Json)
+    let route = if job.status == "published" {
+        Some(super::product_conversations::canonical_route(
+            &state
+                .db
+                .get_ordinary_product_conversation(&job.product_conversation_id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        ))
+    } else {
+        None
+    };
+    product_creation_status_response(job, delivery_retryable, route).map(Json)
 }
 
 fn product_creation_status_response(
     job: crate::db::ProductCreationJobRecord,
     delivery_retryable: bool,
+    canonical_route: Option<String>,
 ) -> Result<super::types::ProductConversationCreationStatusResponse, AppError> {
     use super::types::{
         ProductConversationCreationFailureStatus as Failure,
@@ -2132,7 +2144,9 @@ fn product_creation_status_response(
         })?;
         return Ok(Response::Published {
             request_id: job.request_id,
-            canonical_route: format!("/c/{product_id}"),
+            canonical_route: canonical_route.ok_or_else(|| {
+                AppError::Internal("published creation missing canonical route".to_string())
+            })?,
             product_conversation_id: product_id.to_string(),
             transcript_row_id,
         });
@@ -2473,7 +2487,7 @@ mod product_creation_acceptance_tests {
                 projected_job.status = (*status).to_string();
                 projected_job.last_error = Some("provisioning stopped".to_string());
                 let projected = serde_json::to_value(
-                    product_creation_status_response(projected_job, false).unwrap(),
+                    product_creation_status_response(projected_job, false, None).unwrap(),
                 )
                 .unwrap();
                 assert_eq!(projected["kind"], kind);
@@ -2504,7 +2518,7 @@ mod product_creation_acceptance_tests {
         let mut retryable = job.clone();
         retryable.status = "delivery_failed".to_string();
         let projected =
-            serde_json::to_value(product_creation_status_response(retryable, true).unwrap())
+            serde_json::to_value(product_creation_status_response(retryable, true, None).unwrap())
                 .unwrap();
         assert_eq!(projected["kind"], "failed");
         assert_eq!(projected["status"], "delivery_failed");
@@ -2516,7 +2530,7 @@ mod product_creation_acceptance_tests {
         assert!(projected.get("transcript_row_id").is_none());
         let mut unknown = job;
         unknown.status = "unknown".to_string();
-        assert!(product_creation_status_response(unknown, false).is_err());
+        assert!(product_creation_status_response(unknown, false, None).is_err());
     }
 
     #[tokio::test]
@@ -2572,7 +2586,7 @@ mod product_creation_acceptance_tests {
         let mut cancelled = job.clone();
         cancelled.status = "cancelled".to_string();
         let recovery =
-            serde_json::to_value(product_creation_status_response(cancelled, false).unwrap())
+            serde_json::to_value(product_creation_status_response(cancelled, false, None).unwrap())
                 .unwrap();
         assert_eq!(recovery["kind"], "cancelled");
         assert_eq!(
@@ -2582,21 +2596,21 @@ mod product_creation_acceptance_tests {
         assert!(recovery.get("transcript_row_id").is_none());
         let mut published = job;
         published.status = "published".to_string();
-        assert!(product_creation_status_response(published.clone(), false).is_err());
+        assert!(product_creation_status_response(published.clone(), false, None).is_err());
         published.published_product_id = Some(published.product_conversation_id.clone());
         published.published_conversation_id = Some("canonical-transcript".to_string());
-        let ready =
-            serde_json::to_value(product_creation_status_response(published, false).unwrap())
-                .unwrap();
+        let ready = serde_json::to_value(
+            product_creation_status_response(
+                published,
+                false,
+                Some("/c/readable-name".to_string()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(ready["kind"], "published");
         assert_eq!(ready["transcript_row_id"], "canonical-transcript");
-        assert_eq!(
-            ready["canonical_route"],
-            format!(
-                "/c/{}",
-                pending["product_conversation_id"].as_str().unwrap()
-            )
-        );
+        assert_eq!(ready["canonical_route"], "/c/readable-name");
         assert_eq!(
             get("/api/product-conversations/creation/unknown-request".to_string())
                 .await
@@ -7658,6 +7672,21 @@ async fn rename_conversation(
     Path(id): Path<String>,
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
+    let resolved = state
+        .runtime
+        .db()
+        .resolve_ordinary_product_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let id = state
+        .runtime
+        .db()
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?
+        .root
+        .conversation
+        .id;
     state
         .runtime
         .db()
@@ -7677,6 +7706,23 @@ async fn regenerate_conversation_name(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationResponse>, AppError> {
+    let resolved = state
+        .runtime
+        .db()
+        .resolve_ordinary_product_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let root = state
+        .runtime
+        .db()
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?
+        .root
+        .conversation;
+    let id = root.id.clone();
+    let baseline_title = root.title.clone();
+    let baseline_slug = root.slug.clone();
     let opening = state
         .runtime
         .db()
@@ -7718,23 +7764,23 @@ async fn regenerate_conversation_name(
         )
     })?;
 
-    rename_conversation_slug(&state, &id, &generated).await?;
-    conversation_response(&state, &id).await
-}
-
-async fn rename_conversation_slug(state: &AppState, id: &str, slug: &str) -> Result<(), AppError> {
-    state
+    let committed = state
         .runtime
         .db()
-        .rename_conversation(id, slug)
+        .set_ordinary_product_conversation_title_if_unchanged(
+            resolved.product_conversation_id.as_str(),
+            &generated,
+            baseline_title.as_deref(),
+            baseline_slug.as_deref(),
+        )
         .await
-        .map_err(|e| match e {
-            crate::db::DbError::SlugExists(_) => {
-                AppError::BadRequest("Slug already exists".to_string())
-            }
-            crate::db::DbError::ConversationNotFound(_) => AppError::NotFound(e.to_string()),
-            _ => AppError::Internal(e.to_string()),
-        })
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if committed.is_none() {
+        return Err(AppError::Internal(
+            "conversation name changed while regeneration was running".to_string(),
+        ));
+    }
+    conversation_response(&state, &id).await
 }
 
 async fn conversation_response(
@@ -17131,7 +17177,8 @@ mod regenerate_conversation_name_tests {
         )
         .await
         .expect("rename");
-        assert_eq!(response.conversation["slug"], "After Rename");
+        assert_eq!(response.conversation["slug"], "after-rename");
+        assert_eq!(response.conversation["title"], "After Rename");
         assert!(response.conversation.get("presentation_mode").is_some());
         assert!(response.conversation.get("requires_action").is_some());
         assert!(response.conversation.get("work_scope_key").is_some());
@@ -17199,7 +17246,7 @@ mod regenerate_conversation_name_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_generated_slug_returns_error_and_leaves_slug_unchanged() {
+    async fn duplicate_generated_name_allocates_projection_and_preserves_prose() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
             StubLlm::Ok("Taken Slug"),
         ))))
@@ -17208,13 +17255,16 @@ mod regenerate_conversation_name_tests {
         seed_conversation(&state, "conv-rename", "deterministic-conv-rename").await;
         seed_opening(&state, "conv-rename", "rename this later").await;
 
-        assert!(regenerate(&state, "conv-rename").await.is_err());
+        let Json(response) = regenerate(&state, "conv-rename").await.expect("regenerate");
+        assert_eq!(response.conversation["slug"], "taken-slug-2");
+        assert_eq!(response.conversation["title"], "Taken Slug");
         let reloaded = state
             .db
             .get_conversation("conv-rename")
             .await
             .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-rename"));
+        assert_eq!(reloaded.slug.as_deref(), Some("taken-slug-2"));
+        assert_eq!(reloaded.title.as_deref(), Some("Taken Slug"));
     }
 
     #[tokio::test]
@@ -20700,7 +20750,7 @@ mod detached_task_worktree_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }

@@ -64,10 +64,8 @@ pub(super) const CHAIN_NAME_MAX_CHARS: usize = 200;
 /// Chain snapshot returned by `GET /api/chains/:rootId` and the body of the
 /// PATCH name response.
 ///
-/// `display_name` is the resolved label the UI renders without re-running
-/// the `chain_name → root.title → slug` fallback. `chain_name` is the
-/// user-set override (or `None` when unset) — kept distinct so an "edit"
-/// affordance can show the unset state. `current_member_count` and
+/// `display_name` is the root title. The legacy `chain_name` response slot
+/// is always null; it is not a separate editable authority. `current_member_count` and
 /// `current_total_messages` let the UI compute staleness against each
 /// stored Q&A's snapshot integers (REQ-CHN-005) without a second roundtrip.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -273,6 +271,11 @@ pub async fn regenerate_chain_name(
     Path(root_id): Path<String>,
 ) -> Result<Json<ChainView>, AppError> {
     validate_chain_root(&state, &root_id).await?;
+    let baseline = state
+        .db
+        .get_conversation(&root_id)
+        .await
+        .map_err(db_to_app)?;
 
     let member_ids = state
         .db
@@ -345,17 +348,24 @@ pub async fn regenerate_chain_name(
         ));
     }
 
-    state
+    let committed = state
         .db
-        .set_ordinary_product_conversation_title(
+        .set_ordinary_product_conversation_title_if_unchanged(
             &root_id,
             normalized
                 .as_deref()
                 .expect("empty generated name rejected"),
+            baseline.title.as_deref(),
+            baseline.slug.as_deref(),
         )
         .await
         .map_err(db_to_app)?;
 
+    if committed.is_none() {
+        return Err(AppError::Internal(
+            "conversation name changed while regeneration was running".to_string(),
+        ));
+    }
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
 }
@@ -744,7 +754,7 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
     Ok(ChainView {
         root_conv_id: root_conv.id.clone(),
         product_conversation_id: root_conv.product_conversation_id.to_string(),
-        chain_name: root_conv.chain_name.clone(),
+        chain_name: None,
         display_name,
         archived: product_conversation.product_conversation.ordinary_lifecycle()
             == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
@@ -823,14 +833,8 @@ fn build_member_summaries(members: &[Conversation]) -> Vec<ChainMemberSummary> {
         .collect()
 }
 
-/// Resolve the user-visible chain name: explicit `chain_name` if set,
-/// else the conversation title, else the slug, else the bare id.
+/// Resolve the root conversation display name.
 fn resolve_display_name(root: &Conversation) -> String {
-    if let Some(name) = root.chain_name.as_deref() {
-        if !name.is_empty() {
-            return name.to_string();
-        }
-    }
     if let Some(title) = root.title.as_deref() {
         if !title.is_empty() {
             return title.to_string();
@@ -1023,7 +1027,7 @@ mod tests {
         Ok(ChainView {
             root_conv_id: root_conv.id.clone(),
             product_conversation_id: root_conv.product_conversation_id.to_string(),
-            chain_name: root_conv.chain_name.clone(),
+            chain_name: None,
             display_name,
             archived: product_conversation.product_conversation.ordinary_lifecycle()
             == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
@@ -1200,7 +1204,7 @@ mod tests {
         );
         let view = build_view_for_test(&db, &chain_qa, "dn-a").await.unwrap();
 
-        assert_eq!(view.chain_name.as_deref(), Some("auth refactor"));
+        assert_eq!(view.chain_name, None);
         assert_eq!(view.display_name, "auth refactor");
     }
 
@@ -1228,11 +1232,6 @@ mod tests {
 
     // ----- rename interaction: chain-name override vs conversation rename -
 
-    /// Set a conversation's title directly (mirrors what a title-generation
-    /// pass would persist), so a test can exercise the title-vs-slug branch of
-    /// `resolve_display_name`. `rename_conversation` deliberately does NOT touch
-    /// the title column, so the title is the only thing that can shadow the slug
-    /// in the fallback.
     async fn set_title(db: &Database, conv_id: &str, title: Option<&str>) {
         sqlx::query("UPDATE conversations SET title = ?1 WHERE id = ?2")
             .bind(title)
@@ -1242,11 +1241,8 @@ mod tests {
             .unwrap();
     }
 
-    /// REQ-CHN-007 / REQ-CHN-010: an explicit `chain_name` override is the
-    /// top of the `chain_name → title → slug → id` precedence, so renaming the
-    /// root conversation's slug leaves `display_name` pinned to the override.
     #[tokio::test]
-    async fn chain_name_override_survives_root_conversation_rename() {
+    async fn legacy_name_is_replaced_by_root_conversation_rename() {
         let db = Database::open_in_memory().await.unwrap();
         build_linear_chain(&db, &["ro-a", "ro-b"]).await;
         add_continuation_summary(&db, "ro-a", "first").await;
@@ -1267,23 +1263,10 @@ mod tests {
         );
         let view = build_view_for_test(&db, &chain_qa, "ro-a").await.unwrap();
 
-        // The override is unaffected by the root slug rename.
-        assert_eq!(view.chain_name.as_deref(), Some("auth refactor"));
-        assert_eq!(view.display_name, "auth refactor");
+        assert_eq!(view.chain_name, None);
+        assert_eq!(view.display_name, "slug-ro-renamed");
     }
 
-    /// With the chain-name override cleared and the root's stored title NULL,
-    /// the `display_name` fallback follows the renamed root: `get_conversation`
-    /// synthesizes a title from the (renamed) slug via `title_from_slug`, so the
-    /// resolved name tracks the rename. This proves the fallback is not pinned
-    /// to a stale value once the override and stored title are both absent.
-    ///
-    /// Subtlety the assertion captures: `rename_conversation` writes only the
-    /// slug, but `get_conversation` derives a title-cased title from that slug
-    /// when the title column is NULL — so `display_name` is the title-cased
-    /// form of the new slug, not the raw slug. (The bare-slug rung of
-    /// `resolve_display_name` is therefore unreachable through
-    /// `get_conversation`, which always yields some title when a slug exists.)
     #[tokio::test]
     async fn fallback_tracks_root_rename_when_title_absent() {
         use phoenix_core::domain::db_schema::title_from_slug;
@@ -1309,7 +1292,7 @@ mod tests {
 
         assert_eq!(view.chain_name, None);
         // The fallback tracked the rename via the slug-derived title.
-        assert_eq!(view.display_name, title_from_slug("renamed-root-slug"));
+        assert_eq!(view.display_name, "renamed-root-slug");
         // And it is not pinned to the pre-rename slug ("slug-fr-a", the build
         // helper's auto-assigned slug for the root).
         assert_ne!(
@@ -1319,15 +1302,8 @@ mod tests {
         );
     }
 
-    /// Interaction subtlety worth pinning: `rename_conversation` updates the
-    /// slug but NOT the title, and the title outranks the slug in the
-    /// `display_name` fallback. So when no chain-name override is set and the
-    /// root still carries its creation-time title, renaming the slug does NOT
-    /// move `display_name` — it stays on the (now-stale-relative-to-slug)
-    /// title. This is by-design precedence, not a bug; the test documents it so
-    /// a future change to either rung is a conscious decision.
     #[tokio::test]
-    async fn root_rename_is_masked_by_stale_title() {
+    async fn root_rename_replaces_stale_title() {
         let db = Database::open_in_memory().await.unwrap();
         build_linear_chain(&db, &["mt-a", "mt-b"]).await;
         add_continuation_summary(&db, "mt-a", "first").await;
@@ -1346,8 +1322,7 @@ mod tests {
         let view = build_view_for_test(&db, &chain_qa, "mt-a").await.unwrap();
 
         assert_eq!(view.chain_name, None);
-        // Title outranks the renamed slug.
-        assert_eq!(view.display_name, "Original Title");
+        assert_eq!(view.display_name, "brand-new-slug");
     }
 
     #[tokio::test]

@@ -192,6 +192,12 @@ rather than as a separate chain-specific naming action or lifecycle
 THE SYSTEM SHALL apply the chosen title consistently anywhere this one
 product conversation is named
 
+THE SYSTEM SHALL use the canonical root transcript title as that single name authority
+AND SHALL derive the current readable route from it under
+`specs/conversation-identity/requirements.md` REQ-CID-001–006
+AND SHALL route legacy chain-name mutations to that same authority, without
+retaining an independently editable chain name
+
 **Rationale:** The user names a conversation, not a second chain object.
 A separate chain-name affordance would duplicate the ordinary
 conversation title concept and risk divergence.
