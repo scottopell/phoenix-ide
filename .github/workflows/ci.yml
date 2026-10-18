@@ -192,7 +192,7 @@ jobs:
 
   qualify-history-realserver:
     name: typed codegen and isolated instrumented opening witness (not shipping)
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'qualification/continuation-opening-codegen' || github.head_ref == 'integration/v013-history-current-main') }}
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'qualification/continuation-opening-codegen' || github.head_ref == 'integration/v013-history-current-main' || github.head_ref == 'prepare/exact-f16-stock-admission') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -201,6 +201,7 @@ jobs:
       RUST_TEST_THREADS: "2"
       APP_ROOT: ${{ github.workspace }}/pinned-app
       APP_BUILD_RECEIPT: ${{ github.workspace }}/history-build.json
+      STOCK_PREPARE_ONLY: ${{ github.head_ref == 'prepare/exact-f16-stock-admission' }}
       PHOENIX_CHECK_ALL: "1"
       PHOENIX_CHECK_WORKERS: "2"
       CARGO_TERM_COLOR: always
@@ -239,29 +240,17 @@ jobs:
       - name: Compiler-free harness regressions
         working-directory: harness
         run: |
+          python3 -B tests/e2e/history_stock_prepare.test.py
+          python3 -B tests/e2e/history_runtime_publication.test.py
           uv run tests/e2e/history_browser.test.py
           node --test ui/scripts/qualify-history-realserver.selftest.mjs
           node --check ui/scripts/qualify-history-realserver.mjs
-      - name: Build separate stock and controlled UI artifacts (not runtime qualification)
+      - name: Build stock UI before receiving executable (not runtime qualification)
         timeout-minutes: 10
         working-directory: pinned-app/ui
         run: |
           pnpm install --frozen-lockfile
           node node_modules/vite/bin/vite.js build
-          node node_modules/vite/bin/vite.js build --config vite.controlled-functional.config.ts --mode controlled-functional
-          python3 - <<'PY'
-          import importlib.util,json
-          from pathlib import Path
-          root=Path.cwd().parent
-          spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
-          import sys
-          module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
-          source='f16afb227d9336a863c0b0345960ea9a6d62b7c7'; tree='369305dcd94862d4ee12e7af9fd463d5da14d808'
-          for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
-              module.admit_artifact(root, root/'ui'/name, source, tree, mode)
-          (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
-              'ui_artifacts':module.build_owner_binding(root), 'scope':'hosted exact-source two-build attestation; not runtime acceptance'},indent=2))
-          PY
       - name: Genuine typed-contract codegen through existing dev.py
         timeout-minutes: 10
         shell: bash
@@ -376,13 +365,15 @@ jobs:
           completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
           (root.parent/'opening-instrumented-unit.log').write_text(completed.stdout+completed.stderr)
           receipt = json.loads((root.parent/'opening-codegen-receipt.json').read_text())
-          ui_owner = json.loads((root.parent/'opening-ui-build-owner.json').read_text())
-          assert ui_owner['app_source'] == receipt['app_source'] and ui_owner['app_tree'] == receipt['app_tree']
-          receipt['ui_artifacts'] = ui_owner['ui_artifacts']
           receipt.update({'evidence_class':'instrumented_cfg_test_library_not_shipping_runtime',
                           'executable_sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),
                           'compiled_executable_path':str(executable.relative_to(root)),
                           'compiler_artifact_selector':selector,
+                          'compiler_target_features':next(a['features'] for a in artifacts if a.get('executable') == str(executable)),
+                          'compiler_target_profile':next(a['profile'] for a in artifacts if a.get('executable') == str(executable)),
+                          'cargo_version':subprocess.check_output(['cargo','--version'],text=True).strip(),
+                          'build_configuration_files':{name:hashlib.sha256((root/name).read_bytes()).hexdigest()
+                              for name in ['Cargo.toml','crates/phoenix-ide/Cargo.toml','.cargo/config.toml'] if (root/name).is_file()},
                           'ui_lock_sha256':hashlib.sha256((root/'ui/pnpm-lock.yaml').read_bytes()).hexdigest(),
                           'ui_files':{str(path.relative_to(root/'ui/dist')):hashlib.sha256(path.read_bytes()).hexdigest()
                                       for path in sorted((root/'ui/dist').rglob('*'))
@@ -432,6 +423,62 @@ jobs:
               receipt['production_capacity_tests'].append({'command':command[1:], 'exit':outcome.returncode, 'passed':passed})
               (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
               assert outcome.returncode == 0 and passed == 1, 'production capacity/privacy guard failed or ran zero tests; see retained log'
+          PY
+      - name: Retain stock receiving libtest before any controlled UI build (not shipping)
+        working-directory: pinned-app
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,shutil,sys
+          from pathlib import Path
+          root=Path.cwd(); out=root.parent
+          sys.path.insert(0,str(out/'harness/tests/e2e'))
+          import history_controlled_artifact as artifact
+          source='f16afb227d9336a863c0b0345960ea9a6d62b7c7'; tree='369305dcd94862d4ee12e7af9fd463d5da14d808'
+          stock=artifact.admit_artifact(root,root/'ui/stock-natural-build.json',source,tree,'stock_natural')
+          artifact.require_stock(stock)
+          assert not (root/'ui/controlled-functional-build.json').exists(), 'stock receiving build must precede controlled UI'
+          receipt=json.loads((out/'opening-instrumented-receipt.json').read_text())
+          assert receipt['app_source'] == source and receipt['app_tree'] == tree
+          destination=out/'opening-stock-libtest'
+          shutil.copyfile(out/'opening-instrumented-libtest',destination); destination.chmod(0o700)
+          assert hashlib.sha256(destination.read_bytes()).hexdigest() == receipt['executable_sha256']
+          receipt.update({'receiving_ui_evidence_class':'stock_natural',
+              'stock_manifest_sha256':stock.manifest_sha256,
+              'stock_ui_files':dict(stock.ui_files),
+              'build_order':'stock UI, default-feature cfg(test) libtest, then separate controlled UI',
+              'runtime_admission':'not_executed', 'full_acceptance':False, 'overhead_clearance':False,
+              'scope':'retained stock receiving cfg(test) executable; not shipping, not fixture admission or sampled evidence'})
+          (out/'opening-stock-receiving-build.json').write_text(json.dumps(receipt,indent=2))
+          PY
+      - name: Build separate controlled UI and bind existing two-build receipt
+        timeout-minutes: 10
+        working-directory: pinned-app/ui
+        run: |
+          node node_modules/vite/bin/vite.js build --config vite.controlled-functional.config.ts --mode controlled-functional
+          python3 - <<'PY'
+          import importlib.util,json
+          from pathlib import Path
+          root=Path.cwd().parent
+          spec=importlib.util.spec_from_file_location('artifact', root.parent/'harness/tests/e2e/history_controlled_artifact.py')
+          import sys
+          module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module)
+          source='f16afb227d9336a863c0b0345960ea9a6d62b7c7'; tree='369305dcd94862d4ee12e7af9fd463d5da14d808'
+          for mode,name in [('stock_natural','stock-natural-build.json'),('controlled_functional','controlled-functional-build.json')]:
+              module.admit_artifact(root, root/'ui'/name, source, tree, mode)
+          (root.parent/'opening-ui-build-owner.json').write_text(json.dumps({'app_source':source,'app_tree':tree,
+              'ui_artifacts':module.build_owner_binding(root), 'scope':'hosted exact-source two-build attestation; not runtime acceptance'},indent=2))
+          receipt=json.loads((root.parent/'opening-instrumented-receipt.json').read_text())
+          ui_owner = json.loads((root.parent/'opening-ui-build-owner.json').read_text())
+          assert ui_owner['app_source'] == receipt['app_source'] and ui_owner['app_tree'] == receipt['app_tree']
+          receipt['ui_artifacts'] = ui_owner['ui_artifacts']
+          stock=json.loads((root.parent/'opening-stock-receiving-build.json').read_text())
+          assert stock['executable_sha256'] == module.digest(root.parent/'opening-stock-libtest') == receipt['executable_sha256']
+          assert stock['stock_manifest_sha256'] == ui_owner['ui_artifacts']['stock_natural']['manifest_sha256']
+          assert stock['stock_ui_files'] == receipt['ui_files']
+          receipt['receiving_ui_evidence_class']='stock_natural'
+          (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          (root.parent/'opening-stock-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
+          print('Stock cfg(test) receiving artifact bound; existing joint CLI performs fixture admission AND bounded natural sampling, not shipping/overhead clearance.')
           PY
       - name: Compiler-free instrumented harness regressions
         working-directory: harness
@@ -491,6 +538,7 @@ jobs:
         working-directory: pinned-app/ui
         run: pnpm exec playwright install --with-deps chromium
       - name: Exact Linux owned Chrome group, executable shim and real layout qualification
+        if: ${{ env.STOCK_PREPARE_ONLY != 'true' }}
         working-directory: pinned-app
         timeout-minutes: 15
         env:
@@ -500,7 +548,20 @@ jobs:
           cargo build -p phoenix-tools --bin phoenix-browser
           export PHOENIX_TEST_CHROME=1
           bash "$GITHUB_WORKSPACE/harness/scripts/qualify-owned-chrome-teardown.sh"
+      - name: Stock joint fixture admission and bounded natural sampling (not shipping or overhead clearance)
+        if: ${{ env.STOCK_PREPARE_ONLY == 'true' }}
+        timeout-minutes: 10
+        working-directory: harness
+        run: |
+          chmod 700 ../opening-stock-libtest
+          uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_opening_browser.py \
+            --joint-telemetry \
+            --app-root "$GITHUB_WORKSPACE/pinned-app" \
+            --instrumented-exe "$GITHUB_WORKSPACE/opening-stock-libtest" \
+            --instrumented-receipt "$GITHUB_WORKSPACE/opening-stock-instrumented-receipt.json" \
+            --output "$GITHUB_WORKSPACE/opening-stock-evidence" --timeout 500
       - name: Controlled-functional six-report witness (separate from immutable stock baseline)
+        if: ${{ env.STOCK_PREPARE_ONLY != 'true' }}
         working-directory: harness
         run: |
           chmod 700 ../opening-instrumented-libtest
@@ -510,8 +571,15 @@ jobs:
             --instrumented-exe "$GITHUB_WORKSPACE/opening-instrumented-libtest" \
             --instrumented-receipt "$GITHUB_WORKSPACE/opening-instrumented-receipt.json" \
             --output "$GITHUB_WORKSPACE/opening-browser-evidence" --timeout 420
+      - name: Publish only stock allowlisted synthetic runtime distributions (never auth DB or raw OTLP)
+        if: ${{ always() && env.STOCK_PREPARE_ONLY == 'true' }}
+        working-directory: harness
+        run: |
+          python3 -B tests/e2e/history_runtime_publication.py \
+            --input "$GITHUB_WORKSPACE/opening-stock-evidence" \
+            --output "$GITHUB_WORKSPACE/opening-stock-publication.json"
       - name: Retain receipts on success or failure
-        if: ${{ always() }}
+        if: ${{ always() && env.STOCK_PREPARE_ONLY != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: opening-codegen-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
@@ -539,6 +607,37 @@ jobs:
             pinned-app-full-ui.log
             pinned-app-full-ui-receipt.json
             owned-chrome-linux/
+      - name: Retain stock artifacts and safe publication on success or failure
+        if: ${{ always() && env.STOCK_PREPARE_ONLY == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: opening-stock-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            opening-codegen-receipt.json
+            opening-bound-ceiling/
+            opening-codegen.log
+            opening-coordinator-home-fixture.log
+            opening-coordinator-home-fixture-receipt.json
+            pinned-app/ui/src/generated/
+            opening-instrumented-libtest
+            opening-instrumented-receipt.json
+            opening-ui-build-owner.json
+            pinned-app/ui/stock-natural-build.json
+            pinned-app/ui/dist/
+            opening-stock-libtest
+            opening-stock-receiving-build.json
+            opening-stock-instrumented-receipt.json
+            opening-stock-publication.json
+            pinned-app/ui/controlled-functional-build.json
+            opening-instrumented-unit.log
+            opening-collector-witness-unit.log
+            opening-sdk-metadata-unit.log
+            opening-production-capacity-unit.log
+            opening-instrumented-selector.log
+            pinned-app-full-ui.log
+            pinned-app-full-ui-receipt.json
 
   check-ui:
     name: check (ui/specs)
