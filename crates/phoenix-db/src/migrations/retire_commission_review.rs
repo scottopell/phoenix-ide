@@ -1202,7 +1202,8 @@ mod tests {
                  )
              );
              ALTER TABLE conversations ADD COLUMN product_conversation_id TEXT
-                 REFERENCES product_conversations(id) ON DELETE CASCADE;",
+                 REFERENCES product_conversations(id) ON DELETE CASCADE;
+             ALTER TABLE conversations DROP COLUMN chain_name;",
         )
         .execute(&upgraded)
         .await
