@@ -1,14 +1,20 @@
 # ADR-128: Repair failure stopped truth includes persistent auto-start absence
 
-- Status: Accepted
-- Date: 2026-10-18
-- Affects: REQ-LDD-025, exact current-schema launchd repair failure settlement
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Affects:** REQ-LDD-025, exact current-schema launchd repair failure settlement
 
 ## Context
 
 The exact current-schema repair publishes the repair LaunchAgent plist before removing the old restore reservation, persisting terminal child status, and releasing the original claim. A failure after publication can confirm that the current launchd job is absent while leaving the persistent plist available for a later login or reboot to load. Reporting `failed_stopped` from process absence alone would therefore assert a stable stopped condition that the host has not established.
 
 The target plist path can also contain unknown or mismatched bytes. Deleting those bytes without proving that they are the sealed repair plist would turn failure settlement into unowned cleanup and destroy diagnostic evidence.
+
+## Options considered
+
+1. Treat process absence as sufficient stopped truth. Rejected because persistent launchd registration can reactivate the process after login or reboot.
+2. Unlink the target path after hashing it in place. Rejected because a pathname replacement between hash and unlink can destroy unknown evidence.
+3. Atomically isolate the directory entry, validate through a no-follow descriptor, and distinguish exact cleanup from unknown evidence. Chosen because removal authority and stopped truth remain structurally coupled.
 
 ## Decision
 
