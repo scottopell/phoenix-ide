@@ -47,6 +47,7 @@ jobs:
       channel: ${{ steps.ver.outputs.channel }}
       commit: ${{ steps.ver.outputs.commit }}
       macos_matrix: ${{ steps.macos.outputs.matrix }}
+      operation: ${{ steps.macos.outputs.operation }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -170,6 +171,12 @@ jobs:
         env:
           OPERATION: ${{ inputs.operation }}
         run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo "operation=$OPERATION" >> "$GITHUB_OUTPUT"
+          else
+            echo "operation=" >> "$GITHUB_OUTPUT"
+          fi
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$OPERATION" == prepare-incident-237100-arm64 ]]; then
             echo 'matrix={"include":[{"runner":"macos-15","target":"aarch64-apple-darwin","asset":"phoenix_ide-aarch64-apple-darwin"}]}' >> "$GITHUB_OUTPUT"
           else

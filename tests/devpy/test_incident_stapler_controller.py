@@ -301,6 +301,17 @@ sys.exit(entry(json.loads(sys.argv[3])))
 class WorkflowTests(unittest.TestCase):
     def test_incident_and_normal_matrix_execute_actual_workflow_shell(self):
         shell = step_shell("Select protected macOS architecture matrix")
+        gate_outputs = WORKFLOW.split("    outputs:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertIn("      operation: ${{ steps.macos.outputs.operation }}\n", gate_outputs)
+        producer = WORKFLOW.split("      - name: Select protected macOS architecture matrix", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("        id: macos\n", producer)
+        package = WORKFLOW.split("      - name: Sign, verify, notarize", 1)[1].split("      - name:", 1)[0]
+        timeout = re.search(
+            r"timeout-minutes: \$\{\{ needs\.gate\.outputs\.operation == '([^']+)' && (\d+) \|\| (\d+) \}\}", package,
+        )
+        self.assertIsNotNone(timeout)
+        incident_operation, incident_minutes, ordinary_minutes = timeout.groups()
+        self.assertEqual(incident_operation, controller.OPERATION)
         for event, operation, targets in [
             ("workflow_dispatch", controller.OPERATION, [controller.TARGET]),
             ("workflow_dispatch", "prepare-main", [controller.TARGET, "x86_64-apple-darwin"]),
@@ -312,7 +323,12 @@ class WorkflowTests(unittest.TestCase):
                 output = Path(temp) / "output"
                 subprocess.run(["bash", "-euo", "pipefail", "-c", shell], check=True,
                                env=dict(os.environ, GITHUB_EVENT_NAME=event, OPERATION=operation, GITHUB_OUTPUT=str(output)))
-                matrix = json.loads(output.read_text().removeprefix("matrix="))["include"]
+                produced = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                expected_operation = operation if event == "workflow_dispatch" else ""
+                self.assertEqual(produced["operation"], expected_operation)
+                minutes = int(incident_minutes if produced["operation"] == incident_operation else ordinary_minutes)
+                self.assertEqual(minutes, 30 if len(targets) == 1 else 360)
+                matrix = json.loads(produced["matrix"])["include"]
                 self.assertEqual([row["target"] for row in matrix], targets)
                 self.assertEqual(matrix[0], dict(runner="macos-15", target=controller.TARGET, asset=f"phoenix_ide-{controller.TARGET}"))
                 if len(matrix) == 2:
