@@ -36,6 +36,7 @@ import { useIsDesktop } from '../hooks';
 import { useDensity } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
+import { SubAgentTaskDetails } from './SubAgentTaskDetails';
 
 import { linkifyText } from '../utils/linkify';
 import { getMessageMarkdown } from '../utils/messageCopy';
@@ -3355,10 +3356,15 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
  * card. Owns its own read-only stream; `running` is the card's authoritative
  * status (the card is mounted whenever it's visible).
  */
-function ChildConversationActivity({ agentId, expanded, running, finalResult }: { agentId: string; expanded: boolean; running: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
+function ChildConversationActivity({ agentId, task, expanded, running, finalResult }: { agentId: string; task: string; expanded: boolean; running: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
   const inline = useConversationInlineStream(agentId, expanded, running);
   if (!expanded) return null;
-  return <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />;
+  return (
+    <>
+      <SubAgentTaskDetails task={task} inline={inline} />
+      <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />
+    </>
+  );
 }
 
 function SubAgentActivityCard({
@@ -3415,6 +3421,7 @@ function SubAgentActivityCard({
       {!isActive && (
         <ChildConversationActivity
           agentId={agentId}
+          task={task}
           expanded={expanded}
           running={running}
           finalResult={resultText ? { text: resultText, statusClass } : undefined}

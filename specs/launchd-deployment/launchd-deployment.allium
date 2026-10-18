@@ -13,6 +13,12 @@ config {
     current_schema_growth_margin_divisor: Integer = 10
     current_schema_growth_margin_min_bytes: Integer = 1_073_741_824
     current_schema_growth_margin_max_bytes: Integer = 8_589_934_592
+    current_repair_quarantine_attempts: Integer = 8
+    current_repair_plist_evidence_max_bytes: Integer = 1_048_576
+    current_repair_quarantine_max_entries: Integer = 128
+    current_repair_quarantine_max_total_bytes: Integer = 33_554_432
+    current_repair_quarantine_headroom_entries: Integer = 26
+    current_repair_quarantine_headroom_bytes: Integer = 27_262_976
     current_schema_evidence_budget_bytes: Integer = 2_097_152
     current_schema_max_proof_bytes: Integer = 1_048_576
 }
@@ -1623,6 +1629,10 @@ entity CurrentSchemaRepair {
 --   committed/pending parent with target128 commit proof and exact parent claim.
 --   The exact original/repair pair is solely the pin table there; no other pair
 --   can be inferred from ancestry, version equality or unchanged registry bytes.
+-- current_repair_failure_route_valid(repair) -> Boolean
+--   Before any failure teardown, the parent service label is the fixed Phoenix label
+--   and its target plist is exactly that label's canonical owning-user LaunchAgents
+--   path. Mutable child or parent evidence cannot redirect stop or quarantine.
 -- current_repair_inputs_qualified(repair) -> Boolean
 --   Exact REQ-COMP-015 repair candidate/version/git-object registry and original
 --   target128; accepted prepared receipt/signing evidence; separately clean full
@@ -1640,7 +1650,21 @@ entity CurrentSchemaRepair {
 -- current_repair_offline_verified(repair) -> Boolean
 --   Parent operation lock held, original helper absent, service confirmed absent,
 --   database exclusive with exact target128/integrity/FK and adequate held restore
---   capacity plus protected floor/evidence allowance. No child claim is acquired.
+--   capacity plus protected floor/evidence allowance. After full sealed-child
+--   validation, a persistent target plist and every retained quarantine are absent
+--   or byte-exact sealed repair input. Admission enforces current_repair_quarantine_max_entries
+--   during enumeration and current_repair_quarantine_max_total_bytes during each pass,
+--   while reserving current_repair_quarantine_headroom_entries and
+--   current_repair_quarantine_headroom_bytes for both publication retirements and all
+--   three bounded settlement passes. A failure-state retry may consume that reserved capacity.
+--   Reads use non-following nonblocking descriptors, enforce
+--   current_repair_plist_evidence_max_bytes, and require stable file identity, type,
+--   size and change metadata for the complete read, recheck pathname-to-descriptor
+--   identity, and revalidate accepted metadata tokens at admission close. Repeated
+--   complete enumeration and digest passes plus a stable containing-
+--   directory change token reject replaced or newly added quarantine entries. Unknown,
+--   mutable, oversized, nonregular or unreadable
+--   evidence refuses resume. No child claim is acquired.
 -- current_repair_target_verified(repair) -> Boolean
 --   Successful exact-candidate reconciliation, exact complete target128/integrity/FK
 --   and capacity checked; durable child proof bound to seal and parent proof hash.
@@ -1662,13 +1686,19 @@ entity CurrentSchemaRepair {
 -- current_repair_checkpoint_durable(repair) -> Boolean
 --   The named child checkpoint and its required proof hash are durably fsynced.
 -- current_repair_finalization_complete(repair) -> Boolean
---   Repair deployed SHA and child plist published/fsynced; only owned publication
---   temporary and old restore reservation removed/fsynced; both proofs/backup retained.
+--   Repair deployed SHA and child plist published/fsynced; publication temporary
+--   atomically retired/fsynced into authenticated retained quarantine without pathname
+--   deletion; only the owned old restore reservation removed/fsynced; proofs retained.
 -- CurrentRepairReconciliationInvoked(repair), CurrentRepairStarted(repair),
 -- CurrentRepairFailure(repair), CurrentRepairPrepared(repair),
 -- CurrentRepairTargetChecked(repair), CurrentRepairHealthy(repair),
 -- CurrentRepairFinalized(repair) are observations of the exact retained child.
 -- CurrentRepairStopConfirmed(repair) -> Boolean: exact service absence confirmed.
+-- CurrentRepairPersistentAutoStartAbsent(repair) -> Boolean: the auto-loaded target
+--   path is absent after at most current_repair_quarantine_attempts atomic isolation
+--   attempts, directory fsync and explicit recheck. Quarantine contents remain evidence
+--   and do not affect this stopped-truth fact. Continued recreation through the bound
+--   makes the fact false rather than extending settlement indefinitely.
 -- CurrentRepairClaimReleased(repair) -> Boolean: only exact parent claim unlinked/fsynced.
 -- CurrentRepairNeverStartsOriginalOrPredecessor(repair) -> Boolean: every repair path
 --   excludes original/predecessor install/start and database snapshot replay.
@@ -1811,6 +1841,7 @@ rule StopWithMalformedCurrentRepairStatus {
 rule FailCurrentRepairStopped {
     when: CurrentRepairFailure(repair)
     requires: CurrentRepairStopConfirmed(repair)
+    requires: CurrentRepairPersistentAutoStartAbsent(repair)
     ensures: repair.state = failed_stopped
     ensures: repair.resume_from != null
     ensures: repair.failure != null
@@ -1820,12 +1851,22 @@ rule FailCurrentRepairStopped {
 
 rule FailCurrentRepairStopUnconfirmed {
     when: CurrentRepairFailure(repair)
-    requires: not CurrentRepairStopConfirmed(repair)
+    requires: not (CurrentRepairStopConfirmed(repair) and CurrentRepairPersistentAutoStartAbsent(repair))
     ensures: repair.state = stop_unconfirmed
     ensures: repair.resume_from != null
     ensures: repair.failure != null
     ensures: repair.finalization_pending = false
     ensures: active_claim_retained(repair.parent)
+
+    @guidance
+        -- Use bounded quarantine and fsync passes without reading or deleting evidence
+        -- before stop, repeat after stop, reconfirm exact process absence, and run a
+        -- final quarantine/fsync pass to fence recreation during that probe. The process
+        -- probe and following persistence pass are authoritative even when an earlier
+        -- stop or probe was ambiguous. Exhaustion with a live target or
+        -- process reappearance selects stop_unconfirmed. Resume only
+        -- after sealed-child validation and separately authenticates every retained
+        -- quarantine through bounded stable descriptor reads.
 }
 
 invariant CurrentRepairSingleChild {

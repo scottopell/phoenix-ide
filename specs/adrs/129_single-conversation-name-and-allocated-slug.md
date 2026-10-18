@@ -1,4 +1,4 @@
-# ADR-128: One conversation name with an allocated route projection
+# ADR-129: One conversation name with an allocated route projection
 
 - **Status:** Accepted
 - **Date:** 2026-10-18
