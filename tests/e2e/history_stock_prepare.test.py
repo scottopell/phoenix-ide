@@ -175,10 +175,13 @@ class StockPrepareTests(unittest.TestCase):
         (self.app / 'ui/dist').mkdir(parents=True)
         (self.out / 'opening-instrumented-libtest').write_bytes(b'UNIT ONLY libtest bytes')
         self.sha = hashlib.sha256((self.out / 'opening-instrumented-libtest').read_bytes()).hexdigest()
-        self.stock = artifact.StockArtifact(self.app / 'ui/dist', 'a' * 64, (('index.html', 'b' * 64),))
+        self.stock = artifact.StockArtifact(self.app / 'ui/dist', 'a' * 64,
+                                            (('.gitkeep', hashlib.sha256(b'').hexdigest()),
+                                             ('index.html', 'b' * 64)))
         self.receipt = {'app_source': 'f16afb227d9336a863c0b0345960ea9a6d62b7c7',
                         'app_tree': '369305dcd94862d4ee12e7af9fd463d5da14d808',
-                        'executable_sha256': self.sha, 'ui_files': dict(self.stock.ui_files),
+                        'executable_sha256': self.sha,
+                        'ui_files': {name:sha for name,sha in self.stock.ui_files if name != '.gitkeep'},
                         'evidence_class': 'instrumented_cfg_test_library_not_shipping_runtime'}
         (self.out / 'opening-instrumented-receipt.json').write_text(json.dumps(self.receipt))
 
@@ -195,11 +198,99 @@ class StockPrepareTests(unittest.TestCase):
         self.assertEqual((self.out / 'opening-stock-libtest').read_bytes(), b'UNIT ONLY libtest bytes')
         self.assertEqual(value['executable_sha256'], self.sha)
         self.assertEqual(value['stock_manifest_sha256'], self.stock.manifest_sha256)
+        self.assertEqual(value['stock_ui_files'], dict(self.stock.ui_files))
+        self.assertEqual(value['stock_served_ui_files'], self.receipt['ui_files'])
+        self.assertIn('.gitkeep', value['stock_ui_files'])
+        self.assertNotIn('.gitkeep', value['stock_served_ui_files'])
         self.assertEqual(value['receiving_ui_evidence_class'], 'stock_natural')
         self.assertEqual(value['evidence_class'], 'instrumented_cfg_test_library_not_shipping_runtime')
         self.assertEqual(value['runtime_admission'], 'not_executed')
         self.assertIs(value['full_acceptance'], False)
         self.assertIs(value['overhead_clearance'], False)
+
+    def test_actual_artifact_shape_454_raw_files_and_453_served_files(self):
+        files = dict(self.stock.ui_files)
+        files.update({f'assets/unit-{number}.js': hashlib.sha256(str(number).encode()).hexdigest()
+                      for number in range(452)})
+        self.stock = artifact.StockArtifact(self.stock.root, self.stock.manifest_sha256,
+                                            tuple(sorted(files.items())))
+        self.receipt['ui_files'] = {name:sha for name,sha in files.items() if name != '.gitkeep'}
+        (self.out / 'opening-instrumented-receipt.json').write_text(json.dumps(self.receipt))
+        value = self.retain()
+        owner = self.bind()
+        self.assertEqual(len(value['stock_ui_files']), 454)
+        self.assertEqual(len(value['stock_served_ui_files']), 453)
+        self.assertEqual(value['stock_ui_files'], files)
+        self.assertEqual(value['stock_served_ui_files'], self.receipt['ui_files'])
+        self.assertEqual(value['stock_manifest_sha256'], self.stock.manifest_sha256)
+        self.assertEqual(owner['ui_artifacts']['stock_natural']['ui_files'],
+                         {'ui/dist/' + name:sha for name,sha in files.items()})
+
+    def test_stock_without_placeholder_remains_exactly_bound(self):
+        self.stock = artifact.StockArtifact(self.stock.root, self.stock.manifest_sha256,
+                                            tuple(self.receipt['ui_files'].items()))
+        value = self.retain()
+        self.bind()
+        self.assertEqual(value['stock_ui_files'], value['stock_served_ui_files'])
+
+    def test_retain_rejects_nonempty_nested_or_unrecognized_dotfiles(self):
+        original = self.stock
+        for name, sha in (('.gitkeep', 'c' * 64), ('assets/.gitkeep', hashlib.sha256(b'').hexdigest()),
+                          ('.unexpected', hashlib.sha256(b'').hexdigest()),
+                          ('assets/.unexpected', hashlib.sha256(b'').hexdigest())):
+            files = dict(original.ui_files)
+            files[name] = sha
+            self.stock = artifact.StockArtifact(original.root, original.manifest_sha256,
+                                                tuple(files.items()))
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                self.retain()
+            self.assertFalse((self.out / 'opening-stock-receiving-build.json').exists())
+
+    def test_retain_rejects_wrong_served_sha_missing_extra_and_changed_index(self):
+        original = self.stock
+        for change in ('wrong_served_sha', 'missing', 'extra', 'changed_index'):
+            files = dict(original.ui_files)
+            served = dict(self.receipt['ui_files'])
+            if change == 'wrong_served_sha':
+                served['index.html'] = 'f' * 64
+            elif change == 'missing':
+                served.pop('index.html')
+            elif change == 'extra':
+                files['assets/extra.js'] = 'f' * 64
+            else:
+                files['index.html'] = 'f' * 64
+            self.stock = artifact.StockArtifact(original.root, original.manifest_sha256,
+                                                tuple(files.items()))
+            receipt = dict(self.receipt, ui_files=served)
+            (self.out / 'opening-instrumented-receipt.json').write_text(json.dumps(receipt))
+            with self.subTest(change=change), self.assertRaisesRegex(AssertionError, 'served UI inventory'):
+                self.retain()
+            self.assertFalse((self.out / 'opening-stock-receiving-build.json').exists())
+
+    def test_binding_rejects_dropped_placeholder_or_unserved_extra_in_raw_inventory(self):
+        self.retain()
+        path = self.out / 'opening-stock-receiving-build.json'
+        original = json.loads(path.read_text())
+        for change in ('missing_placeholder', 'extra_raw', 'changed_index'):
+            value = json.loads(json.dumps(original))
+            if change == 'missing_placeholder':
+                value['stock_ui_files'].pop('.gitkeep')
+            elif change == 'extra_raw':
+                value['stock_ui_files']['assets/extra.js'] = 'f' * 64
+            else:
+                value['stock_ui_files']['index.html'] = 'f' * 64
+                value['stock_served_ui_files']['index.html'] = 'f' * 64
+                receipt = dict(self.receipt, ui_files=value['stock_served_ui_files'])
+                (self.out / 'opening-instrumented-receipt.json').write_text(json.dumps(receipt))
+            path.write_text(json.dumps(value))
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                self.bind()
+            self.assertFalse((self.out / 'opening-stock-instrumented-receipt.json').exists())
+
+    def test_existing_receipt_producer_keeps_its_original_file_filter(self):
+        producer = step('Verify and retain instrumented libtest')
+        self.assertIn("'ui_files':{str(path.relative_to(root/'ui/dist')):hashlib.sha256(path.read_bytes()).hexdigest()", producer)
+        self.assertIn("if path.is_file() and path.name != '.gitkeep'", producer)
 
     def test_retain_rejects_controlled_before_stock_or_changed_binary(self):
         controlled = self.app / 'ui/controlled-functional-build.json'
@@ -214,7 +305,8 @@ class StockPrepareTests(unittest.TestCase):
 
     def bind(self):
         owner = {'app_source': self.receipt['app_source'], 'app_tree': self.receipt['app_tree'],
-                 'ui_artifacts': {'stock_natural': {'manifest_sha256': self.stock.manifest_sha256},
+                 'ui_artifacts': {'stock_natural': {'manifest_sha256': self.stock.manifest_sha256,
+                                                   'ui_files': {'ui/dist/' + name:sha for name,sha in self.stock.ui_files}},
                                   'controlled_functional': {'manifest_sha256': 'c' * 64}}}
         (self.out / 'opening-ui-build-owner.json').write_text(json.dumps(owner))
         code = python_block('Build separate controlled UI and bind')
@@ -240,7 +332,8 @@ class StockPrepareTests(unittest.TestCase):
         stock_path = self.out / 'opening-stock-receiving-build.json'
         original = stock_path.read_text()
         for key, replacement in (('executable_sha256', 'd' * 64), ('stock_manifest_sha256', 'e' * 64),
-                                 ('stock_ui_files', {'index.html': 'f' * 64})):
+                                 ('stock_ui_files', {'index.html': 'f' * 64}),
+                                 ('stock_served_ui_files', {'index.html': 'f' * 64})):
             value = json.loads(original)
             value[key] = replacement
             stock_path.write_text(json.dumps(value))

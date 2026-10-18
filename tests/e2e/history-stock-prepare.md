@@ -42,6 +42,15 @@ all four immutable telemetry module pins, imports the sink/assertion helpers
 from the pinned app, and uses the existing authenticated ordinary + Global
 fixture, lifecycle `sidebar_home`, owned receiver, and `runTelemetryChecks` route.
 
+The receiving build receipt keeps `stock_ui_files` as the complete raw manifest
+inventory and records `stock_served_ui_files` separately for comparison with the
+existing instrumented receipt's `ui_files`. Only the root `.gitkeep` placeholder
+is excluded from the served map; if present its SHA-256 must be the empty-file
+hash. Nested placeholders and other dotfiles fail closed. The full raw map must
+still match the admitted stock build-owner inventory, and the served map must
+match the existing receipt exactly. Manifest/source-graph hashes and the original
+instrumented receipt producer are unchanged.
+
 This is fixture admission **plus bounded natural sampling** at 0.25, not a new
 fixture-only mode. The telemetry operation's immutable watchdog is 285 seconds,
 with two bounded 5-second cleanup/drain waits (295 seconds of explicit bounds,
@@ -100,8 +109,15 @@ Full `dev.py check`, shipping-feature/runtime capability, physical/native browse
 behavior, natural-sample sufficiency, and overhead clearance are not established.
 
 Final bounded integration validation: stock preparation static/filesystem
-regressions **10/10**, publication allowlist/distribution regressions **4/4**,
+regressions **17/17**, publication allowlist/distribution regressions **4/4**,
 and controlled artifact regressions **8/8**; CI YAML parse and all inline workflow
 shell blocks passed `bash -n`. No broader tests were rerun for these integration
 fixes. GitHub roadmap context was not re-fetched because this packet's validation
 prohibits network access. Parent review is required before any push.
+
+The empty-placeholder fixture reproduces the original raw-versus-served binding
+failure. A separate read-only proof against the retained `27e135` stock artifact
+passed the new workflow mapping assertions: 454 raw files, 453 served files, only
+empty root `.gitkeep` excluded, and unchanged manifest SHA-256
+`99700f2b31f4cf322cac450334722f91596ae275382ba531eba58b5b982cdb75`.
+No retained artifact was rewritten; this mapping proof is not runtime admission.

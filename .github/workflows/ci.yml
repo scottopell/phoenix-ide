@@ -439,12 +439,19 @@ jobs:
           assert not (root/'ui/controlled-functional-build.json').exists(), 'stock receiving build must precede controlled UI'
           receipt=json.loads((out/'opening-instrumented-receipt.json').read_text())
           assert receipt['app_source'] == source and receipt['app_tree'] == tree
+          stock_ui_files=dict(stock.ui_files)
+          assert all(name == '.gitkeep' or not any(part.startswith('.') for part in Path(name).parts)
+                     for name in stock_ui_files), 'unexpected stock UI dotfile'
+          if '.gitkeep' in stock_ui_files:
+              assert stock_ui_files['.gitkeep'] == hashlib.sha256(b'').hexdigest(), 'stock .gitkeep must be empty'
+          stock_served_ui_files={name:sha for name,sha in stock_ui_files.items() if name != '.gitkeep'}
+          assert stock_served_ui_files == receipt['ui_files'], 'stock served UI inventory mismatch'
           destination=out/'opening-stock-libtest'
           shutil.copyfile(out/'opening-instrumented-libtest',destination); destination.chmod(0o700)
           assert hashlib.sha256(destination.read_bytes()).hexdigest() == receipt['executable_sha256']
           receipt.update({'receiving_ui_evidence_class':'stock_natural',
               'stock_manifest_sha256':stock.manifest_sha256,
-              'stock_ui_files':dict(stock.ui_files),
+              'stock_ui_files':stock_ui_files, 'stock_served_ui_files':stock_served_ui_files,
               'build_order':'stock UI, default-feature cfg(test) libtest, then separate controlled UI',
               'runtime_admission':'not_executed', 'full_acceptance':False, 'overhead_clearance':False,
               'scope':'retained stock receiving cfg(test) executable; not shipping, not fixture admission or sampled evidence'})
@@ -474,7 +481,10 @@ jobs:
           stock=json.loads((root.parent/'opening-stock-receiving-build.json').read_text())
           assert stock['executable_sha256'] == module.digest(root.parent/'opening-stock-libtest') == receipt['executable_sha256']
           assert stock['stock_manifest_sha256'] == ui_owner['ui_artifacts']['stock_natural']['manifest_sha256']
-          assert stock['stock_ui_files'] == receipt['ui_files']
+          assert stock['stock_ui_files'] == {name.removeprefix('ui/dist/'):sha
+              for name,sha in ui_owner['ui_artifacts']['stock_natural']['ui_files'].items()}
+          assert stock['stock_served_ui_files'] == {name:sha for name,sha in stock['stock_ui_files'].items() if name != '.gitkeep'}
+          assert stock['stock_served_ui_files'] == receipt['ui_files']
           receipt['receiving_ui_evidence_class']='stock_natural'
           (root.parent/'opening-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
           (root.parent/'opening-stock-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))
