@@ -3407,13 +3407,8 @@ mod product_creation_tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(
-            owner,
-            (
-                accepted.product_conversation_id.to_string(),
-                scope.to_string()
-            )
-        );
+        assert_eq!(owner.0, accepted.product_conversation_id.to_string());
+        assert_eq!(owner.1, scope.to_string());
     }
 
     #[tokio::test]
