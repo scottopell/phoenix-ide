@@ -1,10 +1,9 @@
 # ADR-134: Disposable launchd validation precedes installer adoption
 
-**Status:** Accepted
-
-**Date:** 2026-10-18
-
-**Extends:** [ADR-125](125_qualify-exact-prepared-source114-candidate.md), [ADR-126](126_standalone-controller-owns-durability-and-supervision.md), [ADR-128](128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Affects:** REQ-SDC-023; exact PreparedSource114 launchd installer validation
+- **Extends:** [ADR-125](125_qualify-exact-prepared-source114-candidate.md), [ADR-126](126_standalone-controller-owns-durability-and-supervision.md), [ADR-128](128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
 
 ## Context
 
@@ -12,7 +11,21 @@ The standalone controller reaches `ReadyForDisruption` in a real disposable laun
 
 Calling the production deploy command with path overrides would not form a safe integration test. It acquires production-shaped authority before candidate preparation and can reach irreversible operations. Conversely, testing only copied manifest dictionaries would not prove that the real installer and retained helper agree on their closed typed contract.
 
+## Options considered
+
+1. **Integrate the controller into the production launchd installer immediately.** This crosses
+   claim, service-control, database-migration, publication, and recovery boundaries before the
+   exact handoff is qualified.
+2. **Validate a synthetic protocol or fake executable fixture.** This cannot prove compatibility
+   with the retained helper, signed candidate, immutable migration registry, or real manifest
+   loader and classifier.
+3. **Qualify the real pre-disruption handoff under a generated disposable root.** Exercise the
+   production admission and read-only validation seams while withholding every production
+   mutation capability.
+
 ## Decision
+
+Choose option 3.
 
 A validation-only boundary SHALL exercise the real installer-to-helper handoff before production adoption.
 
