@@ -42,6 +42,35 @@ class StockPrepareTests(unittest.TestCase):
         self.assertIn('369305dcd94862d4ee12e7af9fd463d5da14d808', LANE)
         self.assertIn('persist-credentials: false', LANE)
 
+    def test_offline_label_only_excludes_the_existing_runtime_job(self):
+        guard = next(line.strip() for line in LANE.splitlines() if line.startswith('    if:'))
+        self.assertEqual(guard, "if: ${{ github.event_name == 'pull_request' && "
+                         "github.event.pull_request.head.repo.full_name == github.repository && "
+                         "(github.head_ref == 'qualification/continuation-opening-codegen' || "
+                         "github.head_ref == 'integration/v013-history-current-main' || "
+                         "github.head_ref == 'prepare/exact-f16-stock-admission') && "
+                         "!contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}")
+        outside_runtime = WORKFLOW.replace('  qualify-history-realserver:\n' + LANE, '')
+        self.assertNotIn('offline-regression-only', outside_runtime)
+        triggers = WORKFLOW.split('\non:\n', 1)[1].split('\nconcurrency:', 1)[0]
+        self.assertIn('  pull_request:\n', triggers)
+        self.assertNotIn('types:', triggers)
+
+    def test_offline_controls_run_unconditionally_in_normal_ui_job(self):
+        ui = WORKFLOW.split('\n  check-ui:\n', 1)[1].split('\n  check-fast:', 1)[0]
+        self.assertIn("    if: ${{ needs.plan_check.outputs.ui == 'true' }}", ui)
+        offline = next(value for value in ui.split('      - name: ')[1:]
+                       if value.startswith('Offline lifecycle and stock-publication regressions'))
+        self.assertNotIn('if:', offline)
+        self.assertNotIn('continue-on-error:', offline)
+        self.assertNotIn('working-directory:', offline)
+        self.assertIn('          node --test ui/scripts/lifecycle-close-drain.selftest.mjs\n', offline)
+        for filename in ('history_stock_prepare', 'history_runtime_publication', 'history_controlled_artifact'):
+            self.assertIn('          python3 -B tests/e2e/' + filename + '.test.py\n', offline)
+        self.assertLess(ui.index('uses: actions/setup-node@'), ui.index(offline))
+        self.assertLess(ui.index(offline), ui.index('      - name: ./dev.py check (ui/specs)'))
+        self.assertIn('run: ./dev.py check --lanes tsc,ui-lint,vitest,ast-grep,allium,spec-shape,spec-anchors,pkglock', ui)
+
     def test_existing_harness_commit_binding_covers_the_diagnostic_wrapper(self):
         self.assertIn('ref: ${{ github.event.pull_request.head.sha }}\n          path: harness', LANE)
         self.assertIn("'harness_source': '${{ github.event.pull_request.head.sha }}'", LANE)

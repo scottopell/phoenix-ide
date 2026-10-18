@@ -278,3 +278,55 @@ No unit suites were rerun for this documentation-only clarification; the counts
 above are retained prior results, not new execution evidence. No Playwright
 module was executed, and no browser, network, service, install, build, SQL, CI or
 push was used. Roadmap context remains unverified under the offline restriction.
+
+## Offline publication CI boundary (follow-up from ca7469)
+
+The existing `qualify-history-realserver` job now additionally requires
+`!contains(github.event.pull_request.labels.*.name, 'offline-regression-only')`.
+Its existing PR-event, same-repository and three-branch allowlist conditions are
+unchanged. With that exact label present in the PR event, the **entire job is
+skipped**, including its builds, browser/server runtime and artifact publication;
+it is **not a passed runtime qualification**. Without the label, the historical
+job conditions and commands are unchanged. This protects against an unintended
+measurement run, not a coverage waiver, validated fix or overhead clearance.
+The conditional fake-context model and installed-Playwright contract review above
+remain unchanged; no Global or ordinary runtime result is added or upgraded.
+
+**Parent publication ordering:** set/verify the PR label **before pushing** the
+publication commit. This child neither sets labels nor pushes. The existing
+`pull_request` trigger has no explicit activity types, so `labeled`/`unlabeled`
+events do not themselves launch this workflow. The subsequent `synchronize`
+event reads its PR-label snapshot. Adding a label after a run starts does not
+retroactively stop that run; this guard is not a cancellation mechanism.
+
+Normal check-plan/check jobs are not label-gated. In the existing `check-ui` job,
+a new step after Node setup and before `./dev.py check` runs, with no step-level
+condition or failure suppression:
+
+```sh
+node --test ui/scripts/lifecycle-close-drain.selftest.mjs
+python3 -B tests/e2e/history_stock_prepare.test.py
+python3 -B tests/e2e/history_runtime_publication.test.py
+python3 -B tests/e2e/history_controlled_artifact.test.py
+```
+
+That job retains its ordinary `plan_check.outputs.ui == 'true'` gate; the workflow
+and UI changes in this publication select that lane. Its existing full Vitest
+lane also discovers the actual-reporter file (six tests) normally. The Python
+source guards above explicitly check the unchanged historical runtime predicate
+plus label exclusion, unchanged default PR trigger, absence of label gating
+outside the runtime job, and unconditional offline commands in `check-ui`.
+They run there explicitly rather than depending on E2E scenario discovery or the
+skipped runtime job. No new job, runner framework or dependency is introduced.
+
+### Follow-up validation actually run
+
+Offline: **17/17 lifecycle Node controls**, **170/170 existing joint/opening Node
+controls**, **6/6 actual-reporter Vitest tests**, **20/20 stock-preparation tests**
+(including the two new CI source guards), **12/12 publication tests**, and
+**8/8 artifact-admission tests** pass. Vitest reused the existing dependency cache
+with this worktree's root/config and a temporary symlink removed afterwards.
+CI YAML parsed with Ruby YAML; all **36** inline run blocks passed `bash -n`
+with GitHub expressions substituted; `git diff --check` passes. Full
+`./dev.py check` and hosted CI were not run. No network/roadmap refresh, install,
+app build, browser, server, measurement, label change or push was performed.
