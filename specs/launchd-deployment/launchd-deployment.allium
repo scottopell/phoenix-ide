@@ -1640,7 +1640,9 @@ entity CurrentSchemaRepair {
 -- current_repair_offline_verified(repair) -> Boolean
 --   Parent operation lock held, original helper absent, service confirmed absent,
 --   database exclusive with exact target128/integrity/FK and adequate held restore
---   capacity plus protected floor/evidence allowance. No child claim is acquired.
+--   capacity plus protected floor/evidence allowance. Persistent target plist is
+--   absent or byte-exact sealed repair input; unknown bytes refuse resume. No child
+--   claim is acquired.
 -- current_repair_target_verified(repair) -> Boolean
 --   Successful exact-candidate reconciliation, exact complete target128/integrity/FK
 --   and capacity checked; durable child proof bound to seal and parent proof hash.
@@ -1669,6 +1671,10 @@ entity CurrentSchemaRepair {
 -- CurrentRepairTargetChecked(repair), CurrentRepairHealthy(repair),
 -- CurrentRepairFinalized(repair) are observations of the exact retained child.
 -- CurrentRepairStopConfirmed(repair) -> Boolean: exact service absence confirmed.
+-- CurrentRepairPersistentAutoStartAbsent(repair) -> Boolean: persistent target
+--   plist is absent after directory fsync plus explicit absence recheck, optionally
+--   preceded by atomic quarantine and exact repair-plist removal. Lookup error and
+--   unknown, mismatched or quarantined bytes are preserved and do not satisfy it.
 -- CurrentRepairClaimReleased(repair) -> Boolean: only exact parent claim unlinked/fsynced.
 -- CurrentRepairNeverStartsOriginalOrPredecessor(repair) -> Boolean: every repair path
 --   excludes original/predecessor install/start and database snapshot replay.
@@ -1811,6 +1817,7 @@ rule StopWithMalformedCurrentRepairStatus {
 rule FailCurrentRepairStopped {
     when: CurrentRepairFailure(repair)
     requires: CurrentRepairStopConfirmed(repair)
+    requires: CurrentRepairPersistentAutoStartAbsent(repair)
     ensures: repair.state = failed_stopped
     ensures: repair.resume_from != null
     ensures: repair.failure != null
@@ -1820,12 +1827,17 @@ rule FailCurrentRepairStopped {
 
 rule FailCurrentRepairStopUnconfirmed {
     when: CurrentRepairFailure(repair)
-    requires: not CurrentRepairStopConfirmed(repair)
+    requires: not (CurrentRepairStopConfirmed(repair) and CurrentRepairPersistentAutoStartAbsent(repair))
     ensures: repair.state = stop_unconfirmed
     ensures: repair.resume_from != null
     ensures: repair.failure != null
     ensures: repair.finalization_pending = false
     ensures: active_claim_retained(repair.parent)
+
+    @guidance
+        -- Atomically quarantine before hashing; remove and fsync only exact sealed
+        -- repair bytes before reporting stopped. Unknown or mismatched bytes remain
+        -- evidence and refuse resume publication.
 }
 
 invariant CurrentRepairSingleChild {

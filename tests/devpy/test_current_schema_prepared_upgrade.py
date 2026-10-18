@@ -3369,6 +3369,128 @@ class CurrentSchemaRepairTests(unittest.TestCase):
         helper.activate_current_repair(self.path)
         self.assertNotIn((self.parent.target_binary, "--migrate-only"), self.events)
 
+    def test_post_publication_failure_removes_persistent_repair_plist_before_stopped_status(self):
+        self.sealed()
+        self.environment()
+        restore = helper._restore_capacity_path(self.parent)
+        real_fsync = helper.fsync_dir
+        failed = [False]
+
+        def fsync(directory):
+            if directory == restore.parent and not restore.exists() and not failed[0]:
+                failed[0] = True
+                raise OSError("restore cleanup fsync")
+            return real_fsync(directory)
+
+        with mock.patch.object(helper, "fsync_dir", side_effect=fsync):
+            with self.assertRaisesRegex(OSError, "restore cleanup fsync"):
+                helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("failed_stopped", "committed"))
+        self.assertFalse(Path(self.parent.target_plist).exists())
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_persistence_fence_failure_cannot_report_failed_stopped(self):
+        self.sealed()
+        self.environment()
+        helper.atomic_write(Path(self.parent.target_plist), (self.path.parent / "candidate.plist").read_bytes())
+        real_fsync = helper.fsync_dir
+
+        def fsync(directory):
+            if directory == Path(self.parent.target_plist).parent:
+                raise OSError("plist directory fsync")
+            return real_fsync(directory)
+
+        with mock.patch.object(helper, "fsync_dir", side_effect=fsync):
+            helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
+            helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
+        self.assertEqual((self.status().state, self.status().resume_from), ("stop_unconfirmed", "prepared"))
+        self.assertFalse(Path(self.parent.target_plist).exists())
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_persistence_cleanup_isolates_path_before_hashing_and_preserves_swapped_bytes(self):
+        self.sealed()
+        self.environment()
+        target = Path(self.parent.target_plist)
+        helper.atomic_write(target, (self.path.parent / "candidate.plist").read_bytes())
+        real_rename = helper.os.rename
+
+        def rename(source, destination):
+            target.write_bytes(b"swapped before isolation")
+            return real_rename(source, destination)
+
+        with mock.patch.object(helper.os, "rename", side_effect=rename):
+            helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
+        self.assertEqual((self.status().state, self.status().resume_from), ("stop_unconfirmed", "prepared"))
+        self.assertFalse(target.exists())
+        quarantines = helper._current_repair_quarantines(self.parent)
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), b"swapped before isolation")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_interrupted_exact_quarantine_is_recovered_on_next_settlement(self):
+        self.sealed()
+        self.environment()
+        target = Path(self.parent.target_plist)
+        helper.atomic_write(target, (self.path.parent / "candidate.plist").read_bytes())
+        quarantine = target.parent / f"{helper._current_repair_quarantine_prefix(self.parent)}crash"
+        helper.os.rename(target, quarantine)
+        helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
+        self.assertEqual((self.status().state, self.status().resume_from), ("failed_stopped", "prepared"))
+        self.assertFalse(target.exists())
+        self.assertEqual(helper._current_repair_quarantines(self.parent), [])
+
+    def test_unknown_published_plist_is_preserved_and_stop_is_unconfirmed(self):
+        self.sealed()
+        self.environment()
+        target = Path(self.parent.target_plist)
+        helper.atomic_write(target, b"not the repair plist")
+        helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
+        self.assertEqual((self.status().state, self.status().resume_from), ("stop_unconfirmed", "prepared"))
+        self.assertFalse(target.exists())
+        quarantines = helper._current_repair_quarantines(self.parent)
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), b"not the repair plist")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+        with self.assertRaisesRegex(helper.ActivationError, "persistent target plist"):
+            helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("stop_unconfirmed", "prepared"))
+        self.assertFalse(target.exists())
+        self.assertEqual(helper._current_repair_quarantines(self.parent), quarantines)
+
+    def test_quarantine_enumeration_failure_blocks_resume_and_reports_unconfirmed(self):
+        self.sealed()
+        self.environment()
+        with mock.patch.object(helper.os, "scandir", side_effect=PermissionError("quarantine lookup")):
+            with self.assertRaisesRegex(helper.ActivationError, "persistent target plist"):
+                helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("stop_unconfirmed", "prepared"))
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_unknown_plist_appearing_during_publication_is_not_overwritten(self):
+        self.sealed()
+        self.environment()
+        target = Path(self.parent.target_plist)
+        real_link = helper.os.link
+        calls = [0]
+
+        def link(source, destination):
+            result = real_link(source, destination)
+            calls[0] += 1
+            if calls[0] == 1:
+                helper.atomic_write(target, b"appeared during health verification")
+            return result
+
+        with mock.patch.object(helper.os, "link", side_effect=link):
+            with self.assertRaisesRegex(helper.ActivationError, "unknown bytes during publication"):
+                helper.activate_current_repair(self.path)
+        self.assertEqual((self.status().state, self.status().resume_from), ("stop_unconfirmed", "committed"))
+        self.assertFalse(target.exists())
+        quarantines = helper._current_repair_quarantines(self.parent)
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), b"appeared during health verification")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
     def test_claim_parent_fsync_failure_restores_exact_owner_and_retries_after_cleanup(self):
         self.sealed()
         self.environment()
@@ -3673,6 +3795,7 @@ class CurrentSchemaRepairTests(unittest.TestCase):
                 helper.activate_current_repair(self.path)
         self.assertEqual(self.status().resume_from, "committed")
         self.assertTrue(Path(self.parent.active_path).exists())
+        self.assertFalse(Path(self.parent.target_plist).exists())
         self.assertFalse(restore.exists())
         self.events.clear()
         self.assertEqual(helper.activate_current_repair(self.path), "committed")
