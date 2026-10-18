@@ -50,6 +50,8 @@ MAX_DATABASE_PROOF_BYTES = 1024 * 1024
 CAPACITY_EVIDENCE_BUDGET_BYTES = 4096
 PROJECTED_MIGRATION_TIMESTAMP = "9999-12-31T23:59:59.999999+00:00"
 DEPLOY_HELPER_LABEL_PREFIX = "com.phoenix-ide.deploy"
+DEFAULT_TRANSITION_TIMEOUT_SECS = 30.0
+DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
 
 TERMINAL_STATES = {
     "committed",
@@ -251,6 +253,13 @@ class PreparedSource114Upgrade(CurrentSchemaUpgrade):
 
 
 @dataclasses.dataclass(frozen=True)
+class ValidatedLaunchdHandoff:
+    candidate_binary: Path
+    candidate_plist: Path
+    rollback: Optional[tuple[Path, Path]]
+
+
+@dataclasses.dataclass(frozen=True)
 class OrdinaryForwardMigration:
     database_path: str
     helper_sha256: str
@@ -310,8 +319,8 @@ class Manifest:
     lock_path: str
     claim_lock_path: str
     created_at: str
-    transition_timeout_secs: float = 30.0
-    health_timeout_secs: float = 120.0
+    transition_timeout_secs: float = DEFAULT_TRANSITION_TIMEOUT_SECS
+    health_timeout_secs: float = DEFAULT_HEALTH_TIMEOUT_SECS
     # None is intentional for pre-feature runtime-only manifests.
     paired_database_upgrade: Optional[PairedDatabaseUpgrade] = None
     current_schema_upgrade: Optional[CurrentSchemaUpgrade | PreparedSource114Upgrade] = None
@@ -582,10 +591,12 @@ def prepared_database_upgrade(
     return modes[0] if modes else None
 
 
-def _private_transaction_dir(path: Path) -> Path:
+def _private_transaction_dir(path: Path, *, create: bool = True) -> Path:
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
+        if not create:
+            raise ActivationError("paired transaction directory is unavailable")
         path.mkdir(parents=True, mode=0o700)
         mode = path.lstat().st_mode
     except OSError as exc:
@@ -595,7 +606,11 @@ def _private_transaction_dir(path: Path) -> Path:
     return path
 
 
-def _paired_path_context(manifest: Manifest) -> tuple[Path, Path, Path, Path]:
+def _paired_path_context(
+    manifest: Manifest,
+    *,
+    prepare_transaction: bool = True,
+) -> tuple[Path, Path, Path, Path]:
     upgrade = prepared_database_upgrade(manifest)
     if upgrade is None:
         raise ActivationError("prepared database upgrade is not configured")
@@ -610,7 +625,10 @@ def _paired_path_context(manifest: Manifest) -> tuple[Path, Path, Path, Path]:
     resolved = {path.resolve(strict=False) for path in (database, backup, proof)}
     if len(resolved) != 3:
         raise ActivationError("database backup and proof must not alias the database or each other")
-    return database, backup, proof, _private_transaction_dir(backup.parent)
+    return database, backup, proof, _private_transaction_dir(
+        backup.parent,
+        create=prepare_transaction,
+    )
 
 
 def _restore_capacity_path(manifest: Manifest, database: Optional[Path] = None) -> Path:
@@ -1994,7 +2012,11 @@ def validate_prepared_source114(manifest: Manifest) -> None:
     migration_registry(registry)
 
 
-def validate_manifest_mode(manifest: Manifest) -> None:
+def validate_manifest_mode(
+    manifest: Manifest,
+    *,
+    prepare_transaction: bool = True,
+) -> None:
     validate_prepared_source114(manifest)
     upgrade = prepared_database_upgrade(manifest)
     if manifest.source_kind not in {
@@ -2068,7 +2090,10 @@ def validate_manifest_mode(manifest: Manifest) -> None:
         raise ActivationError("prepared mode helper path is not the running helper")
     if not helper.is_file() or sha256(helper) != upgrade.controller_helper_sha256:
         raise ActivationError("controller helper bytes changed")
-    _database, _backup, _proof, transaction_dir = _paired_path_context(manifest)
+    _database, _backup, _proof, transaction_dir = _paired_path_context(
+        manifest,
+        prepare_transaction=prepare_transaction,
+    )
     if transaction_dir != helper.parent:
         raise ActivationError("prepared snapshot must belong to the helper transaction")
     if manifest.previous is None or manifest.rollback_binary_sha256 is None or manifest.rollback_plist_sha256 is None:
@@ -2248,6 +2273,107 @@ def validate_manifest_identities(manifest: Manifest) -> None:
         raise ActivationError("previous runtime identity is malformed")
 
 
+def _load_staged_plist(path: Path, description: str) -> dict:
+    try:
+        with path.open("rb") as stream:
+            plist = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        raise ActivationError(f"{description} is unreadable") from exc
+    if not isinstance(plist, dict):
+        raise ActivationError(f"{description} is not a dictionary")
+    return plist
+
+
+def _validate_staged_plist_binding(
+    plist: dict,
+    *,
+    manifest_label: str,
+    target_binary: Path,
+    description: str,
+) -> None:
+    if not manifest_label.strip() or plist.get("Label") != manifest_label:
+        raise ActivationError(f"{description} label does not match the immutable manifest")
+    if "Program" in plist or plist.get("ProgramArguments") != [str(target_binary)]:
+        raise ActivationError(f"{description} program does not match the immutable target")
+
+
+def expected_helper_label(manifest: Manifest) -> str:
+    return f"{DEPLOY_HELPER_LABEL_PREFIX}.{manifest.transaction_id}"
+
+
+def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHandoff:
+    """Validate retained installer evidence without preparing or invoking mutation."""
+    exact_prepared_source114 = isinstance(
+        manifest.current_schema_upgrade, PreparedSource114Upgrade
+    )
+    if exact_prepared_source114:
+        if manifest.transition_timeout_secs != DEFAULT_TRANSITION_TIMEOUT_SECS:
+            raise ActivationError(
+                f"exact prepared source114 transition_timeout_secs must be {DEFAULT_TRANSITION_TIMEOUT_SECS}"
+            )
+        if manifest.health_timeout_secs != DEFAULT_HEALTH_TIMEOUT_SECS:
+            raise ActivationError(
+                f"exact prepared source114 health_timeout_secs must be {DEFAULT_HEALTH_TIMEOUT_SECS}"
+            )
+    validate_manifest_identities(manifest)
+    validate_manifest_mode(manifest, prepare_transaction=False)
+    if manifest.helper_label != expected_helper_label(manifest):
+        raise ActivationError("immutable manifest has an invalid helper label")
+    candidate_binary = verify_staged(
+        manifest.candidate_binary,
+        manifest.candidate_binary_sha256,
+        "candidate binary",
+    )
+    candidate_plist = verify_staged(
+        manifest.candidate_plist,
+        manifest.candidate_plist_sha256,
+        "candidate plist",
+    )
+    candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
+    if exact_prepared_source114:
+        _validate_staged_plist_binding(
+            candidate_plist_contents,
+            manifest_label=manifest.label,
+            target_binary=Path(manifest.target_binary),
+            description="candidate plist",
+        )
+    rollback: Optional[tuple[Path, Path]] = None
+    if manifest.previous is not None:
+        rollback_binary = verify_staged(
+            manifest.rollback_binary,
+            manifest.rollback_binary_sha256,
+            "rollback binary",
+        )
+        rollback_plist = verify_staged(
+            manifest.rollback_plist,
+            manifest.rollback_plist_sha256,
+            "rollback plist",
+        )
+        rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
+        if exact_prepared_source114:
+            _validate_staged_plist_binding(
+                rollback_plist_contents,
+                manifest_label=manifest.label,
+                target_binary=Path(manifest.target_binary),
+                description="rollback plist",
+            )
+        rollback = (rollback_binary, rollback_plist)
+    elif any(
+        (
+            manifest.rollback_binary,
+            manifest.rollback_binary_sha256,
+            manifest.rollback_plist,
+            manifest.rollback_plist_sha256,
+        )
+    ):
+        raise ActivationError("first-install rollback inputs are inconsistent")
+    return ValidatedLaunchdHandoff(
+        candidate_binary=candidate_binary,
+        candidate_plist=candidate_plist,
+        rollback=rollback,
+    )
+
+
 def require_fresh_prepared_activation(manifest: Manifest) -> None:
     if manifest.current_schema_upgrade is None:
         return
@@ -2280,12 +2406,19 @@ def activate(manifest: Manifest) -> str:
         capacity_reservation: Optional[DatabaseCapacityReservation] = None
         ordinary_forward_only = False
         try:
-            validate_manifest_identities(manifest)
-            validate_manifest_mode(manifest)
-            candidate_binary = verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "candidate binary")
-            candidate_plist = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "candidate plist")
-            with candidate_plist.open("rb") as stream:
-                plistlib.load(stream)
+            validated = validate_pre_disruption_handoff(manifest)
+            ordinary_forward_only = ordinary_forward_policy_applies(manifest)
+            if manifest.paired_database_upgrade is not None:
+                validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+            elif manifest.current_schema_upgrade is not None:
+                validate_current_schema_database(
+                    Path(manifest.current_schema_upgrade.database_path),
+                    _current_schema_registry(manifest),
+                    source_kind=manifest.source_kind,
+                    manifest=manifest,
+                )
+            candidate_binary = validated.candidate_binary
+            candidate_plist = validated.candidate_plist
             prepared_candidate_binary = prepare_atomic_install(
                 candidate_binary, Path(manifest.target_binary), 0o755
             )
@@ -2297,11 +2430,8 @@ def activate(manifest: Manifest) -> str:
             )
             prepared_installs.append(prepared_candidate_plist)
             prepared_candidate = (prepared_candidate_binary, prepared_candidate_plist)
-            if manifest.previous is not None:
-                rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
-                rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
-                with rollback_plist.open("rb") as stream:
-                    plistlib.load(stream)
+            if validated.rollback is not None:
+                rollback_binary, rollback_plist = validated.rollback
                 prepared_rollback_binary = prepare_atomic_install(
                     rollback_binary, Path(manifest.target_binary), 0o755
                 )
@@ -2313,22 +2443,7 @@ def activate(manifest: Manifest) -> str:
                 )
                 prepared_installs.append(prepared_rollback_plist)
                 prepared_rollback = (prepared_rollback_binary, prepared_rollback_plist)
-            elif any((
-                manifest.rollback_binary,
-                manifest.rollback_binary_sha256,
-                manifest.rollback_plist,
-                manifest.rollback_plist_sha256,
-            )):
-                raise ActivationError("first-install rollback inputs are inconsistent")
-            ordinary_forward_only = ordinary_forward_policy_applies(manifest)
             upgrade = prepared_database_upgrade(manifest)
-            if manifest.paired_database_upgrade is not None:
-                validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
-            elif manifest.current_schema_upgrade is not None:
-                validate_current_schema_database(
-                    Path(manifest.current_schema_upgrade.database_path),
-                    _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
-                )
             if upgrade is not None:
                 capacity_reservation = reserve_database_capacity(manifest)
         except Exception as exc:
