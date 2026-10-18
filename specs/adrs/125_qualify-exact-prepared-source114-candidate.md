@@ -6,7 +6,7 @@
 
 ## Context
 
-Prepared current-schema launchd admission qualifies exact prefix123 or exact target128. ADR-115 separately qualifies published-release prefix114. The commissioned prepared artifact is candidate `23badb8be4bc8d05a7e1c49c5367ceb14ebccd92` with migration source SHA-256 `a4eb7e213b363892f316f0034bc45b52e809124e85394730705599cecb257d6f`. Its semantic migration registry is unchanged from RC4, but a prepared artifact is not a published release: unchanged migrations alone cannot authorize a new source-kind/candidate admission under ADR-034. A newer clean controller must supply the admission helper without substituting its own registry or rebuilding/resigning the prepared candidate.
+Prepared current-schema launchd admission qualifies exact prefix123 or exact target128. ADR-115 separately qualifies published-release prefix114. The commissioned prepared artifact is candidate `23badb8be4bc8d05a7e1c49c5367ceb14ebccd92` with migration source SHA-256 `a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6`. Its semantic migration registry is unchanged from RC4, but a prepared artifact is not a published release: unchanged migrations alone cannot authorize a new source-kind/candidate admission under ADR-034. A newer clean controller must supply the admission helper without substituting its own registry or rebuilding/resigning the prepared candidate.
 
 ## Options considered
 
