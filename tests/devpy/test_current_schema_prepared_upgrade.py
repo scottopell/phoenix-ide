@@ -3476,7 +3476,7 @@ class CurrentSchemaRepairTests(unittest.TestCase):
             self.assertEqual(kind, "local_head")
             destination.write_bytes(self.registry.read_bytes())
         def handoff(path, **kwargs):
-            self.assertEqual(events[-1], "manifest.json")
+            events.append("handoff-enter")
             self.assertEqual(helper.validate_current_repair(path, running_helper=False)[2].state, "prepared")
             self.assertFalse(kwargs["resume"])
             events.append("handoff")
@@ -3499,6 +3499,7 @@ class CurrentSchemaRepairTests(unittest.TestCase):
         self.assertLess(events.index("validate-staging"), events.index("status.json"))
         self.assertLess(events.index("status.json"), events.index("installed"))
         self.assertLess(events.index("installed"), events.index("manifest.json"))
+        self.assertLess(events.index("manifest.json"), events.index("handoff-enter"))
         self.assertEqual(Path(self.parent.target_binary).read_bytes(), b"")
         self.assertFalse(Path(self.parent.target_binary).stat().st_mode & 0o111)
         self.assertFalse(Path(self.parent.target_plist).exists())

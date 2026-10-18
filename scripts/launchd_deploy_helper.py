@@ -3408,8 +3408,10 @@ def recover_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
 
 
 def status_is_durable_terminal(manifest: Manifest) -> bool:
-    if os.path.lexists(current_repair_entry(manifest)) or current_repair_entry(manifest).parent.is_symlink():
-        return False  # Only the child terminal path may release the original claim.
+    if isinstance(getattr(manifest, "candidate_binary", None), str):
+        repair_entry = current_repair_entry(manifest)
+        if os.path.lexists(repair_entry) or repair_entry.parent.is_symlink():
+            return False
     try:
         status = read_status(manifest)
         return (
