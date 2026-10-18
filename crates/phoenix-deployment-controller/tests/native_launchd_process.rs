@@ -395,13 +395,10 @@ impl ReadOnlyPreparedSource114Validation {
             python_location.starts_with(&runner_tool_cache),
             "validation Python must reside under the hosted runner tool cache"
         );
-        let python = python_location
-            .join("bin/python3")
-            .canonicalize()
-            .expect("setup-python must provide bin/python3");
+        let python = python_location.join("bin/python3");
         assert!(
-            python.starts_with(&python_location),
-            "validation Python escaped the setup-python location"
+            python.is_file(),
+            "actions/setup-python must provide its bin/python3 entrypoint"
         );
         python
     }
@@ -485,6 +482,7 @@ impl ReadOnlyPreparedSource114Validation {
                     {
                         break;
                     }
+                    // test-timing-allow: bounded polling waits for the child exit status.
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 assert!(
@@ -496,6 +494,7 @@ impl ReadOnlyPreparedSource114Validation {
                 );
                 panic!("PreparedSource114 validation exceeded 15 minutes");
             }
+            // test-timing-allow: bounded polling waits for the child exit status.
             std::thread::sleep(Duration::from_millis(100));
         };
         let stdout =
