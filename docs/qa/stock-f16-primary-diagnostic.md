@@ -1,5 +1,10 @@
 # PREPARE: exact-f16 stock primary-assertion diagnostic
 
+Offline follow-up from harness023: [lifecycle close-drain proof and actual-023
+coverage boundary](stock-f16-lifecycle-offline-proof.md). It reproduces a sampled
+cleanup scheduling defect and tests an isolated three-line proposal; it neither
+attributes the earlier incident nor changes the pinned app/live driver.
+
 ## Scope and prior outcome
 
 This is diagnostic source preparation, not a new runtime result. After parent
