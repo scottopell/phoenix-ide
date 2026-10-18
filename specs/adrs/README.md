@@ -139,6 +139,7 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
+| [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
 | [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
 | [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
 | [124](124_public-literal-chat-uses-known-receiver-verification.md) | Public literal chat uses known-receiver verification | Accepted | REQ-API-031; built-in API guidance |
@@ -202,6 +203,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying post-tool direct-turn restart recovery or bounded owed-baton settlement | 074, then 024, 020, 014 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
+| Repairing protected packaging for the exact ARM forward-replacement candidate | 127; fixed candidate, separate controller, no generic selection or compatibility expansion |
 | Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
 | Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
