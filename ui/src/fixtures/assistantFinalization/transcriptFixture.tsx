@@ -64,7 +64,7 @@ function Transcript({ retry, response }: { retry: boolean; response: string }) {
   const finalized = view.messages.some(message => message.message_id === requestId);
   const finalize = () => {
     dispatch({
-      type: 'sse_message', sequenceId: 4,
+      type: 'sse_message', sequenceId: 4, opening: null,
       message: {
         event_presentation: null, message_id: requestId, conversation_id: slug,
         sequence_id: 2, message_type: 'agent', created_at: timestamp,
