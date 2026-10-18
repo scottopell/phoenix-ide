@@ -3495,7 +3495,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(projection.root_title.as_deref(), Some("Legacy Override"));
+        assert_eq!(projection.root_title.as_deref(), Some("Aggregate Title"));
     }
 
     #[tokio::test]

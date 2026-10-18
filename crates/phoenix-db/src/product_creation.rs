@@ -3380,6 +3380,19 @@ mod product_creation_tests {
                 .product_conversation_id,
             existing.product_conversation_id
         );
+        assert!(db
+            .resolve_ordinary_product_conversation(&reserved_slug)
+            .await
+            .is_err());
+        sqlx::query(
+            "UPDATE product_creation_jobs SET status = 'published',
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL,
+                 delivery_retry_at_unix_micros = NULL, provisioning_stage = 'finalize_publication'
+             WHERE request_id = 'reserved-route' AND status = 'delivery_pending'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         assert_eq!(
             db.resolve_ordinary_product_conversation(&reserved_slug)
                 .await
