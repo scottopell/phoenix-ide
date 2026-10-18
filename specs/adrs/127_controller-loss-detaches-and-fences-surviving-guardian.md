@@ -1,4 +1,4 @@
-# ADR-119: Controller loss detaches and fences the surviving guardian
+# ADR-127: Controller loss detaches and fences the surviving guardian
 
 - **Status:** Accepted
 - **Date:** 2026-10-15

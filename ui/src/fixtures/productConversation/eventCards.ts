@@ -49,11 +49,11 @@ export function makeCompactEventsScenario(global: boolean): ProductConversationS
       initialEntry: '/global/event-latest',
       alignedLatestMessages: messages.map(message => ({ ...message, conversation_id: 'event-latest' })),
     } : {}),
-    sourceSnapshot: { ...source, product_conversation_id: 'source-member', canonical_route: '/product-conversations/source-member', requested_transcript_row_id: 'source-member', latest_transcript_row_id: 'source-member', writable_transcript_row_id: 'source-member', segments: [{ ...first, messages: [
+    sourceSnapshot: { ...source, boundaries: [], product_conversation_id: 'source-member', canonical_route: '/product-conversations/source-member', requested_transcript_row_id: 'source-member', latest_transcript_row_id: 'source-member', writable_transcript_row_id: 'source-member', segments: [{ ...first, messages: [
       { ...messages[3]!, content: { text: 'Source conversation for compact event acceptance.' } },
     ] }] },
     snapshot: {
-      ...base.snapshot!, work_identity: null, source: null, chain_qa_compatibility: null,
+      ...base.snapshot!, boundaries: [], work_identity: null, source: null, chain_qa_compatibility: null,
       latest_transcript_row_id: 'event-latest', writable_transcript_row_id: 'event-latest',
       presentation: { kind: 'state', display_name: 'Compact events', presentation_mode: 'idle' },
       segments: [

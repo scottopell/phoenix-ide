@@ -455,9 +455,11 @@ WHEN a conversation accesses browser state
 THE SYSTEM SHALL resolve the lookup from its opaque persisted `work_scope_id`
 AND SHALL NOT derive browser identity from its conversation id, working directory, or worktree path
 
-WHEN `BrowserSession::new` constructs a Chrome instance
+WHEN the IDE constructs a Chrome instance
 THE SYSTEM SHALL derive the user data directory from the same scope key
-AND two sessions resolving to the same scope SHALL share the same on-disk profile
+AND two IDE sessions resolving to the same scope SHALL share the same on-disk profile
+
+The standalone CLI's explicitly selected transient-profile policy is governed by `../browser-cli/requirements.md` REQ-BCLI-006a. It does not change IDE profile derivation, continuation inheritance, process-epoch Close authority, or the prohibition on adopting untrusted profiles.
 
 **Rationale:** Conversations retaining one persisted scope are the same unit of work. Their tools should drive the same Chrome window — including open tabs, cookies, and dev-tools state — without a continuation observing a silent re-login. Distinct persisted scopes remain isolated even when their environments point at the same path.
 

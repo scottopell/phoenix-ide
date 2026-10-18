@@ -113,6 +113,15 @@ surface TranscriptPositioningEffectExecutor {
         effect.command_key
         effect.align
         effect.result
+
+    @guarantee SuccessfulAnchorSettlement
+        -- Before notifying the parent of an applied finish, the executor settles
+        -- the matching authorized physical anchor and discards pending target
+        -- intent. Settlement retains same-view measurement geometry, not active
+        -- command capability; it emits neither another position command nor a
+        -- terminal result. Superseded and missing-target finishes do not settle.
+        -- View changes, replacement authority, cancellation, user takeover, and
+        -- executor detach retire settled ownership even without a scroll event.
 }
 
 surface VirtualTranscriptPhysicalAuthority {

@@ -56,8 +56,8 @@ survival, IPC correctness, or production orchestration.
 
 ## Native architecture contract
 
-[ADR-120](../adrs/120_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
-extends ADR-119 without changing its detach-and-fence decision. REQ-SDC-015–022
+[ADR-128](../adrs/128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)
+extends ADR-127 without changing its detach-and-fence decision. REQ-SDC-015–022
 specify separate same-build guardian and runner executables, owner-only Unix socket
 IPC with bounded length-prefixed typed JSON, and explicit wire DTOs that cannot
 materialize internal affine authority. The guardian mints one-use dispatch admissions
@@ -394,7 +394,7 @@ The remaining replacement gaps are explicit:
 The next controller-owned work is successful-terminal and unapplied-failure settlement,
 child-list failure settlement, discovered-child identity acquisition, signal
 mutation, general continuing orchestration, and the remaining process-death matrix. Those
-surfaces must extend REQ-SDC-015–022 and ADR-120/121/122/123/124/125 while preserving ADR-119
+surfaces must extend REQ-SDC-015–022 and ADR-128/121/122/123/124/125 while preserving ADR-127
 **detach-and-fence**, exact-instance
 recovery, the original absolute deadline, retained results, monotonic reconciliation generations,
 and whole-round signal-result reservation.

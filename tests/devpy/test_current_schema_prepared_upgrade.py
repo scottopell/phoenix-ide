@@ -214,6 +214,158 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
                                 database, self.registry, source_kind=source_kind,
                             )
 
+    def prepared114_manifest(self, database: Path) -> helper.Manifest:
+        base = self.manifest(database)
+        current = base.current_schema_upgrade
+        registry = Path(current.migration_registry_path)
+        registry.write_bytes(subprocess.check_output(
+            ["git", "show", f"{helper.PREPARED_SOURCE114_COMMIT}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
+        ))
+        self.assertEqual(helper.sha256(registry), helper.PREPARED_SOURCE114_REGISTRY_SHA256)
+        qualified = helper.PreparedSource114Upgrade(
+            **{**dataclasses.asdict(current), "migration_registry_sha256": helper.sha256(registry)},
+            prepared_source_baseline=114,
+            candidate_registry_expected_sha256=helper.PREPARED_SOURCE114_REGISTRY_SHA256,
+        )
+        return dataclasses.replace(base, source_commit=helper.PREPARED_SOURCE114_COMMIT,
+                                   expected=helper.Identity("2.0.0", helper.PREPARED_SOURCE114_COMMIT),
+                                   current_schema_upgrade=qualified)
+
+    def test_exact_prepared114_and_target_admission_requires_structural_evidence(self) -> None:
+        for through in range(113, 130):
+            with self.subTest(through=through):
+                database = self.database(through=through)
+                if through == 129:
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("INSERT INTO _migrations VALUES (129, 'future')")
+                manifest = self.prepared114_manifest(database)
+                registry = Path(manifest.current_schema_upgrade.migration_registry_path)
+                if through in (114, 128):
+                    self.assertEqual(helper.validate_current_schema_database(database, registry, manifest=manifest),
+                                     tuple(compiled_ledger(through)))
+                else:
+                    with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
+                        helper.validate_current_schema_database(database, registry, manifest=manifest)
+                if through == 114:
+                    with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
+                        helper.validate_current_schema_database(database, registry)
+
+    def test_prepared114_invalid_binding_rejects_before_stop(self) -> None:
+        manifest = self.prepared114_manifest(self.database(through=114))
+        current = manifest.current_schema_upgrade
+        plain = helper.CurrentSchemaUpgrade(**{
+            field.name: getattr(current, field.name) for field in dataclasses.fields(helper.CurrentSchemaUpgrade)
+        })
+        mutations = [
+            dataclasses.replace(manifest, source_commit="e" * 40),
+            dataclasses.replace(manifest, expected=helper.Identity("2.0.0", "e" * 40)),
+            dataclasses.replace(manifest, source_kind="published_release"),
+            dataclasses.replace(manifest, source_kind="local_head"),
+            dataclasses.replace(manifest, current_schema_upgrade=plain),
+        ]
+        mutations += [dataclasses.replace(manifest, current_schema_upgrade=dataclasses.replace(current, **fields))
+                      for fields in (
+                          {"controller_source_commit": manifest.source_commit},
+                          {"prepared_source_baseline": 113},
+                          {"prepared_source_baseline": True},
+                          {"candidate_registry_expected_sha256": "0" * 64},
+                          {"migration_registry_sha256": "0" * 64},
+                      )]
+        self.write_current_status(manifest, "prepared")
+        for changed in mutations:
+            with self.subTest(changed=changed), \
+                 mock.patch.object(helper, "__file__", current.controller_helper_path), \
+                 mock.patch.object(helper, "Launchctl") as launchctl, \
+                 mock.patch.object(helper, "reserve_database_capacity", side_effect=AssertionError("capacity before binding")):
+                self.write_current_status(changed, "prepared")
+                with self.assertRaises(helper.ActivationError):
+                    helper.activate(changed)
+                launchctl.return_value.stop.assert_not_called()
+        registry = Path(current.migration_registry_path)
+        registry.write_bytes(registry.read_bytes() + b"\n// altered bytes\n")
+        with mock.patch.object(helper, "__file__", current.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl") as launchctl:
+            self.write_current_status(manifest, "prepared")
+            with self.assertRaises(helper.ActivationError):
+                helper.activate(manifest)
+            launchctl.return_value.stop.assert_not_called()
+
+    def test_prepared114_other_source_prefixes_reject_before_stop(self) -> None:
+        for through in (113, *range(115, 128)):
+            with self.subTest(through=through):
+                manifest = self.prepared114_manifest(self.database(through=through))
+                self.write_current_status(manifest, "prepared")
+                with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+                     mock.patch.object(helper, "Launchctl") as launchctl, \
+                     mock.patch.object(helper, "reserve_database_capacity") as reserve:
+                    with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
+                        helper.activate(manifest)
+                    launchctl.assert_not_called()
+                    reserve.assert_not_called()
+
+    def test_prepared114_manifest_fields_are_all_required_typed_and_closed(self) -> None:
+        manifest = self.prepared114_manifest(self.database(through=114))
+        path = self.root / "qualified-manifest.json"
+        payload = dataclasses.asdict(manifest)
+        path.write_text(json.dumps(payload))
+        loaded = helper.Manifest.load(path)
+        self.assertIsInstance(loaded.current_schema_upgrade, helper.PreparedSource114Upgrade)
+        for key in ("prepared_source_baseline", "candidate_registry_expected_sha256"):
+            changed = json.loads(json.dumps(payload))
+            del changed["current_schema_upgrade"][key]
+            path.write_text(json.dumps(changed))
+            with self.assertRaises(helper.ActivationError):
+                helper.Manifest.load(path)
+        for fields in ({"extra_qualification": True}, {"prepared_source_baseline": "114"},
+                       {"prepared_source_baseline": None}, {"candidate_registry_expected_sha256": None}):
+            changed = json.loads(json.dumps(payload))
+            changed["current_schema_upgrade"].update(fields)
+            path.write_text(json.dumps(changed))
+            with self.assertRaises(helper.ActivationError):
+                helper.Manifest.load(path)
+
+    def test_prepared114_recovery_rejects_altered_candidate_or_qualification_before_start(self) -> None:
+        manifest = self.prepared114_manifest(self.database(through=114))
+        self.write_snapshot_proof(manifest)
+        current = manifest.current_schema_upgrade
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        self.write_current_status(manifest, "activation_failed_rollback_failed")
+        for changed in (
+            dataclasses.replace(manifest, source_commit="e" * 40, expected=helper.Identity("2.0.0", "e" * 40)),
+            dataclasses.replace(manifest, current_schema_upgrade=dataclasses.replace(current, candidate_registry_expected_sha256="0" * 64)),
+            dataclasses.replace(manifest, current_schema_upgrade=dataclasses.replace(current, controller_source_commit=manifest.source_commit)),
+        ):
+            with self.subTest(changed=changed), \
+                 mock.patch.object(helper, "__file__", current.controller_helper_path), \
+                 mock.patch.object(helper, "Launchctl") as launchctl:
+                with self.assertRaises(helper.ActivationError):
+                    helper.recover_paired(changed, current_schema=True)
+                launchctl.assert_not_called()
+                self.assertEqual(Path(manifest.active_path).read_text(), manifest.transaction_id)
+
+    def test_prepared114_retained_qualification_tamper_rejected_by_snapshot_proof(self) -> None:
+        manifest = self.prepared114_manifest(self.database(through=128))
+        self.write_snapshot_proof(manifest)
+        current = manifest.current_schema_upgrade
+        proof_path = Path(current.proof_path)
+        original = proof_path.read_bytes()
+        for evidence in (None, {"prepared_source_baseline": 115},
+                         {"prepared_source_baseline": 114, "candidate_registry_expected_sha256": "0" * 64}):
+            proof = json.loads(original)
+            proof["prepared_source_qualification"] = evidence
+            proof_path.write_text(json.dumps(proof))
+            with self.assertRaisesRegex(helper.ActivationError, "proof context mismatch"):
+                helper._snapshot_proof(manifest)
+        proof_path.write_bytes(original)
+        plain = helper.CurrentSchemaUpgrade(**{
+            field.name: getattr(current, field.name) for field in dataclasses.fields(helper.CurrentSchemaUpgrade)
+        })
+        with self.assertRaisesRegex(helper.ActivationError, "proof context mismatch"):
+            helper._snapshot_proof(dataclasses.replace(manifest, current_schema_upgrade=plain))
+        Path(current.migration_registry_path).write_text("tampered registry")
+        with self.assertRaises(helper.ActivationError):
+            helper._snapshot_proof(manifest)
+
     def test_release_114_rejects_incomplete_mismatched_and_extra_ledger(self) -> None:
         for mutation in (
             "DELETE FROM _migrations WHERE version = 70",
@@ -781,7 +933,12 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         growth_bytes: int = 0,
     ) -> None:
         target = Path(manifest.target_binary)
-        baseline = 114 if manifest.source_kind == "published_release" else 123
+        baseline = (
+            114
+            if manifest.source_kind == "published_release"
+            or isinstance(manifest.current_schema_upgrade, helper.PreparedSource114Upgrade)
+            else 123
+        )
         pending = [item for item in compiled_ledger() if item[0] > baseline]
         migrations = pending[:1] if partial else pending
         growth = (
@@ -804,10 +961,16 @@ sys.exit({7 if partial else 0})
         object.__setattr__(manifest, "candidate_binary_sha256", helper.sha256(target))
 
     def test_release_114_migration_and_startup_failures_never_launch_predecessor(self) -> None:
+        self.assert_114_failures_never_launch_predecessor(self.release_manifest)
+
+    def test_prepared_114_migration_and_startup_failures_never_launch_predecessor(self) -> None:
+        self.assert_114_failures_never_launch_predecessor(self.prepared114_manifest)
+
+    def assert_114_failures_never_launch_predecessor(self, manifest_factory) -> None:
         for failure in ("migration", "startup"):
             with self.subTest(failure=failure):
                 database = self.database(through=114)
-                manifest = self.release_manifest(database)
+                manifest = manifest_factory(database)
                 self.migration_script(manifest, partial=failure == "migration")
                 current = manifest.current_schema_upgrade
                 Path(manifest.target_plist).write_bytes(Path(manifest.rollback_plist).read_bytes())
@@ -819,6 +982,7 @@ sys.exit({7 if partial else 0})
                 class CandidateLaunch:
                     disruption_started = False
                     starts = 0
+                    started_plists = []
 
                     def stop(self):
                         self.disruption_started = True
@@ -829,6 +993,7 @@ sys.exit({7 if partial else 0})
 
                     def start(self, old_pid, plist_path=None):
                         self.starts += 1
+                        self.started_plists.append(plist_path)
                         raise helper.ActivationError("injected startup failure")
 
                 launchctl = CandidateLaunch()
@@ -853,6 +1018,7 @@ sys.exit({7 if partial else 0})
                 restore.assert_not_called()
                 self.assertEqual(len(invoked), 1)
                 self.assertEqual(launchctl.starts, 0 if failure == "migration" else 1)
+                self.assertEqual(launchctl.started_plists, [] if failure == "migration" else [manifest.candidate_plist])
                 self.assertEqual(state, "activation_failed_database_committed" if failure == "migration" else "committed")
                 self.assertEqual(Path(manifest.active_path).read_text(), manifest.transaction_id)
                 proof = helper._snapshot_proof(manifest)
@@ -891,6 +1057,9 @@ sys.exit({7 if partial else 0})
 
     def test_exact_target_source_still_invokes_offline_candidate(self) -> None:
         self.assert_exact_target_invokes_offline_candidate(self.manifest)
+
+    def test_qualified_prepared114_target_source_still_invokes_offline_candidate(self) -> None:
+        self.assert_exact_target_invokes_offline_candidate(self.prepared114_manifest)
 
     def test_protected_release_exact_target_fails_before_disruption(self) -> None:
         database = self.database(through=128)

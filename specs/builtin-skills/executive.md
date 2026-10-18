@@ -80,6 +80,12 @@ The question recipe is verified against `respond_to_question`, `RespondToQuestio
 
 Focused Rust regressions in `builtin.rs`, the catalog metadata expectation, `system_prompt.rs` and `continuation.rs` are authored but not executed locally under the no-build constraint. Offline drift tests use the existing Python unittest discovery harness; they validate recipe JSON and source anchors without calling a live API. No live question was read or answered, and no merge/deployment or current-instruction activation is implied.
 
+## Public literal-chat recipe qualification
+
+The embedded `phoenix-api` five-step recipe and `PhoenixApiDestinationAuthority` guidance require full `/api/version` `git_sha` matching an independently verified immutable supporting commit (or source-inspected accepted descendant) at the exact authenticated verified-TLS destination before each use/retry. Unknown receivers stop before POST. One harmless retained-ID smoke on the authorized idle target confirms acceptance and materialized bytes, not policy support by HTTP success alone. Literal requests use existing `/chat` with explicit `literal_text`, without extra routes or negotiation flags (ADR-124, REQ-API-031).
+
+Missing/malformed/mismatched receiver identity stops before POST. Original transcript/message identity and intent, destination authority, active WorkScope, normal lifecycle/auth/attachment guards, and local-only `send_conversation_message` boundaries remain intact. Offline drift and E2E harness self-tests qualify the recipe's JSON/source correspondence and zero-POST preflight failures; real Rust router/application and mock-provider E2E execution remain pending under the no-build constraint. No live request, credential operation, deployment or instruction activation is implied.
+
 ## Cross-Spec References
 
 - `specs/skills/` — defines discovery, invocation, frontmatter stripping,

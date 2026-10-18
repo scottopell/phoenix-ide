@@ -6,7 +6,7 @@ import { resolveActiveUnitIndex } from './conversationNavSpy';
 import type { Chapter } from '../conversation/conversationChapters';
 
 function chapter(unitIndex: number): Chapter {
-  return { unitIndex, kind: 'prompt', label: `c${unitIndex}`, sequenceId: unitIndex };
+  return { unitIndex, kind: 'prompt', target: { kind: 'persisted', messageId: `message-${unitIndex}`, transcriptId: 'test' }, label: `c${unitIndex}`, sequenceId: unitIndex };
 }
 
 describe('resolveActiveUnitIndex', () => {

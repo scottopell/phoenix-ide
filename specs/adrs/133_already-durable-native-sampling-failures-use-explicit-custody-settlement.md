@@ -1,4 +1,4 @@
-# ADR-125: Already-durable native sampling failures use explicit custody settlement
+# ADR-133: Already-durable native sampling failures use explicit custody settlement
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -70,10 +70,10 @@ neutral and distinct from successful-sample ACK evidence.
 
 ## References
 
-- [ADR-119: Detach-and-fence](119_controller-loss-detaches-and-fences-surviving-guardian.md).
-- [ADR-120: Same-build native guardian IPC](120_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md).
-- [ADR-121: Retained native application-only recovery](121_retained-native-results-use-application-only-recovery.md).
-- [ADR-124: Retained exact-root identity application-only recovery](124_retained-exact-root-identity-results-use-application-only-recovery.md).
+- [ADR-127: Detach-and-fence](127_controller-loss-detaches-and-fences-surviving-guardian.md).
+- [ADR-128: Same-build native guardian IPC](128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md).
+- [ADR-129: Retained native application-only recovery](129_retained-native-results-use-application-only-recovery.md).
+- [ADR-132: Retained exact-root identity application-only recovery](132_retained-exact-root-identity-results-use-application-only-recovery.md).
 - [Standalone controller requirements](../standalone-deployment-controller/requirements.md), REQ-SDC-018–020.
 - [Standalone controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium), `NativeGuardianPersistenceBoundary`.
 - [Compatibility requirements](../compatibility/requirements.md), REQ-COMP-001 and REQ-COMP-005.

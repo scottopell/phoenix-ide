@@ -1,4 +1,4 @@
-# ADR-121: Retained native results use application-only recovery
+# ADR-129: Retained native results use application-only recovery
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-118, ADR-119, and ADR-120 establish controller durability, disconnect fencing,
+ADR-126, ADR-127, and ADR-128 establish controller durability, disconnect fencing,
 and same-build native IPC. This decision refines those boundaries.
 
 A native sampling runner can die after the guardian has executed and retained
