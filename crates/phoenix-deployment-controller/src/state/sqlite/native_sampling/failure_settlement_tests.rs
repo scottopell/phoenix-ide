@@ -368,6 +368,13 @@ fn failure_ack_is_revision_neutral_immediate_or_fresh_and_remains_historical() {
                     .unwrap(),
                 Some(confirmed)
             );
+            assert_eq!(
+                fixture
+                    .store
+                    .sole_native_sampling_failure(fixture.issue.key().attempt_id())
+                    .unwrap(),
+                Some((fixture.issue.key(), confirmed))
+            );
             assert!(matches!(
                 fixture
                     .store
@@ -655,6 +662,130 @@ fn status_loader_rejects_settlement_that_reuses_issuing_session() {
         fixture
             .store
             .load_native_sampling_status(fixture.issue.key()),
+        Err(ControllerStoreError::Malformed(_))
+    ));
+}
+
+fn insert_reconciliation_completion(
+    fixture: &FailureFixture,
+    generation: NonZeroU64,
+) -> rusqlite::Result<usize> {
+    let session = fixture
+        .binding
+        .sessions()
+        .iter()
+        .find(|session| session.generation == generation)
+        .unwrap();
+    fixture.store.connection.execute(
+        "INSERT INTO native_reconciliation_completions(attempt_id,session_generation,interruption_revision,recovery_revision,binding_revision) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            key(fixture.issue.key().attempt_id()),
+            Word(generation.get()),
+            Word(session.interruption_revision.get()),
+            Word(session.interruption_revision.checked_next().unwrap().get()),
+            Word(fixture.binding.revision().get()),
+        ],
+    )
+}
+
+#[test]
+fn schema_rejects_failure_settlement_or_ack_from_completed_reconciliation_session() {
+    let mut before_settlement = FailureFixture::new(ResourceObservationFailure::Unsupported);
+    before_settlement
+        .store
+        .connection
+        .execute_batch("DROP TRIGGER native_reconciliation_completion_requires_exact_preparation;")
+        .unwrap();
+    insert_reconciliation_completion(
+        &before_settlement,
+        before_settlement.binding.current_session().generation,
+    )
+    .unwrap();
+    let candidate = before_settlement.candidate();
+    assert!(matches!(
+        before_settlement.store.settle_native_sampling_failure_at(
+            VerifiedNativeSamplingFailureSettlement::after_live_verification(candidate),
+            MonotonicTick::new(499),
+        ),
+        Err(ControllerStoreError::Sqlite(_))
+    ));
+
+    let mut before_ack = FailureFixture::new(ResourceObservationFailure::Unsupported);
+    let pending = before_ack.settle();
+    before_ack.reconnect();
+    before_ack
+        .store
+        .connection
+        .execute_batch("DROP TRIGGER native_reconciliation_completion_requires_exact_preparation;")
+        .unwrap();
+    insert_reconciliation_completion(&before_ack, before_ack.binding.current_session().generation)
+        .unwrap();
+    let confirmation = before_ack.confirmation(pending);
+    assert!(matches!(
+        before_ack
+            .store
+            .confirm_native_sampling_failure_ack(confirmation),
+        Err(ControllerStoreError::Sqlite(_))
+    ));
+}
+
+#[test]
+fn status_loader_rejects_completed_settling_or_confirming_session() {
+    let mut settled = FailureFixture::new(ResourceObservationFailure::Unsupported);
+    let _pending = settled.settle();
+    settled
+        .store
+        .connection
+        .execute_batch("DROP TRIGGER native_reconciliation_completion_requires_exact_preparation;")
+        .unwrap();
+    assert!(insert_reconciliation_completion(
+        &settled,
+        settled.binding.current_session().generation,
+    )
+    .is_err());
+    settled
+        .store
+        .connection
+        .execute_batch(
+            "DROP TRIGGER native_reconciliation_completion_excludes_failure_settlement_sessions;",
+        )
+        .unwrap();
+    insert_reconciliation_completion(&settled, settled.binding.current_session().generation)
+        .unwrap();
+    assert!(matches!(
+        read_status(&settled.store.connection, settled.issue.key()),
+        Err(ControllerStoreError::Malformed(_))
+    ));
+
+    let mut confirmed = FailureFixture::new(ResourceObservationFailure::Unsupported);
+    let pending = confirmed.settle();
+    confirmed.reconnect();
+    let confirmation = confirmed.confirmation(pending);
+    confirmed
+        .store
+        .confirm_native_sampling_failure_ack(confirmation)
+        .unwrap();
+    confirmed
+        .store
+        .connection
+        .execute_batch("DROP TRIGGER native_reconciliation_completion_requires_exact_preparation;")
+        .unwrap();
+    assert!(insert_reconciliation_completion(
+        &confirmed,
+        confirmed.binding.current_session().generation,
+    )
+    .is_err());
+    confirmed
+        .store
+        .connection
+        .execute_batch(
+            "DROP TRIGGER native_reconciliation_completion_excludes_failure_settlement_sessions;",
+        )
+        .unwrap();
+    insert_reconciliation_completion(&confirmed, confirmed.binding.current_session().generation)
+        .unwrap();
+    assert!(matches!(
+        read_status(&confirmed.store.connection, confirmed.issue.key()),
         Err(ControllerStoreError::Malformed(_))
     ));
 }

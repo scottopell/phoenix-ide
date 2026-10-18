@@ -177,6 +177,17 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'native sampling settlement requires failed application');
 END;
+CREATE TRIGGER native_sampling_settlement_excludes_completed_session
+BEFORE INSERT ON native_sampling_failure_settlements
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM native_reconciliation_completions
+    WHERE attempt_id = NEW.attempt_id
+      AND session_generation = NEW.settling_session_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'native sampling settlement session already completed reconciliation');
+END;
 CREATE TABLE native_sampling_failure_ack_confirmations (
     attempt_id BLOB NOT NULL,
     dispatch_revision BLOB NOT NULL CHECK(length(dispatch_revision) = 8 AND dispatch_revision != zeroblob(8)),
@@ -201,6 +212,17 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'native sampling failure ACK requires exact settlement');
+END;
+CREATE TRIGGER native_sampling_failure_ack_excludes_completed_session
+BEFORE INSERT ON native_sampling_failure_ack_confirmations
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM native_reconciliation_completions
+    WHERE attempt_id = NEW.attempt_id
+      AND session_generation = NEW.confirming_session_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'native sampling failure ACK session already completed reconciliation');
 END;
 CREATE TRIGGER native_sampling_settled_failure_is_immutable
 BEFORE UPDATE ON native_sampling_applications
@@ -283,6 +305,18 @@ WHEN NOT EXISTS (
       AND s.generation=(SELECT max(generation) FROM guardian_sessions WHERE attempt_id=NEW.attempt_id)
 )
 BEGIN SELECT RAISE(ABORT, 'completion requires exact prepared checkpoint and session'); END;
+CREATE TRIGGER native_reconciliation_completion_excludes_failure_settlement_sessions
+BEFORE INSERT ON native_reconciliation_completions
+WHEN EXISTS (
+    SELECT 1 FROM native_sampling_failure_settlements
+    WHERE attempt_id = NEW.attempt_id
+      AND settling_session_generation = NEW.session_generation
+) OR EXISTS (
+    SELECT 1 FROM native_sampling_failure_ack_confirmations
+    WHERE attempt_id = NEW.attempt_id
+      AND confirming_session_generation = NEW.session_generation
+)
+BEGIN SELECT RAISE(ABORT, 'reconciliation completion conflicts with failure settlement session'); END;
 CREATE TRIGGER native_reconciliation_completion_is_immutable
 BEFORE UPDATE ON native_reconciliation_completions
 BEGIN SELECT RAISE(ABORT, 'prepared completion is immutable'); END;

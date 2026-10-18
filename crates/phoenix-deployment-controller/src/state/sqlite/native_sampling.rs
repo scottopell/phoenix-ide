@@ -976,7 +976,8 @@ impl ControllerSqliteStore {
                 match read_status(&tx, dispatch)? {
                     Some(
                         status @ (NativeSamplingStatus::ParkedRetained { .. }
-                        | NativeSamplingStatus::FailureSettledPendingAck { .. }),
+                        | NativeSamplingStatus::FailureSettledPendingAck { .. }
+                        | NativeSamplingStatus::FailureSettlementAckConfirmed { .. }),
                     ) => {
                         if failure.replace((dispatch, status)).is_some() {
                             return Err(ControllerStoreError::RevisionConflict);
@@ -1269,6 +1270,20 @@ pub(super) fn insert_application(
     Ok(())
 }
 
+fn session_completed_reconciliation(
+    connection: &rusqlite::Connection,
+    attempt: crate::AttemptId,
+    generation: NonZeroU64,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_reconciliation_completions WHERE attempt_id=?1 AND session_generation=?2) OR EXISTS(SELECT 1 FROM native_reconciliation_activations WHERE attempt_id=?1 AND session_generation=?2)",
+            params![key(attempt), Word(generation.get())],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn read_status(
     connection: &rusqlite::Connection,
@@ -1463,6 +1478,11 @@ pub(super) fn read_status(
                         || header.revision < settlement_revision
                         || settling_session.interruption_revision.checked_next()
                             != Some(settlement_revision)
+                        || session_completed_reconciliation(
+                            connection,
+                            dispatch.attempt_id(),
+                            settling_session_generation,
+                        )?
                     {
                         return malformed("invalid failure settlement");
                     }
@@ -1484,6 +1504,15 @@ pub(super) fn read_status(
                             && confirming_session.interruption_revision <= settlement_revision
                         {
                             return malformed("failure confirmation lacks fresh interruption");
+                        }
+                        if session_completed_reconciliation(
+                            connection,
+                            dispatch.attempt_id(),
+                            confirming_session_generation,
+                        )? {
+                            return malformed(
+                                "failure confirmation cites completed reconciliation",
+                            );
                         }
                         NativeSamplingStatus::FailureSettlementAckConfirmed {
                             issue,

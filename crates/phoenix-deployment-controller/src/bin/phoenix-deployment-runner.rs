@@ -763,11 +763,14 @@ fn run_settle_failed_sample(
         } | NativeSamplingStatus::FailureSettledPendingAck {
             failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported,
             ..
+        } | NativeSamplingStatus::FailureSettlementAckConfirmed {
+            failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported,
+            ..
         }
     ) {
         return Err("settlement fixture requires exact Unsupported failure".into());
     }
-    let settled = match status {
+    let confirmed = match status {
         NativeSamplingStatus::ParkedRetained { .. } => {
             let loaded = store
                 .load_attempt(attempt)
@@ -796,32 +799,35 @@ fn run_settle_failed_sample(
             {
                 return Err("settlement was not exact pending failure ACK".into());
             }
-            settled
+            confirm_native_sampling_failure_settlement(
+                store,
+                client,
+                key,
+                settled,
+                session.generation,
+                fixture,
+            )?
         }
-        status @ NativeSamplingStatus::FailureSettledPendingAck { .. } => status,
+        settled @ NativeSamplingStatus::FailureSettledPendingAck { .. } => {
+            confirm_native_sampling_failure_settlement(
+                store,
+                client,
+                key,
+                settled,
+                session.generation,
+                fixture,
+            )?
+        }
+        confirmed @ NativeSamplingStatus::FailureSettlementAckConfirmed { .. } => confirmed,
         NativeSamplingStatus::IssuedPendingApplication { .. }
         | NativeSamplingStatus::AppliedPendingAck { .. }
-        | NativeSamplingStatus::SampleAckConfirmed { .. }
-        | NativeSamplingStatus::FailureSettlementAckConfirmed { .. } => {
-            return Err("failed sample is neither parked nor pending settlement ACK".into());
+        | NativeSamplingStatus::SampleAckConfirmed { .. } => {
+            return Err("failed sample is not parked, pending settlement ACK, or confirmed".into());
         }
     };
-    if let SettleFailureFixture::PauseAfterSettlement(release) = fixture {
-        let gate = release.prepare()?;
-        println!(
-            "sampling_failure_settled_pending_ack revision={}",
-            key.revision().get()
-        );
-        std::io::stdout().flush().map_err(|e| e.to_string())?;
-        gate.wait()?;
-    }
-    let confirmed = recover_native_sampling_failure_settlement_ack(store, client, key)
-        .map_err(|e| format!("failure ACK: {e:?}"))?;
-    if !matches!((settled, confirmed),
-        (NativeSamplingStatus::FailureSettledPendingAck { issue, .. }, NativeSamplingStatus::FailureSettlementAckConfirmed { issue: stored, failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported, confirming_session_generation, .. })
-        if stored == issue && confirming_session_generation.get() == session.generation)
+    if !matches!(confirmed, NativeSamplingStatus::FailureSettlementAckConfirmed { issue, failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported, .. } if issue.key() == key)
     {
-        return Err("failure ACK confirmation mismatch".into());
+        return Err("failure settlement confirmation mismatch".into());
     }
     let snapshot = client
         .snapshot()
@@ -841,6 +847,34 @@ fn run_settle_failed_sample(
     }
     println!("sampling_failure_settlement_confirmed generation={} effects=0 sample_resources=0 list_children=0 observe_identity=0 signal=0", session.generation);
     std::io::stdout().flush().map_err(|e| e.to_string())
+}
+
+fn confirm_native_sampling_failure_settlement(
+    store: &mut ControllerSqliteStore,
+    client: &mut GuardianClient,
+    key: phoenix_deployment_controller::DispatchKey,
+    settled: NativeSamplingStatus,
+    current_generation: u64,
+    fixture: &SettleFailureFixture,
+) -> Result<NativeSamplingStatus, String> {
+    if let SettleFailureFixture::PauseAfterSettlement(release) = fixture {
+        let gate = release.prepare()?;
+        println!(
+            "sampling_failure_settled_pending_ack revision={}",
+            key.revision().get()
+        );
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        gate.wait()?;
+    }
+    let confirmed = recover_native_sampling_failure_settlement_ack(store, client, key)
+        .map_err(|e| format!("failure ACK: {e:?}"))?;
+    if !matches!((settled, confirmed),
+        (NativeSamplingStatus::FailureSettledPendingAck { issue, .. }, NativeSamplingStatus::FailureSettlementAckConfirmed { issue: stored, failure: phoenix_deployment_controller::ResourceObservationFailure::Unsupported, confirming_session_generation, .. })
+        if stored == issue && confirming_session_generation.get() == current_generation)
+    {
+        return Err("failure ACK confirmation mismatch".into());
+    }
+    Ok(confirmed)
 }
 
 fn run_recover_applied_ack(
