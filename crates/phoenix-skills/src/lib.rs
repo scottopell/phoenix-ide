@@ -1447,7 +1447,9 @@ mod tests {
             !trusted.contains("jq "),
             "supported recipe must not require jq"
         );
-        assert!(trusted.contains("Do not use `POST /api/conversations/{id}/chat`"));
+        assert!(trusted.contains("Public literal chat with a known receiver"));
+        assert!(trusted.contains("Smoke HTTP success alone does not prove policy support"));
+        assert!(trusted.contains("Do not use omitted/default `expand_references` mode"));
         for forbidden in [
             "UPDATE conversations",
             "INSERT INTO conversations",

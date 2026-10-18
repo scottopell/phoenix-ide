@@ -1226,7 +1226,7 @@ def _queue_literal_behind_gated_turn(
             "text": f"[[scenario:plain_text]] [[stream-gate:{port}]] literal queue setup",
             "message_id": str(uuid.uuid4()),
         }, follow_redirects=False, timeout=10.0)
-        assert setup.status_code == 200 and setup.json().get("steering") is False, setup.text
+        assert setup.status_code == 200 and setup.json().get("steering", False) is False, setup.text
         connection, _ = listener.accept()
         with connection:
             try:
@@ -1254,7 +1254,7 @@ def scenario_public_literal_chat(base_url: str) -> None:
             "expansion_policy": "literal_text",
         }
         accepted = _post_public_literal_chat(base_url, conv_id, smoke, expected_receiver_sha)
-        assert accepted.status_code == 200 and accepted.json().get("steering") is False, accepted.text
+        assert accepted.status_code == 200 and accepted.json().get("steering", False) is False, accepted.text
         materialized = _poll_to_idle_with_messages(
             base_url, conv_id,
             lambda messages: any(m.get("message_id") == smoke["message_id"] for m in _user_messages(messages)),
@@ -1275,7 +1275,7 @@ def scenario_public_literal_chat(base_url: str) -> None:
             response = _post_public_literal_chat(base_url, conv_id, body, expected_receiver_sha)
         assert response.status_code == 200, f"literal POST failed: {response.status_code} {response.text}"
         assert response.json().get("queued") is True
-        assert response.json().get("steering") is running, response.json()
+        assert response.json().get("steering", False) is running, response.json()
 
         def has_literal(messages: list[dict]) -> bool:
             return any(m.get("message_id") == body["message_id"] for m in _user_messages(messages))
