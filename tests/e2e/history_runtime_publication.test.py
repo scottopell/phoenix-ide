@@ -122,6 +122,78 @@ class SafePublicationTests(unittest.TestCase):
         self.assertEqual(value['ui_artifacts']['stock_natural']['manifest_sha256'], 'c' * 64)
         self.assertEqual(case['publication_gates']['long_tasks'], 'not_emitted_by_pinned_driver')
 
+    def diagnostic(self, line=530, phase='module_checks'):
+        return {'schema_version': 1, 'resolution': 'verified_assertion_site', 'phase': phase,
+                'error_code': 'ERR_ASSERTION', 'module_basename': 'qualify-view-telemetry.mjs',
+                'module_sha256': publication.ASSERTION_MODULES['qualify-view-telemetry.mjs'],
+                'line': line, 'column': 10,
+                'assertion_site_id': f'f16-qualify-view-telemetry-L{line}-C10'}
+
+    def test_exact_source_assertion_projection_keeps_primary_separate_from_secondary(self):
+        primary = self.diagnostic()
+        secondary = self.diagnostic(531, 'context_cleanup')
+        secret = 'UNIT_ONLY_cookie_https://private.invalid/?token=SECRET'
+        path = 'ordinary/joint-telemetry-dependency-manifest.json'
+        self.write(path, {'failure_phase': 'module_checks', 'primary_failure': secret,
+            'primary_diagnostic': primary | {'stack': secret, 'message': secret, 'url': secret},
+            'secondary_diagnostics': [secondary | {'message': secret}], 'cleanup_failures': [secret]})
+        result = publication.project(self.root)['cases']['ordinary']['diagnostics']['joint_dependency_manifest']
+        self.assertEqual(result['primary_diagnostic'], primary)
+        self.assertEqual(result['primary_diagnostic_boundary'], 'present')
+        self.assertEqual(result['secondary_diagnostics']['items'], [secondary])
+        self.assertNotIn(secret, json.dumps(result))
+        self.write(path, {'primary_diagnostic': primary, 'secondary_diagnostics': [secondary] * 4})
+        bounded = publication.project(self.root)['cases']['ordinary']['diagnostics']['joint_dependency_manifest']
+        self.assertEqual(bounded['primary_diagnostic'], primary)
+        self.assertEqual(len(bounded['secondary_diagnostics']['items']), 2)
+        self.assertTrue(bounded['secondary_diagnostics']['overflow'])
+        self.assertEqual(publication.joint_diagnostics({})['primary_diagnostic_boundary'], 'missing_field')
+        self.assertIsNone(publication.joint_diagnostics({'primary_diagnostic': None})['primary_diagnostic'])
+
+    def test_source_diagnostic_unknown_fallback_rejects_malicious_or_unverified_fields(self):
+        secret = 'UNIT_ONLY_SECRET'
+        for change in ({'module_basename': '../' + secret}, {'module_sha256': '0' * 64},
+                       {'line': 529}, {'column': 11}, {'line': True}, {'schema_version': True},
+                       {'assertion_site_id': secret}, {'phase': secret}, {'error_code': secret},
+                       {'resolution': secret}, {'line': -1}, {'line': 99999}, {'column': secret}):
+            result = publication.assertion_diagnostic(self.diagnostic() | change)
+            self.assertEqual(result['resolution'], 'unknown', change)
+            self.assertNotIn('module_basename', result)
+            self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(publication.assertion_diagnostic(self.diagnostic(531, 'context_cleanup'))['resolution'], 'unknown')
+        from unittest.mock import patch
+        with patch.object(Path, 'read_bytes', return_value=b'UNIT_ONLY_CHANGED_SOURCE'):
+            self.assertEqual(publication.assertion_diagnostic(self.diagnostic())['resolution'], 'unknown')
+
+    def test_every_node_source_token_maps_to_same_finite_publisher_site_id(self):
+        import subprocess
+        root = Path(__file__).resolve().parents[2]
+        script = r'''
+          import {fileURLToPath,pathToFileURL} from 'node:url';
+          import {readFileSync} from 'node:fs';
+          import assert from 'node:assert/strict';
+          import {prepareJointFailureDiagnostic,TELEMETRY_MODULE_SHA256,TELEMETRY_DIAGNOSTICS_SHA256} from './ui/scripts/history-joint-telemetry.mjs';
+          const modulePath=fileURLToPath(new URL('./ui/scripts/qualify-view-telemetry.mjs',import.meta.url));
+          const helper=fileURLToPath(new URL('./ui/scripts/view-telemetry-diagnostics.mjs',import.meta.url));
+          const diagnose=prepareJointFailureDiagnostic({modulePath,dependencies:{[modulePath]:TELEMETRY_MODULE_SHA256,[helper]:TELEMETRY_DIAGNOSTICS_SHA256}});
+          const output=[];
+          for (const path of [modulePath,helper]) readFileSync(path,'utf8').split('\n').forEach((line,index)=>{
+            for(const match of line.matchAll(/\bassert\.(\w+)\(/g)) {
+              const error=new assert.AssertionError({message:'UNIT_ONLY_NOT_RUNTIME'});
+              error.stack=`AssertionError [ERR_ASSERTION]: ${error.message}\n    at test (${pathToFileURL(path).href}:${index+1}:${match.index+8})`;
+              output.push(diagnose(error,'module_checks'));
+            }
+          });
+          console.log(JSON.stringify(output));
+        '''
+        result = subprocess.run(['node', '--input-type=module', '-e', script], cwd=root,
+                                check=True, capture_output=True, text=True, timeout=10)
+        diagnostics = json.loads(result.stdout)
+        self.assertGreater(len(diagnostics), 150)
+        for diagnostic in diagnostics:
+            self.assertEqual(diagnostic['resolution'], 'verified_assertion_site')
+            self.assertEqual(publication.assertion_diagnostic(diagnostic), diagnostic)
+
     def test_fixed_inventory_and_phases_are_pinned_to_actual_producers(self):
         scripts = Path(__file__).resolve().parents[2] / 'ui/scripts'
         browser = (scripts / 'qualify-history-opening-realserver.mjs').read_text()

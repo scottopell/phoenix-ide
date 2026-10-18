@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Project stock synthetic runtime distributions; never copy raw evidence."""
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -171,6 +172,52 @@ def browser_diagnostics(value):
     return out
 
 
+ASSERTION_MODULES = {
+    'qualify-view-telemetry.mjs': '1c702c78bb06f74f3dae4c8f97d1932fc308959596f3602375bc65d7d99fb9e1',
+    'view-telemetry-diagnostics.mjs': 'e06232a39200d88e0a98aedb3d9e6183537f97a6e9498f27fe57a7e2a9a4696b',
+}
+JOINT_SECONDARY_PHASES = ('context_cleanup', 'dependency_verification')
+
+
+def assertion_diagnostic(value, phases=JOINT_PHASES):
+    value = object_value(value)
+    out = {'schema_version': 1, 'resolution': 'unknown', 'phase': 'unknown', 'error_code': 'unknown'}
+    if type(value.get('schema_version')) is not int or value['schema_version'] != 1:
+        return out
+    if value.get('phase') in phases:
+        out['phase'] = value['phase']
+    if value.get('error_code') == 'ERR_ASSERTION':
+        out['error_code'] = 'ERR_ASSERTION'
+    name = value.get('module_basename')
+    if (value.get('resolution') != 'verified_assertion_site' or out['phase'] == 'unknown'
+            or out['error_code'] != 'ERR_ASSERTION' or type(name) is not str or name not in ASSERTION_MODULES
+            or value.get('module_sha256') != ASSERTION_MODULES[name]
+            or type(value.get('line')) is not int or type(value.get('column')) is not int):
+        return out
+    # Independently constrain the producer projection to assertion tokens in exact pinned bytes.
+    path = Path(__file__).resolve().parents[2] / 'ui/scripts' / name
+    try:
+        if path.is_symlink() or path.stat().st_size > 128 * 1024:
+            return out
+        source = path.read_bytes()
+        if hashlib.sha256(source).hexdigest() != ASSERTION_MODULES[name]:
+            return out
+        lines = source.decode().split('\n')
+        line, column = value['line'], value['column']
+        if not 1 <= line <= len(lines):
+            return out
+        if column not in {match.start(1) + 1 for match in re.finditer(r'\bassert\.(\w+)\(', lines[line - 1])}:
+            return out
+        site = f'f16-{name[:-4]}-L{line}-C{column}'
+        if value.get('assertion_site_id') != site:
+            return out
+    except (OSError, UnicodeError):
+        return out
+    return out | {'resolution': 'verified_assertion_site', 'module_basename': name,
+                  'module_sha256': ASSERTION_MODULES[name], 'line': line, 'column': column,
+                  'assertion_site_id': site}
+
+
 def joint_diagnostics(value):
     value = object_value(value)
     out = scalars(value, booleans=('context_acquired',), enums={'failure_phase': JOINT_PHASES})
@@ -180,6 +227,12 @@ def joint_diagnostics(value):
     out.update(failure_presence(value, ('primary_failure', 'authentication_response_cleanup_failure')))
     out['cleanup_failure_count'] = inventory(value, 'cleanup_failures')
     out['cleanup_boundary'] = field_boundary(value, 'cleanup_failures', isinstance(value.get('cleanup_failures'), list))
+    out['primary_diagnostic'] = (None if value.get('primary_diagnostic') is None else
+                                 assertion_diagnostic(value['primary_diagnostic']))
+    out['primary_diagnostic_boundary'] = field_boundary(value, 'primary_diagnostic',
+        value.get('primary_diagnostic') is None or isinstance(value.get('primary_diagnostic'), dict))
+    out['secondary_diagnostics'] = bounded_records(value, 'secondary_diagnostics', 2,
+        lambda item: assertion_diagnostic(item, JOINT_SECONDARY_PHASES))
     return out
 
 

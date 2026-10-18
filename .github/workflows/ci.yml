@@ -624,6 +624,7 @@ jobs:
           name: opening-stock-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: warn
+          include-hidden-files: true
           path: |
             opening-codegen-receipt.json
             opening-bound-ceiling/
@@ -641,6 +642,7 @@ jobs:
             opening-stock-instrumented-receipt.json
             opening-stock-publication.json
             pinned-app/ui/controlled-functional-build.json
+            pinned-app/ui/dist-controlled-functional/
             opening-instrumented-unit.log
             opening-collector-witness-unit.log
             opening-sdk-metadata-unit.log

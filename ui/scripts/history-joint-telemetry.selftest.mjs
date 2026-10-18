@@ -4,8 +4,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSyn
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { assertBackgroundReport } from './qualify-view-telemetry.mjs';
 import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, UNIT_ONLY,
-  prepareJointTelemetry, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage, authenticateOwnedContext,
+  prepareJointTelemetry, prepareJointFailureDiagnostic, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage, authenticateOwnedContext,
   installObservedHistoryTelemetry, installHistoryRequestOwnership, installHistoryPaginationDiagnostic, appendObservedHistory } from './history-joint-telemetry.mjs';
 
 // All positive fake browser/module/fixture values in this file are UNIT ONLY, not runtime proof.
@@ -162,6 +164,86 @@ for (const phase of ['runtime_import', 'export_admission', 'context_acquisition'
       assert.equal(manifest.before[f.diagnostics], TELEMETRY_DIAGNOSTICS_SHA256);
     } finally { f.cleanup(); }
   });
+function pinnedDiagnosticConfig() {
+  const modulePath = fileURLToPath(new URL('./qualify-view-telemetry.mjs', import.meta.url));
+  const helper = fileURLToPath(new URL('./view-telemetry-diagnostics.mjs', import.meta.url));
+  return { modulePath, dependencies: { [modulePath]: TELEMETRY_MODULE_SHA256, [helper]: TELEMETRY_DIAGNOSTICS_SHA256 } };
+}
+function pinnedAssertion() {
+  try { assertBackgroundReport({}, {}); } catch (error) { return error; }
+  assert.fail('UNIT ONLY pure pinned assertion must fail');
+}
+function syntheticAssertion(message, frames) {
+  const error = new assert.AssertionError({ message });
+  error.stack = `AssertionError [ERR_ASSERTION]: ${message}\n${frames.join('\n')}`;
+  return error;
+}
+
+test('offline native Node assertion resolves exact pinned source token, not its message', () => {
+  const diagnose = prepareJointFailureDiagnostic(pinnedDiagnosticConfig());
+  assert.deepEqual(diagnose(pinnedAssertion(), 'module_checks'), {
+    schema_version: 1, phase: 'module_checks', error_code: 'ERR_ASSERTION', resolution: 'verified_assertion_site',
+    module_basename: 'qualify-view-telemetry.mjs', module_sha256: TELEMETRY_MODULE_SHA256,
+    line: 530, column: 10, assertion_site_id: 'f16-qualify-view-telemetry-L530-C10',
+  });
+});
+
+test('offline malicious stacks, unknown modules, nonassertion lines and mismatched hashes fail closed', () => {
+  const config = pinnedDiagnosticConfig(), diagnose = prepareJointFailureDiagnostic(config);
+  const url = pathToFileURL(config.modulePath).href;
+  const trusted = `    at secretFunction (${url}:530:10)`;
+  const secret = `UNIT_ONLY_password_https://private.invalid/path?auth=SECRET\n${trusted}`;
+  const valid = diagnose(syntheticAssertion(secret, [trusted]), 'module_checks');
+  assert.equal(valid.resolution, 'verified_assertion_site');
+  assert.ok(!JSON.stringify(valid).includes('SECRET'));
+  for (const frames of [
+    [`    at unknown (file:///private/qualify-view-telemetry.mjs:530:10)`, trusted],
+    [`    at unknown (${url}?token=SECRET:530:10)`, trusted],
+    [`    at unknown (https://private.invalid/qualify-view-telemetry.mjs:530:10)`, trusted],
+    [`    at nonassertion (${url}:529:10)`], [`    at wrongColumn (${url}:530:11)`],
+    ['    at unknown (file:///SECRET.mjs:1:1)'], [],
+  ]) {
+    const result = diagnose(syntheticAssertion(secret, frames), 'module_checks');
+    assert.equal(result.resolution, 'unknown');
+    assert.ok(!JSON.stringify(result).includes('SECRET'));
+    assert.equal(result.module_basename, undefined);
+  }
+  assert.equal(diagnose(new Error(secret), 'module_checks').error_code, 'unknown');
+  assert.equal(diagnose(pinnedAssertion(), secret).resolution, 'unknown');
+  assert.equal(diagnose(pinnedAssertion(), secret).phase, 'unknown');
+  assert.equal(diagnose(syntheticAssertion(secret, ['x'.repeat(32769), trusted]), 'module_checks').resolution, 'unknown');
+  const mismatched = { ...config, dependencies: { ...config.dependencies, [config.modulePath]: '0'.repeat(64) } };
+  assert.equal(prepareJointFailureDiagnostic(mismatched)(pinnedAssertion(), 'module_checks').resolution, 'unknown');
+  const f = unitFiles(); try {
+    // A claimed correct digest never substitutes for hashing the actual on-disk bytes.
+    const fake = prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT });
+    const error = syntheticAssertion(secret, [`    at fake (${pathToFileURL(f.module).href}:530:10)`]);
+    assert.equal(prepareJointFailureDiagnostic(fake)(error, 'module_checks').resolution, 'unknown');
+  } finally { f.cleanup(); }
+});
+
+test('UNIT ONLY first source assertion is frozen before cleanup mutates the Error or fails', async () => {
+  const f = unitFiles(); try {
+    const config = { ...prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT }), ...pinnedDiagnosticConfig() };
+    const primary = pinnedAssertion(), expected = prepareJointFailureDiagnostic(config)(primary, 'module_checks');
+    const context = { newPage: async () => ({}), close: async () => {
+      primary.stack = 'UNIT_ONLY_cleanup_overwrite';
+      throw syntheticAssertion('UNIT_ONLY_cleanup_secret', [`    at cleanup (${pathToFileURL(config.modulePath).href}:531:10)`]);
+    } };
+    await assert.rejects(runJointTelemetryStage({ config, browser: { newContext: async () => context },
+      baseURL: 'http://127.0.0.1:12345', outputDir: f.root, harnessPath: import.meta.filename,
+      historyPhysical: { count: 1, visible: true, persistedMessageID: 'unit-exact' },
+      UNIT: { label: UNIT_ONLY, importModule: async () => ({ runTelemetryChecks: async () => { throw primary; } }) } }),
+    error => error === primary);
+    const receipt = JSON.parse(readFileSync(resolve(f.root, 'joint-telemetry-dependency-manifest.json'), 'utf8'));
+    assert.deepEqual(receipt.primary_diagnostic, expected);
+    assert.equal(receipt.secondary_diagnostics.length, 1);
+    assert.equal(receipt.secondary_diagnostics[0].phase, 'context_cleanup');
+    assert.equal(receipt.secondary_diagnostics[0].line, 531);
+    assert.ok(!JSON.stringify([receipt.primary_diagnostic, receipt.secondary_diagnostics]).includes('UNIT_ONLY_'));
+  } finally { f.cleanup(); }
+});
+
 test('UNIT ONLY donor primary survives context cleanup failure and retains dependency manifests', async () => {
   const f = unitFiles(); try {
     const config = prepareJointTelemetry({ env: f.env, appRoot: f.root, UNIT: f.UNIT });

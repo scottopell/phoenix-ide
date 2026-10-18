@@ -142,7 +142,9 @@ class StockPrepareTests(unittest.TestCase):
     def test_both_artifacts_and_failure_receipts_are_retained(self):
         upload = step('Retain stock artifacts and safe publication')
         self.assertIn("if: ${{ always() && env.STOCK_PREPARE_ONLY == 'true' }}", upload)
+        self.assertIn('include-hidden-files: true', upload)
         for name in ('pinned-app/ui/dist/', 'pinned-app/ui/stock-natural-build.json',
+                     'pinned-app/ui/dist-controlled-functional/', 'pinned-app/ui/controlled-functional-build.json',
                      'opening-stock-libtest', 'opening-stock-receiving-build.json',
                      'opening-stock-instrumented-receipt.json', 'opening-stock-publication.json',
                      'opening-instrumented-selector.log', 'opening-ui-build-owner.json'):
