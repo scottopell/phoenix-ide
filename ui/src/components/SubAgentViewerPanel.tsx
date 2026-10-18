@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { SubAgentTranscript, navigateToSubAgent } from './MessageComponents';
+import { SubAgentTaskDetails } from './SubAgentTaskDetails';
 import { useConversationInlineStream } from '../hooks/useConversationInlineStream';
 import { isAgentWorking } from '../utils';
 import type { OpenedSubAgent } from '../contexts/SubAgentViewerContext';
@@ -102,6 +103,7 @@ export function SubAgentViewerPanel({ opened, onClose, width }: Props) {
         </button>
       </div>
       <div className="subagent-viewer-content">
+        <SubAgentTaskDetails task={task} inline={inline} />
         <SubAgentTranscript inline={inline} running={running} full />
       </div>
     </aside>
