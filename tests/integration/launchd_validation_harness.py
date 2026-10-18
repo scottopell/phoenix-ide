@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import runpy
 import shutil
 import stat
 import sys
@@ -30,6 +31,16 @@ EXPECTED_LEGACY_DATABASE_MANIFEST_FIELDS = (
 ROOT = Path(__file__).resolve().parents[2]
 DEV_PATH = ROOT / "dev.py"
 SOURCE114 = "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
+
+
+PROVENANCE_PATH = ROOT / ".github" / "artifacts" / "prepared-source114-aarch64.json"
+
+
+def load_provenance() -> dict:
+    value = json.loads(PROVENANCE_PATH.read_text())
+    assert value["schema_version"] == 1
+    assert value["record_kind"] == "prepared_source114_actions_artifact_provenance"
+    return value
 
 
 def load_dev():
@@ -426,14 +437,71 @@ def validate_receipt(dev, receipt) -> None:
 
 
 def main() -> None:
+    provenance = load_provenance()
     dev = load_dev()
-    expected_names = set(
-        dev._prepared_artifact_bundle_names("aarch64-apple-darwin").values()
+    assert SOURCE114 == provenance["candidate"]["source_commit"]
+    assert (
+        dev.PREPARED_SOURCE114_REGISTRY_SHA256
+        == provenance["candidate"]["candidate_registry_sha256"]
     )
+    expected_names = {item["name"] for item in provenance["bundle"]["files"]}
+    assert expected_names == set(
+        dev._prepared_artifact_bundle_names(provenance["candidate"]["target"]).values()
+    )
+    expected_effects = provenance["expected_validation"]["effects"]
+    assert expected_effects == {
+        "claim": 0,
+        "stop": 0,
+        "backup": 0,
+        "migrate": 0,
+        "publish": 0,
+        "activate": 0,
+        "cleanup": 0,
+    }
+    effects = {name: 0 for name in expected_effects}
+    helper_sinks = {
+        "release_durable_terminal_claim": "claim",
+        "release_claim": "claim",
+        "Launchctl": "stop",
+        "create_database_backup": "backup",
+        "run_current_schema_migration": "migrate",
+        "reserve_database_capacity": "migrate",
+        "prepare_atomic_install": "publish",
+        "prepare_plist_publication": "publish",
+        "_publish_current_repair": "publish",
+        "activate": "activate",
+        "activate_current_repair": "activate",
+        "cleanup_precondition_capacity": "cleanup",
+        "release_capacity_reservation": "cleanup",
+        "release_unsnapshotted_capacity": "cleanup",
+        "finalize_paired": "cleanup",
+        "recover_paired": "cleanup",
+        "finalize_verified_predecessor": "cleanup",
+    }
+    original_run_path = runpy.run_path
+
+    def instrumented_run_path(path, *args, **kwargs):
+        policy = original_run_path(path, *args, **kwargs)
+        if "validate_pre_disruption_handoff" not in policy:
+            return policy
+        validator_globals = policy["validate_pre_disruption_handoff"].__globals__
+        for sink, effect in helper_sinks.items():
+            assert sink in validator_globals
+
+            def forbidden(*_args, _effect=effect, _sink=sink, **_kwargs):
+                effects[_effect] += 1
+                raise AssertionError(f"validation reached forbidden helper sink {_sink}")
+
+            validator_globals[sink] = forbidden
+            policy[sink] = forbidden
+            assert policy["validate_pre_disruption_handoff"].__globals__[sink] is forbidden
+        return policy
+
     artifact = prepared_artifact(expected_names)
     download = Path(os.environ["PHOENIX_PREPARED_ARTIFACT_ROOT"]).resolve(strict=True)
     artifact_before = artifact_witness(download)
     receipt = None
+    runpy.run_path = instrumented_run_path
     try:
         check_failed_preparation_cleanup(dev, artifact, download, artifact_before)
         receipt = dev.prepare_disposable_launchd_validation(
@@ -441,16 +509,22 @@ def main() -> None:
         )
         assert artifact_witness(download) == artifact_before
         validate_receipt(dev, receipt)
+        assert len(receipt.database_ledger) == provenance["expected_validation"][
+            "database_ledger_entries"
+        ]
+        assert effects == expected_effects
     finally:
+        runpy.run_path = original_run_path
         try:
             if receipt is not None:
                 shutil.rmtree(receipt.root)
         finally:
             assert artifact_witness(download) == artifact_before
+    rendered_effects = " ".join(f"{name}={count}" for name, count in effects.items())
     print(
         "launchd-validation-only: PASS "
         f"transaction={receipt.transaction_id} ledger={len(receipt.database_ledger)} "
-        "claim=0 stop=0 backup=0 migrate=0 publish=0 activate=0 cleanup=0"
+        f"{rendered_effects}"
     )
 
 

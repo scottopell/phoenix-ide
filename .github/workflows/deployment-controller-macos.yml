@@ -2,6 +2,12 @@ name: Deployment controller macOS
 
 on:
   workflow_dispatch:
+    inputs:
+      validate_prepared_source114:
+        description: "Owner-authorized exact PreparedSource114 validation"
+        required: true
+        type: boolean
+        default: false
   pull_request:
     paths:
       - "crates/phoenix-deployment-controller/**"
@@ -72,11 +78,13 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Verify exact checked-out head
         env:
           EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Download exact prepared Source114 artifact by ID
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_REPOSITORY: ${{ github.repository }}
@@ -123,11 +131,26 @@ jobs:
           artifact = api_json(f"{prefix}/artifacts/{expected['id']}")
           run = api_json(f"{prefix}/runs/{producer['workflow_run_id']}")
           job = api_json(f"{prefix}/jobs/{producer['qualified_job']['id']}")
+          job_log = subprocess.run(
+              ["gh", "api", f"{prefix}/jobs/{producer['qualified_job']['id']}/logs"],
+              check=True,
+              stdout=subprocess.PIPE,
+          ).stdout
+          workflow_source = subprocess.run(
+              [
+                  "git",
+                  "show",
+                  f"{producer['workflow_commit']}:{producer['workflow_file']}",
+              ],
+              check=True,
+              stdout=subprocess.PIPE,
+          ).stdout
           assert artifact["id"] == expected["id"]
           assert artifact["name"] == expected["name"]
           assert artifact["size_in_bytes"] == expected["size_in_bytes"]
           assert artifact["digest"] == expected["api_digest"]
           assert artifact["expires_at"] == expected["expires_at"]
+          assert artifact["created_at"] == expected["created_at"]
           assert artifact["expired"] is False
           expires = datetime.datetime.fromisoformat(expected["expires_at"].replace("Z", "+00:00"))
           assert expires > datetime.datetime.now(datetime.timezone.utc)
@@ -151,6 +174,13 @@ jobs:
           assert job["head_sha"] == candidate["source_commit"]
           assert job["name"] == producer["qualified_job"]["name"]
           assert job["conclusion"] == producer["qualified_job"]["conclusion"] == "success"
+          assert producer["operation"] == "prepare-main"
+          assert producer["inputs"] == {"operation": "prepare-main"}
+          assert producer["operation_log_marker"].encode() in job_log
+          assert (
+              hashlib.sha256(workflow_source).hexdigest()
+              == producer["workflow_file_sha256"]
+          )
 
           archive = Path("${{ runner.temp }}/prepared-source114.zip")
           with archive.open("wb") as output:
@@ -195,9 +225,16 @@ jobs:
               raise SystemExit("; ".join(errors))
           PY
       - name: Validate disposable launchd installer handoff
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
         env:
           PHOENIX_PREPARED_ARTIFACT_ROOT: ${{ runner.temp }}/prepared-source114
         run: python3 tests/integration/launchd_validation_harness.py
+      - name: Remove retrieved PreparedSource114 bytes
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        run: |
+          rm -rf -- \
+            "${{ runner.temp }}/prepared-source114" \
+            "${{ runner.temp }}/prepared-source114.zip"
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

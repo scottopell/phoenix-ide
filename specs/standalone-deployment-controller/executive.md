@@ -396,10 +396,11 @@ The remaining replacement gaps are explicit:
   migration, publication, health, or forward-recovery authority.
 - `.github/artifacts/prepared-source114-aarch64.json` records ephemeral artifact
   `12122737139`, its API digest, exact producer identity, and expiry on 2026-11-01. No same-byte
-  retention, download, republication, or public release is authorized. After expiry, an
-  owner-authorized rerun of the pinned historical workflow or equivalently pinned reproduction
-  creates a new artifact and new evidence identity that requires a new manifest, real byte
-  admission, review, and qualification; it must never impersonate artifact `12122737139`.
+  retention, separate host-retention download, republication, or public release is authorized;
+  exact hosted validation retrieval requires an explicit authorized workflow dispatch. After
+  expiry, an owner-authorized rerun of the pinned historical workflow or equivalently pinned
+  reproduction creates a new artifact and new evidence identity that requires a new manifest,
+  real byte admission, review, and qualification; it must never impersonate artifact `12122737139`.
 - Launchd owns both disposable jobs only inside the test fixture. The disposable installation
   selects its bounded recovery/continuation runner stages from durable state, but no production
   controller exclusively owns the production controller store, supervises finite runners, or

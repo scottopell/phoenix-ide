@@ -18,6 +18,11 @@ No download, rerun, build, signing, publication, installation, service control,
 migration, or production operation is authorized by this document. Commands below
 are bounded procedures for a separately authorized owner.
 
+The repository workflow retrieves these bytes only on an explicitly authorized
+`workflow_dispatch` with `validate_prepared_source114=true`; ordinary pull-request and
+push runs skip both retrieval and the validation harness. Checkout credentials are not
+persisted into repository-controlled code.
+
 ## Bounded metadata verification
 
 Use an authenticated identity with repository Actions-read access and a reviewed
@@ -38,6 +43,7 @@ run_id=$(jq -er '.producer.workflow_run_id' "$manifest")
 job_id=$(jq -er '.producer.qualified_job.id' "$manifest")
 : "${GH_TOKEN:?An authorized Actions-read token is required}"
 work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 api="https://api.github.com/repos/$repo"
 api_json() {
   curl --fail --silent --show-error --connect-timeout 10 --max-time 60 \
@@ -92,6 +98,18 @@ jq -e --slurpfile m "$manifest" '
   .name == $p.producer.qualified_job.name and
   .conclusion == "success"
 ' "$work/job.json" >/dev/null
+
+gh api "repos/$repo/actions/jobs/$job_id/logs" > "$work/job.log"
+grep -F -- "$(jq -er '.producer.operation_log_marker' "$manifest")" \
+  "$work/job.log" >/dev/null
+workflow_commit=$(jq -er '.producer.workflow_commit' "$manifest")
+workflow_file=$(jq -er '.producer.workflow_file' "$manifest")
+git show "$workflow_commit:$workflow_file" > "$work/producer-workflow.yml"
+printf '%s  %s\n' \
+  "$(jq -er '.producer.workflow_file_sha256' "$manifest")" \
+  "$work/producer-workflow.yml" | shasum -a 256 -c -
+jq -e '.producer.operation == "prepare-main" and
+       .producer.inputs == {"operation":"prepare-main"}' "$manifest" >/dev/null
 
 # One bounded page for the exact run; stop rather than paginate or search by name.
 api_json "$api/actions/runs/$run_id/artifacts?per_page=100&page=1" > "$work/list.json"
@@ -170,11 +188,10 @@ outputs.
    `prepare-main` input, exact ARM job, candidate source, signing/notary/stapler/spctl,
    helper, receipt, headless-acceptance, and upload gates. Record every new artifact
    under a new manifest; never overwrite this one.
-4. If the historical run is no longer rerunnable, pinned regeneration and requalification
-   require an explicit owner-authorized execution of `producer.workflow_file` at
-   `producer.workflow_commit` with the recorded operation. Dispatching current main,
-   moving main, substituting the incident repair operation, or loosening its main-only
-   gate is not equivalent and is not authorized here.
+4. If the historical run is no longer rerunnable, this record defines no exact runnable
+   fallback. Pinned regeneration and requalification require a separately authorized workflow
+   and new-evidence design. Dispatching current main, moving main, substituting the incident
+   repair operation, or loosening its main-only gate is not equivalent and is not authorized.
 5. Repeat real byte admission and hosted validation. A regenerated artifact is new
    evidence even if every recorded source/input field matches.
 
@@ -184,4 +201,6 @@ No owner-controlled byte retention is authorized. If a later requirement truly n
 the same bytes beyond the recorded expiry, the owner must explicitly authorize one
 bounded download, independently verify the API digest and all recorded file hashes,
 store immutable owner-controlled bytes plus retrieval evidence, and distinguish that
-copy from a release, republished artifact, or regenerated artifact.
+copy from a release, republished artifact, or regenerated artifact. The default retrieval
+procedure deletes its private work directory on exit; retaining it requires that separate
+owner authorization.

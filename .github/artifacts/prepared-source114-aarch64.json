@@ -22,6 +22,7 @@
   },
   "producer": {
     "workflow_file": ".github/workflows/release.yml",
+    "workflow_file_sha256": "8383361c1c0cdff5cfa97d0db6d2a705d21c66c8eb62da294b9a434c41a84485",
     "workflow_commit": "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92",
     "workflow_run_id": 39089498019,
     "workflow_run_attempt": 1,
@@ -30,6 +31,7 @@
     "workflow_run_display_title": "Release",
     "workflow_run_conclusion": "failure",
     "operation": "prepare-main",
+    "operation_log_marker": "if [[ \"prepare-main\" != \"prepare-main\" ]]; then",
     "inputs": {
       "operation": "prepare-main"
     },
@@ -110,7 +112,7 @@
   "reproduction": {
     "result_identity": "new_evidence_not_artifact_12122737139",
     "preferred_exact_workflow": "rerun workflow run 39089498019 after separate owner authorization while GitHub still permits rerunning it",
-    "fallback": "owner-authorized pinned regeneration and requalification using the workflow file at workflow_commit with operation prepare-main; current-main dispatch is not equivalent",
+    "fallback": "no exact runnable fallback is defined after historical rerun eligibility ends; a separately authorized workflow and new evidence design is required",
     "public_release_authorized": false,
     "broad_download_or_build_authorized": false
   }
