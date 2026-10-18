@@ -10361,6 +10361,10 @@ def _status_is_terminal_for_owner(
     owner: str,
     terminal_states: set[str],
 ) -> bool:
+    if status_path == LAUNCHD_DEPLOY_STATUS_PATH:
+        repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / owner)
+        if repaired is not None:
+            return repaired
     try:
         if status_path.is_symlink() or not status_path.is_file():
             return False
@@ -10614,6 +10618,13 @@ def _release_launchd_restart_claim(transaction_id: str) -> bool:
 def _paired_recovery_refusal(owner: str | None) -> str | None:
     if owner is None:
         return None
+    repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / owner)
+    if repaired is True:
+        return None
+    if repaired is False:
+        return (f"current-schema repair for {owner} is selected or its evidence is malformed. "
+                f"Retain the original claim and both proofs; use ./dev.py prod resume-current-repair {owner}. "
+                "Never finalize the original candidate or start a predecessor.")
     status_entry_exists = os.path.lexists(LAUNCHD_DEPLOY_STATUS_PATH)
     status_entry_invalid = LAUNCHD_DEPLOY_STATUS_PATH.is_symlink() or (
         status_entry_exists and not LAUNCHD_DEPLOY_STATUS_PATH.is_file()
@@ -10741,6 +10752,11 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
 
 
 def _markerless_status_is_resolved(status: dict[str, object]) -> bool:
+    owner = status.get("transaction_id")
+    if isinstance(owner, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", owner):
+        repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / owner)
+        if repaired is not None:
+            return repaired
     transaction_id = status.get("transaction_id")
     state = status.get("state")
     source_kind = status.get("source_kind")
@@ -10780,6 +10796,11 @@ def _markerless_operation_refusal() -> str | None:
     if not isinstance(status, dict):
         return malformed_refusal
     transaction_id = status.get("transaction_id", "unknown")
+    if isinstance(transaction_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+        repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id)
+        if repaired is False:
+            return (f"markerless current-schema repair {transaction_id} is unresolved; preserve both transactions "
+                    f"and establish exact parent ownership before prod resume-current-repair {transaction_id}.")
     state = status.get("state", "unknown")
     if _markerless_status_is_resolved(status):
         return None
@@ -10974,8 +10995,18 @@ def _materialize_source_file(
         )
     if result.returncode != 0 or not result.stdout:
         raise SystemExit(f"selected source {source_commit} has no {source_path}")
-    destination.write_bytes(result.stdout)
-    destination.chmod(0o700)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(result.stdout)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _preflight_ordinary_launchd_policy(manifest_path: Path, helper: Path) -> None:
@@ -11145,6 +11176,8 @@ def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = Fals
         raise SystemExit(f"{mode_name} finalization requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
+    if _current_repair_resolution(staging) is not None:
+        raise SystemExit(f"original finalization fenced by repair child; use prod resume-current-repair {transaction_id}")
     payload = json.loads(manifest_path.read_text())
     status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
     owner = _deploy_claim_owner()
@@ -11172,6 +11205,201 @@ def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = Fals
         raise SystemExit(f"{mode_name} finalization refused/failed; claim retained: {result.stderr.strip()}")
     action = "candidate start/publication only; no database mutation" if current_schema else "no runtime/database action"
     print(f"{mode_name.capitalize()} finalization complete: {transaction_id}; {action}.")
+
+
+def _current_repair_module(source: Path | None = None):
+    import importlib.util
+    name = "phoenix_current_repair_controller"
+    spec = importlib.util.spec_from_file_location(name, source or ROOT / "scripts/launchd_deploy_helper.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError("repair helper import unavailable")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        # Compile verified source directly; never consume an unbound cached .pyc.
+        exec(compile(Path(spec.origin).read_bytes(), spec.origin, "exec"), module.__dict__)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
+    return module
+
+
+def _current_repair_path(transaction_id: str) -> Path:
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+        raise SystemExit("current-schema repair requires macOS and a safe exact transaction ID")
+    return LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id / "current-schema-repair" / "manifest.json"
+
+
+def _current_repair_resolution(transaction: Path) -> bool | None:
+    child = transaction / "current-schema-repair"
+    path = child / "manifest.json"
+    if not os.path.lexists(path) and not child.is_symlink():
+        return None
+    try:
+        helper = _current_repair_module()
+        _repair, parent, status = helper.classify_current_repair(path)
+        terminal = status.state == "committed" and not status.finalization_pending
+        claim_owner = _claim_owner(Path(parent.active_path))
+        claim_released = claim_owner is None or (
+            claim_owner != _UNREADABLE_CLAIM_OWNER
+            and claim_owner != parent.transaction_id
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", claim_owner) is not None
+        )
+        return terminal and claim_released
+    except Exception:
+        return False
+
+
+def _handoff_current_repair(path: Path, *, resume: bool) -> None:
+    controller = _current_repair_module()
+    retained = path.parent / "helper.py"
+    try:
+        repair, parent = controller._current_repair_routing(path)
+        with Path(parent.lock_path).open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise controller.ConcurrentDeploy("another operation owns current-schema repair") from exc
+            controller._repair_private(retained)
+            controller.verify_staged(str(retained), repair.helper_sha256, "repair retained helper")
+            helper = _current_repair_module(retained)
+            repair, parent, _status = helper.validate_current_repair(path, running_helper=False)
+            helper.require_launchd_absence(parent.helper_label, parent.uid)
+            helper.require_launchd_absence(repair.helper_label, parent.uid)
+            command = "resume-current-repair" if resume else "activate-current-repair"
+            runner = plistlib.loads(_helper_plist(repair.helper_label, retained, path,
+                                                 path.parent / "helper.log", Path(sys.executable).resolve()))
+            runner["ProgramArguments"][2] = command
+            helper.atomic_write(path.parent / "runner.plist", plistlib.dumps(runner))
+        subprocess.run(["launchctl", "bootstrap", f"gui/{parent.uid}", str(path.parent / "runner.plist")], check=True)
+    except Exception:
+        try:
+            controller.stop_invalid_current_repair(path)
+        except Exception:
+            print("Repair teardown could not be confirmed through exact parent ownership; retain claim/evidence.", file=sys.stderr)
+        raise
+    print(f"Exact current-schema repair handed off for {parent.transaction_id}; inspect prod status. Parent audit status is unchanged.")
+
+
+def _clean_unsealed_current_repair(directory: Path, helper) -> None:
+    if not os.path.lexists(directory):
+        return
+    helper._private_transaction_dir(directory)
+    if os.path.lexists(directory / "manifest.json") or os.path.lexists(directory / "proof.json"):
+        raise SystemExit("repair already sealed or checkpointed; use resume-current-repair")
+    status_path = directory / "status.json"
+    if os.path.lexists(status_path):
+        raw = helper._repair_json(status_path)
+        try:
+            status = helper.CurrentSchemaRepairStatus.load(status_path, raw.get("manifest_sha256"))
+        except Exception as exc:
+            raise SystemExit("unsealed repair status malformed; preserve for diagnosis") from exc
+        if status.state != "prepared" or status.resume_from is not None or status.proof_sha256 is not None or status.finalization_pending:
+            raise SystemExit("unsealed repair has ambiguous checkpoint evidence; preserve for diagnosis")
+    owned = {"candidate", "candidate.plist", "migrations.rs", "helper.py", "receipt.json", "status.json", "parent-status.json"}
+    entries = list(directory.iterdir())
+    for entry in entries:
+        if entry.name not in owned and not any(entry.name.startswith(f".{name}.") for name in owned | {"manifest.json"}):
+            raise SystemExit("unsealed repair contains unrecognized evidence; preserve for diagnosis")
+        helper._repair_private(entry)
+    for entry in entries:
+        entry.unlink()
+    helper.fsync_dir(directory)
+    directory.rmdir()
+    helper.fsync_dir(directory.parent)
+
+
+def cmd_prod_repair_current(transaction_id: str, prepared_artifact: Path, expected_full_commit: str) -> None:
+    path = _current_repair_path(transaction_id)
+    helper = _current_repair_module()
+    if expected_full_commit != helper.CURRENT_REPAIR_COMMIT:
+        raise SystemExit("repair requires the single exact merged repair candidate pin")
+    if os.path.lexists(path) or path.parent.is_symlink():
+        try:
+            helper.classify_current_repair(path)
+        except Exception as exc:
+            raise SystemExit("current-schema repair child is selected but malformed; preserve it and use resume-current-repair for diagnosis") from exc
+        raise SystemExit("current-schema repair is already sealed; use resume-current-repair")
+    controller = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    if dirty or not re.fullmatch(r"[0-9a-f]{40}", controller) or controller == expected_full_commit:
+        raise SystemExit("repair preparation requires a clean, separate exact controller checkout")
+    parent_path = path.parent.parent / "manifest.json"
+    parent, _proof = helper.validate_current_repair_parent(parent_path)
+    with Path(parent.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit("another operation owns current-schema repair") from exc
+        parent, proof = helper.validate_current_repair_parent(parent_path)
+        if parent.transaction_id != transaction_id:
+            raise SystemExit("repair transaction ID mismatch")
+        helper.require_launchd_absence(parent.helper_label, parent.uid)
+        helper.require_launchd_absence(f"{parent.helper_label}.current-schema-repair", parent.uid)
+        helper.require_launchd_absence(parent.label, parent.uid)
+        helper.validate_current_repair_runtime_fence_source(parent)
+        helper.assert_database_exclusive(parent)
+        helper.validate_current_schema_database(Path(parent.current_schema_upgrade.database_path),
+                                               helper._current_schema_registry(parent), source_kind=parent.source_kind,
+                                               manifest=parent, migrated=True)
+        helper._repair_capacity(parent, reservation_required=True)
+        prepared = _prepare_prepared_artifact(prepared_artifact, expected_full_commit)
+        if (prepared.identity.version != helper.CURRENT_REPAIR_VERSION or prepared.identity.git_sha != expected_full_commit
+                or prepared.source_commit != expected_full_commit or prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT):
+            raise SystemExit("repair artifact identity/source differs from qualification")
+        _clean_unsealed_current_repair(path.parent, helper)
+        path.parent.mkdir(mode=0o700)
+        helper.fsync_dir(path.parent.parent)
+        helper.atomic_write(path.parent / "candidate", prepared.binary.read_bytes(), 0o700)
+        helper.atomic_write(path.parent / "candidate.plist", Path(parent.candidate_plist).read_bytes())
+        helper.atomic_write(path.parent / "parent-status.json", Path(parent.status_path).read_bytes())
+        target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}[platform.machine().lower()]
+        receipt = prepared_artifact / f"PREPARATION-RECEIPT-{target}.json"
+        helper.atomic_write(path.parent / "receipt.json", receipt.read_bytes())
+        _materialize_helper(controller, path.parent / "helper.py", "local_head")
+        _materialize_source_file(expected_full_commit, "crates/phoenix-db/src/migrations.rs", path.parent / "migrations.rs", "local_head")
+        for evidence in (path.parent / "helper.py", path.parent / "migrations.rs"):
+            evidence.chmod(0o600)
+            with evidence.open("rb") as stream:
+                os.fsync(stream.fileno())
+        if _file_sha256(path.parent / "helper.py") != _file_sha256(ROOT / "scripts/launchd_deploy_helper.py"):
+            raise SystemExit("repair helper is not the clean controller's exact bytes")
+        if (_file_sha256(path.parent / "migrations.rs") != helper.CURRENT_REPAIR_REGISTRY_SHA256
+                or [list(item) for item in helper.migration_registry(path.parent / "migrations.rs")] != proof["target_ledger"]):
+            raise SystemExit("repair immutable git registry differs from qualified original target128")
+        repair = helper.CurrentSchemaRepairManifest(
+            protocol_version=1, parent_manifest_path=str(parent_path),
+            parent_manifest_sha256=_file_sha256(parent_path), parent_status_sha256=_file_sha256(path.parent / "parent-status.json"),
+            parent_proof_sha256=_file_sha256(Path(parent.current_schema_upgrade.proof_path)),
+            source_commit=expected_full_commit, version=helper.CURRENT_REPAIR_VERSION, controller_source_commit=controller,
+            helper_sha256=_file_sha256(path.parent / "helper.py"), candidate_sha256=_file_sha256(path.parent / "candidate"),
+            registry_sha256=_file_sha256(path.parent / "migrations.rs"), plist_sha256=_file_sha256(path.parent / "candidate.plist"),
+            receipt_sha256=_file_sha256(path.parent / "receipt.json"), helper_label=f"{parent.helper_label}.current-schema-repair",
+        )
+        helper.validate_current_repair_staging(
+            repair,
+            parent,
+            proof,
+            path.parent,
+            running_helper=False,
+        )
+        encoded = (json.dumps(dataclasses.asdict(repair), sort_keys=True) + "\n").encode()
+        status = helper.CurrentSchemaRepairStatus(1, hashlib.sha256(encoded).hexdigest(), "prepared", None, None, False, None)
+        helper.atomic_write(path.parent / "status.json", (json.dumps(dataclasses.asdict(status), sort_keys=True) + "\n").encode())
+        helper.fsync_dir(path.parent)
+        helper.install_current_repair_runtime_fence(parent)
+        helper.atomic_write(path, encoded)  # Seal last: no helper has activation authority before this publication.
+        helper.validate_current_repair(path, running_helper=False)
+    _handoff_current_repair(path, resume=False)
+
+
+def cmd_prod_resume_current_repair(transaction_id: str) -> None:
+    path = _current_repair_path(transaction_id)
+    _handoff_current_repair(path, resume=True)
 
 
 def cmd_prod_resume_forward(transaction_id: str) -> None:
@@ -12191,6 +12419,11 @@ def _print_launchd_deploy_status() -> None:
                 f"last status belongs to {deploy.get('transaction_id', 'unknown')}"
             )
         print(f"  Last deploy: {deploy.get('state', 'unknown')} ({deploy.get('transaction_id', 'unknown')})")
+        transaction_id = deploy.get("transaction_id")
+        if isinstance(transaction_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+            repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id)
+            if repaired is not None:
+                print(f"    Current-schema repair: {'committed' if repaired else 'pending/invalid; use prod resume-current-repair ' + transaction_id}; parent status is audit evidence")
         source = deploy.get("source_kind") or "unknown"
         if deploy.get("release_tag"):
             source += f" {deploy['release_tag']}"
@@ -12800,6 +13033,12 @@ def main():
     recover_current_parser.add_argument("transaction_id")
     finalize_current_parser = prod_sub.add_parser("finalize-current", help="Finalize a committed current-schema candidate without rerunning offline migration or snapshot restore")
     finalize_current_parser.add_argument("transaction_id")
+    repair_current_parser = prod_sub.add_parser("repair-current", help="Seal the exact pinned current-schema forward replacement (requires separate qualification)")
+    repair_current_parser.add_argument("transaction_id")
+    repair_current_parser.add_argument("--prepared-artifact", type=Path, required=True)
+    repair_current_parser.add_argument("--expected-full-commit", required=True)
+    resume_current_repair_parser = prod_sub.add_parser("resume-current-repair", help="Resume only the retained sealed current-schema repair child")
+    resume_current_repair_parser.add_argument("transaction_id")
     resume_forward_parser = prod_sub.add_parser("resume-forward", help="Resume only the exact retained forward candidate after predecessor rollback became unsafe")
     resume_forward_parser.add_argument("transaction_id")
     recover_systemd = prod_sub.add_parser(
@@ -13003,6 +13242,10 @@ def main():
             cmd_prod_recover_paired(args.transaction_id, current_schema=True)
         elif args.prod_command == "finalize-current":
             cmd_prod_finalize_paired(args.transaction_id, current_schema=True)
+        elif args.prod_command == "repair-current":
+            cmd_prod_repair_current(args.transaction_id, args.prepared_artifact, args.expected_full_commit)
+        elif args.prod_command == "resume-current-repair":
+            cmd_prod_resume_current_repair(args.transaction_id)
         elif args.prod_command == "resume-forward":
             cmd_prod_resume_forward(args.transaction_id)
         elif args.prod_command == "status":
