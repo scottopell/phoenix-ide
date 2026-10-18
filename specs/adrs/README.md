@@ -139,25 +139,17 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
+| [128](128_repair-failure-stopped-truth-includes-persistence.md) | Repair failure stopped truth includes persistent auto-start absence | Accepted | REQ-LDD-025 |
+| [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
+| [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
+| [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
+| [124](124_public-literal-chat-uses-known-receiver-verification.md) | Public literal chat uses known-receiver verification | Accepted | REQ-API-031; built-in API guidance |
 | [118](118_preserve-complete-span-schemas-with-bounded-capacity.md) | Preserve complete span schemas with bounded provider capacity | Accepted | REQ-CVT-005, REQ-CVT-006, REQ-CVT-007 |
 | [119](119_separate-controlled-functional-telemetry-build.md) | Separate controlled-functional telemetry build | Accepted | REQ-CVT-001, REQ-CVT-005, REQ-CVT-006 |
 | [120](120_successful-position-settles-geometric-anchor.md) | Successful positioning settles geometry without retaining command capability | Accepted | REQ-VT-003, REQ-VT-006, REQ-VT-007 |
 | [121](121_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
 | [122](122_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
 | [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
-| [124](124_public-literal-chat-uses-known-receiver-verification.md) | Public literal chat uses known-receiver verification | Accepted | REQ-API-031; built-in API guidance |
-| [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
-| [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
-| [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
-| [128](128_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
-| [129](129_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
-| [130](130_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
-| [131](131_retained-native-results-use-application-only-recovery.md) | Retained native results use application-only recovery | Accepted | REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–020; completed-but-unapplied native sampling recovery |
-| [132](132_owned-root-child-enumeration-is-distinct-native-authority.md) | Owned-root child enumeration is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–021; native `ListChildren`, schema v6, protocol v6 |
-| [133](133_exact-root-identity-observation-is-distinct-native-authority.md) | Exact-root identity observation is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–022; native `ObserveIdentity`, schema v7, protocol v8 |
-| [134](134_retained-exact-root-identity-results-use-application-only-recovery.md) | Retained exact-root identity results use application-only recovery | Accepted | REQ-SDC-018, REQ-SDC-022; completed-before-application native `ObserveIdentity`, schema v7, protocol v9 |
-| [135](135_already-durable-native-sampling-failures-use-explicit-custody-settlement.md) | Already-durable native sampling failures use explicit custody settlement | Accepted | REQ-SDC-018–020; native sampling failure custody, schema v8, protocol v10 |
-| [136](136_disposable-launchd-validation-precedes-installer-adoption.md) | Disposable launchd validation precedes installer adoption | Accepted | REQ-SDC-023; exact PreparedSource114 handoff validation without activation authority |
 
 ## For agents: which decisions bind your task
 
@@ -216,7 +208,6 @@ Consult the relevant ADRs before starting work of each kind.
 | Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
 | Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
-| Specifying standalone controller durability, surviving guardian custody, native runner IPC, owned-root child enumeration, exact-root identity observation, retained-result application recovery, failed-result custody settlement, or disposable installer validation | 125, 128, 129, 130, 131, 132, 133, 134, 135, 136; 034 for compatibility limits |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -258,10 +249,6 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │       └── ADR-105 (Qualify migration 128 for bounded current-schema activation; supersedes interval portions of 102/103 and applies ADR-104)
       │   │           └── ADR-114 (Admit exact target ledger as a prepared source; retain 105 target and 102 boundary)
       │   │               └── ADR-115 (Protect exact 114-to-128 published release; independent controller, same lifecycle; retain 114 prepared admissions)
-      │   │                   └── ADR-125 (Qualify exact PreparedSource114 candidate)
-      │   │                       ├── ADR-126 (Seal exact current-schema forward replacement)
-      │   │                       │   └── ADR-127 (Bind exact ARM packaging repair to a separate controller)
-      │   │                       └── ADR-136 (Disposable validation; also extends controller ADR-128 and ADR-130)
       │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
       │   ├── ADR-082 (Legacy AUQ waits retain identity absence)
       │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
@@ -276,15 +263,7 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
       │   │           └── ADR-065 (Release candidates share the stable artifact path)
       │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
-      │   ├── ADR-050 (launchd restart preserves installed state through an independent helper)
-      │   └── ADR-128 (Standalone controller owns durability and child supervision)
-      │       └── ADR-129 (Controller loss detaches and fences the surviving guardian)
-      │           └── ADR-130 (Same-build pre-adoption native guardian IPC and runner)
-      │               └── ADR-131 (Retained native results use application-only recovery)
-      │                   ├── ADR-132 (Owned-root child enumeration is distinct native authority)
-      │                   │   └── ADR-133 (Exact-root identity observation is distinct native authority)
-      │                   │       └── ADR-134 (Retained exact-root identity results use application-only recovery)
-      │                   └── ADR-135 (Already-durable native sampling failures use explicit custody settlement)
+      │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)

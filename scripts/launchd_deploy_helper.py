@@ -17,6 +17,7 @@ import math
 import os
 import plistlib
 import re
+import secrets
 import shutil
 import ssl
 import subprocess
@@ -31,30 +32,6 @@ from typing import Callable, Optional, get_args, get_type_hints
 from contextlib import closing
 
 HANDOFF_PROTOCOL_VERSION = 1
-DEFAULT_TRANSITION_TIMEOUT_SECS = 30.0
-DEFAULT_HEALTH_TIMEOUT_SECS = 120.0
-LEGACY_DATABASE_MANIFEST_FIELDS = (
-    "database_mode",
-    "database_path",
-    "database_backup_path",
-    "database_backup_sha256",
-    "database_backup_verified",
-    "database_proof_path",
-    "controller_source_commit",
-    "controller_helper_sha256",
-    "controller_helper_path",
-)
-
-
-def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON key {key!r}")
-        value[key] = item
-    return value
-
-
 FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
@@ -124,6 +101,25 @@ CURRENT_REPAIR_VERSION = "0.13.0-rc.4"
 CURRENT_REPAIR_REGISTRY_SHA256 = PREPARED_SOURCE114_REGISTRY_SHA256
 CURRENT_REPAIR_DIRECTORY = "current-schema-repair"
 CURRENT_REPAIR_RUNTIME_FENCE_SHA256 = hashlib.sha256(b"").hexdigest()
+CURRENT_REPAIR_SERVICE_LABEL = "com.phoenix-ide.server"
+CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES = 1024 * 1024
+CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES = 128
+CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+CURRENT_REPAIR_QUARANTINE_ATTEMPTS = 8
+CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES = 2 + 3 * CURRENT_REPAIR_QUARANTINE_ATTEMPTS
+CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES = (
+    CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES * CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class CurrentRepairFileToken:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -314,8 +310,8 @@ class Manifest:
     lock_path: str
     claim_lock_path: str
     created_at: str
-    transition_timeout_secs: float = DEFAULT_TRANSITION_TIMEOUT_SECS
-    health_timeout_secs: float = DEFAULT_HEALTH_TIMEOUT_SECS
+    transition_timeout_secs: float = 30.0
+    health_timeout_secs: float = 120.0
     # None is intentional for pre-feature runtime-only manifests.
     paired_database_upgrade: Optional[PairedDatabaseUpgrade] = None
     current_schema_upgrade: Optional[CurrentSchemaUpgrade | PreparedSource114Upgrade] = None
@@ -324,56 +320,13 @@ class Manifest:
     @classmethod
     def load(cls, path: Path) -> "Manifest":
         try:
-            raw = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+            raw = json.loads(path.read_text())
             if not isinstance(raw, dict):
                 raise TypeError("manifest must be an object")
             if raw.get("manifest_version") != HANDOFF_PROTOCOL_VERSION:
                 raise ActivationError(
                     f"unsupported handoff protocol {raw.get('manifest_version')!r}; expected {HANDOFF_PROTOCOL_VERSION}"
                 )
-            raw_current_schema_upgrade = raw.get("current_schema_upgrade")
-            raw_expected = raw.get("expected")
-            prepared_source114_identity = raw.get("source_kind") == "prepared_artifact" and (
-                raw.get("source_commit") == PREPARED_SOURCE114_COMMIT
-                or (
-                    isinstance(raw_expected, dict)
-                    and raw_expected.get("git_sha") == PREPARED_SOURCE114_COMMIT
-                )
-            )
-            prepared_source114_fields = isinstance(raw_current_schema_upgrade, dict) and (
-                "prepared_source_baseline" in raw_current_schema_upgrade
-                or "candidate_registry_expected_sha256" in raw_current_schema_upgrade
-            )
-            exact_prepared_source114 = prepared_source114_identity or prepared_source114_fields
-            if exact_prepared_source114:
-                if not isinstance(raw_current_schema_upgrade, dict):
-                    raise ActivationError(
-                        "exact prepared source114 manifest missing current-schema evidence"
-                    )
-                missing_qualification_fields = {
-                    "prepared_source_baseline",
-                    "candidate_registry_expected_sha256",
-                } - raw_current_schema_upgrade.keys()
-                if missing_qualification_fields:
-                    missing = ", ".join(sorted(missing_qualification_fields))
-                    raise ActivationError(
-                        f"exact prepared source114 manifest missing qualification fields: {missing}"
-                    )
-                missing_timeout_fields = {
-                    "transition_timeout_secs",
-                    "health_timeout_secs",
-                } - raw.keys()
-                if missing_timeout_fields:
-                    missing = ", ".join(sorted(missing_timeout_fields))
-                    raise ActivationError(
-                        f"exact prepared source114 manifest missing timeout fields: {missing}"
-                    )
-                extra_legacy_fields = set(LEGACY_DATABASE_MANIFEST_FIELDS).intersection(raw)
-                if extra_legacy_fields:
-                    extra = ", ".join(sorted(extra_legacy_fields))
-                    raise ActivationError(
-                        f"exact prepared source114 manifest has legacy fields: {extra}"
-                    )
             raw["expected"] = _manifest_record(Identity, raw["expected"])
             previous = raw.get("previous")
             raw["previous"] = _manifest_record(Identity, previous) if previous is not None else None
@@ -392,20 +345,13 @@ class Manifest:
                     if any(isinstance(item, str) and not item.strip() for item in dataclasses.asdict(value).values()):
                         raise ValueError(f"{key} string fields must be nonempty")
                 raw[key] = value
-            # Runtime-only manifests written before the paired feature may contain these keys.
-            for legacy_key in LEGACY_DATABASE_MANIFEST_FIELDS:
+            # Runtime-only manifests written before the paired feature omit the field.
+            raw.pop("database_mode", None)
+            for legacy_key in ("database_path", "database_backup_path", "database_backup_sha256", "database_backup_verified", "database_proof_path", "controller_source_commit", "controller_helper_sha256", "controller_helper_path"):
                 raw.pop(legacy_key, None)
             return _manifest_record(cls, raw)
         except (TypeError, KeyError, ValueError) as exc:
             raise ActivationError(f"invalid manifest: {exc}") from exc
-
-
-@dataclasses.dataclass(frozen=True)
-class ValidatedLaunchdHandoff:
-    candidate_binary: Path
-    candidate_plist: Path
-    rollback: Optional[tuple[Path, Path]]
-    ordinary_forward_only: bool
 
 
 def _manifest_record(record_type: type, raw: object):
@@ -649,16 +595,6 @@ def _private_transaction_dir(path: Path) -> Path:
     return path
 
 
-def _existing_private_transaction_dir(path: Path) -> Path:
-    try:
-        mode = path.lstat().st_mode
-    except OSError as exc:
-        raise ActivationError("paired transaction directory is unavailable") from exc
-    if not stat.S_ISDIR(mode) or path.is_symlink() or (mode & 0o777) != 0o700:
-        raise ActivationError("paired transaction directory must be a private 0700 directory")
-    return path
-
-
 def _paired_path_context(manifest: Manifest) -> tuple[Path, Path, Path, Path]:
     upgrade = prepared_database_upgrade(manifest)
     if upgrade is None:
@@ -674,7 +610,7 @@ def _paired_path_context(manifest: Manifest) -> tuple[Path, Path, Path, Path]:
     resolved = {path.resolve(strict=False) for path in (database, backup, proof)}
     if len(resolved) != 3:
         raise ActivationError("database backup and proof must not alias the database or each other")
-    return database, backup, proof, _existing_private_transaction_dir(backup.parent)
+    return database, backup, proof, _private_transaction_dir(backup.parent)
 
 
 def _restore_capacity_path(manifest: Manifest, database: Optional[Path] = None) -> Path:
@@ -2312,118 +2248,6 @@ def validate_manifest_identities(manifest: Manifest) -> None:
         raise ActivationError("previous runtime identity is malformed")
 
 
-def _load_staged_plist(path: Path, description: str) -> dict:
-    try:
-        with path.open("rb") as stream:
-            plist = plistlib.load(stream)
-    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
-        raise ActivationError(f"{description} is unreadable") from exc
-    if not isinstance(plist, dict):
-        raise ActivationError(f"{description} is not a dictionary")
-    return plist
-
-
-def _validate_staged_plist_binding(
-    plist: dict,
-    *,
-    manifest_label: str,
-    target_binary: Path,
-    description: str,
-) -> None:
-    if not manifest_label.strip() or plist.get("Label") != manifest_label:
-        raise ActivationError(f"{description} label does not match the immutable manifest")
-    if "Program" in plist or plist.get("ProgramArguments") != [str(target_binary)]:
-        raise ActivationError(f"{description} program does not match the immutable target")
-
-
-def expected_helper_label(manifest: Manifest) -> str:
-    return f"{DEPLOY_HELPER_LABEL_PREFIX}.{manifest.transaction_id}"
-
-
-def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHandoff:
-    """Validate retained installer evidence without preparing or invoking mutation."""
-    exact_prepared_source114 = isinstance(
-        manifest.current_schema_upgrade, PreparedSource114Upgrade
-    )
-    if exact_prepared_source114:
-        if manifest.transition_timeout_secs != DEFAULT_TRANSITION_TIMEOUT_SECS:
-            raise ActivationError(
-                f"exact prepared source114 transition_timeout_secs must be {DEFAULT_TRANSITION_TIMEOUT_SECS}"
-            )
-        if manifest.health_timeout_secs != DEFAULT_HEALTH_TIMEOUT_SECS:
-            raise ActivationError(
-                f"exact prepared source114 health_timeout_secs must be {DEFAULT_HEALTH_TIMEOUT_SECS}"
-            )
-    validate_manifest_identities(manifest)
-    validate_manifest_mode(manifest)
-    if manifest.helper_label != expected_helper_label(manifest):
-        raise ActivationError("immutable manifest has an invalid helper label")
-    candidate_binary = verify_staged(
-        manifest.candidate_binary,
-        manifest.candidate_binary_sha256,
-        "candidate binary",
-    )
-    candidate_plist = verify_staged(
-        manifest.candidate_plist,
-        manifest.candidate_plist_sha256,
-        "candidate plist",
-    )
-    candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
-    if exact_prepared_source114:
-        _validate_staged_plist_binding(
-            candidate_plist_contents,
-            manifest_label=manifest.label,
-            target_binary=Path(manifest.target_binary),
-            description="candidate plist",
-        )
-    rollback: Optional[tuple[Path, Path]] = None
-    if manifest.previous is not None:
-        rollback_binary = verify_staged(
-            manifest.rollback_binary,
-            manifest.rollback_binary_sha256,
-            "rollback binary",
-        )
-        rollback_plist = verify_staged(
-            manifest.rollback_plist,
-            manifest.rollback_plist_sha256,
-            "rollback plist",
-        )
-        rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
-        if exact_prepared_source114:
-            _validate_staged_plist_binding(
-                rollback_plist_contents,
-                manifest_label=manifest.label,
-                target_binary=Path(manifest.target_binary),
-                description="rollback plist",
-            )
-        rollback = (rollback_binary, rollback_plist)
-    elif any(
-        (
-            manifest.rollback_binary,
-            manifest.rollback_binary_sha256,
-            manifest.rollback_plist,
-            manifest.rollback_plist_sha256,
-        )
-    ):
-        raise ActivationError("first-install rollback inputs are inconsistent")
-    ordinary_forward_only = ordinary_forward_policy_applies(manifest)
-    if manifest.paired_database_upgrade is not None:
-        validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
-    elif manifest.current_schema_upgrade is not None:
-        validate_current_schema_database(
-            Path(manifest.current_schema_upgrade.database_path),
-            _current_schema_registry(manifest),
-            source_kind=manifest.source_kind,
-            manifest=manifest,
-        )
-    return ValidatedLaunchdHandoff(
-        candidate_binary=candidate_binary,
-        candidate_plist=candidate_plist,
-        rollback=rollback,
-        ordinary_forward_only=ordinary_forward_only,
-    )
-
-
 def require_fresh_prepared_activation(manifest: Manifest) -> None:
     if manifest.current_schema_upgrade is None:
         return
@@ -2456,41 +2280,55 @@ def activate(manifest: Manifest) -> str:
         capacity_reservation: Optional[DatabaseCapacityReservation] = None
         ordinary_forward_only = False
         try:
-            validated = validate_pre_disruption_handoff(manifest)
+            validate_manifest_identities(manifest)
+            validate_manifest_mode(manifest)
+            candidate_binary = verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "candidate binary")
+            candidate_plist = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "candidate plist")
+            with candidate_plist.open("rb") as stream:
+                plistlib.load(stream)
             prepared_candidate_binary = prepare_atomic_install(
-                validated.candidate_binary, Path(manifest.target_binary), 0o755
+                candidate_binary, Path(manifest.target_binary), 0o755
             )
             prepared_installs.append(prepared_candidate_binary)
             prepared_candidate_plist = (
-                prepare_plist_publication(
-                    validated.candidate_plist, Path(manifest.target_plist)
-                )
+                prepare_plist_publication(candidate_plist, Path(manifest.target_plist))
                 if prepared_database_upgrade(manifest) is not None
-                else prepare_atomic_install(
-                    validated.candidate_plist, Path(manifest.target_plist), 0o600
-                )
+                else prepare_atomic_install(candidate_plist, Path(manifest.target_plist), 0o600)
             )
             prepared_installs.append(prepared_candidate_plist)
             prepared_candidate = (prepared_candidate_binary, prepared_candidate_plist)
-            if validated.rollback is not None:
-                rollback_binary, rollback_plist = validated.rollback
+            if manifest.previous is not None:
+                rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
+                rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
+                with rollback_plist.open("rb") as stream:
+                    plistlib.load(stream)
                 prepared_rollback_binary = prepare_atomic_install(
                     rollback_binary, Path(manifest.target_binary), 0o755
                 )
                 prepared_installs.append(prepared_rollback_binary)
                 prepared_rollback_plist = (
-                    prepare_plist_publication(
-                        rollback_plist, Path(manifest.target_plist)
-                    )
+                    prepare_plist_publication(rollback_plist, Path(manifest.target_plist))
                     if prepared_database_upgrade(manifest) is not None
-                    else prepare_atomic_install(
-                        rollback_plist, Path(manifest.target_plist), 0o600
-                    )
+                    else prepare_atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
                 )
                 prepared_installs.append(prepared_rollback_plist)
                 prepared_rollback = (prepared_rollback_binary, prepared_rollback_plist)
-            ordinary_forward_only = validated.ordinary_forward_only
+            elif any((
+                manifest.rollback_binary,
+                manifest.rollback_binary_sha256,
+                manifest.rollback_plist,
+                manifest.rollback_plist_sha256,
+            )):
+                raise ActivationError("first-install rollback inputs are inconsistent")
+            ordinary_forward_only = ordinary_forward_policy_applies(manifest)
             upgrade = prepared_database_upgrade(manifest)
+            if manifest.paired_database_upgrade is not None:
+                validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
+            elif manifest.current_schema_upgrade is not None:
+                validate_current_schema_database(
+                    Path(manifest.current_schema_upgrade.database_path),
+                    _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
+                )
             if upgrade is not None:
                 capacity_reservation = reserve_database_capacity(manifest)
         except Exception as exc:
@@ -3196,19 +3034,216 @@ def _repair_publication_path(parent: Manifest) -> Path:
     return target.parent / f".{target.name}.current-schema-repair-{parent.transaction_id}"
 
 
+def _current_repair_publication_quarantine_prefix(parent: Manifest) -> str:
+    target = Path(parent.target_plist)
+    return f".{target.name}.current-schema-repair-publication-{parent.transaction_id}-"
+
+
+def _retire_current_repair_publication(runtime: Manifest, publication: Path) -> Path:
+    target = Path(runtime.target_plist)
+    retired = target.parent / f"{_current_repair_publication_quarantine_prefix(runtime)}{secrets.token_hex(16)}"
+    try:
+        os.rename(publication, retired)
+    except FileNotFoundError as exc:
+        raise ActivationError("repair publication disappeared before retirement") from exc
+    fsync_dir(target.parent)
+    _repair_private(retired)
+    if _regular_file_digest(retired, "retired repair publication") != runtime.candidate_plist_sha256:
+        raise ActivationError("repair publication changed before retirement")
+    return retired
+
+
+def _commit_current_repair_plist(runtime: Manifest, publication: Path) -> None:
+    target = Path(runtime.target_plist)
+    if _current_repair_target_plist_digest(runtime) is None:
+        try:
+            os.link(publication, target)
+        except FileExistsError:
+            pass
+    if _current_repair_target_plist_digest(runtime) != runtime.candidate_plist_sha256:
+        raise ActivationError("persistent target plist appeared with unknown bytes during publication")
+    _retire_current_repair_publication(runtime, publication)
+    if _current_repair_target_plist_digest(runtime) != runtime.candidate_plist_sha256:
+        raise ActivationError("published repair plist changed during durable publication")
+
+
 def _publish_current_repair(runtime: Manifest, parent: Manifest) -> None:
     publication = _repair_publication_path(parent)
     if os.path.lexists(publication):
-        _repair_private(publication)
-        verify_staged(str(publication), runtime.candidate_plist_sha256, "owned repair publication")
-        publication.unlink()
-        fsync_dir(publication.parent)
+        _retire_current_repair_publication(runtime, publication)
     os.link(runtime.candidate_plist, publication)
     fsync_dir(publication.parent)
-    commit_atomic_install(publication, Path(runtime.target_plist))
+    _commit_current_repair_plist(runtime, publication)
+
+
+def _file_metadata_token(metadata: os.stat_result) -> CurrentRepairFileToken:
+    return CurrentRepairFileToken(
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _regular_file_path_token(path: Path) -> CurrentRepairFileToken | None:
+    try:
+        return _file_metadata_token(os.stat(path, follow_symlinks=False))
+    except FileNotFoundError:
+        return None
+
+
+def _regular_file_evidence(path: Path, label: str) -> tuple[str, CurrentRepairFileToken] | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ActivationError(f"{label} is not a regular file")
+        if before.st_size > CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES:
+            raise ActivationError(f"{label} exceeds the bounded plist evidence size")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(remaining, CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES))
+            if not chunk:
+                raise ActivationError(f"{label} changed while being read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ActivationError(f"{label} changed while being read")
+        after = os.fstat(fd)
+        after_token = _file_metadata_token(after)
+        if _file_metadata_token(before) != after_token:
+            raise ActivationError(f"{label} changed while being read")
+        if _regular_file_path_token(path) != after_token:
+            raise ActivationError(f"{label} path changed while being read")
+        return digest.hexdigest(), after_token
+    finally:
+        os.close(fd)
+
+
+def _regular_file_digest(path: Path, label: str) -> str | None:
+    evidence = _regular_file_evidence(path, label)
+    return None if evidence is None else evidence[0]
+
+
+def _current_repair_target_plist_digest(parent: Manifest) -> str | None:
+    return _regular_file_digest(Path(parent.target_plist), "published repair plist")
+
+
+def _current_repair_quarantine_prefix(parent: Manifest) -> str:
+    target = Path(parent.target_plist)
+    return f".{target.name}.current-schema-repair-fence-{parent.transaction_id}-"
+
+
+def _current_repair_quarantines(parent: Manifest) -> list[Path]:
+    target = Path(parent.target_plist)
+    prefixes = (
+        _current_repair_quarantine_prefix(parent),
+        _current_repair_publication_quarantine_prefix(parent),
+    )
+    quarantines = []
+    with os.scandir(target.parent) as entries:
+        for entry in entries:
+            if not entry.name.startswith(prefixes):
+                continue
+            quarantines.append(Path(entry.path))
+            if len(quarantines) > CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES:
+                raise ActivationError("repair plist quarantine entry limit exceeded")
+    return sorted(quarantines)
+
+
+def _current_repair_directory_token(parent: Manifest) -> tuple[int, ...]:
+    metadata = os.stat(Path(parent.target_plist).parent, follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ActivationError("repair plist directory is not a directory")
+    return tuple(
+        getattr(metadata, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_mtime_ns", "st_ctime_ns")
+    )
+
+
+def _current_repair_persistence_owned(
+    repair: CurrentSchemaRepairManifest,
+    parent: Manifest,
+    *,
+    reserve_attempt_headroom: bool = True,
+) -> bool:
+    try:
+        target = Path(parent.target_plist)
+        directory_token = _current_repair_directory_token(parent)
+        quarantines = _current_repair_quarantines(parent)
+        reserved_entries = CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES if reserve_attempt_headroom else 0
+        reserved_bytes = CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES if reserve_attempt_headroom else 0
+        if len(quarantines) > CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES - reserved_entries:
+            return False
+        quarantine_tokens: dict[Path, CurrentRepairFileToken] = {}
+        target_token: CurrentRepairFileToken | None = None
+        for _pass in range(2):
+            pass_tokens: dict[Path, CurrentRepairFileToken] = {}
+            total_bytes = 0
+            for item in quarantines:
+                evidence = _regular_file_evidence(item, "repair plist quarantine")
+                if evidence is None or evidence[0] != repair.plist_sha256:
+                    return False
+                total_bytes += evidence[1].size
+                if total_bytes > CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES - reserved_bytes:
+                    return False
+                pass_tokens[item] = evidence[1]
+            if _current_repair_quarantines(parent) != quarantines:
+                return False
+            target_evidence = _regular_file_evidence(target, "published repair plist")
+            if target_evidence is not None and target_evidence[0] != repair.plist_sha256:
+                return False
+            if _current_repair_quarantines(parent) != quarantines:
+                return False
+            quarantine_tokens = pass_tokens
+            target_token = None if target_evidence is None else target_evidence[1]
+        if any(_regular_file_path_token(item) != token for item, token in quarantine_tokens.items()):
+            return False
+        if _regular_file_path_token(target) != target_token:
+            return False
+        return _current_repair_directory_token(parent) == directory_token
+    except Exception:
+        return False
+
+
+def _current_repair_target_absent(target: Path) -> bool:
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _quarantine_current_repair_persistence(parent: Manifest) -> bool:
+    target = Path(parent.target_plist)
+    try:
+        for _attempt in range(CURRENT_REPAIR_QUARANTINE_ATTEMPTS):
+            if _current_repair_target_absent(target):
+                fsync_dir(target.parent)
+                return _current_repair_target_absent(target)
+            quarantine = target.parent / f"{_current_repair_quarantine_prefix(parent)}{secrets.token_hex(16)}"
+            try:
+                os.rename(target, quarantine)
+            except FileNotFoundError:
+                fsync_dir(target.parent)
+                if _current_repair_target_absent(target):
+                    return True
+                continue
+            fsync_dir(target.parent)
+        fsync_dir(target.parent)
+        return _current_repair_target_absent(target)
+    except Exception:
+        return False
 
 
 def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Launchctl) -> None:
+    _quarantine_current_repair_persistence(parent)
     stopped = False
     try:
         launchctl.stop()
@@ -3219,8 +3254,20 @@ def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Laun
         stopped = True
     except Exception:
         stopped = False
-    truth = "failed_stopped" if stopped else "stop_unconfirmed"
-    print(f"current-schema repair teardown: {truth}; original claim retained", file=sys.stderr, flush=True)
+    _quarantine_current_repair_persistence(parent)
+    try:
+        require_launchd_absence(parent.label, parent.uid)
+        stopped = True
+    except Exception:
+        stopped = False
+    persistence_fenced = _quarantine_current_repair_persistence(parent)
+    truth = "failed_stopped" if stopped and persistence_fenced else "stop_unconfirmed"
+    print(
+        f"current-schema repair teardown: {truth}; persistent auto-start "
+        f"{'absent' if persistence_fenced else 'unconfirmed'}; original claim retained",
+        file=sys.stderr,
+        flush=True,
+    )
     try:
         durable = CurrentSchemaRepairStatus.load(path.parent / "status.json", sha256(path))
     except Exception:
@@ -3232,6 +3279,12 @@ def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Laun
     _write_repair_status(path, failed)
 
 
+def _require_current_repair_persistent_route(parent: Manifest) -> None:
+    expected = Path.home() / "Library" / "LaunchAgents" / f"{CURRENT_REPAIR_SERVICE_LABEL}.plist"
+    if parent.label != CURRENT_REPAIR_SERVICE_LABEL or Path(parent.target_plist) != expected:
+        raise ActivationError("repair parent persistent route differs from the canonical launchd target")
+
+
 def _current_repair_routing(path: Path) -> tuple[CurrentSchemaRepairManifest, Manifest]:
     repair = CurrentSchemaRepairManifest.load(path)
     parent_path = Path(repair.parent_manifest_path)
@@ -3239,6 +3292,7 @@ def _current_repair_routing(path: Path) -> tuple[CurrentSchemaRepairManifest, Ma
     verify_staged(str(parent_path), repair.parent_manifest_sha256, "original repair parent manifest")
     parent = Manifest.load(parent_path)
     validate_manifest_identities(parent)
+    _require_current_repair_persistent_route(parent)
     if (parent.helper_label != f"{DEPLOY_HELPER_LABEL_PREFIX}.{parent.transaction_id}" or parent.uid != os.getuid()
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", parent.transaction_id)
             or not re.fullmatch(r"[A-Za-z0-9._-]+", parent.label)
@@ -3271,7 +3325,9 @@ def activate_current_repair(path: Path) -> str:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another operation owns current-schema repair") from exc
         try:
-            repair, parent, status = validate_current_repair(path)
+            validated_repair, validated_parent, status = validate_current_repair(path)
+            _require_current_repair_persistent_route(validated_parent)
+            repair, parent = validated_repair, validated_parent
         except Exception:
             # Only the original owner can authorize teardown using hash-bound routing.
             _require_current_repair_claim(parent)
@@ -3283,6 +3339,13 @@ def activate_current_repair(path: Path) -> str:
         terminal = status.state == "committed" and not status.finalization_pending
         try:
             require_launchd_absence(parent.helper_label, parent.uid)
+            reserve_attempt_headroom = status.state not in {"failed_stopped", "stop_unconfirmed"}
+            if not terminal and not _current_repair_persistence_owned(
+                repair,
+                parent,
+                reserve_attempt_headroom=reserve_attempt_headroom,
+            ):
+                raise ActivationError("persistent target plist is not absent or the exact sealed repair plist")
             pending_running = False
             if status.state == "committed" and status.finalization_pending:
                 observed, pid = launchctl.inspect()
@@ -3680,10 +3743,12 @@ def main() -> int:
         )
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
             raise identity_rejection("helper identity does not match the immutable manifest")
-        immutable_helper_label = expected_helper_label(manifest)
-        if manifest.helper_label != immutable_helper_label:
+        expected_helper_label = (
+            f"{DEPLOY_HELPER_LABEL_PREFIX}.{manifest.transaction_id}"
+        )
+        if manifest.helper_label != expected_helper_label:
             raise identity_rejection("immutable manifest has an invalid helper label")
-        verified_helper_label = immutable_helper_label
+        verified_helper_label = expected_helper_label
         if args.command in {"cleanup-paired", "cleanup-current"}:
             state = cleanup_precondition_capacity(
                 manifest, current_schema=args.command == "cleanup-current"
