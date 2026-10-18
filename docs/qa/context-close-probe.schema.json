@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Synthetic bare-Playwright context-close probe, version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "runId",
+    "provenance",
+    "cases",
+    "suiteError",
+    "cleanupErrors"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "runId": {
+      "$ref": "#/$defs/uuid"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/case"
+      },
+      "maxItems": 4
+    },
+    "suiteError": {
+      "$ref": "#/$defs/error"
+    },
+    "cleanupErrors": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "browser_cleanup"
+        ]
+      },
+      "maxItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "error": {
+      "enum": [
+        null,
+        "deadline",
+        "incorrect_owner",
+        "multiple_post",
+        "invalid_payload",
+        "event_overflow",
+        "invalid_event",
+        "unexpected_response",
+        "missing_barrier",
+        "operation_failed"
+      ]
+    },
+    "facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestOwned",
+        "collectorOwned",
+        "responseJoined",
+        "failureJoined",
+        "releaseWhileClosePending",
+        "serverFinished",
+        "serverClosed",
+        "forcedSocketDisposal",
+        "postCount",
+        "clientStatus",
+        "writeAvailable"
+      ],
+      "properties": {
+        "requestOwned": {
+          "type": "boolean"
+        },
+        "collectorOwned": {
+          "type": "boolean"
+        },
+        "responseJoined": {
+          "type": "boolean"
+        },
+        "failureJoined": {
+          "type": "boolean"
+        },
+        "releaseWhileClosePending": {
+          "type": "boolean"
+        },
+        "serverFinished": {
+          "type": "boolean"
+        },
+        "serverClosed": {
+          "type": "boolean"
+        },
+        "forcedSocketDisposal": {
+          "type": "boolean"
+        },
+        "postCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "clientStatus": {
+          "enum": [
+            null,
+            204,
+            "other"
+          ]
+        },
+        "writeAvailable": {
+          "enum": [
+            null,
+            true,
+            false
+          ]
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "atMs"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "request_emit",
+            "collector_received",
+            "close_begin",
+            "response_release",
+            "server_response_finish",
+            "server_response_close",
+            "client_response",
+            "request_failed",
+            "close_resolve"
+          ]
+        },
+        "atMs": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 70000
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node",
+        "playwright",
+        "lockSha256",
+        "browserRevision",
+        "sourceCommit"
+      ],
+      "properties": {
+        "node": {
+          "type": "string",
+          "pattern": "^v[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"
+        },
+        "playwright": {
+          "const": "1.61.0"
+        },
+        "lockSha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "browserRevision": {
+          "type": "string",
+          "pattern": "^[0-9]{1,10}$"
+        },
+        "sourceCommit": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case",
+        "runId",
+        "caseId",
+        "primaryError",
+        "cleanupErrors",
+        "events",
+        "facts",
+        "outcome"
+      ],
+      "properties": {
+        "case": {
+          "enum": [
+            "before",
+            "during",
+            "after",
+            "never"
+          ]
+        },
+        "runId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "caseId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "primaryError": {
+          "$ref": "#/$defs/error"
+        },
+        "cleanupErrors": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "context_cleanup",
+              "server_cleanup"
+            ]
+          },
+          "maxItems": 2,
+          "uniqueItems": true
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event"
+          },
+          "maxItems": 24
+        },
+        "facts": {
+          "$ref": "#/$defs/facts"
+        },
+        "outcome": {
+          "enum": [
+            "not_observed",
+            "response_after_close",
+            "response_before_close_resolve",
+            "request_cancelled",
+            "no_response_observed"
+          ]
+        }
+      }
+    }
+  }
+}

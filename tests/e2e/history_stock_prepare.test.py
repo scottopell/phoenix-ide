@@ -42,7 +42,7 @@ class StockPrepareTests(unittest.TestCase):
         self.assertIn('369305dcd94862d4ee12e7af9fd463d5da14d808', LANE)
         self.assertIn('persist-credentials: false', LANE)
 
-    def test_offline_label_only_excludes_the_existing_runtime_job(self):
+    def test_offline_label_excludes_stock_runtime_and_only_admits_bare_probe(self):
         guard = next(line.strip() for line in LANE.splitlines() if line.startswith('    if:'))
         self.assertEqual(guard, "if: ${{ github.event_name == 'pull_request' && "
                          "github.event.pull_request.head.repo.full_name == github.repository && "
@@ -50,8 +50,15 @@ class StockPrepareTests(unittest.TestCase):
                          "github.head_ref == 'integration/v013-history-current-main' || "
                          "github.head_ref == 'prepare/exact-f16-stock-admission') && "
                          "!contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}")
+        probe = WORKFLOW.split('  context-close-functional-probe:\n', 1)[1].split('\n  qualify-history-realserver:', 1)[0]
+        self.assertEqual(next(line.strip() for line in probe.splitlines() if line.startswith('    if:')),
+                         "if: ${{ github.event_name == 'pull_request' && "
+                         "github.event.pull_request.head.repo.full_name == github.repository && "
+                         "github.head_ref == 'prepare/exact-f16-stock-admission' && "
+                         "contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}")
         outside_runtime = WORKFLOW.replace('  qualify-history-realserver:\n' + LANE, '')
-        self.assertNotIn('offline-regression-only', outside_runtime)
+        outside_owned_jobs = outside_runtime.replace('  context-close-functional-probe:\n' + probe, '')
+        self.assertNotIn('offline-regression-only', outside_owned_jobs)
         triggers = WORKFLOW.split('\non:\n', 1)[1].split('\nconcurrency:', 1)[0]
         self.assertIn('  pull_request:\n', triggers)
         self.assertNotIn('types:', triggers)

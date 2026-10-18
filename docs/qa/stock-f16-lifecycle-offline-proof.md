@@ -372,3 +372,17 @@ missing causal datum is **a primary Node error, or the first cleanup-only error,
 with its phase**—not necessarily a primary assertion. The newer diagnostic's
 fixed cleanup stages narrow that boundary when retained, but its clean
 non-reproduction does not reconstruct the old event or close the incident.
+
+## Separately authorized Stage 1 hosted functional probe
+
+The follow-up from `5d2a62905` prepares a narrowly gated bare-Playwright probe:
+[context-close-probe.md](context-close-probe.md). Unlike the offline model above,
+its future hosted execution uses an owned ephemeral synthetic collector and
+actual Playwright 1.61.0 Chromium, **not** the reporter or Phoenix collector.
+The new job requires the exact same-repo prepare-branch PR **and** the
+`offline-regression-only` label; the stock runtime job remains skipped by its
+unchanged negative-label guard. No real result is checked in, no local runtime
+is authorized, and no historical cause, production fix, stock qualification or
+performance clearance follows from this preparation or its fake-object tests.
+The earlier offline publication receipts remain earlier receipts, not Stage 1
+execution evidence. Stage 2 reporter work is outside this packet.

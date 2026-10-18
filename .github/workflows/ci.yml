@@ -190,6 +190,45 @@ jobs:
       - name: ./dev.py check (e2e)
         run: ./dev.py check --lanes e2e
 
+  context-close-functional-probe:
+    name: bare Playwright context-close probe (not stock qualification)
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'prepare/exact-f16-stock-admission' && contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Compiler-free probe controls
+        run: node --test ui/scripts/context-close-probe.test.mjs
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - name: Frozen hosted dependencies and Chromium only
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm exec playwright install --with-deps chromium
+      - name: Four synthetic functional schedules (60-second probe budget)
+        env:
+          PROBE_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
+        run: timeout --signal=TERM --kill-after=5s 65s node ui/scripts/context-close-probe.cli.mjs
+      - name: Retain only fixed-schema synthetic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-close-functional-probe-not-qualification
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            context-close-evidence/result.json
+            docs/qa/context-close-probe.schema.json
+            docs/qa/context-close-probe.md
+
   qualify-history-realserver:
     name: typed codegen and isolated instrumented opening witness (not shipping)
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.head_ref == 'qualification/continuation-opening-codegen' || github.head_ref == 'integration/v013-history-current-main' || github.head_ref == 'prepare/exact-f16-stock-admission') && !contains(github.event.pull_request.labels.*.name, 'offline-regression-only') }}
@@ -715,6 +754,7 @@ jobs:
       - name: Offline lifecycle and stock-publication regressions (not runtime qualification)
         run: |
           node --test ui/scripts/lifecycle-close-drain.selftest.mjs
+          node --test ui/scripts/context-close-probe.test.mjs
           python3 -B tests/e2e/history_stock_prepare.test.py
           python3 -B tests/e2e/history_runtime_publication.test.py
           python3 -B tests/e2e/history_controlled_artifact.test.py
