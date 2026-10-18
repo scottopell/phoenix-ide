@@ -360,3 +360,15 @@ Its returned `finalizeHistory` callback executes later, outside that catch. An
 error there is a specific remaining capture boundary, not evidence that it threw
 in the historical run. No capture expansion, production fix, module-pin change,
 or natural-sampling retry is included in this offline publication.
+
+A further source boundary prevents assuming that a primary Node assertion even
+existed: `retainCleanupFailure` in the opening driver sets `result.status` to
+`failed` without requiring `result.error`. A later `finalizeHistory` exception is
+retained as `joint_browser_cleanup`; the Python outer-case return-code assertion
+can then become its own primary error. Thus the old failed browser status and
+nine completed checks are also compatible with a cleanup-only failure. The old
+safe artifact omitted both Node error presence and the cleanup inventory. The
+missing causal datum is **a primary Node error, or the first cleanup-only error,
+with its phase**—not necessarily a primary assertion. The newer diagnostic's
+fixed cleanup stages narrow that boundary when retained, but its clean
+non-reproduction does not reconstruct the old event or close the incident.
