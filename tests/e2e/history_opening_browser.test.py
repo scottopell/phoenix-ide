@@ -248,7 +248,7 @@ class OpeningQualificationTests(unittest.TestCase):
 
     def test_ui_command_is_accepted_by_exact_app_lane_resolver_not_ci_group_alias(self):
         import ast, re, subprocess, sys
-        source = subprocess.check_output(["git", "-C", str(opening.ROOT), "show", f"{opening.PIN}:dev.py"], text=True)
+        source = subprocess.check_output(["git", "-C", str(Path(os.environ.get('APP_ROOT', opening.ROOT))), "show", f"{opening.PIN}:dev.py"], text=True)
         tree = ast.parse(source)
         selected = [node for node in tree.body if
                     isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"_LANE_DEFS", "_LANE_ALIASES"} for t in node.targets)

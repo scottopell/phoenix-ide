@@ -4,8 +4,10 @@ import ast
 from contextlib import chdir
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -94,7 +96,7 @@ class StockPrepareTests(unittest.TestCase):
                     and any(isinstance(target, ast.Name) and target.id == 'TELEMETRY_MODULES' for target in node.targets))
         source = None
         for name, expected in pins.items():
-            data = subprocess.check_output(['git', '-C', str(ROOT), 'show',
+            data = subprocess.check_output(['git', '-C', str(Path(os.environ.get('APP_ROOT', ROOT))), 'show',
                                             'f16afb227d9336a863c0b0345960ea9a6d62b7c7:' + name])
             self.assertEqual(hashlib.sha256(data).hexdigest(), expected)
             if name == 'ui/scripts/qualify-view-telemetry.mjs':
@@ -104,6 +106,38 @@ class StockPrepareTests(unittest.TestCase):
         self.assertIn("5000, 'outer context cleanup'", source)
         self.assertIn("5000, 'outer operation drain'", source)
         self.assertLess(285 + 5 + 5, 300)
+
+    def test_pinned_source_lookups_use_separate_app_authority_or_local_fallback(self):
+        harness = self.out / 'shallow-harness'
+        app = self.out / 'full-history-app'
+        harness.mkdir()
+        app.mkdir()
+        pin = 'f16afb227d9336a863c0b0345960ea9a6d62b7c7'
+        cases = (
+            ('history_stock_prepare.test.py',
+             'test_pinned_sampling_deadline_and_module_hashes_are_unchanged',
+             'ui/scripts/qualify-view-telemetry.mjs', {}),
+            ('history_opening_browser.test.py',
+             'test_ui_command_is_accepted_by_exact_app_lane_resolver_not_ci_group_alias',
+             'dev.py', {'text': True}),
+        )
+        for filename, method, relative, kwargs in cases:
+            tree = ast.parse((ROOT / 'tests/e2e' / filename).read_text())
+            function = next(node for node in ast.walk(tree)
+                            if isinstance(node, ast.FunctionDef) and node.name == method)
+            lookup = next(node for node in ast.walk(function)
+                          if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                          and node.func.attr == 'check_output')
+            expression = compile(ast.Expression(lookup), filename, 'eval')
+            for env, authority in (({'APP_ROOT': str(app)}, app), ({}, harness)):
+                with self.subTest(filename=filename, env=env), \
+                        patch.dict(os.environ, env, clear=True), \
+                        patch.object(subprocess, 'check_output', return_value=b'UNIT ONLY source') as git_show:
+                    eval(expression, {'subprocess': subprocess, 'Path': Path, 'os': os,
+                                      'ROOT': harness, 'name': relative,
+                                      'opening': types.SimpleNamespace(ROOT=harness, PIN=pin)})
+                    git_show.assert_called_once_with(
+                        ['git', '-C', str(authority), 'show', pin + ':' + relative], **kwargs)
 
     def test_both_artifacts_and_failure_receipts_are_retained(self):
         upload = step('Retain stock artifacts and safe publication')
