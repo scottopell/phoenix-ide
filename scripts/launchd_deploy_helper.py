@@ -192,11 +192,33 @@ class Manifest:
                     f"unsupported handoff protocol {raw.get('manifest_version')!r}; expected {HANDOFF_PROTOCOL_VERSION}"
                 )
             raw_current_schema_upgrade = raw.get("current_schema_upgrade")
-            exact_prepared_source114 = isinstance(raw_current_schema_upgrade, dict) and (
+            raw_expected = raw.get("expected")
+            prepared_source114_identity = raw.get("source_kind") == "prepared_artifact" and (
+                raw.get("source_commit") == PREPARED_SOURCE114_COMMIT
+                or (
+                    isinstance(raw_expected, dict)
+                    and raw_expected.get("git_sha") == PREPARED_SOURCE114_COMMIT
+                )
+            )
+            prepared_source114_fields = isinstance(raw_current_schema_upgrade, dict) and (
                 "prepared_source_baseline" in raw_current_schema_upgrade
                 or "candidate_registry_expected_sha256" in raw_current_schema_upgrade
             )
+            exact_prepared_source114 = prepared_source114_identity or prepared_source114_fields
             if exact_prepared_source114:
+                if not isinstance(raw_current_schema_upgrade, dict):
+                    raise ActivationError(
+                        "exact prepared source114 manifest missing current-schema evidence"
+                    )
+                missing_qualification_fields = {
+                    "prepared_source_baseline",
+                    "candidate_registry_expected_sha256",
+                } - raw_current_schema_upgrade.keys()
+                if missing_qualification_fields:
+                    missing = ", ".join(sorted(missing_qualification_fields))
+                    raise ActivationError(
+                        f"exact prepared source114 manifest missing qualification fields: {missing}"
+                    )
                 missing_timeout_fields = {
                     "transition_timeout_secs",
                     "health_timeout_secs",

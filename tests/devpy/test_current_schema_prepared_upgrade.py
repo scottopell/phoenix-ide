@@ -329,6 +329,33 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             path.write_text(json.dumps(changed))
             with self.assertRaises(helper.ActivationError):
                 helper.Manifest.load(path)
+        changed = json.loads(json.dumps(payload))
+        del changed["current_schema_upgrade"]["prepared_source_baseline"]
+        del changed["current_schema_upgrade"]["candidate_registry_expected_sha256"]
+        path.write_text(json.dumps(changed))
+        with self.assertRaises(helper.ActivationError):
+            helper.Manifest.load(path)
+        non_source114 = "e" * 40
+        for source_commit, expected_commit in (
+            (helper.PREPARED_SOURCE114_COMMIT, non_source114),
+            (non_source114, helper.PREPARED_SOURCE114_COMMIT),
+        ):
+            changed = json.loads(json.dumps(payload))
+            changed["source_commit"] = source_commit
+            changed["expected"]["git_sha"] = expected_commit
+            del changed["current_schema_upgrade"]["prepared_source_baseline"]
+            del changed["current_schema_upgrade"]["candidate_registry_expected_sha256"]
+            path.write_text(json.dumps(changed))
+            with self.assertRaises(helper.ActivationError):
+                helper.Manifest.load(path)
+        generic = json.loads(json.dumps(payload))
+        generic["source_commit"] = non_source114
+        generic["expected"]["git_sha"] = non_source114
+        del generic["current_schema_upgrade"]["prepared_source_baseline"]
+        del generic["current_schema_upgrade"]["candidate_registry_expected_sha256"]
+        path.write_text(json.dumps(generic))
+        loaded_generic = helper.Manifest.load(path)
+        self.assertIs(type(loaded_generic.current_schema_upgrade), helper.CurrentSchemaUpgrade)
         for fields in ({"extra_qualification": True}, {"prepared_source_baseline": "114"},
                        {"prepared_source_baseline": None}, {"candidate_registry_expected_sha256": None}):
             changed = json.loads(json.dumps(payload))

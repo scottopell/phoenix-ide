@@ -203,58 +203,75 @@ def validate_receipt(dev, receipt) -> None:
                     dev._disposable_validation_tree_witness(receipt.root) == full_root_baseline
                 ), f"{reason} did not restore the full root"
 
-    candidate_plist_path = Path(manifest["candidate_plist"])
-    candidate_plist_relative = str(candidate_plist_path.relative_to(receipt.root))
-    original_candidate_plist_bytes = candidate_plist_path.read_bytes()
-    original_candidate_plist_mode = stat.S_IMODE(candidate_plist_path.stat().st_mode)
-    original_candidate_plist = plistlib.loads(original_candidate_plist_bytes)
-    assert "Program" not in original_candidate_plist
-    assert original_candidate_plist["ProgramArguments"] == [manifest["target_binary"]]
-    retained_without_manifest_or_plist = tuple(
-        item
-        for item in full_root_baseline
-        if item[0] not in {manifest_relative, candidate_plist_relative}
-    )
+    def exercise_plist_negatives(
+        *, plist_field: str, sha_field: str, staged_binary_field: str, description: str
+    ) -> None:
+        plist_path = Path(manifest[plist_field])
+        plist_relative = str(plist_path.relative_to(receipt.root))
+        original_plist_bytes = plist_path.read_bytes()
+        original_plist_mode = stat.S_IMODE(plist_path.stat().st_mode)
+        original_plist = plistlib.loads(original_plist_bytes)
+        assert "Program" not in original_plist
+        assert original_plist["ProgramArguments"] == [manifest["target_binary"]]
+        retained_without_manifest_or_plist = tuple(
+            item
+            for item in full_root_baseline
+            if item[0] not in {manifest_relative, plist_relative}
+        )
 
-    def reject_candidate_plist(wrong: dict, reason: str) -> None:
-        try:
-            candidate_plist_path.write_bytes(plistlib.dumps(wrong))
-            wrong_manifest = copy.deepcopy(manifest)
-            wrong_manifest["candidate_plist_sha256"] = digest(candidate_plist_path)
-            receipt.manifest_path.write_text(json.dumps(wrong_manifest))
+        def reject_plist(wrong: dict, reason: str) -> None:
             try:
-                loaded_wrong = helper_policy["Manifest"].load(receipt.manifest_path)
-                helper_policy["validate_pre_disruption_handoff"](loaded_wrong)
-            except helper_policy["ActivationError"]:
-                pass
-            else:
-                raise AssertionError(f"helper accepted {reason}")
-        finally:
-            try:
-                retained_after = tuple(
-                    item
-                    for item in dev._disposable_validation_tree_witness(receipt.root)
-                    if item[0] not in {manifest_relative, candidate_plist_relative}
-                )
-                assert retained_after == retained_without_manifest_or_plist
+                plist_path.write_bytes(plistlib.dumps(wrong))
+                wrong_manifest = copy.deepcopy(manifest)
+                wrong_manifest[sha_field] = digest(plist_path)
+                receipt.manifest_path.write_text(json.dumps(wrong_manifest))
+                try:
+                    loaded_wrong = helper_policy["Manifest"].load(receipt.manifest_path)
+                    helper_policy["validate_pre_disruption_handoff"](loaded_wrong)
+                except helper_policy["ActivationError"]:
+                    pass
+                else:
+                    raise AssertionError(f"helper accepted {reason}")
             finally:
-                candidate_plist_path.write_bytes(original_candidate_plist_bytes)
-                candidate_plist_path.chmod(original_candidate_plist_mode)
-                receipt.manifest_path.write_bytes(original_manifest_bytes)
-                receipt.manifest_path.chmod(original_manifest_mode)
-                assert dev._disposable_validation_tree_witness(receipt.root) == full_root_baseline
+                try:
+                    retained_after = tuple(
+                        item
+                        for item in dev._disposable_validation_tree_witness(receipt.root)
+                        if item[0] not in {manifest_relative, plist_relative}
+                    )
+                    assert retained_after == retained_without_manifest_or_plist
+                finally:
+                    plist_path.write_bytes(original_plist_bytes)
+                    plist_path.chmod(original_plist_mode)
+                    receipt.manifest_path.write_bytes(original_manifest_bytes)
+                    receipt.manifest_path.chmod(original_manifest_mode)
+                    assert (
+                        dev._disposable_validation_tree_witness(receipt.root)
+                        == full_root_baseline
+                    )
 
-    program_override = copy.deepcopy(original_candidate_plist)
-    program_override["Program"] = "/usr/bin/false"
-    reject_candidate_plist(program_override, "candidate plist Program override")
-    wrong_target = copy.deepcopy(original_candidate_plist)
-    wrong_target["ProgramArguments"] = [
-        str(candidate_plist_path.parent / "candidate-phoenix-ide")
-    ]
-    reject_candidate_plist(wrong_target, "candidate plist staged-binary program")
-    trailing_arguments = copy.deepcopy(original_candidate_plist)
-    trailing_arguments["ProgramArguments"].append("--unexpected")
-    reject_candidate_plist(trailing_arguments, "candidate plist trailing argument")
+        program_override = copy.deepcopy(original_plist)
+        program_override["Program"] = "/usr/bin/false"
+        reject_plist(program_override, f"{description} Program override")
+        wrong_target = copy.deepcopy(original_plist)
+        wrong_target["ProgramArguments"] = [manifest[staged_binary_field]]
+        reject_plist(wrong_target, f"{description} staged-binary program")
+        trailing_arguments = copy.deepcopy(original_plist)
+        trailing_arguments["ProgramArguments"].append("--unexpected")
+        reject_plist(trailing_arguments, f"{description} trailing argument")
+
+    exercise_plist_negatives(
+        plist_field="candidate_plist",
+        sha_field="candidate_plist_sha256",
+        staged_binary_field="candidate_binary",
+        description="candidate plist",
+    )
+    exercise_plist_negatives(
+        plist_field="rollback_plist",
+        sha_field="rollback_plist_sha256",
+        staged_binary_field="rollback_binary",
+        description="rollback plist",
+    )
 
     for wrong_label in (
         "test.disposable.phoenix.validation.helper",
@@ -297,6 +314,9 @@ def validate_receipt(dev, receipt) -> None:
 
     legacy_manifest = copy.deepcopy(manifest)
     legacy_manifest["current_schema_upgrade"] = None
+    legacy_manifest["source_kind"] = "local_head"
+    legacy_manifest["source_commit"] = "f" * 40
+    legacy_manifest["expected"]["git_sha"] = "f" * 40
     del legacy_manifest["transition_timeout_secs"]
     del legacy_manifest["health_timeout_secs"]
     for legacy_field in EXPECTED_LEGACY_DATABASE_MANIFEST_FIELDS:
@@ -323,6 +343,17 @@ def validate_receipt(dev, receipt) -> None:
         receipt.manifest_path.write_bytes(original_manifest_bytes)
         receipt.manifest_path.chmod(original_manifest_mode)
         assert dev._disposable_validation_tree_witness(receipt.root) == full_root_baseline
+
+    downgraded_source114 = copy.deepcopy(manifest)
+    del downgraded_source114["current_schema_upgrade"]["prepared_source_baseline"]
+    del downgraded_source114["current_schema_upgrade"][
+        "candidate_registry_expected_sha256"
+    ]
+    downgraded_source114["transition_timeout_secs"] += 1
+    reject_manifest(
+        downgraded_source114,
+        "prepared source114 identity without both qualification fields",
+    )
 
     paired_fields = (
         "database_path", "backup_path", "proof_path", "controller_source_commit",
