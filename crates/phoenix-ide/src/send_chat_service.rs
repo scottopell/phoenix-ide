@@ -352,6 +352,16 @@ impl SendChatApplicationService {
                         == req.message_id
             })
         {
+            if req.expansion_policy == MessageExpansionPolicy::LiteralText
+                && (req.message_id != intent.message_id.as_str()
+                    || req.text != intent.handoff
+                    || req.user_agent != intent.user_agent)
+            {
+                return Ok(SendChatOutcome::Rejected {
+                    message: "reserved continuation opening payload does not match".to_string(),
+                    code: "continuation_opening_mismatch",
+                });
+            }
             req.origin = match intent.opening_authority {
                 phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => phoenix_core::domain::db_schema::InputOrigin::UserApi,
@@ -1118,6 +1128,8 @@ async fn lookup_durable_steering_replay(
                     }
                 }
             }
+        } else if req.expansion_policy != MessageExpansionPolicy::ExpandReferences {
+            return Err(SendChatServiceError::IdempotencyConflict);
         }
         return Ok(Some(outcome));
     }
@@ -2249,6 +2261,67 @@ mod tests {
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn transcript_only_replay_cannot_prove_nondefault_expansion_policy() {
+        for skill in [false, true] {
+            let mut req = request();
+            req.text = "/build now".to_string();
+            req.origin = phoenix_core::domain::db_schema::InputOrigin::UserApi;
+            let db = db_with_conversation(&req.conversation_id).await;
+            let content = if skill {
+                crate::db::MessageContent::Skill(SkillContent {
+                    name: "build".to_string(),
+                    body: "expanded historical skill".to_string(),
+                    trigger: req.text.clone(),
+                    files: vec![],
+                })
+            } else {
+                crate::db::MessageContent::user(&req.text)
+            };
+            db.add_message_with_seq_and_origin(
+                &req.message_id,
+                &req.conversation_id,
+                1,
+                &content,
+                None,
+                None,
+                &req.origin,
+            )
+            .await
+            .unwrap();
+            assert!(db
+                .get_steering_acceptance_fingerprint(&req.conversation_id, &req.message_id)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                lookup_durable_steering_replay(
+                    &db,
+                    &req,
+                    &super::request_fingerprint(&req).unwrap()
+                )
+                .await
+                .unwrap(),
+                Some(SendChatOutcome::AlreadyPersisted)
+            );
+            for policy in [
+                MessageExpansionPolicy::LiteralText,
+                MessageExpansionPolicy::GeneratedPredecessorContext,
+            ] {
+                req.expansion_policy = policy;
+                assert!(matches!(
+                    lookup_durable_steering_replay(
+                        &db,
+                        &req,
+                        &super::request_fingerprint(&req).unwrap()
+                    )
+                    .await,
+                    Err(SendChatServiceError::IdempotencyConflict)
+                ));
+            }
+        }
     }
 
     #[tokio::test]

@@ -45,3 +45,8 @@ Compiler caching supports an exact Kache 0.26.0 local command/daemon contract as
 ## Next work
 
 Task 44016 should enforce the offline downgrade boundary and make runtime-artifact rollback messaging truthful. A wider compatibility effort should inventory existing guarantees, classify accidental compatibility, remove machinery that serves unsupported scenarios, and audit feature-owned migration data policies.
+
+
+## Public literal chat
+
+REQ-API-031 and ADR-124 limit public literal steering to the existing `/chat` opt-in on a known receiver, verified by full immutable `git_sha` before each use or retry. A harmless retained-ID smoke confirms acceptance/materialization, not policy support by itself. Transcript-only historical replay remains default-policy-only; nondefault literal replay requires policy-bearing durable evidence. No database migration, downgrade, mixed-version ownership, live-replacement or deployment guarantee is added.

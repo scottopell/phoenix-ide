@@ -246,6 +246,19 @@ rule PhoenixApiDestinationAuthority {
     ensures: action.remote_continue_depends_on_federated_messaging = false
 
     @guidance
+        -- Public literal chat uses existing POST /api/conversations/{id}/chat
+        -- with explicit expansion_policy: "literal_text". First require full
+        -- git_sha in complete GET /api/version JSON from the exact authenticated
+        -- verified-TLS destination without redirects, matching an independently
+        -- verified immutable supporting commit or source-inspected accepted
+        -- descendant; re-read immediately before use and every exact retry.
+        -- Unknown/malformed/mismatched receiver means stop before POST, no
+        -- expandable probe or default-policy fallback. Then confirm one harmless
+        -- "literal steering smoke test" on the authorized idle target with a
+        -- retained message ID and materialized bytes; HTTP success alone cannot
+        -- prove policy support. Pin original target/identity/intent for retries.
+        -- Preserve authority, admission and local-only send_conversation_message.
+        -- See ../api/requirements.md REQ-API-031; no live-replacement guarantee.
         -- For a user-authorized question response, freshly resolve the target
         -- and GET its exact transcript. Require awaiting_user_response and
         -- the opaque current request_id, never the provider tool_use_id.

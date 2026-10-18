@@ -76,9 +76,11 @@ WHEN client sends chat message while conversation is idle or in error state
 THE SYSTEM SHALL forward message to state machine for processing
 AND return acknowledgment immediately
 
-WHEN client sends chat message while agent is busy
-THE SYSTEM SHALL return error indicating agent is busy
-AND inform user they can cancel current operation
+WHEN client sends chat message while agent is busy and accepts steering
+THE SYSTEM SHALL durably queue the message as steering and report that admission outcome
+
+WHEN the target cannot accept direct input or steering
+THE SYSTEM SHALL return the applicable admission refusal without claiming delivery
 
 WHEN client sends chat message with inline images
 THE SYSTEM SHALL accept base64-encoded image data in message payload
@@ -87,7 +89,7 @@ WHEN client requests cancellation
 THE SYSTEM SHALL forward cancel event to state machine
 AND return acknowledgment
 
-**Rationale:** Users interact with agent via messages and can interrupt operations. Rejecting messages while busy simplifies the state machine and makes message ordering explicit.
+**Rationale:** Users interact with the agent via messages and can interrupt operations. Direct delivery, steering admission, and refusal are distinct outcomes.
 
 ---
 
@@ -324,6 +326,30 @@ AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, 
 AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
 
 **Rationale:** Automatic continuation configuration is aggregate-scoped so a continuation cannot silently replace the configured identity, and its write response does not claim that existing exhausted work was scheduled.
+
+
+### REQ-API-031: Explicit Public Literal Chat
+
+WHEN an authorized client sends `POST /api/conversations/{id}/chat`
+THE SYSTEM SHALL accept only `expand_references` and `literal_text` as the public `expansion_policy` values
+AND SHALL use `expand_references` when the field is omitted
+AND SHALL reject unknown, null, or non-string policy values rather than mapping them to a default
+AND SHALL NOT expose internal generated-predecessor-context policy.
+
+WHEN literal text is admitted for direct delivery or steering
+THE SYSTEM SHALL preserve the decoded text unchanged for display and model input
+AND SHALL perform no slash-command, skill, @ mention or file-reference expansion
+AND SHALL create no skill invocation or expanded-text overlay
+AND SHALL preserve normal attachment validation, UserApi provenance, close/history fences and direct-versus-steering routing.
+AND for a reserved continuation opening SHALL reject an already-transcript-prefixed client identity or changed submitted text/user agent before canonicalization, retaining the original raw reserved identity.
+
+WHEN the client retries an admitted message identity
+THE SYSTEM SHALL compare expansion policy as part of exact submitted intent along with original transcript, text, ordered attachments, origin and user agent
+AND SHALL return HTTP 409 `idempotency_conflict` for changed policy
+AND SHALL require durable policy-bearing evidence for nondefault-policy replay rather than inferring it from transcript content alone
+AND SHALL preserve historical transcript-only replay only for default `expand_references` intent with matching content and provenance.
+
+Public literal-chat guidance SHALL require complete HTTP-200 `GET /api/version` JSON from the exact authenticated verified-TLS destination, with no redirects, whose full `git_sha` exactly matches an immutable commit independently verified to support this literal mode or a source-inspected accepted descendant. It SHALL re-read immediately before use and each exact retry, stop before POST on unknown, malformed or mismatched receivers, and never infer support from semver, local capability assumptions or smoke HTTP success alone. After known-version verification, it SHALL confirm one harmless `literal steering smoke test` on the exact authorized idle target with a retained message ID and materialized bytes before sending expandable content. It SHALL use existing `/chat` with explicit `literal_text`, preserve original target and intent for retries, and never fall back to default expansion. This recipe grants no additional authority or live-replacement guarantee.
 
 
 ### REQ-API-030: Bounded Global Aggregate History

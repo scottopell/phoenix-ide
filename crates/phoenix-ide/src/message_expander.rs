@@ -704,13 +704,24 @@ mod tests {
     #[test]
     fn test_expand_missing_file_error() {
         let tmp = make_tmp();
-        let err = expand("check @missing.rs", &root(tmp.path())).unwrap_err();
-        assert_eq!(
-            err,
-            ExpansionError::FileNotFound {
-                path: "missing.rs".to_string()
-            }
-        );
+        let bare = "@nonexistent-literal-chat-file";
+        let result = expand(bare, &root(tmp.path())).unwrap();
+        assert_eq!(result.display_text, bare);
+        assert_eq!(result.llm_text, bare);
+        assert!(result.skill_invocation.is_none());
+        for path in [
+            "missing.rs",
+            "nonexistent-literal-chat-file.txt",
+            "missing/file.txt",
+        ] {
+            let err = expand(&format!("check @{path}"), &root(tmp.path())).unwrap_err();
+            assert_eq!(
+                err,
+                ExpansionError::FileNotFound {
+                    path: path.to_string()
+                }
+            );
+        }
     }
 
     #[test]
