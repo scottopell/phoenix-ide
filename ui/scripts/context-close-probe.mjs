@@ -184,6 +184,10 @@ export function observeRequests(context, collector, record, runId, caseId) {
 
 export function classify(record) {
   const { result } = record, { facts, events } = result;
+  if (result.cleanupErrors.length) {
+    result.outcome = 'not_observed';
+    return result;
+  }
   const index = kind => events.findIndex(e => e.kind === kind);
   const has = kind => index(kind) >= 0;
   if (facts.postCount !== 1 || !facts.requestOwned || !facts.collectorOwned

@@ -194,7 +194,9 @@ for (const mode of ['browser_close_failure', 'browser_close_hang']) test(`browse
   const value = await runFake('never', mode, { cleanupMs: 5 });
   assert.equal(value.facts.browserClosed, false);
   assert.deepEqual(value.cleanupErrors, ['browser_cleanup']);
-  assert.equal(value.primaryError, 'missing_barrier');
+  assert.equal(value.primaryError, null);
+  assert.equal(value.outcome, 'not_observed');
+  assert.equal(functionalPass(packet([value])), false);
   assert.doesNotMatch(safeJSON(packet([value])), /PRIVATE/);
 });
 

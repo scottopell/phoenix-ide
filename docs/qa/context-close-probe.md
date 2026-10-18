@@ -206,3 +206,7 @@ The synthetic POST uses `keepalive: true`, matching the reporter transport optio
 This is still bare fetch: no reporter AbortController, pagehide callback, report
 serialization, sampling, Phoenix collector, or export pipeline is exercised.
 `request_failed_observed` does not establish cancellation or its cause.
+
+Cleanup-only failures retain `primaryError: null`; classification remains
+`not_observed` and functional qualification fails. A missing cleanup/transport
+barrier is not fabricated as a new primary error, and does not support absence.
