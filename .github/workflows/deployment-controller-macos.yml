@@ -7,14 +7,19 @@ on:
       - "crates/phoenix-deployment-controller/**"
       - "specs/standalone-deployment-controller/**"
       - "specs/adrs/README.md"
-      - "specs/adrs/118_standalone-controller-owns-durability-and-supervision.md"
-      - "specs/adrs/119_controller-loss-detaches-and-fences-surviving-guardian.md"
-      - "specs/adrs/120_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md"
-      - "specs/adrs/121_retained-native-results-use-application-only-recovery.md"
-      - "specs/adrs/122_owned-root-child-enumeration-is-distinct-native-authority.md"
-      - "specs/adrs/123_exact-root-identity-observation-is-distinct-native-authority.md"
-      - "specs/adrs/124_retained-exact-root-identity-results-use-application-only-recovery.md"
-      - "specs/adrs/125_already-durable-native-sampling-failures-use-explicit-custody-settlement.md"
+      - "specs/adrs/125_qualify-exact-prepared-source114-candidate.md"
+      - "specs/adrs/126_standalone-controller-owns-durability-and-supervision.md"
+      - "specs/adrs/127_controller-loss-detaches-and-fences-surviving-guardian.md"
+      - "specs/adrs/128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md"
+      - "specs/adrs/129_retained-native-results-use-application-only-recovery.md"
+      - "specs/adrs/130_owned-root-child-enumeration-is-distinct-native-authority.md"
+      - "specs/adrs/131_exact-root-identity-observation-is-distinct-native-authority.md"
+      - "specs/adrs/132_retained-exact-root-identity-results-use-application-only-recovery.md"
+      - "specs/adrs/133_already-durable-native-sampling-failures-use-explicit-custody-settlement.md"
+      - "specs/adrs/134_disposable-launchd-validation-precedes-installer-adoption.md"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/integration/launchd_validation_harness.py"
       - ".github/workflows/deployment-controller-macos.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -24,14 +29,19 @@ on:
       - "crates/phoenix-deployment-controller/**"
       - "specs/standalone-deployment-controller/**"
       - "specs/adrs/README.md"
-      - "specs/adrs/118_standalone-controller-owns-durability-and-supervision.md"
-      - "specs/adrs/119_controller-loss-detaches-and-fences-surviving-guardian.md"
-      - "specs/adrs/120_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md"
-      - "specs/adrs/121_retained-native-results-use-application-only-recovery.md"
-      - "specs/adrs/122_owned-root-child-enumeration-is-distinct-native-authority.md"
-      - "specs/adrs/123_exact-root-identity-observation-is-distinct-native-authority.md"
-      - "specs/adrs/124_retained-exact-root-identity-results-use-application-only-recovery.md"
-      - "specs/adrs/125_already-durable-native-sampling-failures-use-explicit-custody-settlement.md"
+      - "specs/adrs/125_qualify-exact-prepared-source114-candidate.md"
+      - "specs/adrs/126_standalone-controller-owns-durability-and-supervision.md"
+      - "specs/adrs/127_controller-loss-detaches-and-fences-surviving-guardian.md"
+      - "specs/adrs/128_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md"
+      - "specs/adrs/129_retained-native-results-use-application-only-recovery.md"
+      - "specs/adrs/130_owned-root-child-enumeration-is-distinct-native-authority.md"
+      - "specs/adrs/131_exact-root-identity-observation-is-distinct-native-authority.md"
+      - "specs/adrs/132_retained-exact-root-identity-results-use-application-only-recovery.md"
+      - "specs/adrs/133_already-durable-native-sampling-failures-use-explicit-custody-settlement.md"
+      - "specs/adrs/134_disposable-launchd-validation-precedes-installer-adoption.md"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/integration/launchd_validation_harness.py"
       - ".github/workflows/deployment-controller-macos.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -40,17 +50,57 @@ concurrency:
   group: deployment-controller-macos-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   native-controller:
     name: native controller (macOS)
-    runs-on: macos-14
+    runs-on: macos-14-xlarge
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
     steps:
+      - name: Verify ARM64 runner
+        run: test "$(uname -m)" = arm64
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact checked-out head
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Verify prepared Source114 artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/actions/artifacts/12122737139 > "${{ runner.temp }}/prepared-artifact.json"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          artifact = json.loads(Path("${{ runner.temp }}/prepared-artifact.json").read_text())
+          assert artifact["id"] == 12122737139
+          assert artifact["name"] == "desktop-preparation-aarch64-apple-darwin-23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
+          assert artifact["size_in_bytes"] == 44634849
+          assert artifact["expired"] is False
+          assert artifact["workflow_run"]["id"] == 39089498019
+          assert artifact["workflow_run"]["head_sha"] == "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
+          assert artifact["workflow_run"]["repository_id"] == 1152151096
+          PY
+      - name: Download metadata-verified prepared Source114 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-preparation-aarch64-apple-darwin-23badb8be4bc8d05a7e1c49c5367ceb14ebccd92
+          path: ${{ runner.temp }}/prepared-source114
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: scottopell/phoenix-ide
+          run-id: 39089498019
+      - name: Validate disposable launchd installer handoff
+        env:
+          PHOENIX_PREPARED_ARTIFACT_ROOT: ${{ runner.temp }}/prepared-source114
+        run: python3 tests/integration/launchd_validation_harness.py
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

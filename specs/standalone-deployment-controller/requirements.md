@@ -673,3 +673,37 @@ SHALL NOT reconstruct the original dispatch ticket or repeat identity observatio
 Deadline expiry after writer ownership or before commit SHALL roll back without policy
 advance. A pre-commit crash MAY repeat live verification; a post-commit crash SHALL use
 acknowledgement-only recovery.
+
+
+## REQ-SDC-023 — Disposable installer validation is structurally pre-disruption
+
+WHEN validating the controller-to-launchd-installer boundary before production adoption
+THE system SHALL generate an owner-private temporary root. Its sole external artifact input
+SHALL pass the exact receipt commit/schema, candidate-byte digest, Developer ID signature,
+hardened-runtime, notarization, stapling, and Gatekeeper checks before candidate execution;
+the candidate's build-identity execution SHALL then complete exact commit/version admission.
+The system SHALL derive its predecessor witness, disposable service label, transaction paths,
+target paths, evidence paths, and health endpoints internally rather
+than accepting production locations or executable fixtures from the caller.
+
+THE boundary SHALL validate one complete closed installer handoff using the same manifest
+loader, exact mode classifier, identity checks, immutable candidate migration registry,
+database-ledger admission, and pre-disruption helper validator used by activation. Candidate
+registry evidence SHALL come from the exact candidate source commit; retained helper evidence
+SHALL come from the distinct clean controller commit. The exact PreparedSource114 handoff SHALL
+use the build-defined transition and health timeout budgets. Missing, extra, malformed,
+source-mismatched, ledger-mismatched, altered-timeout, or plist-to-manifest-inconsistent
+evidence SHALL fail closed before service disruption, and helper validation SHALL leave all
+retained evidence unchanged.
+
+IF validation fails after generating the private root
+THEN the system SHALL remove only that generated root before returning the failure and SHALL
+leave the external prepared artifact unchanged.
+
+A successful validation SHALL return diagnostic evidence only. It SHALL NOT acquire or release
+a production claim, prepare a target publication, reserve migration capacity, stop or start a
+service, create a database backup, write a migration marker, invoke migration, publish an
+artifact or plist, perform health activation, finalize or recover a transaction, signal a
+process, clean production evidence, or authorize guardian replacement. The validation path
+SHALL be unable to construct the service-control, database-mutation, publication, activation,
+cleanup, or guardian-replacement capabilities owned by those operations.

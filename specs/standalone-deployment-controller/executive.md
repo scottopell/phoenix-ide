@@ -19,8 +19,7 @@ tests plus five adapter unit regressions cover supervised-child finalization,
 bounded best-effort teardown, arbitrary-PID mutation rejection, native resource
 measurement, counter regression, and capacity arithmetic. Exact-head full CI
 run `38805004723` and dedicated macOS run `38805004659` pass at commit
-`907ca04670f46c5c2ea9f0b15993a996a83ac911`; no local heavy compilation was
-performed for this source-only slice.
+`907ca04670f46c5c2ea9f0b15993a996a83ac911`.
 
 A controller-owned normalized SQLite store implements atomic checkpoint replacement,
 durable compare-and-swap revisions, strict schema-version admission, affine crash-load
@@ -330,6 +329,7 @@ production adoption remain outside this pre-adoption qualification.
 | REQ-SDC-020 | Linux policy/IPC/SQLite tests and macOS process tests cover exact source-input handshake, gated start, one native sample, original parenthood, runner death after application/before ACK, guardian receipt before a lost ACK response, same-live reconnection, durable confirmation with one issue/application, and pending-begin death/catch-up/two-phase activation without another effect; these pass exact-head macOS/full-CI qualification at `55a90279c54ea30c82f3803d80efd340db319a88`. The preceding test-only launchd three-runner application-death/ACK/reconciliation-activation journey and four launchd-free shape/parser units pass run `39009502330` and full CI `39009503934` at `26692b6daef41ef2ae2c4ca80ae17eb87ed07350`. The extended launchd and added direct-process three-barrier/one-sample-continuation journeys, mode-parser regression, and live-Reconciling admission regression pass macOS run `39012241514` and full CI `39012245789` at `1d6f09bb40cf617a0fdbf13275e6297b8d047702`. The new direct and launchd runner-death-before-application journeys, retained-provenance verifier, and interrupted nonterminal application regressions pass macOS run `39022439278` and full CI `39022440430` at `53c45538b98d25e90d749edf72402b001c7f5510`. The staged two-job launchd-owned runner lifecycle passes macOS run `39027451788` and full CI `39027454259` at `5c8526f561659afa206f5a406c05cffeb4107074`. Additional direct and same-label two-job journeys cover completed-before-application child-list recovery, exact-root natural-exit identity reconciliation, zero-signal readiness, and identity application-before-ACK recovery; they pass exact-head macOS run `39056571889` and full CI run `39056573676` at `9a25ae6154e418bf94bddd6006b86d97b3ebb55f`. Already-durable parked sampling-failure settlement, direct crash/ACK-only coverage, and terminal-confirmed rerun pass macOS run `39081728842` and full CI run `39081728855` at `085c3d95d314531b0bb48dd5440c07b0f56d5533`. Successful-terminal and unapplied-failure settlement, child-list failure settlement, discovered-child adoption, signal mutation, installer/helper integration, guardian replacement, updater, and rollback scenarios remain required. |
 | REQ-SDC-021 | Schema-v7 child-list issue/application/ordered-result-child/ACK evidence, protocol-v10 exact owned-slot admission, bounded result decoding, same-loop application-before-ACK, and immediate-predecessor rejection are implemented. Direct and two-job launchd journeys cover both completed-before-application and application-before-ACK runner death with one enumeration/application/ACK and no successor effect; ACK/application-only recovery remains `Interrupted`. The new completed-before-application journeys pass exact-head macOS run `39056571889` and full CI run `39056573676` at `9a25ae6154e418bf94bddd6006b86d97b3ebb55f`. No arbitrary PID, signal, cleanup mutation, installer, migration, or production path is authorized. |
 | REQ-SDC-022 | Exact-root `ObserveIdentity` uses key/session-only native admission derived from the durable issue and sole PID-plus-birth slot, normalized schema-v7 evidence, same-loop application-before-ACK, original-group finalization, and an already-clean zero-signal deadline transition. Completed-before-application recovery adds protocol-v10 key/session/provenance-only retained-result verification, exactly-once interrupted application, and the existing durable ACK path without re-observation or successor effects. Direct and two-job launchd journeys pass exact-head macOS run `39071653753` and full CI run `39071653757` at `d66f5a5847d8add572fd742c68d25bfef3fde3d1`. Earlier exact-root coverage passes macOS run `39056571889` and full CI run `39056573676` at `9a25ae6154e418bf94bddd6006b86d97b3ebb55f`. |
+| REQ-SDC-023 | A sealed validation-only launchd boundary admits the real signed, notarized, receipt-bound PreparedSource114 candidate from an unchanged external artifact, stages it with an internally derived inert predecessor under a generated private root, materializes candidate registry and independent controller helper from immutable commits, constructs and classifies the complete closed manifest with exact timeout and plist label/program bindings, and invokes the read-only helper validator shared with activation. Failure removes the generated root. The executable harness asserts no claim, service control, backup, migration, publication, activation, or installer cleanup; exact-head hosted qualification is pending. |
 
 ## Next work
 
@@ -369,12 +369,31 @@ same disposable installation owner; it passes exact-head macOS run `39086283270`
 run `39086281970` at `0e89075198623f01c414ebffeaa6fa433e55c562`. Neither journey
 demonstrates application deployment.
 
+A separate sealed launchd validation boundary now exercises the real installer-to-helper
+contract under a generated owner-private root. It admits the real PreparedSource114 candidate
+through receipt/schema, byte-digest, signing, hardened-runtime, notarization, stapling,
+Gatekeeper, and exact build-identity checks, derives an inert predecessor witness, and
+materializes the candidate registry and independent retained helper from their
+immutable commits, generates both plists, constructs the complete PreparedSource114 manifest,
+classifies it with production logic, validates its source114 database ledger, and invokes the
+helper pre-disruption validator shared with activation. The shared validator closes the exact
+PreparedSource114 timeout budgets and plist label/program bindings and is witnessed read-only
+across paths, bytes, modes, and ownership. Failed preparation removes its generated root while
+leaving the downloaded artifact unchanged. The boundary returns diagnostic evidence only and the
+executable harness asserts zero claim, service control, backup, migration, publication, activation,
+or installer cleanup.
+Exact-head hosted qualification is pending.
+
 The remaining replacement gaps are explicit:
 
 - The supported macOS installer remains `dev.py prod deploy --prepared-artifact ...
-  --current-schema-upgrade` and its immutable manifest/retained Python helper. It has no safe
-  disposable-root switch, and the Rust controller does not invoke or replace its signature,
-  claim, ledger, application-DB, migration, publication, health, or forward-recovery authority.
+  --current-schema-upgrade` and its immutable manifest/retained Python helper. The disposable
+  boundary validates preparation but cannot acquire a production claim or activate it, and the
+  Rust controller does not invoke or replace its signature, claim, application-DB mutation,
+  migration, publication, health, or forward-recovery authority.
+- The exact prepared candidate is retained as Actions artifact `12122737139` through
+  2026-11-01. Recurring qualification after that expiry requires durable publication of the same
+  immutable bytes or a newly reviewed exact artifact; name/run substitution is not accepted.
 - Launchd owns both disposable jobs only inside the test fixture. The disposable installation
   selects its bounded recovery/continuation runner stages from durable state, but no production
   controller exclusively owns the production controller store, supervises finite runners, or
@@ -394,14 +413,15 @@ The remaining replacement gaps are explicit:
 The next controller-owned work is successful-terminal and unapplied-failure settlement,
 child-list failure settlement, discovered-child identity acquisition, signal
 mutation, general continuing orchestration, and the remaining process-death matrix. Those
-surfaces must extend REQ-SDC-015–022 and ADR-128/121/122/123/124/125 while preserving ADR-127
+surfaces must extend REQ-SDC-015–022 and ADR-128–133 while preserving ADR-127
 **detach-and-fence**, exact-instance
 recovery, the original absolute deadline, retained results, monotonic reconciliation generations,
 and whole-round signal-result reservation.
 
-Installer and `dev.py` integration remain separately owned. The future boundary may
-invoke only the supported prepared current-schema deploy seam; helper-owned schema,
-ledger, claim, recovery, signature, and source-binding policy remain outside the Rust
-controller. Independent guardian/runtime work does not wait on artifact identity, but
-no helper invocation, native activation, deployment, or production adoption is
-implemented or authorized by this qualification.
+Installer and `dev.py` integration remain separately owned. The validation-only boundary
+loads only the supported exact prepared current-schema handoff and shares the helper's
+pre-disruption validator; helper-owned claim, recovery, application-DB mutation, publication,
+activation, signature, and source-binding policy remain outside the Rust controller.
+Independent guardian/runtime work does not wait on artifact identity, and no native activation,
+deployment, production adoption, or irreversible helper operation is implemented or authorized
+by this qualification.

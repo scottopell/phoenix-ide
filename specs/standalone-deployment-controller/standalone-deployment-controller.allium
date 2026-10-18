@@ -27,6 +27,8 @@
 -- REQ-SDC-019: NativeSameBuildBoundary
 -- REQ-SDC-020: NativeGuardianQualificationBoundary
 -- REQ-SDC-021: NativeDispatchAdmissionBoundary, NativeGuardianPersistenceBoundary, NativeGuardianQualificationBoundary
+-- REQ-SDC-022: NativeDispatchAdmissionBoundary and NativeGuardianPersistenceBoundary
+-- REQ-SDC-023: ReturnDisposableInstallerDiagnosticEvidence, DisposableInstallerValidationBoundary, DisposableInstallerValidation
 
 value ProcessIdentity {
     pid: Integer
@@ -151,6 +153,29 @@ value StatusSummary {
     persistence_revision: Integer
     phase: PersistedControllerPhase
     cleanup_outcome: CleanupResult
+}
+
+value DisposableValidationIdentity {
+    version: String
+    git_sha: String
+}
+
+value DisposableValidationLedgerEntry {
+    version: Integer
+    name: String
+}
+
+value DisposableLaunchdValidationReceipt {
+    transaction_id: String
+    root: String
+    transaction_path: String
+    manifest_path: String
+    candidate_identity: DisposableValidationIdentity
+    rollback_identity: DisposableValidationIdentity
+    controller_source_commit: String
+    controller_helper_sha256: String
+    candidate_registry_sha256: String
+    database_ledger: List<DisposableValidationLedgerEntry>
 }
 
 entity DeploymentAttempt {
@@ -926,10 +951,52 @@ contract NativeRunnerBoundary {
 
     @invariant NoInstallerOrProductionAdoption
         -- The runnable loop is invocable without installer/dev.py orchestration.
-        -- Only disposable resources and harmless work are permitted. There is no
-        -- prepared-helper invocation, production label change, application DB
-        -- mutation, artifact installation, or production activation. Installer,
+        -- Only disposable resources and harmless work are permitted. The native
+        -- runner never invokes a prepared helper, changes a production label, mutates
+        -- an application DB, installs an artifact, or activates production. Installer,
         -- claim, ledger, signature, source-binding, and migration policy stay outside.
+}
+
+rule ReturnDisposableInstallerDiagnosticEvidence {
+    when: DisposableInstallerHandoffValidated(receipt)
+    requires: receipt.controller_source_commit != receipt.candidate_identity.git_sha
+    ensures: DisposableInstallerDiagnosticEvidenceReturned(receipt)
+}
+
+contract DisposableInstallerValidationBoundary {
+    validate: (prepared_artifact: String) -> DisposableLaunchdValidationReceipt
+
+    @invariant PrivateDerivedNamespace
+        -- The boundary generates its owner-private temporary root. Its sole external
+        -- artifact passes receipt/schema, byte digest, signature, hardened-runtime,
+        -- notarization, stapling, and Gatekeeper checks before exact build-identity
+        -- execution. The predecessor witness, service label, paths, handles, endpoints, and
+        -- disposable database are internally derived; no executable fixture or
+        -- production location is accepted from the caller.
+
+    @invariant DiagnosticEvidenceOnly
+        -- The boundary loads the exact closed manifest and invokes the same helper
+        -- pre-disruption validator used by activation. The returned receipt contains
+        -- only diagnostic transaction identifiers, paths, identities, source/digest
+        -- bindings, and ledger entries. Its values cannot construct claim,
+        -- service-control, database-mutation, publication, activation, cleanup,
+        -- signal, or guardian-replacement authority.
+
+    @invariant CandidateAndControllerSourcesRemainDistinct
+        -- Candidate registry evidence is materialized from the exact candidate commit.
+        -- Retained helper evidence is materialized from the distinct clean controller
+        -- commit; working-tree bytes and generic schema maxima cannot substitute.
+
+    @invariant ClosedReadOnlyHandoff
+        -- PreparedSource114 uses the build-defined transition and health budgets.
+        -- Missing, extra, malformed, source-mismatched, ledger-mismatched,
+        -- altered-timeout, or plist-to-manifest-inconsistent evidence fails before
+        -- service disruption. Shared helper
+        -- validation leaves every retained evidence path, byte, mode, and owner unchanged.
+
+    @invariant FailedPreparationIsDisposable
+        -- Any failure after private-root creation removes only that generated root.
+        -- The external prepared artifact retains its bytes, type, mode, and ownership.
 }
 
 contract NativeGuardianIpcBoundary {
@@ -1338,4 +1405,24 @@ surface DisposableNativeGuardianRunner {
         binding.minimum_dispatch_revision
         binding.reconciliation_floor
         binding.latest_reconciliation_revision
+}
+
+
+surface DisposableInstallerValidation {
+    contracts:
+        demands DisposableInstallerValidationBoundary
+    context receipt: DisposableLaunchdValidationReceipt
+    exposes:
+        receipt.transaction_id
+        receipt.root
+        receipt.transaction_path
+        receipt.manifest_path
+        receipt.candidate_identity
+        receipt.rollback_identity
+        receipt.controller_source_commit
+        receipt.controller_helper_sha256
+        receipt.candidate_registry_sha256
+        receipt.database_ledger
+    provides:
+        DisposableInstallerHandoffValidated(receipt)
 }
