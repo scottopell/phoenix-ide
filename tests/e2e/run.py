@@ -1255,12 +1255,13 @@ def scenario_public_literal_chat(base_url: str) -> None:
         }
         accepted = _post_public_literal_chat(base_url, conv_id, smoke, expected_receiver_sha)
         assert accepted.status_code == 200 and accepted.json().get("steering", False) is False, accepted.text
+        smoke_id = f"{conv_id}:{smoke['message_id']}"
         materialized = _poll_to_idle_with_messages(
             base_url, conv_id,
-            lambda messages: any(m.get("message_id") == smoke["message_id"] for m in _user_messages(messages)),
+            lambda messages: any(m.get("message_id") == smoke_id for m in _user_messages(messages)),
             "harmless literal smoke materialization", timeout=SCENARIO_TIMEOUT_SECONDS,
         )
-        smoke_messages = [m for m in _user_messages(materialized["messages"]) if m.get("message_id") == smoke["message_id"]]
+        smoke_messages = [m for m in _user_messages(materialized["messages"]) if m.get("message_id") == smoke_id]
         assert len(smoke_messages) == 1 and smoke_messages[0]["content"]["text"] == smoke["text"], smoke_messages
         text = "/spears @Cargo.toml @file:missing @someone\n  café exact bytes  \n[[scenario:plain_text]]"
         body = {
@@ -1277,14 +1278,16 @@ def scenario_public_literal_chat(base_url: str) -> None:
         assert response.json().get("queued") is True
         assert response.json().get("steering", False) is running, response.json()
 
+        materialized_id = body["message_id"] if running else f"{conv_id}:{body['message_id']}"
+
         def has_literal(messages: list[dict]) -> bool:
-            return any(m.get("message_id") == body["message_id"] for m in _user_messages(messages))
+            return any(m.get("message_id") == materialized_id for m in _user_messages(messages))
 
         final = _poll_to_idle_with_messages(
             base_url, conv_id, has_literal, "literal message materialization",
             timeout=SCENARIO_TIMEOUT_SECONDS,
         )
-        matches = [m for m in _user_messages(final["messages"]) if m.get("message_id") == body["message_id"]]
+        matches = [m for m in _user_messages(final["messages"]) if m.get("message_id") == materialized_id]
         assert len(matches) == 1, f"literal message was not materialized once: {matches!r}"
         assert matches[0]["content"]["text"] == text, matches[0]
         assert not matches[0]["content"].get("llm_text"), "unexpected expansion overlay"
@@ -2151,6 +2154,77 @@ class StreamReadinessTests(unittest.TestCase):
 
 
 class PublicLiteralChatPreflightTests(unittest.TestCase):
+    def test_scenario_matches_exact_materialized_ids_and_retries_original_client_ids(self):
+        submitted = {}
+        last_post = {}
+        polls = []
+        retries = []
+
+        def post(base_url, conv_id, body, expected_receiver_sha):
+            self.assertEqual(expected_receiver_sha, "a" * 40)
+            key = (conv_id, body["message_id"])
+            snapshot = json.loads(json.dumps(body))
+            last_post[conv_id] = snapshot
+            if key in submitted:
+                self.assertEqual(body, submitted[key])
+                retries.append(key)
+                return httpx.Response(200, json={"queued": True, "already_persisted": True})
+            submitted[key] = snapshot
+            return httpx.Response(200, json={"queued": True})
+
+        def queue(base_url, conv_id, body, expected_receiver_sha):
+            post(base_url, conv_id, body, expected_receiver_sha)
+            return httpx.Response(200, json={"queued": True, "steering": True})
+
+        def poll(base_url, conv_id, predicate, description, **kwargs):
+            body = last_post[conv_id]
+            client_id = body["message_id"]
+            steering = conv_id == "running-conv" and description == "literal message materialization"
+            expected_id = client_id if steering else f"{conv_id}:{client_id}"
+
+            def message(message_id, message_type="user", text="wrong message"):
+                return {"message_id": message_id, "message_type": message_type, "content": {"text": text}}
+
+            decoys = [
+                message(f"other-conv:{client_id}"),
+                message(f"prefix:{expected_id}"),
+                message(expected_id, "agent"),
+                message(f"{conv_id}:{client_id}" if steering else client_id),
+            ]
+            self.assertFalse(predicate(decoys), description)
+            messages = [*decoys, message(expected_id, text=body["text"])]
+            self.assertTrue(predicate(messages), description)
+            polls.append((conv_id, expected_id))
+            return {"messages": messages}
+
+        conflict = httpx.Response(409, json={"error_type": "idempotency_conflict"})
+        with mock.patch.dict(globals(), {
+            "_new_conv_and_stream": mock.Mock(side_effect=["idle-conv", "running-conv"]),
+            "_post_public_literal_chat": post,
+            "_queue_literal_behind_gated_turn": mock.Mock(side_effect=queue),
+            "_poll_to_idle_with_messages": poll,
+        }), mock.patch("subprocess.run", side_effect=[
+            mock.Mock(stdout="a" * 40), mock.Mock(stdout=""),
+        ]), mock.patch("uuid.uuid4", side_effect=["smoke-idle", "literal-idle", "smoke-running", "literal-running"]), \
+                mock.patch("httpx.post", return_value=conflict) as changed_policy:
+            scenario_public_literal_chat("http://local.test")
+
+        self.assertEqual(polls, [
+            ("idle-conv", "idle-conv:smoke-idle"),
+            ("idle-conv", "idle-conv:literal-idle"),
+            ("running-conv", "running-conv:smoke-running"),
+            ("running-conv", "literal-running"),
+        ])
+        self.assertEqual(len(submitted), 4)
+        self.assertEqual(retries, [("idle-conv", "literal-idle"), ("running-conv", "literal-running")])
+        self.assertEqual(changed_policy.call_count, 2)
+        for call, (conv_id, client_id) in zip(changed_policy.call_args_list, [
+            ("idle-conv", "literal-idle"), ("running-conv", "literal-running"),
+        ]):
+            body = call.kwargs["json"]
+            self.assertEqual(body, {**submitted[(conv_id, client_id)], "expansion_policy": "expand_references"})
+            self.assertEqual(call.args[0], f"http://local.test/api/conversations/{conv_id}/chat")
+
     def test_running_literal_subscribes_before_post_and_consumes_live_queue_event(self):
         order = []
         body = {"message_id": "literal-id", "text": "/spears @missing\n café  \n", "expansion_policy": "literal_text"}
@@ -2159,6 +2233,9 @@ class PublicLiteralChatPreflightTests(unittest.TestCase):
             order.append("init")
             yield mock.Mock(event="init", data="{}")
             self.assertEqual(order, ["init", "post"])
+            yield mock.Mock(event="steer_message_queued", data=json.dumps({"message": {
+                "message_id": f"conv:{body['message_id']}", "text": "wrong namespaced queue entry",
+            }}))
             order.append("queue")
             yield mock.Mock(event="steer_message_queued", data=json.dumps({"message": {
                 "message_id": body["message_id"], "text": body["text"], "origin": {"kind": "user_api"},

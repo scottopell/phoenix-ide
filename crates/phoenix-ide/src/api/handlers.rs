@@ -18172,10 +18172,19 @@ mod chat_authority_tests {
             });
             let response = public_chat_post(&state, id, &body).await;
             assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(literal_chat_body(response).await["steering"], running);
+            let response_body = literal_chat_body(response).await;
+            assert_eq!(
+                response_body,
+                if running {
+                    serde_json::json!({"queued": true, "steering": true})
+                } else {
+                    serde_json::json!({"queued": true})
+                }
+            );
             if running {
                 let queue = state.db.get_steering_queue(id).await.unwrap();
                 assert_eq!(queue.len(), 1);
+                assert_eq!(queue[0].message_id, "literal-message");
                 assert_eq!(queue[0].text, text);
                 assert!(queue[0].llm_text.is_none());
                 assert!(queue[0].skill_invocation.is_none());
@@ -18197,6 +18206,7 @@ mod chat_authority_tests {
                     .expect("accepted direct turn");
                 let payload =
                     PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+                assert_eq!(payload.message_id(), "literal-message");
                 assert_eq!(payload.delivery.text, text);
                 assert!(payload.delivery.llm_text.is_none());
                 assert!(payload.delivery.skill_invocation.is_none());
@@ -18365,17 +18375,38 @@ mod chat_authority_tests {
     #[tokio::test]
     async fn public_chat_default_still_expands_and_rejects_unknown_policy() {
         let state = make_state().await;
+        let cwd = tempfile::tempdir().unwrap();
         state
             .db
-            .create_conversation("expand", "expand", "/tmp", true, None, None)
+            .create_conversation(
+                "expand",
+                "expand",
+                cwd.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
             .await
             .unwrap();
-        let mut body =
-            serde_json::json!({"text": "@nonexistent-literal-chat-file", "message_id": "m"});
-        let response = public_chat_post(&state, "expand", &body).await;
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        for policy in ["generated_predecessor_context", "unknown"] {
-            body["expansion_policy"] = serde_json::json!(policy);
+        for policy in [None, Some("expand_references")] {
+            let mut body = serde_json::json!({"text": "@nonexistent-literal-chat-file.txt", "message_id": "m"});
+            if let Some(policy) = policy {
+                body["expansion_policy"] = serde_json::json!(policy);
+            }
+            let response = public_chat_post(&state, "expand", &body).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let error = literal_chat_body(response).await;
+            assert_eq!(error["error_type"], "file_not_found");
+            assert_eq!(error["reference"], "@nonexistent-literal-chat-file.txt");
+        }
+        let mut body = serde_json::json!({"text": "plain text", "message_id": "m"});
+        for policy in [
+            serde_json::json!("generated_predecessor_context"),
+            serde_json::json!("unknown"),
+            serde_json::Value::Null,
+            serde_json::json!(1),
+        ] {
+            body["expansion_policy"] = policy;
             assert_eq!(
                 public_chat_post(&state, "expand", &body).await.status(),
                 StatusCode::UNPROCESSABLE_ENTITY
