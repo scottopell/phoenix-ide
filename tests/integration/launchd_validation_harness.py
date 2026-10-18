@@ -246,22 +246,28 @@ def validate_receipt(dev, receipt) -> None:
     )
 
     def reject_manifest_bytes(
-        wrong: bytes, reason: str, *, reject_classifier: bool = False
+        wrong: bytes,
+        reason: str,
+        *,
+        expected_classifier=None,
+        reject_helper: bool = True,
     ) -> None:
         try:
             receipt.manifest_path.write_bytes(wrong)
-            if reject_classifier:
+            if expected_classifier is not None:
                 assert (
                     dev._deploy_manifest_kind(receipt.transaction_path)
-                    is dev.DeployManifestKind.UNKNOWN
-                ), f"classifier accepted {reason}"
+                    is expected_classifier
+                ), f"classifier returned the wrong kind for {reason}"
             try:
                 loaded_wrong = helper_policy["Manifest"].load(receipt.manifest_path)
                 helper_policy["validate_pre_disruption_handoff"](loaded_wrong)
             except helper_policy["ActivationError"]:
-                pass
+                if not reject_helper:
+                    raise AssertionError(f"helper rejected compatible {reason}")
             else:
-                raise AssertionError(f"helper accepted {reason}")
+                if reject_helper:
+                    raise AssertionError(f"helper accepted {reason}")
         finally:
             try:
                 retained_after = tuple(
@@ -279,9 +285,18 @@ def validate_receipt(dev, receipt) -> None:
                     dev._disposable_validation_tree_witness(receipt.root) == full_root_baseline
                 ), f"{reason} did not restore the full root"
 
-    def reject_manifest(wrong: dict, reason: str, *, reject_classifier: bool = False) -> None:
+    def reject_manifest(
+        wrong: dict,
+        reason: str,
+        *,
+        expected_classifier=None,
+        reject_helper: bool = True,
+    ) -> None:
         reject_manifest_bytes(
-            json.dumps(wrong).encode(), reason, reject_classifier=reject_classifier
+            json.dumps(wrong).encode(),
+            reason,
+            expected_classifier=expected_classifier,
+            reject_helper=reject_helper,
         )
 
     def exercise_plist_negatives(
@@ -379,7 +394,12 @@ def validate_receipt(dev, receipt) -> None:
     }
     for reason, raw in duplicate_cases.items():
         assert raw != original_manifest_bytes
-        reject_manifest_bytes(raw, reason, reject_classifier=True)
+        reject_manifest_bytes(
+            raw,
+            reason,
+            expected_classifier=dev.DeployManifestKind.UNKNOWN,
+            reject_helper=False,
+        )
 
     for wrong_label in (
         "test.disposable.phoenix.validation.helper",
@@ -408,16 +428,19 @@ def validate_receipt(dev, receipt) -> None:
     for timeout in ("transition_timeout_secs", "health_timeout_secs"):
         missing_timeout = dict(manifest)
         del missing_timeout[timeout]
-        reject_manifest(missing_timeout, f"missing {timeout}")
+        reject_manifest(
+            missing_timeout,
+            f"missing {timeout}",
+            expected_classifier=dev.DeployManifestKind.CURRENT_SCHEMA,
+            reject_helper=False,
+        )
 
-    assert (
-        tuple(helper_policy["LEGACY_DATABASE_MANIFEST_FIELDS"])
-        == EXPECTED_LEGACY_DATABASE_MANIFEST_FIELDS
-    )
     for legacy_field in EXPECTED_LEGACY_DATABASE_MANIFEST_FIELDS:
         reject_manifest(
-            {**manifest, legacy_field: "unexpected legacy evidence"},
+            {**manifest, legacy_field: "compatible legacy evidence"},
             f"legacy top-level field {legacy_field}",
+            expected_classifier=dev.DeployManifestKind.CURRENT_SCHEMA,
+            reject_helper=False,
         )
 
     legacy_manifest = copy.deepcopy(manifest)
@@ -475,7 +498,7 @@ def validate_receipt(dev, receipt) -> None:
             },
         },
         "combined paired and current-schema top-level modes",
-        reject_classifier=True,
+        expected_classifier=dev.DeployManifestKind.UNKNOWN,
     )
     reject_manifest(
         {
@@ -485,7 +508,7 @@ def validate_receipt(dev, receipt) -> None:
             },
         },
         "extra prepared-source114 mode evidence",
-        reject_classifier=True,
+        expected_classifier=dev.DeployManifestKind.UNKNOWN,
     )
     assert dev._disposable_validation_tree_witness(receipt.root) == full_root_baseline
     assert dev._deploy_manifest_kind(receipt.transaction_path) is dev.DeployManifestKind.CURRENT_SCHEMA

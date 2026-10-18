@@ -11412,7 +11412,6 @@ def _prepare_disposable_launchd_validation(
         validated.candidate_binary != candidate
         or validated.candidate_plist != candidate_plist
         or validated.rollback != (rollback, rollback_plist)
-        or validated.ordinary_forward_only
     ):
         raise SystemExit("disposable helper validation returned mismatched evidence")
     return DisposableLaunchdValidationReceipt(

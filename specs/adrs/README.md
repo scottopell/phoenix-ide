@@ -140,6 +140,15 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
 | [128](128_repair-failure-stopped-truth-includes-persistence.md) | Repair failure stopped truth includes persistent auto-start absence | Accepted | REQ-LDD-025 |
+| [129](129_standalone-controller-owns-durability-and-supervision.md) | The standalone deployment controller owns durability and child supervision | Accepted | REQ-SDC-001, REQ-SDC-003–012; `DeploymentAttempt`, `AttemptStore`, `SupervisedChild` |
+| [130](130_controller-loss-detaches-and-fences-surviving-guardian.md) | Controller loss detaches and fences the surviving guardian | Accepted | REQ-SDC-008, REQ-SDC-012; `GuardianBinding`, `SurvivingGuardianBoundary` |
+| [131](131_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md) | Native guardian IPC and runner are same-build pre-adoption surfaces | Accepted | REQ-SDC-011–020; `DisposableNativeGuardianRunner` and native IPC, admission, persistence, reconnect, and qualification contracts |
+| [132](132_retained-native-results-use-application-only-recovery.md) | Retained native results use application-only recovery | Accepted | REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–020; completed-but-unapplied native sampling recovery |
+| [133](133_owned-root-child-enumeration-is-distinct-native-authority.md) | Owned-root child enumeration is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–021; native `ListChildren`, schema v6, protocol v6 |
+| [134](134_exact-root-identity-observation-is-distinct-native-authority.md) | Exact-root identity observation is distinct native authority | Accepted | REQ-SDC-011, REQ-SDC-013, REQ-SDC-015, REQ-SDC-017–022; native `ObserveIdentity`, schema v7, protocol v8 |
+| [135](135_retained-exact-root-identity-results-use-application-only-recovery.md) | Retained exact-root identity results use application-only recovery | Accepted | REQ-SDC-018, REQ-SDC-022; completed-before-application native `ObserveIdentity`, schema v7, protocol v9 |
+| [136](136_already-durable-native-sampling-failures-use-explicit-custody-settlement.md) | Already-durable native sampling failures use explicit custody settlement | Accepted | REQ-SDC-018–020; native sampling failure custody, schema v8, protocol v10 |
+| [137](137_disposable-launchd-validation-precedes-installer-adoption.md) | Disposable launchd validation precedes installer adoption | Accepted | REQ-SDC-023; exact PreparedSource114 handoff validation without activation authority |
 | [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
 | [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
 | [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
@@ -207,6 +216,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Repairing protected packaging for the exact ARM forward-replacement candidate | 127; fixed candidate, separate controller, no generic selection or compatibility expansion |
 | Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
 | Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
+| Specifying standalone controller durability, surviving guardian custody, native runner IPC, owned-root child enumeration, exact-root identity observation, retained-result application recovery, failed-result custody settlement, or disposable installer validation | 125, 129, 130, 131, 132, 133, 134, 135, 136, 137; 034 for compatibility limits |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
@@ -264,6 +274,15 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │           └── ADR-065 (Release candidates share the stable artifact path)
       │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
       │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
+      │   └── ADR-129 (Standalone controller owns durability and child supervision)
+      │       └── ADR-130 (Controller loss detaches and fences the surviving guardian)
+      │           └── ADR-131 (Same-build pre-adoption native guardian IPC and runner)
+      │               ├── ADR-132 (Retained native results use application-only recovery)
+      │               │   ├── ADR-133 (Owned-root child enumeration is distinct native authority)
+      │               │   │   └── ADR-134 (Exact-root identity observation is distinct native authority)
+      │               │   │       └── ADR-135 (Retained exact-root identity results use application-only recovery)
+      │               │   └── ADR-136 (Already-durable native sampling failures use explicit custody settlement)
+      │               └── ADR-137 (Disposable validation; also extends exact PreparedSource114 ADR-125)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)
