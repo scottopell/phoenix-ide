@@ -33,7 +33,8 @@ pub(crate) async fn allocate_slug_tx(
         let occupied: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1 AND id <> ?2)
                  OR EXISTS(SELECT 1 FROM conversations WHERE id = ?1)
-                 OR EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1)",
+                 OR EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1)
+                 OR EXISTS(SELECT 1 FROM product_creation_jobs WHERE product_conversation_id = ?1)",
         )
         .bind(&candidate)
         .bind(transcript_id)
@@ -206,11 +207,13 @@ mod tests {
             .unwrap();
         sqlx::raw_sql(
             "CREATE TABLE product_conversations(id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+             CREATE TABLE product_creation_jobs(product_conversation_id TEXT PRIMARY KEY);
              CREATE TABLE conversations(id TEXT PRIMARY KEY, product_conversation_id TEXT, slug TEXT UNIQUE,
                  title TEXT, chain_name TEXT, parent_conversation_id TEXT, continued_in_conv_id TEXT,
                  user_initiated INTEGER, runtime_role TEXT, created_at TEXT);
              CREATE TABLE messages(message_id TEXT PRIMARY KEY, conversation_id TEXT REFERENCES conversations(id), content TEXT);
              INSERT INTO product_conversations VALUES ('p-a','ordinary'),('p-b','ordinary'),('p-c','ordinary'),('p-d','ordinary');
+             INSERT INTO product_creation_jobs VALUES ('slug-fallback');
              INSERT INTO conversations VALUES
                  ('a','p-a','old-a','Hidden','Shared Name',NULL,'a-next',1,'user','1'),
                  ('a-next','p-a','part-2','Part 2',NULL,NULL,NULL,1,'user','2'),
@@ -233,7 +236,7 @@ mod tests {
             vec![
                 ("a".into(), "Shared Name".into(), "shared-name".into()),
                 ("b".into(), "Shared Name".into(), "shared-name-2".into()),
-                ("c".into(), "slug-fallback".into(), "slug-fallback".into()),
+                ("c".into(), "slug-fallback".into(), "slug-fallback-2".into()),
                 ("d".into(), "Conversation".into(), "conversation".into()),
             ]
         );

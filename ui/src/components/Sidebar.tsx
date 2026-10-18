@@ -357,7 +357,7 @@ export function Sidebar({
     } catch (err) {
       setProductRenameError(err instanceof Error ? err.message : 'Failed to rename');
     }
-  }, [productRenameTarget, onConversationCreated, location, navigate]);
+  }, [productRenameTarget, onConversationCreated, navigate]);
 
   const handleGenerateRename = useCallback(async () => {
     if (!renameTarget) return;

@@ -3309,6 +3309,101 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn pending_product_identity_is_reserved_from_conversation_routes_until_publication() {
+        let db = Database::open_in_memory().await.unwrap();
+        let existing = db
+            .create_conversation("existing-route", "existing", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let accepted = db
+            .accept_product_creation("reserved-route", &intent("/tmp", "reserve route"))
+            .await
+            .unwrap();
+        let ProductCreationAcceptOutcome::Accepted(accepted) = accepted else {
+            panic!("new creation should be accepted");
+        };
+        let reserved_slug = accepted.product_conversation_id.to_string();
+
+        db.rename_conversation(&existing.id, &reserved_slug)
+            .await
+            .unwrap();
+        let renamed = db.get_conversation(&existing.id).await.unwrap();
+        let expected_existing_slug = format!("{reserved_slug}-2");
+        assert_eq!(renamed.title.as_deref(), Some(reserved_slug.as_str()));
+        assert_eq!(
+            renamed.slug.as_deref(),
+            Some(expected_existing_slug.as_str())
+        );
+
+        let claimed = db
+            .claim_product_creation(
+                "reserved-route",
+                "worker",
+                "token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        advance_to_metadata(&db, "reserved-route", &claimed.claim).await;
+        let scope = WorkScopeId::new();
+        let published = db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "reserved-route".to_string(),
+                claim: claimed.claim,
+                conversation: published_conversation(
+                    "reserved-conversation",
+                    accepted.product_conversation_id.clone(),
+                    scope.clone(),
+                    "/tmp",
+                ),
+                authority_kind: AuthorityKind::Direct,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: "/tmp".to_string(),
+                },
+                git_publication: None,
+            })
+            .await
+            .unwrap();
+        assert!(published);
+
+        let existing_after = db.get_conversation(&existing.id).await.unwrap();
+        assert_eq!(
+            existing_after.slug.as_deref(),
+            Some(expected_existing_slug.as_str())
+        );
+        assert_eq!(
+            db.resolve_ordinary_product_conversation(&expected_existing_slug)
+                .await
+                .unwrap()
+                .product_conversation_id,
+            existing.product_conversation_id
+        );
+        assert_eq!(
+            db.resolve_ordinary_product_conversation(&reserved_slug)
+                .await
+                .unwrap()
+                .product_conversation_id,
+            accepted.product_conversation_id
+        );
+        let owner: (String, String) = sqlx::query_as(
+            "SELECT product_conversation_id, work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
+        )
+        .bind(accepted.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            owner,
+            (
+                accepted.product_conversation_id.to_string(),
+                scope.to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn publication_requires_metadata_predecessor_and_monotonic_stage_timestamp() {
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("stage-publish", &intent("/repo/direct", "inspect"))

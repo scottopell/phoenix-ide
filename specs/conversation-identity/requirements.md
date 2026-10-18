@@ -26,7 +26,7 @@ WHEN a ProductConversation name is created or changed, THE SYSTEM SHALL atomical
 
 THE SYSTEM SHALL derive a lowercase hyphen-separated projection from the name's Unicode letters and numbers, use `conversation` if there are no such characters, and resolve collisions with the first available candidate among the base, `base-2`, `base-3`, and subsequent integer suffixes.
 
-THE SYSTEM SHALL allocate against the shared namespace of all transcript slugs and all actual transcript and ProductConversation IDs, without imposing a UUID-shaped-name prohibition or using shortened IDs.
+THE SYSTEM SHALL allocate against the shared namespace of all transcript slugs and all actual transcript and ProductConversation IDs, including durably reserved creation identities, without imposing a UUID-shaped-name prohibition or using shortened IDs.
 
 THE SYSTEM SHALL serialize allocation and mutation in the same database write transaction, so concurrent names cannot reserve the same projection or expose a new name with an old projection.
 
