@@ -16,7 +16,9 @@ config {
     current_repair_quarantine_attempts: Integer = 8
     current_repair_plist_evidence_max_bytes: Integer = 1_048_576
     current_repair_quarantine_max_entries: Integer = 128
-    current_repair_quarantine_max_total_bytes: Integer = 8_388_608
+    current_repair_quarantine_max_total_bytes: Integer = 33_554_432
+    current_repair_quarantine_headroom_entries: Integer = 18
+    current_repair_quarantine_headroom_bytes: Integer = 18_874_368
     current_schema_evidence_budget_bytes: Integer = 2_097_152
     current_schema_max_proof_bytes: Integer = 1_048_576
 }
@@ -1627,6 +1629,10 @@ entity CurrentSchemaRepair {
 --   committed/pending parent with target128 commit proof and exact parent claim.
 --   The exact original/repair pair is solely the pin table there; no other pair
 --   can be inferred from ancestry, version equality or unchanged registry bytes.
+-- current_repair_failure_route_valid(repair) -> Boolean
+--   Before any failure teardown, the parent service label is the fixed Phoenix label
+--   and its target plist is exactly that label's canonical owning-user LaunchAgents
+--   path. Mutable child or parent evidence cannot redirect stop or quarantine.
 -- current_repair_inputs_qualified(repair) -> Boolean
 --   Exact REQ-COMP-015 repair candidate/version/git-object registry and original
 --   target128; accepted prepared receipt/signing evidence; separately clean full
@@ -1647,7 +1653,10 @@ entity CurrentSchemaRepair {
 --   capacity plus protected floor/evidence allowance. After full sealed-child
 --   validation, a persistent target plist and every retained quarantine are absent
 --   or byte-exact sealed repair input. Admission enforces current_repair_quarantine_max_entries
---   during enumeration and current_repair_quarantine_max_total_bytes during each pass.
+--   during enumeration and current_repair_quarantine_max_total_bytes during each pass,
+--   while reserving current_repair_quarantine_headroom_entries and
+--   current_repair_quarantine_headroom_bytes for both publication retirements and both
+--   bounded settlement passes. A failure-state retry may consume that reserved capacity.
 --   Reads use non-following nonblocking descriptors, enforce
 --   current_repair_plist_evidence_max_bytes, and require stable file identity, type,
 --   size and change metadata for the complete read, recheck pathname-to-descriptor
@@ -1852,7 +1861,8 @@ rule FailCurrentRepairStopUnconfirmed {
     @guidance
         -- Use bounded quarantine and fsync passes without reading or deleting evidence
         -- before stop, then repeat after stop and reconfirm exact process absence before
-        -- reporting persistent auto-start absence. Exhaustion with a live target or
+        -- reporting persistent auto-start absence. The final probe is authoritative even
+        -- when an earlier stop or probe was ambiguous. Exhaustion with a live target or
         -- process reappearance selects stop_unconfirmed. Resume only
         -- after sealed-child validation and separately authenticates every retained
         -- quarantine through bounded stable descriptor reads.

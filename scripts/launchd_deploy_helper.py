@@ -101,10 +101,15 @@ CURRENT_REPAIR_VERSION = "0.13.0-rc.4"
 CURRENT_REPAIR_REGISTRY_SHA256 = PREPARED_SOURCE114_REGISTRY_SHA256
 CURRENT_REPAIR_DIRECTORY = "current-schema-repair"
 CURRENT_REPAIR_RUNTIME_FENCE_SHA256 = hashlib.sha256(b"").hexdigest()
+CURRENT_REPAIR_SERVICE_LABEL = "com.phoenix-ide.server"
 CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES = 1024 * 1024
 CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES = 128
-CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 CURRENT_REPAIR_QUARANTINE_ATTEMPTS = 8
+CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES = 2 + 2 * CURRENT_REPAIR_QUARANTINE_ATTEMPTS
+CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES = (
+    CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES * CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3162,11 +3167,20 @@ def _current_repair_directory_token(parent: Manifest) -> tuple[int, ...]:
     )
 
 
-def _current_repair_persistence_owned(repair: CurrentSchemaRepairManifest, parent: Manifest) -> bool:
+def _current_repair_persistence_owned(
+    repair: CurrentSchemaRepairManifest,
+    parent: Manifest,
+    *,
+    reserve_attempt_headroom: bool = True,
+) -> bool:
     try:
         target = Path(parent.target_plist)
         directory_token = _current_repair_directory_token(parent)
         quarantines = _current_repair_quarantines(parent)
+        reserved_entries = CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES if reserve_attempt_headroom else 0
+        reserved_bytes = CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES if reserve_attempt_headroom else 0
+        if len(quarantines) > CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES - reserved_entries:
+            return False
         quarantine_tokens: dict[Path, CurrentRepairFileToken] = {}
         target_token: CurrentRepairFileToken | None = None
         for _pass in range(2):
@@ -3177,7 +3191,7 @@ def _current_repair_persistence_owned(repair: CurrentSchemaRepairManifest, paren
                 if evidence is None or evidence[0] != repair.plist_sha256:
                     return False
                 total_bytes += evidence[1].size
-                if total_bytes > CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES:
+                if total_bytes > CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES - reserved_bytes:
                     return False
                 pass_tokens[item] = evidence[1]
             if _current_repair_quarantines(parent) != quarantines:
@@ -3241,11 +3255,11 @@ def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Laun
     except Exception:
         stopped = False
     persistence_fenced = _quarantine_current_repair_persistence(parent)
-    if stopped:
-        try:
-            require_launchd_absence(parent.label, parent.uid)
-        except Exception:
-            stopped = False
+    try:
+        require_launchd_absence(parent.label, parent.uid)
+        stopped = True
+    except Exception:
+        stopped = False
     truth = "failed_stopped" if stopped and persistence_fenced else "stop_unconfirmed"
     print(
         f"current-schema repair teardown: {truth}; persistent auto-start "
@@ -3264,6 +3278,12 @@ def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Laun
     _write_repair_status(path, failed)
 
 
+def _require_current_repair_persistent_route(parent: Manifest) -> None:
+    expected = Path.home() / "Library" / "LaunchAgents" / f"{CURRENT_REPAIR_SERVICE_LABEL}.plist"
+    if parent.label != CURRENT_REPAIR_SERVICE_LABEL or Path(parent.target_plist) != expected:
+        raise ActivationError("repair parent persistent route differs from the canonical launchd target")
+
+
 def _current_repair_routing(path: Path) -> tuple[CurrentSchemaRepairManifest, Manifest]:
     repair = CurrentSchemaRepairManifest.load(path)
     parent_path = Path(repair.parent_manifest_path)
@@ -3271,6 +3291,7 @@ def _current_repair_routing(path: Path) -> tuple[CurrentSchemaRepairManifest, Ma
     verify_staged(str(parent_path), repair.parent_manifest_sha256, "original repair parent manifest")
     parent = Manifest.load(parent_path)
     validate_manifest_identities(parent)
+    _require_current_repair_persistent_route(parent)
     if (parent.helper_label != f"{DEPLOY_HELPER_LABEL_PREFIX}.{parent.transaction_id}" or parent.uid != os.getuid()
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", parent.transaction_id)
             or not re.fullmatch(r"[A-Za-z0-9._-]+", parent.label)
@@ -3303,7 +3324,9 @@ def activate_current_repair(path: Path) -> str:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another operation owns current-schema repair") from exc
         try:
-            repair, parent, status = validate_current_repair(path)
+            validated_repair, validated_parent, status = validate_current_repair(path)
+            _require_current_repair_persistent_route(validated_parent)
+            repair, parent = validated_repair, validated_parent
         except Exception:
             # Only the original owner can authorize teardown using hash-bound routing.
             _require_current_repair_claim(parent)
@@ -3315,7 +3338,12 @@ def activate_current_repair(path: Path) -> str:
         terminal = status.state == "committed" and not status.finalization_pending
         try:
             require_launchd_absence(parent.helper_label, parent.uid)
-            if not terminal and not _current_repair_persistence_owned(repair, parent):
+            reserve_attempt_headroom = status.state not in {"failed_stopped", "stop_unconfirmed"}
+            if not terminal and not _current_repair_persistence_owned(
+                repair,
+                parent,
+                reserve_attempt_headroom=reserve_attempt_headroom,
+            ):
                 raise ActivationError("persistent target plist is not absent or the exact sealed repair plist")
             pending_running = False
             if status.state == "committed" and status.finalization_pending:

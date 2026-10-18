@@ -3152,6 +3152,16 @@ class CurrentSchemaRepairTests(unittest.TestCase):
         self.launchctl = mock.Mock()
         self.launchctl.stop.side_effect = lambda: self.events.append("stop")
         self.launchctl.start.side_effect = lambda *a, **kw: self.events.append(("start", kw["plist_path"]))
+        expected_label = self.parent.label
+        expected_target_plist = Path(self.parent.target_plist)
+
+        def require_persistent_route(parent):
+            if parent.label != expected_label or Path(parent.target_plist) != expected_target_plist:
+                raise helper.ActivationError("repair parent persistent route differs from the sealed route")
+
+        stack.enter_context(
+            mock.patch.object(helper, "_require_current_repair_persistent_route", side_effect=require_persistent_route)
+        )
         stack.enter_context(mock.patch.object(helper, "__file__", str(self.path.parent / "helper.py")))
         stack.enter_context(mock.patch.object(helper, "Launchctl", return_value=self.launchctl))
         stack.enter_context(mock.patch.object(helper, "assert_database_exclusive", side_effect=lambda p: self.events.append("exclusive")))
@@ -3524,6 +3534,22 @@ class CurrentSchemaRepairTests(unittest.TestCase):
         self.assertEqual(self.status().state, "stop_unconfirmed")
         self.assertTrue(Path(self.parent.active_path).exists())
 
+    def test_final_process_absence_probe_overrides_transient_first_probe(self):
+        self.sealed()
+        self.environment()
+        absence_checks = [0]
+
+        def require_absence(*_args):
+            absence_checks[0] += 1
+            if absence_checks[0] == 1:
+                raise helper.ActivationError("transient absence probe failure")
+
+        with mock.patch.object(helper, "require_launchd_absence", side_effect=require_absence):
+            helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
+        self.assertEqual(absence_checks[0], 2)
+        self.assertEqual(self.status().state, "failed_stopped")
+        self.assertTrue(Path(self.parent.active_path).exists())
+
     def test_failure_settlement_never_opens_quarantined_evidence(self):
         self.sealed()
         self.environment()
@@ -3710,6 +3736,38 @@ class CurrentSchemaRepairTests(unittest.TestCase):
                 helper._current_repair_quarantines(self.parent)
             self.assertFalse(helper._current_repair_persistence_owned(self.repair, self.parent))
 
+    def test_quarantine_admission_reserves_attempt_headroom(self):
+        self.sealed()
+        directory = Path(self.parent.target_plist).parent
+        prefix = helper._current_repair_quarantine_prefix(self.parent)
+        plist = (self.path.parent / "candidate.plist").read_bytes()
+        helper.atomic_write(directory / f"{prefix}one", plist)
+        helper.atomic_write(directory / f"{prefix}two", plist)
+        with mock.patch.object(helper, "CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES", 4), mock.patch.object(
+            helper, "CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES", 3
+        ):
+            self.assertFalse(helper._current_repair_persistence_owned(self.repair, self.parent))
+
+    def test_failure_retry_consumes_previously_reserved_headroom(self):
+        self.sealed()
+        directory = Path(self.parent.target_plist).parent
+        prefix = helper._current_repair_quarantine_prefix(self.parent)
+        plist = (self.path.parent / "candidate.plist").read_bytes()
+        helper.atomic_write(directory / f"{prefix}one", plist)
+        helper.atomic_write(directory / f"{prefix}two", plist)
+        with mock.patch.object(helper, "CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES", 2), mock.patch.object(
+            helper, "CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES", 1
+        ), mock.patch.object(helper, "CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES", len(plist) * 2), mock.patch.object(
+            helper, "CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES", len(plist)
+        ):
+            self.assertTrue(
+                helper._current_repair_persistence_owned(
+                    self.repair,
+                    self.parent,
+                    reserve_attempt_headroom=False,
+                )
+            )
+
     def test_quarantine_aggregate_byte_limit_fails_closed(self):
         self.sealed()
         directory = Path(self.parent.target_plist).parent
@@ -3717,7 +3775,21 @@ class CurrentSchemaRepairTests(unittest.TestCase):
         plist = (self.path.parent / "candidate.plist").read_bytes()
         helper.atomic_write(directory / f"{prefix}one", plist)
         helper.atomic_write(directory / f"{prefix}two", plist)
-        with mock.patch.object(helper, "CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES", len(plist) * 2 - 1):
+        with mock.patch.object(helper, "CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES", len(plist) * 2 - 1), mock.patch.object(
+            helper, "CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES", 0
+        ):
+            self.assertFalse(helper._current_repair_persistence_owned(self.repair, self.parent))
+
+    def test_quarantine_admission_reserves_byte_headroom(self):
+        self.sealed()
+        directory = Path(self.parent.target_plist).parent
+        prefix = helper._current_repair_quarantine_prefix(self.parent)
+        plist = (self.path.parent / "candidate.plist").read_bytes()
+        helper.atomic_write(directory / f"{prefix}one", plist)
+        helper.atomic_write(directory / f"{prefix}two", plist)
+        with mock.patch.object(helper, "CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES", len(plist) * 3), mock.patch.object(
+            helper, "CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES", len(plist) * 2
+        ):
             self.assertFalse(helper._current_repair_persistence_owned(self.repair, self.parent))
 
     def test_publication_is_idempotent_without_replacing_exact_target(self):
@@ -4206,6 +4278,40 @@ class CurrentSchemaRepairTests(unittest.TestCase):
                     helper.classify_current_repair(self.path)
                 helper.atomic_write(path, original)
                 self.reseal(**{digest_field: helper.sha256(path)})
+
+    def test_mutable_child_cannot_rebind_failure_settlement_target(self):
+        self.sealed()
+        self.environment()
+        unrelated = self.root / "unrelated.plist"
+        helper.atomic_write(unrelated, b"unrelated evidence")
+        parent_path = Path(self.repair.parent_manifest_path)
+        parent_record = json.loads(parent_path.read_text())
+        parent_record["target_plist"] = str(unrelated)
+        helper.atomic_write(parent_path, json.dumps(parent_record).encode())
+        repair_record = json.loads(self.path.read_text())
+        repair_record["parent_manifest_sha256"] = helper.sha256(parent_path)
+        helper.atomic_write(self.path, json.dumps(repair_record).encode())
+
+        with self.assertRaisesRegex(helper.ActivationError, "persistent route differs"):
+            helper.activate_current_repair(self.path)
+        self.assertEqual(unrelated.read_bytes(), b"unrelated evidence")
+        self.launchctl.stop.assert_not_called()
+        self.assertTrue(Path(self.parent.active_path).exists())
+
+    def test_reloaded_parent_cannot_bypass_persistent_route_check(self):
+        self.sealed()
+        self.environment()
+        unrelated = self.root / "reloaded-unrelated.plist"
+        helper.atomic_write(unrelated, b"reloaded unrelated evidence")
+        rebound = dataclasses.replace(self.parent, target_plist=str(unrelated))
+        status = self.status()
+
+        with mock.patch.object(helper, "validate_current_repair", return_value=(self.repair, rebound, status)):
+            with self.assertRaisesRegex(helper.ActivationError, "persistent route differs"):
+                helper.activate_current_repair(self.path)
+        self.assertEqual(unrelated.read_bytes(), b"reloaded unrelated evidence")
+        self.launchctl.stop.assert_called_once_with()
+        self.assertTrue(Path(self.parent.active_path).exists())
 
     def test_malformed_status_stops_with_hash_bound_routing_without_fabricating_checkpoint(self):
         self.sealed()
