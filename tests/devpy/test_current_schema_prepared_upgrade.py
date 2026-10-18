@@ -248,8 +248,8 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             "__file__",
             manifest.current_schema_upgrade.controller_helper_path,
         ), mock.patch.object(
-            helper.sqlite3,
-            "connect",
+            helper,
+            "_readonly_connection",
             side_effect=AssertionError("SQLite opened by read-only handoff"),
         ):
             validated = helper.validate_pre_disruption_handoff(manifest)
