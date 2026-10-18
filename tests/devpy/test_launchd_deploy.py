@@ -5061,7 +5061,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_controller_durability_test")
 
     @contextlib.contextmanager
-    def deployment(self, *, paired=True, current=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False):
+    def deployment(self, *, paired=True, current=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False, candidate_commit="a" * 40, controller_commit="d" * 40, registry_bytes=b"candidate registry bytes\n"):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             root = Path(td)
             deploy = root / "deploy"
@@ -5077,7 +5077,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 (root / "prod.db").touch()
                 (installed / "phoenix-ide").write_bytes(b"previous")
                 target_plist.write_bytes(plist)
-            identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
+            identity = self.dev.RuntimeIdentity("2.0.0", candidate_commit)
             previous = self.dev.RuntimeIdentity("1.0.0", "b" * 40)
             prepared = self.dev.PreparedCandidate(
                 binary=candidate,
@@ -5133,11 +5133,11 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             def run(command, **_kwargs):
                 events.append(("command", tuple(command)))
                 if "rev-parse" in command:
-                    return subprocess.CompletedProcess(command, 0, "d" * 40, "")
+                    return subprocess.CompletedProcess(command, 0, controller_commit, "")
                 if command[:2] == ["git", "status"] and dirty:
                     return subprocess.CompletedProcess(command, 0, " M dev.py\n", "")
                 if command[:2] == ["git", "show"]:
-                    return subprocess.CompletedProcess(command, 0, b"candidate registry bytes\n", b"")
+                    return subprocess.CompletedProcess(command, 0, registry_bytes, b"")
                 if command[:2] == ["gh", "api"]:
                     contents = b"controller helper bytes\n" if "launchd_deploy_helper.py" in command[2] else b"release registry bytes\n"
                     return subprocess.CompletedProcess(command, 0, contents, b"")
@@ -5454,6 +5454,42 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             self.assertLess(events.index(("file", "migrations.rs")), prepared)
             self.assertLess(events.index(("directory", staging)), prepared)
             self.assertLess(prepared, next(i for i, event in enumerate(events) if event[0] == "command" and "bootstrap" in event[1]))
+
+    def test_prepared114_receipt_candidate_gets_typed_evidence_from_exact_git_object(self):
+        commit = self.dev.PREPARED_SOURCE114_COMMIT
+        registry_bytes = subprocess.check_output(
+            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
+        )
+        with self.deployment(current=True, candidate_commit=commit, registry_bytes=registry_bytes) as (staging, controller, events), \
+             mock.patch.object(self.dev, "ROOT", staging / "different-controller-checkout"):
+            self.dev.launchd_prod_deploy(controller=controller)
+            manifest = json.loads((staging / "manifest.json").read_text())
+            current = manifest["current_schema_upgrade"]
+            self.assertEqual(manifest["source_commit"], commit)
+            self.assertEqual(manifest["expected"]["git_sha"], commit)
+            self.assertEqual(current["prepared_source_baseline"], 114)
+            self.assertEqual(current["candidate_registry_expected_sha256"], self.dev.PREPARED_SOURCE114_REGISTRY_SHA256)
+            self.assertEqual(current["migration_registry_sha256"], self.dev.PREPARED_SOURCE114_REGISTRY_SHA256)
+            self.assertEqual(current["controller_source_commit"], "d" * 40)
+            self.assertEqual((staging / "migrations.rs").read_bytes(), registry_bytes)
+            self.assertIn(("command", ("git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs")), events)
+            self.assertFalse(any(event[0] == "command" and event[1][:2] == ("gh", "api") for event in events))
+        with self.deployment(current=True) as (staging, controller, _events):
+            self.dev.launchd_prod_deploy(controller=controller)
+            current = json.loads((staging / "manifest.json").read_text())["current_schema_upgrade"]
+            self.assertNotIn("prepared_source_baseline", current)
+            self.assertNotIn("candidate_registry_expected_sha256", current)
+
+    def test_prepared114_controller_rejects_bad_registry_same_controller_and_dirty_checkout(self):
+        commit = self.dev.PREPARED_SOURCE114_COMMIT
+        for options, error in (({}, "registry SHA-256 mismatch"),
+                               ({"controller_commit": commit}, "different clean controller"),
+                               ({"dirty": True}, "clean controller checkout")):
+            with self.subTest(options=options), self.deployment(current=True, candidate_commit=commit, **options) as (staging, controller, events):
+                with self.assertRaisesRegex(SystemExit, error):
+                    self.dev.launchd_prod_deploy(controller=controller)
+                self.assertNotIn(("status", "prepared"), events)
+                self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
 
     def test_current_schema_rejects_dirty_controller_before_staging_registry(self):
         with self.deployment(current=True, dirty=True) as (staging, controller, events):

@@ -2,7 +2,8 @@
 -- Native macOS launchd deployment lifecycle
 -- Requirement traceability: REQ-LDD-001 through REQ-LDD-024
 -- REQ-LDD-019–022 admit prepared sources at exact 123 or exact 128 with
--- exact target 128; the protected published-release admission is exact 114 -> 128.
+-- exact target 128; one exact prepared candidate additionally admits prefix114.
+-- The protected published-release admission remains separate exact 114 -> 128.
 -- REQ-LDD-023 admits ordinary pending migrations only at exact 123 -> 128.
 
 config {
@@ -164,10 +165,14 @@ variant PreparedArtifactDeployment : DeployTransaction {
 }
 
 entity CurrentSchemaSource {
-    kind: PreparedCurrentSchemaSource | PublishedCurrentSchemaSource
+    kind: PreparedCurrentSchemaSource | PreparedSource114CurrentSchemaSource | PublishedCurrentSchemaSource
 }
 
 variant PreparedCurrentSchemaSource : CurrentSchemaSource {}
+variant PreparedSource114CurrentSchemaSource : CurrentSchemaSource {
+    prepared_source_baseline: Integer
+    candidate_registry_expected_sha256: String
+}
 variant PublishedCurrentSchemaSource : CurrentSchemaSource {
     release_tag: String
 }
@@ -291,7 +296,8 @@ external entity TargetService {
 --   either case the candidate's 40-character lowercase embedded git_sha equals
 --   source_commit. Prepared sources independently verify receipt, signing,
 --   notarization and exact identity. CurrentSchemaDeployment.source is either
---   PreparedCurrentSchemaSource with those checks or PublishedCurrentSchemaSource
+--   PreparedCurrentSchemaSource or PreparedSource114CurrentSchemaSource with those
+--   checks, or PublishedCurrentSchemaSource
 --   with an exact non-alias release tag, expected full release commit, full embedded
 --   version/SHA, host-target asset and published checksum agreeing. The protected
 --   release retains published_release source kind, not prepared_artifact.
@@ -317,6 +323,20 @@ external entity TargetService {
 --   candidate migration registry path/SHA-256 bound to the immutable transaction.
 --   PreparedCurrentSchemaSource admits only the complete qualified ordered ledger
 --   through 123 or complete target registry through 128, retaining all receipt checks.
+--   PreparedSource114CurrentSchemaSource requires prepared_source_baseline = 114,
+--   candidate_registry_expected_sha256 = a4eb7e213b363892f316f0034bc45b52e809124e85394730705599cecb257d6f,
+--   source/expected/receipt/embedded SHA = 23badb8be4bc8d05a7e1c49c5367ceb14ebccd92,
+--   and actual retained registry digest equal to that expected digest. All evidence
+--   fields are required together; partial, extra, mistyped or contradictory fields
+--   reject before DB admission/stop. Only complete prefix114 or exact target128
+--   is admitted, not prefix113 or prefixes115..127. The candidate commit must be
+--   locally present and its registry obtained with git show SOURCE_COMMIT:path,
+--   never controller working-tree bytes. A different clean controller commit
+--   supplies the retained/hash-bound helper. No other candidate is qualified;
+--   manifests without these fields retain PreparedCurrentSchemaSource semantics.
+--   The registry semantics are unchanged from RC4; this expands only the exact
+--   candidate/source-kind admission. Snapshot proof binds this typed evidence;
+--   its removal/alteration rejects during recovery/finalization. REQ-LDD-019.
 --   PublishedCurrentSchemaSource admits only the exact complete candidate-registry
 --   prefix through 114 (every version/name, no gaps or extras), with candidate binary
 --   and complete registry from the exact release commit. No other source baseline
@@ -419,7 +439,8 @@ external entity TargetService {
 -- controller_identity_is_independently_bound(transaction) -> Boolean
 --   True for ordinary sources. For prepared sources, the controller helper hash
 --   is bound to the recorded clean controller source and protocol; controller and
---   candidate commits may be equal when independently verified. For protected
+--   candidate commits may be equal when independently verified, except that
+--   PreparedSource114CurrentSchemaSource requires different commits. For protected
 --   PublishedCurrentSchemaSource, require a separately explicit full controller
 --   commit, not the candidate release commit or ambient checkout. Retain helper
 --   bytes/path/SHA-256 from that controller commit independently of candidate

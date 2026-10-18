@@ -10212,6 +10212,10 @@ def _prepare_release_candidate(
     )
 
 
+PREPARED_SOURCE114_COMMIT = "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
+PREPARED_SOURCE114_REGISTRY_SHA256 = "a4eb7e213b363892f316f0034bc45b52e809124e85394730705599cecb257d6f"
+
+
 def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> PreparedCandidate:
     """Validate one protected prepare-main standalone artifact without resigning it."""
     if sys.platform != "darwin":
@@ -11622,6 +11626,17 @@ def launchd_prod_deploy(
             "published_release" if controller.controller_source_commit is not None
             else "local_head" if controller_source_commit else source_kind,
         )
+        prepared_source114 = (
+            controller.current_schema_upgrade
+            and prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT
+            and prepared.source_commit == PREPARED_SOURCE114_COMMIT
+        )
+        if prepared_source114 and (
+            selected_identity.git_sha != PREPARED_SOURCE114_COMMIT
+            or controller.expected_full_commit != PREPARED_SOURCE114_COMMIT
+            or controller_source_commit == PREPARED_SOURCE114_COMMIT
+        ):
+            raise SystemExit("exact prepared source114 requires receipt-bound candidate and different clean controller")
         migration_registry = None
         ordinary_forward_migration = (
             prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT
@@ -11637,6 +11652,8 @@ def launchd_prod_deploy(
                 "local_head" if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT else source_kind,
             )
             migration_registry.chmod(0o600)
+            if prepared_source114 and _file_sha256(migration_registry) != PREPARED_SOURCE114_REGISTRY_SHA256:
+                raise SystemExit("exact prepared source114 candidate registry SHA-256 mismatch")
         python_executable = Path(sys.executable).resolve()
         protocol = subprocess.run(
             [str(python_executable), str(helper), "--protocol-version"],
@@ -11714,6 +11731,10 @@ def launchd_prod_deploy(
                 "controller_helper_path": str(helper) if controller_source_commit else None,
             } if controller.paired_database_upgrade else None),
             **({"current_schema_upgrade": {
+                **({
+                    "prepared_source_baseline": 114,
+                    "candidate_registry_expected_sha256": PREPARED_SOURCE114_REGISTRY_SHA256,
+                } if prepared_source114 else {}),
                 "database_path": candidate_database_path,
                 "backup_path": str(staging / "database-backup.sqlite3"),
                 "proof_path": str(staging / "database-backup-proof.json"),
