@@ -83,6 +83,11 @@ jobs:
         env:
           EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Set up isolated validation Python
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Download exact prepared Source114 artifact by ID
         if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
         env:
@@ -229,17 +234,6 @@ jobs:
           if errors:
               raise SystemExit("; ".join(errors))
           PY
-      - name: Validate disposable launchd installer handoff
-        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
-        env:
-          PHOENIX_PREPARED_ARTIFACT_ROOT: ${{ runner.temp }}/prepared-source114
-        run: python3 tests/integration/launchd_validation_harness.py
-      - name: Remove retrieved PreparedSource114 bytes
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
-        run: |
-          rm -rf -- \
-            "${{ runner.temp }}/prepared-source114" \
-            "${{ runner.temp }}/prepared-source114.zip"
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -255,6 +249,26 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - name: Validate ready controller handoff with exact PreparedSource114
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        env:
+          PHOENIX_PREPARED_ARTIFACT_ROOT: ${{ runner.temp }}/prepared-source114
+        run: |
+          cargo test \
+            -p phoenix-deployment-controller \
+            --test native_launchd_process \
+            installed_ready_controller_validates_prepared_source114_handoff_without_effects \
+            -- \
+            --ignored \
+            --exact \
+            --nocapture \
+            --test-threads=1
+      - name: Remove retrieved PreparedSource114 bytes
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        run: |
+          rm -rf -- \
+            "${{ runner.temp }}/prepared-source114" \
+            "${{ runner.temp }}/prepared-source114.zip"
       - name: Run deployment controller tests serially
         run: cargo nextest run -p phoenix-deployment-controller --test-threads 1
       - name: Lint deployment controller

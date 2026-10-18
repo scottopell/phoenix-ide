@@ -20,8 +20,11 @@ are bounded procedures for a separately authorized owner.
 
 The repository workflow retrieves these bytes only on an explicitly authorized
 `workflow_dispatch` with `validate_prepared_source114=true`; ordinary pull-request and
-push runs skip both retrieval and the validation harness. Checkout credentials are not
-persisted into repository-controlled code.
+push runs skip both retrieval and the joined controller-to-validator integration. The
+manual integration consumes a real persisted `ReadyForDisruption`/`VerifiedClean`
+controller result before it invokes the fixed validation harness, then removes the
+retrieved bytes with an `always()` cleanup step. Checkout credentials are not persisted
+into repository-controlled code.
 
 ## Bounded metadata verification
 
@@ -65,6 +68,7 @@ jq -e --slurpfile m "$manifest" '
   .id == $p.artifact.id and .name == $p.artifact.name and
   .size_in_bytes == $p.artifact.size_in_bytes and
   .digest == $p.artifact.api_digest and
+  .created_at == $p.artifact.created_at and
   .expires_at == $p.artifact.expires_at and .expired == false and
   (.expires_at | fromdateiso8601) > now and
   .workflow_run.id == $p.producer.workflow_run_id and
@@ -168,6 +172,40 @@ head being qualified; that head must differ from `candidate.source_commit`.
 REQ-SDC-023 and `launchd_validation_harness.py` define the validation-only boundary.
 Success is diagnostic only: no production claim, service control, backup, migration,
 publication, activation, cleanup, recovery, signal, or guardian replacement authority.
+
+## Joined nonproduction orchestration
+
+The explicitly ignored macOS test
+`installed_ready_controller_validates_prepared_source114_handoff_without_effects`
+reuses the successful natural-root-exit controller journey. It admits the fixed Python
+validation entrypoint only after a fresh, affine `LoadedAttempt` and the existing
+`ReadyWorkflowSelection::Complete` prove durable `ReadyForDisruption` plus
+`VerifiedClean`, with no pending native acknowledgement or retained guardian result.
+The test passes no serialized readiness record, manifest field, executor command, or
+mutation adapter across the boundary.
+
+The read-only test capability accepts no caller-selected command: it resolves the
+Python 3.12 interpreter installed by `actions/setup-python` beneath the hosted runner's
+canonical tool cache, uses isolated Python startup, and invokes only
+`tests/integration/launchd_validation_harness.py` with
+`PHOENIX_PREPARED_ARTIFACT_ROOT`. The harness continues to call
+`prepare_disposable_launchd_validation`, materialize the existing exact handoff, and
+reach the shared `validate_pre_disruption_handoff` policy. It intercepts both helper and
+`dev.py` mutation entrypoints in their real function globals, rejects any `launchctl`
+subprocess, and rejects every SQLite path outside its generated owner-private root.
+Manifest and staged-plist paths, test labels, databases, and loopback ports are checked
+as disposable rather than production values. The controller SQLite main/WAL bytes and
+loaded ready coordinates must remain identical across validation. The child receives a
+parent-owned temporary directory, runs in its own process group, and has a 15-minute
+bound; timeout kills the group, reaps the child within a second bound, and lets Rust
+fixture and temporary-root teardown proceed.
+
+A successful joined receipt contains the controller attempt/revision and the existing
+harness line with ledger 113, all seven installer effects at zero, and explicit zero
+production label/path/database observations. Fixture-owned launchd jobs and temporary
+roots remain test lifecycle resources; they are not installer service-control or cleanup
+effects. This proves orchestration continuity into read-only validation only. It grants
+no installer adoption or production mutation authority.
 
 ## Deterministic reproduction after expiry
 

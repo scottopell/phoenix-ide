@@ -9,9 +9,11 @@ import os
 import plistlib
 import runpy
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 
@@ -157,6 +159,67 @@ def validate_receipt(dev, receipt) -> None:
         assert receipt.root in path.resolve(strict=False).parents
 
     manifest = json.loads(receipt.manifest_path.read_text())
+    def disposable_path(value: str, description: str) -> Path:
+        path = Path(value).resolve(strict=False)
+        assert receipt.root in path.parents, f"{description} escaped the generated root"
+        return path
+
+    manifest_paths = (
+        "candidate_binary",
+        "candidate_plist",
+        "rollback_binary",
+        "rollback_plist",
+        "target_binary",
+        "target_plist",
+        "active_path",
+        "status_path",
+        "deployed_sha_path",
+        "lock_path",
+        "claim_lock_path",
+    )
+    for field in manifest_paths:
+        disposable_path(manifest[field], field)
+    for field in (
+        "database_path",
+        "backup_path",
+        "proof_path",
+        "controller_helper_path",
+        "migration_registry_path",
+    ):
+        disposable_path(manifest["current_schema_upgrade"][field], field)
+    assert manifest["label"] != "com.phoenix-ide.server"
+    assert manifest["label"].startswith("test.disposable.phoenix.validation.")
+    for field in ("health_url", "previous_health_url"):
+        parsed = urllib.parse.urlparse(manifest[field])
+        assert parsed.scheme == "http"
+        assert parsed.hostname == "127.0.0.1"
+        assert parsed.port is not None and 40_000 <= parsed.port < 50_001
+        assert parsed.path == "/api/version"
+
+    expected_database = disposable_path(
+        manifest["current_schema_upgrade"]["database_path"], "database_path"
+    )
+    expected_ports = (
+        urllib.parse.urlparse(manifest["health_url"]).port,
+        urllib.parse.urlparse(manifest["previous_health_url"]).port,
+    )
+    for plist_field, expected_port in zip(
+        ("candidate_plist", "rollback_plist"), expected_ports, strict=True
+    ):
+        staged_plist = plistlib.loads(Path(manifest[plist_field]).read_bytes())
+        assert staged_plist["Label"] == manifest["label"]
+        assert staged_plist["ProgramArguments"] == [manifest["target_binary"]]
+        assert disposable_path(
+            staged_plist["EnvironmentVariables"]["PHOENIX_DB_PATH"],
+            f"{plist_field} database",
+        ) == expected_database
+        assert staged_plist["Sockets"] == {
+            "Listeners": {
+                "SockServiceName": str(expected_port),
+                "SockType": "stream",
+            }
+        }
+
     assert manifest["manifest_version"] == dev.LAUNCHD_HANDOFF_PROTOCOL_VERSION
     assert manifest["label"].startswith("test.disposable.phoenix.validation.")
     assert manifest["helper_label"] == f"com.phoenix-ide.deploy.{receipt.transaction_id}"
@@ -478,7 +541,77 @@ def main() -> None:
         "recover_paired": "cleanup",
         "finalize_verified_predecessor": "cleanup",
     }
+    dev_sinks = {
+        "_discard_unclaimed_bare_transaction": "cleanup",
+        "_prune_launchd_deploy_transactions": "cleanup",
+        "_release_launchd_deploy_claim_unlocked": "claim",
+        "_release_launchd_deploy_claim": "claim",
+        "_release_launchd_restart_claim_unlocked": "claim",
+        "_release_launchd_restart_claim": "claim",
+        "_claim_launchd_deploy": "claim",
+        "_claim_launchd_restart": "claim",
+        "_helper_plist": "activate",
+        "cmd_prod_finalize_paired": "cleanup",
+        "_handoff_current_repair": "activate",
+        "_clean_unsealed_current_repair": "cleanup",
+        "cmd_prod_repair_current": "activate",
+        "cmd_prod_resume_current_repair": "activate",
+        "cmd_prod_resume_forward": "activate",
+        "native_prod_deploy": "activate",
+        "prod_daemon_deploy": "activate",
+        "launchd_prod_deploy": "activate",
+        "cmd_prod_deploy": "activate",
+        "write_deployed_sha": "publish",
+    }
+
+    def make_forbidden(sink: str, effect: str):
+        def forbidden(*_args, **_kwargs):
+            effects[effect] += 1
+            raise AssertionError(f"validation reached forbidden authority sink {sink}")
+
+        forbidden.__name__ = f"forbidden_{sink}"
+        return forbidden
+
+    dev_globals = dev.prepare_disposable_launchd_validation.__globals__
+    assert dev_globals is vars(dev)
+    original_dev_sinks = {}
+    generated_roots = []
+    opened_database_paths = []
+    original_sqlite_connect = sqlite3.connect
+    original_subprocess_run = dev.subprocess.run
+    original_mkdtemp = tempfile.mkdtemp
     original_run_path = runpy.run_path
+
+    def guarded_mkdtemp(*args, **kwargs):
+        path = original_mkdtemp(*args, **kwargs)
+        prefix = kwargs.get("prefix")
+        if prefix is None and args:
+            prefix = args[0]
+        if prefix == "phoenix-launchd-validation-":
+            generated_roots.append(Path(path).resolve(strict=True))
+        return path
+
+    def guarded_sqlite_connect(database, *args, **kwargs):
+        raw = os.fspath(database)
+        if raw.startswith("file:"):
+            assert kwargs.get("uri") is True, "SQLite URI must opt in to URI parsing"
+            raw = urllib.parse.unquote(raw[5:].split("?", 1)[0])
+        path = Path(raw).resolve(strict=False)
+        root = generated_roots[-1] if generated_roots else None
+        if root is None or root not in path.parents:
+            effects["migrate"] += 1
+            raise AssertionError(f"validation attempted to open non-disposable database {path}")
+        opened_database_paths.append(path)
+        return original_sqlite_connect(database, *args, **kwargs)
+
+    def guarded_subprocess_run(args, *positional, **kwargs):
+        if not isinstance(args, (list, tuple)) or not args:
+            effects["activate"] += 1
+            raise AssertionError("validation attempted an unstructured subprocess command")
+        if any(Path(os.fspath(part)).name == "launchctl" for part in args):
+            effects["stop"] += 1
+            raise AssertionError("validation attempted to invoke launchctl")
+        return original_subprocess_run(args, *positional, **kwargs)
 
     def instrumented_run_path(path, *args, **kwargs):
         policy = original_run_path(path, *args, **kwargs)
@@ -488,25 +621,40 @@ def main() -> None:
         for sink, effect in helper_sinks.items():
             assert sink in validator_globals
 
-            def forbidden(*_args, _effect=effect, _sink=sink, **_kwargs):
-                effects[_effect] += 1
-                raise AssertionError(f"validation reached forbidden helper sink {_sink}")
-
+            forbidden = make_forbidden(sink, effect)
             validator_globals[sink] = forbidden
             policy[sink] = forbidden
             assert policy["validate_pre_disruption_handoff"].__globals__[sink] is forbidden
         return policy
 
-    artifact = prepared_artifact(expected_names)
-    download = Path(os.environ["PHOENIX_PREPARED_ARTIFACT_ROOT"]).resolve(strict=True)
-    artifact_before = artifact_witness(download)
+    artifact = None
+    download = None
+    artifact_before = None
     receipt = None
-    runpy.run_path = instrumented_run_path
     try:
+        for sink, effect in dev_sinks.items():
+            assert sink in dev_globals, f"missing dev authority sink {sink}"
+            original_dev_sinks[sink] = dev_globals[sink]
+            dev_globals[sink] = make_forbidden(sink, effect)
+            assert dev_globals[sink].__name__ == f"forbidden_{sink}"
+        sqlite3.connect = guarded_sqlite_connect
+        dev.subprocess.run = guarded_subprocess_run
+        tempfile.mkdtemp = guarded_mkdtemp
+        runpy.run_path = instrumented_run_path
+
+        artifact = prepared_artifact(expected_names)
+        download = Path(os.environ["PHOENIX_PREPARED_ARTIFACT_ROOT"]).resolve(strict=True)
+        artifact_before = artifact_witness(download)
         check_failed_preparation_cleanup(dev, artifact, download, artifact_before)
         receipt = dev.prepare_disposable_launchd_validation(
             dev.DisposableLaunchdValidationInputs(prepared_artifact=artifact)
         )
+        assert len(generated_roots) == 2
+        assert generated_roots[0] != generated_roots[1]
+        assert not generated_roots[0].exists()
+        assert receipt.root == generated_roots[1]
+        assert opened_database_paths
+        assert all(receipt.root in path.parents for path in opened_database_paths)
         assert artifact_witness(download) == artifact_before
         validate_receipt(dev, receipt)
         assert len(receipt.database_ledger) == provenance["expected_validation"][
@@ -515,16 +663,23 @@ def main() -> None:
         assert effects == expected_effects
     finally:
         runpy.run_path = original_run_path
+        tempfile.mkdtemp = original_mkdtemp
+        sqlite3.connect = original_sqlite_connect
+        dev.subprocess.run = original_subprocess_run
+        for sink, original in original_dev_sinks.items():
+            dev_globals[sink] = original
         try:
             if receipt is not None:
                 shutil.rmtree(receipt.root)
         finally:
-            assert artifact_witness(download) == artifact_before
+            if download is not None and artifact_before is not None:
+                assert artifact_witness(download) == artifact_before
+    assert receipt is not None
     rendered_effects = " ".join(f"{name}={count}" for name, count in effects.items())
     print(
         "launchd-validation-only: PASS "
         f"transaction={receipt.transaction_id} ledger={len(receipt.database_ledger)} "
-        f"{rendered_effects}"
+        f"{rendered_effects} production_label=0 production_path=0 production_db=0"
     )
 
 

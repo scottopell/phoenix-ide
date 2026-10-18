@@ -16,14 +16,16 @@ use phoenix_deployment_controller::{
         WireState,
     },
     native_guardian::{verify_native_binding, GuardianClient, VerifiedBindingStatus},
-    CleanupOutcome, ControllerOs, ControllerSqliteStore, IdentityObservation, MacOsControllerOs,
-    MonotonicTick, NativeChildListStatus, NativeSamplingStatus, NativeSessionState,
-    NativeSlotLiveness, Phase,
+    CleanupOutcome, ControllerOs, ControllerSqliteStore, IdentityObservation, LoadedAttempt,
+    MacOsControllerOs, MonotonicTick, NativeChildListStatus, NativeSamplingStatus,
+    NativeSessionState, NativeSlotLiveness, Phase,
 };
 use std::{
+    collections::BTreeMap,
     io::Write,
     num::NonZeroU64,
-    path::PathBuf,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -369,9 +371,245 @@ fn assert_fenced_sample(fenced: &WireSnapshot, revision: u64, deadline: Monotoni
     ));
 }
 
+struct ReadOnlyPreparedSource114Validation {
+    artifact_root: PathBuf,
+}
+
+impl ReadOnlyPreparedSource114Validation {
+    fn trusted_python() -> PathBuf {
+        let runner_tool_cache = PathBuf::from(
+            std::env::var_os("RUNNER_TOOL_CACHE")
+                .filter(|value| !value.is_empty())
+                .expect("RUNNER_TOOL_CACHE must identify the hosted runner tool cache"),
+        )
+        .canonicalize()
+        .expect("runner tool cache must have a canonical path");
+        let python_location = PathBuf::from(
+            std::env::var_os("pythonLocation")
+                .filter(|value| !value.is_empty())
+                .expect("actions/setup-python must identify its Python location"),
+        )
+        .canonicalize()
+        .expect("setup-python location must have a canonical path");
+        assert!(
+            python_location.starts_with(&runner_tool_cache),
+            "validation Python must reside under the hosted runner tool cache"
+        );
+        let python = python_location
+            .join("bin/python3")
+            .canonicalize()
+            .expect("setup-python must provide bin/python3");
+        assert!(
+            python.starts_with(&python_location),
+            "validation Python escaped the setup-python location"
+        );
+        python
+    }
+
+    fn from_required_env() -> Self {
+        let artifact_root = std::env::var_os("PHOENIX_PREPARED_ARTIFACT_ROOT")
+            .filter(|value| !value.is_empty())
+            .expect("PHOENIX_PREPARED_ARTIFACT_ROOT must name the owner-authorized exact PreparedSource114 artifact");
+        let artifact_root = PathBuf::from(artifact_root);
+        let metadata = std::fs::symlink_metadata(&artifact_root)
+            .expect("prepared artifact root metadata must be readable");
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "prepared artifact root must be a real directory"
+        );
+        let artifact_root = artifact_root
+            .canonicalize()
+            .expect("prepared artifact root must have an absolute canonical path");
+        Self { artifact_root }
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines,
+        reason = "the bounded test-only handoff consumes one affine result and verifies one complete receipt"
+    )]
+    fn validate(self, ready: LoadedAttempt) -> String {
+        assert_eq!(ready.attempt_id(), ATTEMPT);
+        assert_eq!(ready.phase(), Phase::ReadyForDisruption);
+        assert_eq!(ready.cleanup_outcome(), CleanupOutcome::VerifiedClean);
+        let entrypoint = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/integration/launchd_validation_harness.py");
+        let output_root = tempfile::tempdir().expect("create private validation output root");
+        let stdout_path = output_root.path().join("stdout");
+        let stderr_path = output_root.path().join("stderr");
+        let validation_tmp = tempfile::tempdir_in(output_root.path())
+            .expect("create parent-owned validation temporary root");
+        let mut child = Command::new(Self::trusted_python())
+            .arg("-I")
+            .arg(entrypoint)
+            .env_remove("PYTHONHOME")
+            .env_remove("PYTHONPATH")
+            .env_remove("PYTHONSTARTUP")
+            .env("PYTHONNOUSERSITE", "1")
+            .env("TMPDIR", validation_tmp.path())
+            .env("PHOENIX_PREPARED_ARTIFACT_ROOT", self.artifact_root)
+            .stdin(Stdio::null())
+            .stdout(private_file(&stdout_path).unwrap())
+            .stderr(private_file(&stderr_path).unwrap())
+            .process_group(0)
+            .spawn()
+            .expect("could not run the fixed PreparedSource114 validation entrypoint");
+        let until = Instant::now() + Duration::from_secs(15 * 60);
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .expect("could not poll PreparedSource114 validation")
+            {
+                break status;
+            }
+            if Instant::now() >= until {
+                let process_group = i32::try_from(child.id())
+                    .expect("validation child PID must fit the native process identifier");
+                // SAFETY: the child starts a fresh process group, so the negative PID targets
+                // only it and descendants that have not deliberately escaped its custody.
+                let kill_result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+                if kill_result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(libc::ESRCH),
+                        "could not terminate timed-out validation process group: {error}"
+                    );
+                }
+                let reap_until = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < reap_until {
+                    if child
+                        .try_wait()
+                        .expect("could not reap timed-out PreparedSource114 validation")
+                        .is_some()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(
+                    child
+                        .try_wait()
+                        .expect("could not confirm timed-out validation termination")
+                        .is_some(),
+                    "timed-out PreparedSource114 validation was not reaped within 5 seconds"
+                );
+                panic!("PreparedSource114 validation exceeded 15 minutes");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let stdout =
+            std::fs::read_to_string(stdout_path).expect("validation stdout must be readable UTF-8");
+        let stderr =
+            std::fs::read_to_string(stderr_path).expect("validation stderr must be readable UTF-8");
+        assert!(
+            status.success(),
+            "PreparedSource114 validation failed ({status}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let pass_lines: Vec<_> = stdout
+            .lines()
+            .chain(stderr.lines())
+            .filter(|line| line.starts_with("launchd-validation-only: PASS"))
+            .collect();
+        assert_eq!(
+            pass_lines.len(),
+            1,
+            "expected exactly one validation PASS line:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let pass = pass_lines[0];
+        let mut tokens = pass.split_whitespace();
+        assert_eq!(tokens.next(), Some("launchd-validation-only:"));
+        assert_eq!(tokens.next(), Some("PASS"));
+        let mut fields = BTreeMap::new();
+        for token in tokens {
+            let (name, value) = token
+                .split_once('=')
+                .unwrap_or_else(|| panic!("validation PASS token has no value: {token}"));
+            assert!(
+                fields.insert(name, value).is_none(),
+                "validation PASS repeats field {name}"
+            );
+        }
+        assert_eq!(
+            fields.len(),
+            12,
+            "unexpected validation PASS fields: {pass}"
+        );
+        assert!(
+            fields
+                .get("transaction")
+                .is_some_and(|value| value.starts_with("validation-")),
+            "unexpected validation transaction: {pass}"
+        );
+        for (name, expected) in [
+            ("ledger", "113"),
+            ("claim", "0"),
+            ("stop", "0"),
+            ("backup", "0"),
+            ("migrate", "0"),
+            ("publish", "0"),
+            ("activate", "0"),
+            ("cleanup", "0"),
+            ("production_label", "0"),
+            ("production_path", "0"),
+            ("production_db", "0"),
+        ] {
+            assert_eq!(
+                fields.get(name),
+                Some(&expected),
+                "unexpected {name}: {pass}"
+            );
+        }
+        pass.to_owned()
+    }
+}
+
+fn controller_persistent_bytes(path: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
+    let main = std::fs::read(path).expect("read controller SQLite main bytes");
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    let wal = match std::fs::read(PathBuf::from(wal_path)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read controller SQLite WAL bytes: {error}"),
+    };
+    (main, wal)
+}
+
 #[test]
-#[allow(clippy::too_many_lines)]
+#[ignore = "requires owner-authorized exact PreparedSource114 artifact"]
+fn installed_ready_controller_validates_prepared_source114_handoff_without_effects() {
+    let validation = ReadOnlyPreparedSource114Validation::from_required_env();
+    installed_ready_after_natural_root_exit(|ready, path| {
+        let attempt = ready.attempt_id();
+        let revision = ready.persistence_revision();
+        let deadline = ready.deadline();
+        let before = controller_persistent_bytes(path);
+        let pass = validation.validate(ready);
+        assert_eq!(controller_persistent_bytes(path), before);
+        let mut reloaded_store = ControllerSqliteStore::open_read_only(path).unwrap();
+        let reloaded = reloaded_store.load_attempt(attempt).unwrap().unwrap();
+        assert_eq!(reloaded.attempt_id(), attempt);
+        assert_eq!(reloaded.persistence_revision(), revision);
+        assert_eq!(reloaded.phase(), Phase::ReadyForDisruption);
+        assert_eq!(reloaded.cleanup_outcome(), CleanupOutcome::VerifiedClean);
+        assert_eq!(reloaded.deadline(), deadline);
+        assert_eq!(controller_persistent_bytes(path), before);
+        println!(
+            "installed-ready-prepared-source114: PASS attempt={} revision={} {pass}",
+            attempt.get(),
+            revision.get()
+        );
+    });
+}
+
+#[test]
 fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signals() {
+    installed_ready_after_natural_root_exit(|_, _| {});
+}
+
+#[allow(clippy::too_many_lines)]
+fn installed_ready_after_natural_root_exit(on_ready: impl FnOnce(LoadedAttempt, &Path)) {
     let mut installation = DisposableLaunchdInstallation::start_with_timing(30, 60, 70).unwrap();
     installation.assert_witnesses().unwrap();
     let root_path = installation.guardian().root().to_path_buf();
@@ -624,9 +862,10 @@ fn installed_two_job_launchd_reaches_ready_after_natural_root_exit_without_signa
         runner.advance_ready_workflow().unwrap(),
         ReadyWorkflowSelection::Complete
     );
+    drop((store, db));
+    on_ready(final_attempt, &path);
     runner.finish().unwrap();
     installation.assert_witnesses().unwrap();
-    drop((store, db));
     installation.finish().unwrap();
     assert!(
         !root_path.exists(),
