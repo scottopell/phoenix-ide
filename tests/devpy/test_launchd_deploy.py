@@ -231,6 +231,138 @@ def make_paired_manifest(root: Path, database: Path) -> helper.Manifest:
 
 
 class ActivationTests(unittest.TestCase):
+    def test_pre_disruption_handoff_is_read_only_and_returns_activation_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(
+                root,
+                previous=helper.Identity("1.0.0", "a" * 40),
+            )
+            before = {path: path.read_bytes() for path in root.iterdir() if path.is_file()}
+
+            validated = helper.validate_pre_disruption_handoff(manifest)
+
+            self.assertEqual(validated.candidate_binary, Path(manifest.candidate_binary))
+            self.assertEqual(validated.candidate_plist, Path(manifest.candidate_plist))
+            self.assertEqual(
+                validated.rollback,
+                (Path(manifest.rollback_binary), Path(manifest.rollback_plist)),
+            )
+            self.assertEqual(
+                before,
+                {path: path.read_bytes() for path in root.iterdir() if path.is_file()},
+            )
+            self.assertFalse(Path(manifest.status_path).exists())
+            self.assertFalse(Path(manifest.active_path).exists())
+
+    def test_read_only_paired_path_validation_never_creates_transaction_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "missing" / "transaction"
+            manifest = dataclasses.replace(
+                make_manifest(root),
+                paired_database_upgrade=helper.PairedDatabaseUpgrade(
+                    database_path=str(root / "prod.db"),
+                    backup_path=str(transaction / "backup.sqlite3"),
+                    proof_path=str(transaction / "proof.json"),
+                    controller_source_commit="c" * 40,
+                    controller_helper_sha256="d" * 64,
+                    controller_helper_path=str(root / "controller-helper.py"),
+                ),
+            )
+
+            with self.assertRaisesRegex(helper.ActivationError, "transaction directory is unavailable"):
+                helper._paired_path_context(manifest, prepare_transaction=False)
+            self.assertFalse(transaction.exists())
+            self.assertFalse(transaction.parent.exists())
+
+    def test_exact_prepared_source114_handoff_binds_plist_and_timeouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root)
+            target_binary = Path(manifest.target_binary)
+            candidate_plist = Path(manifest.candidate_plist)
+            rollback_plist = Path(manifest.rollback_plist)
+            bound_plist = plistlib.dumps(
+                {
+                    "Label": manifest.label,
+                    "ProgramArguments": [str(target_binary)],
+                }
+            )
+            candidate_plist.write_bytes(bound_plist)
+            rollback_plist.write_bytes(bound_plist)
+            upgrade = helper.PreparedSource114Upgrade(
+                database_path=str(root / "prod.db"),
+                backup_path=str(root / "backup.sqlite3"),
+                proof_path=str(root / "proof.json"),
+                controller_source_commit="c" * 40,
+                controller_helper_sha256="d" * 64,
+                controller_helper_path=str(root / "controller-helper.py"),
+                migration_registry_path=str(root / "migrations.rs"),
+                migration_registry_sha256="e" * 64,
+                prepared_source_baseline=114,
+                candidate_registry_expected_sha256="f" * 64,
+            )
+            manifest = dataclasses.replace(
+                manifest,
+                source_kind="prepared_artifact",
+                release_tag=None,
+                release_commit=None,
+                candidate_plist_sha256=helper.sha256(candidate_plist),
+                rollback_plist_sha256=helper.sha256(rollback_plist),
+                transition_timeout_secs=helper.DEFAULT_TRANSITION_TIMEOUT_SECS,
+                health_timeout_secs=helper.DEFAULT_HEALTH_TIMEOUT_SECS,
+                current_schema_upgrade=upgrade,
+            )
+            with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+                helper, "validate_manifest_mode"
+            ), mock.patch.object(
+                helper,
+                "_current_schema_registry",
+                side_effect=AssertionError("database registry opened by read-only handoff"),
+            ), mock.patch.object(
+                helper,
+                "validate_current_schema_database",
+                side_effect=AssertionError("database opened by read-only handoff"),
+            ):
+                validated = helper.validate_pre_disruption_handoff(manifest)
+            self.assertEqual(validated.candidate_plist, candidate_plist)
+
+            candidate_plist.write_bytes(plistlib.dumps({"Program": str(target_binary)}))
+            manifest = dataclasses.replace(
+                manifest,
+                candidate_plist_sha256=helper.sha256(candidate_plist),
+            )
+            with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+                helper, "validate_manifest_mode"
+            ):
+                with self.assertRaisesRegex(helper.ActivationError, "label does not match"):
+                    helper.validate_pre_disruption_handoff(manifest)
+
+            manifest = dataclasses.replace(
+                manifest,
+                transition_timeout_secs=helper.DEFAULT_TRANSITION_TIMEOUT_SECS + 1,
+            )
+            with self.assertRaisesRegex(helper.ActivationError, "transition_timeout_secs"):
+                helper.validate_pre_disruption_handoff(manifest)
+
+    def test_activation_consumes_pre_disruption_handoff_before_preparing_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = FakeLaunchctl(manifest)
+            launchctl.events = []
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(
+                helper,
+                "validate_pre_disruption_handoff",
+                side_effect=helper.ActivationError("read-only admission rejected"),
+            ) as validate, mock.patch.object(helper, "prepare_atomic_install") as prepare:
+                with self.assertRaisesRegex(helper.ActivationError, "read-only admission rejected"):
+                    helper.activate(manifest)
+            validate.assert_called_once_with(manifest)
+            prepare.assert_not_called()
+            self.assertNotIn("stop", launchctl.events)
+            self.assertNotIn("start", launchctl.events)
+
     def test_paired_sqlite_backup_is_private_and_context_bound(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as td:
