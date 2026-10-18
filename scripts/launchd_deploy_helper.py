@@ -2206,8 +2206,8 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
         manifest.candidate_plist_sha256,
         "candidate plist",
     )
+    candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
     if exact_prepared_source114:
-        candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
         _validate_staged_plist_binding(
             candidate_plist_contents,
             manifest_label=manifest.label,
@@ -2226,8 +2226,8 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
             manifest.rollback_plist_sha256,
             "rollback plist",
         )
+        rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
         if exact_prepared_source114:
-            rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
             _validate_staged_plist_binding(
                 rollback_plist_contents,
                 manifest_label=manifest.label,
