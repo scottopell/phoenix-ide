@@ -1,0 +1,19 @@
+{
+  "run": 39146439582,
+  "job": 117731123144,
+  "artifact": 12142589938,
+  "sourceCommit": "0b4bc78aef2fa3382de5729d186f5d8b25981435",
+  "sourceTree": "57b204586f38859784b2800a847423d2d6fbb8b7",
+  "resultSha256": "8b8888a809c14d1f34b03085c43c4ff5562d15f29acc82324681c86316b4f719",
+  "resultBytes": 7639,
+  "validation": "validateResult and functionalPass passed; no browser or server executed during preservation",
+  "scope": "Bare Playwright keepalive synthetic loopback functional observation; not reporter/Phoenix collector/history qualification or performance measurement",
+  "runUrl": "https://github.com/scottopell/phoenix-ide/actions/runs/39146439582",
+  "provenance": {
+    "node": "v26.12.0",
+    "playwright": "1.61.0",
+    "lockSha256": "42552207bd7922e4bc35f75f18fc3091c3f8917d8d996a6206e533f4514dedd0",
+    "browserRevision": "1228",
+    "sourceCommit": "0b4bc78aef2fa3382de5729d186f5d8b25981435"
+  }
+}
