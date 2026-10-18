@@ -484,6 +484,8 @@ def validate_receipt(dev, receipt) -> None:
     reject_manifest(
         downgraded_source114,
         "prepared source114 identity without both qualification fields",
+        expected_classifier=dev.DeployManifestKind.UNKNOWN,
+        reject_helper=False,
     )
 
     paired_fields = (
