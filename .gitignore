@@ -36,3 +36,8 @@ scripts/install.sh
 ui/qa-artifacts/
 qa-artifacts/
 ui/.artifacts/
+
+# Distinct qualification artifacts; never production source or embedded UI
+ui/dist-controlled-functional/
+ui/controlled-functional-build.json
+ui/stock-natural-build.json

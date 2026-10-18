@@ -5539,8 +5539,23 @@ fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
         AppError::Internal(message) | AppError::TypedInternal { message, .. } => {
             (message, ErrorKind::ServerError)
         }
+        AppError::TranscriptSnapshotChanged => (
+            "transcript changed during opening observation read".to_string(),
+            ErrorKind::ServerError,
+        ),
         AppError::Forbidden(message) => (message, ErrorKind::Auth),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_instability_maps_to_server_error() {
+    let (message, kind) = app_error_to_kind(AppError::TranscriptSnapshotChanged);
+    assert_eq!(
+        message,
+        "transcript changed during opening observation read"
+    );
+    assert!(matches!(kind, ErrorKind::ServerError));
 }
 
 #[cfg(test)]

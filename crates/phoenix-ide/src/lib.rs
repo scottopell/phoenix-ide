@@ -3,6 +3,10 @@
 //! A Rust backend implementing a conversation state machine for
 //! interacting with LLM agents.
 
+#[cfg(test)]
+#[path = "opening_qualifier_tests.rs"]
+mod opening_qualifier;
+
 mod analytics;
 mod api;
 mod chain_qa;

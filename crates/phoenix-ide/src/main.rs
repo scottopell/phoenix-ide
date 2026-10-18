@@ -42,6 +42,9 @@ fn server_failure_disposition(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    phoenix_browser::process_group::enter_chrome_exec()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    phoenix_browser::process_group::ChromeExecShim::install()?;
     let invocation = parse_invocation(std::env::args().skip(1))?;
     let records_fatal_diagnostics =
         matches!(invocation, Invocation::Server | Invocation::ServerCommand);

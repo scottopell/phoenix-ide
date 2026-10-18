@@ -12,13 +12,20 @@ import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
 import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { getProductConversationScenario } from '../fixtures/productConversation/scenarios';
-import { api, type Conversation, type Message, type ProductConversationSnapshotView } from '../api';
+import { api, type Conversation, type Message, type ProductConversationHistorySnapshotView as ProductConversationSnapshotView } from '../api';
 import type { RenderUnit } from '../conversation/renderUnits';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { VirtualTranscriptHandle, VirtualTranscriptProps } from '../components/VirtualTranscript';
 import { notifyProductConversationSnapshotChanged } from '../notifications';
 import { useConnection } from '../hooks/useConnection';
 import type { InitPayload } from '../conversation/atom';
+vi.mock('../hooks/conversationViewTelemetry', async importOriginal => {
+  const actual = await importOriginal<typeof import('../hooks/conversationViewTelemetry')>();
+  return { ...actual, ViewJourneyReporter: class extends actual.ViewJourneyReporter {
+    constructor() { super({ sampleRate: 1, send: async () => new Response(null, { status: 204 }) }); }
+  } };
+});
+
 
 const probe = vi.hoisted(() => ({
   structuralRenders: 0,
@@ -46,6 +53,10 @@ vi.mock('../components/VirtualTranscript', async () => {
         scrollToTail: probe.scrollToTail,
         setTailFollowAllowed: (allowed) => { probe.followAllowed = allowed; },
         scrollToIndex: () => {},
+        scrollToOwnedIndex: () => {},
+        completePosition: () => {},
+        interruptPosition: () => {},
+        cancelPosition: () => {},
         scrollBy: () => {},
         isProgrammaticScroll: () => false,
         captureVisibleAnchor: () => null,
@@ -95,7 +106,7 @@ vi.mock('../utils/syntaxHighlighter', () => ({ SyntaxHighlighter: () => null, on
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
   return { ...actual, api: { ...actual.api,
-    getProductConversationSnapshot: vi.fn(),
+    getProductConversationHistorySnapshot: vi.fn(),
     reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
   } };
 });
@@ -163,12 +174,13 @@ beforeEach(() => {
   probe.scrollToTail.mockClear();
   commits.length = 0;
   localStorage.clear();
-  const fixture = getProductConversationScenario('desktop-multi-segment-qa-work').snapshot!;
+  const scenario = getProductConversationScenario('desktop-multi-segment-qa-work');
+  const fixture = scenario.snapshot!;
   latestRow = fixture.latest_transcript_row_id;
   snapshot = { ...fixture, chain_qa_compatibility: null, writable_transcript_row_id: latestRow,
-    segments: fixture.segments.map((segment) => ({ ...segment, handoff: null,
+    segments: fixture.segments.map((segment) => ({ ...segment,
       messages: segment.transcript_row_id === latestRow ? [] : segment.messages })) };
-  vi.mocked(api.getProductConversationSnapshot).mockImplementation(async () => snapshot);
+  vi.mocked(api.getProductConversationHistorySnapshot).mockImplementation(async () => snapshot);
   seed(latestRow);
   vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(1000);
   vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(400);
@@ -195,7 +207,7 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     commits.length = 0;
 
     act(() => store.dispatch(latestRow, {
-      type: 'sse_message', sequenceId: store.getSnapshot(latestRow).lastAppliedEventSeq + 1,
+      type: 'sse_message', opening: null, sequenceId: store.getSnapshot(latestRow).lastAppliedEventSeq + 1,
       message: message(acknowledgedId, latestRow, 2, 'user', 'ACKNOWLEDGED_SEND_MARKER'),
     }));
 
@@ -234,7 +246,7 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     commits.length = 0;
     probe.scrollToTail.mockClear();
     act(() => store.dispatch(latestRow, {
-      type: 'sse_message', sequenceId: store.getSnapshot(latestRow).lastAppliedEventSeq + 1,
+      type: 'sse_message', opening: null, sequenceId: store.getSnapshot(latestRow).lastAppliedEventSeq + 1,
       message: message('ordinary-final', latestRow, 2, 'agent', 'RESPONSE_MARKER finalized'),
     }));
     expect(commits.length).toBeGreaterThan(0);
@@ -311,7 +323,7 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     const renders = probe.structuralRenders;
     commits.length = 0;
     act(() => store.dispatch(latestRow, {
-      type: 'sse_message', sequenceId: store.getSnapshot(latestRow).lastAppliedEventSeq + 1,
+      type: 'sse_message', opening: null, sequenceId: store.getSnapshot(latestRow).lastAppliedEventSeq + 1,
       message: { ...staleMessage, message_id: 'retired-atom-arrival', content: { text: 'RETIRED_ATOM_MARKER' } },
     }));
     expect(store.getSnapshot(latestRow).messages.at(-1)!.content).toEqual({ text: 'RETIRED_ATOM_MARKER' });
@@ -376,7 +388,7 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     const payload: InitPayload = {
       conversation: store.getSnapshot(latestRow).conversation!,
       messages: [{ ...staleMessage, content: { text: 'FRESH_INIT_MARKER' } }],
-      steeringMessages: [], phase: { type: 'llm_requesting', attempt: 1 }, contextWindow: { used: 0 },
+      opening: null, steeringMessages: [], phase: { type: 'llm_requesting', attempt: 1 }, contextWindow: { used: 0 },
       transcriptGeneration: 1, streamIncarnation: 'retry-stream',
       lastAppliedEventSeq: 10, pendingAnchorSequenceId: 10, pendingEvents: [], pendingTruncated: false,
       transcriptCoverage: 'complete',

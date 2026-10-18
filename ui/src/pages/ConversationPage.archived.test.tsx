@@ -73,7 +73,7 @@ function makeConnectionInit(conversation: Conversation): InitPayload {
   return {
     conversation,
     messages: [{ ...historyMessage, conversation_id: conversation.id }],
-    steeringMessages: [],
+    opening: null, steeringMessages: [],
     phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,

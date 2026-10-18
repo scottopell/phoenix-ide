@@ -66,6 +66,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     conversation,
     messages: raw.messages || [],
     steeringMessages: raw.steering_messages,
+    opening: raw.opening,
     phase: parseConversationState(conversation?.state),
     contextWindow: { used: raw.context_window_size ?? 0 },
     transcriptGeneration: raw.transcript_generation,
@@ -115,6 +116,7 @@ function snapshotPayload(conversation: Conversation, messages: Message[], contex
     conversation,
     messages,
     steeringMessages: [],
+    opening: null,
     phase: conversation.state ? parseConversationState(conversation.state) : { type: 'idle' },
     contextWindow: { used: contextWindowSize },
     transcriptGeneration: conversation.transcript_generation ?? 1,
@@ -195,7 +197,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         dispatch({
           type: 'atom',
           atomAction: {
-            type: 'sse_message',
+            type: 'sse_message', opening: res.output.opening,
             message: res.output.message,
             sequenceId: res.output.sequence_id,
           },
@@ -211,7 +213,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         dispatch({
           type: 'atom',
           atomAction: {
-            type: 'sse_message_updated',
+            type: 'sse_message_updated', opening: data.opening,
             sequenceId: data.sequence_id,
             messageId: data.message_id,
             ...(data.transcript_generation != null && { transcriptGeneration: data.transcript_generation }),
