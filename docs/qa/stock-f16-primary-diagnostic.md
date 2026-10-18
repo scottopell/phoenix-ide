@@ -2,14 +2,17 @@
 
 ## Scope and prior outcome
 
-This is diagnostic source preparation, not a new runtime result or permission to
-launch one. Parent integration reviews before push. No sampling/cohort-fill,
-readiness, timeout, admission, exporter, production, or performance change is made.
+This is diagnostic source preparation, not a new runtime result. After parent
+review, the parent is authorized to publish the reviewed head to PR #942 for
+**one fresh, normal existing hosted stock-build invocation**. This child does not
+push or launch it. No sampling/cohort-fill, readiness, timeout, admission,
+exporter, production, or performance change is made.
 The stock default remains 0.25. The pinned app and its four telemetry driver
 modules are unchanged.
 
 Starting harness: `f899c119f6b3103b56c4d33a3e45d82725a4eb35`, tree
-`6e67bb060738985da01b1af5b26ec921b940dfdf`.
+`6e67bb060738985da01b1af5b26ec921b940dfdf`. Reviewed diagnostic precursor:
+`19cf7518c4d0cd4ea8d7d01aca6401b437403f3f`.
 App: `f16afb227d9336a863c0b0345960ea9a6d62b7c7`, tree
 `369305dcd94862d4ee12e7af9fd463d5da14d808`.
 
@@ -38,9 +41,11 @@ stack, but raw history evidence is not uploaded by the stock lane.
 
 Before importing/executing the stock module, the harness diagnostic extractor
 reads at most 128 KiB per trusted source and checks its **actual** SHA256 against
-the existing two pins. It builds a finite table of assertion-token line/column
-positions from those verified bytes. In the existing joint-stage catch, before
-harness context cleanup, it projects only:
+the existing two pins. It admits only an explicit map of **166 actual assertion
+calls** (153 main-module, 13 diagnostics-helper), checking the exact method token
+at each fixed line/column against those verified bytes. It does not discover
+sites by searching comments, strings or other source text. In the existing
+joint-stage catch, before harness context cleanup, it projects only:
 
 - schema version 1; fixed phase; error code `ERR_ASSERTION` or `unknown`;
 - resolution `verified_assertion_site` or `unknown`;
@@ -53,7 +58,14 @@ non-Node-internal frame only, with an exact trusted pathname/file URL and an exa
 assertion token. It does not search lower callers after an unknown frame. Unknown
 modules, URLs with queries, source hash mismatches, unsupported stack formats,
 nonassertion locations and excessive stack/message sizes resolve to `unknown`;
-no raw substring becomes a diagnostic field.
+no raw substring becomes a diagnostic field. Generic bounded-observation,
+Playwright and transport Errors remain `unknown`, even if their stack points at
+an assertion call. The seven primary phases are the existing **joint wrapper**
+phases (`runtime_import`, `export_admission`, `context_acquisition`,
+`session_authentication`, `page_acquisition`, `module_checks`,
+`result_validation`), not an internal initial/terminal/pagehide/lifecycle state
+machine. An unknown first nonnative throw frame is never replaced by a more
+convenient trusted caller.
 
 The projected primary is captured before cleanup and is not recomputed from a
 mutated Error. Up to two harness secondary diagnostics (context cleanup and
@@ -63,15 +75,16 @@ code cannot be reconstructed; stock cleanup strings do not become invented
 assertion locations. This captures the surfaced stock primary, not a universal
 first-throw debugger or instrumentation of every rejected promise.
 
-The publisher independently rehashes its trusted pinned source, validates the
-exact token and fixed ID, and projects primary and secondary fields separately.
+The publisher independently rehashes its trusted pinned source, admits only its
+own fixed call-site map, validates the exact token and fixed ID, and projects
+primary and secondary fields separately.
 It copies no raw message, stack, function name, filesystem path, network URL,
 header, credential, screenshot, database or OTLP bytes. Existing f899 check/phase
 inventories and all numeric trial distributions are unchanged. Missing diagnostics
 in old artifacts retain an explicit missing-field/artifact boundary, not success.
 No new trace/OTLP publication is added.
 
-## Reuse gate: do not launch or rebuild
+## One fresh hosted build after parent review
 
 Artifact12122620564 cannot satisfy the existing unmodified joint CLI as downloaded:
 
@@ -95,15 +108,36 @@ receipt, manifest, source identity or admission contract was rewritten. The only
 workflow change retains the controlled dist and hidden files in the existing
 stock artifact upload for future completeness; it does **not** recover missing
 bytes or make this old artifact admissible. No new job, conditional runtime path,
-runner fanout, fetch, install or build is introduced.
+runner fanout or reuse framework is introduced.
 
-Parent gate: obtain the **original, receipt-matching** missing UI bytes if still
-retained and decide the explicit source-binding authority for a successor harness
-before preparing a hosted reuse invocation. Do not invent a receipt, relax the
-existing CLI, rebuild under this packet, or claim the diagnostic runtime occurred.
-No reusable hosted command is claimed while these gates remain open.
+These missing output bytes and the current-harness receipt binding justify a
+**fresh normal hosted stock build**, rather than an indefinite reuse gate or a
+rewritten old receipt. After review, the parent updates the existing same-repo
+PR #942 (`prepare/exact-f16-stock-admission`) with the reviewed commit. Its normal
+automatic PR event runs the existing `qualify-history-realserver` lane: pinned
+stock UI and receiving libtest, separate controlled UI, genuine two-build binding,
+then the existing stock joint CLI once. The existing narrow upload allowlist now
+retains controlled dist and hidden files. The child runs none of this locally.
 
-### Read-only gate reproduction
+The harness checkout uses `github.event.pull_request.head.sha`.
+`opening-codegen-receipt.json` records that exact `harness_source`; the existing
+producer inherits it into `opening-instrumented-receipt.json` and then
+`opening-stock-instrumented-receipt.json`. `identity()` measures the harness git
+HEAD and requires equality. This binds the committed wrapper source to the
+reviewed PR head without inventing a file hash or modifying receipt authority.
+`opening-ui-build-owner.json` itself binds app source/tree and both UI inventories,
+not a separate harness SHA. The existing successful joint receipt additionally
+measures `helper_sha256` from the actual wrapper bytes; no successful joint
+receipt is promised on failure.
+
+This is **one diagnostic invocation**, not a cohort retry: do not pool old/new
+trials, fill missing samples, rerun for acceptance, relax any bound, or infer
+performance clearance. Retain failed/inconclusive outcomes, original before/after
+SQL qualification evidence and earlier failed-run documents. The prior artifact
+and its unknown primary cause remain historical evidence. Do not claim the new
+runtime occurred until its actual receipts exist.
+
+### Historical artifact-completeness reproduction
 
 Set `ARTIFACT_ROOT` to the existing downloaded artifact directory, then run from
 this harness checkout. This only reads manifests and hashes existing build files;
@@ -146,12 +180,19 @@ with invalid UNIT-only arguments, to obtain a real Node AssertionError at
 `f16-qualify-view-telemetry-L530-C10`. **That site is a test control, not the prior
 incident's identified cause.** Other controls exercise message/frame injection,
 unknown same-basename modules, query-bearing locations, wrong line/column/hash,
-actual mismatched source bytes, all trusted assertion-token positions, and cleanup
-that mutates/fails after a captured primary. Publication tests keep cleanup
-separate, reject malicious fields, and preserve existing trial diagnostics.
+actual mismatched source bytes, comment/string decoys, and cleanup that
+mutates/fails after a captured primary. All 166 fixed call positions are exercised
+with **real Node assertion throws** in source-shaped VM functions, without
+rewriting their stacks; the actual pinned helper also throws directly. These
+verify Node's one-based method-token column convention, not just matching a
+synthetic expected frame. Real multiline messages with fake trusted frames,
+foreign same-basename throw sites, wrong positions, and an earlier trusted
+nonassertion throw cannot select a convenient caller. Publication round-trips
+those real-stack projections through its independent fixed map, keeps cleanup
+separate, rejects malicious fields, and preserves existing trial diagnostics.
 
-Validation performed: Node v26.8.2, Python 3.12.13; 165 Node tests, 12 publication
-tests, 17 stock-preparation tests and 8 artifact-admission tests passed.
+Validation performed: Node v26.8.2, Python 3.12.13; 170 Node tests, 12 publication
+tests, 18 stock-preparation tests and 8 artifact-admission tests passed.
 Syntax/diff checks passed. Only cached
 compiler-free tests and read-only artifact checks were run. Full `./dev.py check`,
 hosted execution, browser/server/SQL activity and an actual diagnostic rerun were
@@ -161,13 +202,12 @@ context was not reverified.
 ## Checksummed retention pointers
 
 The GitHub pointer above is the portable artifact authority; its expiry/retrieval
-was not rechecked over the network. The provided local copy is a **host-only**
-retention pointer, not a browser-resolvable path:
-
-`/Users/scottopell/dev/phoenix-ide/.phoenix/worktrees/7c2d9446-46a1-42b4-bbad-c8ddfbfddf7f/target/coordinator-evidence/continuous-history/implementation/.phoenix/evidence/continuous-history/integration7af-source-only/landing/stock-natural-followup/bb9f-stock-artifact`
-
-Paths below are relative to that artifact root; checksums were measured read-only.
-No private DB, raw runtime log or secret is copied into this repository packet.
+was not rechecked over the network. The server-local external fixture location
+stays outside this repository. Its portable identification is artifact
+`12122620564` / run `39088730131` plus the file checksums below, not a private host
+path. File names below are relative to that artifact root; these historical
+checksums were measured read-only. No private DB, raw runtime log or secret is
+copied into this repository packet.
 
 | Retained file | Bytes | SHA256 |
 |---|---:|---|
