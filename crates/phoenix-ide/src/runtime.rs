@@ -15407,6 +15407,7 @@ mod scope_liveness_tests {
         let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
         let terminal_id = "startup-a-terminal-with-queue";
         let recovering_id = "startup-z-interrupted-request";
+        manager.start_sub_agent_handler().await;
         materialize_restart_direct_turn(&manager, recovering_id).await;
         manager.db().reset_all_to_idle().await.unwrap();
         manager
