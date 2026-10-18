@@ -106,7 +106,7 @@ CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES = 1024 * 1024
 CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES = 128
 CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 CURRENT_REPAIR_QUARANTINE_ATTEMPTS = 8
-CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES = 2 + 2 * CURRENT_REPAIR_QUARANTINE_ATTEMPTS
+CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES = 2 + 3 * CURRENT_REPAIR_QUARANTINE_ATTEMPTS
 CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES = (
     CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES * CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES
 )
@@ -3254,12 +3254,13 @@ def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Laun
         stopped = True
     except Exception:
         stopped = False
-    persistence_fenced = _quarantine_current_repair_persistence(parent)
+    _quarantine_current_repair_persistence(parent)
     try:
         require_launchd_absence(parent.label, parent.uid)
         stopped = True
     except Exception:
         stopped = False
+    persistence_fenced = _quarantine_current_repair_persistence(parent)
     truth = "failed_stopped" if stopped and persistence_fenced else "stop_unconfirmed"
     print(
         f"current-schema repair teardown: {truth}; persistent auto-start "

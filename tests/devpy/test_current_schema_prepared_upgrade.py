@@ -3550,6 +3550,26 @@ class CurrentSchemaRepairTests(unittest.TestCase):
         self.assertEqual(self.status().state, "failed_stopped")
         self.assertTrue(Path(self.parent.active_path).exists())
 
+    def test_target_recreated_during_final_absence_probe_is_quarantined(self):
+        self.sealed()
+        self.environment()
+        target = Path(self.parent.target_plist)
+        absence_checks = [0]
+
+        def require_absence(*_args):
+            absence_checks[0] += 1
+            if absence_checks[0] == 2:
+                helper.atomic_write(target, b"recreated during final absence probe")
+
+        with mock.patch.object(helper, "require_launchd_absence", side_effect=require_absence):
+            helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
+        self.assertEqual(absence_checks[0], 2)
+        self.assertEqual(self.status().state, "failed_stopped")
+        self.assertFalse(target.exists())
+        quarantines = helper._current_repair_quarantines(self.parent)
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), b"recreated during final absence probe")
+
     def test_failure_settlement_never_opens_quarantined_evidence(self):
         self.sealed()
         self.environment()
@@ -3578,10 +3598,10 @@ class CurrentSchemaRepairTests(unittest.TestCase):
             helper.os, "rename", side_effect=rename
         ):
             helper._record_current_repair_failure(self.path, self.parent, self.launchctl)
-        self.assertEqual(rename_count[0], 4)
+        self.assertEqual(rename_count[0], 6)
         self.assertEqual(self.status().state, "stop_unconfirmed")
         self.assertTrue(target.exists())
-        self.assertEqual(len(helper._current_repair_quarantines(self.parent)), 4)
+        self.assertEqual(len(helper._current_repair_quarantines(self.parent)), 6)
         self.assertTrue(Path(self.parent.active_path).exists())
 
     def test_quarantine_digest_refuses_symlink_fifo_oversize_and_mutation(self):
