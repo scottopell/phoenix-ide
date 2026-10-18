@@ -7672,7 +7672,7 @@ async fn rename_conversation(
     Path(id): Path<String>,
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    if req.slug.trim().is_empty() {
+    if req.name.trim().is_empty() {
         return Err(AppError::BadRequest(
             "conversation name must not be empty".to_string(),
         ));
@@ -7697,12 +7697,7 @@ async fn rename_conversation(
         .db()
         .rename_conversation(&id, &req.name)
         .await
-        .map_err(|e| match e {
-            crate::db::DbError::SlugExists(_) => {
-                AppError::BadRequest("Slug already exists".to_string())
-            }
-            _ => AppError::NotFound(e.to_string()),
-        })?;
+        .map_err(super::product_conversations::db_to_app)?;
 
     conversation_response(&state, &id).await
 }
@@ -17263,7 +17258,7 @@ mod regenerate_conversation_name_tests {
             State(state.clone()),
             Path("rename-history".to_string()),
             Json(RenameRequest {
-                slug: "  ".to_string(),
+                name: "  ".to_string(),
             }),
         )
         .await;
@@ -17275,16 +17270,18 @@ mod regenerate_conversation_name_tests {
             axum::http::StatusCode::BAD_REQUEST
         );
         let root = state.db.get_conversation("rename-history").await.unwrap();
-        sqlx::query("UPDATE product_conversations SET lifecycle = 'history' WHERE id = ?1")
-            .bind(root.product_conversation_id.as_str())
-            .execute(state.db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .unwrap();
         let closed = rename_conversation(
             State(state.clone()),
             Path(root.id.clone()),
             Json(RenameRequest {
-                slug: "Must Not Replace History".to_string(),
+                name: "Must Not Replace History".to_string(),
             }),
         )
         .await;
