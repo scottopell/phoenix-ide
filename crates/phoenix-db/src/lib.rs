@@ -9114,14 +9114,12 @@ impl Database {
         };
         let intent_json = serde_json::to_string(&intent)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let base_slug = {
-            let slug = schema::slug_from_title(&snapshot.task_title);
-            if slug.is_empty() {
-                "conversation".to_string()
-            } else {
-                slug
-            }
-        };
+        let root_name = snapshot.task_title.trim().to_string();
+        if root_name.is_empty() {
+            return Err(DbError::ContinuationPrecondition(
+                "approved task title must not be empty".to_string(),
+            ));
+        }
         let (scope_id, authority_kind, environment) =
             Self::new_scope_for_conversation(&parent.cwd, &conv_mode_columns(&ConvMode::Direct));
 
@@ -9177,45 +9175,33 @@ impl Database {
             .await?;
         Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
             .await?;
-        let mut slug = base_slug.clone();
-        for attempt in 0..=20 {
-            let title = schema::title_from_slug(&slug);
-            match sqlx::query(
-                "INSERT INTO conversations (
+        let slug = conversation_name::allocate_slug_tx(&mut tx, &root_name, &new_id).await?;
+        sqlx::query(
+            "INSERT INTO conversations (
                      id, product_conversation_id, slug, title, parent_conversation_id,
                      user_initiated, state, state_kind, state_updated_at, created_at, updated_at,
                      archived, model, effort, project_id, desired_base_branch, seed_parent_id,
                      seed_label, llm_language, cm_kind, runtime_role, work_scope_id, service_tier
                  ) VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?7, ?7, ?7, 1, ?8, ?9, ?10, ?11,
                            NULL, ?12, ?13, 'direct', 'user', ?14, ?15)",
-            )
-            .bind(&new_id)
-            .bind(product_id.as_str())
-            .bind(&slug)
-            .bind(title)
-            .bind(&state_json)
-            .bind(conv_state_kind(&state))
-            .bind(&now_str)
-            .bind(parent.model.as_deref())
-            .bind(parent.effort.map(ModelEffort::as_wire_name))
-            .bind(parent.project_id.as_deref())
-            .bind(None::<&str>)
-            .bind(&snapshot.title)
-            .bind(parent.llm_language.as_str())
-            .bind(scope_id.as_str())
-            .bind(parent.service_tier.as_wire_name())
-            .execute(&mut *tx)
-            .await
-            {
-                Ok(_) => break,
-                Err(sqlx::Error::Database(error))
-                    if is_sqlite_unique_constraint(error.as_ref()) && attempt < 20 =>
-                {
-                    slug = format!("{base_slug}-{}", attempt + 2);
-                }
-                Err(error) => return Err(DbError::Sqlx(error)),
-            }
-        }
+        )
+        .bind(&new_id)
+        .bind(product_id.as_str())
+        .bind(&slug)
+        .bind(&root_name)
+        .bind(&state_json)
+        .bind(conv_state_kind(&state))
+        .bind(&now_str)
+        .bind(parent.model.as_deref())
+        .bind(parent.effort.map(ModelEffort::as_wire_name))
+        .bind(parent.project_id.as_deref())
+        .bind(None::<&str>)
+        .bind(&snapshot.title)
+        .bind(parent.llm_language.as_str())
+        .bind(scope_id.as_str())
+        .bind(parent.service_tier.as_wire_name())
+        .execute(&mut *tx)
+        .await?;
         let source_state = ConvState::Idle;
         sqlx::query(
             "UPDATE conversations
@@ -17752,7 +17738,7 @@ mod tests {
         assert_eq!(conversation.slug.as_deref(), Some("human-title"));
         assert_eq!(conversation.cwd, "/tmp/name-race");
         assert_eq!(conversation.desired_base_branch.as_deref(), Some("main"));
-        assert_eq!(conversation.model, "name-race-model");
+        assert_eq!(conversation.model.as_deref(), Some("name-race-model"));
         let stage: String = sqlx::query_scalar(
             "SELECT stage FROM conversation_creation_jobs WHERE id = 'job-name-race'",
         )
@@ -28355,6 +28341,70 @@ mod tests {
             db.get_conversation("handoff-parent").await.unwrap().state,
             ConvState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn task_handoff_shell_allocates_identity_safe_slug_before_worker() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("handoff-parent", "handoff-parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        // The title-derived route is unavailable both as a product UUID and as
+        // an accepted conversation ID, before the provisioning worker runs.
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('approve-fresh', 'ordinary', 'open')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.create_conversation(
+            "approve-fresh-2",
+            "unrelated human name",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "27009".to_string(),
+            task_title: "  Approve Fresh  ".to_string(),
+            title: "Approval display title".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "reviewed plan".to_string(),
+            task_file: "tasks/27009-p1-ready--approve-fresh.md".to_string(),
+            artifact_body: "# Approve Fresh\n\nreviewed plan\n".to_string(),
+        };
+
+        let shell = db
+            .create_task_approval_handoff_creation_job("handoff-parent", &approval)
+            .await
+            .unwrap();
+
+        assert_eq!(shell.title.as_deref(), Some("Approve Fresh"));
+        assert_eq!(shell.slug.as_deref(), Some("approve-fresh-3"));
+        let resolved = db
+            .resolve_ordinary_product_conversation("approve-fresh-3")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.product_conversation_id,
+            shell.product_conversation_id
+        );
+        let aggregate = db
+            .get_ordinary_product_conversation(&shell.product_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(aggregate.root.conversation.id, shell.id);
+        assert!(matches!(shell.state, ConvState::Provisioning { .. }));
+        let job = db
+            .get_conversation_creation_job_for_conversation(&shell.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(job.protocol.status, CreationStatus::Accepted));
     }
 
     #[tokio::test]

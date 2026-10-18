@@ -2197,14 +2197,16 @@ async fn provision_conversation(
         .await
         .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
 
-    let baseline_conversation = manager
-        .db()
-        .get_conversation(&job.conversation_id)
-        .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
-    let name_baseline = ConversationNameBaseline {
-        title: baseline_conversation.title,
-        slug: baseline_conversation.slug,
+    let name_baseline = {
+        let conversation = manager
+            .db()
+            .get_conversation(&job.conversation_id)
+            .await
+            .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+        ConversationNameBaseline {
+            title: conversation.title,
+            slug: conversation.slug,
+        }
     };
     let seed_title = intent.seed_label.clone().filter(|s| !s.trim().is_empty());
     let mut title_source = intent.text.trim().to_string();
