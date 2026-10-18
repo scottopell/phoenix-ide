@@ -936,7 +936,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         baseline = (
             114
             if manifest.source_kind == "published_release"
-            or manifest.current_schema_upgrade.prepared_source_114 is not None
+            or isinstance(manifest.current_schema_upgrade, helper.PreparedSource114Upgrade)
             else 123
         )
         pending = [item for item in compiled_ledger() if item[0] > baseline]
