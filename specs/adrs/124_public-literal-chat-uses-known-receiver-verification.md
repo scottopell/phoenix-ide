@@ -1,8 +1,8 @@
-# ADR-118: Public literal chat uses known-receiver verification
+# ADR-124: Public literal chat uses known-receiver verification
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
-- **Affects:** REQ-API-030; built-in `PhoenixApiDestinationAuthority` guidance
+- **Affects:** REQ-API-031; built-in `PhoenixApiDestinationAuthority` guidance
 
 ## Context
 
@@ -32,7 +32,7 @@ Require durable policy evidence for nondefault replay. Direct-turn receipts and 
 
 ## References
 
-- [API requirements](../api/requirements.md), REQ-API-030
+- [API requirements](../api/requirements.md), REQ-API-031
 - [Compatibility requirements](../compatibility/requirements.md), REQ-COMP-001
 - [Built-in guidance](../builtin-skills/builtin-skills.allium), `PhoenixApiDestinationAuthority`
 - ADR-034 (explicit compatibility policy), ADR-113 (non-exhaustive API recipes)
