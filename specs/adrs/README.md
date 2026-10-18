@@ -139,6 +139,7 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
+| [128](128_repair-failure-stopped-truth-includes-persistence.md) | Repair failure stopped truth includes persistent auto-start absence | Accepted | REQ-LDD-025 |
 | [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
 | [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
 | [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |

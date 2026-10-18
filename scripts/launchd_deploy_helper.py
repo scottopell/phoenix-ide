@@ -17,6 +17,7 @@ import math
 import os
 import plistlib
 import re
+import secrets
 import shutil
 import ssl
 import subprocess
@@ -100,6 +101,25 @@ CURRENT_REPAIR_VERSION = "0.13.0-rc.4"
 CURRENT_REPAIR_REGISTRY_SHA256 = PREPARED_SOURCE114_REGISTRY_SHA256
 CURRENT_REPAIR_DIRECTORY = "current-schema-repair"
 CURRENT_REPAIR_RUNTIME_FENCE_SHA256 = hashlib.sha256(b"").hexdigest()
+CURRENT_REPAIR_SERVICE_LABEL = "com.phoenix-ide.server"
+CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES = 1024 * 1024
+CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES = 128
+CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+CURRENT_REPAIR_QUARANTINE_ATTEMPTS = 8
+CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES = 2 + 3 * CURRENT_REPAIR_QUARANTINE_ATTEMPTS
+CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES = (
+    CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES * CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class CurrentRepairFileToken:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3014,19 +3034,216 @@ def _repair_publication_path(parent: Manifest) -> Path:
     return target.parent / f".{target.name}.current-schema-repair-{parent.transaction_id}"
 
 
+def _current_repair_publication_quarantine_prefix(parent: Manifest) -> str:
+    target = Path(parent.target_plist)
+    return f".{target.name}.current-schema-repair-publication-{parent.transaction_id}-"
+
+
+def _retire_current_repair_publication(runtime: Manifest, publication: Path) -> Path:
+    target = Path(runtime.target_plist)
+    retired = target.parent / f"{_current_repair_publication_quarantine_prefix(runtime)}{secrets.token_hex(16)}"
+    try:
+        os.rename(publication, retired)
+    except FileNotFoundError as exc:
+        raise ActivationError("repair publication disappeared before retirement") from exc
+    fsync_dir(target.parent)
+    _repair_private(retired)
+    if _regular_file_digest(retired, "retired repair publication") != runtime.candidate_plist_sha256:
+        raise ActivationError("repair publication changed before retirement")
+    return retired
+
+
+def _commit_current_repair_plist(runtime: Manifest, publication: Path) -> None:
+    target = Path(runtime.target_plist)
+    if _current_repair_target_plist_digest(runtime) is None:
+        try:
+            os.link(publication, target)
+        except FileExistsError:
+            pass
+    if _current_repair_target_plist_digest(runtime) != runtime.candidate_plist_sha256:
+        raise ActivationError("persistent target plist appeared with unknown bytes during publication")
+    _retire_current_repair_publication(runtime, publication)
+    if _current_repair_target_plist_digest(runtime) != runtime.candidate_plist_sha256:
+        raise ActivationError("published repair plist changed during durable publication")
+
+
 def _publish_current_repair(runtime: Manifest, parent: Manifest) -> None:
     publication = _repair_publication_path(parent)
     if os.path.lexists(publication):
-        _repair_private(publication)
-        verify_staged(str(publication), runtime.candidate_plist_sha256, "owned repair publication")
-        publication.unlink()
-        fsync_dir(publication.parent)
+        _retire_current_repair_publication(runtime, publication)
     os.link(runtime.candidate_plist, publication)
     fsync_dir(publication.parent)
-    commit_atomic_install(publication, Path(runtime.target_plist))
+    _commit_current_repair_plist(runtime, publication)
+
+
+def _file_metadata_token(metadata: os.stat_result) -> CurrentRepairFileToken:
+    return CurrentRepairFileToken(
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _regular_file_path_token(path: Path) -> CurrentRepairFileToken | None:
+    try:
+        return _file_metadata_token(os.stat(path, follow_symlinks=False))
+    except FileNotFoundError:
+        return None
+
+
+def _regular_file_evidence(path: Path, label: str) -> tuple[str, CurrentRepairFileToken] | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ActivationError(f"{label} is not a regular file")
+        if before.st_size > CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES:
+            raise ActivationError(f"{label} exceeds the bounded plist evidence size")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(remaining, CURRENT_REPAIR_PLIST_EVIDENCE_MAX_BYTES))
+            if not chunk:
+                raise ActivationError(f"{label} changed while being read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ActivationError(f"{label} changed while being read")
+        after = os.fstat(fd)
+        after_token = _file_metadata_token(after)
+        if _file_metadata_token(before) != after_token:
+            raise ActivationError(f"{label} changed while being read")
+        if _regular_file_path_token(path) != after_token:
+            raise ActivationError(f"{label} path changed while being read")
+        return digest.hexdigest(), after_token
+    finally:
+        os.close(fd)
+
+
+def _regular_file_digest(path: Path, label: str) -> str | None:
+    evidence = _regular_file_evidence(path, label)
+    return None if evidence is None else evidence[0]
+
+
+def _current_repair_target_plist_digest(parent: Manifest) -> str | None:
+    return _regular_file_digest(Path(parent.target_plist), "published repair plist")
+
+
+def _current_repair_quarantine_prefix(parent: Manifest) -> str:
+    target = Path(parent.target_plist)
+    return f".{target.name}.current-schema-repair-fence-{parent.transaction_id}-"
+
+
+def _current_repair_quarantines(parent: Manifest) -> list[Path]:
+    target = Path(parent.target_plist)
+    prefixes = (
+        _current_repair_quarantine_prefix(parent),
+        _current_repair_publication_quarantine_prefix(parent),
+    )
+    quarantines = []
+    with os.scandir(target.parent) as entries:
+        for entry in entries:
+            if not entry.name.startswith(prefixes):
+                continue
+            quarantines.append(Path(entry.path))
+            if len(quarantines) > CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES:
+                raise ActivationError("repair plist quarantine entry limit exceeded")
+    return sorted(quarantines)
+
+
+def _current_repair_directory_token(parent: Manifest) -> tuple[int, ...]:
+    metadata = os.stat(Path(parent.target_plist).parent, follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ActivationError("repair plist directory is not a directory")
+    return tuple(
+        getattr(metadata, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_mtime_ns", "st_ctime_ns")
+    )
+
+
+def _current_repair_persistence_owned(
+    repair: CurrentSchemaRepairManifest,
+    parent: Manifest,
+    *,
+    reserve_attempt_headroom: bool = True,
+) -> bool:
+    try:
+        target = Path(parent.target_plist)
+        directory_token = _current_repair_directory_token(parent)
+        quarantines = _current_repair_quarantines(parent)
+        reserved_entries = CURRENT_REPAIR_QUARANTINE_HEADROOM_ENTRIES if reserve_attempt_headroom else 0
+        reserved_bytes = CURRENT_REPAIR_QUARANTINE_HEADROOM_BYTES if reserve_attempt_headroom else 0
+        if len(quarantines) > CURRENT_REPAIR_QUARANTINE_MAX_ENTRIES - reserved_entries:
+            return False
+        quarantine_tokens: dict[Path, CurrentRepairFileToken] = {}
+        target_token: CurrentRepairFileToken | None = None
+        for _pass in range(2):
+            pass_tokens: dict[Path, CurrentRepairFileToken] = {}
+            total_bytes = 0
+            for item in quarantines:
+                evidence = _regular_file_evidence(item, "repair plist quarantine")
+                if evidence is None or evidence[0] != repair.plist_sha256:
+                    return False
+                total_bytes += evidence[1].size
+                if total_bytes > CURRENT_REPAIR_QUARANTINE_MAX_TOTAL_BYTES - reserved_bytes:
+                    return False
+                pass_tokens[item] = evidence[1]
+            if _current_repair_quarantines(parent) != quarantines:
+                return False
+            target_evidence = _regular_file_evidence(target, "published repair plist")
+            if target_evidence is not None and target_evidence[0] != repair.plist_sha256:
+                return False
+            if _current_repair_quarantines(parent) != quarantines:
+                return False
+            quarantine_tokens = pass_tokens
+            target_token = None if target_evidence is None else target_evidence[1]
+        if any(_regular_file_path_token(item) != token for item, token in quarantine_tokens.items()):
+            return False
+        if _regular_file_path_token(target) != target_token:
+            return False
+        return _current_repair_directory_token(parent) == directory_token
+    except Exception:
+        return False
+
+
+def _current_repair_target_absent(target: Path) -> bool:
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _quarantine_current_repair_persistence(parent: Manifest) -> bool:
+    target = Path(parent.target_plist)
+    try:
+        for _attempt in range(CURRENT_REPAIR_QUARANTINE_ATTEMPTS):
+            if _current_repair_target_absent(target):
+                fsync_dir(target.parent)
+                return _current_repair_target_absent(target)
+            quarantine = target.parent / f"{_current_repair_quarantine_prefix(parent)}{secrets.token_hex(16)}"
+            try:
+                os.rename(target, quarantine)
+            except FileNotFoundError:
+                fsync_dir(target.parent)
+                if _current_repair_target_absent(target):
+                    return True
+                continue
+            fsync_dir(target.parent)
+        fsync_dir(target.parent)
+        return _current_repair_target_absent(target)
+    except Exception:
+        return False
 
 
 def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Launchctl) -> None:
+    _quarantine_current_repair_persistence(parent)
     stopped = False
     try:
         launchctl.stop()
@@ -3037,8 +3254,20 @@ def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Laun
         stopped = True
     except Exception:
         stopped = False
-    truth = "failed_stopped" if stopped else "stop_unconfirmed"
-    print(f"current-schema repair teardown: {truth}; original claim retained", file=sys.stderr, flush=True)
+    _quarantine_current_repair_persistence(parent)
+    try:
+        require_launchd_absence(parent.label, parent.uid)
+        stopped = True
+    except Exception:
+        stopped = False
+    persistence_fenced = _quarantine_current_repair_persistence(parent)
+    truth = "failed_stopped" if stopped and persistence_fenced else "stop_unconfirmed"
+    print(
+        f"current-schema repair teardown: {truth}; persistent auto-start "
+        f"{'absent' if persistence_fenced else 'unconfirmed'}; original claim retained",
+        file=sys.stderr,
+        flush=True,
+    )
     try:
         durable = CurrentSchemaRepairStatus.load(path.parent / "status.json", sha256(path))
     except Exception:
@@ -3050,6 +3279,12 @@ def _record_current_repair_failure(path: Path, parent: Manifest, launchctl: Laun
     _write_repair_status(path, failed)
 
 
+def _require_current_repair_persistent_route(parent: Manifest) -> None:
+    expected = Path.home() / "Library" / "LaunchAgents" / f"{CURRENT_REPAIR_SERVICE_LABEL}.plist"
+    if parent.label != CURRENT_REPAIR_SERVICE_LABEL or Path(parent.target_plist) != expected:
+        raise ActivationError("repair parent persistent route differs from the canonical launchd target")
+
+
 def _current_repair_routing(path: Path) -> tuple[CurrentSchemaRepairManifest, Manifest]:
     repair = CurrentSchemaRepairManifest.load(path)
     parent_path = Path(repair.parent_manifest_path)
@@ -3057,6 +3292,7 @@ def _current_repair_routing(path: Path) -> tuple[CurrentSchemaRepairManifest, Ma
     verify_staged(str(parent_path), repair.parent_manifest_sha256, "original repair parent manifest")
     parent = Manifest.load(parent_path)
     validate_manifest_identities(parent)
+    _require_current_repair_persistent_route(parent)
     if (parent.helper_label != f"{DEPLOY_HELPER_LABEL_PREFIX}.{parent.transaction_id}" or parent.uid != os.getuid()
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", parent.transaction_id)
             or not re.fullmatch(r"[A-Za-z0-9._-]+", parent.label)
@@ -3089,7 +3325,9 @@ def activate_current_repair(path: Path) -> str:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another operation owns current-schema repair") from exc
         try:
-            repair, parent, status = validate_current_repair(path)
+            validated_repair, validated_parent, status = validate_current_repair(path)
+            _require_current_repair_persistent_route(validated_parent)
+            repair, parent = validated_repair, validated_parent
         except Exception:
             # Only the original owner can authorize teardown using hash-bound routing.
             _require_current_repair_claim(parent)
@@ -3101,6 +3339,13 @@ def activate_current_repair(path: Path) -> str:
         terminal = status.state == "committed" and not status.finalization_pending
         try:
             require_launchd_absence(parent.helper_label, parent.uid)
+            reserve_attempt_headroom = status.state not in {"failed_stopped", "stop_unconfirmed"}
+            if not terminal and not _current_repair_persistence_owned(
+                repair,
+                parent,
+                reserve_attempt_headroom=reserve_attempt_headroom,
+            ):
+                raise ActivationError("persistent target plist is not absent or the exact sealed repair plist")
             pending_running = False
             if status.state == "committed" and status.finalization_pending:
                 observed, pid = launchctl.inspect()
