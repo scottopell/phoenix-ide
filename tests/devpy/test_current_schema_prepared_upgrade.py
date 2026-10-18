@@ -92,13 +92,14 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         candidate_binary.chmod(0o755)
         rollback_binary = self.root / "rollback"
         rollback_binary.write_text("old")
+        target_binary = self.root / "live-binary"
         candidate_plist = self.root / "candidate.plist"
         rollback_plist = self.root / "rollback.plist"
         candidate_plist.write_bytes(
             plistlib.dumps(
                 {
                     "Label": "test.phoenix",
-                    "ProgramArguments": [str(candidate_binary)],
+                    "ProgramArguments": [str(target_binary)],
                     "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
                 }
             )
@@ -107,7 +108,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             plistlib.dumps(
                 {
                     "Label": "test.phoenix",
-                    "ProgramArguments": [str(rollback_binary)],
+                    "ProgramArguments": [str(target_binary)],
                     "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
                 }
             )
@@ -144,7 +145,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             rollback_binary_sha256=helper.sha256(rollback_binary),
             rollback_plist=str(rollback_plist),
             rollback_plist_sha256=helper.sha256(rollback_plist),
-            target_binary=str(candidate_binary),
+            target_binary=str(target_binary),
             target_plist=str(self.root / "live.plist"),
             label="test.phoenix",
             helper_label="com.phoenix-ide.deploy.current-tx",

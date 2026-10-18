@@ -11080,12 +11080,12 @@ def _fsync_disposable_validation_file(path: Path) -> None:
 
 
 def _disposable_launchd_validation_plist(
-    *, label: str, program: Path, database: Path, port: int
+    *, label: str, target_binary: Path, database: Path, port: int
 ) -> bytes:
     return plistlib.dumps(
         {
             "Label": label,
-            "ProgramArguments": [str(program)],
+            "ProgramArguments": [str(target_binary)],
             "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
             "KeepAlive": True,
             "Sockets": {
@@ -11253,6 +11253,8 @@ def _prepare_disposable_launchd_validation(
     rollback = transaction / "rollback-phoenix-ide"
     candidate_plist = transaction / "candidate.plist"
     rollback_plist = transaction / "rollback.plist"
+    target_binary = root / "target" / "phoenix-ide"
+    target_plist = root / "target" / "phoenix.plist"
     helper = transaction / "activate.py"
     registry = transaction / "migrations.rs"
     database = transaction / "application.sqlite3"
@@ -11267,14 +11269,14 @@ def _prepare_disposable_launchd_validation(
     _write_disposable_validation_bytes(
         candidate_plist,
         _disposable_launchd_validation_plist(
-            label=label, program=candidate, database=database, port=first_port
+            label=label, target_binary=target_binary, database=database, port=first_port
         ),
         0o600,
     )
     _write_disposable_validation_bytes(
         rollback_plist,
         _disposable_launchd_validation_plist(
-            label=label, program=rollback, database=database, port=first_port + 1
+            label=label, target_binary=target_binary, database=database, port=first_port + 1
         ),
         0o600,
     )
@@ -11334,8 +11336,8 @@ def _prepare_disposable_launchd_validation(
         "rollback_binary_sha256": _file_sha256(rollback),
         "rollback_plist": str(rollback_plist),
         "rollback_plist_sha256": _file_sha256(rollback_plist),
-        "target_binary": str(root / "target" / "phoenix-ide"),
-        "target_plist": str(root / "target" / "phoenix.plist"),
+        "target_binary": str(target_binary),
+        "target_plist": str(target_plist),
         "label": label,
         "helper_label": helper_label,
         "uid": os.getuid(),

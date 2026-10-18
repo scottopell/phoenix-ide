@@ -2165,18 +2165,13 @@ def _validate_staged_plist_binding(
     plist: dict,
     *,
     manifest_label: str,
-    staged_binary: Path,
+    target_binary: Path,
     description: str,
 ) -> None:
     if not manifest_label.strip() or plist.get("Label") != manifest_label:
         raise ActivationError(f"{description} label does not match the immutable manifest")
-    arguments = plist.get("ProgramArguments")
-    if (
-        not isinstance(arguments, list)
-        or not arguments
-        or arguments[0] != str(staged_binary)
-    ):
-        raise ActivationError(f"{description} program does not match its staged binary")
+    if "Program" in plist or plist.get("ProgramArguments") != [str(target_binary)]:
+        raise ActivationError(f"{description} program does not match the immutable target")
 
 
 def expected_helper_label(manifest: Manifest) -> str:
@@ -2211,12 +2206,12 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
         manifest.candidate_plist_sha256,
         "candidate plist",
     )
-    candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
     if exact_prepared_source114:
+        candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
         _validate_staged_plist_binding(
             candidate_plist_contents,
             manifest_label=manifest.label,
-            staged_binary=candidate_binary,
+            target_binary=Path(manifest.target_binary),
             description="candidate plist",
         )
     rollback: Optional[tuple[Path, Path]] = None
@@ -2231,12 +2226,12 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
             manifest.rollback_plist_sha256,
             "rollback plist",
         )
-        rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
         if exact_prepared_source114:
+            rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
             _validate_staged_plist_binding(
                 rollback_plist_contents,
                 manifest_label=manifest.label,
-                staged_binary=rollback_binary,
+                target_binary=Path(manifest.target_binary),
                 description="rollback plist",
             )
         rollback = (rollback_binary, rollback_plist)
