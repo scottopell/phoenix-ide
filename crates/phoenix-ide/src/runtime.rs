@@ -15399,6 +15399,107 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn startup_terminal_with_retained_steering_does_not_abort_other_recovery() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let terminal_id = "startup-a-terminal-with-queue";
+        let recovering_id = "startup-z-interrupted-request";
+        materialize_restart_direct_turn(&manager, recovering_id).await;
+        manager.db().reset_all_to_idle().await.unwrap();
+        manager
+            .db()
+            .create_conversation(terminal_id, "terminal", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let terminal_state = ConvState::ContextExhausted {
+            summary: "terminal context and retained direction".to_string(),
+        };
+        manager
+            .db()
+            .update_conversation_state(terminal_id, &terminal_state)
+            .await
+            .unwrap();
+        let entry = crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            text: "retained direction".to_string(),
+            llm_text: Some("expanded retained direction".to_string()),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "terminal-retained-steer".to_string(),
+            user_agent: Some("startup-regression".to_string()),
+            skill_invocation: None,
+        };
+        manager
+            .db()
+            .append_steering_entry(terminal_id, &entry, "terminal-retained-fingerprint")
+            .await
+            .unwrap();
+        let state_before: (String, String) =
+            sqlx::query_as("SELECT state, state_updated_at FROM conversations WHERE id = ?1")
+                .bind(terminal_id)
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        let queue_before = manager.db().get_steering_queue(terminal_id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&queue_before).unwrap(),
+            serde_json::to_value(vec![entry]).unwrap()
+        );
+        assert_eq!(
+            manager
+                .startup_llm_recovery_conversation_ids()
+                .await
+                .unwrap(),
+            vec![terminal_id.to_string(), recovering_id.to_string()],
+            "the terminal row is selected from queued steering before the interrupted row"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            manager.settle_persisted_llm_requests(),
+        )
+        .await
+        .expect("terminal startup acknowledges settlement without waiting for a provider")
+        .expect("a legitimate terminal row must not abort the startup recovery pass");
+
+        let terminal = manager.db().get_conversation(terminal_id).await.unwrap();
+        assert_eq!(terminal.state, terminal_state);
+        let state_after: (String, String) =
+            sqlx::query_as("SELECT state, state_updated_at FROM conversations WHERE id = ?1")
+                .bind(terminal_id)
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(state_after, state_before);
+        assert_eq!(
+            serde_json::to_value(manager.db().get_steering_queue(terminal_id).await.unwrap())
+                .unwrap(),
+            serde_json::to_value(queue_before).unwrap()
+        );
+        assert!(manager
+            .db()
+            .get_messages(terminal_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(recovering_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle,
+            "startup continues to settle the later interrupted request"
+        );
+        assert!(!manager.db().has_owed_baton(recovering_id).await.unwrap());
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn startup_settlement_isolates_one_uninitializable_conversation() {
         let manager = Arc::new(test_manager().await);
         let bad_id = "restart-bad-model";
