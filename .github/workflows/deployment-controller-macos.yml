@@ -132,7 +132,12 @@ jobs:
           run = api_json(f"{prefix}/runs/{producer['workflow_run_id']}")
           job = api_json(f"{prefix}/jobs/{producer['qualified_job']['id']}")
           job_log = subprocess.run(
-              ["gh", "api", f"{prefix}/jobs/{producer['qualified_job']['id']}/logs"],
+              [
+                  "gh",
+                  "api",
+                  "--allow-escape-sequences",
+                  f"{prefix}/jobs/{producer['qualified_job']['id']}/logs",
+              ],
               check=True,
               stdout=subprocess.PIPE,
           ).stdout

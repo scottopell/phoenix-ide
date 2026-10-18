@@ -99,7 +99,8 @@ jq -e --slurpfile m "$manifest" '
   .conclusion == "success"
 ' "$work/job.json" >/dev/null
 
-gh api "repos/$repo/actions/jobs/$job_id/logs" > "$work/job.log"
+gh api --allow-escape-sequences \
+  "repos/$repo/actions/jobs/$job_id/logs" > "$work/job.log"
 grep -F -- "$(jq -er '.producer.operation_log_marker' "$manifest")" \
   "$work/job.log" >/dev/null
 workflow_commit=$(jq -er '.producer.workflow_commit' "$manifest")
