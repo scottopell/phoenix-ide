@@ -275,10 +275,6 @@ pub fn create_router(state: AppState) -> Router {
             post(send_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route(
-            "/api/conversations/:id/chat/literal",
-            post(send_literal_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
-        )
-        .route(
             "/api/conversations/:id/attachments",
             post(upload_conversation_attachments)
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
@@ -5195,19 +5191,6 @@ async fn upload_conversation_attachments(
     Ok(Json(AttachmentUploadResponse { files }))
 }
 
-async fn send_literal_chat(
-    state: State<AppState>,
-    id: Path<String>,
-    Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, AppError> {
-    if req.expansion_policy != ChatExpansionPolicy::LiteralText {
-        return Err(AppError::BadRequest(
-            "Literal chat requires expansion_policy: literal_text".to_string(),
-        ));
-    }
-    send_chat(state, id, Json(req)).await
-}
-
 async fn send_chat(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -9130,7 +9113,6 @@ fn version_json_payload(socket_activated: bool) -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "git_sha": env!("PHOENIX_GIT_SHA"),
         "socket_activated": socket_activated,
-        "chat_literal_text_v1": true,
     })
 }
 
@@ -18070,6 +18052,7 @@ mod chat_authority_tests {
     //! The fix: `effective_conversation_state` returns the live state; the
     //! handler queues a steering message instead.
     use super::*;
+    use crate::api::ChatExpansionPolicy;
     use crate::db::Database;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
@@ -18128,19 +18111,6 @@ mod chat_authority_tests {
         }
     }
 
-    async fn literal_chat_post(
-        state: &AppState,
-        id: &str,
-        body: &serde_json::Value,
-    ) -> axum::response::Response {
-        chat_post_path(
-            state,
-            &format!("/api/conversations/{id}/chat/literal"),
-            body,
-        )
-        .await
-    }
-
     async fn public_chat_post(
         state: &AppState,
         id: &str,
@@ -18178,26 +18148,6 @@ mod chat_authority_tests {
     }
 
     #[tokio::test]
-    async fn public_version_advertises_literal_chat_v1() {
-        use tower::ServiceExt as _;
-        let response = create_router(make_state().await)
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/version")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = literal_chat_body(response).await;
-        assert_eq!(body["chat_literal_text_v1"], true);
-        assert!(body["version"].is_string());
-        assert!(body["git_sha"].is_string());
-        assert!(body["socket_activated"].is_boolean());
-    }
-
-    #[tokio::test]
     async fn public_literal_chat_preserves_idle_and_running_payloads_and_retry_policy() {
         use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
         for running in [false, true] {
@@ -18220,7 +18170,7 @@ mod chat_authority_tests {
                 "images": [{"media_type": "image/png", "data": "aW1hZ2U="}],
                 "files": [], "user_agent": "literal-test",
             });
-            let response = literal_chat_post(&state, id, &body).await;
+            let response = public_chat_post(&state, id, &body).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(literal_chat_body(response).await["steering"], running);
             if running {
@@ -18262,7 +18212,7 @@ mod chat_authority_tests {
                 );
             }
             assert_eq!(
-                literal_chat_post(&state, id, &body).await.status(),
+                public_chat_post(&state, id, &body).await.status(),
                 StatusCode::OK
             );
             let mut changed = body.clone();
@@ -18309,7 +18259,7 @@ mod chat_authority_tests {
             .continue_conversation_with_intent(
                 parent,
                 crate::db::NewContinuationDispatchIntent::user_authorized(
-                    ClientTurnKey("manual-opening".to_string()),
+                    ClientTurnKey::new("manual-opening").unwrap(),
                     text.to_string(),
                     Some("original-agent".to_string()),
                 ),
@@ -18343,7 +18293,7 @@ mod chat_authority_tests {
             for (field, value) in [("text", "changed text"), ("user_agent", "changed-agent")] {
                 let mut changed = body.clone();
                 changed[field] = serde_json::json!(value);
-                let response = literal_chat_post(&state, &successor.id, &changed).await;
+                let response = public_chat_post(&state, &successor.id, &changed).await;
                 assert_eq!(response.status(), StatusCode::CONFLICT);
                 assert_eq!(
                     literal_chat_body(response).await["error_type"],
@@ -18378,7 +18328,7 @@ mod chat_authority_tests {
                 );
             }
             assert_eq!(
-                literal_chat_post(&state, &successor.id, &body)
+                public_chat_post(&state, &successor.id, &body)
                     .await
                     .status(),
                 StatusCode::OK
@@ -18404,50 +18354,12 @@ mod chat_authority_tests {
             );
             assert!(payload.delivery.llm_text.is_none());
             assert_eq!(
-                literal_chat_post(&state, &successor.id, &body)
+                public_chat_post(&state, &successor.id, &body)
                     .await
                     .status(),
                 StatusCode::OK
             );
         }
-    }
-
-    #[tokio::test]
-    async fn literal_route_rejects_nonliteral_policy_before_admission() {
-        let state = make_state().await;
-        state
-            .db
-            .create_conversation("literal-policy", "literal-policy", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        for policy in [None, Some("expand_references")] {
-            let mut body =
-                serde_json::json!({"text": "/spears @missing", "message_id": "rejected"});
-            if let Some(policy) = policy {
-                body["expansion_policy"] = serde_json::json!(policy);
-            }
-            assert_eq!(
-                literal_chat_post(&state, "literal-policy", &body)
-                    .await
-                    .status(),
-                StatusCode::BAD_REQUEST
-            );
-        }
-        assert!(state
-            .db
-            .get_steering_queue("literal-policy")
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(state
-            .db
-            .workflow_repository()
-            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
-                "literal-policy".to_string()
-            ))
-            .await
-            .unwrap()
-            .is_none());
     }
 
     #[tokio::test]
@@ -18487,7 +18399,7 @@ mod chat_authority_tests {
             .unwrap(),
         );
         assert_eq!(
-            literal_chat_post(&state, "bounds", &body).await.status(),
+            public_chat_post(&state, "bounds", &body).await.status(),
             StatusCode::UNAUTHORIZED
         );
         state.password = None;
@@ -18496,7 +18408,7 @@ mod chat_authority_tests {
             "stored_path": "/etc/passwd",
         }]);
         assert_eq!(
-            literal_chat_post(&state, "bounds", &body).await.status(),
+            public_chat_post(&state, "bounds", &body).await.status(),
             StatusCode::BAD_REQUEST
         );
         assert!(state
@@ -18544,7 +18456,7 @@ mod chat_authority_tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri(format!("/api/conversations/{id}/chat/literal"))
+                    .uri(format!("/api/conversations/{id}/chat"))
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer test-password")
                     .body(axum::body::Body::from(body.to_string()))
@@ -18594,7 +18506,7 @@ mod chat_authority_tests {
                 .unwrap();
             }
             let body = serde_json::json!({"text": "/spears @Cargo.toml", "message_id": "m", "expansion_policy": "literal_text"});
-            let response = literal_chat_post(&state, id, &body).await;
+            let response = public_chat_post(&state, id, &body).await;
             assert_eq!(response.status(), StatusCode::CONFLICT);
             assert_eq!(literal_chat_body(response).await["error_type"], expected);
             assert!(state.db.get_steering_queue(id).await.unwrap().is_empty());

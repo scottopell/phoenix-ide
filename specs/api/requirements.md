@@ -334,12 +334,6 @@ AND SHALL use `expand_references` when the field is omitted
 AND SHALL reject unknown, null, or non-string policy values rather than mapping them to a default
 AND SHALL NOT expose internal generated-predecessor-context policy.
 
-WHEN an authorized client sends `POST /api/conversations/{id}/chat/literal`
-THE SYSTEM SHALL require explicit `expansion_policy: "literal_text"` in the same `ChatRequest` payload
-AND SHALL reject omitted or `expand_references` policy with HTTP 400 before shared send admission
-AND SHALL reject unknown, null, or non-string policy values during request decoding
-AND SHALL use the same public authentication, body limits, mutation admission and send application service as `/chat`.
-
 WHEN literal text is admitted for direct delivery or steering
 THE SYSTEM SHALL preserve the decoded text unchanged for display and model input
 AND SHALL perform no slash-command, skill, @ mention or file-reference expansion
@@ -352,8 +346,4 @@ AND SHALL return HTTP 409 `idempotency_conflict` for changed policy
 AND SHALL require durable policy-bearing evidence for nondefault-policy replay rather than inferring it from transcript content alone
 AND SHALL preserve historical transcript-only replay only for default `expand_references` intent with matching content and provenance.
 
-WHEN the server reports `GET /api/version`
-THE SYSTEM SHALL advertise boolean `chat_literal_text_v1: true` only for the complete dedicated `/api/conversations/{id}/chat/literal` contract above, including policy validation, idle and steering semantics, and exact replay
-AND SHALL preserve the version response's other fields.
-
-Public literal-chat guidance SHALL require that exact boolean capability in complete HTTP-200 JSON from the selected authenticated verified-TLS destination, with no redirects, before each POST or exact retry. Missing, false, malformed or uncertain capability SHALL stop before POST. The guidance SHALL use only `/chat/literal` with exact `literal_text`, never fall back to `/chat`, and retain the original transcript and message identity for uncertain retries. Capability discovery grants no additional destination authority or deployment compatibility; see `specs/compatibility/requirements.md` REQ-COMP-015.
+Public literal-chat guidance SHALL require complete HTTP-200 `GET /api/version` JSON from the exact authenticated verified-TLS destination, with no redirects, whose full `git_sha` exactly matches an immutable commit independently verified to support this literal mode or a source-inspected accepted descendant. It SHALL re-read immediately before use and each exact retry, stop before POST on unknown, malformed or mismatched receivers, and never infer support from semver, local capability assumptions or smoke HTTP success alone. After known-version verification, it SHALL confirm one harmless `literal steering smoke test` on the exact authorized idle target with a retained message ID and materialized bytes before sending expandable content. It SHALL use existing `/chat` with explicit `literal_text`, preserve original target and intent for retries, and never fall back to default expansion. This recipe grants no additional authority or live-replacement guarantee.

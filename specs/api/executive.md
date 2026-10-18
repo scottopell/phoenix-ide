@@ -20,7 +20,7 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 | **REQ-API-002:** Conversation Creation | Slug: day-time-word-word format | Implemented; durable creation cutover incomplete |
 | **REQ-API-003:** Message Retrieval | GET with `after_sequence` param | Implemented |
 | **REQ-API-004:** User Actions | POST chat, cancel endpoints | Implemented |
-| **REQ-API-030:** Explicit Public Literal Chat | `/chat/literal`, closed policy, version capability, policy-proven replay | Authored; offline qualification only, Rust/E2E execution pending |
+| **REQ-API-030:** Explicit Public Literal Chat | `/chat` opt-in, closed policy, known receiver, policy-proven replay | Authored; offline qualification only, Rust/E2E execution pending |
 | **REQ-API-005:** Real-time Streaming | SSE with init, token events (`request_id` for correlation), replay-backed reconnection | Implemented |
 | **REQ-API-006:** Conversation Lifecycle | Archive, delete, rename | Partially implemented against current norms: archive/delete/rename ship, but unified Close/Open/History lifecycle does not |
 | **REQ-API-007:** Slug Resolution | GET /api/conversation-by-slug/{slug} | Implemented |
@@ -31,9 +31,9 @@ REST/JSON plus SSE. The conversation SSE stream is specified to carry root-keyed
 
 ## Public literal chat
 
-REQ-API-030 is authored in `ChatExpansionPolicy`, `send_literal_chat` and the shared `SendChatApplicationService`. `/chat` keeps its expanding default; `/chat/literal` requires explicit `literal_text` before shared admission, and `chat_literal_text_v1` advertises that dedicated route's complete contract. ADR-118 records the historical-ignore race that a field-only recipe cannot fence. Transcript-only replay remains default-policy-only unless durable receipts prove policy.
+REQ-API-030 is authored in `ChatExpansionPolicy` and the shared `SendChatApplicationService`. Existing `/chat` keeps its expanding default and accepts explicit `literal_text`; no extra route or version flag is added. ADR-118 records the known-receiver verification and harmless retained-ID smoke recipe. Transcript-only replay remains default-policy-only unless durable receipts prove policy.
 
-Router regressions cover the version payload, literal idle/direct and running/steering admission, exact replay and changed-policy conflict, omitted/expanding route refusal, closed/history refusal, authentication and attachment validation. The mock-provider E2E scenario `public_literal_chat` exercises both routing states, materialization and replay. These Rust and real-binary E2E tests are authored, not run under the local no-build constraint. Offline helper self-tests cover missing/false/malformed capability with zero POSTs and an older-route refusal after a successful preflight without fallback. No deployed behavior or live API acceptance is claimed.
+Router regressions cover literal idle/direct and running/steering admission, exact replay and changed-policy conflict, expanding default/unknown policy, pending manual-opening identity, closed/history refusal, authentication and attachment validation. The mock-provider E2E scenario `public_literal_chat` checks compiled-HEAD identity, a harmless retained-ID smoke, both routing states with causal queue observation, materialization and replay. Rust and real-binary E2E tests remain unexecuted locally under the no-build constraint. Eight offline guidance tests and 35 harness self-tests pass, including missing/malformed/mismatched receiver zero-POST checks and version rechecking before retry. No deployed behavior or live API acceptance is claimed.
 
 ## Verification Notes
 

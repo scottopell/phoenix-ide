@@ -15,3 +15,9 @@ Review corrections represented in the shared candidate:
 - Running-message E2E subscribes before POST and consumes the matching live queue event, avoiding the subscribe-after-send race; harness self-tests cover event absence and ordering.
 
 Rust compilation/tests and real-binary E2E were not run locally. Parent must qualify the integrated candidate on hosted infrastructure before claiming runtime acceptance.
+
+## User scope correction and first hosted qualification
+
+User: “Don’t go overboard with destination capability check, I dgaf.” Removed the dedicated route and version capability flag; retained only the opt-in `literal_text` on existing `/chat`. Five-step bootstrap requires an independently verified exact receiving commit, immediate same-destination version check, one harmless endpoint/materialization smoke and no fallback or expandable probes when support is unknown. Existing auth/admission/idempotency remain. ADR118 in this unmerged PR revised accordingly.
+
+First head72318 CI39082259710 failed compilation: missing ChatExpansionPolicy imports and private ClientTurnKey tuple construction. Corrected by scoped test import/public constructor; production missing import disappears with removed extra handler. First hosted review found no findings, but this does not qualify the simplified successor. Intermediate failed evidence retained in PR. Eight offline guidance tests and35 harness self-tests pass; successor requires clean committed real-binary fixture and rejects dirty/unknown identity. No local Rust build, production deploy, RC4 repin, live instruction replacement or remote steering. Parent will commit/push and qualify exact successor in hosted CI.
