@@ -164,14 +164,19 @@ class SafePublicationTests(unittest.TestCase):
         from unittest.mock import patch
         with patch.object(Path, 'read_bytes', return_value=b'UNIT_ONLY_CHANGED_SOURCE'):
             self.assertEqual(publication.assertion_diagnostic(self.diagnostic())['resolution'], 'unknown')
+        for decoy in (b'// assert.equal(1, 2)', b'/* assert.equal(1, 2) */', b'"assert.equal(1, 2)";'):
+            with patch.object(Path, 'read_bytes', return_value=b'\n' * 529 + b'  ' + decoy):
+                self.assertEqual(publication.assertion_diagnostic(self.diagnostic())['resolution'], 'unknown')
 
-    def test_every_node_source_token_maps_to_same_finite_publisher_site_id(self):
+    def test_real_node_assertion_stacks_map_to_independently_fixed_publisher_sites(self):
         import subprocess
         root = Path(__file__).resolve().parents[2]
         script = r'''
-          import {fileURLToPath,pathToFileURL} from 'node:url';
+          import {fileURLToPath} from 'node:url';
           import {readFileSync} from 'node:fs';
+          import {runInNewContext} from 'node:vm';
           import assert from 'node:assert/strict';
+          import {assertBackgroundReport} from './ui/scripts/qualify-view-telemetry.mjs';
           import {prepareJointFailureDiagnostic,TELEMETRY_MODULE_SHA256,TELEMETRY_DIAGNOSTICS_SHA256} from './ui/scripts/history-joint-telemetry.mjs';
           const modulePath=fileURLToPath(new URL('./ui/scripts/qualify-view-telemetry.mjs',import.meta.url));
           const helper=fileURLToPath(new URL('./ui/scripts/view-telemetry-diagnostics.mjs',import.meta.url));
@@ -179,17 +184,25 @@ class SafePublicationTests(unittest.TestCase):
           const output=[];
           for (const path of [modulePath,helper]) readFileSync(path,'utf8').split('\n').forEach((line,index)=>{
             for(const match of line.matchAll(/\bassert\.(\w+)\(/g)) {
-              const error=new assert.AssertionError({message:'UNIT_ONLY_NOT_RUNTIME'});
-              error.stack=`AssertionError [ERR_ASSERTION]: ${error.message}\n    at test (${pathToFileURL(path).href}:${index+1}:${match.index+8})`;
+              const args={equal:'1,2',notEqual:'1,1',deepEqual:'1,2',ok:'false',match:"'unit',/never/"}[match[1]];
+              const run=runInNewContext('(() => {'+'\n'.repeat(index)+' '.repeat(match.index)
+                +`assert.${match[1]}(${args}, 'UNIT_ONLY_NOT_RUNTIME');\n})`,{assert},{filename:path});
+              let error; try {run();} catch(thrown) {error=thrown;}
+              assert.ok(error instanceof Error);
+              assert.equal(error.code,'ERR_ASSERTION');
+              assert.ok(error.stack.includes(`    at ${path}:${index+1}:${match.index+8}`));
               output.push(diagnose(error,'module_checks'));
             }
           });
+          try {assertBackgroundReport({},{});} catch(error) {output.push(diagnose(error,'module_checks'));}
           console.log(JSON.stringify(output));
         '''
         result = subprocess.run(['node', '--input-type=module', '-e', script], cwd=root,
                                 check=True, capture_output=True, text=True, timeout=10)
         diagnostics = json.loads(result.stdout)
-        self.assertGreater(len(diagnostics), 150)
+        self.assertEqual(len(diagnostics), 167)
+        self.assertEqual(sum(map(len, publication.ASSERTION_SITES.values())), 166)
+        self.assertEqual(diagnostics[-1], self.diagnostic())
         for diagnostic in diagnostics:
             self.assertEqual(diagnostic['resolution'], 'verified_assertion_site')
             self.assertEqual(publication.assertion_diagnostic(diagnostic), diagnostic)

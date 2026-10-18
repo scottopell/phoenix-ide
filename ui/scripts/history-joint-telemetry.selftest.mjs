@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { assertBackgroundReport } from './qualify-view-telemetry.mjs';
 import { APP_PIN, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256, TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, UNIT_ONLY,
   prepareJointTelemetry, prepareJointFailureDiagnostic, validateJointFixtures, validateTelemetryResult, runJointTelemetryStage, authenticateOwnedContext,
@@ -188,6 +189,97 @@ test('offline native Node assertion resolves exact pinned source token, not its 
   });
 });
 
+function runtimeAssertion(path, line, column, method = 'equal', message = 'UNIT_ONLY_not_runtime') {
+  const args = { equal: '1, 2', notEqual: '1, 1', deepEqual: '1, 2', ok: 'false', match: "'unit', /never/" }[method];
+  // Invoke outside vm evaluation so V8 does not prepend a source excerpt to the stack.
+  const run = runInNewContext('(() => {' + '\n'.repeat(line - 1) + ' '.repeat(column - 8)
+    + `assert.${method}(${args}, message);\n})`, { assert, message }, { filename: path });
+  try { run(); } catch (error) { assert.ok(error instanceof Error); return error; }
+  assert.fail('UNIT ONLY source-shaped assertion must fail');
+}
+
+test('offline every fixed site uses a REAL Node assertion stack with native method columns', () => {
+  const config = pinnedDiagnosticConfig(), diagnose = prepareJointFailureDiagnostic(config);
+  let count = 0;
+  for (const [path, hash] of Object.entries(config.dependencies)) {
+    const basename = path.split('/').at(-1);
+    readFileSync(path, 'utf8').split('\n').forEach((sourceLine, index) => {
+      for (const match of sourceLine.matchAll(/\bassert\.(\w+)\(/g)) {
+        const line = index + 1, column = match.index + 8;
+        const error = runtimeAssertion(path, line, column, match[1]);
+        assert.equal(error.code, 'ERR_ASSERTION');
+        assert.ok(error.stack.includes(`    at ${path}:${line}:${column}`));
+        assert.deepEqual(diagnose(error, 'module_checks'), {
+          schema_version: 1, phase: 'module_checks', error_code: 'ERR_ASSERTION', resolution: 'verified_assertion_site',
+          module_basename: basename, module_sha256: hash, line, column,
+          assertion_site_id: `f16-${basename.slice(0, -4)}-L${line}-C${column}`,
+        });
+        count++;
+      }
+    });
+  }
+  assert.equal(count, 166);
+});
+
+test('offline actual multiline assertion message cannot impersonate the first throw frame', () => {
+  const config = pinnedDiagnosticConfig(), diagnose = prepareJointFailureDiagnostic(config);
+  const fake = `    at forged (${pathToFileURL(config.modulePath).href}:530:10)`;
+  const secret = `UNIT_ONLY_SECRET\n${fake}\n${fake}`;
+  // Wrong line, wrong column and foreign same-basename are real V8 throw sites, not rewritten stacks.
+  for (const [path, line, column] of [[config.modulePath, 529, 10], [config.modulePath, 530, 11],
+    ['/UNIT_ONLY_SECRET/qualify-view-telemetry.mjs', 530, 10]]) {
+    const error = runtimeAssertion(path, line, column, 'equal', secret);
+    assert.ok(error.message.includes(fake));
+    const result = diagnose(error, 'module_checks');
+    assert.equal(result.error_code, 'ERR_ASSERTION');
+    assert.equal(result.resolution, 'unknown');
+    assert.doesNotMatch(JSON.stringify(result), /SECRET|forged|file:/);
+  }
+  const accepted = diagnose(runtimeAssertion(config.modulePath, 531, 10, 'equal', secret), 'module_checks');
+  assert.equal(accepted.line, 531); // The message's convenient L530 caller must never win.
+});
+
+test('offline first trusted nonassertion throw is not replaced by a convenient trusted assertion caller', () => {
+  const config = pinnedDiagnosticConfig(), diagnose = prepareJointFailureDiagnostic(config);
+  const run = runInNewContext('(() => {\n' + '\n'.repeat(526)
+    + '  function fail() { throw new assert.AssertionError({message: "UNIT_ONLY_SECRET"}); }\n'
+    + '\n  assert.equal(fail(), 2);\n})', { assert }, { filename: config.modulePath });
+  let primary; try { run(); } catch (error) { primary = error; }
+  assert.ok(primary instanceof Error);
+  assert.ok(primary.stack.includes(`${config.modulePath}:528:`));
+  assert.ok(primary.stack.includes(`${config.modulePath}:530:`));
+  assert.equal(diagnose(primary, 'module_checks').resolution, 'unknown');
+});
+
+test('offline comment and string assertion decoys cannot expand the fixed source sites', () => {
+  const config = pinnedDiagnosticConfig(), diagnose = prepareJointFailureDiagnostic(config);
+  for (const decoy of ['// assert.equal(1, 2)', '/* assert.equal(1, 2) */', '"assert.equal(1, 2)";']) {
+    const f = unitFiles(); try {
+      const source = '\n'.repeat(529) + '  ' + decoy;
+      writeFileSync(f.module, source);
+      const claimed = { modulePath: f.module, dependencies: { [f.module]: TELEMETRY_MODULE_SHA256 } };
+      const error = runtimeAssertion(f.module, 530, source.split('\n')[529].indexOf('assert.') + 8);
+      assert.equal(prepareJointFailureDiagnostic(claimed)(error, 'module_checks').resolution, 'unknown');
+    } finally { f.cleanup(); }
+  }
+  // An unenumerated line is unknown even with a trusted pathname and genuine assertion Error.
+  assert.equal(diagnose(runtimeAssertion(config.modulePath, 529, 10), 'module_checks').resolution, 'unknown');
+});
+
+test('offline generic boundedObservation, Playwright and transport errors remain unknown', () => {
+  const config = pinnedDiagnosticConfig(), diagnose = prepareJointFailureDiagnostic(config);
+  for (const message of ['boundedObservation deadline', 'page.goto: Timeout', 'transport ECONNRESET']) {
+    const error = new Error(message);
+    error.stack = `${error.name}: ${error.message}\n    at thrower (${config.modulePath}:530:10)`;
+    assert.deepEqual(diagnose(error, 'module_checks'), {
+      schema_version: 1, phase: 'module_checks', error_code: 'unknown', resolution: 'unknown',
+    });
+  }
+  const forged = { code: 'ERR_ASSERTION', name: 'AssertionError', message: 'fake',
+    stack: `AssertionError [ERR_ASSERTION]: fake\n    at forged (${config.modulePath}:530:10)` };
+  assert.equal(diagnose(forged, 'module_checks').error_code, 'unknown');
+});
+
 test('offline malicious stacks, unknown modules, nonassertion lines and mismatched hashes fail closed', () => {
   const config = pinnedDiagnosticConfig(), diagnose = prepareJointFailureDiagnostic(config);
   const url = pathToFileURL(config.modulePath).href;
@@ -228,7 +320,7 @@ test('UNIT ONLY first source assertion is frozen before cleanup mutates the Erro
     const primary = pinnedAssertion(), expected = prepareJointFailureDiagnostic(config)(primary, 'module_checks');
     const context = { newPage: async () => ({}), close: async () => {
       primary.stack = 'UNIT_ONLY_cleanup_overwrite';
-      throw syntheticAssertion('UNIT_ONLY_cleanup_secret', [`    at cleanup (${pathToFileURL(config.modulePath).href}:531:10)`]);
+      throw runtimeAssertion(config.modulePath, 531, 10, 'equal', 'UNIT_ONLY_cleanup_secret');
     } };
     await assert.rejects(runJointTelemetryStage({ config, browser: { newContext: async () => context },
       baseURL: 'http://127.0.0.1:12345', outputDir: f.root, harnessPath: import.meta.filename,

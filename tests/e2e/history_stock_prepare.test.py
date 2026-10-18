@@ -42,6 +42,18 @@ class StockPrepareTests(unittest.TestCase):
         self.assertIn('369305dcd94862d4ee12e7af9fd463d5da14d808', LANE)
         self.assertIn('persist-credentials: false', LANE)
 
+    def test_existing_harness_commit_binding_covers_the_diagnostic_wrapper(self):
+        self.assertIn('ref: ${{ github.event.pull_request.head.sha }}\n          path: harness', LANE)
+        self.assertIn("'harness_source': '${{ github.event.pull_request.head.sha }}'", LANE)
+        self.assertIn("receipt = json.loads((root.parent/'opening-codegen-receipt.json').read_text())", LANE)
+        self.assertIn("(root.parent/'opening-stock-instrumented-receipt.json').write_text(json.dumps(receipt,indent=2))", LANE)
+        driver = (ROOT / 'tests/e2e/history_opening_browser.py').read_text()
+        self.assertIn('"harness_source": shipping.git(ROOT, "rev-parse", "HEAD")', driver)
+        self.assertIn('if any(receipt.get(k) != v for k, v in measured.items()):', driver)
+        wrapper = ROOT / 'ui/scripts/history-joint-telemetry.mjs'
+        self.assertTrue(wrapper.is_file())
+        self.assertIn('helper_sha256: sha256(readFileSync(fileURLToPath(import.meta.url)))', wrapper.read_text())
+
     def test_stock_compilation_and_receipt_precede_controlled_build(self):
         names = ['Build stock UI before', 'Genuine typed-contract codegen',
                  'Verify and retain instrumented libtest', 'Retain stock receiving libtest',

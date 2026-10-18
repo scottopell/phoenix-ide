@@ -178,6 +178,32 @@ ASSERTION_MODULES = {
 }
 JOINT_SECONDARY_PHASES = ('context_cleanup', 'dependency_verification')
 
+# Independently enumerated actual calls in the two hash-pinned sources, not text search hits.
+ASSERTION_SITES = {
+    'qualify-view-telemetry.mjs': frozenset('''
+        43:10 44:10 45:10 46:10 51:10 53:10 85:16 92:14 103:14 106:14
+        107:14 121:16 132:10 133:10 134:10 153:12 157:10 164:10 165:10 201:16
+        215:16 288:16 292:16 294:18 301:18 302:18 303:18 305:18 306:18 308:18
+        311:42 326:16 327:16 330:18 331:18 333:16 335:18 336:18 378:12 379:12
+        401:10 404:10 405:10 406:10 437:14 441:51 442:14 460:14 464:14 465:14
+        468:14 475:14 476:14 482:14 483:14 484:14 497:10 512:12 513:12 521:12
+        522:12 530:10 531:10 532:10 533:10 535:12 537:10 543:10 544:47 546:12
+        547:12 548:12 557:10 558:10 560:12 561:12 564:10 566:10 571:10 572:10
+        574:10 575:10 576:10 611:12 615:10 622:10 625:10 644:16 659:18 673:18
+        675:18 678:18 680:18 688:24 715:20 719:20 726:20 735:22 737:22 750:26
+        751:26 752:26 753:26 754:26 755:26 756:26 757:26 758:26 759:136 768:18
+        769:18 783:49 784:20 785:20 786:80 825:10 826:10 827:10 828:10 829:10
+        830:10 831:10 834:12 838:10 851:12 866:16 936:18 941:18 945:18 953:20
+        954:20 956:20 959:20 960:20 961:20 962:20 963:20 964:20 965:20 966:20
+        967:20 968:20 969:20 971:20 972:20 979:20 980:20 986:18 995:20 996:20
+        997:20 998:20 1004:14
+    '''.split()),
+    'view-telemetry-diagnostics.mjs': frozenset('''
+        5:10 7:10 8:10 9:42 10:37 11:40 12:36 13:39 14:41 15:43
+        20:10 21:10 22:10
+    '''.split()),
+}
+
 
 def assertion_diagnostic(value, phases=JOINT_PHASES):
     value = object_value(value)
@@ -194,7 +220,7 @@ def assertion_diagnostic(value, phases=JOINT_PHASES):
             or value.get('module_sha256') != ASSERTION_MODULES[name]
             or type(value.get('line')) is not int or type(value.get('column')) is not int):
         return out
-    # Independently constrain the producer projection to assertion tokens in exact pinned bytes.
+    # Both a fixed call site and the exact pinned bytes are required.
     path = Path(__file__).resolve().parents[2] / 'ui/scripts' / name
     try:
         if path.is_symlink() or path.stat().st_size > 128 * 1024:
@@ -204,9 +230,9 @@ def assertion_diagnostic(value, phases=JOINT_PHASES):
             return out
         lines = source.decode().split('\n')
         line, column = value['line'], value['column']
-        if not 1 <= line <= len(lines):
+        if f'{line}:{column}' not in ASSERTION_SITES[name] or not 1 <= line <= len(lines):
             return out
-        if column not in {match.start(1) + 1 for match in re.finditer(r'\bassert\.(\w+)\(', lines[line - 1])}:
+        if not re.match(r'assert\.(?:equal|notEqual|deepEqual|ok|match)\(', lines[line - 1][column - 8:]):
             return out
         site = f'f16-{name[:-4]}-L{line}-C{column}'
         if value.get('assertion_site_id') != site:
