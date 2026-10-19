@@ -1111,6 +1111,12 @@ async fn prior_schema_upgrade_adds_empty_goal_storage_preserves_source_rows_and_
         .fetch_one(db.pool()).await.unwrap();
     db.pool().close().await;
     let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        crate::migrations::run_pending_migrations(reopened.pool())
+            .await
+            .unwrap(),
+        1
+    );
     let after: (String,String,String,String) = sqlx::query_as("SELECT c.id,c.product_conversation_id,m.message_id,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.id='upgrade-root'")
         .fetch_one(reopened.pool()).await.unwrap();
     assert_eq!(before, after);
