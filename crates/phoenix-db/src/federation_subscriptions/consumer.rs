@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    cursor, invalid, uuid, Database, DbResult, FederatedTerminalFact, InstanceId,
+    ProductConversationId, RemoteSubscription, Row, Serialize, Sqlite, SubscriptionCurrentState,
+    SubscriptionCursor, SubscriptionDelivery, SubscriptionEnd, SubscriptionGap,
+    SubscriptionReference, SubscriptionReplay, SubscriptionSnapshot, TerminalFactOutcome,
+    Transaction, TranscriptConversationId, Uuid, REPLAY_BATCH,
+};
 
 pub type RemoteNotificationContent = SubscriptionDelivery;
 #[derive(Debug, Clone, Serialize)]
@@ -159,7 +165,7 @@ impl Database {
         pending_only: bool,
     ) -> DbResult<Vec<RemoteNotification>> {
         let rows = sqlx::query("SELECT a.*, s.product_id, f.event_id, f.source_transcript_id AS fact_transcript, f.outcome, f.occurred_at_us, g.source_transcript_id AS gap_transcript, g.current_outcome FROM federation_remote_admissions a JOIN federation_remote_subscriptions s USING(destination_instance_id,subscription_id) LEFT JOIN federation_received_facts f ON f.admission_id = a.admission_id LEFT JOIN federation_received_gaps g ON g.admission_id = a.admission_id WHERE a.destination_instance_id = ?1 AND a.subscription_id = ?2 AND a.through_cursor > ?4 AND (?5 = 0 OR ((s.state = 'active' OR a.authorization_requested = 1) AND a.accepted_transcript_id IS NULL AND a.suppressed = 0)) ORDER BY a.after_cursor, a.through_cursor LIMIT ?3")
-            .bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(REPLAY_BATCH as i64).bind(after.get()).bind(pending_only).fetch_all(&self.pool).await?;
+            .bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(i64::try_from(REPLAY_BATCH).expect("replay batch fits in SQLite integer")).bind(after.get()).bind(pending_only).fetch_all(&self.pool).await?;
         rows.iter().map(decode_notification).collect()
     }
 }
@@ -173,9 +179,9 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
                 source_transcript_id: TranscriptConversationId::parse(
                     row.try_get::<String, _>("fact_transcript")?,
                 )
-                .map_err(invalid)?,
+                .map_err(|error| invalid(&error.to_string()))?,
                 outcome: TerminalFactOutcome::try_from(row.try_get::<&str, _>("outcome")?)
-                    .map_err(invalid)?,
+                    .map_err(|error| invalid(&error.to_string()))?,
                 occurred_at_us: row.try_get("occurred_at_us")?,
             },
         }
@@ -189,11 +195,11 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
                     transcript_id: TranscriptConversationId::parse(
                         row.try_get::<String, _>("gap_transcript")?,
                     )
-                    .map_err(invalid)?,
+                    .map_err(|error| invalid(&error.to_string()))?,
                     state: match outcome {
                         Some(outcome) => SubscriptionCurrentState::Terminal {
                             outcome: TerminalFactOutcome::try_from(outcome.as_str())
-                                .map_err(invalid)?,
+                                .map_err(|error| invalid(&error.to_string()))?,
                         },
                         None => SubscriptionCurrentState::Nonterminal,
                     },
@@ -204,12 +210,13 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
     let accepted: Option<String> = row.try_get("accepted_transcript_id")?;
     let disposition = match accepted {
         Some(transcript) => RemoteNotificationDisposition::Accepted {
-            transcript_id: TranscriptConversationId::parse(transcript).map_err(invalid)?,
+            transcript_id: TranscriptConversationId::parse(transcript)
+                .map_err(|error| invalid(&error.to_string()))?,
         },
         None if row.try_get::<bool, _>("suppressed")? => RemoteNotificationDisposition::Suppressed,
         None => match row.try_get::<Option<String>, _>("authorization_id")? {
             Some(id) => RemoteNotificationDisposition::Authorized {
-                authorization_id: uuid(id)?,
+                authorization_id: uuid(&id)?,
             },
             None if row.try_get::<bool, _>("authorization_requested")? => {
                 RemoteNotificationDisposition::Authorizing
@@ -222,12 +229,12 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
         reference: SubscriptionReference {
             instance_id: row
                 .try_get::<String, _>("destination_instance_id")?
-                .parse()
-                .map_err(invalid)?,
+                .parse::<InstanceId>()
+                .map_err(|error| invalid(&error.to_string()))?,
             product_conversation_id: ProductConversationId::parse(
                 row.try_get::<String, _>("product_id")?,
             )
-            .map_err(invalid)?,
+            .map_err(|error| invalid(&error.to_string()))?,
         },
         subscription_id: uuid(row.try_get("subscription_id")?)?,
         content,

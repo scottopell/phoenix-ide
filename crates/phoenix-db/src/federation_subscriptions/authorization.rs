@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    end, invalid, snapshot_tx, uuid, Database, DbResult, FederatedTerminalFact, InstanceId,
+    ProductConversationId, RemoteSubscription, Row, Sqlite, SubscriptionAuthorization,
+    SubscriptionCurrentState, SubscriptionDelivery, SubscriptionEnd, SubscriptionReference,
+    Transaction, Uuid,
+};
 
 impl Database {
     /// Serialize a delivery authorization against source Close, revoke, and unsubscribe.
@@ -14,7 +19,9 @@ impl Database {
         product: &ProductConversationId,
         delivery: &SubscriptionDelivery,
     ) -> DbResult<SubscriptionAuthorization> {
-        let (after, through) = delivery.bounds().map_err(invalid)?;
+        let (after, through) = delivery
+            .bounds()
+            .map_err(|error| invalid(&error.to_string()))?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT s.state, e.revoked_at_us, p.ordinary_lifecycle, EXISTS(SELECT 1 FROM close_obligations o WHERE o.product_conversation_id = s.product_id AND o.phase != 'completed') AS closing FROM federation_subscriptions s JOIN federation_enrollments e ON e.id = s.enrollment_id JOIN product_conversations p ON p.id = s.product_id WHERE s.id = ?1 AND s.enrollment_id = ?2 AND s.product_id = ?3 AND e.caller_instance_id = ?4")
             .bind(subscription.to_string()).bind(enrollment_id.to_string()).bind(product.as_str()).bind(caller.to_string()).fetch_optional(&mut *tx).await?.ok_or_else(|| invalid("subscription binding unavailable"))?;

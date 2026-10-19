@@ -1455,10 +1455,12 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
         "federation_terminal_payloads",
     ] {
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
-                .fetch_one(f.db.pool())
-                .await
-                .unwrap(),
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table}"
+            )))
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap(),
             0
         );
     }
