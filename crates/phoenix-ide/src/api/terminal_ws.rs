@@ -921,7 +921,8 @@ mod reclaim_tests {
         assert!(manager.terminals.get(&fixture.scope).is_none());
         assert_eq!(*stop_rx.borrow(), StopReason::TearDown);
         assert_eq!(fixture.handle.master_fd_raw(), None);
-        assert_eq!(fixture.handle.attach_permit.available_permits(), 1);
+        assert!(manager.terminals.get_for_attach(&fixture.scope).is_none());
+        assert!(manager.terminals.reserve_spawn(&fixture.scope).is_err());
         assert_eq!(
             nix::sys::wait::waitpid(
                 fixture.handle.child_pid,

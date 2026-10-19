@@ -163,7 +163,7 @@ fn wait_uninterrupted(
 ) -> nix::Result<WaitStatus> {
     loop {
         match wait() {
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {}
             result => return result,
         }
     }
