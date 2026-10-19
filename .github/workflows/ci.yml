@@ -123,7 +123,7 @@ jobs:
           set -o pipefail
           timeout --signal=TERM --kill-after=10s 7m cargo nextest run --locked \
             -p phoenix-core -p phoenix-db -p phoenix_ide \
-            -E 'test(/conversation_goal|goal_capture|goal_service|steering_accept/)' \
+            -E 'test(/conversation_goal|goal_capture|goal_service|steering_accept|checkpoint_commit_survives|persist_fork_proposal_with_tool_round|persist_tool_round_|terminal_tool_round/)' \
             --test-threads 2 --no-fail-fast --failure-output immediate-final \
             --status-level all --final-status-level all \
             2>&1 | tee ci-rust-logs/goals.log
