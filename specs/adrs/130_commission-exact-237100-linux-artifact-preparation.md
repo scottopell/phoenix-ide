@@ -1,4 +1,4 @@
-# ADR-131: Commission the exact 237100 Linux artifact operation
+# ADR-130: Commission the exact 237100 Linux artifact operation
 
 - **Status:** Accepted
 - **Date:** 2026-10-18

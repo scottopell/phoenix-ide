@@ -140,7 +140,8 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
 | [128](128_repair-failure-stopped-truth-includes-persistence.md) | Repair failure stopped truth includes persistent auto-start absence | Accepted | REQ-LDD-025 |
-| [131](131_commission-exact-237100-linux-artifact-preparation.md) | Commission the exact 237100 Linux artifact operation | Accepted | REQ-DESKTOP-REL-013; REQ-DESKTOP-REL-012 and REQ-COMP-015 boundaries unchanged |
+| [129](129_qualify-exact-prepared-linux-systemd-candidate.md) | Qualify exact prepared Linux systemd candidate | Accepted | REQ-COMP-016, REQ-PD-002/003/012/021/024/025/029 |
+| [130](130_commission-exact-237100-linux-artifact-preparation.md) | Commission the exact 237100 Linux artifact operation | Accepted | REQ-DESKTOP-REL-013; REQ-DESKTOP-REL-012 and REQ-COMP-015 boundaries unchanged |
 | [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
 | [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
 | [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
@@ -206,7 +207,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Repairing protected packaging for the exact ARM forward-replacement candidate | 127; fixed candidate, separate controller, no generic selection or compatibility expansion |
-| Specifying the exact commissioned 237100 Linux artifact operation | 131; fixed candidate/target, closed two-file evidence, no generic Linux or deployment authority |
+| Specifying the exact commissioned 237100 Linux artifact operation | 130; fixed candidate/target, closed two-file evidence, no generic Linux or deployment authority |
 | Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
 | Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
