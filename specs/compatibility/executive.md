@@ -2,6 +2,10 @@
 
 [ADR-125](../adrs/125_qualify-exact-prepared-source114-candidate.md) / REQ-COMP-012 adds one prepared-artifact qualification for exact candidate `23badb8be4bc8d05a7e1c49c5367ceb14ebccd92` and candidate git-object registry SHA-256 `a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6`: exact prefix114 or target128 only, with typed `PreparedSource114Upgrade` evidence, a different clean retained controller/helper, immutable candidate-object registry materialization and snapshot-proof tamper checks. RC4 semantic registry and all protected capacity/snapshot/exclusivity/invocation/recovery/finalization boundaries are unchanged. This is explicit source-kind/candidate expansion, not generic prepared114. Generic prepared123/target128, published-release114 and ordinary paths remain distinct. Tests are authored, not executed; only `py_compile` and `git diff --check` are permitted locally. Hosted CI and exact-head review are pending; no runtime or production acceptance is claimed.
 
+## Prepared Linux admission — normative prefix only
+
+**REQ-COMP-016: implementation/integration gap in this producer branch.** The coordinated installer contract and ADR-129 are included as the documentation prerequisite for ADR-130. PR #955 owns the installer/controller implementation; that runtime is not included here. Required integration order is #955, then producer #954. This source tree does not establish prepared systemd runtime admission, an authenticated Linux artifact, schema-transition/recovery acceptance, or production authorization. Historical published-release/systemd evidence below does not qualify this prepared source. Hosted producer checks qualify source only, not installer behavior or artifact provenance.
+
 ## Current reality
 
 Phoenix supports forward SQLite migrations, but compatibility guarantees have not previously had one project-wide authority. Some feature tests and implementations therefore provide stronger cross-version behavior than a named product requirement demands.

@@ -81,9 +81,12 @@ class CandidateGateTests(unittest.TestCase):
         self.assertEqual(self.git("tag", "--list"), "")
 
     def test_pinned_git_candidate_has_bounded_registry_target_128(self):
-        with mock.patch.object(controller, "CANDIDATE", PINNED_CANDIDATE), \
-             mock.patch.object(controller, "REGISTRY_SHA256", PINNED_REGISTRY_SHA256):
-            controller.verify_candidate(ROOT)
+        try:
+            registry = controller.git(ROOT, "show", f"{PINNED_CANDIDATE}:{controller.REGISTRY_PATH}")
+        except subprocess.CalledProcessError:
+            self.skipTest("pinned candidate Git object is not available in this checkout")
+        self.assertEqual(hashlib.sha256(registry).hexdigest(), PINNED_REGISTRY_SHA256)
+        controller.verify_registry_bytes(registry)
 
     def test_registry_version_scan_is_bounded_before_trailing_fixture(self):
         controller.verify_registry_bytes(self.registry.read_bytes())
