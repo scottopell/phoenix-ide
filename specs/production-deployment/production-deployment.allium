@@ -255,6 +255,19 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   paired helper comes from the separately verified clean controller commit.
 --   Protected systemd uses its separately explicit different controller commit;
 --   all immutable evidence and the exact source ledger pass REQ-PD-023 before stop.
+--   The launchd current-schema refinement under REQ-PD-021 additionally qualifies
+--   prepared source114 only for receipt/source/expected/embedded candidate
+--   23badb8be4bc8d05a7e1c49c5367ceb14ebccd92. It automatically emits required integer
+--   prepared_source_baseline = 114 plus candidate_registry_expected_sha256 =
+--   a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6 inside current_schema_upgrade.
+--   Actual registry digest must match, parsed target must be exact128, and source
+--   must be complete prefix114 or target128. Generic prepared123/target128 and
+--   published-release114 remain distinct. Registry bytes come from git show of
+--   the full locally present receipt-bound candidate commit, never controller
+--   working-tree bytes; helper comes from a different clean retained controller.
+--   Partial/extra/wrong evidence rejects before stop; snapshot proof binds it for
+--   recovery/finalization. No other candidate/baseline/source kind gains admission.
+--   RC4 registry semantics and protected lifecycle/invocation boundary are unchanged.
 -- claim_available(transaction) -> Boolean
 --   No active or unresolved transaction owns the host deployment claim. A
 --   markerless status is resolved only when it positively names a nonempty

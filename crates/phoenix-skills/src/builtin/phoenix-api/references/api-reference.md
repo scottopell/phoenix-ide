@@ -165,11 +165,34 @@ Current read routes accept a ProductConversation ID, transcript-row ID, or slug 
 - `GET /api/product-conversations/{reference}/route` returns a canonical transcript route target.
 - `GET /api/conversations/{transcript_row_id}` returns exact transcript state and messages.
 
-For local message steering, use `send_conversation_message` with non-empty literal text. It resolves only on the local Phoenix instance; never substitute it for remote steering. Do not use `POST /api/conversations/{id}/chat`: that browser route expands slash commands and file references. Delivered/queued is acceptance only; read state separately when observation is required.
+For local message steering, prefer `send_conversation_message` with non-empty literal text. It resolves only on the local Phoenix instance; never substitute it for remote steering. Public chat is permitted for literal steering only through the known-receiver recipe below. Do not use omitted/default `expand_references` mode for literal steering: it expands slash commands and file references. Delivered/queued is acceptance only; read state separately when observation is required.
 
 For cancel, re-resolve and call `POST /api/conversations/{writable_transcript_row_id}/cancel`. The response always has `ok`; `no_op` is omitted when false. Therefore `{ "ok": true }` means cancellation found in-flight work, while `{ "ok": true, "no_op": true }` means nothing cancellable was observed. Cancel has no caller idempotency key or uniform operation receipt.
 
 Remote Continue executes that existing API in the selected destination's context and is independent of federated message steering. For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript. Retain that transcript as the original predecessor before calling `POST /api/conversations/{original_predecessor_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. An uncertain exact retry uses the same original predecessor, message identity, and intent; never retarget a newly current successor. Preserve the successor even for `dispatch_failed`, then re-read aggregate and transcript state. A History aggregate requires a separate Open follow-up, not `/continue`.
+
+## Public literal chat with a known receiver
+
+This text-only recipe changes no destination authority, active WorkScope, credential rules, lifecycle admission or local-only `send_conversation_message` boundary.
+
+1. Establish the exact user-authorized destination and normal authenticated context (`GET /api/auth/status`). Use verified HTTPS/TLS, a destination-bound CA if needed, bounded deadlines, no redirects, and credentials outside argv/output. `/api/version` is public and is not itself proof of owner authentication.
+2. Fetch complete HTTP-200 JSON from `GET /api/version` on that same destination. Require full `git_sha` to exactly match an immutable commit independently verified to implement `ChatRequest`'s `literal_text` mode (or a source-inspected, accepted descendant). Inspect authoritative source at that commit; guessed semver, local capability assumptions and accepted unknown fields are not evidence. Unknown, malformed or mismatched receiver: **stop before POST**, with no expandable probe or default-policy fallback. Re-read immediately before use and each exact retry; this is not a live-replacement guarantee.
+3. Freshly resolve Open and its writable transcript; read the exact transcript as complete JSON and pin its ID. On an explicitly authorized **idle** target, send one harmless `literal steering smoke test` with a retained UUID and `expansion_policy: "literal_text"`. Confirm endpoint acceptance and exact materialized text bytes at `messages[].message_id == "{original_transcript_id}:{client_message_id}"`; idle direct turns namespace the submitted UUID. Retain the original raw UUID for retries, never the persisted namespaced ID. Do not send slash/@/file-expandable text before known-version verification. Smoke HTTP success alone does not prove policy support: an old receiver can ignore the field.
+4. Recheck step 2 immediately before POST. Send the authorized text once to `POST /api/conversations/{original_transcript_id}/chat`, retaining one UUID for this exact intent. Serialize JSON as data using the same safe stdin transport as other recipes; replace these placeholders:
+
+   ```json
+   {
+     "text": "Exact user-authorized literal text",
+     "message_id": "once-generated UUID retained for this exact intent",
+     "expansion_policy": "literal_text",
+     "images": [],
+     "files": [],
+     "user_agent": null
+   }
+   ```
+
+   Do not use omitted/default `expand_references` mode for literal steering. The public enum is only `expand_references` or `literal_text`; internal generated context is not public. Literal mode bypasses reference expansion, not auth, attachment validation, UserApi provenance or admission. Keep attachments empty unless their destination contract is separately verified.
+5. Read complete response JSON: `queued: true` is acceptance, not completion; `steering: true` queues behind running work; omitted `steering` means false. Live queue and drained steering messages retain the raw `client_message_id`, unlike idle direct turns. Observe the original transcript separately. For uncertainty, reconcile and retry only on the same original destination/transcript with identical `message_id`, policy, text, attachments and user agent after rechecking the known receiver. Never transplant to a successor, replace identity or fall back to expansion. Report actual refusals, including HTTP 409; stop on version mismatch.
 
 ## Respond to a pending structured question
 
@@ -198,6 +221,6 @@ Contract anchors: `respond_to_question`, `RespondToQuestionPayload`, and `valida
 
 ## Honest gaps
 
-This is an illustrative inventory qualified by inspected deployment/source, not a denylist or a guarantee about every deployment. Potential gaps to verify include a general Coordinator lifecycle endpoint, destination-aware remote literal-message steering, unified mutation receipts, existing-turn retry, caller-idempotent cancel, remote cwd resolution, bounded image-bearing creation transport, bounded state projections, and observable creation-recovery deletion completion. Recipe limitations do not establish that every supported alternative is absent.
+This is an illustrative inventory qualified by inspected deployment/source, not a denylist or a guarantee about every deployment. Potential gaps to verify include a general Coordinator lifecycle endpoint, literal-message steering on destinations without a verified known receiver, unified mutation receipts, existing-turn retry, caller-idempotent cancel, remote cwd resolution, bounded image-bearing creation transport, bounded state projections, and observable creation-recovery deletion completion. Recipe limitations do not establish that every supported alternative is absent.
 
 Verified supported alternatives and bounded state reads remain available within the user's authority when the selected deployment's inspected contract supplies the needed semantics. Bounded, deadline-limited observation through supported reads is permitted; it does not manufacture idempotency, receipts, or completion evidence. Never invent guarantees or receipts, bypass public enforcement with database writes or private handlers, or create background monitors. Do not use local receipt files, unsupported fields/routes, or polling as substitutes for a missing server guarantee. If no verified supported path provides the requested guarantee, report the exact gap and scope a server change separately.

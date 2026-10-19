@@ -66,6 +66,52 @@ class StockPrepareTests(unittest.TestCase):
         self.assertIn('  pull_request:\n', triggers)
         self.assertNotIn('types:', triggers)
 
+    def test_geometry_capture_resources_exist_in_committed_head(self):
+        committed = set(subprocess.check_output(
+            ['git', '-C', str(ROOT), 'ls-tree', '-r', '--name-only', 'HEAD'],
+            text=True).splitlines())
+        required = {
+            'ui/scripts/capture-assistant-finalization.mjs',
+            'ui/scripts/capture-streaming-table.mjs',
+            'ui/scripts/capture-assistant-finalization-transcript.mjs',
+            'ui/scripts/capture-subagent-task-details.mjs',
+            'ui/src/fixtures/assistantFinalization/acl-reply.md',
+            'ui/src/fixtures/assistantFinalization/renderFixture.tsx',
+            'ui/src/fixtures/assistantFinalization/renderFixture.css',
+            'ui/src/fixtures/assistantFinalization/tableFixture.tsx',
+            'ui/src/fixtures/assistantFinalization/tableFixture.css',
+            'ui/src/fixtures/assistantFinalization/transcriptFixture.tsx',
+            'ui/src/fixtures/assistantFinalization/transcriptFixture.css',
+            'ui/src/stories/assistant-finalization.stories.tsx',
+            'ui/src/stories/streaming-table.stories.tsx',
+            'ui/src/stories/assistant-finalization-transcript.stories.tsx',
+            'ui/src/stories/subagent-task-details.stories.tsx',
+            'ui/src/components/AssistantMessageChrome.tsx',
+            'ui/src/components/AssistantMessageChrome.css',
+            'ui/src/components/SubAgentTaskDetails.tsx',
+            'ui/src/components/SubAgentTaskDetails.css',
+        }
+        self.assertEqual(required - committed, set(), 'geometry resources missing at HEAD')
+
+    def test_geometry_workflow_uses_matching_head_source_not_copied_scripts(self):
+        workflow = subprocess.check_output(
+            ['git', '-C', str(ROOT), 'show', 'HEAD:.github/workflows/ci.yml'], text=True)
+        self.assertIn('\n  check-finalization-geometry:\n', workflow)
+        geometry = workflow.split('\n  check-finalization-geometry:\n', 1)[1].split('\n  check-fast:', 1)[0]
+        self.assertIn("    if: ${{ needs.plan_check.outputs.ui == 'true' }}", geometry)
+        self.assertEqual(geometry.count('uses: actions/checkout@'), 1)
+        self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', geometry)
+        self.assertIn('git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt', geometry)
+        captures = re.findall(r'^          node (scripts/capture-[a-z-]+\.mjs)$', geometry, re.M)
+        self.assertEqual(captures, [
+            'scripts/capture-assistant-finalization.mjs',
+            'scripts/capture-streaming-table.mjs',
+            'scripts/capture-assistant-finalization-transcript.mjs',
+            'scripts/capture-subagent-task-details.mjs',
+        ])
+        self.assertIn('\n          cd ui\n', geometry)
+        self.assertNotRegex(geometry, r'(?m)^\s+(?:cp|curl|wget|git (?:show|checkout|restore))\s')
+
     def test_offline_controls_run_unconditionally_in_normal_ui_job(self):
         ui = WORKFLOW.split('\n  check-ui:\n', 1)[1].split('\n  check-fast:', 1)[0]
         self.assertIn("    if: ${{ needs.plan_check.outputs.ui == 'true' }}", ui)

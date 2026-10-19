@@ -127,7 +127,7 @@ for gate, tag, linux, macos, release, create_tag, cancelled in itertools.product
     assert actual == expected, values + [cancelled]
 
 workflow_header = workflow.split('\njobs:\n', 1)[0]
-if "inputs.operation == 'prepare-main' && 'preparation' || 'release'" not in workflow_header or 'cancel-in-progress: false' not in workflow_header:
+if "(inputs.operation == 'prepare-main' || inputs.operation == 'prepare-incident-237100-arm64') && 'preparation' || 'release'" not in workflow_header or 'cancel-in-progress: false' not in workflow_header:
     raise SystemExit('preparation must not replace a pending release workflow')
 if workflow.count('concurrency:') != 1:
     raise SystemExit('job-local concurrency can break whole-workflow tag/publication serialization')

@@ -231,6 +231,138 @@ def make_paired_manifest(root: Path, database: Path) -> helper.Manifest:
 
 
 class ActivationTests(unittest.TestCase):
+    def test_pre_disruption_handoff_is_read_only_and_returns_activation_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(
+                root,
+                previous=helper.Identity("1.0.0", "a" * 40),
+            )
+            before = {path: path.read_bytes() for path in root.iterdir() if path.is_file()}
+
+            validated = helper.validate_pre_disruption_handoff(manifest)
+
+            self.assertEqual(validated.candidate_binary, Path(manifest.candidate_binary))
+            self.assertEqual(validated.candidate_plist, Path(manifest.candidate_plist))
+            self.assertEqual(
+                validated.rollback,
+                (Path(manifest.rollback_binary), Path(manifest.rollback_plist)),
+            )
+            self.assertEqual(
+                before,
+                {path: path.read_bytes() for path in root.iterdir() if path.is_file()},
+            )
+            self.assertFalse(Path(manifest.status_path).exists())
+            self.assertFalse(Path(manifest.active_path).exists())
+
+    def test_read_only_paired_path_validation_never_creates_transaction_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "missing" / "transaction"
+            manifest = dataclasses.replace(
+                make_manifest(root),
+                paired_database_upgrade=helper.PairedDatabaseUpgrade(
+                    database_path=str(root / "prod.db"),
+                    backup_path=str(transaction / "backup.sqlite3"),
+                    proof_path=str(transaction / "proof.json"),
+                    controller_source_commit="c" * 40,
+                    controller_helper_sha256="d" * 64,
+                    controller_helper_path=str(root / "controller-helper.py"),
+                ),
+            )
+
+            with self.assertRaisesRegex(helper.ActivationError, "transaction directory is unavailable"):
+                helper._paired_path_context(manifest, prepare_transaction=False)
+            self.assertFalse(transaction.exists())
+            self.assertFalse(transaction.parent.exists())
+
+    def test_exact_prepared_source114_handoff_binds_plist_and_timeouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root)
+            target_binary = Path(manifest.target_binary)
+            candidate_plist = Path(manifest.candidate_plist)
+            rollback_plist = Path(manifest.rollback_plist)
+            bound_plist = plistlib.dumps(
+                {
+                    "Label": manifest.label,
+                    "ProgramArguments": [str(target_binary)],
+                }
+            )
+            candidate_plist.write_bytes(bound_plist)
+            rollback_plist.write_bytes(bound_plist)
+            upgrade = helper.PreparedSource114Upgrade(
+                database_path=str(root / "prod.db"),
+                backup_path=str(root / "backup.sqlite3"),
+                proof_path=str(root / "proof.json"),
+                controller_source_commit="c" * 40,
+                controller_helper_sha256="d" * 64,
+                controller_helper_path=str(root / "controller-helper.py"),
+                migration_registry_path=str(root / "migrations.rs"),
+                migration_registry_sha256="e" * 64,
+                prepared_source_baseline=114,
+                candidate_registry_expected_sha256="f" * 64,
+            )
+            manifest = dataclasses.replace(
+                manifest,
+                source_kind="prepared_artifact",
+                release_tag=None,
+                release_commit=None,
+                candidate_plist_sha256=helper.sha256(candidate_plist),
+                rollback_plist_sha256=helper.sha256(rollback_plist),
+                transition_timeout_secs=helper.DEFAULT_TRANSITION_TIMEOUT_SECS,
+                health_timeout_secs=helper.DEFAULT_HEALTH_TIMEOUT_SECS,
+                current_schema_upgrade=upgrade,
+            )
+            with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+                helper, "validate_manifest_mode"
+            ), mock.patch.object(
+                helper,
+                "_current_schema_registry",
+                side_effect=AssertionError("database registry opened by read-only handoff"),
+            ), mock.patch.object(
+                helper,
+                "validate_current_schema_database",
+                side_effect=AssertionError("database opened by read-only handoff"),
+            ):
+                validated = helper.validate_pre_disruption_handoff(manifest)
+            self.assertEqual(validated.candidate_plist, candidate_plist)
+
+            candidate_plist.write_bytes(plistlib.dumps({"Program": str(target_binary)}))
+            manifest = dataclasses.replace(
+                manifest,
+                candidate_plist_sha256=helper.sha256(candidate_plist),
+            )
+            with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+                helper, "validate_manifest_mode"
+            ):
+                with self.assertRaisesRegex(helper.ActivationError, "label does not match"):
+                    helper.validate_pre_disruption_handoff(manifest)
+
+            manifest = dataclasses.replace(
+                manifest,
+                transition_timeout_secs=helper.DEFAULT_TRANSITION_TIMEOUT_SECS + 1,
+            )
+            with self.assertRaisesRegex(helper.ActivationError, "transition_timeout_secs"):
+                helper.validate_pre_disruption_handoff(manifest)
+
+    def test_activation_consumes_pre_disruption_handoff_before_preparing_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = FakeLaunchctl(manifest)
+            launchctl.events = []
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(
+                helper,
+                "validate_pre_disruption_handoff",
+                side_effect=helper.ActivationError("read-only admission rejected"),
+            ) as validate, mock.patch.object(helper, "prepare_atomic_install") as prepare:
+                with self.assertRaisesRegex(helper.ActivationError, "read-only admission rejected"):
+                    helper.activate(manifest)
+            validate.assert_called_once_with(manifest)
+            prepare.assert_not_called()
+            self.assertNotIn("stop", launchctl.events)
+            self.assertNotIn("start", launchctl.events)
+
     def test_paired_sqlite_backup_is_private_and_context_bound(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as td:
@@ -4249,9 +4381,9 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("SHA256SUMS", workflow)
         self.assertIn('missing required release asset: $asset', workflow)
         self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
-        self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
-        self.assertIn("runner: macos-15-intel", workflow)
-        self.assertIn("runner: macos-15", workflow)
+        self.assertEqual(4, workflow.count('test -z "$(git status --porcelain)"'))
+        self.assertIn('"runner":"macos-15-intel"', workflow)
+        self.assertIn('"runner":"macos-15"', workflow)
         self.assertIn("runner: ubuntu-24.04-arm", workflow)
         self.assertIn("runner: ubuntu-latest", workflow)
         self.assertNotIn("runner: macos-14", workflow)
@@ -4821,6 +4953,45 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
                             admission("new-operation")
                         self.assertEqual(self.active.read_text(), "protected\n")
 
+    def test_classifier_accepts_only_complete_typed_prepared_source114_evidence(self):
+        qualified = mode_evidence(self.staging, "current_schema_upgrade") | {
+            "prepared_source_baseline": 114,
+            "candidate_registry_expected_sha256": self.dev.PREPARED_SOURCE114_REGISTRY_SHA256,
+        }
+        self.manifest.write_text(json.dumps({
+            "source_kind": "prepared_artifact",
+            "current_schema_upgrade": qualified,
+        }))
+        self.assertIs(
+            self.dev._deploy_manifest_kind(self.staging),
+            self.dev.DeployManifestKind.CURRENT_SCHEMA,
+        )
+        loadable = self.staging / "qualified-loadable.json"
+        loadable.write_text(json.dumps(dataclasses.asdict(make_manifest(self.staging)) | {
+            "source_kind": "prepared_artifact",
+            "current_schema_upgrade": qualified,
+        }))
+        loaded = helper.Manifest.load(loadable)
+        self.assertIsInstance(loaded.current_schema_upgrade, helper.PreparedSource114Upgrade)
+
+        for changed in (
+            qualified | {"prepared_source_baseline": 113},
+            qualified | {"prepared_source_baseline": "114"},
+            qualified | {"candidate_registry_expected_sha256": ""},
+            {key: value for key, value in qualified.items() if key != "prepared_source_baseline"},
+            qualified | {"unexpected": "field"},
+        ):
+            with self.subTest(changed=changed):
+                self.manifest.write_text(json.dumps({
+                    "source_kind": "prepared_artifact",
+                    "current_schema_upgrade": changed,
+                }))
+                self.assertIs(
+                    self.dev._deploy_manifest_kind(self.staging),
+                    self.dev.DeployManifestKind.UNKNOWN,
+                )
+                self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+
     def test_controller_admission_rejects_status_source_mode_cross_matrix(self):
         for mode in ("paired_database_upgrade", "current_schema_upgrade"):
             current = mode == "current_schema_upgrade"
@@ -5061,7 +5232,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_controller_durability_test")
 
     @contextlib.contextmanager
-    def deployment(self, *, paired=True, current=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False):
+    def deployment(self, *, paired=True, current=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False, candidate_commit="a" * 40, controller_commit="d" * 40, registry_bytes=b"candidate registry bytes\n"):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             root = Path(td)
             deploy = root / "deploy"
@@ -5077,7 +5248,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 (root / "prod.db").touch()
                 (installed / "phoenix-ide").write_bytes(b"previous")
                 target_plist.write_bytes(plist)
-            identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
+            identity = self.dev.RuntimeIdentity("2.0.0", candidate_commit)
             previous = self.dev.RuntimeIdentity("1.0.0", "b" * 40)
             prepared = self.dev.PreparedCandidate(
                 binary=candidate,
@@ -5133,11 +5304,11 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             def run(command, **_kwargs):
                 events.append(("command", tuple(command)))
                 if "rev-parse" in command:
-                    return subprocess.CompletedProcess(command, 0, "d" * 40, "")
+                    return subprocess.CompletedProcess(command, 0, controller_commit, "")
                 if command[:2] == ["git", "status"] and dirty:
                     return subprocess.CompletedProcess(command, 0, " M dev.py\n", "")
                 if command[:2] == ["git", "show"]:
-                    return subprocess.CompletedProcess(command, 0, b"candidate registry bytes\n", b"")
+                    return subprocess.CompletedProcess(command, 0, registry_bytes, b"")
                 if command[:2] == ["gh", "api"]:
                     contents = b"controller helper bytes\n" if "launchd_deploy_helper.py" in command[2] else b"release registry bytes\n"
                     return subprocess.CompletedProcess(command, 0, contents, b"")
@@ -5454,6 +5625,42 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             self.assertLess(events.index(("file", "migrations.rs")), prepared)
             self.assertLess(events.index(("directory", staging)), prepared)
             self.assertLess(prepared, next(i for i, event in enumerate(events) if event[0] == "command" and "bootstrap" in event[1]))
+
+    def test_prepared114_receipt_candidate_gets_typed_evidence_from_exact_git_object(self):
+        commit = self.dev.PREPARED_SOURCE114_COMMIT
+        registry_bytes = subprocess.check_output(
+            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
+        )
+        with self.deployment(current=True, candidate_commit=commit, registry_bytes=registry_bytes) as (staging, controller, events), \
+             mock.patch.object(self.dev, "ROOT", staging / "different-controller-checkout"):
+            self.dev.launchd_prod_deploy(controller=controller)
+            manifest = json.loads((staging / "manifest.json").read_text())
+            current = manifest["current_schema_upgrade"]
+            self.assertEqual(manifest["source_commit"], commit)
+            self.assertEqual(manifest["expected"]["git_sha"], commit)
+            self.assertEqual(current["prepared_source_baseline"], 114)
+            self.assertEqual(current["candidate_registry_expected_sha256"], self.dev.PREPARED_SOURCE114_REGISTRY_SHA256)
+            self.assertEqual(current["migration_registry_sha256"], self.dev.PREPARED_SOURCE114_REGISTRY_SHA256)
+            self.assertEqual(current["controller_source_commit"], "d" * 40)
+            self.assertEqual((staging / "migrations.rs").read_bytes(), registry_bytes)
+            self.assertIn(("command", ("git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs")), events)
+            self.assertFalse(any(event[0] == "command" and event[1][:2] == ("gh", "api") for event in events))
+        with self.deployment(current=True) as (staging, controller, _events):
+            self.dev.launchd_prod_deploy(controller=controller)
+            current = json.loads((staging / "manifest.json").read_text())["current_schema_upgrade"]
+            self.assertNotIn("prepared_source_baseline", current)
+            self.assertNotIn("candidate_registry_expected_sha256", current)
+
+    def test_prepared114_controller_rejects_bad_registry_same_controller_and_dirty_checkout(self):
+        commit = self.dev.PREPARED_SOURCE114_COMMIT
+        for options, error in (({}, "registry SHA-256 mismatch"),
+                               ({"controller_commit": commit}, "different clean controller"),
+                               ({"dirty": True}, "clean controller checkout")):
+            with self.subTest(options=options), self.deployment(current=True, candidate_commit=commit, **options) as (staging, controller, events):
+                with self.assertRaisesRegex(SystemExit, error):
+                    self.dev.launchd_prod_deploy(controller=controller)
+                self.assertNotIn(("status", "prepared"), events)
+                self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
 
     def test_current_schema_rejects_dirty_controller_before_staging_registry(self):
         with self.deployment(current=True, dirty=True) as (staging, controller, events):

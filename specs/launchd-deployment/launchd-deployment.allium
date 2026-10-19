@@ -1,8 +1,9 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
--- Requirement traceability: REQ-LDD-001 through REQ-LDD-024
+-- Requirement traceability: REQ-LDD-001 through REQ-LDD-025
 -- REQ-LDD-019–022 admit prepared sources at exact 123 or exact 128 with
--- exact target 128; the protected published-release admission is exact 114 -> 128.
+-- exact target 128; one exact prepared candidate additionally admits prefix114.
+-- The protected published-release admission remains separate exact 114 -> 128.
 -- REQ-LDD-023 admits ordinary pending migrations only at exact 123 -> 128.
 
 config {
@@ -12,6 +13,12 @@ config {
     current_schema_growth_margin_divisor: Integer = 10
     current_schema_growth_margin_min_bytes: Integer = 1_073_741_824
     current_schema_growth_margin_max_bytes: Integer = 8_589_934_592
+    current_repair_quarantine_attempts: Integer = 8
+    current_repair_plist_evidence_max_bytes: Integer = 1_048_576
+    current_repair_quarantine_max_entries: Integer = 128
+    current_repair_quarantine_max_total_bytes: Integer = 33_554_432
+    current_repair_quarantine_headroom_entries: Integer = 26
+    current_repair_quarantine_headroom_bytes: Integer = 27_262_976
     current_schema_evidence_budget_bytes: Integer = 2_097_152
     current_schema_max_proof_bytes: Integer = 1_048_576
 }
@@ -164,10 +171,14 @@ variant PreparedArtifactDeployment : DeployTransaction {
 }
 
 entity CurrentSchemaSource {
-    kind: PreparedCurrentSchemaSource | PublishedCurrentSchemaSource
+    kind: PreparedCurrentSchemaSource | PreparedSource114CurrentSchemaSource | PublishedCurrentSchemaSource
 }
 
 variant PreparedCurrentSchemaSource : CurrentSchemaSource {}
+variant PreparedSource114CurrentSchemaSource : CurrentSchemaSource {
+    prepared_source_baseline: Integer
+    candidate_registry_expected_sha256: String
+}
 variant PublishedCurrentSchemaSource : CurrentSchemaSource {
     release_tag: String
 }
@@ -291,7 +302,8 @@ external entity TargetService {
 --   either case the candidate's 40-character lowercase embedded git_sha equals
 --   source_commit. Prepared sources independently verify receipt, signing,
 --   notarization and exact identity. CurrentSchemaDeployment.source is either
---   PreparedCurrentSchemaSource with those checks or PublishedCurrentSchemaSource
+--   PreparedCurrentSchemaSource or PreparedSource114CurrentSchemaSource with those
+--   checks, or PublishedCurrentSchemaSource
 --   with an exact non-alias release tag, expected full release commit, full embedded
 --   version/SHA, host-target asset and published checksum agreeing. The protected
 --   release retains published_release source kind, not prepared_artifact.
@@ -317,6 +329,20 @@ external entity TargetService {
 --   candidate migration registry path/SHA-256 bound to the immutable transaction.
 --   PreparedCurrentSchemaSource admits only the complete qualified ordered ledger
 --   through 123 or complete target registry through 128, retaining all receipt checks.
+--   PreparedSource114CurrentSchemaSource requires prepared_source_baseline = 114,
+--   candidate_registry_expected_sha256 = a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6,
+--   source/expected/receipt/embedded SHA = 23badb8be4bc8d05a7e1c49c5367ceb14ebccd92,
+--   and actual retained registry digest equal to that expected digest. All evidence
+--   fields are required together; partial, extra, mistyped or contradictory fields
+--   reject before DB admission/stop. Only complete prefix114 or exact target128
+--   is admitted, not prefix113 or prefixes115..127. The candidate commit must be
+--   locally present and its registry obtained with git show SOURCE_COMMIT:path,
+--   never controller working-tree bytes. A different clean controller commit
+--   supplies the retained/hash-bound helper. No other candidate is qualified;
+--   manifests without these fields retain PreparedCurrentSchemaSource semantics.
+--   The registry semantics are unchanged from RC4; this expands only the exact
+--   candidate/source-kind admission. Snapshot proof binds this typed evidence;
+--   its removal/alteration rejects during recovery/finalization. REQ-LDD-019.
 --   PublishedCurrentSchemaSource admits only the exact complete candidate-registry
 --   prefix through 114 (every version/name, no gaps or extras), with candidate binary
 --   and complete registry from the exact release commit. No other source baseline
@@ -419,7 +445,8 @@ external entity TargetService {
 -- controller_identity_is_independently_bound(transaction) -> Boolean
 --   True for ordinary sources. For prepared sources, the controller helper hash
 --   is bound to the recorded clean controller source and protocol; controller and
---   candidate commits may be equal when independently verified. For protected
+--   candidate commits may be equal when independently verified, except that
+--   PreparedSource114CurrentSchemaSource requires different commits. For protected
 --   PublishedCurrentSchemaSource, require a separately explicit full controller
 --   commit, not the candidate release commit or ambient checkout. Retain helper
 --   bytes/path/SHA-256 from that controller commit independently of candidate
@@ -527,6 +554,13 @@ external entity TargetService {
 --   PairedFinalizationFailed and retain pending.
 -- DurablePreparingStatusWritten(transaction)
 --   Matching preparation identity/PID is durable before ownership publication.
+-- PreDisruptionHandoffValidated(transaction)
+--   The retained helper completed its typed read-only admission without mutation.
+-- pre_disruption_handoff_is_valid(transaction) -> Boolean
+--   Immutable identities/mode/helper label, staged candidate and rollback bytes,
+--   prepared-source114 timeout/plist bindings and registry pass without creating a
+--   transaction directory or opening SQLite. Database eligibility remains the next
+--   distinct activation admission before install preparation.
 
 -- paired_precommit_autoload_safe(transaction) -> Boolean
 --   While preparing, only captured predecessor may be auto-loaded. After helper
@@ -595,6 +629,20 @@ rule HandoffActivation {
     @guidance
         -- Bootstrap the distinct one-shot helper and report handoff before the
         -- target LaunchAgent is stopped. The initiating process may then end.
+}
+
+rule ValidatePreDisruptionHandoff {
+    when: PreDisruptionHandoffValidated(transaction)
+    requires: transaction.state = prepared
+    requires: pre_disruption_handoff_is_valid(transaction)
+    ensures: ProductionArtifactsUnchanged(transaction)
+    ensures: TargetServiceUnchanged(transaction)
+
+    @guidance
+        -- Use the typed result from the same read-only helper contract that mutating
+        -- activation consumes before preparing any filesystem mutation. Do not create
+        -- a diagnostic-only admission policy or invoke status, claim, launchd,
+        -- migration, publication or cleanup effects from this validation surface.
 }
 
 rule ObservePreparedPreflight {
@@ -674,6 +722,7 @@ rule ObserveCurrentSchemaSnapshot {
 
 rule BeginCurrentSchemaMigration {
     when: CurrentSchemaMigrationRequested(transaction)
+    requires: not current_repair_child_entry_exists(transaction)
     requires: transaction.kind = CurrentSchemaDeployment
     requires: transaction.state = activating
     requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
@@ -904,6 +953,7 @@ rule CommitVerifiedCandidate {
 
 rule ResumeCommittedPairedFinalization {
     when: PairedFinalizationRequested(transaction)
+    requires: not current_repair_child_entry_exists(transaction)
     requires: transaction.kind = PreparedArtifactDeployment
     requires: transaction.state = committed
     requires: transaction.finalization = pending
@@ -938,6 +988,7 @@ rule PreserveFailedPairedFinalization {
 
 rule VerifyCompletedPairedFinalization {
     when: PairedFinalizationRequested(transaction)
+    requires: not current_repair_child_entry_exists(transaction)
     requires: transaction.kind = PreparedArtifactDeployment
     requires: transaction.state = committed
     requires: transaction.finalization = complete
@@ -970,6 +1021,7 @@ rule RecordPairedFinalizationOutcome {
 
 rule ResumeCurrentSchemaFinalization {
     when: CurrentSchemaFinalizationRequested(transaction)
+    requires: not current_repair_child_entry_exists(transaction)
     requires: transaction.kind = CurrentSchemaDeployment
     requires: transaction.state in { activating, committed }
     requires: transaction.database_state = target_verified
@@ -993,6 +1045,7 @@ rule ResumeCurrentSchemaFinalization {
 
 rule CompleteCurrentSchemaFinalization {
     when: CurrentSchemaFinalizationFinished(transaction, service)
+    requires: not current_repair_child_entry_exists(transaction)
     requires: transaction.kind = CurrentSchemaDeployment
     requires: transaction.state = committed
     requires: transaction.database_state = target_verified
@@ -1008,6 +1061,7 @@ rule CompleteCurrentSchemaFinalization {
 
 rule RecoverUnchangedCurrentSchemaSource {
     when: CurrentSchemaRecoveryRequested(transaction, service)
+    requires: not current_repair_child_entry_exists(transaction)
     requires: transaction.kind = CurrentSchemaDeployment
     requires: transaction.state = activating
     requires: transaction.current_lifecycle_observation.kind = CurrentSchemaSnapshotVerified
@@ -1530,4 +1584,341 @@ invariant RestartClaimsAreMutuallyExclusive {
             a != b implies not (
                 RestartOwnsActivationClaim(a) and RestartOwnsActivationClaim(b)
             )
+}
+
+-- REQ-LDD-025 / REQ-COMP-015 / REQ-PD-028: a child does not replace the parent audit.
+enum CurrentRepairState {
+    prepared | reconciliation_started | target_verified | start_attempted |
+    failed_stopped | stop_unconfirmed | committed
+}
+enum CurrentRepairCheckpoint {
+    prepared | reconciliation_started | target_verified | start_attempted | committed
+}
+
+value CurrentRepairSeal {
+    protocol_version: Integer
+    parent_manifest_path: String
+    parent_manifest_sha256: String
+    parent_status_sha256: String
+    parent_proof_sha256: String
+    source_commit: String
+    version: String
+    controller_source_commit: String
+    helper_sha256: String
+    candidate_sha256: String
+    registry_sha256: String
+    plist_sha256: String
+    receipt_sha256: String
+    helper_label: String
+}
+
+entity CurrentSchemaRepair {
+    parent: DeployTransaction
+    seal: CurrentRepairSeal
+    state: CurrentRepairState
+    resume_from: CurrentRepairCheckpoint?
+    proof_sha256: String?
+    finalization_pending: Boolean
+    failure: String?
+
+    transitions state {
+        prepared -> reconciliation_started
+        reconciliation_started -> target_verified
+        target_verified -> start_attempted
+        start_attempted -> committed
+        prepared -> failed_stopped
+        prepared -> stop_unconfirmed
+        reconciliation_started -> failed_stopped
+        reconciliation_started -> stop_unconfirmed
+        target_verified -> failed_stopped
+        target_verified -> stop_unconfirmed
+        start_attempted -> failed_stopped
+        start_attempted -> stop_unconfirmed
+        committed -> failed_stopped
+        committed -> stop_unconfirmed
+        failed_stopped -> reconciliation_started
+        stop_unconfirmed -> reconciliation_started
+        failed_stopped -> start_attempted
+        stop_unconfirmed -> start_attempted
+        failed_stopped -> committed
+        stop_unconfirmed -> committed
+    }
+}
+
+-- current_repair_parent_qualified(repair) -> Boolean
+--   Exact original prepared source qualification in REQ-COMP-015; immutable
+--   committed/pending parent with target128 commit proof and exact parent claim.
+--   The exact original/repair pair is solely the pin table there; no other pair
+--   can be inferred from ancestry, version equality or unchanged registry bytes.
+-- current_repair_failure_route_valid(repair) -> Boolean
+--   Before any failure teardown, the parent service label is the fixed Phoenix label
+--   and its target plist is exactly that label's canonical owning-user LaunchAgents
+--   path. Mutable child or parent evidence cannot redirect stop or quarantine.
+-- current_repair_inputs_qualified(repair) -> Boolean
+--   Exact REQ-COMP-015 repair candidate/version/git-object registry and original
+--   target128; accepted prepared receipt/signing evidence; separately clean full
+--   controller commit/helper; captured private plist unchanged. Closed v1 shape,
+--   canonical private owned regular evidence and deterministic child label/paths.
+-- current_repair_sealed(repair) -> Boolean
+--   The single <parent>/current-schema-repair/manifest.json is durably published
+--   after all candidate/helper/receipt/registry/plist bytes, immutable byte-exact
+--   parent-status.json snapshot and prepared status. The status seal hash binds
+--   the original committed/pending snapshot; repair never writes parent status.
+-- current_repair_runtime_fenced(repair) -> Boolean
+--   After full admission and durable child staging, the installed original binary
+--   is replaced by the non-executable empty stopped fence, the published target
+--   plist is removed/fsynced, and service absence is reconfirmed before sealing.
+-- current_repair_offline_verified(repair) -> Boolean
+--   Parent operation lock held, original helper absent, service confirmed absent,
+--   database exclusive with exact target128/integrity/FK and adequate held restore
+--   capacity plus protected floor/evidence allowance. After full sealed-child
+--   validation, a persistent target plist and every retained quarantine are absent
+--   or byte-exact sealed repair input. Admission enforces current_repair_quarantine_max_entries
+--   during enumeration and current_repair_quarantine_max_total_bytes during each pass,
+--   while reserving current_repair_quarantine_headroom_entries and
+--   current_repair_quarantine_headroom_bytes for both publication retirements and all
+--   three bounded settlement passes. A failure-state retry may consume that reserved capacity.
+--   Reads use non-following nonblocking descriptors, enforce
+--   current_repair_plist_evidence_max_bytes, and require stable file identity, type,
+--   size and change metadata for the complete read, recheck pathname-to-descriptor
+--   identity, and revalidate accepted metadata tokens at admission close. Repeated
+--   complete enumeration and digest passes plus a stable containing-
+--   directory change token reject replaced or newly added quarantine entries. Unknown,
+--   mutable, oversized, nonregular or unreadable
+--   evidence refuses resume. No child claim is acquired.
+-- current_repair_target_verified(repair) -> Boolean
+--   Successful exact-candidate reconciliation, exact complete target128/integrity/FK
+--   and capacity checked; durable child proof bound to seal and parent proof hash.
+-- current_repair_identity_verified(repair) -> Boolean
+--   Installed binary bytes and full build identity match repair seal; launchd loaded
+--   child private plist and exact repair health identity are verified.
+-- current_repair_parent_unchanged(repair) -> Boolean
+--   Parent manifest/proof and child parent-status.json equal sealed hashes; original
+--   backup retained. Until child terminal commit, live global status also matches
+--   the snapshot. Terminal historical audit uses the snapshot after global overwrite.
+-- current_repair_child_entry_exists(transaction) -> Boolean
+--   Deterministic child manifest entry exists, including malformed/unsafe entry;
+--   child-directory symlinks also fence original activation/finalization/recovery.
+-- current_repair_classification_valid(repair) -> Boolean
+--   Closed seal/status and exact parent record shapes/paths/hashes, immutable
+--   parent-status snapshot and required child proof. No DB/backup scan or opening.
+--   This classification is not full activation admission: retained artifacts and
+--   full parent backup/proof plus exclusive offline live DB checks precede mutation.
+-- current_repair_checkpoint_durable(repair) -> Boolean
+--   The named child checkpoint and its required proof hash are durably fsynced.
+-- current_repair_finalization_complete(repair) -> Boolean
+--   Repair deployed SHA and child plist published/fsynced; publication temporary
+--   atomically retired/fsynced into authenticated retained quarantine without pathname
+--   deletion; only the owned old restore reservation removed/fsynced; proofs retained.
+-- CurrentRepairReconciliationInvoked(repair), CurrentRepairStarted(repair),
+-- CurrentRepairFailure(repair), CurrentRepairPrepared(repair),
+-- CurrentRepairTargetChecked(repair), CurrentRepairHealthy(repair),
+-- CurrentRepairFinalized(repair) are observations of the exact retained child.
+-- CurrentRepairStopConfirmed(repair) -> Boolean: exact service absence confirmed.
+-- CurrentRepairPersistentAutoStartAbsent(repair) -> Boolean: the auto-loaded target
+--   path is absent after at most current_repair_quarantine_attempts atomic isolation
+--   attempts, directory fsync and explicit recheck. Quarantine contents remain evidence
+--   and do not affect this stopped-truth fact. Continued recreation through the bound
+--   makes the fact false rather than extending settlement indefinitely.
+-- CurrentRepairClaimReleased(repair) -> Boolean: only exact parent claim unlinked/fsynced.
+-- CurrentRepairNeverStartsOriginalOrPredecessor(repair) -> Boolean: every repair path
+--   excludes original/predecessor install/start and database snapshot replay.
+
+rule SealCurrentSchemaRepair {
+    when: CurrentRepairPrepared(repair)
+    requires: current_repair_parent_qualified(repair)
+    requires: current_repair_inputs_qualified(repair)
+    requires: current_repair_offline_verified(repair)
+    requires: not CurrentSchemaRepairs.any(other => other.parent = repair.parent and other != repair)
+    ensures: repair.state = prepared
+    ensures: current_repair_sealed(repair)
+    ensures: current_repair_runtime_fenced(repair)
+    ensures: current_repair_parent_unchanged(repair)
+}
+
+rule InvokeCurrentRepairReconciliation {
+    when: CurrentRepairReconciliationInvoked(repair)
+    requires: current_repair_sealed(repair)
+    requires: current_repair_parent_qualified(repair)
+    requires: current_repair_inputs_qualified(repair)
+    requires: current_repair_offline_verified(repair)
+    requires: repair.state in { prepared, reconciliation_started, failed_stopped, stop_unconfirmed }
+    requires: repair.proof_sha256 = null
+    ensures: repair.state = reconciliation_started
+    ensures: current_repair_checkpoint_durable(repair)
+
+    @guidance
+        -- Install/revalidate only repair bytes; fsync reconciliation_started BEFORE
+        -- invoking installed repair --migrate-only with captured parent environment.
+}
+
+rule VerifyCurrentRepairTarget {
+    when: CurrentRepairTargetChecked(repair)
+    requires: repair.state = reconciliation_started
+    requires: current_repair_target_verified(repair)
+    ensures: repair.state = target_verified
+    ensures: repair.proof_sha256 != null
+    ensures: current_repair_checkpoint_durable(repair)
+}
+
+rule StartCurrentRepair {
+    when: CurrentRepairStarted(repair)
+    requires: current_repair_sealed(repair)
+    requires: current_repair_inputs_qualified(repair)
+    requires: current_repair_offline_verified(repair)
+    requires: current_repair_target_verified(repair)
+    requires: repair.state in { target_verified, start_attempted, failed_stopped, stop_unconfirmed }
+    requires: repair.proof_sha256 != null
+    ensures: repair.state = start_attempted
+    ensures: repair.resume_from = null
+    ensures: current_repair_checkpoint_durable(repair)
+
+    @guidance
+        -- Persist start_attempted before private-plist bootstrap. A failed committed
+        -- finalization retry preserves its committed resume checkpoint because the
+        -- old restore reservation may already be durably removed. No reconciliation
+        -- is repeated after a verified target checkpoint.
+}
+
+rule VerifyCurrentRepairRuntime {
+    when: CurrentRepairHealthy(repair)
+    requires: current_repair_identity_verified(repair)
+    requires: current_repair_target_verified(repair)
+    ensures: repair.state = committed
+    ensures: repair.finalization_pending = true
+    ensures: current_repair_checkpoint_durable(repair)
+}
+
+rule PersistTerminalCurrentRepair {
+    when: CurrentRepairFinalized(repair)
+    requires: repair.state = committed
+    requires: repair.finalization_pending
+    requires: current_repair_identity_verified(repair)
+    requires: current_repair_finalization_complete(repair)
+    requires: active_claim_retained(repair.parent)
+    ensures: repair.finalization_pending = false
+    ensures: current_repair_parent_unchanged(repair)
+    ensures: active_claim_retained(repair.parent)
+}
+
+-- CurrentRepairClaimReleaseCompleted(repair): exact parent claim unlink and parent
+--   directory fsync completed after terminal child status became durable.
+rule ReleaseTerminalCurrentRepairClaim {
+    when: CurrentRepairClaimReleaseCompleted(repair)
+    requires: repair.state = committed
+    requires: not repair.finalization_pending
+    requires: active_claim_retained(repair.parent)
+    ensures: CurrentRepairClaimReleased(repair)
+
+    @guidance
+        -- Restore a visible exact-owner claim if unlink durability is uncertain;
+        -- the durable terminal child remains unresolved until release completes.
+}
+
+-- CurrentRepairMalformedStatus(repair): sealed child status cannot provide a checkpoint.
+-- current_repair_parent_routing_bound(repair) -> Boolean: parent manifest hash,
+--   canonical exact service/lock/claim routing and current UID are verified without
+--   depending on malformed status or scanning a database/backup.
+-- CurrentRepairStopTruthReported(repair): teardown attempted and confirmed absence
+--   or stop uncertainty emitted; no inferred terminal or resume state.
+-- CurrentRepairMalformedStatusPreserved(repair): malformed bytes remain unchanged.
+-- current_repair_pending_running_verified(repair) -> Boolean: pending committed
+--   repair has matching installed bytes, loaded private plist and health identity.
+-- current_repair_parent_backup_proof_admitted(repair) -> Boolean: immutable parent
+--   backup and proof validate without opening or scanning the running live database.
+-- CurrentRepairPendingPublicationRetried(repair): same-child publication/cleanup
+--   retried with no live-DB opening, reinstall, stop/start or reconciliation.
+
+rule RetryRunningCurrentRepairPublication {
+    when: CurrentRepairPendingPublicationRetried(repair)
+    requires: repair.state = committed
+    requires: repair.finalization_pending
+    requires: current_repair_classification_valid(repair)
+    requires: current_repair_pending_running_verified(repair)
+    requires: current_repair_parent_backup_proof_admitted(repair)
+    ensures: current_repair_parent_unchanged(repair)
+
+    @guidance
+        -- Backup/proof-only parent admission applies. No live-DB open or exclusive
+        -- live-DB check occurs while the verified repair runs. A stopped pending
+        -- retry instead validates offline target and starts only repair; no reconciliation.
+        -- Cleanup remains retryable if the old restore reservation is gone.
+}
+
+rule StopWithMalformedCurrentRepairStatus {
+    when: CurrentRepairMalformedStatus(repair)
+    requires: current_repair_parent_routing_bound(repair)
+    requires: active_claim_retained(repair.parent)
+    ensures: CurrentRepairStopTruthReported(repair)
+    ensures: CurrentRepairMalformedStatusPreserved(repair)
+    ensures: active_claim_retained(repair.parent)
+
+    @guidance
+        -- Attempt exact service teardown even without a valid child status.
+        -- Report actual absence confirmation or uncertainty. Never invent a
+        -- resume checkpoint or terminal state; preserve all evidence and claim.
+}
+
+rule FailCurrentRepairStopped {
+    when: CurrentRepairFailure(repair)
+    requires: CurrentRepairStopConfirmed(repair)
+    requires: CurrentRepairPersistentAutoStartAbsent(repair)
+    ensures: repair.state = failed_stopped
+    ensures: repair.resume_from != null
+    ensures: repair.failure != null
+    ensures: repair.finalization_pending = false
+    ensures: active_claim_retained(repair.parent)
+}
+
+rule FailCurrentRepairStopUnconfirmed {
+    when: CurrentRepairFailure(repair)
+    requires: not (CurrentRepairStopConfirmed(repair) and CurrentRepairPersistentAutoStartAbsent(repair))
+    ensures: repair.state = stop_unconfirmed
+    ensures: repair.resume_from != null
+    ensures: repair.failure != null
+    ensures: repair.finalization_pending = false
+    ensures: active_claim_retained(repair.parent)
+
+    @guidance
+        -- Use bounded quarantine and fsync passes without reading or deleting evidence
+        -- before stop, repeat after stop, reconfirm exact process absence, and run a
+        -- final quarantine/fsync pass to fence recreation during that probe. The process
+        -- probe and following persistence pass are authoritative even when an earlier
+        -- stop or probe was ambiguous. Exhaustion with a live target or
+        -- process reappearance selects stop_unconfirmed. Resume only
+        -- after sealed-child validation and separately authenticates every retained
+        -- quarantine through bounded stable descriptor reads.
+}
+
+invariant CurrentRepairSingleChild {
+    for a in CurrentSchemaRepairs:
+        for b in CurrentSchemaRepairs:
+            a.parent = b.parent implies a = b
+}
+
+invariant CurrentRepairKeepsOriginalAudit {
+    for repair in CurrentSchemaRepairs:
+        current_repair_sealed(repair) implies current_repair_parent_unchanged(repair)
+}
+
+invariant CurrentRepairIsForwardOnly {
+    for repair in CurrentSchemaRepairs:
+        CurrentRepairNeverStartsOriginalOrPredecessor(repair)
+}
+
+invariant CurrentRepairVerifiedStatesRequireProof {
+    for repair in CurrentSchemaRepairs:
+        repair.state in { target_verified, start_attempted, committed } implies
+            repair.proof_sha256 != null
+}
+
+invariant CurrentRepairPendingIsCommitted {
+    for repair in CurrentSchemaRepairs:
+        repair.finalization_pending implies repair.state = committed
+}
+
+invariant CurrentRepairRetainsParentClaimUntilTerminal {
+    for repair in CurrentSchemaRepairs:
+        (repair.state != committed or repair.finalization_pending) implies
+            active_claim_retained(repair.parent)
 }
