@@ -74,6 +74,14 @@ pub enum BashLaunchError {
     RegistrationFailed,
 }
 
+/// Descendant state without a registered process-group identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum BashUnregisteredDescendants {
+    Unverified,
+}
+
 /// An unregistered child has no handle or PID/group control authority.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
@@ -81,7 +89,7 @@ pub struct BashUnregisteredRun {
     pub cmd: String,
     pub label: Option<String>,
     pub launch_error: BashLaunchError,
-    pub descendants: String,
+    pub descendants: BashUnregisteredDescendants,
     pub output_complete: bool,
     pub duration_ms: u64,
     #[serde(flatten)]
@@ -385,6 +393,25 @@ pub struct TmuxErrorResponse {
 #[cfg(test)]
 mod bash_tmux_wire_tests {
     use super::*;
+
+    #[test]
+    fn unregistered_descendants_is_a_closed_wire_state() {
+        assert_eq!(
+            serde_json::to_value(BashUnregisteredDescendants::Unverified).unwrap(),
+            serde_json::json!("unverified")
+        );
+        assert_eq!(
+            serde_json::from_value::<BashUnregisteredDescendants>(serde_json::json!("unverified"))
+                .unwrap(),
+            BashUnregisteredDescendants::Unverified
+        );
+        for invalid in ["verified", "absent", "running", "Unverified", ""] {
+            assert!(
+                serde_json::from_value::<BashUnregisteredDescendants>(serde_json::json!(invalid))
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn bash_running_serializes_with_status_tag() {

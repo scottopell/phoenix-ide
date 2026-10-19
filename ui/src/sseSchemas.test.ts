@@ -913,4 +913,7 @@ it.each(bashLaunchOutcomes)('validates no-handle launch outcome $status / $launc
   const missingCaptureFact: Record<string, unknown> = { ...response };
   delete missingCaptureFact['output_complete'];
   expect(v.safeParse(BashResponseSchema, missingCaptureFact).success).toBe(false);
+  for (const descendants of ['verified', 'absent', 'running', 'Unverified', '', null]) {
+    expect(v.safeParse(BashResponseSchema, { ...response, descendants }).success).toBe(false);
+  }
 });

@@ -39,8 +39,9 @@ use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLaunchError, BashLiveHandleSummary,
     BashResponse, BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
-    BashStillRunningPayload, BashTombstonedPayload, BashUnregisteredRun,
-    BashUnregisteredTerminalPayload, BashUnregisteredUnknownPayload, BashWaiterPanickedPayload,
+    BashStillRunningPayload, BashTombstonedPayload, BashUnregisteredDescendants,
+    BashUnregisteredRun, BashUnregisteredTerminalPayload, BashUnregisteredUnknownPayload,
+    BashWaiterPanickedPayload,
 };
 use phoenix_core::process_identity::current_process_identity;
 
@@ -708,7 +709,7 @@ async fn run_run_with_identity_probe(
                 cmd: fallback_cmd,
                 label: fallback_label,
                 launch_error: BashLaunchError::RegistrationFailed,
-                descendants: "unverified".to_string(),
+                descendants: BashUnregisteredDescendants::Unverified,
                 output_complete: false,
                 duration_ms: 0,
                 window: window_to_typed(&read.view, read.partial),
@@ -884,7 +885,7 @@ fn settle_unregistered_run(
                 cmd,
                 label,
                 launch_error,
-                descendants: "unverified".to_string(),
+                descendants: BashUnregisteredDescendants::Unverified,
                 output_complete: output_complete && ring.start_offset() == 0,
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 window: window_to_typed(&read.view, read.partial),
@@ -2411,7 +2412,7 @@ mod tests {
                 cmd: "may-have-side-effects".to_string(),
                 label: None,
                 launch_error: BashLaunchError::IdentityUnavailable,
-                descendants: "unverified".to_string(),
+                descendants: BashUnregisteredDescendants::Unverified,
                 output_complete: false,
                 duration_ms: 1,
                 window: window_to_typed(&read.view, read.partial),

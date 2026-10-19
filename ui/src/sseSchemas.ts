@@ -713,7 +713,7 @@ const BashUnregisteredRunFields = {
   cmd: v.string(),
   label: v.nullable(v.string()),
   launch_error: v.picklist(['identity_unavailable', 'registration_failed']),
-  descendants: v.string(),
+  descendants: v.literal('unverified'),
   output_complete: v.boolean(),
   duration_ms: v.number(),
   ...BashRingWindowFieldsSchema,
