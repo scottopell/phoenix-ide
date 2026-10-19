@@ -25867,7 +25867,6 @@ mod tests {
 
     #[tokio::test]
     async fn restart_tool_round_materialization_replays_with_persisted_timestamp() {
-        use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::{AssistantMessage, ThinkInput, ToolCall, ToolInput};
 

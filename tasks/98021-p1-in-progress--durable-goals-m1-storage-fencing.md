@@ -268,3 +268,41 @@ federation subscription files (eight DB diagnostics total). These are not passin
 and are not automatically blamed on the emitter. The goals-related enum-size
 finding remains on-path follow-up once actual current test compilation succeeds;
 federation lint findings remain captured for integration ownership.
+
+### Comprehensive compile/lint integration sweep before another dispatch
+
+Preserved run `39340499073` at `d4acee564f788b7cf4180c4d6a78761857d32833`
+until terminal FAILED; artifact `12229255970` contains no executed goal tests.
+Its focused test compilation stopped at the now-unused local `ToolResult` import
+in the DB restart fixture. Removed it and all three analogous unused runtime
+imports exposed by the preceding typed-empty-vector repair.
+
+Owned the Effect integration blocker in isolated commit
+`345c6a81e9d55c18dd804fc1af1b75154f26f7d1`, without suppressing the lint. Actual
+hosted sizes were 537 bytes for `PersistAuthoritativeUserMessage`, 336 for the
+next-largest variant, and 544 for `Effect`. The oversized field is the prepared
+authoritative input payload, not `CheckpointData`; its fields predate the goals
+changes and are unchanged from f6. The bounded repair boxes that payload in
+`Effect` and `AuthoritativeEffect`, clones the already-boxed core-event payload,
+forwards ownership unchanged, and unboxes only at the existing adoption input.
+Audited the sole reducer constructor, all 13 runtime fixture constructors, and
+all mapping/match/adoption consumers. `Effect` is not serialized; the prepared
+payload codec and schema are untouched. The existing reducer test additionally
+compares the entire payload and boxed/unboxed JSON equality.
+
+The source sweep covered all 218 `completed_results` references, every
+`CheckpointData::tool_round` construction and direct `ToolRound` match, SVG,
+restart and provider fixtures, and concrete APIs in all six added journey
+functions. Remaining concrete `Vec<ToolResult>` references belong to finalized
+result sinks, not pending-capable state. No additional typed-state constructor
+gap was found. This is a source audit, not a compiler/test result.
+
+The eight already-observed federation lint blockers are batched in a separate
+lint-only change: seven static-string error paths use the existing `invalid`
+mapper directly, and the replay API documents its existing constant-conversion
+panic. No schema, authorization, subscription protocol, or error text changes.
+No fresh hosted run is dispatched until these known blockers are committed and
+active-run absence is checked again. Production emitter remains `None`; actual
+auth/control-fenced admission installation, UserControl/stable-Stop DDL ownership,
+and subsequent Drive lifecycle acceptance remain parent-owned critical-path gates,
+not delivered by the source/test fixture sweep.
