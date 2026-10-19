@@ -56,6 +56,7 @@ import io
 import json
 import os
 import re
+import runpy
 try:
     import resource
 except ImportError:  # Windows: profiling unavailable; normal E2E remains usable.
@@ -75,6 +76,10 @@ from pathlib import Path
 
 import httpx
 from httpx_sse import aconnect_sse
+
+HomeResolutionContractTests = runpy.run_path(
+    str(Path(__file__).with_name("coordinator_home_resolution_contract.py"))
+)["HomeResolutionContractTests"]
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / "target" / "debug" / "phoenix_ide"
@@ -2435,6 +2440,7 @@ def _run_self_tests() -> int:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
         for case in (
+            HomeResolutionContractTests,
             HarnessIsolationTests,
             CpuProfilingTests,
             StartupRetryTests,
