@@ -23,7 +23,7 @@ class _Client(Protocol):
 
 
 def assert_home_resolution(
-    payload: Any, *, expected_scope_id: str, expected_home: str
+    payload: Any, *, expected_transcript_id: str, expected_scope_id: str, expected_home: str
 ) -> None:
     """Assert the local resolver's home projection, not a remote envelope.
 
@@ -32,12 +32,16 @@ def assert_home_resolution(
     on the machine running the assertion. Unexpected extra payload fields are
     allowed; the listed fields must all be present with the specified values.
     """
+    if not isinstance(expected_transcript_id, str) or not expected_transcript_id:
+        raise ValueError("expected_transcript_id must be a nonempty exact transcript ID")
     if not isinstance(expected_scope_id, str) or not expected_scope_id:
         raise ValueError("expected_scope_id must be a nonempty string")
     if not isinstance(expected_home, str) or not expected_home:
         raise ValueError("expected_home must be a nonempty server path string")
     if not isinstance(payload, Mapping):
         raise AssertionError("resolver response must be an object")
+    if payload.get("kind") != "conversation" or payload.get("id") != expected_transcript_id:
+        raise AssertionError("resolver response must identify the requested exact transcript")
     scope = payload.get("work_scope")
     if not isinstance(scope, Mapping):
         raise AssertionError("resolver response must contain work_scope object")
@@ -85,7 +89,8 @@ def check_home_resolution(
     response.raise_for_status()
     payload = response.json()
     assert_home_resolution(
-        payload, expected_scope_id=expected_scope_id, expected_home=expected_home
+        payload, expected_transcript_id=coordinator_id,
+        expected_scope_id=expected_scope_id, expected_home=expected_home
     )
     return payload
 
@@ -111,7 +116,8 @@ class HomeResolutionContractTests(unittest.TestCase):
 
     def check(self, payload: Any, home: str = "/foreign/server/data/coordinator") -> None:
         assert_home_resolution(
-            payload, expected_scope_id="owned-home-scope", expected_home=home
+            payload, expected_transcript_id="exact-transcript",
+            expected_scope_id="owned-home-scope", expected_home=home
         )
 
     def test_complete_home_projection(self) -> None:
@@ -151,7 +157,9 @@ class HomeResolutionContractTests(unittest.TestCase):
     def test_rejects_missing_unavailable_and_malformed_scope(self) -> None:
         for scope in (None, [], {"status": "missing"}, {"status": "unavailable"}):
             with self.subTest(scope=scope), self.assertRaises(AssertionError):
-                self.check({"work_scope": scope})
+                payload = self.payload()
+                payload["work_scope"] = scope
+                self.check(payload)
         for payload in ({}, [], None):
             with self.subTest(payload=payload), self.assertRaises(AssertionError):
                 self.check(payload)
@@ -184,6 +192,34 @@ class HomeResolutionContractTests(unittest.TestCase):
             }),
             "status_checked",
         ])
+
+    def test_rejects_wrong_or_missing_response_identity_with_shared_home(self) -> None:
+        for field, value in (("kind", "product_conversation"), ("kind", None),
+                             ("id", "another-transcript"), ("id", None)):
+            with self.subTest(field=field, value=value):
+                payload = self.payload()
+                if value is None:
+                    del payload[field]
+                else:
+                    payload[field] = value
+
+                class Response:
+                    def raise_for_status(self) -> None:
+                        pass
+
+                    def json(self) -> Any:
+                        return payload
+
+                class Client:
+                    def post(self, *_args: Any, **_kwargs: Any) -> Response:
+                        return Response()
+
+                with self.assertRaises(AssertionError):
+                    check_home_resolution(
+                        Client(), "https://existing-fixture", "exact-transcript",
+                        expected_scope_id="owned-home-scope",
+                        expected_home="/foreign/server/data/coordinator",
+                    )
 
     def test_adorned_or_empty_transcript_id_is_rejected_before_transport(self) -> None:
         class NoTransport:
