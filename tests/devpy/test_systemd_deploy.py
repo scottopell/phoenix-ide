@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -568,6 +569,49 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 candidate.binary.write_bytes(b"changed retained copy")
                 with self.assertRaisesRegex(SystemExit, "changed"):
                     self.dev._require_linux_prepared_unchanged(candidate)
+
+    def test_linux_prepared_directory_swap_cannot_retarget_entry_opens(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            forged = root / "forged"
+            staging = root / "staging"
+            source.mkdir()
+            forged.mkdir()
+            staging.mkdir()
+            self.linux_prepared_directory(source)
+            forged_binary, forged_receipt = self.linux_prepared_directory(forged)
+            forged_binary.write_bytes(b"forged payload")
+            forged_raw = json.loads(forged_receipt.read_text())
+            forged_raw["sha256"][forged_binary.name] = self.dev._file_sha256(forged_binary)
+            forged_receipt.write_text(json.dumps(forged_raw))
+            expected = self.dev.RuntimeIdentity(
+                self.dev.SYSTEMD_PREPARED_VERSION, self.dev.SYSTEMD_PREPARED_COMMIT
+            )
+            real_listdir = os.listdir
+
+            def swap_after_enumeration(directory_fd):
+                names = real_listdir(directory_fd)
+                original = root / "original-source"
+                source.rename(original)
+                original_stat = original.stat()
+                os.utime(
+                    original,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000),
+                )
+                source.symlink_to(forged, target_is_directory=True)
+                return names
+
+            with mock.patch.object(os, "listdir", side_effect=swap_after_enumeration), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=expected) as identity:
+                with self.assertRaisesRegex(SystemExit, "directory changed"):
+                    self.dev._prepare_linux_artifact(
+                        source,
+                        self.dev.SYSTEMD_PREPARED_COMMIT,
+                        "c" * 40,
+                        staging,
+                    )
+            identity.assert_not_called()
 
     def test_linux_prepared_manifest_retains_receipt_and_separate_provenance(self):
         import platform

@@ -8284,18 +8284,25 @@ SYSTEMD_PREPARED_RECEIPT = "LINUX-PREPARATION-RECEIPT-x86_64-unknown-linux-musl.
 SYSTEMD_PREPARED_PROTOCOL = 3
 
 
-def _copy_prepared_regular(source: Path, destination: Path, mode: int) -> str:
-    source_flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        source_flags |= os.O_NOFOLLOW
+def _open_prepared_regular(source_directory_fd: int, source_name: str) -> int:
     try:
-        source_fd = os.open(source, source_flags)
+        source_fd = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_directory_fd)
     except OSError as exc:
-        raise SystemExit(f"cannot open prepared systemd artifact {source.name}: {exc}") from exc
+        raise SystemExit(f"cannot open prepared systemd artifact {source_name}: {exc}") from exc
+    try:
+        source_mode = os.fstat(source_fd).st_mode
+    except BaseException:
+        os.close(source_fd)
+        raise
+    if not stat.S_ISREG(source_mode):
+        os.close(source_fd)
+        raise SystemExit("prepared systemd artifact entries must be regular files")
+    return source_fd
+
+
+def _copy_prepared_regular(source_fd: int, destination: Path, mode: int) -> str:
     destination_fd = None
     try:
-        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-            raise SystemExit("prepared systemd artifact entries must be regular files")
         destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         digest = hashlib.sha256()
         with os.fdopen(source_fd, "rb", closefd=False) as source_stream, os.fdopen(
@@ -8313,7 +8320,6 @@ def _copy_prepared_regular(source: Path, destination: Path, mode: int) -> str:
         destination.unlink(missing_ok=True)
         raise
     finally:
-        os.close(source_fd)
         if destination_fd is not None:
             os.close(destination_fd)
 
@@ -8328,20 +8334,55 @@ def _prepare_linux_artifact(
 
     if expected_full_commit != SYSTEMD_PREPARED_COMMIT:
         raise SystemExit("Linux prepared candidate requires exact app commit")
-    if not directory.is_dir() or directory.is_symlink():
-        raise SystemExit("Linux prepared artifact must be a real directory")
-    if {path.name for path in directory.iterdir()} != {SYSTEMD_PREPARED_PAYLOAD, SYSTEMD_PREPARED_RECEIPT}:
-        raise SystemExit("Linux prepared artifact must contain only exact payload and receipt")
+    try:
+        source_directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise SystemExit(f"cannot open prepared systemd artifact directory: {exc}") from exc
     receipt = staging / SYSTEMD_PREPARED_RECEIPT
     binary = staging / "prepared-candidate"
-    receipt_sha = _copy_prepared_regular(directory / SYSTEMD_PREPARED_RECEIPT, receipt, 0o600)
+    receipt_fd = None
+    binary_fd = None
     try:
-        metadata = parse_prepared_receipt(receipt.read_bytes())
-    except (OSError, ValidationError) as exc:
-        raise SystemExit("invalid Linux prepared artifact receipt") from exc
-    if metadata["controller_commit"] != controller_commit:
-        raise SystemExit("Linux preparation receipt controller commit mismatch")
-    binary_sha = _copy_prepared_regular(directory / SYSTEMD_PREPARED_PAYLOAD, binary, 0o700)
+        directory_before = os.fstat(source_directory_fd)
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise SystemExit("Linux prepared artifact must be a real directory")
+        if set(os.listdir(source_directory_fd)) != {SYSTEMD_PREPARED_PAYLOAD, SYSTEMD_PREPARED_RECEIPT}:
+            raise SystemExit("Linux prepared artifact must contain only exact payload and receipt")
+        receipt_fd = _open_prepared_regular(source_directory_fd, SYSTEMD_PREPARED_RECEIPT)
+        binary_fd = _open_prepared_regular(source_directory_fd, SYSTEMD_PREPARED_PAYLOAD)
+        directory_after = os.fstat(source_directory_fd)
+        if (
+            directory_before.st_dev,
+            directory_before.st_ino,
+            directory_before.st_mtime_ns,
+            directory_before.st_ctime_ns,
+        ) != (
+            directory_after.st_dev,
+            directory_after.st_ino,
+            directory_after.st_mtime_ns,
+            directory_after.st_ctime_ns,
+        ):
+            raise SystemExit("Linux prepared artifact directory changed during validation")
+        receipt_sha = _copy_prepared_regular(receipt_fd, receipt, 0o600)
+        completed_receipt_fd = receipt_fd
+        receipt_fd = None
+        os.close(completed_receipt_fd)
+        try:
+            metadata = parse_prepared_receipt(receipt.read_bytes())
+        except (OSError, ValidationError) as exc:
+            raise SystemExit("invalid Linux prepared artifact receipt") from exc
+        if metadata["controller_commit"] != controller_commit:
+            raise SystemExit("Linux preparation receipt controller commit mismatch")
+        binary_sha = _copy_prepared_regular(binary_fd, binary, 0o700)
+        completed_binary_fd = binary_fd
+        binary_fd = None
+        os.close(completed_binary_fd)
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        if binary_fd is not None:
+            os.close(binary_fd)
+        os.close(source_directory_fd)
     if metadata["sha256"][SYSTEMD_PREPARED_PAYLOAD] != binary_sha:
         raise SystemExit("Linux prepared payload checksum mismatch")
     try:
