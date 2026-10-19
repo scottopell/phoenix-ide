@@ -42,3 +42,29 @@ invocation. Both converge to the same delivery function.
   `/skill` trigger. This spec defines the internal delivery mechanism.
 - `specs/keyboard-interaction/` -- REQ-KB-006 help panel lists `/` as a skill
   trigger.
+
+
+## Turn-stability implementation and verification
+
+Ordinary runtime dispatch retains a rendered metadata-only catalog, separate from
+live prompt guidance, permissions, and invocation discovery. It refreshes after
+successful ordinary input/state persistence (including approval feedback and
+question answers), committed authoritative input, or a committed queued
+start from Idle; a mid-turn queued drain and in-process retries retain it.
+Reconstructed executors discover anew: no persisted snapshot/restart parity is
+claimed. Boundary changes rebuild system content and may miss the provider cache;
+no provider event format or capability claim was added.
+
+REQ-SK-009 regression tests cover edit/add/remove metadata across a model/tool
+loop, rejected busy input, failed state persistence retaining the prior snapshot,
+next ordinary turn, durably seeded mid-turn and queued Idle drains, exact source
+attribution, current body edits, shadowing and fallback, and not-found deletion.
+These tests are authored but not executed locally: host admission forbids heavy
+builds. Runtime authorization and Coordinator authentication paths are unchanged;
+their existing regressions still require CI execution.
+
+This checkout has no automatic goal-continuation producer. Its required refresh
+contract is specified, but an actual automatic-goal boundary regression remains
+an integration gap, not a test pass. The broader project-guidance snapshot and
+explicit refresh work tracked in task 36009 is not fulfilled by this catalog-only
+change.
