@@ -17085,13 +17085,34 @@ mod regenerate_conversation_name_tests {
     #[tokio::test]
     async fn removed_name_management_routes_are_not_registered() {
         let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
+        let router = create_router(state).route_layer(axum::middleware::map_response(
+            |mut response: axum::response::Response| async move {
+                response.headers_mut().insert(
+                    "x-test-registered-route",
+                    axum::http::HeaderValue::from_static("present"),
+                );
+                response
+            },
+        ));
+        let registered = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/product-conversations/unknown")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(registered.headers().contains_key("x-test-registered-route"));
         for (method, uri) in [
             ("POST", "/api/conversations/old/rename"),
             ("POST", "/api/conversations/old/regenerate-name"),
             ("PATCH", "/api/chains/old/name"),
             ("POST", "/api/chains/old/regenerate-name"),
         ] {
-            let response = create_router(state.clone())
+            let response = router
+                .clone()
                 .oneshot(
                     axum::http::Request::builder()
                         .method(method)
@@ -17102,10 +17123,9 @@ mod regenerate_conversation_name_tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                response.status(),
-                axum::http::StatusCode::NOT_FOUND,
-                "{method} {uri}"
+            assert!(
+                !response.headers().contains_key("x-test-registered-route"),
+                "obsolete route was registered: {method} {uri}"
             );
         }
     }
