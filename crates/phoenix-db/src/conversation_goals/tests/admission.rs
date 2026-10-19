@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "admission/checkpoint.rs"]
+mod checkpoint;
+
 async fn fixture() -> (Database, GoalMutation) {
     let (db, owner) = full_substrate().await;
     let mut command = create();

@@ -10099,10 +10099,8 @@ impl Database {
     ) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
 
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
-        }
+        conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
+            .await?;
 
         insert_fork_proposal_tx(&mut tx, proposal).await?;
         persist_tool_round_state_tx(&mut tx, origin_conv_id, state, state_updated_at).await?;
@@ -10141,10 +10139,8 @@ impl Database {
     ) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
 
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
-        }
+        conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
+            .await?;
 
         // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
         // `updated_at` so list-ordering stays current.
@@ -10176,10 +10172,8 @@ impl Database {
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
-        }
+        conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
+            .await?;
         persist_tool_round_state_tx(&mut tx, conversation_id, state, state_updated_at).await?;
         tx.commit().await?;
         Ok(())
@@ -10199,10 +10193,8 @@ impl Database {
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
-        insert_message_tx(&mut tx, assistant).await?;
-        for message in tool_results {
-            insert_message_tx(&mut tx, message).await?;
-        }
+        conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
+            .await?;
         workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(Utc::now().to_rfc3339())

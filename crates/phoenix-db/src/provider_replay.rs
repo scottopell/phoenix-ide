@@ -159,10 +159,12 @@ impl Database {
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> DbResult<()> {
         let mut tx = self.pool().begin().await?;
-        crate::insert_message_tx(&mut tx, assistant).await?;
-        for message in tool_results {
-            crate::insert_message_tx(&mut tx, message).await?;
-        }
+        crate::conversation_goals::round::persist_finalized_round_tx(
+            &mut tx,
+            assistant,
+            tool_results,
+        )
+        .await?;
         crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;

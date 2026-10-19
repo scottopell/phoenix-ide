@@ -13,6 +13,8 @@ use crate::Database;
 type GoalTx<'a> = Transaction<'a, Sqlite>;
 
 mod admission;
+pub(crate) mod checkpoint;
+pub mod round;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GoalDbError {
