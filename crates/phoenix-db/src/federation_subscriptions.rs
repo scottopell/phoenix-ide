@@ -23,6 +23,9 @@ fn cursor(value: i64) -> DbResult<SubscriptionCursor> {
 fn uuid(value: &str) -> DbResult<Uuid> {
     Uuid::parse_str(value).map_err(|error| invalid(&error.to_string()))
 }
+fn replay_batch_sql() -> DbResult<i64> {
+    i64::try_from(REPLAY_BATCH).map_err(|error| invalid(&error.to_string()))
+}
 fn end(value: &str) -> DbResult<SubscriptionEnd> {
     match value {
         "unsubscribed" => Ok(SubscriptionEnd::Unsubscribed),
@@ -252,7 +255,7 @@ impl Database {
             }
         } else {
             let rows = sqlx::query("SELECT i.event_id, i.sequence, p.source_transcript_id,p.outcome,p.occurred_at_us FROM federation_terminal_identities i JOIN federation_terminal_payloads p ON p.event_id = i.event_id WHERE i.subscription_id = ?1 AND i.sequence > ?2 AND i.continuation_state = 'none' AND i.sequence < COALESCE((SELECT MIN(blocked.sequence) FROM federation_terminal_identities blocked JOIN federation_terminal_payloads blocked_payload USING(event_id) WHERE blocked.subscription_id = i.subscription_id AND blocked.continuation_state = 'awaiting'), 9223372036854775807) AND NOT EXISTS (SELECT 1 FROM federation_subscriptions s JOIN close_obligations o ON o.product_conversation_id = s.product_id WHERE s.id = i.subscription_id AND o.phase != 'completed') ORDER BY i.sequence LIMIT ?3")
-                .bind(&id).bind(after.get()).bind(i64::try_from(REPLAY_BATCH).expect("replay batch fits in SQLite integer")).fetch_all(&mut *tx).await?;
+                .bind(&id).bind(after.get()).bind(replay_batch_sql()?).fetch_all(&mut *tx).await?;
             let events = rows
                 .iter()
                 .map(|row| {
@@ -264,7 +267,7 @@ impl Database {
                         )
                         .map_err(|error| invalid(&error.to_string()))?,
                         outcome: TerminalFactOutcome::try_from(row.try_get::<&str, _>("outcome")?)
-                            .map_err(|error| invalid(&error.to_string()))?,
+                            .map_err(invalid)?,
                         occurred_at_us: row.try_get("occurred_at_us")?,
                     })
                 })
@@ -349,8 +352,7 @@ fn decode_remote(row: &sqlx::sqlite::SqliteRow) -> DbResult<RemoteSubscription> 
             .map_err(|error| invalid(&error.to_string()))?,
         },
         subscription_id: uuid(row.try_get("subscription_id")?)?,
-        state: SubscriptionState::try_from(row.try_get::<&str, _>("state")?)
-            .map_err(|error| invalid(&error.to_string()))?,
+        state: SubscriptionState::try_from(row.try_get::<&str, _>("state")?).map_err(invalid)?,
         admitted_cursor: cursor(row.try_get("admitted_cursor")?)?,
         enrolled: row.try_get("enrolled")?,
         pending_unsubscribe: row.try_get("pending_unsubscribe")?,

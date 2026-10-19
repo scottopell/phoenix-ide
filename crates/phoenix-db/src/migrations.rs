@@ -15213,6 +15213,18 @@ with tempfile.TemporaryDirectory() as directory:
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn migration_130_upgrades_full_129_schema_preserving_history_and_fresh_parity() {
+        type ForeignKeyRow = (
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+        );
+
         let db = crate::Database::from_pool_for_tests(test_pool().await, String::new());
         db.run_migrations().await.unwrap();
         sqlx::raw_sql(
@@ -15354,17 +15366,6 @@ with tempfile.TemporaryDirectory() as directory:
                 f.on_update, f.on_delete, f.\"match\"
              FROM sqlite_schema s JOIN pragma_foreign_key_list(s.name) f
              WHERE s.type = 'table' ORDER BY s.name, f.id, f.seq";
-        type ForeignKeyRow = (
-            String,
-            i64,
-            i64,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            String,
-        );
         let foreign_keys_before: Vec<ForeignKeyRow> = sqlx::query_as(foreign_keys)
             .fetch_all(db.pool())
             .await
@@ -20384,10 +20385,6 @@ with tempfile.TemporaryDirectory() as directory:
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
 
-        // Chain A: 3 members, only mid is archived → migration archives all 3.
-        // Chain B: 2 members, both archived already → unchanged.
-        // Chain C: 2 members, neither archived → unchanged.
-        // Standalone S: archived in isolation → unchanged.
         for (id, archived) in [
             ("a-root", 0),
             ("a-mid", 1),

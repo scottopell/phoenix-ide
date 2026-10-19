@@ -1,5 +1,5 @@
 use super::{
-    cursor, invalid, uuid, Database, DbResult, FederatedTerminalFact, InstanceId,
+    cursor, invalid, replay_batch_sql, uuid, Database, DbResult, FederatedTerminalFact, InstanceId,
     ProductConversationId, RemoteSubscription, Row, Serialize, Sqlite, SubscriptionCurrentState,
     SubscriptionCursor, SubscriptionDelivery, SubscriptionEnd, SubscriptionGap,
     SubscriptionReference, SubscriptionReplay, SubscriptionSnapshot, TerminalFactOutcome,
@@ -165,7 +165,7 @@ impl Database {
         pending_only: bool,
     ) -> DbResult<Vec<RemoteNotification>> {
         let rows = sqlx::query("SELECT a.*, s.product_id, f.event_id, f.source_transcript_id AS fact_transcript, f.outcome, f.occurred_at_us, g.source_transcript_id AS gap_transcript, g.current_outcome FROM federation_remote_admissions a JOIN federation_remote_subscriptions s USING(destination_instance_id,subscription_id) LEFT JOIN federation_received_facts f ON f.admission_id = a.admission_id LEFT JOIN federation_received_gaps g ON g.admission_id = a.admission_id WHERE a.destination_instance_id = ?1 AND a.subscription_id = ?2 AND a.through_cursor > ?4 AND (?5 = 0 OR ((s.state = 'active' OR a.authorization_requested = 1) AND a.accepted_transcript_id IS NULL AND a.suppressed = 0)) ORDER BY a.after_cursor, a.through_cursor LIMIT ?3")
-            .bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(i64::try_from(REPLAY_BATCH).expect("replay batch fits in SQLite integer")).bind(after.get()).bind(pending_only).fetch_all(&self.pool).await?;
+            .bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(replay_batch_sql()?).bind(after.get()).bind(pending_only).fetch_all(&self.pool).await?;
         rows.iter().map(decode_notification).collect()
     }
 }
@@ -181,7 +181,7 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
                 )
                 .map_err(|error| invalid(&error.to_string()))?,
                 outcome: TerminalFactOutcome::try_from(row.try_get::<&str, _>("outcome")?)
-                    .map_err(|error| invalid(&error.to_string()))?,
+                    .map_err(invalid)?,
                 occurred_at_us: row.try_get("occurred_at_us")?,
             },
         }
@@ -199,7 +199,7 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
                     state: match outcome {
                         Some(outcome) => SubscriptionCurrentState::Terminal {
                             outcome: TerminalFactOutcome::try_from(outcome.as_str())
-                                .map_err(|error| invalid(&error.to_string()))?,
+                                .map_err(invalid)?,
                         },
                         None => SubscriptionCurrentState::Nonterminal,
                     },
