@@ -342,10 +342,10 @@ compiler/test evidence. All paths below are under `crates/`:
 | Internal-event processing | `executor::process_event(Event) -> Result<(), String>`; no returned event list |
 | Stop | `sm_event::Event::UserCancel { reason, cause }`, `sm_event::CancelCause::UserRequested`; workflow `TurnCommand::Cancel` has only turn ID and expected generation |
 | Parent-only report event | `sm_event::SubAgentEvent::try_from(Event)` rejects `GoalReportPrepared`; private `GoalReportEmitter` is installed only by tests and parent guard returns `None` for child/coordinator contexts |
-| Report admission | `conversation_goal/pending_report.rs::GoalReportBinding` has private `execution/goal`; `TryFrom<GoalAdmissionBinding>` validates it; emitter description does not read fabricated public metadata |
-| Report input | `GoalReportOutcome::parse_input(Value)` validates tagged `status` plus reason and rejects extras; advertised schema uses the same supported statuses |
+| Report admission | `conversation_goal/pending_report.rs::GoalReportBinding` has private `execution/goal`; `TryFrom<GoalExecutionBinding>` validates it; emitter description does not read fabricated public metadata |
+| Report input | `executor::prepare_goal_report` calls `serde_json::from_value::<GoalReportOutcome>(tool.input.to_value())`; the outcome's serde shape validates tagged `status` plus reason and rejects extras; advertised schema uses the same supported statuses |
 | Report execution | `pending_report.rs::GoalPendingReport::execution() -> GoalExecution` reads the existing private admission; no second stored representation |
-| Durable user fixture | `phoenix-db::Database::add_message(message_id, conversation_id, &MessageContent, metrics, created_at)` is the five-argument API |
+| Durable user fixture | `phoenix-db::Database::add_message(message_id, conversation_id, content, display_data, usage_data)` accepts `content: &MessageContent`, `display_data: Option<&serde_json::Value>`, and `usage_data: Option<&UsageData>` |
 | Exact terminal obligation | `workflow::load_active_terminal_obligation(&ConversationAuthority)`; fixture verifies returned turn ID and expected generation |
 | Trusted skill overlay | `NonEmptyString::as_str()` and `executor::PendingTrustedToolResult.output`; no `instructions` field |
 | Public replay | `provider_replay::AnthropicResponseSet::with_public_content` and `ProviderReplayUpdate::Anthropic`; replay owns `response_sets`, `owner_message_id`, and `public_content` |
@@ -358,3 +358,10 @@ origin test lines to `a4ff45f4b7`, not the goals owner additions. The direct-tur
 file is goals-touched elsewhere, so that classification is line-specific rather
 than a claim the whole file is unrelated. Parent review of this exact new test
 API/lint head is required before another hosted dispatch.
+
+Independent parent review of exact `0e75336b8..1abf45e59` reported a bounded
+executable-source pass with no concrete compile/logic defect in the six private
+runtime-emitter journeys and helpers. It identified three inaccurate audit rows
+above; these were corrected against the actual declarations before dispatch.
+This is source-review evidence only, not successful Clippy/test execution or
+proof of a public admission installation path.
