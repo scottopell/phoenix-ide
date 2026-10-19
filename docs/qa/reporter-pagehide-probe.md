@@ -1,11 +1,26 @@
-# PREPARE Stage 2: actual reporter/lifecycle pagehide functional probe
+# Stage 2: actual reporter/lifecycle pagehide functional probe
+
+## Current navigation
+
+The **actual hosted result** is retained in the
+[Stage 2 result README](results/reporter-pagehide-39148822485/README.md): the
+positive functional gate failed despite matched synthetic receiver bodies and
+server-finished 204s; neither listener observed the client 204. This is an
+observation/qualification boundary, not a production collector/export violation
+or reconstruction of the historical missing error. The
+[Stage 1 result](results/context-close-39146439582/README.md) remains separate.
+No acceptance, overhead clearance, or new execution follows. See the
+[current offline preparation boundary](../../tests/e2e/history-stock-prepare.md).
+
+## Historical PREPARE record
 
 Prepared from `404651fbc` (Stage 1 observations retained) and its cleanup-only
 predecessor `0b4bc78ae`, with review corrections to `a293a794c`.
-**No Stage 2 hosted result is claimed.** Parent exact-head review is required
-before any push or hosted execution; the parent reports that prior CI terminated.
-This worker neither sets labels nor pushes/runs CI. Roadmap/network context was
-not queried under the explicit no-network preparation boundary.
+The preparation-era statement **“No Stage 2 hosted result is claimed”** and
+publication instructions below are historical, superseded by the retained result
+and current offline boundary above. This worker neither sets labels nor
+pushes/runs CI. Roadmap/network context was not queried under the explicit
+no-network preparation boundary.
 
 ## Source and runtime scope
 

@@ -811,6 +811,8 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify selected-head geometry sources before dependency setup
+        run: python3 -B tests/e2e/history_stock_prepare.test.py --geometry-source-preflight HEAD
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: ui/package.json

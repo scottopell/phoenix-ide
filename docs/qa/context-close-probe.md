@@ -1,5 +1,16 @@
 # Stage 1: synthetic bare-Playwright context-close functional probe
 
+## Current navigation
+
+This document retains the **HISTORICAL PREPARE** contract and validation record.
+The actual hosted observation is now retained in the
+[Stage 1 result README](results/context-close-39146439582/README.md): no response
+after successful context-close resolution was reproduced in its bounded schedules.
+The [actual Stage 2 result](results/reporter-pagehide-39148822485/README.md) is
+separate. Neither closes the historical cause or grants runtime/overhead acceptance.
+The [current offline boundary](../../tests/e2e/history-stock-prepare.md) supersedes
+any preparation-era publication instructions below; no new execution is authorized.
+
 ## Question and authority
 
 Can a response event joined to the **exact original Playwright Request object**
@@ -9,7 +20,8 @@ while `close()` is merely pending is a different observation. This is a bounded
 functional question, **not** a performance test, reporter test, Phoenix collector
 qualification, or explanation of a historical failure.
 
-This packet is prepared from `5d2a62905`. No real probe result accompanies it.
+Historical preparation from `5d2a62905` had no accompanying real probe result;
+that absence statement does not describe the later retained result linked above.
 `context-close-probe.template.json` is an **unexecuted sanitized shape template**:
 its zero identities, empty cases, and placeholder revision are not observations;
 it deliberately cannot pass `functionalPass`. Only a future hosted run's

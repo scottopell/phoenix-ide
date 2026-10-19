@@ -30,23 +30,34 @@ stock runtime job is preserved.
 | Prose/table/transcript fixtures | `ui/src/fixtures/assistantFinalization/`: `acl-reply.md`, `renderFixture.{tsx,css}`, `tableFixture.{tsx,css}`, `transcriptFixture.{tsx,css}` |
 | Ladle entrypoints | `ui/src/stories/`: `assistant-finalization.stories.tsx`, `streaming-table.stories.tsx`, `assistant-finalization-transcript.stories.tsx`, `subagent-task-details.stories.tsx` |
 | Component regressions | `AssistantMessageChrome.test.tsx`, `StreamingMessage.tables.test.tsx`, `StreamingMessage.disclosures.test.tsx`, `MessageList.test.tsx`, `SubAgentTaskDetails.test.tsx`, `SubAgentViewerPanel.test.tsx` under `ui/src/components/` |
-| Source-only regression | `tests/e2e/history_stock_prepare.test.py`: `test_geometry_capture_resources_exist_in_committed_head`, `test_geometry_workflow_uses_matching_head_source_not_copied_scripts`; existing unconditional offline UI step runs this suite |
+| Source-only preflight | `tests/e2e/history_stock_prepare.test.py`: `geometry_source_preflight` and five geometry tests; existing unconditional offline UI step runs this suite |
 | Normative contract and status | `specs/conversation-ui/requirements.md`, REQ-CONV-019; `specs/conversation-ui/executive.md`, Assistant Finalization Geometry Qualification |
 | Diagnostic tools and results | [stock packet](../../tests/e2e/history-stock-prepare.md), [primary diagnostics](stock-f16-primary-diagnostic.md), [offline proof](stock-f16-lifecycle-offline-proof.md), [context-close result](results/context-close-39146439582/README.md), [actual reporter result](results/reporter-pagehide-39148822485/README.md) |
 
 ## Validation boundaries
 
-The two added regressions inspect Git's committed HEAD tree and workflow text;
-they neither import nor execute any capture entrypoint. Before the merge commit,
-both reject the predecessor HEAD, which lacks these resources and the geometry
-job. Final integration validation is restricted to source regressions, cached
-Node syntax checks, YAML parsing, and `bash -n` of workflow shell blocks.
+**DONE (docs/preflight only):** the refined preflight reads the workflow and
+resources from the selected committed Git head, not ambient filesystem bytes.
+It parses the actual geometry job's exact four entrypoints, resolves the relative
+story/fixture imports and raw fixture URL, checks the checkout-head expression,
+`source.txt` command and source-hash input blobs, and checks geometry membership
+in **both** main failure aggregators. Synthetic temporary-repository negatives
+reject a missing entrypoint before a mock installer can be called, even when an
+ambient copy exists; missing fixture/story, changed checkout/source/hash commands,
+a missing capture command, and either omitted aggregator dependency also fail.
+Dirty ambient bytes do not change the selected-head source/hash observation.
+These tests neither import nor execute a capture entrypoint and do not add a
+pre-install gate to the geometry job. This is source discoverability, not new
+source authority or geometry qualification.
 
 **NOT DONE:** new browser/script capture execution, Ladle/server launch, builds,
 dependency installation, SQL, full `dev.py check`, hosted CI, push, label changes,
 production deployment, new natural samples, or performance/physical-device
-acceptance. The inherited component regressions are discoverable source, not new
-passing test claims. Parent retains UI-owner coordination with `58cff20d`.
+acceptance. **Exact-successor hosted geometry qualification is NOT DONE.** The
+inherited component regressions are discoverable source, not new passing test
+claims. Parent/UI owner confirmed that the four capture scripts remain an atomic
+geometry gate with REQ-CONV-014/019, REQ-MLRU-010 and virtual-anchor ownership;
+none is transplanted, skipped, or relaxed here.
 
 The historical stock failure remains **inconclusive**. The retained synthetic
 context-close schedules did not reproduce a response after successful context
@@ -56,30 +67,35 @@ violation or recover the historical lost primary/cleanup-only assertion. The
 existing results and conditional patch proposal remain evidence, not authority
 to change the pinned app or relax delivery/cleanup gates.
 
-## Exact policy proposal — NOT IMPLEMENTED
+## Publication — BLOCKED; execution-policy gate unresolved
 
-The inspected `offline-regression-only` label description is: “Run offline
+The supplied `offline-regression-only` label description is: “Run offline
 regression checks; explicitly skip benchmark runtime capture”. Its implemented
 stock guard is benchmark-specific. Main's geometry job is an automatic browser
 job whenever `needs.plan_check.outputs.ui == 'true'`; the label does **not**
-suppress it. A future PR update may therefore execute geometry even with that
-label. No push or hosted execution is authorized by this integration.
+suppress it. A PR update may therefore execute geometry even with that label.
+The parent's no-new-browser policy gate is unresolved. No workflow guard, label
+policy, runtime code, or normative requirement changes here. Source-preflight
+success does not satisfy the exact-successor hosted geometry gate or authorize
+publication. This handoff is **NOT READY** for push/CI; no further policy proposal
+or implicit geometry exemption is adopted.
 
-If a future source-only PR update is desired, obtain parent/UI-owner approval
-for this exact narrow extension before publishing; do not silently reinterpret
-the label as a global browser ban:
+### Completed early source gate and discoverability audit
 
-```yaml
-# Proposed replacement only for check-finalization-geometry.if:
-if: ${{ needs.plan_check.outputs.ui == 'true' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'prepare/exact-f16-stock-admission' && contains(github.event.pull_request.labels.*.name, 'offline-regression-only')) }}
-```
+The geometry job now invokes
+`python3 -B tests/e2e/history_stock_prepare.test.py --geometry-source-preflight HEAD`
+immediately after its selected-head checkout and before pnpm/setup/install. This
+source-only CLI verifies the committed checkout identity, all four capture
+entrypoints and their story/fixture dependencies, source SHA inputs, and both
+failure aggregators. It neither installs nor executes a capture. Negative tests
+reject missing committed resources even when ambient files exist.
 
-The accompanying proposed label description is: “Run offline regression checks;
-skip benchmark runtime capture and, on prepare/exact-f16-stock-admission only,
-geometry browser capture; functional probes require separate explicit opt-in”.
-A separately reviewed policy change must update the source regression's exact
-geometry predicate and the offline-guard inventory assertion together. It must
-leave Stage 1/2 opt-ins, stock negative guard, ordinary UI checks, other branches,
-main pushes, and main failure aggregation intact. This is only a geometry-job
-proposal, not proof that every other inherited CI job is runtime-free. Until
-execution scope is resolved, retain the no-push/no-CI boundary.
+The bounded documentation audit is complete: preparation/opt-in navigation,
+historical authorization status, actual Stage 1/2 result links, conditional-model
+limitations, telemetry executive checkpoint and full collector source location
+are updated. Exact result/provenance JSON and normative requirements are unchanged.
+
+Local source regressions: 26 preparation/preflight, 14 publication and 8 artifact
+controls passed. Exact-successor hosted geometry remains NOT DONE. Publication
+remains BLOCKED by the no-new-browser execution constraint: the inherited geometry
+job still launches a browser, and its policy has not been changed or waived.

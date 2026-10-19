@@ -373,16 +373,24 @@ with its phase**—not necessarily a primary assertion. The newer diagnostic's
 fixed cleanup stages narrow that boundary when retained, but its clean
 non-reproduction does not reconstruct the old event or close the incident.
 
-## Separately authorized Stage 1 hosted functional probe
+## Retained hosted observations — separate from the offline model
 
-The follow-up from `5d2a62905` prepares a narrowly gated bare-Playwright probe:
-[context-close-probe.md](context-close-probe.md). Unlike the offline model above,
-its future hosted execution uses an owned ephemeral synthetic collector and
-actual Playwright 1.61.0 Chromium, **not** the reporter or Phoenix collector.
-The new job requires the exact same-repo prepare-branch PR **and** the
-`offline-regression-only` label; the stock runtime job remains skipped by its
-unchanged negative-label guard. No real result is checked in, no local runtime
-is authorized, and no historical cause, production fix, stock qualification or
-performance clearance follows from this preparation or its fake-object tests.
-The earlier offline publication receipts remain earlier receipts, not Stage 1
-execution evidence. Stage 2 reporter work is outside this packet.
+The historical Stage 1 preparation from `5d2a62905` is documented in
+[context-close-probe.md](context-close-probe.md). Its
+[actual retained result](results/context-close-39146439582/README.md) used owned
+bare Playwright 1.61.0 Chromium and a synthetic receiver, **not** the reporter or
+Phoenix collector. No response after successful context-close resolution was
+reproduced in the bounded schedules. This does not validate the modeled schedule
+or support applying the conditional patch; that proposal remains **UNVALIDATED
+and unapplied**.
+
+The separate [actual Stage 2 reporter/pagehide result](results/reporter-pagehide-39148822485/README.md)
+failed its positive client-204 gate despite matched bodies and server-finished
+responses. It demonstrates an observation/qualification boundary, not production
+collector/export acceptance or the historical missing primary/cleanup-only cause.
+Both jobs require their own explicit opt-in label in addition to the exact
+same-repository prepare PR and `offline-regression-only`; the stock runtime
+negative guard is unchanged. The [current offline boundary](../../tests/e2e/history-stock-prepare.md)
+authorizes no new runtime, publication, or policy change. Historical cause remains
+**INCONCLUSIVE_MISSING_EVIDENCE**; no stock acceptance or overhead clearance follows.
+Earlier offline receipts are not relabelled as hosted execution evidence.

@@ -16,7 +16,7 @@ its status list was empty; this is not a completed-delivery clearance.
 
 ## Source-only interpretation and remaining boundary
 
-The production collector handler `api/view_journey.rs` emits
+The production collector handler `crates/phoenix-ide/src/api/view_journey.rs` emits
 `conversation_view_accepted` with status 204 after its validated report handling,
 then returns `StatusCode::NO_CONTENT`. The existing Python
 `collector_acceptances` validates that server-side record and identity. The

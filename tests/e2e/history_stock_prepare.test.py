@@ -5,6 +5,7 @@ from contextlib import chdir
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path
 import re
 import subprocess
@@ -32,6 +33,90 @@ def step(prefix):
 def python_block(prefix):
     value = step(prefix).split("          python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
     return textwrap.dedent(value)
+
+
+def geometry_source_preflight(repository, selected_head):
+    """Inspect selected Git blobs only; no capture imports, install, or execution."""
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(repository), *args])
+
+    head = git('rev-parse', selected_head + '^{commit}').decode().strip()
+    entries = {}
+    for entry in git('ls-tree', '-rz', head).split(b'\0'):
+        if entry:
+            metadata, name = entry.split(b'\t', 1)
+            entries[name.decode()] = metadata.decode().split()
+    blobs = {}
+
+    def read(name):
+        assert name in entries, f'geometry source missing at selected head: {name}'
+        mode, kind, oid = entries[name]
+        assert kind == 'blob' and mode in ('100644', '100755'), name
+        if name not in blobs:
+            blobs[name] = git('cat-file', 'blob', oid)
+        return blobs[name].decode()
+
+    workflow = read('.github/workflows/ci.yml')
+    geometry = workflow.split('\n  check-finalization-geometry:\n', 1)[1].split('\n  check-fast:', 1)[0]
+    assert "    if: ${{ needs.plan_check.outputs.ui == 'true' }}" in geometry
+    assert geometry.count('uses: actions/checkout@') == 1
+    assert 'ref: ${{ github.event.pull_request.head.sha || github.sha }}' in geometry
+    assert 'git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt' in geometry
+    assert not re.search(r'(?m)^\s+(?:cp|curl|wget|git (?:show|checkout|restore))\s', geometry)
+    captures = re.findall(r'^          node (scripts/[^\s]+)$', geometry, re.M)
+    assert captures == [
+        'scripts/capture-assistant-finalization.mjs',
+        'scripts/capture-streaming-table.mjs',
+        'scripts/capture-assistant-finalization-transcript.mjs',
+        'scripts/capture-subagent-task-details.mjs',
+    ], captures
+    assert geometry.index('\n          cd ui\n') < geometry.index('\n          node ')
+    hash_line = re.findall(r'^          sha256sum (.+) > ui/qa-artifacts/assistant-finalization/source-files.sha256$', geometry, re.M)
+    assert len(hash_line) == 1
+    hashed_paths = hash_line[0].split()
+    assert hashed_paths == ['ui/src/index.css', 'ui/src/components/StreamingMessage.tsx',
+                            'ui/src/components/MessageComponents.tsx']
+    for name in hashed_paths:
+        read(name)
+
+    def relative(owner, reference):
+        name = posixpath.normpath(posixpath.join(posixpath.dirname(owner), reference.split('?', 1)[0]))
+        candidates = [name] if posixpath.splitext(name)[1] else [name + suffix for suffix in ('.tsx', '.ts', '.mjs')]
+        matches = [candidate for candidate in candidates if candidate in entries]
+        assert len(matches) == 1, f'geometry relative resource missing/ambiguous: {owner}: {reference}'
+        return matches[0]
+
+    pending = []
+    for capture in captures:
+        name = 'ui/' + capture
+        source = read(name)
+        story = capture.removeprefix('scripts/capture-').removesuffix('.mjs')
+        assert story + '--' in source, name
+        pending.append('ui/src/stories/' + story + '.stories.tsx')
+        for reference in re.findall(r"new URL\(['\"]([^'\"]+)['\"], import\.meta\.url\)", source):
+            read(relative(name, reference))
+    visited = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        source = read(name)
+        for reference in re.findall(r"(?:from\s+|import\s*)['\"](\.[^'\"]+)['\"]", source):
+            dependency = relative(name, reference)
+            read(dependency)
+            if dependency.startswith('ui/src/fixtures/') and dependency.endswith(('.tsx', '.ts')):
+                pending.append(dependency)
+    for name in ('ui/src/components/AssistantMessageChrome.tsx',
+                 'ui/src/components/AssistantMessageChrome.css',
+                 'ui/src/components/SubAgentTaskDetails.tsx',
+                 'ui/src/components/SubAgentTaskDetails.css'):
+        read(name)
+    for job in ('notify-main-failure', 'close-main-failure'):
+        body = re.split(r'\n  (?=\S)', workflow.split('\n  ' + job + ':\n', 1)[1], maxsplit=1)[0]
+        needs = re.search(r'^    needs: \[([^\]]+)\]$', body, re.M)
+        assert needs and 'check-finalization-geometry' in needs.group(1).split(', '), job
+    return head, blobs, {name: hashlib.sha256(blobs[name]).hexdigest() for name in hashed_paths}
 
 
 class StockPrepareTests(unittest.TestCase):
@@ -67,50 +152,99 @@ class StockPrepareTests(unittest.TestCase):
         self.assertNotIn('types:', triggers)
 
     def test_geometry_capture_resources_exist_in_committed_head(self):
-        committed = set(subprocess.check_output(
-            ['git', '-C', str(ROOT), 'ls-tree', '-r', '--name-only', 'HEAD'],
-            text=True).splitlines())
-        required = {
-            'ui/scripts/capture-assistant-finalization.mjs',
-            'ui/scripts/capture-streaming-table.mjs',
-            'ui/scripts/capture-assistant-finalization-transcript.mjs',
-            'ui/scripts/capture-subagent-task-details.mjs',
-            'ui/src/fixtures/assistantFinalization/acl-reply.md',
-            'ui/src/fixtures/assistantFinalization/renderFixture.tsx',
-            'ui/src/fixtures/assistantFinalization/renderFixture.css',
-            'ui/src/fixtures/assistantFinalization/tableFixture.tsx',
-            'ui/src/fixtures/assistantFinalization/tableFixture.css',
-            'ui/src/fixtures/assistantFinalization/transcriptFixture.tsx',
-            'ui/src/fixtures/assistantFinalization/transcriptFixture.css',
-            'ui/src/stories/assistant-finalization.stories.tsx',
-            'ui/src/stories/streaming-table.stories.tsx',
-            'ui/src/stories/assistant-finalization-transcript.stories.tsx',
-            'ui/src/stories/subagent-task-details.stories.tsx',
-            'ui/src/components/AssistantMessageChrome.tsx',
-            'ui/src/components/AssistantMessageChrome.css',
-            'ui/src/components/SubAgentTaskDetails.tsx',
-            'ui/src/components/SubAgentTaskDetails.css',
-        }
-        self.assertEqual(required - committed, set(), 'geometry resources missing at HEAD')
+        head, blobs, hashes = geometry_source_preflight(ROOT, 'HEAD')
+        self.assertEqual(head, subprocess.check_output(
+            ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip())
+        self.assertEqual(len([name for name in blobs if name.startswith('ui/scripts/capture-')]), 4)
+        self.assertIn('ui/src/fixtures/assistantFinalization/acl-reply.md', blobs)
+        self.assertEqual(len(hashes), 3)
 
-    def test_geometry_workflow_uses_matching_head_source_not_copied_scripts(self):
-        workflow = subprocess.check_output(
-            ['git', '-C', str(ROOT), 'show', 'HEAD:.github/workflows/ci.yml'], text=True)
-        self.assertIn('\n  check-finalization-geometry:\n', workflow)
-        geometry = workflow.split('\n  check-finalization-geometry:\n', 1)[1].split('\n  check-fast:', 1)[0]
-        self.assertIn("    if: ${{ needs.plan_check.outputs.ui == 'true' }}", geometry)
-        self.assertEqual(geometry.count('uses: actions/checkout@'), 1)
-        self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', geometry)
-        self.assertIn('git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt', geometry)
-        captures = re.findall(r'^          node (scripts/capture-[a-z-]+\.mjs)$', geometry, re.M)
-        self.assertEqual(captures, [
-            'scripts/capture-assistant-finalization.mjs',
-            'scripts/capture-streaming-table.mjs',
-            'scripts/capture-assistant-finalization-transcript.mjs',
-            'scripts/capture-subagent-task-details.mjs',
-        ])
-        self.assertIn('\n          cd ui\n', geometry)
-        self.assertNotRegex(geometry, r'(?m)^\s+(?:cp|curl|wget|git (?:show|checkout|restore))\s')
+    def geometry_repository(self):
+        head, blobs, hashes = geometry_source_preflight(ROOT, 'HEAD')
+        repo = self.out / 'geometry-source'
+        repo.mkdir()
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        for name, data in blobs.items():
+            path = repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+        self.commit_geometry(repo)
+        return repo, blobs, hashes
+
+    def commit_geometry(self, repo):
+        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Source Test',
+                        '-c', 'user.email=source-test@example.invalid',
+                        'commit', '-qm', 'UNIT ONLY geometry source'], check=True)
+
+    def test_geometry_selected_head_ignores_ambient_files_and_hashes_git_blobs(self):
+        repo, blobs, hashes = self.geometry_repository()
+        selected = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+        for name in blobs:
+            (repo / name).write_bytes(b'UNIT ONLY dirty ambient bytes')
+        actual_head, actual_blobs, actual_hashes = geometry_source_preflight(repo, selected)
+        self.assertEqual(actual_head, selected)
+        self.assertEqual(actual_blobs, blobs)
+        self.assertEqual(actual_hashes, hashes)
+
+    def test_geometry_missing_entrypoint_fails_before_install_even_with_ambient_copy(self):
+        repo, blobs, _ = self.geometry_repository()
+        name = 'ui/scripts/capture-streaming-table.mjs'
+        subprocess.run(['git', '-C', str(repo), 'rm', '-q', name], check=True)
+        self.commit_geometry(repo)
+        (repo / name).write_bytes(blobs[name])
+        install = Mock()
+        with self.assertRaisesRegex(AssertionError, 'missing at selected head: ' + re.escape(name)):
+            geometry_source_preflight(repo, 'HEAD')
+            install()
+        install.assert_not_called()
+        # Selecting the preceding complete commit is independent of ambient HEAD.
+        geometry_source_preflight(repo, 'HEAD^')
+
+    def test_geometry_missing_relative_fixture_and_story_fail_closed(self):
+        repo, blobs, _ = self.geometry_repository()
+        for name in ('ui/src/fixtures/assistantFinalization/acl-reply.md',
+                     'ui/src/stories/subagent-task-details.stories.tsx'):
+            subprocess.run(['git', '-C', str(repo), 'rm', '-q', name], check=True)
+            self.commit_geometry(repo)
+            (repo / name).write_bytes(blobs[name])
+            with self.subTest(name=name), self.assertRaisesRegex(AssertionError, 'geometry .*missing'):
+                geometry_source_preflight(repo, 'HEAD')
+            subprocess.run(['git', '-C', str(repo), 'add', name], check=True)
+            self.commit_geometry(repo)
+
+    def test_geometry_workflow_source_binding_and_both_aggregators_fail_closed(self):
+        repo, blobs, _ = self.geometry_repository()
+        path = repo / '.github/workflows/ci.yml'
+        workflow = blobs['.github/workflows/ci.yml'].decode()
+        geometry_start = workflow.index('\n  check-finalization-geometry:\n')
+        mutations = [
+            ('ref: ${{ github.event.pull_request.head.sha || github.sha }}', 'ref: main'),
+            ('git rev-parse HEAD > ui/qa-artifacts/assistant-finalization/source.txt',
+             'echo main > ui/qa-artifacts/assistant-finalization/source.txt'),
+            ('sha256sum ui/src/index.css ', 'sha256sum ui/src/missing.css '),
+            ('          node scripts/capture-streaming-table.mjs\n', ''),
+        ]
+        for before, after in mutations:
+            changed = workflow[:geometry_start] + workflow[geometry_start:].replace(before, after, 1)
+            path.write_text(changed)
+            subprocess.run(['git', '-C', str(repo), 'add', '.github/workflows/ci.yml'], check=True)
+            self.commit_geometry(repo)
+            with self.subTest(mutation=before), self.assertRaises(AssertionError):
+                geometry_source_preflight(repo, 'HEAD')
+        for job in ('notify-main-failure', 'close-main-failure'):
+            start = workflow.index('\n  ' + job + ':\n')
+            path.write_text(workflow[:start] + workflow[start:].replace(', check-finalization-geometry', '', 1))
+            subprocess.run(['git', '-C', str(repo), 'add', '.github/workflows/ci.yml'], check=True)
+            self.commit_geometry(repo)
+            with self.subTest(job=job), self.assertRaisesRegex(AssertionError, job):
+                geometry_source_preflight(repo, 'HEAD')
+
+    def test_geometry_preflight_runs_before_dependency_setup(self):
+        geometry = WORKFLOW.split('\n  check-finalization-geometry:\n', 1)[1].split('\n  check-fast:', 1)[0]
+        command = 'python3 -B tests/e2e/history_stock_prepare.test.py --geometry-source-preflight HEAD'
+        self.assertLess(geometry.index(command), geometry.index('uses: pnpm/action-setup@'))
+        self.assertLess(geometry.index('uses: actions/checkout@'), geometry.index(command))
 
     def test_offline_controls_run_unconditionally_in_normal_ui_job(self):
         ui = WORKFLOW.split('\n  check-ui:\n', 1)[1].split('\n  check-fast:', 1)[0]
@@ -446,4 +580,10 @@ class StockPrepareTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    if sys.argv[1:2] == ['--geometry-source-preflight']:
+        assert len(sys.argv) == 3, 'expected one selected Git head'
+        selected, blobs, hashes = geometry_source_preflight(ROOT, sys.argv[2])
+        assert subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD']).decode().strip() == selected, 'selected head must match checkout'
+        print(json.dumps({'selected_head': selected, 'resource_count': len(blobs), 'source_sha256': hashes}, sort_keys=True))
+    else:
+        unittest.main()

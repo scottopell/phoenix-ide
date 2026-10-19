@@ -6,22 +6,33 @@ provider configuration, or frozen db6 SQL qualification changes are included.
 The source remains `f16afb227d9336a863c0b0345960ea9a6d62b7c7`, tree
 `369305dcd94862d4ee12e7af9fd463d5da14d808`.
 
-## Activation — parent review first
+## Activation — current offline boundary; parent review first
 
-The `qualify-history-realserver` job activates only for a same-repository PR
+The `qualify-history-realserver` job requires a same-repository PR
 whose head is one of its existing allowed branches or
-`prepare/exact-f16-stock-admission`. On the new branch only, its stock step
+`prepare/exact-f16-stock-admission`, **and absence of `offline-regression-only`**.
+With that label it is **SKIPPED**, not passed. On the prepare branch only, its stock step
 invokes the existing `tests/e2e/history_opening_browser.py --joint-telemetry`
 CLI **once**, without `--controlled-functional`. Existing allowed branches keep
 their controlled runtime command and exact prior raw artifact upload allowlist. Chromium installation is required by both;
 the additional native Chrome teardown/layout repeat is skipped on the prepare
 branch. Nothing in this packet executes the hosted workflow locally.
 
-After review, publishing this branch and opening/updating its same-repository PR
-activates the lane. The workflow's top-level triggers are unchanged: branch
-pushes alone do not activate CI (`push` is restricted to `main`); PR events also
-run the ordinary check-plan/check jobs as before. This packet does not suppress
-normal checks or introduce a broad push trigger.
+Stage 1 additionally requires `context-close-probe`; Stage 2 additionally requires
+`reporter-pagehide-probe`. Both require `offline-regression-only` and the exact
+same-repository prepare-branch PR. Neither opt-in is authorized by this packet.
+The workflow's top-level triggers are unchanged: branch pushes alone do not
+activate CI (`push` is restricted to `main`); ordinary PR events run check jobs,
+but label addition alone does not trigger a run. Inherited geometry capture is
+**not** suppressed by the benchmark-only offline label. Publication is **BLOCKED**
+until the parent resolves the no-new-browser execution-policy gate; there is no
+new push/CI authorization here.
+
+Current interpretation: [primary diagnostic and final disposition](../../docs/qa/stock-f16-primary-diagnostic.md).
+Actual retained observations: [Stage 1 context-close](../../docs/qa/results/context-close-39146439582/README.md)
+and [Stage 2 reporter/pagehide](../../docs/qa/results/reporter-pagehide-39148822485/README.md).
+The stock incident remains **INCONCLUSIVE_MISSING_EVIDENCE**; neither result
+qualifies production delivery/export, exact-successor geometry, or overhead.
 
 ## Receiving artifact and driver ownership
 
@@ -108,7 +119,7 @@ server, browser, SQL, push, or hosted execution is authorized by this packet.
 Full `dev.py check`, shipping-feature/runtime capability, physical/native browser
 behavior, natural-sample sufficiency, and overhead clearance are not established.
 
-Final bounded integration validation: stock preparation static/filesystem
+Historical packet validation (not the latest source-preflight count): stock preparation static/filesystem
 regressions **17/17**, publication allowlist/distribution regressions **4/4**,
 and controlled artifact regressions **8/8**; CI YAML parse and all inline workflow
 shell blocks passed `bash -n`. No broader tests were rerun for these integration

@@ -1,4 +1,21 @@
-# PREPARE: exact-f16 stock primary-assertion diagnostic
+# Exact-f16 stock primary-assertion diagnostic
+
+## Current checkpoint — offline only
+
+The historical fresh-build/automatic-PR authorization below is **SUPERSEDED**,
+not renewed. The stock job's negative `offline-regression-only` guard remains
+in force; Stage 1/2 need their separate explicit opt-in labels. No publication,
+new browser execution, stock retry, or policy change is authorized here.
+Main's inherited geometry job is not skipped by that benchmark-only label;
+publication remains **BLOCKED** on the parent's no-new-browser policy gate.
+See the [current preparation boundary](../../tests/e2e/history-stock-prepare.md)
+and [geometry integration audit](finalization-geometry-integration.md).
+
+Actual retained results: [Stage 1 bounded context-close non-reproduction](results/context-close-39146439582/README.md)
+and [Stage 2 reporter/pagehide positive-gate failure](results/reporter-pagehide-39148822485/README.md).
+Historical cause remains **INCONCLUSIVE_MISSING_EVIDENCE**. Source proof is not
+exact-successor hosted geometry qualification, collector/export acceptance, or
+overhead clearance.
 
 Offline follow-up from harness023: [conditional lifecycle close-drain model and
 actual-023 coverage boundary](stock-f16-lifecycle-offline-proof.md). It demonstrates
@@ -9,8 +26,9 @@ proposal is unapplied and conditional on a real contract/reproducer and admissio
 review. It neither attributes the earlier incident nor changes the pinned app/live
 driver.
 
-## Scope and prior outcome
+## Historical scope and prior outcome — authorization superseded
 
+The following records the earlier preparation authorization, **not current permission**.
 This is diagnostic source preparation, not a new runtime result. After parent
 review, the parent is authorized to publish the reviewed head to PR #942 for
 **one fresh, normal existing hosted stock-build invocation**. This child does not
@@ -93,7 +111,11 @@ inventories and all numeric trial distributions are unchanged. Missing diagnosti
 in old artifacts retain an explicit missing-field/artifact boundary, not success.
 No new trace/OTLP publication is added.
 
-## One fresh hosted build after parent review
+## Historical fresh hosted build after parent review — SUPERSEDED
+
+This section preserves the old artifact-completeness rationale and automatic PR
+execution plan. Its fresh-build/publication authorization is superseded by the
+current offline boundary above; do not execute it as a runbook.
 
 Artifact12122620564 cannot satisfy the existing unmodified joint CLI as downloaded:
 
