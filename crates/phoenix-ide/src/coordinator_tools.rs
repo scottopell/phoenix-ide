@@ -650,6 +650,8 @@ struct ResolveReference(GlobalReadService);
 #[serde(deny_unknown_fields)]
 struct ResolveReferenceInput {
     reference: String,
+    #[serde(default)]
+    instance: Option<String>,
 }
 struct SendConversationMessage {
     service: GlobalReadService,
@@ -828,10 +830,10 @@ impl Tool for ResolveReference {
         "resolve_reference"
     }
     fn description(&self) -> String {
-        "Resolve canonical @conv:<product_conversation_id> and @transcript:<conversation_id> references, plus previously issued app-local, @chain, and @work compatibility references. Results include the selected transcript member's attached WorkScope lifecycle, environment, and explicitly server-side paths when available. This compatibility resolver is broader than typed read/send targets; bare IDs remain unsupported.".to_string()
+        "Resolve canonical @conv:<product_conversation_id> and @transcript:<conversation_id> references, plus previously issued app-local, @chain, and @work compatibility references. Results include destination-qualified primary and related references plus the selected transcript member's attached WorkScope lifecycle. When paths are available, path_owner_instance_id identifies the instance whose server filesystem owns them; never treat remote paths as local Bash targets. This compatibility resolver is broader than typed read/send targets; bare IDs remain unsupported.".to_string()
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object","properties":{"reference":{"type":"string","minLength":1}},"required":["reference"],"additionalProperties":false})
+        json!({"type":"object","properties":{"reference":{"type":"string","minLength":1},"instance":{"type":"string","minLength":1,"description":"Optional enrolled instance UUID or unambiguous display name. Omit only for local resolution."}},"required":["reference"],"additionalProperties":false})
     }
     fn clearable(&self) -> bool {
         true
@@ -841,12 +843,35 @@ impl Tool for ResolveReference {
             Ok(value) => value,
             Err(error) => return ToolOutput::error(format!("invalid input: {error}")),
         };
-        match self.0.resolve_reference(&parsed.reference).await {
-            Ok(value) => match serde_json::to_string_pretty(&value) {
-                Ok(value) => ToolOutput::success(value),
-                Err(error) => ToolOutput::error(format!("failed to encode reference: {error}")),
-            },
-            Err(error) => ToolOutput::error(app_error_message(error)),
+        let value = if let Some(instance) = parsed.instance {
+            let selector =
+                match phoenix_core::domain::instance_identity::InstanceSelector::parse(instance) {
+                    Ok(selector) => selector,
+                    Err(error) => return ToolOutput::error(error.to_string()),
+                };
+            let peer = match self.0.resolve_federation_peer(&selector).await {
+                Ok(peer) => peer,
+                Err(error) => return ToolOutput::error(error.to_string()),
+            };
+            match crate::api::federation::resolve_remote_reference(
+                self.0.database(),
+                &peer,
+                parsed.reference,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => return ToolOutput::error(error.to_string()),
+            }
+        } else {
+            match self.0.resolve_reference(&parsed.reference).await {
+                Ok(value) => value,
+                Err(error) => return ToolOutput::error(app_error_message(error)),
+            }
+        };
+        match serde_json::to_string_pretty(&value) {
+            Ok(value) => ToolOutput::success(value),
+            Err(error) => ToolOutput::error(format!("failed to encode reference: {error}")),
         }
     }
 }

@@ -437,3 +437,71 @@ async fn authenticated_https_read_preserves_stable_and_exact_identity() {
     caller.stop().await;
     receiver.stop().await;
 }
+
+#[tokio::test]
+async fn authenticated_https_resolve_returns_destination_provenance() {
+    use phoenix_core::domain::{
+        conversation_reference::ConversationReferenceTarget,
+        product_conversation::ProductConversationId,
+    };
+
+    let caller = TestInstance::start().await;
+    let receiver = TestInstance::start().await;
+    let destination = receiver.state.db.instance_id().await.unwrap();
+    let conversation = receiver
+        .state
+        .db
+        .create_conversation(
+            "remote-resolve-transcript",
+            "remote-resolve",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let product_id =
+        ProductConversationId::parse(conversation.product_conversation_id.to_string()).unwrap();
+    let peer = caller.connect_to(&receiver).await;
+
+    let resolution = crate::api::federation::resolve_remote_reference(
+        &caller.state.db,
+        &peer,
+        format!("@conv:{product_id}"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolution.reference.instance_id, destination);
+    assert!(resolution.path_owner_instance_id.is_none());
+    assert!(!resolution.related_references.is_empty());
+    assert!(resolution
+        .related_references
+        .iter()
+        .all(|reference| reference.instance_id == destination));
+    assert!(matches!(
+        resolution.reference.target,
+        ConversationReferenceTarget::ProductConversation {
+            product_conversation_id,
+        } if product_conversation_id == product_id
+    ));
+    assert!(resolution
+        .href
+        .as_deref()
+        .is_some_and(|href| href.starts_with("https://localhost:")));
+
+    let error = crate::api::federation::resolve_remote_reference(
+        &caller.state.db,
+        &peer,
+        "@conv:missing-product".to_string(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::api::federation::FederationClientError::ResolveInvalidReference(_)
+    ));
+
+    caller.stop().await;
+    receiver.stop().await;
+}

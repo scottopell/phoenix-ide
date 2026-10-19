@@ -31,16 +31,19 @@ pub struct ResolveGlobalReferenceRequest {
     pub reference: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveGlobalReferenceResponse {
     pub reference: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub href: Option<String>,
     pub title: Option<String>,
     pub work_scope: ResolvedWorkScope,
+    pub path_owner_instance_id: Option<phoenix_core::domain::instance_identity::InstanceId>,
+    pub related_references:
+        Vec<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ResolvedWorkScope {
     Missing,
@@ -59,7 +62,7 @@ pub enum ResolvedWorkScope {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkScopeUnavailableReason {
     RecordNotFound,
@@ -67,7 +70,7 @@ pub enum WorkScopeUnavailableReason {
     ReadFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolvedEnvironmentKind {
     CoordinatorHome,
@@ -76,7 +79,7 @@ pub enum ResolvedEnvironmentKind {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerPathSemantics {
     ServerFilesystem,
@@ -1453,7 +1456,16 @@ impl GlobalReadService {
         &self,
         reference: &str,
     ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-        resolve_reference_impl(self, reference).await
+        let mut resolution = resolve_reference_impl(self, reference).await?;
+        if matches!(resolution.work_scope, ResolvedWorkScope::Available { .. }) {
+            resolution.path_owner_instance_id = Some(
+                self.db
+                    .instance_id()
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+            );
+        }
+        Ok(resolution)
     }
 }
 
@@ -2673,6 +2685,35 @@ async fn qualified_reference(
     )
 }
 
+async fn qualified_transcript_references<'a>(
+    service: &GlobalReadService,
+    transcript_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<
+    Vec<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    AppError,
+> {
+    use phoenix_core::domain::conversation_reference::ConversationReferenceTarget;
+
+    let instance_id = service
+        .db
+        .instance_id()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    transcript_ids
+        .into_iter()
+        .map(|id| {
+            phoenix_core::domain::close::TranscriptConversationId::parse(id)
+                .map(|transcript_id| {
+                    phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                        instance_id,
+                        ConversationReferenceTarget::Transcript { transcript_id },
+                    )
+                })
+                .map_err(|error| AppError::Internal(error.to_string()))
+        })
+        .collect()
+}
+
 async fn resolve_reference_impl(
     service: &GlobalReadService,
     raw: &str,
@@ -2720,6 +2761,11 @@ async fn resolve_reference_impl(
                 .forget();
         }
         let current = resolve_current_member_and_work_scope(service, id).await?;
+        let related_references = qualified_transcript_references(
+            service,
+            [aggregate.root.conversation.id.as_str(), current.id.as_str()],
+        )
+        .await?;
         return Ok(ResolveGlobalReferenceResponse {
             reference: qualified_reference(
                 service,
@@ -2728,7 +2774,9 @@ async fn resolve_reference_impl(
                 },
             )
             .await?,
-            href: Some(format!("/c/{typed_id}")),
+            href: Some(
+                crate::api::product_conversations::canonical_product_conversation_route(&typed_id),
+            ),
             title: aggregate
                 .root
                 .conversation
@@ -2737,6 +2785,8 @@ async fn resolve_reference_impl(
                 .or(aggregate.root.conversation.title.clone())
                 .or(aggregate.root.conversation.slug.clone()),
             work_scope: current.work_scope,
+            path_owner_instance_id: None,
+            related_references,
             summary: format!(
                 "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
                 aggregate.root.conversation.id,
@@ -2896,6 +2946,8 @@ async fn resolve_conversation(
         href,
         title: title.clone(),
         work_scope: resolve_work_scope(service, &conv).await,
+        path_owner_instance_id: None,
+        related_references: Vec::new(),
         summary: format!(
             "conversation {} updated {} state {}",
             title.unwrap_or(conv.id),
@@ -2932,6 +2984,25 @@ async fn resolve_message(
         conversation_message_href(&conv, Some((&message.message_id, message.message_type)))
     });
     let title = conv.title.clone().or(conv.slug.clone());
+    let related_references = match &message.origin {
+        phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            ..
+        } => {
+            let mut references =
+                qualified_transcript_references(service, [transcript_id.as_str()]).await?;
+            references.push(
+                qualified_reference(
+                    service,
+                    stable_reference_target(service, product_conversation_id.clone()).await?,
+                )
+                .await?,
+            );
+            references
+        }
+        _ => Vec::new(),
+    };
     let sender = attributed_sender_with_stable(&service.db, &message.origin)
         .await
         .map_err(|error| AppError::Internal(format!("sender attribution failed: {error}")))?;
@@ -2953,6 +3024,8 @@ async fn resolve_message(
         href,
         title,
         work_scope: resolve_work_scope(service, &conv).await,
+        path_owner_instance_id: None,
+        related_references,
         summary: format!(
             "{}{} message {} in @transcript:{} at {}: {}",
             attributed_role(message.message_type, &message.origin),
@@ -3033,6 +3106,8 @@ async fn resolve_chain(
         || format!("@transcript:{root_id}"),
         |member| format!("@transcript:{member}"),
     );
+    let related_references =
+        qualified_transcript_references(service, members.iter().map(String::as_str)).await?;
     Ok(ResolveGlobalReferenceResponse {
         reference: qualified_reference(
             service,
@@ -3046,6 +3121,8 @@ async fn resolve_chain(
             .or(root.title.clone())
             .or(root.slug.clone()),
         work_scope,
+        path_owner_instance_id: None,
+        related_references,
         summary: format!(
             "legacy chain rooted at @transcript:{root_id} with {} member(s); current/latest {}; ordered members: {}",
             members.len(),
@@ -3112,6 +3189,9 @@ async fn resolve_work(
         .or(current.title.clone())
         .or(current.slug.clone())
         .unwrap_or_else(|| current.id.clone());
+    let related_references =
+        qualified_transcript_references(service, members.iter().map(|member| member.id.as_str()))
+            .await?;
     Ok(ResolveGlobalReferenceResponse {
         reference: qualified_reference(
             service,
@@ -3121,6 +3201,8 @@ async fn resolve_work(
         href: Some(href),
         title: Some(title),
         work_scope: resolve_work_scope(service, current).await,
+        path_owner_instance_id: None,
+        related_references,
         summary: format!(
             "work reference identity; root @transcript:{}; current/latest @transcript:{}; current state {}; state updated {}; conversation updated {}; archived {}",
             root.id,

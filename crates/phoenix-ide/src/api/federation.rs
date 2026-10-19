@@ -95,6 +95,20 @@ pub struct RemoteReadConversationResponse {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct RemoteResolveReferenceRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub reference: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RemoteResolveReferenceResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub resolution: crate::api::global_read::ResolveGlobalReferenceResponse,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RemoteReadErrorCode {
     InvalidTarget,
@@ -107,6 +121,22 @@ enum RemoteReadErrorCode {
 #[derive(Serialize, Deserialize)]
 struct RemoteReadErrorResponse {
     code: RemoteReadErrorCode,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteResolveErrorCode {
+    InvalidReference,
+    DestinationUnavailable,
+    ResponseTooLarge,
+    CallerMismatch,
+    DestinationMismatch,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoteResolveErrorResponse {
+    code: RemoteResolveErrorCode,
     message: String,
 }
 
@@ -154,6 +184,142 @@ pub enum FederationClientError {
     ReadUnavailable(String),
     #[error("remote read response exceeds the bounded response budget: {0}")]
     ReadResponseTooLarge(String),
+    #[error("remote reference rejected: {0}")]
+    ResolveInvalidReference(String),
+    #[error("remote reference destination unavailable: {0}")]
+    ResolveUnavailable(String),
+    #[error("remote reference response exceeds the bounded response budget: {0}")]
+    ResolveResponseTooLarge(String),
+    #[error("remote reference provenance mismatch")]
+    ResolveProvenanceMismatch,
+}
+
+pub async fn resolve_remote_reference(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    reference: String,
+) -> Result<crate::api::global_read::ResolveGlobalReferenceResponse, FederationClientError> {
+    let caller_instance_id = local_db.instance_id().await?;
+    let expected_target =
+        crate::api::global_read::GlobalReadService::parse_read_target(&reference).ok();
+    let endpoint = peer
+        .base_url
+        .navigation_url("/api/federation/peer/resolve-reference")?;
+    let client = remote_query_client(&peer.tls_trust)?;
+    let response = client
+        .post(endpoint.as_url().clone())
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&RemoteResolveReferenceRequest {
+            caller_instance_id,
+            destination_instance_id: peer.peer_instance_id,
+            reference,
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut response = decode_remote_resolve_response(status, &bytes)?;
+    if response.destination_instance_id != peer.peer_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller_instance_id {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.resolution.reference.instance_id != peer.peer_instance_id {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    if expected_target
+        .as_ref()
+        .is_some_and(|target| target != &response.resolution.reference.target)
+    {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    if response
+        .resolution
+        .related_references
+        .iter()
+        .any(|reference| reference.instance_id != peer.peer_instance_id)
+    {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    let path_owner_matches = match (
+        &response.resolution.work_scope,
+        response.resolution.path_owner_instance_id,
+    ) {
+        (crate::api::global_read::ResolvedWorkScope::Available { .. }, Some(instance_id)) => {
+            instance_id == peer.peer_instance_id
+        }
+        (crate::api::global_read::ResolvedWorkScope::Available { .. }, None) => false,
+        (_, None) => true,
+        (_, Some(_)) => false,
+    };
+    if !path_owner_matches {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    if let Some(path) = &response.resolution.href {
+        if expected_target
+            .as_ref()
+            .is_some_and(|target| !resolved_reference_href_matches(target, path))
+        {
+            return Err(FederationClientError::ResolveProvenanceMismatch);
+        }
+        response.resolution.href = Some(peer.base_url.navigation_url(path)?.as_url().to_string());
+    }
+    Ok(response.resolution)
+}
+
+fn resolved_reference_href_matches(target: &ConversationReferenceTarget, href: &str) -> bool {
+    use crate::api::product_conversations::{
+        canonical_product_conversation_route, exact_transcript_route, message_fragment,
+    };
+
+    match target {
+        ConversationReferenceTarget::ProductConversation {
+            product_conversation_id,
+        } => href == canonical_product_conversation_route(product_conversation_id),
+        ConversationReferenceTarget::Transcript { transcript_id } => {
+            href == exact_transcript_route(transcript_id)
+        }
+        ConversationReferenceTarget::Message {
+            transcript_id,
+            message_id,
+        } => {
+            let base = exact_transcript_route(transcript_id);
+            href == base || href == format!("{base}{}", message_fragment(message_id.as_str()))
+        }
+        ConversationReferenceTarget::Coordinator => href == "/global",
+    }
+}
+
+fn decode_remote_resolve_response(
+    status: StatusCode,
+    bytes: &[u8],
+) -> Result<RemoteResolveReferenceResponse, FederationClientError> {
+    if status.is_success() {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    let Some(error) = serde_json::from_slice::<RemoteResolveErrorResponse>(bytes).ok() else {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    };
+    Err(match error.code {
+        RemoteResolveErrorCode::InvalidReference => {
+            FederationClientError::ResolveInvalidReference(error.message)
+        }
+        RemoteResolveErrorCode::DestinationUnavailable => {
+            FederationClientError::ResolveUnavailable(error.message)
+        }
+        RemoteResolveErrorCode::ResponseTooLarge => {
+            FederationClientError::ResolveResponseTooLarge(error.message)
+        }
+        RemoteResolveErrorCode::CallerMismatch => FederationClientError::CallerMismatch,
+        RemoteResolveErrorCode::DestinationMismatch => FederationClientError::DestinationMismatch,
+    })
 }
 
 fn validate_remote_read_provenance(
@@ -589,6 +755,100 @@ fn random_peer_token() -> String {
         "phx_peer_{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     )
+}
+
+pub async fn resolve_reference(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteResolveReferenceRequest>,
+) -> Response {
+    let destination = match state.db.instance_id().await {
+        Ok(instance_id) => instance_id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read local instance identity");
+            return remote_resolve_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                RemoteResolveErrorCode::DestinationUnavailable,
+                "destination reference resolver unavailable",
+            );
+        }
+    };
+    if request.destination_instance_id != destination {
+        return remote_resolve_error(
+            StatusCode::CONFLICT,
+            RemoteResolveErrorCode::DestinationMismatch,
+            "destination instance identity mismatch",
+        );
+    }
+    if request.caller_instance_id != authenticated.caller_instance_id {
+        return remote_resolve_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            RemoteResolveErrorCode::CallerMismatch,
+            "caller instance identity mismatch",
+        );
+    }
+    let service = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match service.resolve_reference(&request.reference).await {
+        Ok(resolution) => {
+            let response = RemoteResolveReferenceResponse {
+                caller_instance_id: authenticated.caller_instance_id,
+                destination_instance_id: destination,
+                resolution,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(encoded) if encoded.len() <= MAX_REMOTE_RESPONSE_BYTES => {
+                    Json(response).into_response()
+                }
+                Ok(_) => remote_resolve_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    RemoteResolveErrorCode::ResponseTooLarge,
+                    "remote reference response exceeds the bounded response budget",
+                ),
+                Err(error) => {
+                    tracing::error!(%error, "failed to encode peer reference resolution");
+                    remote_resolve_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        RemoteResolveErrorCode::DestinationUnavailable,
+                        "destination reference resolver unavailable",
+                    )
+                }
+            }
+        }
+        Err(
+            crate::api::handlers::AppError::BadRequest(message)
+            | crate::api::handlers::AppError::NotFound(message),
+        ) => remote_resolve_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            RemoteResolveErrorCode::InvalidReference,
+            &message,
+        ),
+        Err(error) => {
+            tracing::error!(?error, "peer reference resolution failed");
+            remote_resolve_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                RemoteResolveErrorCode::DestinationUnavailable,
+                "destination reference resolver unavailable",
+            )
+        }
+    }
+}
+
+fn remote_resolve_error(
+    status: StatusCode,
+    code: RemoteResolveErrorCode,
+    message: &str,
+) -> Response {
+    (
+        status,
+        Json(RemoteResolveErrorResponse {
+            code,
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 pub async fn read_conversation(
