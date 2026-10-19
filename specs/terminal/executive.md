@@ -75,8 +75,8 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | REQ-TERM-005: Initial resize before first prompt | ✅ Done | src/terminal/ws.rs:wait_for_resize() |
 | REQ-TERM-006: Resize propagated to PTY and parser | ✅ Done | src/terminal/ws.rs:apply_resize() |
 | REQ-TERM-007: EIO treated as clean termination | ✅ Done | src/terminal/ws.rs:reader_task() |
-| REQ-TERM-008: Master fd closed on WebSocket disconnect | ✅ Done | src/terminal/session.rs:TerminalHandle::Drop |
-| REQ-TERM-009: Child process reaped after shell exit | ✅ Done | src/terminal/ws.rs:waitpid() |
+| REQ-TERM-008: Master fd closed on WebSocket disconnect | Known contract drift; separate disposition required | `terminal_ws::detach_only` preserves the registered master and live child for reclaim, contrary to REQ-TERM-008 and Allium `UserClosedTerminal`. See disposition below. |
+| REQ-TERM-009: Child process reaped after shell exit | Candidate; tests authored, execution unverified | `ActiveTerminals::install_child_observer`, `TerminalChildLifecycle`, `ChildExitReceipt`, and `ActiveTerminals::complete_retirement_by_observing`; detached cleanup and attached EOF-drain behavior require qualification. |
 | REQ-TERM-010: vt100 parser fed every byte in order | ✅ Done | src/terminal/ws.rs:reader_task() |
 | REQ-TERM-011: `read_terminal` agent tool | ✅ Done | src/tools/read_terminal.rs |
 | REQ-TERM-012: Terminal torn down with WorkScope | ✅ Done | src/terminal/ws.rs:teardown watcher (per-scope dispatch) |
@@ -84,4 +84,39 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | REQ-TERM-014: Output channel backpressure | ✅ Done | src/terminal/ws.rs:OUTPUT_BUF bounded reads |
 | REQ-TERM-WS-001: Terminal sessions keyed by WorkScope | ✅ Done | src/terminal/session.rs:ActiveTerminals; src/work_scope.rs |
 
-**Progress:** 15 of 15 complete
+## Detached-child reaping candidate
+
+The candidate installs one observer on successful registry publication through
+`insert_reserved` or `try_insert_exact`. It reaps independently of attachment and
+publishes a read-only in-memory receipt. Natural exit does not send `TearDown` to
+an attached relay: the existing EOF path can drain output. Cleanup acquires
+`attach_permit`, closes the master, and removes only the exact registered handle.
+A live idle detached child is preserved. Explicit Close awaits the same receipt;
+natural cleanup does not clear its retirement fence.
+
+Coverage authored in `crates/phoenix-terminal/src/proptests.rs` includes both
+publication paths, live-idle preservation, attached authority retention, stale
+instance protection, observer failure, and Close/observer sharing. Real-PTY tests
+include `detached_direct_shell_exit_is_reaped_without_reconnect_or_close` and
+`complete_retirement_exits_and_reaps_long_lived_detached_direct_pty`. Existing
+`terminal_ws::reclaim_tests` also exercise real PTY handoff and explicit retirement.
+These are source-level coverage claims, **not passing-test or runtime acceptance
+claims**; candidate execution remains unverified here. Task 08669 tracks scope
+and remaining qualification.
+
+## Separate disconnect-policy disposition
+
+REQ-TERM-008 and Allium `UserClosedTerminal` require master closure on every
+WebSocket disconnect. Actual `terminal_ws::detach_only` preserves the master and
+child in `ActiveTerminals`, and `reclaim` reattaches to that session. This is a
+known normative/implementation contradiction, not completed REQ-TERM-008 coverage.
+The narrow detached-exit fix does not authorize changing disconnect policy.
+Task 08669 records a separate disposition item: obtain the policy decision, then
+reconcile the requirement, Allium rule, implementation, and tests together. No
+normative open question or silent policy rewrite is introduced here.
+
+Legacy `design.md` also describes reader-owned reaping and disconnect teardown;
+it is not an accurate guide to this candidate's observer ownership. Its broader
+lifecycle reconciliation belongs to that separate disposition, not this patch.
+Descriptor inheritance and cancelled-spawn publication gaps are separately
+recorded in task 08669 and are outside this candidate.
