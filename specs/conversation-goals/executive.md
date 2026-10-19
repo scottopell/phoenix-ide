@@ -1,5 +1,15 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest execution evidence
+
+Existing CI39305235616 tested exact `be3986645d83e366c40b9ed811023f7b65bcf5be`. Its failure-only focused nextest step **executed65 goal-related tests:60 passed,5 failed,3398 skipped/filtered** (30.482s), with individual statuses and full assertions retained in Rust job118240613566 and artifact12215452602. These are actual results, not a passing count inferred from the authored inventory. The normal workspace lane also failed independently; this is not complete qualification.
+
+All five focused failures were fixture contract violations: automatic continuation lacked an eligible opted-in exhausted predecessor and genuine continuation-summary message; reservation teardown deleted an untransferred reservation; AUQ and transferred-target setup changed state JSON without the enforced state_kind; Steering acceptance lacked an active Runtime owner. Source corrections are isolated in b69295f13 and1c5212780. Separate913a3c599 restores positive coverage through an actual no-intent continuation transaction, checking stable owner, edge, Idle successor, reservation release, old-target rejection and exactly-once new-target acceptance. No production trigger/admission condition was weakened.
+
+The exact corrected source is `1c52127802927d11bf180ce4fd26dd8dd60c34b2`, under existing hosted CI39310487288. Its results are not yet established. The existing workflow now retains bounded normal/focused Rust logs; its diagnostic step preserves the normal lane and runs only after that lane fails. The shared goal-report finalizer remains private/uncommitted and is **not** included in this qualification target or installed in runtime transactions. Earlier zero-execution/source-only statements below describe historical checkpoints, superseded by the exact execution evidence here.
+
+The three installer historical-registry fixture repairs at431296d7 and8860bf87 passed the actual `dev.py unit tests` stage at86ab (UI job118227195421,93.9s). Production helper targets/pins and actual-newer-schema rejection are unchanged. Inherited federation UI wire parity and large Effect Clippy failures remain separate blockers.
+
 ## Status
 
 M1 source is authored as a dormant core/DB increment under the approved immutable-objective and source-registration amendments. Migration **132** registers the single `crates/phoenix-db/src/conversation_goals/schema.sql` source after coordinated federation migrations130/131 on exact source stack `f744df85865180597118c08b4f142b27fda57ee1`; non-destructive merge `b4f2aa52eee7b3ad560be2a2baa6c48675742758` preserves both histories. Normal fresh initialization replays the same migration, with no duplicate base-DDL application. ADR-182 records the bounded decision. No runtime caller, HTTP endpoint, goal tool, UI/SSE, automatic follow-through, Stop integration or watch change is installed. Source registration is not a production migration or feature activation.

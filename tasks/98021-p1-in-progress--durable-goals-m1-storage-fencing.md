@@ -1,5 +1,11 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual focused execution and corrected candidate
+
+Exactbe398 CI39305235616/Rust118240613566 focused goal filter ACTUALLY executed65:60passed,5failed,3398skipped/filtered (30.482s); full assertions/statuses artifact12215452602. No count inferred from authored tests. All5 are now proven invalid fixture setup/teardown: ineligible automatic continuation, deleting untransferred reservation, state_kind mismatch in AUQ/continuation, and Steering with no Runtime owner. Source-only corrections b69295f13+913a3c599+1c5212780 are pushed;913 adds actual no-intent continuation settled-transfer positive coverage rather than replacing it with a genericIdle assertion. No product admission/trigger relaxation.
+
+Corrected exactcandidate1c52127802927d11bf180ce4fd26dd8dd60c34b2 is under sole existing CI39310487288; results pending. Candidate passes are not established. Existing CI now retains normal tail and full failure-only focused output with pipefail/time/package bounds; no normal lane skipped. The source-signature audit and formatting do not substitute for this execution. Private goal checkpoint finalizer remains uncommitted and excluded from candidate; runtime state/provider replay/actual transaction-owner integration and end-to-end crash tests are still owed. Preserve dirty draft and stash backups. Installer3fixture correction suite actual unit stage passed at86ab; inherited UIwire/Effectlint remain separate blockers.
+
 ## Exact-signature audit and hosted qualification checkpoint
 
 Exact5d8 owner repair imported non-destructively as `c7e81412f099ace91a3981d179fc3b0b1d41e34e`; no conflicts,132 changes or133 prerequisite. Existing CI39297246365 atc7 failed: three goals-owned nonexistent ProductConversationId::from_db calls remained after earlier source fixes. Isolated correction `c42b80e45f89b4920d7550819ccb9a8e384068c3` uses checked parse; it is pushed. Bounded source audit completed for new goal DTO/tests, DB/service/admission/capture helpers, actual message/result constructors and all existing owning full-round implementations. This is not compile or passing evidence. Existing one corrected-head dispatch CI39298092785 targets exactc42; no duplicate dispatch or local heavy execution.
