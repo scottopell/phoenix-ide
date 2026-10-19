@@ -802,7 +802,7 @@ async fn unsubscribe_before_create_reaches_source_confirms_exact_retry_and_fence
         Err(crate::api::federation::FederationClientError::RemoteRejected(_))
     ));
     let reopened =
-        phoenix_db::Database::open(b._tempdir.path().join("instance.db").to_str().unwrap())
+        phoenix_db::Database::open(b.tempdir.path().join("instance.db").to_str().unwrap())
             .await
             .unwrap();
     let fences: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM federation_subscription_create_fences WHERE id = ?1 AND product_id = ?2")

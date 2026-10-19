@@ -175,7 +175,12 @@ async fn apply(
             )
             .await
             .map(|()| SubscriptionResult::Unsubscribed),
-        _ => return rejected(StatusCode::UNPROCESSABLE_ENTITY),
+        SubscriptionOperation::Create
+        | SubscriptionOperation::Replay { .. }
+        | SubscriptionOperation::Authorize { .. }
+        | SubscriptionOperation::Unsubscribe => {
+            return rejected(StatusCode::UNPROCESSABLE_ENTITY);
+        }
     };
     match result {
         Ok(result) => Json(SubscriptionResponse {
@@ -268,7 +273,11 @@ fn validate_response(
                     SubscriptionAuthorization::Rejected { .. } | SubscriptionAuthorization::Refresh,
                     None,
                 ) => Ok(()),
-                _ => Err(mismatch()),
+                (SubscriptionAuthorization::Authorized { .. }, None)
+                | (
+                    SubscriptionAuthorization::Rejected { .. } | SubscriptionAuthorization::Refresh,
+                    Some(_),
+                ) => Err(mismatch()),
             }
         }
         (SubscriptionOperation::Unsubscribe, SubscriptionResult::Unsubscribed) => Ok(()),
@@ -297,7 +306,9 @@ fn validate_response(
                     }
                     Ok(())
                 }
-                _ => Err(mismatch()),
+                SubscriptionReplay::Facts { .. } | SubscriptionReplay::Gap { .. } => {
+                    Err(mismatch())
+                }
             }
         }
         _ => Err(mismatch()),
@@ -874,13 +885,11 @@ pub async fn owner_unsubscribe(
     State(state): State<AppState>,
     Json(request): Json<OwnerSubscriptionRequest>,
 ) -> Response {
-    let selector = match InstanceSelector::parse(request.instance.clone()) {
-        Ok(value) => value,
-        Err(_) => return rejected(StatusCode::UNPROCESSABLE_ENTITY),
+    let Ok(selector) = InstanceSelector::parse(request.instance.clone()) else {
+        return rejected(StatusCode::UNPROCESSABLE_ENTITY);
     };
-    let peer = match state.db.resolve_federation_peer(&selector).await {
-        Ok(peer) => peer,
-        Err(_) => return rejected(StatusCode::NOT_FOUND),
+    let Ok(peer) = state.db.resolve_federation_peer(&selector).await else {
+        return rejected(StatusCode::NOT_FOUND);
     };
     let reference = SubscriptionReference {
         instance_id: peer.peer_instance_id,

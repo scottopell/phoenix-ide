@@ -17,7 +17,7 @@ mod smoke;
 mod subscriptions;
 
 struct TestInstance {
-    _tempdir: tempfile::TempDir,
+    tempdir: tempfile::TempDir,
     state: super::AppState,
     origin: PeerBaseUrl,
     trust: PeerTlsTrust,
@@ -104,7 +104,7 @@ impl TestInstance {
         let server = spawn_https(listener, app, tls.server, shutdown.clone()).await;
 
         Self {
-            _tempdir: tempdir,
+            tempdir,
             state,
             origin,
             trust,
