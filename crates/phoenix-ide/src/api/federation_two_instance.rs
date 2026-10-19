@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
 
+mod send;
 mod smoke;
 
 struct TestInstance {
@@ -59,11 +60,32 @@ impl TestInstance {
             .parse()
             .unwrap();
         let mut state = make_test_state().await;
+        state.db = crate::db::Database::open(tempdir.path().join("instance.db").to_str().unwrap())
+            .await
+            .unwrap();
+        crate::db::run_pending_migrations(state.db.pool())
+            .await
+            .unwrap();
+        state.runtime = Arc::new(crate::runtime::RuntimeManager::new(
+            state.db.clone(),
+            state.llm_registry.clone(),
+            state.platform.clone(),
+            state.mcp_manager.clone(),
+            None,
+        ));
+        state.terminals = state.runtime.terminals.clone();
+        state.sessions = super::auth::SessionStore::new(state.db.clone(), String::new());
+        state.message_retriever = Arc::new(state.db.fts_retriever());
         if search_ready {
             let retriever = state.db.fts_retriever();
             retriever.reconcile().await.unwrap();
             state.message_retriever = Arc::new(retriever);
         }
+        state.chain_qa = crate::chain_qa::ChainQa::new(
+            state.db.clone(),
+            state.llm_registry.clone(),
+            state.message_retriever.clone(),
+        );
         state
             .db
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
@@ -85,8 +107,11 @@ impl TestInstance {
     }
 
     async fn enroll(&self, caller_instance_id: InstanceId) -> PeerBearerCredential {
-        let credential =
-            PeerBearerCredential::parse(format!("phx_peer_{}", "t".repeat(43))).unwrap();
+        let credential = PeerBearerCredential::parse(format!(
+            "phx_peer_{}aaaaaaaaaaa",
+            caller_instance_id.to_string().replace('-', "")
+        ))
+        .unwrap();
         let verifier = FederationCredentialVerifier::from_bearer(credential.expose().as_bytes());
         self.state
             .db

@@ -801,6 +801,31 @@ pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
     route
 }
 
+pub(super) fn canonical_product_route_shape(href: &str) -> bool {
+    let Some(component) = href.strip_prefix(PRODUCT_CONVERSATION_ROUTE_PREFIX) else {
+        return false;
+    };
+    if component.is_empty() || component.contains(['/', '?', '#']) {
+        return false;
+    }
+    let bytes = component.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') => {
+                index += 1;
+            }
+            b'%' if bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) =>
+            {
+                index += 3;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub(super) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
     product_route(
         aggregate.root.conversation.slug.as_deref(),
@@ -1628,6 +1653,35 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    #[test]
+    fn canonical_route_shape_accepts_owner_generated_routes_only() {
+        for slug in [
+            None,
+            Some("renamed-conversation"),
+            Some("encoded/name and space"),
+        ] {
+            assert!(canonical_product_route_shape(&product_route(
+                slug,
+                "stable-uuid"
+            )));
+        }
+        for invalid in [
+            "/c/",
+            "/c/one/two",
+            "/c/one?token=secret",
+            "/c/one#message-evidence",
+            "/c/bad%2",
+            "/c/bad%xx",
+            "//other.invalid/c/one",
+            "https://other.invalid/c/one",
+        ] {
+            assert!(
+                !canonical_product_route_shape(invalid),
+                "accepted {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn routed_history_reads_export_initial_cursor_and_recovery_identity() {

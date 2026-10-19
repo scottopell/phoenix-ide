@@ -640,6 +640,12 @@ pub fn create_router(state: AppState) -> Router {
     // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
     let peer_router = Router::new()
         .route(
+            "/api/federation/peer/send-conversation-message",
+            post(super::federation::send_conversation_message).layer(DefaultBodyLimit::max(
+                super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
             "/api/federation/peer/query-database",
             post(super::federation::query_database)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
