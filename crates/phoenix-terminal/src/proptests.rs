@@ -15,6 +15,7 @@
 
 use proptest::prelude::*;
 
+use super::child_lifecycle::TerminalExit;
 use super::session::{
     ActiveTerminalInsertError, ActiveTerminals, Dims, TerminalLaunchIdentity,
     TerminalRetirementOutcome,
@@ -79,6 +80,7 @@ fn dummy_handle_kind(
     super::session::TerminalHandle {
         master_fd: std::sync::Mutex::new(Some(owned_fd)),
         child_pid: nix::unistd::Pid::from_raw(pid), // synthetic test pid — never reaped
+        child_lifecycle: crate::child_lifecycle::TerminalChildLifecycle::passive(),
         launch_identity: dummy_launch_identity(pid.cast_unsigned()),
         child_kind,
         tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
@@ -90,6 +92,350 @@ fn dummy_handle_kind(
         stop_tx,
         attach_permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
     }
+}
+
+fn controlled_handle() -> (
+    super::session::TerminalHandle,
+    tokio::sync::oneshot::Sender<nix::Result<TerminalExit>>,
+) {
+    let mut handle = dummy_handle(Dims::try_new(80, 24).unwrap());
+    let (lifecycle, exit) = crate::child_lifecycle::TerminalChildLifecycle::controlled();
+    handle.child_lifecycle = lifecycle;
+    (handle, exit)
+}
+
+async fn await_natural_cleanup(handle: &std::sync::Arc<super::session::TerminalHandle>) {
+    let receipt = handle.child_lifecycle.receipt();
+    receipt.wait().await.expect("controlled child exit");
+    // FIFO acquisition follows the monitor's cleanup attempt on this runtime.
+    let _after_cleanup = handle.attach_permit.clone().acquire_owned().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn detached_exit_cleans_both_publication_paths_without_retiring_live_idle_children() {
+    use crate::session::{StopReason, TerminalChildKind};
+    use std::sync::Arc;
+
+    for reserved in [false, true] {
+        for kind in [TerminalChildKind::Shell, TerminalChildKind::TmuxClient] {
+            let registry = ActiveTerminals::new();
+            let dead_scope = ResourceScopeKey::GlobalTerminal;
+            let live_scope = scope("idle-control");
+            let (mut child, exit) = controlled_handle();
+            child.child_kind = kind;
+            let dead = if reserved {
+                registry.reserve_spawn(&dead_scope).unwrap();
+                registry.insert_reserved(dead_scope.clone(), child).unwrap()
+            } else {
+                registry
+                    .try_insert_exact(dead_scope.clone(), child)
+                    .unwrap()
+            };
+            let (live, live_exit) = controlled_handle();
+            let live = registry.try_insert_exact(live_scope.clone(), live).unwrap();
+            let live_fd = live.master_fd_raw();
+            assert!(
+                dead.child_lifecycle.take_observer().is_none(),
+                "publication installs once"
+            );
+            assert!(live.child_lifecycle.take_observer().is_none());
+
+            exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+            await_natural_cleanup(&dead).await;
+            assert!(registry.get(&dead_scope).is_none());
+            assert!(registry.get_for_attach(&dead_scope).is_none());
+            assert!(
+                dead.master_fd_raw().is_none(),
+                "external Arc must not retain the master"
+            );
+            assert!(!registry.is_retirement_fenced(&dead_scope));
+            assert!(registry.reserve_spawn(&dead_scope).is_ok());
+            registry.release_spawn(&dead_scope);
+
+            tokio::time::advance(std::time::Duration::from_secs(86_400)).await;
+            assert!(Arc::ptr_eq(
+                &registry.get_for_attach(&live_scope).unwrap(),
+                &live
+            ));
+            assert_eq!(live.master_fd_raw(), live_fd);
+            assert_eq!(*live.stop_tx.borrow(), StopReason::Running);
+            assert!(registry.prepare_relay(&live_scope, &live));
+            live_exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+            await_natural_cleanup(&live).await;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attached_exit_preserves_relay_until_existing_authority_is_released() {
+    use crate::session::{StopReason, TerminalChildKind};
+    use std::sync::Arc;
+
+    for reserved in [false, true] {
+        for kind in [TerminalChildKind::Shell, TerminalChildKind::TmuxClient] {
+            let registry = ActiveTerminals::new();
+            let dead_scope = ResourceScopeKey::GlobalTerminal;
+            let live_scope = scope("attached-idle-control");
+            let (mut child, exit) = controlled_handle();
+            child.child_kind = kind;
+            let dead = if reserved {
+                registry.reserve_spawn(&dead_scope).unwrap();
+                registry.insert_reserved(dead_scope.clone(), child).unwrap()
+            } else {
+                registry
+                    .try_insert_exact(dead_scope.clone(), child)
+                    .unwrap()
+            };
+            let (live, live_exit) = controlled_handle();
+            let live = registry.try_insert_exact(live_scope.clone(), live).unwrap();
+            let attached_dead = dead.attach_permit.clone().acquire_owned().await.unwrap();
+            let attached_live = live.attach_permit.clone().acquire_owned().await.unwrap();
+            let dead_stop = dead.stop_tx.subscribe();
+            let live_stop = live.stop_tx.subscribe();
+            let dead_fd = dead.master_fd_raw();
+            let live_fd = live.master_fd_raw();
+
+            exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+            dead.child_lifecycle.receipt().wait().await.unwrap();
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            assert_eq!(
+                *dead_stop.borrow(),
+                StopReason::Running,
+                "natural exit must not cancel reads of pending PTY output or OSC markers"
+            );
+            assert!(!dead_stop.has_changed().unwrap());
+            assert!(Arc::ptr_eq(&registry.get(&dead_scope).unwrap(), &dead));
+            assert_eq!(dead.master_fd_raw(), dead_fd, "relay still owns the master");
+            assert!(registry.get_for_attach(&dead_scope).is_none());
+            assert!(!registry.prepare_relay(&dead_scope, &dead));
+            assert_eq!(*live_stop.borrow(), StopReason::Running);
+            assert!(!live_stop.has_changed().unwrap());
+            assert!(Arc::ptr_eq(
+                &registry.get_for_attach(&live_scope).unwrap(),
+                &live
+            ));
+            assert_eq!(live.master_fd_raw(), live_fd);
+
+            drop(attached_dead);
+            await_natural_cleanup(&dead).await;
+            assert!(registry.get(&dead_scope).is_none());
+            assert!(dead.master_fd_raw().is_none());
+            assert!(!registry.is_retirement_fenced(&dead_scope));
+            assert!(Arc::ptr_eq(
+                &registry.get_for_attach(&live_scope).unwrap(),
+                &live
+            ));
+            assert_eq!(*live_stop.borrow(), StopReason::Running);
+            assert_eq!(live.master_fd_raw(), live_fd);
+
+            drop(attached_live);
+            live_exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+            await_natural_cleanup(&live).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn monitor_waiting_for_relay_does_not_retain_registry_or_master() {
+    use crate::session::StopReason;
+    use std::sync::Arc;
+
+    let registry = ActiveTerminals::new();
+    let (child, exit) = controlled_handle();
+    let handle = registry
+        .try_insert_exact(scope("monitor-blocked-weak-ownership"), child)
+        .unwrap();
+    let attached = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let weak = Arc::downgrade(&handle);
+    let stop = handle.stop_tx.subscribe();
+    exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+    handle.child_lifecycle.receipt().wait().await.unwrap();
+    assert_eq!(*stop.borrow(), StopReason::Running);
+    assert!(!stop.has_changed().unwrap());
+    drop(handle);
+    drop(registry);
+    assert!(
+        weak.upgrade().is_none(),
+        "blocked observer must release both strong Arcs"
+    );
+    drop(attached);
+}
+
+#[tokio::test]
+async fn exited_child_rejects_reconnect_and_natural_cleanup_preserves_close_fence_and_receipt() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("natural-exit-close-race");
+    let (child, exit) = controlled_handle();
+    let handle = registry.try_insert_exact(scope.clone(), child).unwrap();
+    let attached = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let old_close = registry.begin_retirement(&scope);
+    let close = registry.begin_retirement(&scope);
+    exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+    handle.child_lifecycle.receipt().wait().await.unwrap();
+    assert!(
+        handle.master_fd_raw().is_some(),
+        "cleanup must await relay authority"
+    );
+    assert!(registry.get_for_attach(&scope).is_none());
+    assert!(!registry.prepare_relay(&scope, &handle));
+    drop(attached);
+    await_natural_cleanup(&handle).await;
+    assert!(registry.get(&scope).is_none());
+    assert!(handle.master_fd_raw().is_none());
+    // Identity lookup is deliberately unobservable: the retained receipt is proof.
+    assert_eq!(
+        registry
+            .complete_retirement_by_observing(&close, tokio::time::Instant::now(), |_| None,)
+            .await,
+        TerminalRetirementOutcome::AbsenceVerified
+    );
+    registry.cancel_retirement(old_close);
+    assert!(registry.is_retirement_fenced(&scope));
+    assert!(matches!(
+        registry.reserve_spawn(&scope),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+    registry.cancel_retirement(close);
+    assert!(!registry.is_retirement_fenced(&scope));
+}
+
+#[tokio::test]
+async fn close_and_monitor_share_one_observer_and_repeated_completion_uses_receipt() {
+    use crate::session::StopReason;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("close-single-observer");
+    let (child, exit) = controlled_handle();
+    let handle = registry.try_insert_exact(scope.clone(), child).unwrap();
+    let mut stop = handle.stop_tx.subscribe();
+    let close = registry.begin_retirement(&scope);
+    let completion = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let outcome = registry.complete_retirement(&close).await;
+            (outcome, close)
+        })
+    };
+    stop.changed().await.unwrap();
+    assert_eq!(*stop.borrow(), StopReason::TearDown);
+    assert!(handle.master_fd_raw().is_none());
+    assert!(
+        !completion.is_finished(),
+        "Close must wait for the registered observer"
+    );
+    assert!(handle.child_lifecycle.take_observer().is_none());
+    exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+    let (outcome, close) = completion.await.unwrap();
+    assert_eq!(outcome, TerminalRetirementOutcome::Retired);
+    assert_eq!(
+        registry
+            .complete_retirement_by_observing(&close, tokio::time::Instant::now(), |_| None,)
+            .await,
+        TerminalRetirementOutcome::AbsenceVerified
+    );
+    assert!(registry.is_retirement_fenced(&scope));
+}
+
+#[tokio::test]
+async fn failed_observer_is_not_exit_proof_or_a_relay_teardown_request() {
+    use crate::session::StopReason;
+    use std::sync::Arc;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("failed-observer-control");
+    let (child, exit) = controlled_handle();
+    let handle = registry.try_insert_exact(scope.clone(), child).unwrap();
+    let stop = handle.stop_tx.subscribe();
+    let fd = handle.master_fd_raw();
+    exit.send(Err(nix::errno::Errno::ECHILD)).unwrap();
+    assert_eq!(
+        handle.child_lifecycle.receipt().wait().await,
+        Err(nix::errno::Errno::ECHILD)
+    );
+    assert!(!handle.child_lifecycle.receipt().exited());
+    assert_eq!(*stop.borrow(), StopReason::Running);
+    assert!(!stop.has_changed().unwrap());
+    assert!(Arc::ptr_eq(
+        &registry.get_for_attach(&scope).unwrap(),
+        &handle
+    ));
+    assert_eq!(handle.master_fd_raw(), fd);
+}
+
+#[tokio::test]
+async fn stale_observer_never_requests_teardown_of_a_replacement() {
+    use crate::session::StopReason;
+    use std::sync::Arc;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("stale-observer-stop");
+    let (child, exit) = controlled_handle();
+    let old = registry.try_insert_exact(scope.clone(), child).unwrap();
+    let old_stop = old.stop_tx.subscribe();
+    registry.remove_unfenced(&scope);
+    let replacement = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .unwrap();
+    let replacement_stop = replacement.stop_tx.subscribe();
+    assert_eq!(old.launch_identity, replacement.launch_identity);
+    exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+    old.child_lifecycle.receipt().wait().await.unwrap();
+    assert_eq!(*old_stop.borrow(), StopReason::Running);
+    assert!(!old_stop.has_changed().unwrap());
+    assert_eq!(*replacement_stop.borrow(), StopReason::Running);
+    assert!(!replacement_stop.has_changed().unwrap());
+    assert!(Arc::ptr_eq(
+        &registry.get_for_attach(&scope).unwrap(),
+        &replacement
+    ));
+    assert!(replacement.master_fd_raw().is_some());
+}
+
+#[tokio::test]
+async fn old_natural_cleanup_never_removes_same_identity_replacement_or_new_close_fence() {
+    use std::sync::Arc;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("natural-exact-instance");
+    let (child, exit) = controlled_handle();
+    let old = registry.try_insert_exact(scope.clone(), child).unwrap();
+    let attached = old.attach_permit.clone().acquire_owned().await.unwrap();
+    exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+    old.child_lifecycle.receipt().wait().await.unwrap();
+    assert!(registry.get_for_attach(&scope).is_none());
+    assert!(!registry.prepare_relay(&scope, &old));
+    registry.remove_unfenced(&scope);
+    let replacement = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .unwrap();
+    assert_eq!(old.launch_identity, replacement.launch_identity);
+    let close = registry.begin_retirement(&scope);
+    drop(attached);
+    await_natural_cleanup(&old).await;
+    assert!(Arc::ptr_eq(&registry.get(&scope).unwrap(), &replacement));
+    assert!(replacement.master_fd_raw().is_some());
+    assert!(registry.is_retirement_fenced(&scope));
+    registry.cancel_retirement(close);
+}
+
+#[tokio::test]
+async fn pending_monitor_does_not_keep_registry_or_master_alive() {
+    use std::sync::Arc;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("monitor-weak-ownership");
+    let (child, exit) = controlled_handle();
+    let handle = registry.try_insert_exact(scope, child).unwrap();
+    let weak = Arc::downgrade(&handle);
+    let receipt = handle.child_lifecycle.receipt();
+    drop(handle);
+    drop(registry);
+    assert!(
+        weak.upgrade().is_none(),
+        "pending wait must not retain the master or registry"
+    );
+    exit.send(Ok(TerminalExit::Exited(0))).unwrap();
+    receipt.wait().await.unwrap();
 }
 
 // ── Unit: OneTerminalPerResourceScopeKey (registry semantics) ────────────────────────
@@ -168,10 +514,10 @@ fn relay_teardown_transfers_to_existing_close_owner() {
         .expect("insert terminal");
     let _permit = registry.begin_retirement(&scope);
 
-    assert_eq!(
+    assert!(matches!(
         registry.claim_relay_teardown(&scope, &handle),
         RelayTeardownOwnership::ExistingRetirementOwner
-    );
+    ));
 
     assert!(registry.is_retirement_fenced(&scope));
     assert!(
@@ -234,6 +580,9 @@ async fn current_relay_completion_reopens_its_own_fence() {
         }
     };
 
+    handle
+        .child_lifecycle
+        .publish_for_test(Err(nix::errno::Errno::ECHILD));
     let completion = registry.complete_relay_retirement(relay).await;
     let outcome = registry.reopen_after_relay_completion(completion);
     assert!(matches!(
@@ -336,12 +685,14 @@ async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() 
         "stale permit must leave entry intact"
     );
 
+    first
+        .child_lifecycle
+        .publish_for_test(Ok(TerminalExit::Exited(0)));
     assert_eq!(
         registry
             .complete_retirement_by_observing(
                 &second_permit,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                |pid| async move { Ok(nix::sys::wait::WaitStatus::Exited(pid, 0)) },
                 |_| None,
             )
             .await,
@@ -384,12 +735,7 @@ async fn retirement_waits_for_attach_release_without_consuming_a_second_budget()
         let registry = registry.clone();
         tokio::spawn(async move {
             registry
-                .complete_retirement_by_observing(
-                    &permit,
-                    deadline,
-                    |pid| async move { Ok(nix::sys::wait::WaitStatus::Exited(pid, 0)) },
-                    |_| None,
-                )
+                .complete_retirement_by_observing(&permit, deadline, |_| None)
                 .await
         })
     };
@@ -399,6 +745,9 @@ async fn retirement_waits_for_attach_release_without_consuming_a_second_budget()
     tokio::time::advance(std::time::Duration::from_secs(9)).await;
     assert!(!completing.is_finished());
 
+    handle
+        .child_lifecycle
+        .publish_for_test(Ok(TerminalExit::Exited(0)));
     // Permit release is the causal notification; no sleep or polling is needed.
     drop(relay_authority);
     tokio::task::yield_now().await;
@@ -469,9 +818,11 @@ async fn attached_relay_close_transfers_authority_and_completes_exact_teardown()
 
     stop_rx.changed().await.unwrap();
     assert_eq!(*stop_rx.borrow(), StopReason::TearDown);
-    assert_eq!(
-        registry.claim_relay_teardown(&scope, &handle),
-        RelayTeardownOwnership::ExistingRetirementOwner,
+    assert!(
+        matches!(
+            registry.claim_relay_teardown(&scope, &handle),
+            RelayTeardownOwnership::ExistingRetirementOwner
+        ),
         "attached relay must transfer exact teardown authority to Close"
     );
     drop(relay_permit);
@@ -532,6 +883,7 @@ async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority(
             TerminalHandle {
                 master_fd: std::sync::Mutex::new(Some(master_fd)),
                 child_pid: child,
+                child_lifecycle: crate::child_lifecycle::TerminalChildLifecycle::new(),
                 launch_identity: TerminalLaunchIdentity {
                     process,
                     launch_uuid: "resistant-child".to_string(),
@@ -563,10 +915,10 @@ async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority(
 
     stop_rx.changed().await.unwrap();
     assert_eq!(*stop_rx.borrow(), StopReason::TearDown);
-    assert_eq!(
+    assert!(matches!(
         registry.claim_relay_teardown(&scope, &handle),
         crate::session::RelayTeardownOwnership::ExistingRetirementOwner
-    );
+    ));
     drop(relay_permit);
     let (outcome, permit) = completing.await.unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
@@ -590,7 +942,13 @@ async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority(
     );
 
     nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).unwrap();
-    nix::sys::wait::waitpid(child, None).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        handle.child_lifecycle.receipt().wait(),
+    )
+    .await
+    .expect("registered monitor must reap killed child")
+    .expect("child exit receipt");
 }
 
 #[tokio::test(start_paused = true)]
@@ -606,12 +964,7 @@ async fn deadline_with_unobservable_identity_retains_exact_handle_for_retry() {
     let permit = registry.begin_retirement(&scope);
 
     let outcome = registry
-        .complete_retirement_by_observing(
-            &permit,
-            tokio::time::Instant::now(),
-            |_| std::future::pending(),
-            |_| None,
-        )
+        .complete_retirement_by_observing(&permit, tokio::time::Instant::now(), |_| None)
         .await;
 
     assert_eq!(
@@ -646,11 +999,13 @@ async fn failed_wait_with_reused_pid_retires_exact_handle() {
         ..expected
     };
 
+    handle
+        .child_lifecycle
+        .publish_for_test(Err(nix::errno::Errno::ECHILD));
     let outcome = registry
         .complete_retirement_by_observing(
             &permit,
             tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-            |_| async { Err(nix::errno::Errno::ECHILD) },
             |_| Some(reused),
         )
         .await;
@@ -659,6 +1014,49 @@ async fn failed_wait_with_reused_pid_retires_exact_handle() {
     assert!(
         registry.get(&scope).is_none(),
         "a different identity at the PID proves the exact child absent"
+    );
+}
+
+#[tokio::test]
+async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
+    use crate::spawn::{spawn_pty, PtyExecPlan};
+
+    let _real_child_guard = REAL_CHILD_TEST_LOCK.lock().await;
+    let registry = ActiveTerminals::new();
+    let scope = ResourceScopeKey::GlobalTerminal;
+    registry.reserve_spawn(&scope).unwrap();
+    let handle = registry
+        .insert_reserved(
+            scope.clone(),
+            spawn_pty(
+                std::path::Path::new("/tmp"),
+                Dims::try_new(80, 24).unwrap(),
+                PtyExecPlan::Shell,
+            )
+            .expect("spawn direct shell"),
+        )
+        .unwrap();
+    let fd = handle.master_fd_raw().unwrap();
+    let command = b"exit\n";
+    // SAFETY: this handle still owns the master and the command buffer is valid.
+    assert_eq!(
+        unsafe { libc::write(fd, command.as_ptr().cast(), command.len()) },
+        5
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        await_natural_cleanup(&handle),
+    )
+    .await
+    .expect("natural exit must clean detached shell without another connection");
+    assert!(registry.get(&scope).is_none());
+    assert!(registry.get_for_attach(&scope).is_none());
+    assert!(handle.master_fd_raw().is_none());
+    assert!(!registry.is_retirement_fenced(&scope));
+    assert_eq!(
+        nix::sys::wait::waitpid(handle.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+        Err(nix::errno::Errno::ECHILD),
+        "receipt follows the sole observer's completed reap",
     );
 }
 
