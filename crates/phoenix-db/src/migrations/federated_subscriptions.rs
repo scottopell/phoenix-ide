@@ -59,10 +59,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        migrations::{create_migrations_table, run_pending_migrations},
-        Database,
-    };
+    use crate::{migrations::run_pending_migrations, Database};
 
     async fn history(pool: &SqlitePool) -> Vec<Vec<String>> {
         let mut snapshot = Vec::new();
@@ -106,12 +103,24 @@ mod tests {
             .unwrap();
         let db = Database::from_pool_for_tests(pool, String::new());
         db.run_migrations().await.unwrap();
-        create_migrations_table(db.pool()).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO _migrations(version,name) VALUES (131,'fixture_skip_131')")
             .execute(db.pool())
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 130);
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            super::super::MIGRATIONS.len() - 1
+        );
         let source = db
             .create_conversation("historical-source", "source", "/tmp", true, None, None)
             .await
