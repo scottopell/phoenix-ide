@@ -129,7 +129,6 @@ mod tests {
                 message_id: text("round-assistant"),
                 tool_use_id: text("round-call"),
             },
-            text("round-action"),
             GoalReportOutcome::Complete(text("finished")),
         );
         ToolRoundResult::PendingGoalReport {

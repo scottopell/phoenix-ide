@@ -32,6 +32,7 @@ impl TryFrom<GoalExecutionBinding> for GoalReportBinding {
 impl<'de> Deserialize<'de> for GoalReportBinding {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct WireBinding {
             execution: GoalExecution,
             goal: GoalFence,
@@ -55,6 +56,12 @@ pub struct GoalReportCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "reason",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum GoalReportOutcome {
     Blocked(GoalText),
     Complete(GoalText),
@@ -73,10 +80,10 @@ impl GoalReportOutcome {
 
 /// Pending data, not a successful result or proof of authenticated tool provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoalPendingReport {
     admission: GoalReportBinding,
     call: GoalReportCall,
-    action_id: GoalText,
     outcome: GoalReportOutcome,
 }
 
@@ -85,13 +92,11 @@ impl GoalPendingReport {
     pub fn new(
         admission: GoalReportBinding,
         call: GoalReportCall,
-        action_id: GoalText,
         outcome: GoalReportOutcome,
     ) -> Self {
         Self {
             admission,
             call,
-            action_id,
             outcome,
         }
     }
@@ -102,8 +107,34 @@ impl GoalPendingReport {
     }
 
     #[must_use]
+    pub fn outcome(&self) -> &GoalReportOutcome {
+        &self.outcome
+    }
+
+    fn action_id(&self) -> GoalText {
+        let goal = &self.admission.goal;
+        let source = (
+            goal.owner.as_str(),
+            goal.goal_id.as_str(),
+            goal.version.get(),
+            self.admission.execution.workflow_id(),
+            self.admission.execution.turn_id(),
+            self.call.transcript_id.as_str(),
+            self.call.message_id.as_str(),
+            self.call.tool_use_id.as_str(),
+            &self.outcome,
+        );
+        let bytes = serde_json::to_vec(&source)
+            .expect("checked report source fields serialize without arbitrary JSON");
+        let fingerprint = crate::domain::sm_event::exact_payload_fingerprint(&bytes);
+        GoalText::parse(format!("goal-report:{fingerprint}"))
+            .expect("fixed prefix makes report action identity nonblank")
+    }
+
+    #[must_use]
     pub fn mutation(&self) -> GoalMutation {
         let goal = &self.admission.goal;
+        let action_id = self.action_id();
         let binding = GoalExecutionBinding {
             owner: goal.owner.clone(),
             execution: self.admission.execution,
@@ -119,12 +150,10 @@ impl GoalPendingReport {
         GoalMutation {
             owner: goal.owner.clone(),
             expected_version: goal.version,
-            action_id: self.action_id.clone(),
+            action_id: action_id.clone(),
             attribution: GoalAttribution {
                 requested_by: GoalActor::OwningAgent(source),
-                applied_by: GoalActor::GeneratedHost {
-                    action_id: self.action_id.clone(),
-                },
+                applied_by: GoalActor::GeneratedHost { action_id },
             },
             change: GoalChange::Report {
                 binding,
@@ -166,7 +195,6 @@ mod tests {
                 message_id: text("assistant"),
                 tool_use_id: text("tool-call"),
             },
-            text("stable-action"),
             GoalReportOutcome::Blocked(text("restore access")),
         );
         let command = pending.mutation();
@@ -224,6 +252,39 @@ mod tests {
     }
 
     #[test]
+    fn report_action_identity_is_recomputed_from_exact_source_and_intended_payload() {
+        let original = GoalPendingReport::new(
+            binding().try_into().unwrap(),
+            GoalReportCall {
+                transcript_id: text("segment:a"),
+                message_id: text("assistant:b"),
+                tool_use_id: text("call"),
+            },
+            GoalReportOutcome::Complete(text("done")),
+        );
+        let mut changed_payload = original.clone();
+        changed_payload.outcome = GoalReportOutcome::Blocked(text("different request body"));
+        assert_ne!(
+            original.mutation().action_id,
+            changed_payload.mutation().action_id
+        );
+        let mut changed_source = original.clone();
+        changed_source.call.message_id = text("assistant");
+        changed_source.call.transcript_id = text("segment:a:b");
+        assert_ne!(
+            original.mutation().action_id,
+            changed_source.mutation().action_id
+        );
+        let restored: GoalPendingReport =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(original.mutation(), restored.mutation());
+        assert!(serde_json::to_value(&original)
+            .unwrap()
+            .get("action_id")
+            .is_none());
+    }
+
+    #[test]
     fn persisted_pending_report_requires_its_original_call_and_nonzero_fence() {
         let pending = GoalPendingReport::new(
             binding().try_into().unwrap(),
@@ -232,11 +293,10 @@ mod tests {
                 message_id: text("assistant"),
                 tool_use_id: text("call"),
             },
-            text("action"),
             GoalReportOutcome::Complete(text("done")),
         );
         let original = serde_json::to_value(&pending).unwrap();
-        for field in ["admission", "call", "action_id", "outcome"] {
+        for field in ["admission", "call", "outcome"] {
             let mut missing = original.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<GoalPendingReport>(missing).is_err());
