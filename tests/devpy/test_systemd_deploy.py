@@ -646,9 +646,8 @@ class SystemdDeployCommandTests(unittest.TestCase):
             staging_root.mkdir()
             binary, receipt = self.linux_prepared_directory(base)
             expected = self.dev.RuntimeIdentity(self.dev.SYSTEMD_PREPARED_VERSION, self.dev.SYSTEMD_PREPARED_COMMIT)
-            verified_helper = self.dev._load_verified_systemd_helper_source(
-                (ROOT / "scripts/systemd_deploy_helper.py").read_bytes(),
-                "c" * 40,
+            verified_helper = self.dev.VerifiedSystemdControllerHelper(
+                source=(ROOT / "scripts/systemd_deploy_helper.py").read_bytes()
             )
 
             def prepare(expected_receipt_sha256=None):
@@ -793,9 +792,8 @@ class SystemdDeployCommandTests(unittest.TestCase):
                         "c" * 40,
                         self.dev._file_sha256(source / self.dev.SYSTEMD_PREPARED_RECEIPT),
                         staging,
-                        self.dev._load_verified_systemd_helper_source(
-                            (ROOT / "scripts/systemd_deploy_helper.py").read_bytes(),
-                            "c" * 40,
+                        self.dev.VerifiedSystemdControllerHelper(
+                            source=(ROOT / "scripts/systemd_deploy_helper.py").read_bytes()
                         ),
                     )
             identity.assert_not_called()
@@ -822,6 +820,10 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 captured["receipt_bytes"] = dict(files)[self.dev.SYSTEMD_PREPARED_RECEIPT].read_bytes()
                 return self.dev.SYSTEMD_TRANSACTION_ROOT / tx / "manifest.json"
             expected = self.dev.RuntimeIdentity(self.dev.SYSTEMD_PREPARED_VERSION, self.dev.SYSTEMD_PREPARED_COMMIT)
+            def run_verified_helper(command, **kwargs):
+                if "--parse-prepared-receipt" in command:
+                    return subprocess.CompletedProcess(command, 0, json.dumps(raw).encode(), b"")
+                return subprocess.CompletedProcess(command, 0, b"3\n", b"")
             with mock.patch.object(sys, "platform", "linux"), \
                  mock.patch.object(platform, "machine", return_value="x86_64"), \
                  mock.patch.object(self.dev, "_binary_identity", return_value=expected), \
@@ -835,11 +837,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
                  mock.patch.object(self.dev, "_stage_systemd_root_handoff", side_effect=stage), \
                  mock.patch.object(self.dev, "_launch_systemd_activation"), \
-                 mock.patch.object(
-                     self.dev.subprocess,
-                     "run",
-                     return_value=subprocess.CompletedProcess([], 0, b"3\n", b""),
-                 ) as run:
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=run_verified_helper) as run:
                 self.dev.native_prod_deploy(controller=self.linux_prepared_options(base))
             manifest = captured["manifest"]
             self.assertEqual("prepared_artifact", manifest["source_kind"])
@@ -861,11 +859,19 @@ class SystemdDeployCommandTests(unittest.TestCase):
             self.assertEqual([("c" * 40, "scripts/systemd_deploy_helper.py", "prepared_artifact"),
                               (self.dev.SYSTEMD_PREPARED_COMMIT, "crates/phoenix-db/src/migrations.rs", "prepared_artifact")],
                              captured["sources"])
-            self.assertIn("--protected-prepared-protocol-version", run.call_args_list[0].args[0])
-            self.assertEqual("-", run.call_args_list[0].args[0][1])
+            parse_call = next(
+                call for call in run.call_args_list
+                if "--parse-prepared-receipt" in call.args[0]
+            )
+            self.assertEqual([sys.executable, "-I", "-S", "-"], parse_call.args[0][:4])
+            protocol_call = next(
+                call for call in run.call_args_list
+                if "--protected-prepared-protocol-version" in call.args[0]
+            )
+            self.assertEqual("-", protocol_call.args[0][1])
             self.assertEqual(
                 (ROOT / "scripts/systemd_deploy_helper.py").read_bytes(),
-                run.call_args_list[0].kwargs["input"],
+                protocol_call.kwargs["input"],
             )
             checkout.assert_called_once_with("c" * 40)
 

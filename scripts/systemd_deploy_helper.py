@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import dataclasses
 import datetime as dt
 import fcntl
@@ -2382,6 +2384,7 @@ def main() -> int:
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--protected-protocol-version", action="store_true")
     parser.add_argument("--protected-prepared-protocol-version", action="store_true")
+    parser.add_argument("--parse-prepared-receipt")
     parser.add_argument("action", nargs="?", choices=("activate", "stage", "abandon", "recover-current"),
                         help="recover-current restores only a proven pre-marker predecessor or resumes the exact post-marker candidate")
     parser.add_argument("--manifest", type=Path)
@@ -2390,6 +2393,14 @@ def main() -> int:
     parser.add_argument("--expected-preparation-receipt-sha256")
     parser.add_argument("--source-uid", type=int)
     args = parser.parse_args()
+    if args.parse_prepared_receipt is not None:
+        try:
+            receipt = base64.b64decode(args.parse_prepared_receipt, validate=True)
+            print(json.dumps(parse_prepared_receipt(receipt), sort_keys=True, separators=(",", ":")))
+            return 0
+        except (binascii.Error, ValueError, ValidationError) as exc:
+            print(f"prepared receipt validation failed: {exc}", file=sys.stderr)
+            return 1
     if args.protected_prepared_protocol_version:
         print(PREPARED_HANDOFF_PROTOCOL_VERSION)
         return 0

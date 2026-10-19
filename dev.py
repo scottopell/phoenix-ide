@@ -32,7 +32,6 @@ import tempfile
 import threading
 import time
 import traceback
-import types
 from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -8370,31 +8369,38 @@ def _copy_prepared_regular(source_fd: int, destination: Path, mode: int) -> str:
 @dataclasses.dataclass(frozen=True)
 class VerifiedSystemdControllerHelper:
     source: bytes
-    module: types.ModuleType
 
     def digest(self) -> str:
         return hashlib.sha256(self.source).hexdigest()
 
 
-def _load_verified_systemd_helper_source(
-    source: bytes,
-    controller_commit: str,
-) -> VerifiedSystemdControllerHelper:
-    module_name = f"_phoenix_verified_systemd_helper_{controller_commit}"
-    module = types.ModuleType(module_name)
-    module.__file__ = f"{controller_commit}:scripts/systemd_deploy_helper.py"
-    sys.modules[module_name] = module
+def _parse_prepared_receipt_with_verified_helper(
+    verified_helper: VerifiedSystemdControllerHelper,
+    receipt: bytes,
+) -> dict:
+    import base64
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-",
+            "--parse-prepared-receipt",
+            base64.b64encode(receipt).decode("ascii"),
+        ],
+        input=verified_helper.source,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit("invalid Linux prepared artifact receipt")
     try:
-        exec(compile(source, module.__file__, "exec"), module.__dict__)
-    except BaseException:
-        sys.modules.pop(module_name, None)
-        raise
-    if (not callable(getattr(module, "parse_prepared_receipt", None))
-            or not isinstance(getattr(module, "ValidationError", None), type)
-            or not issubclass(module.ValidationError, Exception)):
-        sys.modules.pop(module_name, None)
-        raise SystemExit("exact controller helper does not expose prepared receipt validation")
-    return VerifiedSystemdControllerHelper(source=source, module=module)
+        metadata = json.loads(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("exact controller helper returned invalid prepared receipt metadata") from exc
+    if not isinstance(metadata, dict):
+        raise SystemExit("exact controller helper returned invalid prepared receipt metadata")
+    return metadata
 
 
 def _materialize_verified_systemd_helper(
@@ -8411,7 +8417,7 @@ def _materialize_verified_systemd_helper(
     source = destination.read_bytes()
     if hashlib.sha256(source).hexdigest() != expected_sha256:
         raise SystemExit("prepared systemd helper changed after exact controller materialization")
-    return _load_verified_systemd_helper_source(source, source_commit)
+    return VerifiedSystemdControllerHelper(source=source)
 
 
 def _prepare_linux_artifact(
@@ -8459,10 +8465,10 @@ def _prepare_linux_artifact(
         os.close(completed_receipt_fd)
         if receipt_sha != expected_receipt_sha256:
             raise SystemExit("Linux prepared receipt does not match independently authenticated digest")
-        try:
-            metadata = verified_helper.module.parse_prepared_receipt(receipt.read_bytes())
-        except (OSError, verified_helper.module.ValidationError) as exc:
-            raise SystemExit("invalid Linux prepared artifact receipt") from exc
+        metadata = _parse_prepared_receipt_with_verified_helper(
+            verified_helper,
+            receipt.read_bytes(),
+        )
         if metadata["controller_commit"] != controller_commit:
             raise SystemExit("Linux preparation receipt controller commit mismatch")
         binary_sha = _copy_prepared_regular(binary_fd, binary, 0o700)
