@@ -590,6 +590,11 @@ class SystemdDeployCommandTests(unittest.TestCase):
              mock.patch.object(self.dev, "_require_exact_clean_controller_checkout"), \
              mock.patch.object(
                  self.dev,
+                 "_materialize_verified_systemd_helper",
+                 return_value=mock.sentinel.verified_helper,
+             ), \
+             mock.patch.object(
+                 self.dev,
                  "_prepare_linux_artifact",
                  side_effect=SystemExit("receipt authority mismatch"),
              ) as prepare, \
@@ -641,6 +646,10 @@ class SystemdDeployCommandTests(unittest.TestCase):
             staging_root.mkdir()
             binary, receipt = self.linux_prepared_directory(base)
             expected = self.dev.RuntimeIdentity(self.dev.SYSTEMD_PREPARED_VERSION, self.dev.SYSTEMD_PREPARED_COMMIT)
+            verified_helper = self.dev._load_verified_systemd_helper_source(
+                (ROOT / "scripts/systemd_deploy_helper.py").read_bytes(),
+                "c" * 40,
+            )
 
             def prepare(expected_receipt_sha256=None):
                 staging = Path(tempfile.mkdtemp(dir=staging_root))
@@ -650,6 +659,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                     "c" * 40,
                     expected_receipt_sha256 or self.dev._file_sha256(receipt),
                     staging,
+                    verified_helper,
                 )
 
             invoked = []
@@ -659,7 +669,15 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 binary.write_bytes(b"mutable source changed after private copy")
                 return expected
 
-            with mock.patch.object(self.dev, "_binary_identity", side_effect=identity):
+            trusted_import = __import__
+
+            def reject_ambient_helper_import(name, *args, **kwargs):
+                if name == "scripts.systemd_deploy_helper":
+                    raise AssertionError("prepared receipt parsing used mutable ambient helper")
+                return trusted_import(name, *args, **kwargs)
+
+            with mock.patch("builtins.__import__", side_effect=reject_ambient_helper_import), \
+                 mock.patch.object(self.dev, "_binary_identity", side_effect=identity):
                 candidate = prepare()
             self.assertEqual([candidate.binary], invoked)
             self.assertNotEqual(binary, candidate.binary)
@@ -775,6 +793,10 @@ class SystemdDeployCommandTests(unittest.TestCase):
                         "c" * 40,
                         self.dev._file_sha256(source / self.dev.SYSTEMD_PREPARED_RECEIPT),
                         staging,
+                        self.dev._load_verified_systemd_helper_source(
+                            (ROOT / "scripts/systemd_deploy_helper.py").read_bytes(),
+                            "c" * 40,
+                        ),
                     )
             identity.assert_not_called()
 

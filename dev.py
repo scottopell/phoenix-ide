@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -8366,15 +8367,61 @@ def _copy_prepared_regular(source_fd: int, destination: Path, mode: int) -> str:
             os.close(destination_fd)
 
 
+@dataclasses.dataclass(frozen=True)
+class VerifiedSystemdControllerHelper:
+    source: bytes
+    module: types.ModuleType
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.source).hexdigest()
+
+
+def _load_verified_systemd_helper_source(
+    source: bytes,
+    controller_commit: str,
+) -> VerifiedSystemdControllerHelper:
+    module_name = f"_phoenix_verified_systemd_helper_{controller_commit}"
+    module = types.ModuleType(module_name)
+    module.__file__ = f"{controller_commit}:scripts/systemd_deploy_helper.py"
+    sys.modules[module_name] = module
+    try:
+        exec(compile(source, module.__file__, "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    if (not callable(getattr(module, "parse_prepared_receipt", None))
+            or not isinstance(getattr(module, "ValidationError", None), type)
+            or not issubclass(module.ValidationError, Exception)):
+        sys.modules.pop(module_name, None)
+        raise SystemExit("exact controller helper does not expose prepared receipt validation")
+    return VerifiedSystemdControllerHelper(source=source, module=module)
+
+
+def _materialize_verified_systemd_helper(
+    source_commit: str,
+    destination: Path,
+    source_kind: str,
+) -> VerifiedSystemdControllerHelper:
+    expected_sha256 = _materialize_source_file(
+        source_commit,
+        "scripts/systemd_deploy_helper.py",
+        destination,
+        source_kind,
+    )
+    source = destination.read_bytes()
+    if hashlib.sha256(source).hexdigest() != expected_sha256:
+        raise SystemExit("prepared systemd helper changed after exact controller materialization")
+    return _load_verified_systemd_helper_source(source, source_commit)
+
+
 def _prepare_linux_artifact(
     directory: Path,
     expected_full_commit: str,
     controller_commit: str,
     expected_receipt_sha256: str,
     staging: Path,
+    verified_helper: VerifiedSystemdControllerHelper,
 ) -> "ValidatedLinuxPreparedCandidate":
-    from scripts.systemd_deploy_helper import ValidationError, parse_prepared_receipt
-
     if expected_full_commit != SYSTEMD_PREPARED_COMMIT:
         raise SystemExit("Linux prepared candidate requires exact app commit")
     try:
@@ -8413,8 +8460,8 @@ def _prepare_linux_artifact(
         if receipt_sha != expected_receipt_sha256:
             raise SystemExit("Linux prepared receipt does not match independently authenticated digest")
         try:
-            metadata = parse_prepared_receipt(receipt.read_bytes())
-        except (OSError, ValidationError) as exc:
+            metadata = verified_helper.module.parse_prepared_receipt(receipt.read_bytes())
+        except (OSError, verified_helper.module.ValidationError) as exc:
             raise SystemExit("invalid Linux prepared artifact receipt") from exc
         if metadata["controller_commit"] != controller_commit:
             raise SystemExit("Linux preparation receipt controller commit mismatch")
@@ -8541,6 +8588,16 @@ def native_prod_deploy(
 
     with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
         staging = Path(temporary)
+        helper = staging / "helper.py"
+        verified_controller_helper = (
+            _materialize_verified_systemd_helper(
+                controller.controller_source_commit,
+                helper,
+                ProdSourceKind.PREPARED_ARTIFACT.value,
+            )
+            if prepared_systemd_request
+            else None
+        )
         prepared = (
             _prepare_linux_artifact(
                 controller.prepared_artifact,
@@ -8548,6 +8605,7 @@ def native_prod_deploy(
                 controller.controller_source_commit,
                 controller.expected_preparation_receipt_sha256,
                 staging,
+                verified_controller_helper,
             )
             if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None
             else _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
@@ -8598,13 +8656,15 @@ def native_prod_deploy(
         candidate_socket.write_text(generate_systemd_socket(config))
         candidate_socket.chmod(0o600)
 
-        helper = staging / "helper.py"
-        expected_helper_sha256 = _materialize_source_file(
-            controller.controller_source_commit or prepared.source_commit,
-            "scripts/systemd_deploy_helper.py",
-            helper,
-            prepared.source_kind.value,
-        )
+        if verified_controller_helper is not None:
+            expected_helper_sha256 = verified_controller_helper.digest()
+        else:
+            expected_helper_sha256 = _materialize_source_file(
+                controller.controller_source_commit or prepared.source_commit,
+                "scripts/systemd_deploy_helper.py",
+                helper,
+                prepared.source_kind.value,
+            )
         registry = None
         if controller.systemd_current_schema_upgrade:
             if isinstance(prepared, ValidatedLinuxPreparedCandidate):
