@@ -43,7 +43,67 @@ function RequestBoundPanel({ requestId, text }: { requestId: string; text: strin
 
 describe('QuestionPanel request identity', () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('keeps keyboard selection on the question until explicit navigation', () => {
+    vi.useFakeTimers();
+    const respond = vi.spyOn(api, 'respondToQuestion');
+    const { container } = render(
+      <QuestionPanel
+        questions={[question('Q1?'), question('Q2?'), question('Q3?')]}
+        conversationId="conversation"
+        requestId="request-q1"
+        showToast={() => {}}
+        onAnswered={() => {}}
+        onDismissed={() => {}}
+      />,
+    );
+    const panel = container.querySelector('.question-panel');
+    expect(panel).not.toBeNull();
+
+    fireEvent.keyDown(panel!, { key: 'Enter' });
+
+    expect(screen.getByText('Q1?')).toBeInTheDocument();
+    expect(container.querySelector('input[name="Q1?"]')).toBeChecked();
+    expect(respond).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Q2?')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Q3?')).toBeInTheDocument();
+
+    act(() => vi.advanceTimersByTime(200));
+
+    expect(screen.getByText('Q3?')).toBeInTheDocument();
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  it('requires an explicit submit action after keyboard selection', async () => {
+    const respond = vi.spyOn(api, 'respondToQuestion').mockResolvedValue({ success: true });
+    const { container } = render(
+      <QuestionPanel
+        questions={[question('Q1?')]}
+        conversationId="conversation"
+        requestId="request-q1"
+        showToast={() => {}}
+        onAnswered={() => {}}
+        onDismissed={() => {}}
+      />,
+    );
+    const panel = container.querySelector('.question-panel');
+    expect(panel).not.toBeNull();
+
+    fireEvent.keyDown(panel!, { key: 'Enter' });
+    fireEvent.keyDown(panel!, { key: 'Enter' });
+
+    expect(screen.getByText('Q1?')).toBeInTheDocument();
+    expect(respond).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(panel!, { key: 'Enter', ctrlKey: true });
+
+    await waitFor(() => expect(respond).toHaveBeenCalledOnce());
   });
 
   it('sends the pending identity with an answer', async () => {
