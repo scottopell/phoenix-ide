@@ -1,10 +1,8 @@
 # ADR-182: Immutable conversation goals use owner-version fences
 
-**Date:** 2026-10-19
-
-**Status:** Accepted
-
-**Affects:** REQ-GOAL-001 through REQ-GOAL-008 (`specs/conversation-goals/requirements.md`)
+- **Status:** Accepted
+- **Date:** 2026-10-19
+- **Affects:** REQ-GOAL-001 through REQ-GOAL-008 (`specs/conversation-goals/requirements.md`)
 
 ## Context
 
