@@ -1932,22 +1932,79 @@ def prepare_data_directory(service_user: str, deployed_sha_target: str) -> bool:
     return preexisting
 
 
-def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) -> Path:
+def _read_bound_bundle(bundle_path: Path, expected_sha256: str, source_uid: int) -> dict:
+    if SHA256_RE.fullmatch(expected_sha256) is None:
+        raise ValidationError("invalid handoff bundle digest")
+    try:
+        bundle_fd = os.open(bundle_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ValidationError("invalid handoff bundle") from exc
+    try:
+        bundle_stat = os.fstat(bundle_fd)
+        if not stat.S_ISREG(bundle_stat.st_mode) or bundle_stat.st_uid != source_uid:
+            raise ValidationError("invalid handoff bundle ownership or type")
+        if stat.S_IMODE(bundle_stat.st_mode) & 0o022:
+            raise ValidationError("handoff bundle is group/world writable")
+        with os.fdopen(bundle_fd, "rb", closefd=False) as stream:
+            bundle_bytes = stream.read()
+    finally:
+        os.close(bundle_fd)
+    if hashlib.sha256(bundle_bytes).hexdigest() != expected_sha256:
+        raise ValidationError("handoff bundle digest mismatch")
+    try:
+        bundle = json.loads(bundle_bytes)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("invalid handoff bundle") from exc
+    if not isinstance(bundle, dict):
+        raise ValidationError("invalid handoff bundle")
+    return bundle
+
+
+def _read_legacy_bundle(bundle_path: Path) -> dict:
+    try:
+        bundle = json.loads(bundle_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("invalid handoff bundle") from exc
+    if not isinstance(bundle, dict):
+        raise ValidationError("invalid handoff bundle")
+    return bundle
+
+
+def stage_handoff(bundle_path: Path, expected_bundle_sha256: str, source_uid: int, policy: ValidationPolicy) -> Path:
     policy.activation_lock_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     with policy.activation_lock_path.open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another deployment is staging or activating") from exc
-        return _stage_handoff_locked(bundle_path, source_uid, policy)
+        return _stage_handoff_locked(bundle_path, expected_bundle_sha256, source_uid, policy)
 
 
-def _stage_handoff_locked(bundle_path: Path, source_uid: int, policy: ValidationPolicy) -> Path:
+def stage_handoff_legacy(bundle_path: Path, source_uid: int, policy: ValidationPolicy) -> Path:
+    policy.activation_lock_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with policy.activation_lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment is staging or activating") from exc
+        return _stage_handoff_locked(bundle_path, None, source_uid, policy)
+
+
+def _stage_handoff_locked(
+    bundle_path: Path,
+    expected_bundle_sha256: Optional[str],
+    source_uid: int,
+    policy: ValidationPolicy,
+) -> Path:
     try:
-        bundle = json.loads(bundle_path.read_text())
+        bundle = (
+            _read_bound_bundle(bundle_path, expected_bundle_sha256, source_uid)
+            if expected_bundle_sha256 is not None
+            else _read_legacy_bundle(bundle_path)
+        )
         transaction_id = bundle["transaction_id"]
         files = bundle["files"]
-    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError) as exc:
         raise ValidationError("invalid handoff bundle") from exc
     allowed = {
         "candidate-binary": 0o700,
@@ -1979,6 +2036,8 @@ def _stage_handoff_locked(bundle_path: Path, source_uid: int, policy: Validation
         manifest = Manifest.load(manifest_path)
         if manifest.mode not in {"ordinary", PROTECTED_MODE}:
             raise ValidationError("unknown systemd deployment mode")
+        if manifest.mode == PROTECTED_MODE and expected_bundle_sha256 is None:
+            raise ValidationError("protected systemd staging requires a controller-bound bundle")
         capture_rollback(transaction, policy, manifest_path)
         manifest = Manifest.load(manifest_path)
         if manifest.previous is None:
@@ -2297,6 +2356,7 @@ def main() -> int:
                         help="recover-current restores only a proven pre-marker predecessor or resumes the exact post-marker candidate")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--bundle-sha256")
     parser.add_argument("--source-uid", type=int)
     args = parser.parse_args()
     if args.protected_prepared_protocol_version:
@@ -2314,7 +2374,13 @@ def main() -> int:
         if args.bundle is None or args.source_uid is None:
             parser.error("staging requires stage --bundle PATH --source-uid UID")
         try:
-            print(stage_handoff(args.bundle, args.source_uid, ValidationPolicy.production()))
+            policy = ValidationPolicy.production()
+            manifest_path = (
+                stage_handoff(args.bundle, args.bundle_sha256, args.source_uid, policy)
+                if args.bundle_sha256 is not None
+                else stage_handoff_legacy(args.bundle, args.source_uid, policy)
+            )
+            print(manifest_path)
             return 0
         except Exception as exc:
             print(f"systemd handoff staging failed: {exc}", file=sys.stderr)

@@ -39,19 +39,75 @@ class SystemdDeployCommandTests(unittest.TestCase):
             staging = Path(td)
             artifact = staging / "candidate"
             artifact.write_text("candidate")
-            with mock.patch.object(
-                self.dev.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 1, "", "denied"),
-            ) as run:
+            helper_sha256 = self.dev._file_sha256(artifact)
+            results = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, f"{helper_sha256}  helper.py\n", ""),
+                subprocess.CompletedProcess([], 1, "", "denied"),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=results) as run:
                 with self.assertRaisesRegex(SystemExit, "handoff staging failed"):
                     self.dev._stage_systemd_root_handoff(
                         staging,
                         "a" * 32,
                         artifact,
-                        [("candidate-binary", artifact)],
+                        [("candidate-binary", artifact), ("helper.py", artifact)],
                     )
             self.assertTrue(all("systemd-run" not in call.args[0] for call in run.call_args_list))
+            stage_command = run.call_args_list[3].args[0]
+            digest_index = stage_command.index("--bundle-sha256") + 1
+            self.assertEqual(
+                self.dev._file_sha256(staging / "bundle.json"),
+                stage_command[digest_index],
+            )
+
+    def test_root_staging_rejects_unverified_bootstrap_helper(self):
+        with tempfile.TemporaryDirectory() as td:
+            staging = Path(td)
+            helper = staging / "helper.py"
+            helper.write_text("trusted helper")
+            results = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 1, "", "sha256sum failed"),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=results) as run:
+                with self.assertRaisesRegex(SystemExit, "bootstrap helper hash mismatch"):
+                    self.dev._stage_systemd_root_handoff(
+                        staging,
+                        "a" * 32,
+                        helper,
+                        [("helper.py", helper)],
+                    )
+            self.assertFalse(any("python3" in call.args[0] for call in run.call_args_list))
+
+    def test_ordinary_root_staging_preserves_legacy_helper_cli(self):
+        with tempfile.TemporaryDirectory() as td:
+            staging = Path(td)
+            helper = staging / "helper.py"
+            helper.write_text("trusted helper")
+            helper_sha256 = self.dev._file_sha256(helper)
+            results = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, f"{helper_sha256}  helper.py\n", ""),
+                subprocess.CompletedProcess([], 1, "", "denied"),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=results) as run:
+                with self.assertRaisesRegex(SystemExit, "handoff staging failed"):
+                    self.dev._stage_systemd_root_handoff(
+                        staging,
+                        "a" * 32,
+                        helper,
+                        [("helper.py", helper)],
+                        bind_bundle=False,
+                    )
+            stage_command = run.call_args_list[3].args[0]
+            self.assertNotIn("--bundle-sha256", stage_command)
 
     def test_transient_launch_failure_abandons_staged_claim(self):
         manifest = Path("/root/transactions/tx/manifest.json")
@@ -111,9 +167,10 @@ class SystemdDeployCommandTests(unittest.TestCase):
                  mock.patch.object(
                      self.dev,
                      "_stage_systemd_root_handoff",
-                     side_effect=lambda _staging, _tx, helper, files, *, noninteractive=False: captured.update(
+                     side_effect=lambda _staging, _tx, helper, files, *, noninteractive=False, bind_bundle=True: captured.update(
                          helper_text=helper.read_text(),
                          noninteractive=noninteractive,
+                         bind_bundle=bind_bundle,
                          manifest=json.loads(dict(files)["manifest.json"].read_text()),
                          manifest_text=dict(files)["manifest.json"].read_text(),
                          socket_text=dict(files)["candidate.socket"].read_text(),
@@ -134,6 +191,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             files = captured["files"]
             manifest = captured["manifest"]
             self.assertFalse(captured["noninteractive"])
+            self.assertFalse(captured["bind_bundle"])
             self.assertNotIn("value", captured["manifest_text"])
             self.assertEqual(identity.as_dict(), manifest["expected"])
             self.assertEqual(1, manifest["manifest_version"])

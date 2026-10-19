@@ -8156,15 +8156,25 @@ def _stage_systemd_root_handoff(
     files: list[tuple[str, Path]],
     *,
     noninteractive: bool = False,
+    bind_bundle: bool = True,
 ) -> Path:
     bundle = staging / "bundle.json"
-    _write_json_atomic(bundle, {
+    bundle_value = {
         "transaction_id": transaction_id,
         "files": [
             {"name": name, "source": str(path), "sha256": _file_sha256(path)}
             for name, path in files
         ],
-    })
+    }
+    bundle_bytes = (json.dumps(bundle_value, indent=2, sort_keys=True) + "\n").encode()
+    bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
+    try:
+        helper_sha256 = next(
+            entry["sha256"] for entry in bundle_value["files"] if entry["name"] == "helper.py"
+        )
+    except StopIteration as exc:
+        raise SystemExit("systemd handoff bundle is missing helper.py") from exc
+    _write_json_atomic(bundle, bundle_value)
     bootstrap = SYSTEMD_DEPLOY_DIR / f"bootstrap-{transaction_id}"
     root_helper = bootstrap / "helper.py"
     sudo = ["sudo", "-n"] if noninteractive else ["sudo"]
@@ -8174,11 +8184,28 @@ def _stage_systemd_root_handoff(
 
         str(helper), str(root_helper),
     ], check=True)
+    try:
+        verified_helper = subprocess.run(
+            [*sudo, "sha256sum", str(root_helper)],
+            capture_output=True,
+            text=True,
+        )
+    except BaseException:
+        subprocess.run([*sudo, "rm", "-rf", str(bootstrap)], check=False)
+        raise
+    helper_output = (verified_helper.stdout or "").split(maxsplit=1)
+    if (verified_helper.returncode != 0 or not helper_output
+            or helper_output[0] != helper_sha256):
+        subprocess.run([*sudo, "rm", "-rf", str(bootstrap)], check=False)
+        raise SystemExit("systemd handoff bootstrap helper hash mismatch")
+    stage_command = [
+        *sudo, "python3", str(root_helper), "stage", "--bundle", str(bundle),
+    ]
+    if bind_bundle:
+        stage_command.extend(("--bundle-sha256", bundle_sha256))
+    stage_command.extend(("--source-uid", str(os.getuid())))
     result = subprocess.run(
-        [
-            *sudo, "python3", str(root_helper), "stage",
-            "--bundle", str(bundle), "--source-uid", str(os.getuid()),
-        ],
+        stage_command,
         capture_output=True,
         text=True,
     )
@@ -8626,6 +8653,7 @@ def native_prod_deploy(
             helper,
             files,
             noninteractive=controller.enabled,
+            bind_bundle=controller.systemd_current_schema_upgrade,
         )
 
     _launch_systemd_activation(

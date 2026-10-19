@@ -33,6 +33,10 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def stage_handoff(bundle, source_uid, policy):
+    return helper.stage_handoff(bundle, digest(bundle), source_uid, policy)
+
+
 def write_manual_tls_fixture(directory: Path, stem: str = "manual") -> tuple[Path, Path]:
     cert, key = directory / f"{stem}.crt", directory / f"{stem}.key"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
@@ -450,6 +454,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
     def bundle(self, files):
         path = self.base / "bundle.json"
         path.write_text(json.dumps({"transaction_id": self.transaction_id, "files": files}))
+        path.chmod(0o600)
         return path
 
     def staging_policy(self):
@@ -480,7 +485,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
         policy = self.staging_policy()
         with mock.patch.object(helper, "prepare_data_directory", return_value=True):
-            manifest = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+            manifest = stage_handoff(self.bundle(sources), os.getuid(), policy)
         self.assertEqual(policy.transaction_root / self.transaction_id / "manifest.json", manifest)
         self.assertEqual(self.transaction_id, policy.active_path.read_text().strip())
         self.assertEqual("candidate-binary", (manifest.parent / "candidate-binary").read_text())
@@ -488,6 +493,26 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         status = json.loads(policy.status_path.read_text())
         self.assertEqual("prepared", status["state"])
         self.assertEqual(self.transaction_id, status["transaction_id"])
+
+    def test_stage_handoff_rejects_bundle_mutation_after_controller_binding(self):
+        sources = self.staging_sources()
+        source_manifest = self.base / "source-manifest.json"
+        source_manifest.write_text(json.dumps(self.raw))
+        sources.append({
+            "name": "manifest.json",
+            "source": str(source_manifest),
+            "sha256": digest(source_manifest),
+        })
+        bundle = self.bundle(sources)
+        expected_bundle_sha256 = digest(bundle)
+        bundle.write_text(json.dumps({"transaction_id": self.transaction_id, "files": []}))
+        with self.assertRaisesRegex(helper.ValidationError, "bundle digest mismatch"):
+            helper.stage_handoff(
+                bundle,
+                expected_bundle_sha256,
+                os.getuid(),
+                self.staging_policy(),
+            )
 
     def test_root_staging_derives_previous_runtime_from_captured_install(self):
         sources = self.staging_sources()
@@ -518,7 +543,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         with mock.patch.object(helper, "prepare_data_directory", return_value=True), \
              mock.patch.object(helper, "installed_runtime_identity", return_value=identity), \
              mock.patch.object(helper, "copy_handoff_file", side_effect=copy_file):
-            manifest_path = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+            manifest_path = stage_handoff(self.bundle(sources), os.getuid(), policy)
         manifest = helper.Manifest.load(manifest_path)
         self.assertEqual(identity, manifest.previous)
         self.assertEqual("https://[::1]:9443/api/version", manifest.previous_health_url)
@@ -592,7 +617,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                      mock.patch.object(helper.sys, "platform", "linux"), \
                      mock.patch("platform.machine", return_value="x86_64"), \
                      mock.patch.object(helper, "database_preflight") as database_preflight:
-                    manifest_path = helper.stage_handoff(bundle, os.getuid(), policy)
+                    manifest_path = stage_handoff(bundle, os.getuid(), policy)
                     manifest = helper.Manifest.load(manifest_path)
                     helper.validate_manifest(manifest_path, manifest, policy)
                     database_preflight.assert_called_once_with(manifest)
@@ -624,7 +649,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                      mock.patch.object(helper, "Systemctl") as controller, \
                      mock.patch.object(helper, "install_start_inhibit") as inhibit:
                     with self.assertRaises(helper.ValidationError):
-                        helper.stage_handoff(bundle, os.getuid(), policy)
+                        stage_handoff(bundle, os.getuid(), policy)
                 controller.assert_not_called()
                 inhibit.assert_not_called()
                 self.assertFalse(policy.active_path.exists())
@@ -668,7 +693,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                      mock.patch.object(helper, "run_current_migration") as migration, \
                      mock.patch.object(helper, "database_preflight") as database_preflight:
                     with self.assertRaises(helper.ValidationError):
-                        helper.stage_handoff(bundle, os.getuid(), policy)
+                        stage_handoff(bundle, os.getuid(), policy)
                 controller.assert_not_called()
                 inhibit.assert_not_called()
                 migration.assert_not_called()
@@ -684,7 +709,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         source.write_text("secret")
         policy = self.staging_policy()
         with self.assertRaisesRegex(helper.ValidationError, "non-allowlisted"):
-            helper.stage_handoff(
+            stage_handoff(
                 self.bundle([{"name": "arbitrary", "source": str(source), "sha256": digest(source)}]),
                 os.getuid(),
                 policy,
@@ -700,7 +725,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         ]
         policy = self.staging_policy()
         with self.assertRaisesRegex(helper.ValidationError, "checksum mismatch"):
-            helper.stage_handoff(self.bundle(required), os.getuid(), policy)
+            stage_handoff(self.bundle(required), os.getuid(), policy)
         self.assertFalse(policy.active_path.exists())
         self.assertFalse((policy.transaction_root / self.transaction_id).exists())
 
@@ -717,12 +742,12 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         with mock.patch.object(helper, "prepare_data_directory", return_value=True), \
              mock.patch.object(helper, "write_policy_status", side_effect=uncertain):
             with self.assertRaises(OSError):
-                helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+                stage_handoff(self.bundle(sources), os.getuid(), policy)
         self.assertTrue((policy.transaction_root / self.transaction_id / "manifest.json").exists())
         self.assertEqual(self.transaction_id, policy.active_path.read_text().strip())
         self.assertEqual("prepared", json.loads(policy.status_path.read_text())["state"])
         with self.assertRaises(helper.ConcurrentDeploy):
-            helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+            stage_handoff(self.bundle(sources), os.getuid(), policy)
 
     def test_new_staging_claim_retires_only_exact_partial_transaction(self):
         policy = self.staging_policy()
@@ -761,7 +786,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         with mock.patch.object(helper, "copy_handoff_file", side_effect=copy), \
              mock.patch.object(helper, "write_policy_status", side_effect=status), \
              mock.patch.object(helper, "prepare_data_directory", return_value=True):
-            helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+            stage_handoff(self.bundle(sources), os.getuid(), policy)
 
     def test_staging_process_crash_boundaries_reenter_without_orphan_claim(self):
         sources = self.staging_sources()
@@ -794,7 +819,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                         with mock.patch.object(helper, "atomic_write", side_effect=write), \
                              mock.patch.object(helper, "copy_handoff_file", side_effect=copy), \
                              mock.patch.object(helper, "prepare_data_directory", return_value=True):
-                            helper.stage_handoff(bundle, os.getuid(), policy)
+                            stage_handoff(bundle, os.getuid(), policy)
                     finally:
                         os._exit(78)
                 _, status = os.waitpid(pid, 0)
@@ -805,10 +830,10 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                     if boundary == "prepared":
                         before = policy.status_path.read_bytes()
                         with self.assertRaises(helper.ConcurrentDeploy):
-                            helper.stage_handoff(bundle, os.getuid(), policy)
+                            stage_handoff(bundle, os.getuid(), policy)
                         self.assertEqual(before, policy.status_path.read_bytes())
                     else:
-                        helper.stage_handoff(bundle, os.getuid(), policy)
+                        stage_handoff(bundle, os.getuid(), policy)
                         self.assertEqual("prepared", json.loads(policy.status_path.read_text())["state"])
 
     def test_staging_retirement_refuses_marker_mismatch_or_ambiguous_status(self):
@@ -2682,6 +2707,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
         bundle = self.base / "prepared-bundle.json"
         bundle.write_text(json.dumps({"transaction_id": manifest.transaction_id, "files": sources}))
+        bundle.chmod(0o600)
         original_copy = helper.copy_handoff_file
         def copy(source, target, expected, _uid, mode):
             original_copy(source, target, expected, os.getuid(), mode)
@@ -2690,7 +2716,9 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         with mock.patch.object(helper, "copy_handoff_file", side_effect=copy), \
              mock.patch.object(helper, "installed_runtime_identity", side_effect=identity), \
              mock.patch.object(helper, "prepare_data_directory", side_effect=AssertionError("preserve live data ownership")):
-            staged_path = helper.stage_handoff(bundle, os.getuid(), policy)
+            with self.assertRaisesRegex(helper.ValidationError, "controller-bound bundle"):
+                helper.stage_handoff_legacy(bundle, os.getuid(), policy)
+            staged_path = stage_handoff(bundle, os.getuid(), policy)
             staged = helper.Manifest.load(staged_path)
             helper.validate_manifest(staged_path, staged, policy)
         self.assertEqual(manifest.prepared_artifact_receipt.sha256, staged.prepared_artifact_receipt.sha256)
@@ -2723,13 +2751,14 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
         bundle = self.base / "bundle.json"
         bundle.write_text(json.dumps({"transaction_id": manifest.transaction_id, "files": sources}))
+        bundle.chmod(0o600)
         original_copy = helper.copy_handoff_file
         def copy(source, target, expected, _uid, mode):
             original_copy(source, target, expected, os.getuid(), mode)
         with mock.patch.object(helper, "copy_handoff_file", side_effect=copy), \
              mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.previous), \
              mock.patch.object(helper, "prepare_data_directory", side_effect=AssertionError("preserve live data ownership")):
-            staged_path = helper.stage_handoff(bundle, os.getuid(), policy)
+            staged_path = stage_handoff(bundle, os.getuid(), policy)
         staged = helper.Manifest.load(staged_path)
         self.assertEqual(0o400, staged_path.stat().st_mode & 0o777)
         self.assertEqual(os.getuid(), staged_path.stat().st_uid)
