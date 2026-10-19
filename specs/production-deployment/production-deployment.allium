@@ -5,7 +5,7 @@
 -- and bare Linux, with backend-specific activation ownership.
 -- This module owns shared guarantees. Platform-specific launchd mechanics
 -- are cumulative refinements in specs/launchd-deployment/launchd-deployment.allium.
--- Requirement traceability: REQ-PD-001 through REQ-PD-027. Runtime lifecycle
+-- Requirement traceability: REQ-PD-001 through REQ-PD-029. Runtime lifecycle
 -- rules model REQ-PD-002 through REQ-PD-014; backend selection, operator
 -- syntax, bare-Linux reboot integration, disposable test isolation, and
 -- release asset publication are interface/build obligations in requirements.md.
@@ -73,7 +73,7 @@ entity DeployTransaction {
     id: String
     backend: BackendKind
     kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment
-        | ProtectedSystemdReleaseDeployment
+        | ProtectedSystemdReleaseDeployment | ProtectedSystemdPreparedDeployment
     source_commit: String
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
@@ -130,6 +130,16 @@ variant ProtectedSystemdReleaseDeployment : DeployTransaction {
     database_path: String
 }
 
+-- REQ-PD-029 / REQ-COMP-016: exact prepared Linux source, not a release or paired launchd source.
+variant ProtectedSystemdPreparedDeployment : DeployTransaction {
+    preparation_receipt_hash: String
+    preparation_run_id: Integer
+    preparation_run_attempt: Integer
+    controller_source_commit: String
+    controller_helper_hash: String
+    database_path: String
+}
+
 variant PreparedArtifactDeployment : DeployTransaction {
     paired_lifecycle_observation: PreparedArtifactLifecycleObservation
     finalization: FinalizationOutcome
@@ -176,28 +186,32 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   source_commit, both are 40 lowercase hexadecimal characters, and no prefix
 --   match establishes candidate identity.
 -- prepared_artifact_source_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, the protected standalone
---   artifact identity and receipt contents are valid. The operator establishes
---   protected run/source association independently of local JSON validation;
---   clean controller source/helper hash and protocol are independent evidence,
---   not receipt-derived. This does not assert database lifecycle observations.
+--   True for local and published sources. For a launchd prepared source, its signed
+--   standalone identity and receipt are valid. For ProtectedSystemdPreparedDeployment,
+--   the closed exact Linux receipt, sole payload/hash, candidate identity, target,
+--   registry digest, workflow run/attempt and verified checks satisfy REQ-PD-029.
+--   The operator establishes protected run/source/artifact association independently
+--   of local JSON validation. This does not assert database lifecycle observations.
 -- paired_database_preflight_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, the immutable proof has
---   Candidate and captured predecessor configure the same canonical path; the
---   single shared_database_path is that value. The proof includes
---   legacy-schema eligibility, one canonical database path shared by installed
---   predecessor and candidate, ledger at most 69, and ProductConversation upgrade
---   mode. It does not assert quiesce, offline ownership, or a snapshot.
+--   True unless transaction.kind = PreparedArtifactDeployment. For that launchd
+--   paired variant, the immutable proof has Candidate and captured predecessor
+--   configure the same canonical path; the single shared_database_path is that
+--   value. The proof includes legacy-schema eligibility, one canonical database
+--   path shared by installed predecessor and candidate, ledger at most 69, and
+--   ProductConversation upgrade mode. It does not assert quiesce, offline ownership,
+--   or a snapshot. Protected systemd variants use protected_systemd_preflight_valid.
 -- paired_database_proof_is_valid(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, after quiesce the lifecycle
---   observation is PreparedArtifactSnapshotVerified: exclusive offline ownership
---   and verified SQLite snapshot integrity bound to the immutable controller,
---   predecessor and shared path. No future rollback result is required.
+--   True unless transaction.kind = PreparedArtifactDeployment. For that launchd
+--   paired variant, after quiesce the lifecycle observation is
+--   PreparedArtifactSnapshotVerified: exclusive offline ownership and verified
+--   SQLite snapshot integrity bound to the immutable controller, predecessor and
+--   shared path. Protected systemd variants use their backup/rehearsal predicates.
 -- controller_identity_is_independently_bound(transaction) -> Boolean
---   True for ordinary sources. For prepared_artifact, the controller helper hash
---   is bound to the recorded clean controller source and protocol. The controller
---   and candidate commits may be equal when that independently bound helper is
---   valid.
+--   True for ordinary sources. For prepared sources, the controller helper hash is
+--   bound to the recorded clean controller source and protocol. A launchd prepared
+--   contract governs whether controller and candidate commits may be equal. The
+--   exact systemd prepared contract requires different commits and requires the
+--   receipt controller commit to equal the independently selected controller source.
 -- PairedRecoveryVerified(transaction, mode)
 --   Separately requested retained-helper recovery verified matched database,
 --   runtime/configuration and predecessor identity before releasing ownership.
@@ -205,9 +219,10 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   Emitted after quiesce and paired snapshot proof verification, before
 --   candidate install/start; ordinary sources use their prepared inputs.
 -- candidate_startup_proof_is_valid(transaction) -> Boolean
---   True for unprotected ordinary sources. For prepared_artifact, paired_database_proof_is_valid
---   holds and the verified predecessor snapshot follows exclusive offline proof
---   before candidate startup. Protected systemd additionally requires a durable
+--   True for unprotected ordinary sources. For PreparedArtifactDeployment,
+--   paired_database_proof_is_valid holds and the verified predecessor snapshot
+--   follows exclusive offline proof before candidate startup. Protected systemd
+--   variants instead require a durable
 --   live marker, protected_systemd_target_valid, intact backup/rehearsal evidence
 --   and preserved configuration; inhibit removal immediately precedes exact
 --   candidate start, only after exclusive stopped target/candidate verification.
@@ -698,7 +713,7 @@ rule CommitVerifiedCandidate {
     requires: atomic_install_complete(transaction)
     ensures: transaction.state = committed
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.finalization = pending
-    ensures: transaction.kind = ProtectedSystemdReleaseDeployment implies ProtectedSystemdRetained(transaction)
+    ensures: protected_systemd_deployment(transaction) implies ProtectedSystemdRetained(transaction)
     ensures: DeployedShaWritten(transaction.source_commit)
     ensures: DurableStatusWritten(transaction)
 
@@ -781,7 +796,7 @@ rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, failure)
     requires: transaction.state = activating
     requires: transaction.kind != PreparedArtifactDeployment
-    requires: transaction.kind != ProtectedSystemdReleaseDeployment
+    requires: not protected_systemd_deployment(transaction)
     requires: current_claim_matches(transaction)
     requires: exact_previous_restored(transaction)
     ensures: transaction.state = activation_failed_rolled_back
@@ -863,7 +878,7 @@ rule RollBackFailedPreparedPairedActivation {
 rule PreserveRollbackFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
     requires: transaction.state = activating
-    requires: transaction.kind != ProtectedSystemdReleaseDeployment
+    requires: not protected_systemd_deployment(transaction)
     requires: current_claim_matches(transaction)
     ensures: transaction.kind = PreparedArtifactDeployment implies transaction.state = activation_failed_rollback_failed
     ensures: transaction.kind != PreparedArtifactDeployment implies transaction.state = ordinary_activation_failed_rollback_failed
@@ -902,13 +917,19 @@ rule PreservePreparedRecoveryFailure {
     ensures: active_claim_retained(transaction)
 }
 
--- Protected systemd helpers (REQ-PD-023–027 / REQ-COMP-014)
+-- Protected systemd helpers (REQ-PD-023–029 / REQ-COMP-014, REQ-COMP-016)
+-- protected_systemd_deployment(transaction) -> Boolean
+--   True only for ProtectedSystemdReleaseDeployment or
+--   ProtectedSystemdPreparedDeployment.
 -- protected_systemd_preflight_valid(transaction) -> Boolean
 --   True for other kinds. ProtectedSystemdReleaseDeployment requires systemd on
---   Linux x86_64, the exact tag/version/full commit/asset/hash/registry bytes in
---   REQ-PD-023, complete ordered registry prefix through65, existing predecessor,
---   preserved installed env/service/socket/canonical DB path, absent live marker,
---   and independently bound explicit different controller commit/helper hash.
+--   Linux x86_64 and the exact published tag/version/full commit/asset/hash/registry
+--   bytes in REQ-PD-023. ProtectedSystemdPreparedDeployment instead requires the
+--   exact candidate, Linux target, closed receipt/payload hashes and registry bytes
+--   in REQ-PD-029, with receipt controller identity equal to the independently
+--   selected different controller commit/helper hash and no release evidence.
+--   Both require complete ordered registry prefix through65, existing predecessor,
+--   preserved installed env/service/socket/canonical DB path and absent live marker.
 --   Root staging binds both retained health URLs to exactly one preserved TCP
 --   ListenStream: bare port (IPv6), IPv4/bracketed IPv6 wildcard, or explicit
 --   loopback. It maps wildcard to same-family loopback, preserves explicit
@@ -1045,7 +1066,7 @@ rule PreservePreparedRecoveryFailure {
 
 rule ProtectedSystemdBackup {
     when: ProtectedSystemdBackupVerified(transaction)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state = activating
     requires: not protected_systemd_marker_present(transaction)
     requires: protected_systemd_start_inhibit_valid(transaction)
@@ -1063,7 +1084,7 @@ rule ProtectedSystemdBackup {
 
 rule ProtectedSystemdRehearsal {
     when: ProtectedSystemdRehearsalVerified(transaction)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state = activating
     requires: not protected_systemd_marker_present(transaction)
     requires: protected_systemd_start_inhibit_valid(transaction)
@@ -1075,7 +1096,7 @@ rule ProtectedSystemdRehearsal {
 
 rule ProtectedSystemdCrossLiveBoundary {
     when: ProtectedSystemdLiveMigrationRequested(transaction)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state = activating
     requires: not protected_systemd_marker_present(transaction)
     requires: protected_systemd_start_inhibit_valid(transaction)
@@ -1097,7 +1118,7 @@ rule ProtectedSystemdCrossLiveBoundary {
 
 rule ProtectedSystemdVerifyTarget {
     when: ProtectedSystemdTargetVerified(transaction)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state = activating
     requires: protected_systemd_marker_present(transaction)
     requires: protected_systemd_start_inhibit_valid(transaction)
@@ -1106,7 +1127,7 @@ rule ProtectedSystemdVerifyTarget {
 
 rule ProtectedSystemdInterruptedPreMarkerRecovery {
     when: ProtectedSystemdRecoveryRequested(transaction)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state in { activating, activation_failed_rollback_failed }
     requires: not protected_systemd_marker_present(transaction)
     requires: current_claim_matches(transaction)
@@ -1128,7 +1149,7 @@ rule ProtectedSystemdInterruptedPreMarkerRecovery {
 
 rule ProtectedSystemdPreMarkerRecovery {
     when: ProtectedSystemdUnchangedPredecessorObserved(transaction)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state = activating
     requires: not protected_systemd_marker_present(transaction)
     requires: current_claim_matches(transaction)
@@ -1150,7 +1171,7 @@ rule ProtectedSystemdPreMarkerRecovery {
 
 rule ProtectedSystemdUnprovenPreMarkerRecovery {
     when: RollbackFailed(transaction, failure, rollback_failure)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state = activating
     requires: not protected_systemd_marker_present(transaction)
     requires: current_claim_matches(transaction)
@@ -1165,7 +1186,7 @@ rule ProtectedSystemdUnprovenPreMarkerRecovery {
 
 rule ProtectedSystemdPostMarkerFailure {
     when: ActivationFailed(transaction, failure)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state = activating
     requires: protected_systemd_marker_present(transaction)
     requires: current_claim_matches(transaction)
@@ -1179,7 +1200,7 @@ rule ProtectedSystemdPostMarkerFailure {
 
 rule ProtectedSystemdForwardRecovery {
     when: ProtectedSystemdRecoveryRequested(transaction)
-    requires: transaction.kind = ProtectedSystemdReleaseDeployment
+    requires: protected_systemd_deployment(transaction)
     requires: transaction.state in { activating, current_forward_failed }
     requires: protected_systemd_marker_present(transaction)
     requires: current_claim_matches(transaction)
@@ -1219,14 +1240,14 @@ rule RetireSystemdPartialStaging {
 
 invariant ProtectedSystemdIsOneExactTransition {
     for transaction in DeployTransactions:
-        transaction.kind = ProtectedSystemdReleaseDeployment
+        protected_systemd_deployment(transaction)
         and transaction.state not in { preparing, precondition_failed, rejected_concurrent } implies
             transaction.backend = systemd and transaction.previous != null
 }
 
 invariant ProtectedSystemdMarkerForbidsRollback {
     for transaction in DeployTransactions:
-        transaction.kind = ProtectedSystemdReleaseDeployment
+        protected_systemd_deployment(transaction)
         and protected_systemd_marker_present(transaction) implies
             not DatabaseRollbackCompleted(transaction)
             and not RuntimeArtifactRollbackRecorded(transaction)
@@ -1235,13 +1256,13 @@ invariant ProtectedSystemdMarkerForbidsRollback {
 
 invariant ProtectedSystemdPersistentInhibit {
     for transaction in DeployTransactions:
-        transaction.kind = ProtectedSystemdReleaseDeployment implies
+        protected_systemd_deployment(transaction) implies
             protected_systemd_inhibit_disposition_valid(transaction)
 }
 
 invariant ProtectedSystemdCommitRetainsPristineBackup {
     for transaction in DeployTransactions:
-        transaction.kind = ProtectedSystemdReleaseDeployment
+        protected_systemd_deployment(transaction)
         and transaction.state = committed implies
             protected_systemd_marker_present(transaction)
             and protected_systemd_target_valid(transaction)
