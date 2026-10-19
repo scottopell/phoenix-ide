@@ -124,15 +124,19 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
     def manifest(self, database: Path) -> helper.Manifest:
         transaction = self.root / "transaction"
         transaction.mkdir(mode=0o700, exist_ok=True)
-        candidate_binary = self.root / "candidate"
+        candidate_binary = transaction / "candidate"
         candidate_binary.write_text("#!/bin/sh\nexit 0\n")
         candidate_binary.chmod(0o755)
-        rollback_binary = self.root / "rollback"
+        rollback_binary = transaction / "rollback"
         rollback_binary.write_text("old")
-        candidate_plist = self.root / "candidate.plist"
-        rollback_plist = self.root / "rollback.plist"
+        candidate_plist = transaction / "candidate.plist"
+        rollback_plist = transaction / "rollback.plist"
         plist = plistlib.dumps(
-            {"EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)}}
+            {
+                "Label": "test.phoenix",
+                "ProgramArguments": [str(candidate_binary)],
+                "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
+            }
         )
         candidate_plist.write_bytes(plist)
         rollback_plist.write_bytes(plist)
@@ -266,6 +270,37 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         return dataclasses.replace(base, source_commit=helper.PREPARED_SOURCE114_COMMIT,
                                    expected=helper.Identity("2.0.0", helper.PREPARED_SOURCE114_COMMIT),
                                    current_schema_upgrade=qualified)
+
+    def test_exact_prepared114_read_only_handoff_uses_real_mode_without_sqlite(self) -> None:
+        manifest = self.prepared114_manifest(self.database(through=114))
+        before = {
+            path.relative_to(self.root): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        }
+        with mock.patch.object(
+            helper,
+            "__file__",
+            manifest.current_schema_upgrade.controller_helper_path,
+        ), mock.patch.object(
+            helper,
+            "_readonly_connection",
+            side_effect=AssertionError("SQLite opened by read-only handoff"),
+        ):
+            validated = helper.validate_pre_disruption_handoff(manifest)
+
+        self.assertEqual(validated.candidate_binary, Path(manifest.candidate_binary))
+        self.assertEqual(validated.candidate_plist, Path(manifest.candidate_plist))
+        self.assertEqual(
+            before,
+            {
+                path.relative_to(self.root): path.read_bytes()
+                for path in self.root.rglob("*")
+                if path.is_file()
+            },
+        )
+        self.assertFalse(Path(manifest.status_path).exists())
+        self.assertFalse(Path(manifest.active_path).exists())
 
     def test_exact_prepared114_and_target_admission_requires_structural_evidence(self) -> None:
         for through in range(113, 129):

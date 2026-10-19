@@ -554,6 +554,13 @@ external entity TargetService {
 --   PairedFinalizationFailed and retain pending.
 -- DurablePreparingStatusWritten(transaction)
 --   Matching preparation identity/PID is durable before ownership publication.
+-- PreDisruptionHandoffValidated(transaction)
+--   The retained helper completed its typed read-only admission without mutation.
+-- pre_disruption_handoff_is_valid(transaction) -> Boolean
+--   Immutable identities/mode/helper label, staged candidate and rollback bytes,
+--   prepared-source114 timeout/plist bindings and registry pass without creating a
+--   transaction directory or opening SQLite. Database eligibility remains the next
+--   distinct activation admission before install preparation.
 
 -- paired_precommit_autoload_safe(transaction) -> Boolean
 --   While preparing, only captured predecessor may be auto-loaded. After helper
@@ -622,6 +629,20 @@ rule HandoffActivation {
     @guidance
         -- Bootstrap the distinct one-shot helper and report handoff before the
         -- target LaunchAgent is stopped. The initiating process may then end.
+}
+
+rule ValidatePreDisruptionHandoff {
+    when: PreDisruptionHandoffValidated(transaction)
+    requires: transaction.state = prepared
+    requires: pre_disruption_handoff_is_valid(transaction)
+    ensures: ProductionArtifactsUnchanged(transaction)
+    ensures: TargetServiceUnchanged(transaction)
+
+    @guidance
+        -- Use the typed result from the same read-only helper contract that mutating
+        -- activation consumes before preparing any filesystem mutation. Do not create
+        -- a diagnostic-only admission policy or invoke status, claim, launchd,
+        -- migration, publication or cleanup effects from this validation surface.
 }
 
 rule ObservePreparedPreflight {

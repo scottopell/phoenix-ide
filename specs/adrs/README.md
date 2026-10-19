@@ -144,6 +144,8 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [131](131_single-conversation-name-and-allocated-slug.md) | One conversation name with an allocated route projection | Accepted | REQ-CID-001–006, REQ-CHN-007, REQ-COMP-001/002 |
 | [132](132_retire-duplicate-naming-mutations.md) | Retire duplicate naming mutations after caller migration | Accepted | REQ-CID-001/005, REQ-CHN-007, REQ-COMP-001/002 |
 | [128](128_repair-failure-stopped-truth-includes-persistence.md) | Repair failure stopped truth includes persistent auto-start absence | Accepted | REQ-LDD-025 |
+| [129](129_qualify-exact-prepared-linux-systemd-candidate.md) | Qualify exact prepared Linux systemd candidate | Accepted | REQ-COMP-016, REQ-PD-002/003/012/021/024/025/029 |
+| [130](130_commission-exact-237100-linux-artifact-preparation.md) | Commission the exact 237100 Linux artifact operation | Accepted | REQ-DESKTOP-REL-013; REQ-DESKTOP-REL-012 and REQ-COMP-015 boundaries unchanged |
 | [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
 | [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |
 | [125](125_qualify-exact-prepared-source114-candidate.md) | Qualify one exact prepared source114 candidate | Accepted | REQ-COMP-012, REQ-PD-021, REQ-LDD-019–024 |
@@ -209,9 +211,11 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Repairing protected packaging for the exact ARM forward-replacement candidate | 127; fixed candidate, separate controller, no generic selection or compatibility expansion |
+| Specifying the exact commissioned 237100 Linux artifact operation | 130; fixed candidate/target, closed two-file evidence, no generic Linux or deployment authority |
 | Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
 | Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
+| Qualifying the exact prepared237100 Linux systemd prefix65-to-target128 activation | 129, then 116/117, 034 and 017; keep published protocol 2 and prepared protocol 3 as distinct exact source authorities |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -247,6 +251,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-116 (Protect exact 65-to-128 systemd published-release activation; independent exact-release exception)
       │   │   └── ADR-117 (Recover interrupted pre-marker systemd activation; retained predecessor only, no launchd impact)
+      │   │       └── ADR-129 (Qualify exact prepared237100 Linux candidate; retain protected lifecycle and published route)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
       │   ├── ADR-102 (Current-schema prepared activation commits at the database-write boundary)
       │   │   └── ADR-103 (Ordinary forward candidate launch is the downgrade boundary)
