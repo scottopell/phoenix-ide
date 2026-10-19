@@ -181,7 +181,7 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
                 )
                 .map_err(|error| invalid(&error.to_string()))?,
                 outcome: TerminalFactOutcome::try_from(row.try_get::<&str, _>("outcome")?)
-                    .map_err(|error| invalid(&error.to_string()))?,
+                    .map_err(invalid)?,
                 occurred_at_us: row.try_get("occurred_at_us")?,
             },
         }
@@ -199,7 +199,7 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
                     state: match outcome {
                         Some(outcome) => SubscriptionCurrentState::Terminal {
                             outcome: TerminalFactOutcome::try_from(outcome.as_str())
-                                .map_err(|error| invalid(&error.to_string()))?,
+                                .map_err(invalid)?,
                         },
                         None => SubscriptionCurrentState::Nonterminal,
                     },

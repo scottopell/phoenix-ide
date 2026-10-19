@@ -18,7 +18,7 @@ fn invalid(message: &str) -> DbError {
     DbError::Serialization(message.to_owned())
 }
 fn cursor(value: i64) -> DbResult<SubscriptionCursor> {
-    SubscriptionCursor::try_from(value).map_err(|error| invalid(&error.to_string()))
+    SubscriptionCursor::try_from(value).map_err(invalid)
 }
 fn uuid(value: &str) -> DbResult<Uuid> {
     Uuid::parse_str(value).map_err(|error| invalid(&error.to_string()))
@@ -159,7 +159,7 @@ async fn snapshot_tx(
                     .as_deref()
                     .map(TerminalFactOutcome::try_from)
                     .transpose()
-                    .map_err(|error| invalid(&error.to_string()))?,
+                    .map_err(invalid)?,
             )
         },
     })
@@ -212,6 +212,9 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error for a changed binding, invalid cursor, inactive enrollment, or failed transaction.
+    ///
+    /// # Panics
+    /// Panics if `REPLAY_BATCH` cannot be represented by a SQLite integer.
     pub async fn replay_federation_subscription(
         &self,
         enrollment_id: Uuid,
@@ -264,7 +267,7 @@ impl Database {
                         )
                         .map_err(|error| invalid(&error.to_string()))?,
                         outcome: TerminalFactOutcome::try_from(row.try_get::<&str, _>("outcome")?)
-                            .map_err(|error| invalid(&error.to_string()))?,
+                            .map_err(invalid)?,
                         occurred_at_us: row.try_get("occurred_at_us")?,
                     })
                 })
@@ -349,8 +352,7 @@ fn decode_remote(row: &sqlx::sqlite::SqliteRow) -> DbResult<RemoteSubscription> 
             .map_err(|error| invalid(&error.to_string()))?,
         },
         subscription_id: uuid(row.try_get("subscription_id")?)?,
-        state: SubscriptionState::try_from(row.try_get::<&str, _>("state")?)
-            .map_err(|error| invalid(&error.to_string()))?,
+        state: SubscriptionState::try_from(row.try_get::<&str, _>("state")?).map_err(invalid)?,
         admitted_cursor: cursor(row.try_get("admitted_cursor")?)?,
         enrolled: row.try_get("enrolled")?,
         pending_unsubscribe: row.try_get("pending_unsubscribe")?,
