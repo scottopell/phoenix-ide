@@ -3764,7 +3764,7 @@ where
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
-        self.apply_transition_result_with_input(result, None).await
+        Box::pin(self.apply_transition_result_with_input(result, None)).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3794,7 +3794,7 @@ where
                 tokio::select! {
                     biased;
                     () = &mut cutoff => None,
-                    applied = self.apply_transition_result_inner(settlement, ordinary_input_id) => Some(applied?),
+                    applied = Box::pin(self.apply_transition_result_inner(settlement, ordinary_input_id)) => Some(applied?),
                 }
             };
             let Some(mut generated) = generated.take() else {
@@ -3817,8 +3817,7 @@ where
             }
             return Ok(generated);
         }
-        self.apply_transition_result_inner(result, ordinary_input_id)
-            .await
+        Box::pin(self.apply_transition_result_inner(result, ordinary_input_id)).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -18980,6 +18979,7 @@ mod explore_prompt_cache_shape_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn skill_catalog_survives_tool_loop_and_refreshes_on_new_input() {
         let temp = TempDir::new().unwrap();
         let write = |name: &str, description: &str| {
@@ -19052,7 +19052,22 @@ mod explore_prompt_cache_shape_tests {
             user_agent: None,
             skill_invocation: None,
         };
-        runtime.process_event(user("first")).await.unwrap();
+        assert!(
+            std::mem::size_of_val(&runtime.apply_transition_result(
+                crate::state_machine::transition::TransitionResult::new(ConvState::Idle),
+            )) < 8_192,
+            "transition wrapper must not embed the settlement future inline",
+        );
+        assert!(
+            std::mem::size_of_val(&runtime.apply_transition_result_with_input(
+                crate::state_machine::transition::TransitionResult::new(ConvState::Idle),
+                Some("size-check"),
+            )) < 8_192,
+            "input transition wrapper must not embed the settlement future inline",
+        );
+        Box::pin(runtime.process_event(user("first")))
+            .await
+            .unwrap();
         let (_, outcome) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
@@ -19064,7 +19079,7 @@ mod explore_prompt_cache_shape_tests {
         write("added", "added description");
         std::fs::remove_dir_all(temp.path().join(".claude/skills/removed")).unwrap();
         // Rejected busy input must not refresh the active turn.
-        assert!(runtime.process_event(user("busy")).await.is_err());
+        assert!(Box::pin(runtime.process_event(user("busy"))).await.is_err());
         let entries = vec![crate::state_machine::event::SteerEntry {
             text: "mid-turn steering".into(),
             origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
@@ -19076,12 +19091,10 @@ mod explore_prompt_cache_shape_tests {
             skill_invocation: None,
         }];
         storage.set_steering_queue("catalog-turn", entries.clone());
-        runtime
-            .process_event(Event::SteerDrainedUserMessages { entries })
+        Box::pin(runtime.process_event(Event::SteerDrainedUserMessages { entries }))
             .await
             .unwrap();
-        runtime
-            .process_outcome(EffectOutcome::Llm(outcome))
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
             .await
             .unwrap();
         let (_, outcome) = tokio::time::timeout(
@@ -19091,8 +19104,7 @@ mod explore_prompt_cache_shape_tests {
         .await
         .unwrap()
         .unwrap();
-        runtime
-            .process_outcome(EffectOutcome::Tool(outcome))
+        Box::pin(runtime.process_outcome(EffectOutcome::Tool(outcome)))
             .await
             .unwrap();
         let (_, outcome) = tokio::time::timeout(
@@ -19102,8 +19114,7 @@ mod explore_prompt_cache_shape_tests {
         .await
         .unwrap()
         .unwrap();
-        runtime
-            .process_outcome(EffectOutcome::Llm(outcome))
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
             .await
             .unwrap();
         let first = llm.recorded_requests();
@@ -19119,7 +19130,9 @@ mod explore_prompt_cache_shape_tests {
         assert!(matches!(runtime.state, ConvState::Idle));
         let retained_catalog = format!("{:?}", runtime.ordinary_skill_catalog);
         storage.set_fail_state_update(true);
-        assert!(runtime.process_event(user("failed-state")).await.is_err());
+        assert!(Box::pin(runtime.process_event(user("failed-state")))
+            .await
+            .is_err());
         storage.set_fail_state_update(false);
         assert!(matches!(runtime.state, ConvState::Idle));
         assert_eq!(
@@ -19128,7 +19141,9 @@ mod explore_prompt_cache_shape_tests {
             "a failed state commit must retain the prior advertised catalog"
         );
         assert_eq!(llm.recorded_requests().len(), 2);
-        runtime.process_event(user("second")).await.unwrap();
+        Box::pin(runtime.process_event(user("second")))
+            .await
+            .unwrap();
         let (_, outcome) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
@@ -19141,8 +19156,7 @@ mod explore_prompt_cache_shape_tests {
         assert!(refreshed[2].system[0].text.contains("turn-test-added"));
         assert!(!refreshed[2].system[0].text.contains("turn-test-removed"));
         assert_ne!(first[0].system[0].text, refreshed[2].system[0].text);
-        runtime
-            .process_outcome(EffectOutcome::Llm(outcome))
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
             .await
             .unwrap();
         write("edited", "queued description");
@@ -19157,8 +19171,7 @@ mod explore_prompt_cache_shape_tests {
             skill_invocation: None,
         }];
         storage.set_steering_queue("catalog-turn", entries.clone());
-        runtime
-            .process_event(Event::SteerDrainedUserMessages { entries })
+        Box::pin(runtime.process_event(Event::SteerDrainedUserMessages { entries }))
             .await
             .unwrap();
         let (_, outcome) = tokio::time::timeout(
@@ -19171,8 +19184,7 @@ mod explore_prompt_cache_shape_tests {
         assert!(llm.recorded_requests()[3].system[0]
             .text
             .contains("queued description"));
-        runtime
-            .process_outcome(EffectOutcome::Llm(outcome))
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
             .await
             .unwrap();
     }
