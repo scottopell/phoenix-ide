@@ -18,7 +18,7 @@ fn invalid(message: &str) -> DbError {
     DbError::Serialization(message.to_owned())
 }
 fn cursor(value: i64) -> DbResult<SubscriptionCursor> {
-    SubscriptionCursor::try_from(value).map_err(|error| invalid(&error.to_string()))
+    SubscriptionCursor::try_from(value).map_err(invalid)
 }
 fn uuid(value: &str) -> DbResult<Uuid> {
     Uuid::parse_str(value).map_err(|error| invalid(&error.to_string()))
@@ -162,7 +162,7 @@ async fn snapshot_tx(
                     .as_deref()
                     .map(TerminalFactOutcome::try_from)
                     .transpose()
-                    .map_err(|error| invalid(&error.to_string()))?,
+                    .map_err(invalid)?,
             )
         },
     })

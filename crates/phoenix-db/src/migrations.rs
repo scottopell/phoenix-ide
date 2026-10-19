@@ -20377,6 +20377,15 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(row.get::<i64, _>("chain_messages_at_answer"), 17);
     }
 
+    async fn archived_conversation(pool: &SqlitePool, id: &str) -> bool {
+        sqlx::query("SELECT archived FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .get::<bool, _>("archived")
+    }
+
     /// Migration 006: a chain with mixed `archived` state has every member
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
@@ -20473,30 +20482,18 @@ with tempfile.TemporaryDirectory() as directory:
         // the now-wired chain (the migration table thinks 006 is done).
         sqlx::raw_sql(MIGRATION_006).execute(&pool).await.unwrap();
 
-        let archived_for = |id: &'static str| {
-            let pool = pool.clone();
-            async move {
-                sqlx::query("SELECT archived FROM conversations WHERE id = ?1")
-                    .bind(id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap()
-                    .get::<bool, _>("archived")
-            }
-        };
-
         // Chain A: every member ends archived.
-        assert!(archived_for("a-root").await);
-        assert!(archived_for("a-mid").await);
-        assert!(archived_for("a-leaf").await);
+        assert!(archived_conversation(&pool, "a-root").await);
+        assert!(archived_conversation(&pool, "a-mid").await);
+        assert!(archived_conversation(&pool, "a-leaf").await);
         // Chain B: untouched (already fully archived).
-        assert!(archived_for("b-root").await);
-        assert!(archived_for("b-leaf").await);
+        assert!(archived_conversation(&pool, "b-root").await);
+        assert!(archived_conversation(&pool, "b-leaf").await);
         // Chain C: untouched (none archived).
-        assert!(!archived_for("c-root").await);
-        assert!(!archived_for("c-leaf").await);
+        assert!(!archived_conversation(&pool, "c-root").await);
+        assert!(!archived_conversation(&pool, "c-leaf").await);
         // Standalone: untouched.
-        assert!(archived_for("solo-s").await);
+        assert!(archived_conversation(&pool, "solo-s").await);
     }
 
     /// Migration 007: top-level Explore conversations get `worktree_path`
