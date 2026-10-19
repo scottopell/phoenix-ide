@@ -156,7 +156,7 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [121](121_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
 | [122](122_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
 | [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
-| [129](129_federated-subscriptions-carry-bounded-terminal-facts.md) | Federated subscriptions carry bounded durable terminal facts | Accepted | REQ-FED-015; extends ADR-070 across authenticated peers |
+| [133](133_federated-subscriptions-carry-bounded-terminal-facts.md) | Federated subscriptions carry bounded durable terminal facts | Accepted | REQ-FED-015; extends ADR-070 across authenticated peers |
 
 ## For agents: which decisions bind your task
 
