@@ -325,7 +325,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             enabled=True,
             exact_release_tag="v2.0.0",
             expected_full_commit="a" * 40,
-            transaction_id="tx-123",
+            transaction_id="1" * 32,
         )
         with mock.patch.object(
             self.dev.subprocess,
@@ -342,7 +342,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             enabled=True,
             exact_release_tag="v2.0.0",
             expected_full_commit="a" * 40,
-            transaction_id="tx-123",
+            transaction_id="1" * 32,
         )
         with mock.patch.object(self.dev, "check_systemd_available", return_value=True), \
              mock.patch.object(self.dev, "_require_noninteractive_sudo_ready"), \
