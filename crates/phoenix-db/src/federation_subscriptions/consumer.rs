@@ -1,9 +1,9 @@
 use super::{
-    cursor, invalid, uuid, Database, DbResult, FederatedTerminalFact, ProductConversationId,
-    RemoteSubscription, Row, Serialize, Sqlite, SubscriptionCurrentState, SubscriptionCursor,
-    SubscriptionDelivery, SubscriptionEnd, SubscriptionGap, SubscriptionReference,
-    SubscriptionReplay, SubscriptionSnapshot, TerminalFactOutcome, Transaction,
-    TranscriptConversationId, Uuid, REPLAY_BATCH,
+    cursor, invalid, uuid, Database, DbResult, FederatedTerminalFact, InstanceId,
+    ProductConversationId, RemoteSubscription, Row, Serialize, Sqlite, SubscriptionCurrentState,
+    SubscriptionCursor, SubscriptionDelivery, SubscriptionEnd, SubscriptionGap,
+    SubscriptionReference, SubscriptionReplay, SubscriptionSnapshot, TerminalFactOutcome,
+    Transaction, TranscriptConversationId, Uuid, REPLAY_BATCH,
 };
 
 pub type RemoteNotificationContent = SubscriptionDelivery;
@@ -229,7 +229,7 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
         reference: SubscriptionReference {
             instance_id: row
                 .try_get::<String, _>("destination_instance_id")?
-                .parse()
+                .parse::<InstanceId>()
                 .map_err(|error| invalid(&error.to_string()))?,
             product_conversation_id: ProductConversationId::parse(
                 row.try_get::<String, _>("product_id")?,

@@ -18,9 +18,7 @@ fn invalid(message: &str) -> DbError {
     DbError::Serialization(message.to_owned())
 }
 fn cursor(value: i64) -> DbResult<SubscriptionCursor> {
-    value
-        .try_into()
-        .map_err(|error| invalid(&error.to_string()))
+    SubscriptionCursor::try_from(value).map_err(|error| invalid(&error.to_string()))
 }
 fn uuid(value: &str) -> DbResult<Uuid> {
     Uuid::parse_str(value).map_err(|error| invalid(&error.to_string()))
@@ -343,7 +341,7 @@ fn decode_remote(row: &sqlx::sqlite::SqliteRow) -> DbResult<RemoteSubscription> 
         reference: SubscriptionReference {
             instance_id: row
                 .try_get::<String, _>("destination_instance_id")?
-                .parse()
+                .parse::<InstanceId>()
                 .map_err(|error| invalid(&error.to_string()))?,
             product_conversation_id: ProductConversationId::parse(
                 row.try_get::<String, _>("product_id")?,
