@@ -116,7 +116,7 @@ impl Database {
         Ok(())
     }
 
-    /// Confirm a source receipt after its source-generated navigation is durable.
+    /// Persist a source authorization receipt and its navigation atomically.
     ///
     /// # Errors
     /// Returns an error for a mismatched receipt, missing locator, or failed write.
@@ -125,14 +125,26 @@ impl Database {
         remote: &RemoteSubscription,
         admission_id: &str,
         authorization_id: Uuid,
+        stable_path: &str,
+        source_path: &str,
     ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::save_remote_notification_navigation_tx(
+            &mut tx,
+            remote,
+            admission_id,
+            stable_path,
+            source_path,
+        )
+        .await?;
         let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_id = ?4 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND authorization_requested = 1 AND suppressed = 0 AND (authorization_id IS NULL OR authorization_id = ?4)")
-            .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(authorization_id.to_string()).execute(&self.pool).await?.rows_affected();
+            .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(authorization_id.to_string()).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(invalid(
                 "authorization receipt does not match staged delivery",
             ));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -170,6 +182,10 @@ impl Database {
             return Err(invalid("remote subscription unavailable"));
         }
         sqlx::query("INSERT INTO federation_pending_unsubscribes(destination_instance_id,subscription_id) VALUES (?1,?2) ON CONFLICT DO NOTHING")
+            .bind(reference.instance_id.to_string()).bind(subscription.to_string()).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM federation_remote_navigation WHERE admission_id IN (SELECT admission_id FROM federation_remote_admissions WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND accepted_transcript_id IS NULL)")
+            .bind(reference.instance_id.to_string()).bind(subscription.to_string()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE federation_remote_admissions SET suppressed = 1, authorization_requested = 0, authorization_id = NULL WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND accepted_transcript_id IS NULL")
             .bind(reference.instance_id.to_string()).bind(subscription.to_string()).execute(&mut *tx).await?;
         sqlx::query("UPDATE federation_remote_subscriptions SET state = 'unsubscribed' WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND state = 'active'")
             .bind(reference.instance_id.to_string()).bind(subscription.to_string()).execute(&mut *tx).await?;

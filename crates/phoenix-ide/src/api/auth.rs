@@ -507,16 +507,7 @@ pub async fn peer_auth_middleware(
         .map(|token| FederationCredentialVerifier::from_bearer(token.as_bytes()));
     let enrollment = match authenticated {
         Some(verifier) => {
-            let enrollment = if req.method() == axum::http::Method::POST
-                && req.uri().path() == "/api/federation/peer/subscriptions/authorize"
-            {
-                state
-                    .db
-                    .authenticate_federation_delivery_verifier(&verifier)
-                    .await
-            } else {
-                state.db.authenticate_federation_verifier(&verifier).await
-            };
+            let enrollment = state.db.authenticate_federation_verifier(&verifier).await;
             match enrollment {
                 Ok(enrollment) => enrollment,
                 Err(error) => {

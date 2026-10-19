@@ -802,6 +802,17 @@ pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
 }
 
 pub(super) fn canonical_product_route_shape(href: &str) -> bool {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    fn unreserved(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+    }
+
     let Some(component) = href.strip_prefix(PRODUCT_CONVERSATION_ROUTE_PREFIX) else {
         return false;
     };
@@ -809,21 +820,28 @@ pub(super) fn canonical_product_route_shape(href: &str) -> bool {
         return false;
     }
     let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        match bytes[index] {
-            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') => {
-                index += 1;
-            }
-            b'%' if bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
-                && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) =>
-            {
-                index += 3;
-            }
-            _ => return false,
+        if unreserved(bytes[index]) {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
         }
+        let Some(high) = bytes.get(index + 1).and_then(|byte| hex(*byte)) else {
+            return false;
+        };
+        let Some(low) = bytes.get(index + 2).and_then(|byte| hex(*byte)) else {
+            return false;
+        };
+        let byte = (high << 4) | low;
+        if bytes[index] != b'%' || unreserved(byte) {
+            return false;
+        }
+        decoded.push(byte);
+        index += 3;
     }
-    true
+    std::str::from_utf8(&decoded).is_ok()
 }
 
 pub(super) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
@@ -1673,6 +1691,12 @@ mod tests {
             "/c/one#message-evidence",
             "/c/bad%2",
             "/c/bad%xx",
+            "/c/%61",
+            "/c/%2f",
+            "/c/%7E",
+            "/c/%FF",
+            "/c/%C0%AF",
+            "/c/%E2%82",
             "//other.invalid/c/one",
             "https://other.invalid/c/one",
         ] {

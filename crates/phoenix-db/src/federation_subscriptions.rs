@@ -419,6 +419,31 @@ impl Database {
         sqlx::query("UPDATE federation_remote_subscriptions SET state = ?4 WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND product_id = ?3 AND state = 'active'").bind(reference.instance_id.to_string()).bind(subscription.to_string()).bind(reference.product_conversation_id.as_str()).bind(state).execute(&self.pool).await?;
         Ok(())
     }
+
+    /// Settle a source revocation and discard work that can no longer be authorized.
+    ///
+    /// # Errors
+    /// Returns an error if the transaction fails.
+    pub async fn settle_remote_subscription_revocation(
+        &self,
+        reference: &SubscriptionReference,
+        subscription: Uuid,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let matched = sqlx::query("UPDATE federation_remote_subscriptions SET state = 'revoked' WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND product_id = ?3")
+            .bind(reference.instance_id.to_string()).bind(subscription.to_string()).bind(reference.product_conversation_id.as_str()).execute(&mut *tx).await?.rows_affected();
+        if matched != 1 {
+            return Err(invalid("remote subscription binding unavailable"));
+        }
+        sqlx::query("DELETE FROM federation_remote_navigation WHERE admission_id IN (SELECT admission_id FROM federation_remote_admissions WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND accepted_transcript_id IS NULL)")
+            .bind(reference.instance_id.to_string()).bind(subscription.to_string()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE federation_remote_admissions SET suppressed = 1, authorization_requested = 0, authorization_id = NULL WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND accepted_transcript_id IS NULL")
+            .bind(reference.instance_id.to_string()).bind(subscription.to_string()).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM federation_pending_unsubscribes WHERE destination_instance_id = ?1 AND subscription_id = ?2")
+            .bind(reference.instance_id.to_string()).bind(subscription.to_string()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 mod authorization;

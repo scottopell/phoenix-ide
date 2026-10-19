@@ -207,20 +207,6 @@ impl Database {
         row.as_ref().map(decode_enrollment).transpose()
     }
 
-    /// Resolve an exact verifier, including a revoked enrollment, for receipt recovery only.
-    /// New authorization eligibility is checked by `authorize_federation_delivery`.
-    ///
-    /// # Errors
-    /// Returns an error if the lookup fails or the persisted enrollment cannot be decoded.
-    pub async fn authenticate_federation_delivery_verifier(
-        &self,
-        credential_verifier: &FederationCredentialVerifier,
-    ) -> DbResult<Option<FederationEnrollment>> {
-        let row = sqlx::query("SELECT id, caller_instance_id, caller_display_name, revoked_at_us FROM federation_enrollments WHERE credential_verifier = ?1")
-            .bind(credential_verifier.to_string()).fetch_optional(&self.pool).await?;
-        row.as_ref().map(decode_enrollment).transpose()
-    }
-
     /// Return the active enrollment for a caller instance, if one exists.
     ///
     /// # Errors

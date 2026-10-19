@@ -523,20 +523,20 @@ fn single_fact() -> SubscriptionReplay {
         }],
     }
 }
-async fn fixture_navigation(db: &Database, remote: &RemoteSubscription, id: &str) {
+async fn fixture_navigation(
+    db: &Database,
+    remote: &RemoteSubscription,
+    id: &str,
+) -> (String, String) {
     let transcript: String = sqlx::query_scalar("SELECT COALESCE(f.source_transcript_id,g.source_transcript_id) FROM federation_remote_admissions a LEFT JOIN federation_received_facts f USING(admission_id) LEFT JOIN federation_received_gaps g USING(admission_id) WHERE a.admission_id = ?1")
         .bind(id).fetch_one(db.pool()).await.unwrap();
     let product =
         presentation::encoded_component(remote.reference.product_conversation_id.as_str());
     let transcript = presentation::encoded_component(&transcript);
-    db.save_remote_notification_navigation(
-        remote,
-        id,
-        &format!("/c/{product}"),
-        &format!("/c/{transcript}?source_transcript={transcript}"),
+    (
+        format!("/c/{product}"),
+        format!("/c/{transcript}?source_transcript={transcript}"),
     )
-    .await
-    .unwrap();
 }
 
 async fn fixture_authorize(db: &Database, remote: &RemoteSubscription, id: &str) {
@@ -553,8 +553,8 @@ async fn fixture_authorize(db: &Database, remote: &RemoteSubscription, id: &str)
     db.request_remote_notification_authorization(remote, id)
         .await
         .unwrap();
-    fixture_navigation(db, remote, id).await;
-    db.confirm_remote_authorization(remote, id, Uuid::new_v4())
+    let (stable, source) = fixture_navigation(db, remote, id).await;
+    db.confirm_remote_authorization(remote, id, Uuid::new_v4(), &stable, &source)
         .await
         .unwrap();
 }
@@ -1373,10 +1373,16 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
             let SubscriptionAuthorization::Authorized { authorization_id } = receipt else {
                 panic!("authorization required")
             };
-            fixture_navigation(&a, &remote, &note.admission_id).await;
-            a.confirm_remote_authorization(&remote, &note.admission_id, authorization_id)
-                .await
-                .unwrap();
+            let (stable, source) = fixture_navigation(&a, &remote, &note.admission_id).await;
+            a.confirm_remote_authorization(
+                &remote,
+                &note.admission_id,
+                authorization_id,
+                &stable,
+                &source,
+            )
+            .await
+            .unwrap();
             steer(&a, &target, &note.admission_id).await.unwrap();
         }
         // The second response is lost: only the source has its committed authorization.
@@ -1407,10 +1413,16 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
     else {
         panic!("committed obligation must survive Close")
     };
-    fixture_navigation(&a, &remote, &pending[1].admission_id).await;
-    a.confirm_remote_authorization(&remote, &pending[1].admission_id, authorization_id)
-        .await
-        .unwrap();
+    let (stable, source) = fixture_navigation(&a, &remote, &pending[1].admission_id).await;
+    a.confirm_remote_authorization(
+        &remote,
+        &pending[1].admission_id,
+        authorization_id,
+        &stable,
+        &source,
+    )
+    .await
+    .unwrap();
     steer(&a, &target, &pending[1].admission_id).await.unwrap();
     assert_eq!(
         authorize_source(&f, &pending[2].content).await,
@@ -1617,7 +1629,7 @@ async fn authorization_refresh_replaces_an_expired_attempt_without_ending_or_adv
 }
 
 #[tokio::test]
-async fn received_navigation_is_canonical_durable_and_batched_before_authorization() {
+async fn interrupted_authorization_rolls_back_navigation_and_retries_after_slug_rename() {
     let db = Database::open(":memory:").await.unwrap();
     let remote = remote_fixture(&db).await;
     db.stage_remote_replay(&remote, &single_fact())
@@ -1631,8 +1643,94 @@ async fn received_navigation_is_canonical_durable_and_batched_before_authorizati
     db.request_remote_notification_authorization(&remote, &note.admission_id)
         .await
         .unwrap();
+    let (_, source) = fixture_navigation(&db, &remote, &note.admission_id).await;
+    let authorization = Uuid::new_v4();
+    sqlx::query("CREATE TRIGGER interrupt_confirmation BEFORE UPDATE OF authorization_id ON federation_remote_admissions BEGIN SELECT RAISE(ABORT, 'interrupted'); END")
+        .execute(db.pool()).await.unwrap();
     assert!(db
-        .confirm_remote_authorization(&remote, &note.admission_id, Uuid::new_v4())
+        .confirm_remote_authorization(
+            &remote,
+            &note.admission_id,
+            authorization,
+            "/c/old-slug",
+            &source
+        )
+        .await
+        .is_err());
+    let persisted: (Option<String>, Option<String>) = sqlx::query_as("SELECT a.authorization_id, n.stable_path FROM federation_remote_admissions a LEFT JOIN federation_remote_navigation n USING(admission_id) WHERE admission_id = ?1")
+        .bind(&note.admission_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(persisted, (None, None));
+    sqlx::query("DROP TRIGGER interrupt_confirmation")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.confirm_remote_authorization(
+        &remote,
+        &note.admission_id,
+        authorization,
+        "/c/renamed-slug",
+        &source,
+    )
+    .await
+    .unwrap();
+    // A repeated source receipt may carry a newly canonical slug, not a new evidence identity.
+    db.confirm_remote_authorization(
+        &remote,
+        &note.admission_id,
+        authorization,
+        "/c/renamed-again",
+        &source,
+    )
+    .await
+    .unwrap();
+    let persisted: (String, String, String) = sqlx::query_as("SELECT a.authorization_id, n.stable_path, n.source_path FROM federation_remote_admissions a JOIN federation_remote_navigation n USING(admission_id) WHERE admission_id = ?1")
+        .bind(&note.admission_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        persisted,
+        (
+            authorization.to_string(),
+            "/c/renamed-again".into(),
+            source.clone()
+        )
+    );
+    assert!(db
+        .confirm_remote_authorization(
+            &remote,
+            &note.admission_id,
+            Uuid::new_v4(),
+            "/c/not-committed",
+            &source
+        )
+        .await
+        .is_err());
+    let stable: String = sqlx::query_scalar(
+        "SELECT stable_path FROM federation_remote_navigation WHERE admission_id = ?1",
+    )
+    .bind(&note.admission_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stable, "/c/renamed-again");
+}
+
+#[tokio::test]
+async fn received_navigation_is_canonical_durable_and_batched_with_authorization() {
+    let db = Database::open(":memory:").await.unwrap();
+    let remote = remote_fixture(&db).await;
+    db.stage_remote_replay(&remote, &single_fact())
+        .await
+        .unwrap();
+    let note = db
+        .pending_remote_notifications(&remote)
+        .await
+        .unwrap()
+        .remove(0);
+    db.request_remote_notification_authorization(&remote, &note.admission_id)
+        .await
+        .unwrap();
+    let (stable, source) = fixture_navigation(&db, &remote, &note.admission_id).await;
+    assert!(db
+        .confirm_remote_authorization(&remote, &note.admission_id, Uuid::new_v4(), "", &source)
         .await
         .is_err());
     for path in [
@@ -1642,19 +1740,25 @@ async fn received_navigation_is_canonical_durable_and_batched_before_authorizati
         "/c/p#secret",
     ] {
         assert!(db
-            .save_remote_notification_navigation(
+            .confirm_remote_authorization(
                 &remote,
                 &note.admission_id,
+                Uuid::new_v4(),
                 path,
-                "/c/t?source_transcript=t"
+                &source,
             )
             .await
             .is_err());
     }
-    fixture_navigation(&db, &remote, &note.admission_id).await;
-    db.confirm_remote_authorization(&remote, &note.admission_id, Uuid::new_v4())
-        .await
-        .unwrap();
+    db.confirm_remote_authorization(
+        &remote,
+        &note.admission_id,
+        Uuid::new_v4(),
+        &stable,
+        &source,
+    )
+    .await
+    .unwrap();
     let mut ids = vec![note.admission_id.clone(); 401];
     ids.push("federation:missing".into());
     let presentations = db.remote_notification_presentations(&ids).await.unwrap();
@@ -1747,7 +1851,7 @@ async fn failure_gap_snapshots_follow_real_projection_not_terminal_kind_whitelis
 }
 
 #[tokio::test]
-async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply() {
+async fn local_unsubscribe_fences_inflight_confirmation_after_stop_barrier() {
     let f = Fixture::new().await;
     f.emit("in-flight", TerminalFactOutcome::Completed, NOW)
         .await;
@@ -1764,30 +1868,52 @@ async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply(
         .await
         .unwrap();
     let authorized = authorize_source(&f, &note.content).await;
-    db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
-        .await
-        .unwrap();
-    f.db.unsubscribe_federation_subscription(
-        f.enrollment,
-        f.caller,
-        f.subscription,
-        &f.source.product_conversation_id,
-    )
-    .await
-    .unwrap();
-    assert_eq!(authorize_source(&f, &note.content).await, authorized);
-    assert!(matches!(
-        db.pending_remote_notifications(&remote).await.unwrap()[0].disposition,
-        RemoteNotificationDisposition::Authorizing
-    ));
     let SubscriptionAuthorization::Authorized { authorization_id } = authorized else {
         panic!("source authorized")
     };
-    fixture_navigation(&db, &remote, &note.admission_id).await;
-    db.confirm_remote_authorization(&remote, &note.admission_id, authorization_id)
+    let (stable, source) = fixture_navigation(&db, &remote, &note.admission_id).await;
+    let stopped = tokio::sync::Barrier::new(2);
+    let stop = async {
+        db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+            .await
+            .unwrap();
+        stopped.wait().await;
+    };
+    let confirm = async {
+        stopped.wait().await;
+        assert!(db
+            .confirm_remote_authorization(
+                &remote,
+                &note.admission_id,
+                authorization_id,
+                &stable,
+                &source
+            )
+            .await
+            .is_err());
+        assert!(steer(&db, &target, &note.admission_id).await.is_err());
+    };
+    tokio::join!(stop, confirm);
+    assert!(db
+        .pending_remote_notifications(&remote)
         .await
+        .unwrap()
+        .is_empty());
+    let current = db
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .unwrap()
         .unwrap();
-    steer(&db, &target, &note.admission_id).await.unwrap();
+    assert_eq!(current.admitted_cursor, SubscriptionCursor::START);
+    assert!(current.pending_unsubscribe);
+    assert!(db
+        .stage_remote_replay(&remote, &f.replay(0, NOW).await)
+        .await
+        .is_err());
+    assert!(db
+        .request_remote_notification_authorization(&remote, &note.admission_id)
+        .await
+        .is_err());
     db.complete_remote_unsubscribe(&remote.reference, remote.subscription_id)
         .await
         .unwrap();
@@ -1801,8 +1927,184 @@ async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply(
             .await
             .unwrap()[0]
             .disposition,
-        RemoteNotificationDisposition::Accepted { .. }
+        RemoteNotificationDisposition::Suppressed
     ));
+}
+
+#[tokio::test]
+async fn revocation_settlement_suppresses_authorizing_work_and_clears_unsubscribe_retry() {
+    let db = Database::open(":memory:").await.unwrap();
+    let remote = remote_fixture(&db).await;
+    let mut events = facts(single_fact());
+    let mut second = events[0].clone();
+    second.event_id = Uuid::new_v4();
+    second.sequence = cursor(2).unwrap();
+    second.source_transcript_id = TranscriptConversationId::parse("second-transcript").unwrap();
+    events.push(second);
+    db.stage_remote_replay(&remote, &SubscriptionReplay::Facts { events })
+        .await
+        .unwrap();
+    let notes = db.pending_remote_notifications(&remote).await.unwrap();
+    assert_eq!(notes.len(), 2);
+    for note in &notes {
+        db.request_remote_notification_authorization(&remote, &note.admission_id)
+            .await
+            .unwrap();
+    }
+
+    let wrong_reference = SubscriptionReference {
+        instance_id: remote.reference.instance_id,
+        product_conversation_id: ProductConversationId::parse("different-product").unwrap(),
+    };
+    assert!(db
+        .settle_remote_subscription_revocation(&wrong_reference, remote.subscription_id)
+        .await
+        .is_err());
+    assert_eq!(
+        db.remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SubscriptionState::Active
+    );
+    assert!(db
+        .pending_remote_notifications(&remote)
+        .await
+        .unwrap()
+        .iter()
+        .all(|note| matches!(note.disposition, RemoteNotificationDisposition::Authorizing)));
+
+    db.settle_remote_subscription_revocation(&remote.reference, remote.subscription_id)
+        .await
+        .unwrap();
+    let revoked = db
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revoked.state, SubscriptionState::Revoked);
+    assert!(!revoked.pending_unsubscribe);
+    assert!(db
+        .remote_notification_history(&revoked, SubscriptionCursor::START)
+        .await
+        .unwrap()
+        .iter()
+        .all(|note| matches!(note.disposition, RemoteNotificationDisposition::Suppressed)));
+    assert!(db
+        .next_remote_subscription_sync_batch(4)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let pending = remote_fixture(&db).await;
+    db.begin_remote_unsubscribe(&pending.reference, pending.subscription_id)
+        .await
+        .unwrap();
+    db.complete_remote_unsubscribe(&pending.reference, pending.subscription_id)
+        .await
+        .unwrap();
+    let unsubscribed = db
+        .remote_subscription_by_id(pending.reference.instance_id, pending.subscription_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unsubscribed.state, SubscriptionState::Unsubscribed);
+    assert!(!unsubscribed.pending_unsubscribe);
+    assert!(db
+        .next_remote_subscription_sync_batch(4)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn local_unsubscribe_serializes_with_accepted_admission_in_both_barrier_orders() {
+    for accepted_first in [false, true] {
+        let f = Fixture::new().await;
+        f.emit("accept-stop-race", TerminalFactOutcome::Completed, NOW)
+            .await;
+        let (db, remote, target) = consumer_for_source(&f).await;
+        db.stage_remote_replay(&remote, &f.replay(0, NOW).await)
+            .await
+            .unwrap();
+        let note = db
+            .pending_remote_notifications(&remote)
+            .await
+            .unwrap()
+            .remove(0);
+        db.request_remote_notification_authorization(&remote, &note.admission_id)
+            .await
+            .unwrap();
+        let SubscriptionAuthorization::Authorized { authorization_id } =
+            authorize_source(&f, &note.content).await
+        else {
+            panic!("source authorized")
+        };
+        let (stable, source) = fixture_navigation(&db, &remote, &note.admission_id).await;
+        db.confirm_remote_authorization(
+            &remote,
+            &note.admission_id,
+            authorization_id,
+            &stable,
+            &source,
+        )
+        .await
+        .unwrap();
+        let first_done = tokio::sync::Barrier::new(2);
+        let admit = async {
+            if !accepted_first {
+                first_done.wait().await;
+            }
+            let result = steer(&db, &target, &note.admission_id).await;
+            assert_eq!(result.is_ok(), accepted_first);
+            if accepted_first {
+                first_done.wait().await;
+            }
+        };
+        let stop = async {
+            if accepted_first {
+                first_done.wait().await;
+            }
+            db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+                .await
+                .unwrap();
+            if !accepted_first {
+                first_done.wait().await;
+            }
+        };
+        tokio::join!(admit, stop);
+        assert!(db
+            .pending_remote_notifications(&remote)
+            .await
+            .unwrap()
+            .is_empty());
+        let history = db
+            .remote_notification_history(&remote, SubscriptionCursor::START)
+            .await
+            .unwrap();
+        assert_eq!(
+            matches!(
+                history[0].disposition,
+                RemoteNotificationDisposition::Accepted { .. }
+            ),
+            accepted_first
+        );
+        assert_eq!(
+            matches!(
+                history[0].disposition,
+                RemoteNotificationDisposition::Suppressed
+            ),
+            !accepted_first
+        );
+        let current = db
+            .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.admitted_cursor.get(), i64::from(accepted_first));
+        assert!(current.pending_unsubscribe);
+    }
 }
 
 #[tokio::test]
@@ -1862,10 +2164,16 @@ async fn drain_1025_with_gap_and_authorization_keeps_other_subscription_independ
             else {
                 panic!("active source authorizes retained bytes")
             };
-            fixture_navigation(&a, &remote, &note.admission_id).await;
-            a.confirm_remote_authorization(&remote, &note.admission_id, authorization_id)
-                .await
-                .unwrap();
+            let (stable, source) = fixture_navigation(&a, &remote, &note.admission_id).await;
+            a.confirm_remote_authorization(
+                &remote,
+                &note.admission_id,
+                authorization_id,
+                &stable,
+                &source,
+            )
+            .await
+            .unwrap();
             steer(&a, &target, &note.admission_id).await.unwrap();
             admitted_rows += 1;
         }

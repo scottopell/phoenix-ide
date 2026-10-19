@@ -123,41 +123,48 @@ async fn apply(
             )
             .await
             .map(|replay| SubscriptionResult::Replay { replay }),
-        SubscriptionOperation::Authorize { ref delivery } if operation == "authorize" => state
-            .db
-            .authorize_federation_delivery(
-                peer.enrollment_id,
-                peer.caller_instance_id,
-                request.subscription_id,
-                &request.reference.product_conversation_id,
-                delivery,
-            )
-            .await
-            .map(|authorization| {
-                let navigation = matches!(
-                    authorization,
-                    SubscriptionAuthorization::Authorized { .. }
-                )
-                .then(|| {
-                    let transcript = match delivery {
-                        SubscriptionDelivery::Fact { fact } => &fact.source_transcript_id,
-                        SubscriptionDelivery::Gap { gap } => &gap.snapshot.transcript_id,
+        SubscriptionOperation::Authorize { ref delivery } if operation == "authorize" => {
+            async {
+                let authorization = state
+                    .db
+                    .authorize_federation_delivery(
+                        peer.enrollment_id,
+                        peer.caller_instance_id,
+                        request.subscription_id,
+                        &request.reference.product_conversation_id,
+                        delivery,
+                    )
+                    .await?;
+                let navigation =
+                    if matches!(authorization, SubscriptionAuthorization::Authorized { .. }) {
+                        let transcript = match delivery {
+                            SubscriptionDelivery::Fact { fact } => &fact.source_transcript_id,
+                            SubscriptionDelivery::Gap { gap } => &gap.snapshot.transcript_id,
+                        };
+                        let aggregate = state
+                            .db
+                            .get_ordinary_product_conversation(
+                                &request.reference.product_conversation_id,
+                            )
+                            .await?;
+                        Some(SubscriptionNavigation {
+                            stable_path: crate::api::product_conversations::canonical_route(
+                                &aggregate,
+                            ),
+                            source_path: crate::api::product_conversations::exact_transcript_route(
+                                transcript,
+                            ),
+                        })
+                    } else {
+                        None
                     };
-                    SubscriptionNavigation {
-                        stable_path: crate::api::product_conversations::product_route(
-                            None,
-                            request.reference.product_conversation_id.as_str(),
-                        ),
-                        source_path: crate::api::product_conversations::exact_transcript_route(
-                            transcript,
-                        ),
-                    }
-                });
-                SubscriptionResult::Authorization {
+                Ok(SubscriptionResult::Authorization {
                     authorization,
                     navigation,
-                }
-            }),
+                })
+            }
+            .await
+        }
         SubscriptionOperation::Unsubscribe if operation == "unsubscribe" => state
             .db
             .unsubscribe_federation_subscription(
@@ -248,13 +255,10 @@ fn validate_response(
                         SubscriptionDelivery::Fact { fact } => &fact.source_transcript_id,
                         SubscriptionDelivery::Gap { gap } => &gap.snapshot.transcript_id,
                     };
-                    if navigation.stable_path
-                        != crate::api::product_conversations::product_route(
-                            None,
-                            request.reference.product_conversation_id.as_str(),
-                        )
-                        || navigation.source_path
-                            != crate::api::product_conversations::exact_transcript_route(transcript)
+                    if !crate::api::product_conversations::canonical_product_route_shape(
+                        &navigation.stable_path,
+                    ) || navigation.source_path
+                        != crate::api::product_conversations::exact_transcript_route(transcript)
                     {
                         return Err(mismatch());
                     }
@@ -374,6 +378,23 @@ pub(crate) struct RemoteUnsubscribeReceipt {
     pub remote_confirmed: bool,
 }
 
+async fn request_active_peer_subscription(
+    db: &Database,
+    peer: &FederationPeerConnection,
+    request: &SubscriptionRequest,
+) -> Result<SubscriptionResponse, String> {
+    let response = request_peer(peer, request).await;
+    if matches!(
+        response,
+        Err(FederationClientError::SubscriptionAuthenticationRejected)
+    ) {
+        db.settle_remote_subscription_revocation(&request.reference, request.subscription_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    response.map_err(|error| error.to_string())
+}
+
 pub(crate) async fn create_saved_peer_subscription(
     db: &Database,
     instance: String,
@@ -421,9 +442,7 @@ pub(crate) async fn create_saved_peer_subscription(
         subscription_id: id,
         operation: SubscriptionOperation::Create,
     };
-    let response = request_peer(&peer, &request)
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = request_active_peer_subscription(db, &peer, &request).await?;
     let SubscriptionResult::Created { snapshot } = response.result else {
         return Err("enrollment snapshot required".into());
     };
@@ -490,6 +509,12 @@ async fn unsubscribe_remote(
                 .map_err(|error| error.to_string())?;
             true
         }
+        Err(FederationClientError::SubscriptionAuthenticationRejected) => {
+            db.complete_remote_unsubscribe(&remote.reference, remote.subscription_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            false
+        }
         Err(error) => {
             tracing::debug!(%error, "remote unsubscribe unconfirmed; durable retry retained and local delivery stopped");
             false
@@ -515,23 +540,33 @@ pub(crate) async fn sync_once(
         .federation_peer_connection(remote.reference.instance_id)
         .await
         .map_err(|error| error.to_string())?;
-    drain_notifications(db, runtime, remote, peer.as_ref()).await?;
     let remote = db
         .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote subscription unavailable".to_string())?;
-    let peer = peer.ok_or_else(|| "saved peer unavailable; no local fallback".to_string())?;
     if remote.pending_unsubscribe {
+        let peer = peer.ok_or_else(|| "saved peer unavailable; no local fallback".to_string())?;
         unsubscribe_remote(db, &peer, &remote).await?;
         return Ok(());
     }
     if remote.state != SubscriptionState::Active {
         return Ok(());
     }
+    drain_notifications(db, runtime, &remote, peer.as_ref()).await?;
+    let remote = db
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "remote subscription unavailable".to_string())?;
+    if remote.pending_unsubscribe || remote.state != SubscriptionState::Active {
+        return Ok(());
+    }
+    let peer = peer.ok_or_else(|| "saved peer unavailable; no local fallback".to_string())?;
     let caller = db.instance_id().await.map_err(|error| error.to_string())?;
     if !remote.enrolled {
-        request_peer(
+        request_active_peer_subscription(
+            db,
             &peer,
             &SubscriptionRequest {
                 caller_instance_id: caller,
@@ -540,13 +575,13 @@ pub(crate) async fn sync_once(
                 operation: SubscriptionOperation::Create,
             },
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
         db.mark_remote_subscription_enrolled(&remote.reference, remote.subscription_id)
             .await
             .map_err(|error| error.to_string())?;
     }
-    let response = request_peer(
+    let response = request_active_peer_subscription(
+        db,
         &peer,
         &SubscriptionRequest {
             caller_instance_id: caller,
@@ -557,8 +592,7 @@ pub(crate) async fn sync_once(
             },
         },
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     let SubscriptionResult::Replay { replay } = response.result else {
         return Err("replay response required".into());
     };
@@ -633,17 +667,13 @@ async fn drain_notifications(
                     ..
                 }) => (authorization, navigation),
                 Err(FederationClientError::SubscriptionAuthenticationRejected) => {
-                    db.suppress_remote_notification(remote, &notification.admission_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    db.end_remote_subscription(
+                    db.settle_remote_subscription_revocation(
                         &remote.reference,
                         remote.subscription_id,
-                        SubscriptionEnd::Revoked,
                     )
                     .await
                     .map_err(|error| error.to_string())?;
-                    continue;
+                    return Ok(());
                 }
                 Err(error) => return Err(error.to_string()),
                 _ => return Err("authorization receipt required".into()),
@@ -652,18 +682,12 @@ async fn drain_notifications(
                 SubscriptionAuthorization::Authorized { authorization_id } => {
                     let navigation = navigation
                         .ok_or_else(|| "authorized source navigation required".to_string())?;
-                    db.save_remote_notification_navigation(
-                        remote,
-                        &notification.admission_id,
-                        &navigation.stable_path,
-                        &navigation.source_path,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
                     db.confirm_remote_authorization(
                         remote,
                         &notification.admission_id,
                         authorization_id,
+                        &navigation.stable_path,
+                        &navigation.source_path,
                     )
                     .await
                     .map_err(|error| error.to_string())?;

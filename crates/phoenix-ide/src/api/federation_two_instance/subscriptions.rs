@@ -1254,8 +1254,22 @@ async fn source_and_coordinator_continuation_preserve_exact_fact_and_follow_curr
     else {
         panic!("destination-qualified paths required")
     };
-    let origin = b.origin.to_string();
-    assert!(stable_url.starts_with(origin.as_str()));
+    let aggregate = b
+        .state
+        .db
+        .get_ordinary_product_conversation(&source.product_conversation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stable_url,
+        b.origin
+            .navigation_url(&crate::api::product_conversations::canonical_route(
+                &aggregate,
+            ))
+            .unwrap()
+            .as_url()
+            .to_string()
+    );
     assert_eq!(
         source_url,
         b.origin
@@ -1350,6 +1364,269 @@ async fn subscription_peer_bearer_cannot_use_owner_routes_and_owner_password_can
             .status(),
         reqwest::StatusCode::OK
     );
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn source_revocation_without_pending_notifications_ends_create_or_replay_locally() {
+    for enrolled in [false, true] {
+        let a = TestInstance::start().await;
+        let b = TestInstance::start().await;
+        let peer = a.connect_to(&b).await;
+        let source = source(&b).await;
+        let reference = SubscriptionReference {
+            instance_id: peer.peer_instance_id,
+            product_conversation_id: source.product_conversation_id.clone(),
+        };
+        let id = Uuid::new_v4();
+        a.state
+            .db
+            .save_remote_subscription(&reference, id)
+            .await
+            .unwrap();
+        if enrolled {
+            let remote = create_saved_peer_subscription(
+                &a.state.db,
+                peer.peer_instance_id.to_string(),
+                source.product_conversation_id.clone(),
+                Some(id),
+            )
+            .await
+            .unwrap()
+            .subscription;
+            commit_terminal(&b, &source, TerminalFactOutcome::Completed).await;
+            sync_once(&a.state.db, &a.state.runtime, &remote)
+                .await
+                .unwrap();
+        }
+        let remote = a
+            .state
+            .db
+            .remote_subscription_by_id(peer.peer_instance_id, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.enrolled, enrolled);
+        assert_eq!(remote.admitted_cursor.get(), i64::from(enrolled));
+        assert!(a
+            .state
+            .db
+            .pending_remote_notifications(&remote)
+            .await
+            .unwrap()
+            .is_empty());
+        let history = a
+            .state
+            .db
+            .remote_notification_history(&remote, SubscriptionCursor::START)
+            .await
+            .unwrap();
+        if enrolled {
+            assert!(matches!(
+                history[0].disposition,
+                phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Accepted { .. }
+            ));
+        }
+        let history = serde_json::to_value(history).unwrap();
+        b.state
+            .db
+            .revoke_federation_enrollment(a.state.db.instance_id().await.unwrap())
+            .await
+            .unwrap();
+        let source_query = "SELECT state,last_sequence,acknowledged_through,pruned_through,(SELECT COUNT(*) FROM federation_terminal_payloads),(SELECT COUNT(*) FROM federation_delivery_authorizations) FROM federation_subscriptions ORDER BY id";
+        let before: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(source_query)
+            .fetch_all(b.state.db.pool())
+            .await
+            .unwrap();
+        assert!(sync_once(&a.state.db, &a.state.runtime, &remote)
+            .await
+            .is_err());
+        let ended = refreshed(&a, &remote).await;
+        assert_eq!(ended.state, SubscriptionState::Revoked);
+        assert_eq!(ended.admitted_cursor, remote.admitted_cursor);
+        assert_eq!(ended.enrolled, enrolled);
+        assert!(!ended.pending_unsubscribe);
+        assert_eq!(
+            serde_json::to_value(
+                a.state
+                    .db
+                    .remote_notification_history(&ended, SubscriptionCursor::START)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            history
+        );
+        let after: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(source_query)
+            .fetch_all(b.state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        a.stop().await;
+        b.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn revocation_during_saved_peer_create_ends_the_persisted_retry_identity() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let b = TestInstance::start_with_router(false, {
+        let entered = entered.clone();
+        let release = release.clone();
+        move |state| {
+            create_router(state).layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        if request.uri().path() == "/api/federation/peer/subscriptions/create" {
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        next.run(request).await
+                    }
+                },
+            ))
+        }
+    })
+    .await;
+    let a = TestInstance::start().await;
+    let peer = a.connect_to(&b).await;
+    let source = source(&b).await;
+    let id = Uuid::new_v4();
+    let create = tokio::spawn({
+        let db = a.state.db.clone();
+        let product = source.product_conversation_id.clone();
+        async move {
+            create_saved_peer_subscription(
+                &db,
+                peer.peer_instance_id.to_string(),
+                product,
+                Some(id),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    let remote = a
+        .state
+        .db
+        .remote_subscription_by_id(peer.peer_instance_id, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remote.state, SubscriptionState::Active);
+    assert!(!remote.enrolled);
+    b.state
+        .db
+        .revoke_federation_enrollment(a.state.db.instance_id().await.unwrap())
+        .await
+        .unwrap();
+    release.notify_one();
+    assert!(create.await.unwrap().is_err());
+    let ended = refreshed(&a, &remote).await;
+    assert_eq!(ended.state, SubscriptionState::Revoked);
+    assert_eq!(ended.admitted_cursor, SubscriptionCursor::START);
+    assert!(!ended.enrolled && !ended.pending_unsubscribe);
+    assert!(a
+        .state
+        .db
+        .remote_notification_history(&ended, SubscriptionCursor::START)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM federation_subscriptions")
+            .fetch_one(b.state.db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn revoked_bearer_cannot_recover_an_already_authorized_delivery_receipt_over_https() {
+    let a = TestInstance::start().await;
+    let b = TestInstance::start().await;
+    let peer = a.connect_to(&b).await;
+    let source = source(&b).await;
+    let remote = create_saved_peer_subscription(
+        &a.state.db,
+        peer.peer_instance_id.to_string(),
+        source.product_conversation_id.clone(),
+        None,
+    )
+    .await
+    .unwrap()
+    .subscription;
+    commit_terminal(&b, &source, TerminalFactOutcome::Completed).await;
+    let pending = stage_one(&a, &b, &peer, &remote).await;
+    let request = SubscriptionRequest {
+        caller_instance_id: a.state.db.instance_id().await.unwrap(),
+        reference: remote.reference.clone(),
+        subscription_id: remote.subscription_id,
+        operation: SubscriptionOperation::Authorize {
+            delivery: pending.content,
+        },
+    };
+    let authorized = request_peer(&peer, &request).await.unwrap();
+    assert!(matches!(
+        authorized.result,
+        SubscriptionResult::Authorization {
+            authorization: SubscriptionAuthorization::Authorized { .. },
+            ..
+        }
+    ));
+    b.state
+        .db
+        .revoke_federation_enrollment(request.caller_instance_id)
+        .await
+        .unwrap();
+    let response = b
+        .client
+        .post(b.endpoint("/api/federation/peer/subscriptions/authorize"))
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(matches!(
+        request_peer(&peer, &request).await,
+        Err(crate::api::federation::FederationClientError::SubscriptionAuthenticationRejected)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM federation_delivery_authorizations")
+            .fetch_one(b.state.db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        refreshed(&a, &remote).await.admitted_cursor,
+        SubscriptionCursor::START
+    );
+    let receipt = unsubscribe_remote(&a.state.db, &peer, &remote)
+        .await
+        .unwrap();
+    assert!(receipt.local_stopped);
+    assert!(!receipt.remote_confirmed);
+    let unsubscribed = refreshed(&a, &remote).await;
+    assert_eq!(unsubscribed.state, SubscriptionState::Unsubscribed);
+    assert!(!unsubscribed.pending_unsubscribe);
+    assert!(a
+        .state
+        .db
+        .next_remote_subscription_sync_batch(4)
+        .await
+        .unwrap()
+        .is_empty());
     a.stop().await;
     b.stop().await;
 }
