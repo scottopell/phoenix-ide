@@ -104,27 +104,29 @@ jobs:
           git config --global user.name "Phoenix CI"
       - name: Install musl compiler
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: ./dev.py check (rust,cargo-fmt)
-        id: rust_check
-        run: |
-          mkdir -p ci-rust-logs
-          set -o pipefail
-          ./dev.py check --lanes rust,cargo-fmt 2>&1 | tee ci-rust-logs/check.log
-      - name: Focused goal failure evidence
-        if: ${{ failure() && steps.rust_check.outcome == 'failure' }}
+      - name: Focused goal qualification
+        id: goal_check
         timeout-minutes: 8
         env:
           CARGO_BUILD_JOBS: "2"
           RUST_TEST_THREADS: "2"
         run: |
+          mkdir -p ci-rust-logs
           set -o pipefail
           timeout --signal=TERM --kill-after=10s 7m cargo nextest run --locked \
             -p phoenix-core -p phoenix-db -p phoenix_ide \
-            -E 'test(/conversation_goal|goal_capture|goal_service/)' \
+            -E 'test(/conversation_goal|goal_capture|goal_service|steering_accept/)' \
             --test-threads 2 --no-fail-fast --failure-output immediate-final \
             --status-level all --final-status-level all \
             2>&1 | tee ci-rust-logs/goals.log
-      - name: Retain Rust failure evidence
+      - name: ./dev.py check (rust,cargo-fmt)
+        if: ${{ !cancelled() }}
+        id: rust_check
+        run: |
+          mkdir -p ci-rust-logs
+          set -o pipefail
+          ./dev.py check --lanes rust,cargo-fmt 2>&1 | tee ci-rust-logs/check.log
+      - name: Retain Rust qualification evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
