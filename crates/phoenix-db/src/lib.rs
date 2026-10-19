@@ -29750,14 +29750,20 @@ mod tests {
             conversation_id: "origin-tr".to_string(),
             sequence_id: 10,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool-1",
+                    "propose_fork",
+                    serde_json::json!({}),
+                ),
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
         let tool_result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-1-result".to_string(),
+            message_id: "tool-result:6:asst-1:tool-1".to_string(),
             conversation_id: "origin-tr".to_string(),
             sequence_id: 11,
             message_type: MessageType::Tool,
@@ -29822,7 +29828,7 @@ mod tests {
         );
         let ack = msgs
             .iter()
-            .find(|m| m.message_id == "tool-1-result")
+            .find(|m| m.message_id == "tool-result:6:asst-1:tool-1")
             .expect("synthetic ack must be durable");
         assert_eq!(
             ack.display_data
@@ -30041,14 +30047,25 @@ mod tests {
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool-a",
+                    "bash",
+                    serde_json::json!({}),
+                ),
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool-b",
+                    "bash",
+                    serde_json::json!({}),
+                ),
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
         let result_a = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-a-result".to_string(),
+            message_id: "tool-result:7:asst-tr:tool-a".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 11,
             message_type: MessageType::Tool,
@@ -30059,7 +30076,7 @@ mod tests {
         };
         let result_b = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-b-result".to_string(),
+            message_id: "tool-result:7:asst-tr:tool-b".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 12,
             message_type: MessageType::Tool,
@@ -30080,11 +30097,11 @@ mod tests {
             "assistant message must be durable"
         );
         assert!(
-            ids.contains(&"tool-a-result"),
+            ids.contains(&"tool-result:7:asst-tr:tool-a"),
             "first tool result must be durable"
         );
         assert!(
-            ids.contains(&"tool-b-result"),
+            ids.contains(&"tool-result:7:asst-tr:tool-b"),
             "second tool result must be durable"
         );
     }
@@ -30184,7 +30201,11 @@ mod tests {
             sequence_id: 20,
             message_type: MessageType::Agent,
             content: MessageContent::agent(vec![
-                phoenix_core::domain::llm_types::ContentBlock::text("checkpoint"),
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool",
+                    "bash",
+                    serde_json::json!({}),
+                ),
             ]),
             display_data: None,
             usage_data: None,
@@ -30192,7 +30213,7 @@ mod tests {
         };
         let tool = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "checkpoint-tool".to_string(),
+            message_id: "tool-result:20:checkpoint-assistant:tool".to_string(),
             conversation_id: "conv-checkpoint-cuts".to_string(),
             sequence_id: 21,
             message_type: MessageType::Tool,
@@ -30461,14 +30482,20 @@ mod tests {
             conversation_id: conversation_id.to_string(),
             sequence_id: 20,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool-terminal",
+                    "bash",
+                    serde_json::json!({}),
+                ),
+            ]),
             display_data: None,
             usage_data: None,
             created_at,
         };
         let result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-terminal-exact".to_string(),
+            message_id: "tool-result:24:assistant-terminal-exact:tool-terminal".to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id: 21,
             message_type: MessageType::Tool,
@@ -30543,14 +30570,20 @@ mod tests {
             conversation_id: "conv-terminal-round".to_string(),
             sequence_id: 20,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool-terminal",
+                    "bash",
+                    serde_json::json!({}),
+                ),
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
         let result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-terminal-result".to_string(),
+            message_id: "tool-result:19:asst-terminal-round:tool-terminal".to_string(),
             conversation_id: "conv-terminal-round".to_string(),
             sequence_id: 21,
             message_type: MessageType::Tool,
@@ -30588,12 +30621,6 @@ mod tests {
 
     #[tokio::test]
     async fn persist_tool_round_rolls_back_assistant_when_a_result_insert_fails() {
-        // A `tool_use` with no paired `tool_result` 400s every later LLM
-        // request. `persist_tool_round` must commit the whole round or none of
-        // it. Here the second result names a non-existent conversation, so its
-        // INSERT trips the `messages.conversation_id` foreign key (FKs are on)
-        // and the transaction rolls back — the assistant message must NOT be
-        // left behind unpaired.
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-tr", "ctr", "/tmp", true, None, None)
             .await
@@ -30605,14 +30632,25 @@ mod tests {
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool-a",
+                    "bash",
+                    serde_json::json!({}),
+                ),
+                phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                    "tool-b",
+                    "bash",
+                    serde_json::json!({}),
+                ),
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
         let good_result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-a-result".to_string(),
+            message_id: "tool-result:7:asst-tr:tool-a".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 11,
             message_type: MessageType::Tool,
@@ -30621,11 +30659,10 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         };
-        let orphan_fk_result = Message {
+        let failed_result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-b-result".to_string(),
-            // No such conversation: FK violation on insert.
-            conversation_id: "conv-does-not-exist".to_string(),
+            message_id: "tool-result:7:asst-tr:tool-b".to_string(),
+            conversation_id: "conv-tr".to_string(),
             sequence_id: 12,
             message_type: MessageType::Tool,
             content: MessageContent::tool("tool-b", "output b", false),
@@ -30634,10 +30671,13 @@ mod tests {
             created_at: Utc::now(),
         };
 
+        sqlx::query("CREATE TRIGGER reject_second_round_result BEFORE INSERT ON messages WHEN NEW.message_id='tool-result:7:asst-tr:tool-b' BEGIN SELECT RAISE(ABORT,'second result write failed'); END")
+            .execute(db.pool()).await.unwrap();
         let err = db
-            .persist_tool_round("conv-tr", &assistant, &[good_result, orphan_fk_result])
-            .await;
-        assert!(err.is_err(), "FK violation must surface as an error");
+            .persist_tool_round("conv-tr", &assistant, &[good_result, failed_result])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("second result write failed"));
 
         // Nothing from the round committed: not the assistant, not the first
         // (otherwise-valid) result. All-or-nothing.

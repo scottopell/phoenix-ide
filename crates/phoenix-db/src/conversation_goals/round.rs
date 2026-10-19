@@ -42,15 +42,50 @@ pub(crate) async fn persist_finalized_round_tx(
     assistant: &Message,
     results: &[Message],
 ) -> DbResult<()> {
-    if let MessageContent::Agent(blocks) = &assistant.content {
-        for block in blocks {
-            if let ContentBlock::ToolUse { id, name, .. } = block {
-                if name == "goal_report" && results.iter().any(|result| matches!(
-                    &result.content, MessageContent::Tool(content) if &content.tool_use_id == id && !content.is_error
-                )) {
-                    return Err(DbError::Serialization("goal report success requires pending round finalization".into()));
-                }
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        return Err(DbError::Serialization(
+            "tool round requires a genuine assistant".into(),
+        ));
+    };
+    let mut calls = std::collections::HashMap::new();
+    for block in blocks {
+        if let ContentBlock::ToolUse { id, name, .. } = block {
+            if calls.insert(id.as_str(), name.as_str()).is_some() {
+                return Err(DbError::Serialization("tool round duplicate call".into()));
             }
+        }
+    }
+    if assistant.message_type != MessageType::Agent || calls.len() != results.len() {
+        return Err(DbError::Serialization(
+            "tool round call/result cardinality".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for result in results {
+        let MessageContent::Tool(content) = &result.content else {
+            return Err(DbError::Serialization(
+                "tool round requires tool results".into(),
+            ));
+        };
+        let Some(name) = calls.get(content.tool_use_id.as_str()) else {
+            return Err(DbError::Serialization(
+                "tool round result has no owning call".into(),
+            ));
+        };
+        if result.message_type != MessageType::Tool
+            || result.conversation_id != assistant.conversation_id
+            || result.message_id
+                != tool_result_message_id(&assistant.message_id, &content.tool_use_id)
+            || !seen.insert(content.tool_use_id.as_str())
+        {
+            return Err(DbError::Serialization(
+                "tool round result owning assistant differs".into(),
+            ));
+        }
+        if *name == "goal_report" && !content.is_error {
+            return Err(DbError::Serialization(
+                "goal report success requires pending round finalization".into(),
+            ));
         }
     }
     crate::insert_message_tx(tx, assistant).await?;

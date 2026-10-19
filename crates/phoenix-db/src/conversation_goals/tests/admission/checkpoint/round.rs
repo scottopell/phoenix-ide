@@ -220,3 +220,134 @@ async fn finalized_checkpoint_owners_cannot_commit_precomputed_report_success() 
         1
     );
 }
+
+#[tokio::test]
+async fn finalized_owners_reject_cross_assistant_goal_results_before_rows_or_state_are_written() {
+    use phoenix_core::domain::db_schema::ToolResult;
+    use phoenix_core::domain::llm_types::ContentBlock;
+    use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
+    for call_id in ["unrelated-call", "report-call"] {
+        let (db, command, _) = pending_fixture(GoalReportOutcome::Complete(t("finished"))).await;
+        let source = round_assistant(&db).await;
+        let result = crate::conversation_goals::round::result_message(
+            &source,
+            0,
+            &ToolResult::success("report-call".into(), "uncommitted goal success".into()),
+        )
+        .unwrap();
+        let mut unrelated = source.clone();
+        unrelated.message_id = "unrelated-assistant".into();
+        unrelated.sequence_id = 4;
+        unrelated.content = MessageContent::Agent(vec![ContentBlock::ToolUse {
+            id: call_id.into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command":"pwd"}),
+        }]);
+        let results = [result];
+        let state = ConvState::LlmRequesting { attempt: 2 };
+        assert!(db
+            .persist_tool_round("full-root", &unrelated, &results)
+            .await
+            .is_err());
+        assert!(db
+            .persist_tool_round_and_state("full-root", &unrelated, &results, &state, Utc::now(),)
+            .await
+            .is_err());
+        assert!(db
+            .persist_tool_round_state_and_replay(
+                "full-root",
+                &unrelated,
+                &results,
+                &state,
+                Utc::now(),
+                &ProviderReplayUpdate::Clear,
+            )
+            .await
+            .is_err());
+        let messages = db.get_messages("full-root").await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(!messages
+            .iter()
+            .any(|message| message.message_id == "unrelated-assistant"));
+        assert!(matches!(
+            db.get_conversation("full-root").await.unwrap().state,
+            ConvState::Idle
+        ));
+        assert_eq!(
+            db.conversation_goal(&command.owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .version
+                .get(),
+            1
+        );
+        assert_eq!(
+            db.conversation_goal_history(&command.owner, GoalVersion::INITIAL)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn finalized_owner_rejects_missing_extra_duplicate_and_cross_conversation_pairing() {
+    use phoenix_core::domain::db_schema::{MessageType, ToolResult};
+    for invalid in [
+        "missing",
+        "extra",
+        "duplicate_call",
+        "cross_conversation",
+        "wrong_type",
+    ] {
+        let (db, _, _) = pending_fixture(GoalReportOutcome::Complete(t("finished"))).await;
+        let mut assistant = round_assistant(&db).await;
+        let result = crate::conversation_goals::round::result_message(
+            &assistant,
+            0,
+            &ToolResult::error("report-call".into(), "unknown tool".into()),
+        )
+        .unwrap();
+        let mut results = vec![result];
+        match invalid {
+            "missing" => results.clear(),
+            "extra" => results.push(results[0].clone()),
+            "duplicate_call" => {
+                let MessageContent::Agent(blocks) = &mut assistant.content else {
+                    panic!("assistant");
+                };
+                blocks.push(blocks[0].clone());
+                results.push(results[0].clone());
+            }
+            "cross_conversation" => results[0].conversation_id = "different-transcript".into(),
+            "wrong_type" => results[0].message_type = MessageType::Agent,
+            _ => unreachable!(),
+        }
+        assert!(
+            db.persist_tool_round_and_state(
+                "full-root",
+                &assistant,
+                &results,
+                &ConvState::LlmRequesting { attempt: 2 },
+                Utc::now(),
+            )
+            .await
+            .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(
+            db.get_messages("full-root").await.unwrap().len(),
+            2,
+            "{invalid}"
+        );
+        assert!(
+            matches!(
+                db.get_conversation("full-root").await.unwrap().state,
+                ConvState::Idle
+            ),
+            "{invalid}"
+        );
+    }
+}
