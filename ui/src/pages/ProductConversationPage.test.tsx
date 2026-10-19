@@ -172,7 +172,7 @@ vi.mock('./ConversationPage', () => ({
   },
 }));
 
-vi.mock('./ChainPage', () => ({
+vi.mock('../components/ChainQaColumn', () => ({
   ChainQaColumn: (props: Record<string, unknown>) => {
     chainQaColumnSpy(props);
     const activeTextareaRef = props['activeTextareaRef'] as React.MutableRefObject<HTMLTextAreaElement | null>;

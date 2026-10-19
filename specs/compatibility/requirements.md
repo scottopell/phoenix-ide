@@ -43,6 +43,11 @@ THE SYSTEM SHALL NOT guarantee that an older Phoenix binary can open, read, or w
 THE SYSTEM SHALL NOT make a project-wide guarantee that migrations preserve all persisted data
 AND SHALL require each migration's owning feature requirements to define whether affected data is preserved, transformed, or retired
 
+The conversation-name transformation is owned by
+`specs/conversation-identity/requirements.md` REQ-CID-006. Permanent product,
+transcript, and message identities remain stable under REQ-CID-004; former
+readable slugs have no retention or redirect guarantee.
+
 **Rationale:** Forward migration supports normal upgrades without treating database damage as a supported sparse ledger. Data retention is a product decision owned by each feature. Requiring historical binaries to understand future schemas would create an unbounded cross-version protocol.
 
 ---

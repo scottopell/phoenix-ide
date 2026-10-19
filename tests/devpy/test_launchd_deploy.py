@@ -5477,7 +5477,13 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                     connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
                     connection.executemany(
                         "INSERT INTO _migrations VALUES (?, ?)",
-                        [entry for entry in helper.migration_registry(registry) if entry[0] <= 114],
+                        [
+                            entry
+                            for entry in helper.migration_registry(
+                                registry, qualified_current_target=False,
+                            )
+                            if entry[0] <= 114
+                        ],
                     )
                 before = database.read_bytes()
                 env = {"PATH": "/test", "PHOENIX_DB_PATH": str(database)}

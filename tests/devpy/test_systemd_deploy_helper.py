@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pwd
+import re
 import shutil
 import stat
 import subprocess
@@ -1378,7 +1379,22 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.manifest_path = self.manifest_path.resolve()
         # Unit subprocess oracles use inert artifacts, never the production executable.
         asset_pin = mock.patch.object(helper, "PROTECTED_ASSET_SHA256", self.raw["candidate"]["binary"]["sha256"])
-        registry_pin = mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", digest(ROOT / "crates/phoenix-db/src/migrations.rs"))
+        registry_source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
+        registry_match = re.search(r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)", registry_source, re.DOTALL)
+        self.assertIsNotNone(registry_match)
+        historical_entries, removed = re.subn(
+            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
+            "",
+            registry_match.group(2),
+            count=1,
+            flags=re.DOTALL,
+        )
+        self.assertEqual(1, removed, "synthetic qualified-128 fixture requires current migration 129")
+        historical_registry = self.transaction / "qualified-128-migrations.rs"
+        historical_registry.write_text(
+            registry_source[:registry_match.start(2)] + historical_entries + registry_source[registry_match.end(2):]
+        )
+        registry_pin = mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", digest(historical_registry))
         asset_pin.start()
         registry_pin.start()
         self.addCleanup(asset_pin.stop)
@@ -1390,7 +1406,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                         release_tag=helper.PROTECTED_RELEASE_TAG, release_commit=helper.PROTECTED_RELEASE_COMMIT,
                         controller_source_commit="c" * 40,
                         controller_helper=self.artifact("helper.py", (ROOT / "scripts/systemd_deploy_helper.py").read_text()),
-                        registry=self.artifact("migrations.rs", (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()),
+                        registry=self.artifact("migrations.rs", historical_registry.read_text()),
                         database_path=str(Path(self.targets.deployed_sha).parent / "prod.db"),
                         release_asset_name="phoenix_ide-x86_64-unknown-linux-musl",
                         release_asset_sha256=self.raw["candidate"]["binary"]["sha256"])
@@ -2280,6 +2296,17 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                     helper.activate(mutated, ctl)
                 self.assertNotIn("stop", ctl.events)
 
+    def test_actual_registry_with_migration129_is_rejected_by_protected_fixture(self):
+        manifest = self.protected()
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        mutated = dataclasses.replace(
+            manifest,
+            registry=helper.Artifact(str(actual_registry), digest(actual_registry)),
+        )
+        with mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", mutated.registry.sha256):
+            with self.assertRaisesRegex(helper.ActivationError, "exact qualified target128"):
+                helper.candidate_registry(mutated)
+
     def test_pre_marker_rollback_uses_stopped_snapshot_including_writes_during_stop(self):
         import sqlite3
         manifest = self.protected()
@@ -2596,7 +2623,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
             "path": str(retained_candidate),
             "sha256": digest(retained_candidate),
         }
-        pin = mock.patch.object(helper, "PREPARED_REGISTRY_SHA256", digest(ROOT / "crates/phoenix-db/src/migrations.rs"))
+        pin = mock.patch.object(helper, "PREPARED_REGISTRY_SHA256", self.raw["registry"]["sha256"])
         pin.start()
         self.addCleanup(pin.stop)
         receipt = self.artifact(helper.PREPARED_RECEIPT, json.dumps({

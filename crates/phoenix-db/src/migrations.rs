@@ -656,6 +656,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "product_creation_provisioning_stage",
         sql: MIGRATION_128,
     },
+    Migration {
+        version: 129,
+        name: "single_conversation_name_and_route_projection",
+        sql: "",
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -11461,6 +11466,9 @@ async fn apply_migration_body(
     tx: &mut Transaction<'_, Sqlite>,
     migration: &Migration,
 ) -> DbResult<()> {
+    if migration.version == 129 {
+        return crate::conversation_name::migrate_name_authority(tx).await;
+    }
     if migration.version == 120 {
         index_outbox_children_before_rebuild(tx).await?;
     }
@@ -14173,15 +14181,30 @@ mod tests {
         let script = r#"
 import importlib.util
 import sys
+import tempfile
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("migration_contract_helper", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
-module.validate_current_schema_database(
-    Path(sys.argv[2]), Path(sys.argv[3]), migrated=sys.argv[4] == "target"
-)
+source = Path(sys.argv[3])
+ledger = module.migration_registry(source, qualified_current_target=False)
+assert ledger[-1][0] > 128
+try:
+    module.migration_registry(source)
+except module.ActivationError as error:
+    assert "newer than the qualified target" in str(error)
+else:
+    raise AssertionError("incident controller accepted an unqualified newer registry")
+with tempfile.TemporaryDirectory() as directory:
+    registry = Path(directory) / "qualified-registry.rs"
+    entries = "".join(f'    Migration {{ version: {version}, name: "{name}", sql: "" }},\n'
+                      for version, name in ledger if version <= 128)
+    registry.write_text("const MIGRATIONS: &[Migration] = &[\n" + entries + "];\n")
+    module.validate_current_schema_database(
+        Path(sys.argv[2]), registry, migrated=sys.argv[4] == "target"
+    )
 "#;
         let output = std::process::Command::new("python3")
             .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -14257,14 +14280,29 @@ module.validate_current_schema_database(
         validate_current_schema_with_controller(&path, false);
 
         let db = crate::Database::open(path_text).await.unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 128)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
         let target_count = MIGRATIONS
             .iter()
-            .filter(|migration| migration.version > 123)
+            .filter(|migration| migration.version > 123 && migration.version <= 128)
             .count();
         assert_eq!(
             run_pending_migrations(db.pool()).await.unwrap() as usize,
             target_count
         );
+        sqlx::query("DELETE FROM _migrations WHERE version > 128")
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(db.pool())
             .await
@@ -14340,6 +14378,7 @@ module.validate_current_schema_database(
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (129, "single_conversation_name_and_route_projection"),
             (128, "product_creation_provisioning_stage"),
             (127, "coordinator_owned_work_scope_home"),
             (126, "retire_wake_feature_preserving_history"),
@@ -18540,8 +18579,8 @@ module.validate_current_schema_database(
             .map(|r| r.get::<String, _>("name"))
             .collect();
         assert!(
-            cols.iter().any(|c| c == "chain_name"),
-            "chain_name must be added by un-stamped migration 005, got: {cols:?}"
+            !cols.iter().any(|c| c == "chain_name"),
+            "migration 129 must retire chain_name after the sparse migrations, got: {cols:?}"
         );
         let chain_qa_exists: Option<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='chain_qa'",
@@ -19463,7 +19502,11 @@ module.validate_current_schema_database(
         .await
         .unwrap();
 
-        run_pending_migrations(&pool).await.unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 5)
+            .unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
             .fetch_all(&pool)
@@ -19486,6 +19529,15 @@ module.validate_current_schema_database(
             chain_name.is_none(),
             "Existing rows should backfill chain_name to NULL, got: {chain_name:?}"
         );
+
+        sqlx::raw_sql("CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now'))); INSERT INTO _migrations(version,name) VALUES (5,'add_chain_name_and_chain_qa');").execute(&pool).await.unwrap();
+        run_pending_migrations(&pool).await.unwrap();
+        let final_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('conversations')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(!final_columns.iter().any(|column| column == "chain_name"));
 
         // chain_qa table exists with the expected columns
         let qa_columns: Vec<String> = sqlx::query("PRAGMA table_info(chain_qa)")
@@ -19650,7 +19702,8 @@ module.validate_current_schema_database(
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
                     (126, 'temporarily_skip_wake_feature_retirement'),
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
-                    (128, 'temporarily_skip_product_creation_provisioning_stage')",
+                    (128, 'temporarily_skip_product_creation_provisioning_stage'),
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
         )
         .execute(&pool)
         .await
@@ -20516,7 +20569,8 @@ module.validate_current_schema_database(
                     (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
                     (126, 'temporarily_skip_wake_feature_retirement'),
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
-                    (128, 'temporarily_skip_product_creation_provisioning_stage')",
+                    (128, 'temporarily_skip_product_creation_provisioning_stage'),
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
         )
         .execute(pool)
         .await

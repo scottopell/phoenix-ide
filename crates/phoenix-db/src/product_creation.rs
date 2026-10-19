@@ -2195,7 +2195,7 @@ mod product_creation_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
         }
@@ -3255,6 +3255,160 @@ mod product_creation_tests {
             expired
         );
         assert_eq!(expired.claim_generation, claimed.claim.generation);
+    }
+
+    #[tokio::test]
+    async fn publication_allocates_duplicate_human_names_without_publishing_input_slugs() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (request, expected) in [("name-one", "über-東京"), ("name-two", "über-東京-2")] {
+            db.accept_product_creation(request, &intent("/tmp", "name projection"))
+                .await
+                .unwrap();
+            let claimed = db
+                .claim_product_creation(
+                    request,
+                    "worker",
+                    "token",
+                    Utc::now(),
+                    chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            advance_to_metadata(&db, request, &claimed.claim).await;
+            let mut conversation = published_conversation(
+                request,
+                claimed.job.product_conversation_id.clone(),
+                WorkScopeId::new(),
+                "/tmp",
+            );
+            conversation.title = Some("  Über 東京  ".to_string());
+            conversation.slug = Some("unrelated-input-slug".to_string());
+            let published = db
+                .publish_product_creation_atomically(&ProductCreationPublishInput {
+                    request_id: request.to_string(),
+                    claim: claimed.claim,
+                    conversation,
+                    authority_kind: AuthorityKind::Direct,
+                    environment: EnvironmentContext::UnownedCwd {
+                        cwd: "/tmp".to_string(),
+                    },
+                    git_publication: None,
+                })
+                .await
+                .unwrap();
+            assert!(published);
+            let stored = db.get_conversation(request).await.unwrap();
+            assert_eq!(stored.title.as_deref(), Some("Über 東京"));
+            assert_eq!(stored.slug.as_deref(), Some(expected));
+            assert_eq!(
+                stored.product_conversation_id,
+                claimed.job.product_conversation_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_product_identity_is_reserved_from_conversation_routes_until_publication() {
+        let db = Database::open_in_memory().await.unwrap();
+        let existing = db
+            .create_conversation("existing-route", "existing", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let accepted = db
+            .accept_product_creation("reserved-route", &intent("/tmp", "reserve route"))
+            .await
+            .unwrap();
+        let ProductCreationAcceptOutcome::Accepted(accepted) = accepted else {
+            panic!("new creation should be accepted");
+        };
+        let reserved_slug = accepted.product_conversation_id.to_string();
+
+        db.set_ordinary_product_conversation_title(&existing.id, &reserved_slug)
+            .await
+            .unwrap();
+        let renamed = db.get_conversation(&existing.id).await.unwrap();
+        let expected_existing_slug = format!("{reserved_slug}-2");
+        assert_eq!(renamed.title.as_deref(), Some(reserved_slug.as_str()));
+        assert_eq!(
+            renamed.slug.as_deref(),
+            Some(expected_existing_slug.as_str())
+        );
+
+        let claimed = db
+            .claim_product_creation(
+                "reserved-route",
+                "worker",
+                "token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        advance_to_metadata(&db, "reserved-route", &claimed.claim).await;
+        let scope = WorkScopeId::new();
+        let published = db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "reserved-route".to_string(),
+                claim: claimed.claim,
+                conversation: published_conversation(
+                    "reserved-conversation",
+                    accepted.product_conversation_id.clone(),
+                    scope.clone(),
+                    "/tmp",
+                ),
+                authority_kind: AuthorityKind::Direct,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: "/tmp".to_string(),
+                },
+                git_publication: None,
+            })
+            .await
+            .unwrap();
+        assert!(published);
+
+        let existing_after = db.get_conversation(&existing.id).await.unwrap();
+        assert_eq!(
+            existing_after.slug.as_deref(),
+            Some(expected_existing_slug.as_str())
+        );
+        assert_eq!(
+            db.resolve_ordinary_product_conversation(&expected_existing_slug)
+                .await
+                .unwrap()
+                .product_conversation_id,
+            existing.product_conversation_id
+        );
+        assert!(db
+            .resolve_ordinary_product_conversation(&reserved_slug)
+            .await
+            .is_err());
+        sqlx::query(
+            "UPDATE product_creation_jobs SET status = 'published',
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL,
+                 delivery_retry_at_unix_micros = NULL, provisioning_stage = 'finalize_publication'
+             WHERE request_id = 'reserved-route' AND status = 'delivery_pending'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.resolve_ordinary_product_conversation(&reserved_slug)
+                .await
+                .unwrap()
+                .product_conversation_id,
+            accepted.product_conversation_id
+        );
+        let owner: (String, String) = sqlx::query_as(
+            "SELECT product_conversation_id, work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
+        )
+        .bind(accepted.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(owner.0, accepted.product_conversation_id.to_string());
+        assert_eq!(owner.1, scope.to_string());
     }
 
     #[tokio::test]

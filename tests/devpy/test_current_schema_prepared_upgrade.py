@@ -47,7 +47,10 @@ sys.modules[spec.name] = helper
 spec.loader.exec_module(helper)
 
 
-def compiled_ledger(through: int | None = None) -> list[tuple[int, str]]:
+QUALIFIED_TARGET = 128
+
+
+def compiled_ledger(through: int | None = QUALIFIED_TARGET) -> list[tuple[int, str]]:
     source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
     registry = source.split("const MIGRATIONS: &[Migration] = &[", 1)[1].split("\n];", 1)[0]
     migrations = [
@@ -65,7 +68,40 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        self.current_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        source = self.current_registry.read_text()
+        registry_match = re.search(
+            r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(registry_match)
+        entries = registry_match.group(2)
+        historical_entries, removed = re.subn(
+            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
+            "",
+            entries,
+            count=1,
+            flags=re.DOTALL,
+        )
+        self.assertEqual(removed, 1, "historical registry fixture requires migration 129")
+        self.registry = self.root / "qualified-128-migrations.rs"
+        self.registry.write_text(
+            source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
+        )
+        # Synthetic unit fixture: this registry models the historical v128
+        # candidate independently of the exact source-114 release artifact.
+        self.prepared_registry_pin = helper.sha256(self.registry)
+        registry_pin = mock.patch.object(
+            helper, "PREPARED_SOURCE114_REGISTRY_SHA256", self.prepared_registry_pin,
+        )
+        registry_pin.start()
+        self.addCleanup(registry_pin.stop)
+        repair_pin = mock.patch.object(
+            helper, "CURRENT_REPAIR_REGISTRY_SHA256", self.prepared_registry_pin,
+        )
+        repair_pin.start()
+        self.addCleanup(repair_pin.stop)
         capacity = shutil.disk_usage(self.root)._replace(free=100 * 1024**3)
         disk_usage = mock.patch.object(helper.shutil, "disk_usage", return_value=capacity)
         disk_usage.start()
@@ -200,7 +236,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
 
     def test_source_qualified_prefixes_are_exact_and_distinct(self) -> None:
         for source_kind in ("prepared_artifact", "published_release"):
-            for through in range(113, 130):
+            for through in range(113, 129):
                 with self.subTest(source_kind=source_kind, through=through):
                     database = self.database(through=through)
                     admitted = (123, 128) if source_kind == "prepared_artifact" else (114,)
@@ -223,14 +259,13 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         base = self.manifest(database)
         current = base.current_schema_upgrade
         registry = Path(current.migration_registry_path)
-        registry.write_bytes(subprocess.check_output(
-            ["git", "show", f"{helper.PREPARED_SOURCE114_COMMIT}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
-        ))
-        self.assertEqual(helper.sha256(registry), helper.PREPARED_SOURCE114_REGISTRY_SHA256)
+        # Use the synthetic historical-v128 registry for this unit fixture;
+        # the real source-114 artifact is covered by separate integration tests.
+        registry.write_bytes(self.registry.read_bytes())
         qualified = helper.PreparedSource114Upgrade(
             **{**dataclasses.asdict(current), "migration_registry_sha256": helper.sha256(registry)},
             prepared_source_baseline=114,
-            candidate_registry_expected_sha256=helper.PREPARED_SOURCE114_REGISTRY_SHA256,
+            candidate_registry_expected_sha256=self.prepared_registry_pin,
         )
         return dataclasses.replace(base, source_commit=helper.PREPARED_SOURCE114_COMMIT,
                                    expected=helper.Identity("2.0.0", helper.PREPARED_SOURCE114_COMMIT),
@@ -268,12 +303,9 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.assertFalse(Path(manifest.active_path).exists())
 
     def test_exact_prepared114_and_target_admission_requires_structural_evidence(self) -> None:
-        for through in range(113, 130):
+        for through in range(113, 129):
             with self.subTest(through=through):
                 database = self.database(through=through)
-                if through == 129:
-                    with sqlite3.connect(database) as connection:
-                        connection.execute("INSERT INTO _migrations VALUES (129, 'future')")
                 manifest = self.prepared114_manifest(database)
                 registry = Path(manifest.current_schema_upgrade.migration_registry_path)
                 if through in (114, 128):
@@ -285,6 +317,14 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
                 if through == 114:
                     with self.assertRaisesRegex(helper.ActivationError, "qualified source"):
                         helper.validate_current_schema_database(database, registry)
+
+    def test_actual_current129_registry_is_rejected_as_prepared114(self) -> None:
+        database = self.database(through=129)
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        with self.assertRaises(helper.ActivationError):
+            helper.validate_current_schema_database(
+                database, actual_registry, source_kind="prepared_artifact",
+            )
 
     def test_prepared114_invalid_binding_rejects_before_stop(self) -> None:
         manifest = self.prepared114_manifest(self.database(through=114))
@@ -526,6 +566,15 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         ledger = helper.validate_current_schema_database(database, self.registry)
         self.assertEqual(ledger[-1], compiled_ledger(123)[-1])
         self.assertEqual(ledger, tuple(compiled_ledger(123)))
+
+    def test_actual_current_129_registry_is_rejected_by_qualified_helper(self) -> None:
+        database = self.database(through=129)
+        current_registry = self.current_registry
+
+        with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
+            helper.migration_registry(current_registry)
+        with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
+            helper.validate_current_schema_database(database, current_registry)
 
     def test_exact_candidate_target_is_also_an_admitted_prepared_source(self) -> None:
         database = self.database(through=128)
