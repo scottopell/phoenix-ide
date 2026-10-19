@@ -1,4 +1,4 @@
-# ADR-129: Ordinary skill catalog advertisement is executor-turn-local
+# ADR-142: Ordinary skill catalog advertisement is executor-turn-local
 
 - **Status:** Accepted
 - **Date:** 2026-10-18
