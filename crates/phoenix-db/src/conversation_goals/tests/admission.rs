@@ -354,6 +354,71 @@ async fn pending_opening_delivery_is_not_a_settled_creation() {
 }
 
 #[tokio::test]
+async fn completed_real_continuation_releases_reservation_and_admits_only_the_new_target() {
+    use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
+    let (db, command) = fixture().await;
+    db.add_message(
+        "settled-continuation-summary",
+        "full-root",
+        &MessageContent::continuation("settled handoff"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    db.update_conversation_state(
+        "full-root",
+        &ConvState::ContextExhausted {
+            summary: "settled handoff".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let crate::ContinueOutcome::Created(successor) =
+        db.continue_conversation("full-root").await.unwrap()
+    else {
+        panic!("expected a genuine newly settled continuation");
+    };
+    assert_eq!(successor.product_conversation_id, command.owner);
+    assert!(matches!(successor.state, ConvState::Idle));
+    let predecessor = db.get_conversation("full-root").await.unwrap();
+    assert_eq!(
+        predecessor.continued_in_conv_id.as_deref(),
+        Some(successor.id.as_str())
+    );
+    let reservations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM product_continuation_reservations WHERE product_conversation_id=?",
+    )
+    .bind(command.owner.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(reservations, 0);
+    assert!(matches!(
+        db.apply_conversation_goal(&command, "full-root", at())
+            .await,
+        Err(GoalDbError::TargetChanged)
+    ));
+    let applied = db
+        .apply_conversation_goal(&command, &successor.id, at())
+        .await
+        .unwrap();
+    assert_eq!(applied.snapshot.version.get(), 1);
+    let retried = db
+        .apply_conversation_goal(&command, &successor.id, at())
+        .await
+        .unwrap();
+    assert_eq!(retried.snapshot, applied.snapshot);
+    assert_eq!(
+        db.conversation_goal_history(&command.owner)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn transferred_latest_target_is_rechecked_and_unaccepted_opening_intent_blocks() {
     let (db, command) = fixture().await;
     db.update_conversation_state(
