@@ -29,18 +29,10 @@ impl ToolRoundResult {
     }
 
     #[must_use]
-    pub fn tool_name(&self) -> &str {
-        match self {
-            Self::Finalized(result) => &result.tool_name,
-            Self::PendingGoalReport { .. } => "goal_report",
-        }
-    }
-
-    #[must_use]
-    pub fn duration_ms(&self) -> u64 {
+    pub fn duration_ms(&self) -> Option<u64> {
         match self {
             Self::Finalized(result) => result.duration_ms,
-            Self::PendingGoalReport { duration_ms, .. } => *duration_ms,
+            Self::PendingGoalReport { duration_ms, .. } => Some(*duration_ms),
         }
     }
 
@@ -139,8 +131,9 @@ mod tests {
 
     #[test]
     fn finalized_round_entry_keeps_exact_existing_tool_result_encoding() {
-        let result = ToolResult::success("call", "think", "ordinary result", 7);
+        let result = ToolResult::success("call".into(), "ordinary result".into());
         let entry = ToolRoundResult::from(result.clone());
+        assert_eq!(entry.duration_ms(), None);
         assert_eq!(
             serde_json::to_vec(&entry).unwrap(),
             serde_json::to_vec(&result).unwrap()
@@ -155,7 +148,7 @@ mod tests {
         let entry = pending();
         assert!(entry.finalized().is_none());
         assert_eq!(entry.tool_use_id(), "round-call");
-        assert_eq!(entry.tool_name(), "goal_report");
+        assert_eq!(entry.duration_ms(), Some(5));
         let value = serde_json::to_value(&entry).unwrap();
         assert!(value.get("outcome").is_none());
         let restored: ToolRoundResult = serde_json::from_value(value).unwrap();

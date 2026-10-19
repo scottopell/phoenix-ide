@@ -20,7 +20,7 @@ impl TryFrom<GoalExecutionBinding> for GoalReportBinding {
             return Err(GoalError::ReportBindingRequired);
         };
         if goal.owner != binding.owner || goal.version.get() == 0 {
-            return Err(GoalError::StaleFence);
+            return Err(GoalError::Conflict);
         }
         Ok(Self {
             execution: binding.execution,
@@ -39,7 +39,7 @@ impl<'de> Deserialize<'de> for GoalReportBinding {
         }
         let wire = WireBinding::deserialize(deserializer)?;
         if wire.goal.version.get() == 0 {
-            return Err(serde::de::Error::custom(GoalError::StaleFence));
+            return Err(serde::de::Error::custom(GoalError::Conflict));
         }
         Ok(Self {
             execution: wire.execution,
@@ -238,17 +238,14 @@ mod tests {
         mismatch.owner = ProductConversationId::from_db("different".into());
         assert_eq!(
             GoalReportBinding::try_from(mismatch),
-            Err(GoalError::StaleFence)
+            Err(GoalError::Conflict)
         );
         let mut zero = binding();
         let GoalAdmissionObservation::Goal(ref mut fence) = zero.observation else {
             panic!("fixture")
         };
         fence.version = GoalVersion::INITIAL;
-        assert_eq!(
-            GoalReportBinding::try_from(zero),
-            Err(GoalError::StaleFence)
-        );
+        assert_eq!(GoalReportBinding::try_from(zero), Err(GoalError::Conflict));
     }
 
     #[test]
