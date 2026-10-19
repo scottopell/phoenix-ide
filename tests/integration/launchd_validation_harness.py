@@ -475,16 +475,16 @@ def validate_receipt(dev, receipt) -> None:
         receipt.manifest_path.chmod(original_manifest_mode)
         assert dev._disposable_validation_tree_witness(receipt.root) == full_root_baseline
 
-    downgraded_source114 = copy.deepcopy(manifest)
-    del downgraded_source114["current_schema_upgrade"]["prepared_source_baseline"]
-    del downgraded_source114["current_schema_upgrade"][
+    generic_current_schema = copy.deepcopy(manifest)
+    del generic_current_schema["current_schema_upgrade"]["prepared_source_baseline"]
+    del generic_current_schema["current_schema_upgrade"][
         "candidate_registry_expected_sha256"
     ]
-    downgraded_source114["transition_timeout_secs"] += 1
+    generic_current_schema["transition_timeout_secs"] += 1
     reject_manifest(
-        downgraded_source114,
-        "prepared source114 identity without both qualification fields",
-        expected_classifier=dev.DeployManifestKind.UNKNOWN,
+        generic_current_schema,
+        "generic current-schema compatibility without source114 qualification fields",
+        expected_classifier=dev.DeployManifestKind.CURRENT_SCHEMA,
         reject_helper=False,
     )
 
