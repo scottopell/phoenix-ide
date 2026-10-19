@@ -242,3 +242,29 @@ or authority surfaces. Removed the extra cancellation argument after reading
 the actual callee. Coverage language above is corrected to six journey
 functions plus one helper-only parent guard, with manual retry stated precisely.
 These corrections are source-only until a subsequent exact-head hosted run.
+
+### Corrected-head hosted run and typed-fixture compile repair
+
+Run `39339502154` at `c20bb67b2dc287c6e81d0d2aca9578d09694169f` is terminal
+FAILED, Rust artifact `12228638204`. The focused stage still did not execute
+tests: nextest's package-wide test compilation stopped on pre-existing concrete
+`Vec<ToolResult>` fixtures in `svg_artifacts` and the DB restart fixture after
+the production state fields had moved to `Vec<ToolRoundResult>`. Adapted those
+fixtures with typed conversion/inference, and the analogous runtime restart
+fixtures without deleting or weakening them.
+
+Regrounded retained goal-test APIs in the actual definitions: exact active
+terminal-obligation lookup takes a `ConversationAuthority` and returns the
+turn/generation; trusted skill output is `NonEmptyString` and the live overlay
+field is `output`; `TurnCommand::Cancel` has no cause field; requests expose
+`tool_availability.declarations()`, not a raw tools field. Added the explicit
+`MessageType` import. No production architecture or policy changed by this
+fixture repair, and no local compiler/test was run.
+
+Additional aggregate blockers remain recorded rather than silenced: Clippy
+reported `large_enum_variant` at `phoenix-state-machine::effect::Effect` and
+seven unnecessary-string-copy findings and one missing-panic-doc finding across
+federation subscription files (eight DB diagnostics total). These are not passing evidence
+and are not automatically blamed on the emitter. The goals-related enum-size
+finding remains on-path follow-up once actual current test compilation succeeds;
+federation lint findings remain captured for integration ownership.

@@ -6,6 +6,7 @@ use phoenix_core::domain::{
         GoalPendingReport, GoalReportCall, GoalReportOutcome, GoalState, GoalText, GoalTimestampUs,
         GoalVersion, ToolRoundResult,
     },
+    db_schema::MessageType,
     sm_event::{
         PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
         SubmittedDirectTurnIdentity,
@@ -386,12 +387,14 @@ async fn conversation_goal_runtime_terminal_pending_checkpoint_stages_existing_o
         rt.direct_turn_terminal_fact,
         TerminalFactDurability::Durable
     );
-    assert!(db
+    let obligation = db
         .workflow_repository()
-        .load_terminal_obligation(settlement.turn.turn_id)
+        .load_active_terminal_obligation(&ConversationAuthority(CONVERSATION.into()))
         .await
         .unwrap()
-        .is_some());
+        .expect("live exact-turn terminal obligation");
+    assert_eq!(obligation.turn_id, settlement.turn.turn_id);
+    assert_eq!(obligation.expected_generation, settlement.turn.generation);
     assert!(matches!(
         db.conversation_goal(&report.mutation().owner)
             .await
@@ -535,7 +538,9 @@ async fn conversation_goal_mixed_legacy_trusted_payload_keeps_live_authority_and
         .await
         .unwrap();
     let messages = db.get_messages(CONVERSATION).await.unwrap();
-    assert!(!serde_json::to_string(&messages).unwrap().contains(&payload));
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains(payload.as_str()));
     let durable = messages
         .iter()
         .find_map(|message| {
@@ -550,7 +555,7 @@ async fn conversation_goal_mixed_legacy_trusted_payload_keeps_live_authority_and
         "Authenticated built-in skill instructions were delivered for this live request."
     );
     assert_eq!(rt.pending_trusted_tool_results.len(), 1);
-    assert_eq!(rt.pending_trusted_tool_results[0].instructions, payload);
+    assert_eq!(rt.pending_trusted_tool_results[0].output, payload.as_str());
     rt.execute_effect(Effect::PersistCheckpoint { data })
         .await
         .unwrap();
@@ -822,7 +827,6 @@ async fn conversation_goal_terminal_late_replay_failure_is_known_rollback_and_re
             command: phoenix_workflow::TurnCommand::Cancel {
                 turn_id: active(&report).turn_id,
                 expected_generation: 0,
-                cause: phoenix_workflow::CancelCause::UserRequested,
             },
             projection: Some(phoenix_db::workflow::PersistedConversationProjection {
                 state: ConvState::Idle,
@@ -1017,9 +1021,13 @@ async fn conversation_goal_actual_internal_emitter_processes_round_before_next_m
     journey_provider_step(&mut rt).await;
     let requests = client.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].tools.iter().any(
-        |tool| tool.name == "goal_report" && tool.input_schema["additionalProperties"] == false
-    ));
+    assert!(requests[0]
+        .tool_availability
+        .declarations()
+        .iter()
+        .any(
+            |tool| tool.name == "goal_report" && tool.input_schema["additionalProperties"] == false
+        ));
     let second_wire = client.wires.lock().unwrap()[1].clone();
     let results: Vec<_> = second_wire["messages"]
         .as_array()
@@ -1466,7 +1474,8 @@ async fn conversation_goal_model_cannot_supply_binding_or_actor_and_production_g
         assert!(result.is_error);
         assert_eq!(
             client.requests.lock().unwrap()[0]
-                .tools
+                .tool_availability
+                .declarations()
                 .iter()
                 .any(|tool| tool.name == "goal_report"),
             inject_binding

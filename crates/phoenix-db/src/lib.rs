@@ -25896,7 +25896,7 @@ mod tests {
                 }),
             ),
             remaining_tools: Vec::new(),
-            completed_results: Vec::<ToolResult>::new(),
+            completed_results: Vec::new(),
             pending_sub_agents: Vec::new(),
             assistant_message: AssistantMessage::new(
                 "stable-assistant".to_string(),
