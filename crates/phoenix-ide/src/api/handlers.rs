@@ -8,9 +8,9 @@ use super::assets::{
     PUBLIC_ROOT_ASSETS,
 };
 use super::chains::{
-    archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
-    stream_chain, submit_chain_question,
+    archive_chain_handler, delete_chain_handler, get_chain, stream_chain, submit_chain_question,
 };
+use super::event_presentation::{enrich_messages, EventPresentations};
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
     get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
@@ -25,7 +25,7 @@ use super::lifecycle_handlers::{
 };
 use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
-    list_product_conversations, rename_product_conversation,
+    list_product_conversations, regenerate_product_conversation_name, rename_product_conversation,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -43,9 +43,9 @@ use super::types::{
     ProductConversationRouteResponse, ProjectFileSearchQuery, ProjectSkillsQuery,
     ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
     RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
-    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ReconcileAcceptedMessagesResponse, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
+    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -159,6 +159,10 @@ pub fn create_router(state: AppState) -> Router {
             axum::routing::patch(rename_product_conversation),
         )
         .route(
+            "/api/product-conversations/:reference/regenerate-name",
+            post(regenerate_product_conversation_name),
+        )
+        .route(
             "/api/product-conversations/:reference/close",
             axum::routing::post(close_product_conversation),
         )
@@ -250,6 +254,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
+        .route(
+            "/api/telemetry/conversation-view",
+            post(super::view_journey::report).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
         .route(
             "/api/telemetry/conversation-open",
             post(report_conversation_open),
@@ -345,7 +353,6 @@ pub fn create_router(state: AppState) -> Router {
         // unarchive — archive is not reversible.
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route("/api/conversations/:id/delete", post(delete_conversation))
-        .route("/api/conversations/:id/rename", post(rename_conversation))
         // Token usage (Phase 4)
         .route(
             "/api/conversations/:id/usage",
@@ -399,14 +406,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
-        .route(
-            "/api/chains/:rootId/name",
-            axum::routing::patch(set_chain_name),
-        )
-        .route(
-            "/api/chains/:rootId/regenerate-name",
-            post(regenerate_chain_name),
-        )
         .route("/api/chains/:rootId/stream", get(stream_chain))
         .route("/api/chains/:rootId/archive", post(archive_chain_handler))
         .route(
@@ -455,10 +454,6 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/credential-helper/invalidate",
             post(invalidate_credential),
-        )
-        .route(
-            "/api/conversations/:id/regenerate-name",
-            post(regenerate_conversation_name),
         )
         .route(
             "/api/conversations/:id/upgrade-model",
@@ -1054,7 +1049,7 @@ async fn resolve_coordinator_route(
         }
     };
     Ok(Json(CoordinatorRouteResponse {
-        coordinator_id: matched.then_some(coordinator_id),
+        coordinator_id: matched.then_some(root_id),
     }))
 }
 
@@ -2074,12 +2069,24 @@ async fn get_product_conversation_creation(
     } else {
         false
     };
-    product_creation_status_response(job, delivery_retryable).map(Json)
+    let route = if job.status == "published" {
+        Some(super::product_conversations::canonical_route(
+            &state
+                .db
+                .get_ordinary_product_conversation(&job.product_conversation_id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        ))
+    } else {
+        None
+    };
+    product_creation_status_response(job, delivery_retryable, route).map(Json)
 }
 
 fn product_creation_status_response(
     job: crate::db::ProductCreationJobRecord,
     delivery_retryable: bool,
+    canonical_route: Option<String>,
 ) -> Result<super::types::ProductConversationCreationStatusResponse, AppError> {
     use super::types::{
         ProductConversationCreationFailureStatus as Failure,
@@ -2127,7 +2134,9 @@ fn product_creation_status_response(
         })?;
         return Ok(Response::Published {
             request_id: job.request_id,
-            canonical_route: format!("/c/{product_id}"),
+            canonical_route: canonical_route.ok_or_else(|| {
+                AppError::Internal("published creation missing canonical route".to_string())
+            })?,
             product_conversation_id: product_id.to_string(),
             transcript_row_id,
         });
@@ -2468,7 +2477,7 @@ mod product_creation_acceptance_tests {
                 projected_job.status = (*status).to_string();
                 projected_job.last_error = Some("provisioning stopped".to_string());
                 let projected = serde_json::to_value(
-                    product_creation_status_response(projected_job, false).unwrap(),
+                    product_creation_status_response(projected_job, false, None).unwrap(),
                 )
                 .unwrap();
                 assert_eq!(projected["kind"], kind);
@@ -2499,7 +2508,7 @@ mod product_creation_acceptance_tests {
         let mut retryable = job.clone();
         retryable.status = "delivery_failed".to_string();
         let projected =
-            serde_json::to_value(product_creation_status_response(retryable, true).unwrap())
+            serde_json::to_value(product_creation_status_response(retryable, true, None).unwrap())
                 .unwrap();
         assert_eq!(projected["kind"], "failed");
         assert_eq!(projected["status"], "delivery_failed");
@@ -2511,7 +2520,7 @@ mod product_creation_acceptance_tests {
         assert!(projected.get("transcript_row_id").is_none());
         let mut unknown = job;
         unknown.status = "unknown".to_string();
-        assert!(product_creation_status_response(unknown, false).is_err());
+        assert!(product_creation_status_response(unknown, false, None).is_err());
     }
 
     #[tokio::test]
@@ -2567,7 +2576,7 @@ mod product_creation_acceptance_tests {
         let mut cancelled = job.clone();
         cancelled.status = "cancelled".to_string();
         let recovery =
-            serde_json::to_value(product_creation_status_response(cancelled, false).unwrap())
+            serde_json::to_value(product_creation_status_response(cancelled, false, None).unwrap())
                 .unwrap();
         assert_eq!(recovery["kind"], "cancelled");
         assert_eq!(
@@ -2577,21 +2586,21 @@ mod product_creation_acceptance_tests {
         assert!(recovery.get("transcript_row_id").is_none());
         let mut published = job;
         published.status = "published".to_string();
-        assert!(product_creation_status_response(published.clone(), false).is_err());
+        assert!(product_creation_status_response(published.clone(), false, None).is_err());
         published.published_product_id = Some(published.product_conversation_id.clone());
         published.published_conversation_id = Some("canonical-transcript".to_string());
-        let ready =
-            serde_json::to_value(product_creation_status_response(published, false).unwrap())
-                .unwrap();
+        let ready = serde_json::to_value(
+            product_creation_status_response(
+                published,
+                false,
+                Some("/c/readable-name".to_string()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(ready["kind"], "published");
         assert_eq!(ready["transcript_row_id"], "canonical-transcript");
-        assert_eq!(
-            ready["canonical_route"],
-            format!(
-                "/c/{}",
-                pending["product_conversation_id"].as_str().unwrap()
-            )
-        );
+        assert_eq!(ready["canonical_route"], "/c/readable-name");
         assert_eq!(
             get("/api/product-conversations/creation/unknown-request".to_string())
                 .await
@@ -3609,10 +3618,8 @@ async fn get_conversation(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -3675,7 +3682,17 @@ where
             .get_conversation(conversation_id)
             .await
             .map_err(|e| AppError::NotFound(e.to_string()))?;
-        let value = read_value(db, conversation_id, attempt).await?;
+        let value = match read_value(db, conversation_id, attempt).await {
+            Err(AppError::TranscriptSnapshotChanged) => {
+                tracing::debug!(
+                    conversation_id,
+                    attempt,
+                    "retrying changed opening snapshot"
+                );
+                continue;
+            }
+            result => result?,
+        };
         bump_transcript_generation_for_test(db, conversation_id).await?;
         let after = db
             .get_conversation(conversation_id)
@@ -3734,17 +3751,15 @@ async fn bump_transcript_generation_for_test(
     Ok(())
 }
 
-fn build_message_slice_response(
+async fn build_message_slice_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
     has_older_messages: bool,
 ) -> ConversationMessageSliceResponse {
     ConversationMessageSliceResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -3752,7 +3767,8 @@ fn build_message_slice_response(
     }
 }
 
-fn build_message_range_response(
+async fn build_message_range_response(
+    db: &crate::db::Database,
     messages: &[crate::db::Message],
     start_message_sequence: i64,
     end_message_sequence: i64,
@@ -3764,10 +3780,7 @@ fn build_message_range_response(
         .filter(|seq| !present.contains(seq))
         .collect();
     ConversationMessageRangeResponse {
-        messages: messages
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        messages: enrich_messages(db, messages).await,
         missing_sequences,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
@@ -3775,21 +3788,16 @@ fn build_message_range_response(
     }
 }
 
-fn build_messages_around_response(
+async fn build_messages_around_response(
+    db: &crate::db::Database,
     before: &[crate::db::Message],
     after: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
 ) -> ConversationMessagesAroundResponse {
     ConversationMessagesAroundResponse {
-        before: before
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
-        after: after
-            .iter()
-            .map(super::wire::EnrichedMessage::from)
-            .collect(),
+        before: enrich_messages(db, before).await,
+        after: enrich_messages(db, after).await,
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
@@ -4026,7 +4034,11 @@ async fn reconcile_accepted_messages(
     for message_id in req.message_ids {
         let disposition = match state.db.get_message_by_id(&message_id).await {
             Ok(message) if message.conversation_id == id => AcceptedMessageDisposition::Persisted {
-                message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                message: Box::new(
+                    EventPresentations::load(&state.db, [&message])
+                        .await
+                        .enrich(&message),
+                ),
             },
             Err(crate::db::DbError::MessageNotFound(_))
                 if queued_ids.contains(message_id.as_str()) =>
@@ -4075,12 +4087,16 @@ async fn get_conversation_messages_latest(
     })
     .await?;
     let (messages, has_older_messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_slice_response(
-        &messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-        has_older_messages,
-    )))
+    Ok(Json(
+        build_message_slice_response(
+            &state.db,
+            &messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+            has_older_messages,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages(
@@ -4111,12 +4127,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, has_older_messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                has_older_messages,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    has_older_messages,
+                )
+                .await,
+            ))
         }
         (None, Some(after)) => {
             let stable = stable_transcript_read(db, &id, |db, id, _attempt| {
@@ -4131,12 +4151,16 @@ async fn get_conversation_messages(
             })
             .await?;
             let (messages, server_message_tail) = stable.value;
-            Ok(Json(build_message_slice_response(
-                &messages,
-                stable.conversation.transcript_generation,
-                server_message_tail,
-                false,
-            )))
+            Ok(Json(
+                build_message_slice_response(
+                    &state.db,
+                    &messages,
+                    stable.conversation.transcript_generation,
+                    server_message_tail,
+                    false,
+                )
+                .await,
+            ))
         }
     }
 }
@@ -4177,13 +4201,17 @@ async fn get_conversation_message_range(
     })
     .await?;
     let (messages, server_message_tail) = stable.value;
-    Ok(Json(build_message_range_response(
-        &messages,
-        start_message_sequence,
-        end_message_sequence,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_message_range_response(
+            &state.db,
+            &messages,
+            start_message_sequence,
+            end_message_sequence,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 async fn get_conversation_messages_around(
@@ -4206,12 +4234,16 @@ async fn get_conversation_messages_around(
     })
     .await?;
     let (before_messages, after_messages, server_message_tail) = stable.value;
-    Ok(Json(build_messages_around_response(
-        &before_messages,
-        &after_messages,
-        stable.conversation.transcript_generation,
-        server_message_tail,
-    )))
+    Ok(Json(
+        build_messages_around_response(
+            &state.db,
+            &before_messages,
+            &after_messages,
+            stable.conversation.transcript_generation,
+            server_message_tail,
+        )
+        .await,
+    ))
 }
 
 /// `GET /api/conversations/:id/slug` — compatibility lookup used by links that
@@ -4903,7 +4935,7 @@ async fn read_stream_init_messages_with_tail(
 }
 
 async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
-    super::sse::aggregate_event_stream(state.runtime.subscribe_aggregate_events())
+    super::sse::aggregate_event_stream(state.db.clone(), state.runtime.subscribe_aggregate_events())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5007,7 +5039,7 @@ async fn stream_conversation(
     let stable = stable_transcript_read(db, &id, |db, id, attempt| {
         let query = query.clone();
         Box::pin(async move {
-            read_stream_init_messages_with_tail(
+            let value = read_stream_init_messages_with_tail(
                 db,
                 id,
                 &query,
@@ -5015,18 +5047,34 @@ async fn stream_conversation(
                 attempt,
                 get_stream_last_sequence_id(db, id).await,
             )
-            .await
+            .await?;
+            let generation = db
+                .get_conversation(id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .transcript_generation;
+            let opening = db
+                .read_continuation_opening_at_snapshot(id, generation, value.3)
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+            Ok((value, opening))
         })
     })
     .await?;
     let conversation = stable.conversation;
+    let (stream_value, opening) = stable.value;
     let (
         last_sequence_id,
         db_message_selection,
         messages,
         _server_message_tail,
         transcript_coverage,
-    ) = stable.value;
+    ) = stream_value;
     init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
     init_trace.record_message_count(messages.len());
     let highest_message_seq = match db_message_selection {
@@ -5127,6 +5175,7 @@ async fn stream_conversation(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
@@ -5144,6 +5193,7 @@ async fn stream_conversation(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         id,
         init_event,
         broadcast_rx,
@@ -5200,7 +5250,7 @@ async fn send_chat(
             images: req.images,
             files: req.files,
             user_agent: req.user_agent,
-            expansion_policy: crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
+            expansion_policy: req.expansion_policy.into(),
         })
         .await
         .map_err(|error| match error {
@@ -5359,7 +5409,9 @@ async fn cancel_conversation(
             | AppError::TypedBadRequest { .. }
             | AppError::Forbidden(_)
             | AppError::UnprocessableEntity(_) => ("request_error", false),
-            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+            AppError::Internal(_)
+            | AppError::TypedInternal { .. }
+            | AppError::TranscriptSnapshotChanged => ("server_error", true),
         };
         span.record("outcome", outcome);
         if is_server_error {
@@ -7605,106 +7657,6 @@ async fn cleanup_pending_fork_orphans_on_delete(
         .map_err(|error| AppError::Internal(error.to_string()))
 }
 
-async fn rename_conversation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<RenameRequest>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    state
-        .runtime
-        .db()
-        .rename_conversation(&id, &req.name)
-        .await
-        .map_err(|e| match e {
-            crate::db::DbError::SlugExists(_) => {
-                AppError::BadRequest("Slug already exists".to_string())
-            }
-            _ => AppError::NotFound(e.to_string()),
-        })?;
-
-    conversation_response(&state, &id).await
-}
-
-async fn regenerate_conversation_name(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let opening = state
-        .runtime
-        .db()
-        .first_opening_message_text(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .ok_or_else(|| {
-            tracing::debug!(
-                conv_id = %id,
-                "conversation regenerate-name: no opening message; leaving slug unchanged"
-            );
-            AppError::Internal(
-                "cannot regenerate conversation name: no opening message to summarize".to_string(),
-            )
-        })?;
-
-    let (cheap_model_id, cheap_model) =
-        state
-            .llm_registry
-            .get_cheap_model_with_id()
-            .ok_or_else(|| {
-                AppError::Internal(
-                    "no cheap LLM model is available for name regeneration".to_string(),
-                )
-            })?;
-    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
-
-    let generated = crate::title_generator::generate_title(
-        &opening,
-        cheap_model,
-        effective_effort,
-        state.llm_registry.output_token_limit(&cheap_model_id),
-    )
-    .await
-    .filter(|slug| !slug.is_empty())
-    .ok_or_else(|| {
-        AppError::Internal(
-            "conversation name regeneration failed — the existing name is unchanged".to_string(),
-        )
-    })?;
-
-    rename_conversation_slug(&state, &id, &generated).await?;
-    conversation_response(&state, &id).await
-}
-
-async fn rename_conversation_slug(state: &AppState, id: &str, slug: &str) -> Result<(), AppError> {
-    state
-        .runtime
-        .db()
-        .rename_conversation(id, slug)
-        .await
-        .map_err(|e| match e {
-            crate::db::DbError::SlugExists(_) => {
-                AppError::BadRequest("Slug already exists".to_string())
-            }
-            crate::db::DbError::ConversationNotFound(_) => AppError::NotFound(e.to_string()),
-            _ => AppError::Internal(e.to_string()),
-        })
-}
-
-async fn conversation_response(
-    state: &AppState,
-    id: &str,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok(Json(ConversationResponse {
-        conversation: conversation_to_json_with_seed(state, &conversation, true).await?,
-    }))
-}
-
 pub(crate) fn title_from_text(text: &str) -> String {
     text.split_whitespace()
         .take(8)
@@ -7816,10 +7768,8 @@ async fn get_by_slug(
     let conversation = stable.conversation;
     let messages = stable.value;
 
-    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
-        .iter()
-        .map(super::wire::EnrichedMessage::from)
-        .collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> =
+        enrich_messages(&state.db, &messages).await;
 
     let context_window_size = messages
         .iter()
@@ -9445,9 +9395,10 @@ async fn get_shared_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let presentations = EventPresentations::redacted();
     let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
         .iter()
-        .map(super::wire::EnrichedMessage::from)
+        .map(|message| presentations.enrich(message))
         .collect();
 
     let context_window_size = messages
@@ -9468,6 +9419,7 @@ async fn get_shared_conversation(
 /// SSE stream for a shared conversation. Validates token, then subscribes.
 ///
 /// REQ-AUTH-006 + REQ-AUTH-007: Token-validated, supports multiple simultaneous viewers.
+#[allow(clippy::too_many_lines)]
 async fn shared_sse_stream(
     State(state): State<AppState>,
     Path(token): Path<String>,
@@ -9478,13 +9430,6 @@ async fn shared_sse_stream(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Invalid share token".to_string()))?;
-
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&conversation_id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     // A read-only share viewer must never *start* a runtime: `shared_sse_stream`
     // is auth-exempt (token-gated), so calling `get_or_create` here would let an
@@ -9520,17 +9465,44 @@ async fn shared_sse_stream(
     let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
         broadcast_tx.snapshot_pending();
 
-    let messages = state
-        .runtime
-        .db()
-        .get_messages(&conversation_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let transcript_coverage = latest_stream_transcript_coverage(
-        &messages,
-        get_server_message_tail(state.runtime.db(), &conversation_id).await?,
-        false,
-    );
+    let stable =
+        stable_transcript_read(state.runtime.db(), &conversation_id, |db, id, _attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                let messages = db
+                    .get_messages(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                #[cfg(test)]
+                shared_stream_snapshot_tests::change_snapshot(db, id).await?;
+                let opening = db
+                    .read_continuation_opening_at_snapshot(
+                        id,
+                        generation,
+                        messages.iter().map(|message| message.sequence_id).max(),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        crate::db::DbError::TranscriptSnapshotChanged => {
+                            AppError::TranscriptSnapshotChanged
+                        }
+                        error => AppError::Internal(error.to_string()),
+                    })?;
+                let coverage = latest_stream_transcript_coverage(
+                    &messages,
+                    get_server_message_tail(db, id).await?,
+                    false,
+                );
+                Ok((messages, coverage, opening))
+            })
+        })
+        .await?;
+    let conversation = stable.conversation;
+    let (messages, transcript_coverage, opening) = stable.value;
     let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
     let init_seq = std::cmp::max(
         std::cmp::max(last_sequence_id, highest_pending_seq),
@@ -9562,6 +9534,7 @@ async fn shared_sse_stream(
         crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
     };
     let init_event = SseEvent::Init {
+        opening: Some(opening.into()),
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
@@ -9580,12 +9553,212 @@ async fn shared_sse_stream(
     };
 
     Ok(sse_stream(
+        state.runtime.db().clone(),
         conversation_id,
         init_event,
         broadcast_rx,
         None,
         crate::api::sse::SseStreamAudience::SharedTranscript,
     ))
+}
+
+#[cfg(test)]
+mod shared_stream_snapshot_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum SnapshotChange {
+        Append,
+        Mutate,
+    }
+
+    thread_local! {
+        static CHANGE: std::cell::RefCell<Option<(String, SnapshotChange, usize)>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) async fn change_snapshot(
+        db: &crate::db::Database,
+        id: &str,
+    ) -> Result<(), AppError> {
+        let change = CHANGE.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            let (target, change, remaining) = hook.as_mut()?;
+            if target != id {
+                return None;
+            }
+            let change = *change;
+            *remaining -= 1;
+            if *remaining == 0 {
+                *hook = None;
+            }
+            Some(change)
+        });
+        match change {
+            Some(SnapshotChange::Append) => {
+                db.add_message(
+                    "shared-appended",
+                    id,
+                    &crate::db::MessageContent::user("appended"),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            Some(SnapshotChange::Mutate) => {
+                db.update_message_display_data(
+                    "shared-initial",
+                    &serde_json::json!({"race": true}),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    async fn shared_init(state: AppState, token: String) -> serde_json::Value {
+        use futures::StreamExt as _;
+        let response = shared_sse_stream(State(state), Path(token))
+            .await
+            .expect("shared stable init")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let chunk = body.next().await.expect("init chunk").expect("init bytes");
+        let chunk = std::str::from_utf8(&chunk).unwrap();
+        assert!(chunk.lines().any(|line| line == "event: init"));
+        let data = chunk
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        serde_json::from_str(data).unwrap()
+    }
+
+    async fn assert_shared_snapshot_race(change: SnapshotChange) {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let id = "shared-snapshot-race";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "shared-initial",
+                id,
+                &crate::db::MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let token = state.db.create_share_token(id).await.unwrap();
+        let before = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        CHANGE.with(|hook| *hook.borrow_mut() = Some((id.into(), change, 1)));
+        let init = shared_init(state.clone(), token).await;
+        assert!(CHANGE.with(|hook| hook.borrow().is_none()));
+        assert_eq!(init["messages"][0]["message_id"], "shared-initial");
+        assert_eq!(init["opening"], serde_json::json!({"status": "none"}));
+        assert_eq!(init["transcript_coverage"], "complete");
+        let persisted = state.db.get_messages(id).await.unwrap();
+        assert_eq!(init["messages"].as_array().unwrap().len(), persisted.len());
+        let tail = persisted
+            .iter()
+            .map(|message| message.sequence_id)
+            .max()
+            .unwrap();
+        assert_eq!(init["sequence_id"], tail);
+        assert_eq!(init["last_sequence_id"], tail);
+        let generation = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        assert_eq!(init["transcript_generation"], generation);
+        assert_eq!(init["conversation"]["transcript_generation"], generation);
+        match change {
+            SnapshotChange::Append => {
+                assert_eq!(init["messages"][1]["message_id"], "shared-appended");
+                assert_eq!(generation, before);
+            }
+            SnapshotChange::Mutate => {
+                assert_eq!(init["messages"][0]["display_data"]["race"], true);
+                assert_eq!(generation, before + 1);
+            }
+        }
+        assert!(state.runtime.try_get_handle(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_stream_retries_append_between_messages_and_opening() {
+        assert_shared_snapshot_race(SnapshotChange::Append).await;
+    }
+
+    #[tokio::test]
+    async fn shared_stream_retries_mutation_between_messages_and_opening() {
+        assert_shared_snapshot_race(SnapshotChange::Mutate).await;
+    }
+
+    #[tokio::test]
+    async fn opening_snapshot_retry_is_bounded() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let id = "shared-snapshot-exhausted";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "shared-initial",
+                id,
+                &crate::db::MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let token = state.db.create_share_token(id).await.unwrap();
+        let before = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        CHANGE.with(|hook| {
+            *hook.borrow_mut() = Some((
+                id.into(),
+                SnapshotChange::Mutate,
+                STABLE_TRANSCRIPT_READ_MAX_ATTEMPTS,
+            ));
+        });
+        let result = shared_sse_stream(State(state.clone()), Path(token)).await;
+        assert!(matches!(result, Err(AppError::Internal(_))));
+        assert!(CHANGE.with(|hook| hook.borrow().is_none()));
+        let after = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .transcript_generation;
+        assert_eq!(
+            after - before,
+            i64::try_from(STABLE_TRANSCRIPT_READ_MAX_ATTEMPTS).unwrap()
+        );
+        assert!(state.runtime.try_get_handle(id).await.is_none());
+    }
 }
 
 // ============================================================
@@ -9603,6 +9776,7 @@ pub(crate) enum AppError {
     /// 403 — the action is restricted to a caller on the server host.
     Forbidden(String),
     Internal(String),
+    TranscriptSnapshotChanged,
     TypedInternal {
         message: String,
         error_type: String,
@@ -9645,6 +9819,10 @@ impl IntoResponse for AppError {
             AppError::Forbidden(ref msg) => {
                 tracing::debug!(error = %msg, "403 Forbidden");
                 (StatusCode::FORBIDDEN, Json(ErrorResponse::new(msg.clone()))).into_response()
+            }
+            AppError::TranscriptSnapshotChanged => {
+                AppError::Internal("transcript changed during opening observation read".into())
+                    .into_response()
             }
             AppError::Internal(ref msg) => {
                 tracing::error!(error = %msg, "500 Internal Server Error");
@@ -12491,6 +12669,47 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn stable_read_retries_typed_opening_snapshot_mismatch() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "opening-snapshot-retry",
+            "opening-snapshot-retry",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stable = stable_transcript_read(&db, "opening-snapshot-retry", |db, id, attempt| {
+            Box::pin(async move {
+                let generation = db
+                    .get_conversation(id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                    .transcript_generation;
+                db.read_continuation_opening_at_snapshot(
+                    id,
+                    generation,
+                    if attempt == 1 { Some(1) } else { None },
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::TranscriptSnapshotChanged => {
+                        AppError::TranscriptSnapshotChanged
+                    }
+                    error => AppError::Internal(error.to_string()),
+                })?;
+                Ok(attempt)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(stable.attempts, 2);
+        assert_eq!(stable.value, 2);
+    }
+
+    #[tokio::test]
     async fn stable_stream_read_keeps_latest_selection_after_none_generation_race() {
         let state = make_test_state().await;
         state
@@ -13572,7 +13791,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("live message after subscribe");
         match live {
-            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
     }
@@ -16689,26 +16908,39 @@ mod regenerate_conversation_name_tests {
         ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
     };
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[derive(Debug)]
     enum StubLlm {
         Ok(&'static str),
+        Long,
+        Paused {
+            started: Arc<tokio::sync::Semaphore>,
+            resume: Arc<tokio::sync::Semaphore>,
+        },
         Err,
     }
 
     #[async_trait]
     impl LlmService for StubLlm {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            match self {
-                StubLlm::Ok(text) => Ok(LlmResponse {
-                    provider_replay: None,
-                    content: vec![ContentBlock::text(*text)],
-                    end_turn: true,
-                    usage: Usage::default(),
-                    stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-                }),
-                StubLlm::Err => Err(LlmError::server_error("temporary outage")),
-            }
+            let text = match self {
+                StubLlm::Ok(text) => (*text).to_string(),
+                StubLlm::Long => "Word ".repeat(100),
+                StubLlm::Paused { started, resume } => {
+                    started.add_permits(1);
+                    resume.acquire().await.unwrap().forget();
+                    "Stale Generated Name".to_string()
+                }
+                StubLlm::Err => return Err(LlmError::server_error("temporary outage")),
+            };
+            Ok(LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text(text)],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
         }
 
         async fn complete_streaming(
@@ -16794,32 +17026,236 @@ mod regenerate_conversation_name_tests {
 
     async fn regenerate(
         state: &AppState,
-        id: &str,
-    ) -> Result<Json<ConversationResponse>, AppError> {
-        regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
+        reference: &str,
+    ) -> Result<Json<crate::api::types::ProductConversationListRow>, AppError> {
+        crate::api::product_conversations::regenerate_product_conversation_name(
+            State(state.clone()),
+            Path(reference.to_string()),
+        )
+        .await
     }
 
     #[tokio::test]
-    async fn rename_response_uses_canonical_presentation_serializer() {
+    async fn canonical_regenerate_name_route_returns_product_conversation_row() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("unused"),
+            StubLlm::Ok("Route Generated Name"),
         ))))
         .await;
-        seed_conversation(&state, "conv-rename", "before-rename").await;
+        seed_conversation(&state, "conv-route-name", "initial-name").await;
+        seed_opening(&state, "conv-route-name", "name this conversation").await;
 
-        let Json(response) = rename_conversation(
-            State(state.clone()),
-            Path("conv-rename".to_string()),
-            Json(RenameRequest {
-                name: "After Rename".to_string(),
-            }),
+        let owner = state
+            .db
+            .get_conversation("conv-route-name")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let router = create_router(state);
+        for reference in [
+            "initial-name",
+            owner.as_str(),
+            "conv-route-name",
+            "route-generated-name",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/api/product-conversations/{reference}/regenerate-name"
+                        ))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["canonical_root"]["title"], "Route Generated Name");
+            assert_eq!(body["canonical_root"]["slug"], "route-generated-name");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_name_management_routes_are_not_registered() {
+        let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
+        let router = create_router(state).route_layer(axum::middleware::map_response(
+            |mut response: axum::response::Response| async move {
+                response.headers_mut().insert(
+                    "x-test-registered-route",
+                    axum::http::HeaderValue::from_static("present"),
+                );
+                response
+            },
+        ));
+        let registered = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/product-conversations/unknown")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(registered.headers().contains_key("x-test-registered-route"));
+        for (method, uri) in [
+            ("POST", "/api/conversations/old/rename"),
+            ("POST", "/api/conversations/old/regenerate-name"),
+            ("PATCH", "/api/chains/old/name"),
+            ("POST", "/api/chains/old/regenerate-name"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"name":"ignored"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !response.headers().contains_key("x-test-registered-route"),
+                "obsolete route was registered: {method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_naming_preserves_validation_and_history_conflicts() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Generated Name"),
+        ))))
+        .await;
+        seed_conversation(&state, "history-name", "retained-history-name").await;
+        seed_opening(&state, "history-name", "opening").await;
+        let before = state.db.get_conversation("history-name").await.unwrap();
+        let router = create_router(state.clone());
+        let invalid = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri("/api/product-conversations/history-name/title")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"title":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
         )
+        .bind(before.product_conversation_id.as_str())
+        .execute(state.db.pool())
         .await
-        .expect("rename");
-        assert_eq!(response.conversation["slug"], "After Rename");
-        assert!(response.conversation.get("presentation_mode").is_some());
-        assert!(response.conversation.get("requires_action").is_some());
-        assert!(response.conversation.get("work_scope_key").is_some());
+        .unwrap();
+        for (method, suffix, body) in [
+            ("PATCH", "title", r#"{"title":"Changed Name"}"#),
+            ("POST", "regenerate-name", ""),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(format!(
+                            "/api/product-conversations/{}/{suffix}",
+                            before.product_conversation_id
+                        ))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        }
+        let after = state.db.get_conversation("history-name").await.unwrap();
+        assert_eq!((after.title, after.slug), (before.title, before.slug));
+    }
+
+    #[tokio::test]
+    async fn canonical_generation_rejects_invalid_output_without_name_or_route_changes() {
+        for llm in [StubLlm::Long, StubLlm::Ok("\u{0007}"), StubLlm::Ok("")] {
+            let state =
+                make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(llm)))).await;
+            seed_conversation(&state, "invalid-generated", "retained-name").await;
+            seed_opening(&state, "invalid-generated", "opening").await;
+            let before = state
+                .db
+                .get_conversation("invalid-generated")
+                .await
+                .unwrap();
+            assert!(regenerate(&state, "retained-name").await.is_err());
+            let after = state
+                .db
+                .get_conversation("invalid-generated")
+                .await
+                .unwrap();
+            assert_eq!(after.title, before.title);
+            assert_eq!(after.slug, before.slug);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_generation_pins_owner_and_rejects_aba_after_slug_reassignment() {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Paused {
+                started: started.clone(),
+                resume: resume.clone(),
+            },
+        ))))
+        .await;
+        seed_conversation(&state, "generated-owner", "original-name").await;
+        seed_opening(&state, "generated-owner", "opening").await;
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Original Name")
+            .await
+            .unwrap();
+        let generating_state = state.clone();
+        let generation =
+            tokio::spawn(async move { regenerate(&generating_state, "original-name").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Interim Name")
+            .await
+            .unwrap();
+        seed_conversation(&state, "other-owner", "original-name").await;
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Original Name")
+            .await
+            .unwrap();
+        let before = state.db.get_conversation("generated-owner").await.unwrap();
+        let other_before = state.db.get_conversation("other-owner").await.unwrap();
+        resume.add_permits(1);
+        assert!(generation.await.unwrap().is_err());
+        let after = state.db.get_conversation("generated-owner").await.unwrap();
+        let other_after = state.db.get_conversation("other-owner").await.unwrap();
+        assert_eq!((after.title, after.slug), (before.title, before.slug));
+        assert_eq!(
+            (other_after.title, other_after.slug),
+            (other_before.title, other_before.slug)
+        );
     }
 
     #[tokio::test]
@@ -16837,13 +17273,15 @@ mod regenerate_conversation_name_tests {
         .await;
 
         let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
-        assert_eq!(response.conversation["slug"], "useful-auth-fix");
-        assert!(response
-            .conversation
-            .get("product_conversation_id")
-            .is_none());
-        assert!(response.conversation.get("presentation_mode").is_some());
-        assert!(response.conversation.get("work_scope_key").is_some());
+        assert_eq!(
+            response.canonical_root.slug.as_deref(),
+            Some("useful-auth-fix")
+        );
+        assert!(!response.product_conversation_id.is_empty());
+        assert!(matches!(
+            response.presentation,
+            crate::api::types::ProductConversationPresentationView::State { .. }
+        ));
         let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
     }
@@ -16884,7 +17322,7 @@ mod regenerate_conversation_name_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_generated_slug_returns_error_and_leaves_slug_unchanged() {
+    async fn duplicate_generated_name_allocates_projection_and_preserves_prose() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
             StubLlm::Ok("Taken Slug"),
         ))))
@@ -16893,13 +17331,19 @@ mod regenerate_conversation_name_tests {
         seed_conversation(&state, "conv-rename", "deterministic-conv-rename").await;
         seed_opening(&state, "conv-rename", "rename this later").await;
 
-        assert!(regenerate(&state, "conv-rename").await.is_err());
+        let Json(response) = regenerate(&state, "conv-rename").await.expect("regenerate");
+        assert_eq!(
+            response.canonical_root.slug.as_deref(),
+            Some("taken-slug-2")
+        );
+        assert_eq!(response.canonical_root.title.as_deref(), Some("Taken Slug"));
         let reloaded = state
             .db
             .get_conversation("conv-rename")
             .await
             .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-rename"));
+        assert_eq!(reloaded.slug.as_deref(), Some("taken-slug-2"));
+        assert_eq!(reloaded.title.as_deref(), Some("Taken Slug"));
     }
 
     #[tokio::test]
@@ -18037,6 +18481,7 @@ mod chat_authority_tests {
     //! The fix: `effective_conversation_state` returns the live state; the
     //! handler queues a steering message instead.
     use super::*;
+    use crate::api::ChatExpansionPolicy;
     use crate::db::Database;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
@@ -18095,6 +18540,462 @@ mod chat_authority_tests {
         }
     }
 
+    async fn public_chat_post(
+        state: &AppState,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> axum::response::Response {
+        chat_post_path(state, &format!("/api/conversations/{id}/chat"), body).await
+    }
+
+    async fn chat_post_path(
+        state: &AppState,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> axum::response::Response {
+        use tower::ServiceExt as _;
+        create_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn literal_chat_body(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_preserves_idle_and_running_payloads_and_retry_policy() {
+        use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
+        for running in [false, true] {
+            let state = make_state().await;
+            let id = "literal-chat";
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            if running {
+                state
+                    .runtime
+                    .inject_handle_for_test(id, ConvState::LlmRequesting { attempt: 1 })
+                    .await;
+            }
+            let text = "/spears @Cargo.toml @file:missing @someone\n  exact café bytes  \n";
+            let body = serde_json::json!({
+                "text": text, "message_id": "literal-message", "expansion_policy": "literal_text",
+                "images": [{"media_type": "image/png", "data": "aW1hZ2U="}],
+                "files": [], "user_agent": "literal-test",
+            });
+            let response = public_chat_post(&state, id, &body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = literal_chat_body(response).await;
+            assert_eq!(
+                response_body,
+                if running {
+                    serde_json::json!({"queued": true, "steering": true})
+                } else {
+                    serde_json::json!({"queued": true})
+                }
+            );
+            if running {
+                let queue = state.db.get_steering_queue(id).await.unwrap();
+                assert_eq!(queue.len(), 1);
+                assert_eq!(queue[0].message_id, "literal-message");
+                assert_eq!(queue[0].text, text);
+                assert!(queue[0].llm_text.is_none());
+                assert!(queue[0].skill_invocation.is_none());
+                assert_eq!(queue[0].images[0].data, "aW1hZ2U=");
+                assert_eq!(queue[0].user_agent.as_deref(), Some("literal-test"));
+                assert_eq!(
+                    queue[0].origin,
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi
+                );
+            } else {
+                let turn = state
+                    .db
+                    .workflow_repository()
+                    .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                        id.to_string(),
+                    ))
+                    .await
+                    .unwrap()
+                    .expect("accepted direct turn");
+                let payload =
+                    PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+                assert_eq!(payload.message_id(), "literal-message");
+                assert_eq!(payload.delivery.text, text);
+                assert!(payload.delivery.llm_text.is_none());
+                assert!(payload.delivery.skill_invocation.is_none());
+                assert_eq!(payload.delivery.images[0].data, "aW1hZ2U=");
+                assert_eq!(payload.delivery.user_agent.as_deref(), Some("literal-test"));
+                assert_eq!(
+                    payload.submitted.expansion_policy,
+                    phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::LiteralText
+                );
+                assert_eq!(
+                    payload.submitted.origin,
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi
+                );
+            }
+            assert_eq!(
+                public_chat_post(&state, id, &body).await.status(),
+                StatusCode::OK
+            );
+            let mut changed = body.clone();
+            changed["expansion_policy"] = serde_json::json!("expand_references");
+            let conflict = public_chat_post(&state, id, &changed).await;
+            assert_eq!(conflict.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                literal_chat_body(conflict).await["error_type"],
+                "idempotency_conflict"
+            );
+            if running {
+                assert_eq!(state.db.get_steering_queue(id).await.unwrap().len(), 1);
+            }
+        }
+    }
+
+    async fn pending_literal_manual_opening(
+        text: &str,
+    ) -> (
+        AppState,
+        crate::db::Conversation,
+        crate::db::ContinuationDispatchIntent,
+    ) {
+        use phoenix_workflow::ClientTurnKey;
+        let state = make_state().await;
+        let parent = "literal-opening-parent";
+        state
+            .db
+            .create_conversation(parent, parent, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                parent,
+                &ConvState::ContextExhausted {
+                    summary: "predecessor summary".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let (outcome, intent) = state
+            .db
+            .continue_conversation_with_intent(
+                parent,
+                crate::db::NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::new("manual-opening").unwrap(),
+                    text.to_string(),
+                    Some("original-agent".to_string()),
+                ),
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected successor");
+        };
+        let intent = intent.expect("pending manual opening");
+        (state, successor, intent)
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_checks_pending_manual_opening_before_canonicalization() {
+        use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
+        use phoenix_workflow::ConversationAuthority;
+
+        for namespaced in [false, true] {
+            let text = "/spears @missing manual handoff\n  café  \n";
+            let (state, successor, intent) = pending_literal_manual_opening(text).await;
+            let message_id = if namespaced {
+                format!("{}:{}", successor.id, intent.message_id.as_str())
+            } else {
+                intent.message_id.as_str().to_string()
+            };
+            let body = serde_json::json!({
+                "text": text, "message_id": message_id, "expansion_policy": "literal_text",
+                "user_agent": "original-agent",
+            });
+            let mut conflicts = vec![body.clone(), body.clone()];
+            conflicts[0]["text"] = serde_json::json!("changed text");
+            conflicts[1]["user_agent"] = serde_json::json!("changed-agent");
+            if namespaced {
+                conflicts.push(body.clone());
+            }
+            for changed in conflicts {
+                let response = public_chat_post(&state, &successor.id, &changed).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(
+                    literal_chat_body(response).await["error_type"],
+                    "continuation_opening_mismatch"
+                );
+                assert!(state
+                    .db
+                    .workflow_repository()
+                    .load_active_runtime_turn(&ConversationAuthority(successor.id.clone()),)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(state
+                    .db
+                    .get_steering_queue(&successor.id)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert!(state
+                    .db
+                    .get_messages(&successor.id)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    state
+                        .db
+                        .continuation_dispatch_intent_for_successor(&successor.id)
+                        .await
+                        .unwrap(),
+                    Some(intent.clone())
+                );
+            }
+            if namespaced {
+                continue;
+            }
+            assert_eq!(
+                public_chat_post(&state, &successor.id, &body)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            let turn = state
+                .db
+                .workflow_repository()
+                .load_active_runtime_turn(&ConversationAuthority(successor.id.clone()))
+                .await
+                .unwrap()
+                .expect("exact manual opening accepted");
+            let payload =
+                PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+            assert_eq!(payload.submitted.message_id, intent.message_id.as_str());
+            assert_eq!(payload.submitted.text, text);
+            assert_eq!(payload.delivery.text, text);
+            assert_eq!(
+                payload.submitted.user_agent.as_deref(),
+                Some("original-agent")
+            );
+            assert_eq!(
+                payload.delivery.user_agent.as_deref(),
+                Some("original-agent")
+            );
+            assert!(payload.delivery.llm_text.is_none());
+            assert_eq!(
+                public_chat_post(&state, &successor.id, &body)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_chat_default_still_expands_and_rejects_unknown_policy() {
+        let state = make_state().await;
+        let cwd = tempfile::tempdir().unwrap();
+        state
+            .db
+            .create_conversation(
+                "expand",
+                "expand",
+                cwd.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for policy in [None, Some("expand_references")] {
+            let mut body = serde_json::json!({"text": "@nonexistent-literal-chat-file.txt", "message_id": "m"});
+            if let Some(policy) = policy {
+                body["expansion_policy"] = serde_json::json!(policy);
+            }
+            let response = public_chat_post(&state, "expand", &body).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let error = literal_chat_body(response).await;
+            assert_eq!(error["error_type"], "file_not_found");
+            assert_eq!(error["reference"], "@nonexistent-literal-chat-file.txt");
+        }
+        let mut body = serde_json::json!({"text": "plain text", "message_id": "m"});
+        for (policy, expected_status) in [
+            (
+                serde_json::json!("generated_predecessor_context"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!("unknown"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (serde_json::Value::Null, StatusCode::BAD_REQUEST),
+            (serde_json::json!(1), StatusCode::BAD_REQUEST),
+        ] {
+            body["expansion_policy"] = policy;
+            assert_eq!(
+                public_chat_post(&state, "expand", &body).await.status(),
+                expected_status,
+                "expansion_policy={}",
+                body["expansion_policy"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_keeps_auth_and_attachment_validation() {
+        let mut state = make_state().await;
+        state
+            .db
+            .create_conversation("bounds", "bounds", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut body = serde_json::json!({"text": "literal", "message_id": "m", "expansion_policy": "literal_text"});
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "test-password".to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            public_chat_post(&state, "bounds", &body).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        state.password = None;
+        body["files"] = serde_json::json!([{
+            "original_name": "secret", "media_type": "text/plain", "size_bytes": 1,
+            "stored_path": "/etc/passwd",
+        }]);
+        assert_eq!(
+            public_chat_post(&state, "bounds", &body).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state
+            .db
+            .get_steering_queue("bounds")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .workflow_repository()
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                "bounds".to_string()
+            ))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_accepts_valid_bearer_authentication() {
+        use tower::ServiceExt as _;
+        let mut state = make_state().await;
+        let id = "literal-authenticated";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "test-password".to_string(),
+            )
+            .unwrap(),
+        );
+        state
+            .runtime
+            .inject_handle_for_test(id, ConvState::LlmRequesting { attempt: 1 })
+            .await;
+        let text = "/spears @missing authenticated literal";
+        let body = serde_json::json!({
+            "text": text, "message_id": "authenticated-message", "expansion_policy": "literal_text",
+        });
+        let response = create_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/conversations/{id}/chat"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-password")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(literal_chat_body(response).await["steering"], true);
+        let queue = state.db.get_steering_queue(id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].text, text);
+        assert!(queue[0].llm_text.is_none());
+        assert!(queue[0].skill_invocation.is_none());
+    }
+
+    #[tokio::test]
+    async fn public_literal_chat_keeps_close_and_history_admission() {
+        for (id, expected) in [
+            ("literal-closing", "close_admission_fenced"),
+            ("literal-history", "target_unavailable"),
+        ] {
+            let state = make_state().await;
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let conversation = state.db.get_conversation(id).await.unwrap();
+            if expected == "close_admission_fenced" {
+                state
+                    .db
+                    .begin_close_foundation(
+                        &conversation.product_conversation_id,
+                        &phoenix_core::domain::close::TranscriptConversationId::parse(id).unwrap(),
+                        "literal-close-attempt",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query(
+                    "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+                )
+                .bind(conversation.product_conversation_id.as_str())
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            }
+            let body = serde_json::json!({"text": "/spears @Cargo.toml", "message_id": "m", "expansion_policy": "literal_text"});
+            let response = public_chat_post(&state, id, &body).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(literal_chat_body(response).await["error_type"], expected);
+            assert!(state.db.get_steering_queue(id).await.unwrap().is_empty());
+            assert!(state
+                .db
+                .workflow_repository()
+                .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(id.to_string()))
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
     /// Regression for FM-7: DB row says `Idle`, live runtime says `LlmRequesting`.
     /// `POST /chat` must queue the message as a steering directive, not reject it
     /// with `AgentBusy` after a spurious `200 OK`.
@@ -18139,6 +19040,7 @@ mod chat_authority_tests {
         // POST /chat: must queue as steering (not reject AgentBusy).
         let req = ChatRequest {
             text: "continue please".to_string(),
+            expansion_policy: ChatExpansionPolicy::ExpandReferences,
             message_id: uuid::Uuid::new_v4().to_string(),
             images: vec![],
             files: vec![],
@@ -18199,6 +19101,7 @@ mod chat_authority_tests {
             Path("c-cancel".to_string()),
             Json(ChatRequest {
                 text: "cancel me".to_string(),
+                expansion_policy: ChatExpansionPolicy::ExpandReferences,
                 message_id: message_id.clone(),
                 images: Vec::new(),
                 files: Vec::new(),
@@ -18266,6 +19169,7 @@ mod chat_authority_tests {
                 Path("c-order".to_string()),
                 Json(ChatRequest {
                     text: text.to_string(),
+                    expansion_policy: ChatExpansionPolicy::ExpandReferences,
                     message_id: message_id.to_string(),
                     images: Vec::new(),
                     files: Vec::new(),
@@ -19925,7 +20829,7 @@ mod detached_task_worktree_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }

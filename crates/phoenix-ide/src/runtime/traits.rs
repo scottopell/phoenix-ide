@@ -120,6 +120,18 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String>;
+
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        _work_scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     async fn coordinator_home_scope(
         &self,
     ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
@@ -782,6 +794,13 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
+        (**self).read_message_continuation_opening(message_id).await
+    }
+
     async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String> {
         (**self).has_pending_continuation_opening(conv_id).await
     }
@@ -1582,6 +1601,26 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn read_message_continuation_opening(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
+        self.db
+            .read_message_continuation_opening(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_work_scope_legacy_conversation_id(
+        &self,
+        work_scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> Result<Option<String>, String> {
+        self.db
+            .get_work_scope_legacy_conversation_id(work_scope_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn coordinator_home_scope(
         &self,
     ) -> Result<Option<crate::work_scope::WorkScopeEnvironmentRecord>, String> {
@@ -1906,6 +1945,13 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
         use phoenix_db::workflow::PreflightDirectTurnMaterializationInput;
         use phoenix_workflow::TurnAuthorityId;
+        #[cfg(test)]
+        crate::opening_qualifier::before_authoritative_message(
+            &self.db,
+            authority.turn_id.0,
+            &payload.submitted.message_id,
+        )
+        .await?;
         let repo = self.db.workflow_repository();
         let local_authority = direct_turn_local_authority(authority);
         repo.preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
@@ -1929,6 +1975,13 @@ impl MessageStore for DatabaseStorage {
         use phoenix_workflow::TurnAuthorityId;
         let repo = self.db.workflow_repository();
         let local_authority = direct_turn_local_authority(&input.authority);
+        #[cfg(test)]
+        crate::opening_qualifier::before_authoritative_message(
+            &self.db,
+            input.authority.turn_id.0,
+            &input.payload.submitted.message_id,
+        )
+        .await?;
         let materialized = repo
             .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
                 turn_id: TurnAuthorityId(input.authority.turn_id.0),

@@ -51,6 +51,12 @@ As an AI agent optimizing a web app, I need to measure performance under a repro
 
 The `browser_navigate` tool SHALL navigate to a specified URL and wait for the page to be ready for interaction
 
+WHEN the destination equals the current URL
+`browser_navigate` SHALL reload the document, replacing its DOM and JavaScript state while retaining browser-session cookies and origin storage
+
+WHEN only the URL fragment changes
+`browser_navigate` SHALL preserve native navigation semantics and complete without requiring a document load event when the browser performs same-document navigation
+
 WHEN navigation fails (network error, DNS failure, timeout, HTTP error)
 `browser_navigate` SHALL return a clear error message indicating the failure type
 
@@ -71,7 +77,8 @@ WHEN the expression returns a Promise
 `browser_eval` SHALL await the Promise and return the resolved value (configurable via the `await` parameter)
 
 WHEN execution throws an exception
-`browser_eval` SHALL return the error message and context
+`browser_eval` SHALL return a concise error message with an available source location
+AND SHALL retain the full exception context, including any stack trace, separately from the concise summary
 
 WHEN the result exceeds 4096 bytes
 `browser_eval` SHALL write output to a temp file and return the file path
@@ -88,6 +95,16 @@ The `browser_take_screenshot` tool SHALL capture a screenshot of the current vie
 
 WHEN a CSS selector is provided
 `browser_take_screenshot` SHALL capture only the matching element
+
+WHEN an explicit output path is provided
+`browser_take_screenshot` SHALL require a nonempty absolute server-filesystem path before browser access,
+SHALL save the PNG at that path, replacing an existing regular file when writing succeeds,
+AND SHALL report that same saved path in the result.
+
+THE SYSTEM SHALL reject a symbolic-link or non-regular-file output destination without writing through it.
+
+WHEN the destination cannot be written
+`browser_take_screenshot` SHALL report the save failure rather than claim a saved screenshot.
 
 THE SYSTEM SHALL make the screenshot visible to the agent by passing the saved path to `read_image`
 
@@ -107,6 +124,12 @@ THE SYSTEM SHALL automatically capture console messages (log, warn, error, info)
 The `browser_recent_console_logs` tool SHALL retrieve recent captured log entries, newest first, up to a configurable limit (default: 100)
 
 The `browser_clear_console_logs` tool SHALL discard all captured log entries, resetting the buffer
+
+THE SYSTEM SHALL bound each incoming frame and message on the console-capture CDP connection to 8 MiB before deserialization
+
+WHEN console context ownership cannot be established or the console listener fails
+THE SYSTEM SHALL expose the failure to navigation capture and log the listener or ownership failure
+AND SHALL NOT represent unavailable navigation capture as an empty successful capture.
 
 WHEN output from `browser_recent_console_logs` exceeds 4096 bytes
 `browser_recent_console_logs` SHALL write the full output to a temp file and return the file path
@@ -163,13 +186,19 @@ THE SYSTEM SHALL use the cached browser without downloading again
 
 ### REQ-BT-008: Reliable Element Clicking
 
-The `browser_click` tool SHALL click a page element identified by CSS selector using CDP-level mouse events
+The `browser_click` tool SHALL click a page element identified by exactly one CSS `selector` or accessibility snapshot `ref` using CDP-level mouse events
+
+WHEN both target fields or neither target field is supplied
+`browser_click` SHALL reject the request before interacting with the page
 
 WHEN the target element does not exist
 `browser_click` SHALL return a clear error indicating the element was not found
 
-WHEN the `wait` parameter is set to true
+WHEN a CSS selector is supplied and the `wait` parameter is set to true
 `browser_click` SHALL wait for the element to appear in the DOM before clicking
+
+WHEN a snapshot reference is supplied
+`browser_click` SHALL resolve only the original referenced node under REQ-BT-025 and SHALL NOT wait for a replacement element
 
 `browser_click` SHALL reliably trigger event handlers regardless of the UI framework in use (React, Vue, Angular, plain DOM)
 
@@ -181,7 +210,13 @@ WHEN the `wait` parameter is set to true
 
 ### REQ-BT-009: Reliable Text Input
 
-The `browser_type` tool SHALL type text into an input element identified by CSS selector using CDP-level keyboard events
+The `browser_type` tool SHALL type text into an input element identified by exactly one CSS `selector` or accessibility snapshot `ref` using CDP-level keyboard events
+
+WHEN both target fields or neither target field is supplied
+`browser_type` SHALL reject the request before interacting with the page
+
+WHEN a snapshot reference is supplied
+`browser_type` SHALL resolve only the original referenced node under REQ-BT-025
 
 WHEN the target element does not exist
 `browser_type` SHALL return a clear error indicating the element was not found
@@ -194,6 +229,56 @@ WHEN the `clear` parameter is set to true
 **Rationale:** Directly setting an element's value property does not fire the synthetic events that React/Vue listen to. CDP-level keyboard events correctly trigger all framework event handlers.
 
 **User Stories:** US-2
+
+---
+
+### REQ-BT-025: Accessibility Snapshots and Element References
+
+WHEN `browser_snapshot` is invoked
+THE SYSTEM SHALL return a compact, nested representation of Chrome's accessibility tree for the main document, including accessible roles, names, values, and relevant states exposed by Chrome
+
+THE SYSTEM SHALL omit ignored accessibility nodes while preserving their included descendants and nesting
+
+WHEN `interactive` is true (default: false)
+`browser_snapshot` SHALL restrict output to interactive nodes, preserving their relative hierarchy
+
+THE SYSTEM SHALL exclude iframe documents and SHALL include shadow-tree content to the extent Chrome exposes it in the main document's accessibility tree
+
+THE SYSTEM SHALL provide opaque references for supported interactive DOM elements, including supported shadow-tree nodes
+AND SHALL NOT issue interaction references for document or web-area roots
+
+THE SYSTEM SHALL bind every reference to the originating browser instance, main document, and exact DOM node, rather than an accessible name, selector, or position
+
+WHEN a snapshot attempt begins
+THE SYSTEM SHALL invalidate the browser's previous snapshot references, including when the new attempt fails
+
+WHEN snapshot collection detects a main-document change
+`browser_snapshot` SHALL fail visibly and SHALL NOT publish usable references from the interrupted collection
+
+WHEN a reference is missing, malformed, from another browser or snapshot, belongs to a replaced document, or targets a detached node
+THE SYSTEM SHALL reject the action with instructions to take `browser_snapshot` again and SHALL NOT resolve it to a replacement node
+
+WHEN ordinary DOM changes leave the referenced node attached to its original document
+THE SYSTEM SHALL retain that reference until a new snapshot attempt or browser teardown invalidates it
+
+THE SYSTEM SHALL bound snapshot output to 2000 displayed nodes and 256 KiB of text, explicitly report truncation, and issue references only for nodes included in the output
+
+WHEN formatted snapshot output exceeds 4096 bytes
+THE SYSTEM SHALL write the bounded output to an owner-only temporary file in an owner-only directory and return its path with any truncation notice
+AND SHALL retire that owned artifact when the references are invalidated or the browser is torn down
+
+THE SYSTEM SHALL cap the complete incoming snapshot CDP message and individual frame at 8 MiB before deserializing the accessibility tree
+AND SHALL report oversized collection responses as visible failures
+
+WHEN a reference interaction times out after browser-side input may have begun
+THE SYSTEM SHALL report that the action may have partially executed and instruct the caller to inspect page state before retrying
+
+WHEN collection fails or exceeds its timeout (default: 15 seconds)
+`browser_snapshot` SHALL return a visible error rather than an empty successful snapshot
+
+**Rationale:** Agents need readable page structure and unambiguous interaction targets without inventing CSS selectors. Node-bound references distinguish duplicate labels and prevent stale actions from targeting an unrelated replacement element.
+
+**User Stories:** US-1, US-2
 
 ---
 
@@ -370,9 +455,11 @@ WHEN a conversation accesses browser state
 THE SYSTEM SHALL resolve the lookup from its opaque persisted `work_scope_id`
 AND SHALL NOT derive browser identity from its conversation id, working directory, or worktree path
 
-WHEN `BrowserSession::new` constructs a Chrome instance
+WHEN the IDE constructs a Chrome instance
 THE SYSTEM SHALL derive the user data directory from the same scope key
-AND two sessions resolving to the same scope SHALL share the same on-disk profile
+AND two IDE sessions resolving to the same scope SHALL share the same on-disk profile
+
+The standalone CLI's explicitly selected transient-profile policy is governed by `../browser-cli/requirements.md` REQ-BCLI-006a. It does not change IDE profile derivation, continuation inheritance, process-epoch Close authority, or the prohibition on adopting untrusted profiles.
 
 **Rationale:** Conversations retaining one persisted scope are the same unit of work. Their tools should drive the same Chrome window — including open tabs, cookies, and dev-tools state — without a continuation observing a silent re-login. Distinct persisted scopes remain isolated even when their environments point at the same path.
 
@@ -403,27 +490,25 @@ THE SYSTEM SHALL derive `browser_session_active` from `is_active(&WorkScope)` of
 
 ### REQ-BROWSER-WS-003: Cascade Integration
 
-WHEN the resource-cleanup cascade runs (archive / abandon / mark-merged / hard-delete)
-THE SYSTEM SHALL invoke `cascade_browser_on_delete(manager, &WorkScope, inheritor_scope)`
-AND `inheritor_scope` SHALL be `Some(work_scope)` iff a live conversation other than the one being deleted resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope — and `None` otherwise, where a live conversation is one that is BOTH non-terminal in state AND not `archived` according to the persisted conversation rows in the DATABASE, NOT merely one that holds a live runtime handle (a non-terminal conversation with no runtime handle, after a server restart or runtime eviction, is still a live owner)
-AND the deleted conversation SHALL be excluded from that live-owner enumeration, because the cascade runs before its terminal-state write so it still reads non-terminal
-AND an `archived` conversation SHALL NOT count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs
-AND failures of the per-resource kills SHALL log WARN and continue
-    (consistent with the bash / tmux / projects cascade error policy)
+WHEN an individual execution-row cleanup occurs without retiring its ProductConversation
+THE SYSTEM SHALL preserve the scope's browser session while another non-terminal, non-archived member retains that exact persisted scope
+AND SHALL determine retention from persisted rows rather than process-local runtime handles
+AND SHALL exclude the row being cleaned from that enumeration.
 
-WHEN the live-owner enumeration itself cannot be answered because the database is unreadable
-THE SYSTEM SHALL refuse the cascade and surface the error to the caller, rather than derive `inheritor_scope` from an assumed-live answer
-    (assuming "live" would skip every resource + worktree teardown while the row is archived/deleted, orphaning resources with no retry; refusing lets the caller retry once the DB is healthy, and the refusal precedes every side effect so it leaves no partial state)
+WHEN a ProductConversation is retired through Close/Delete or equivalent aggregate cleanup
+THE SYSTEM SHALL use aggregate retirement authority rather than execution-row liveness
+AND SHALL NOT let continuations or subordinate execution rows belonging to that same aggregate veto its resource retirement
+AND SHALL preserve a scope only for a distinct still-Open aggregate owner
+AND SHALL surface unresolved identity conflicts instead of guessing ownership.
 
-WHEN `inheritor_scope == Some(work_scope)` (the scope is still owned by a live conversation other than the deleted one)
-THE SYSTEM SHALL skip the session kill
-    (the surviving owner is still driving the same Chrome window)
+WHEN the applicable ownership enumeration cannot be answered
+THE SYSTEM SHALL refuse cleanup and surface the error before side effects rather than assume a retaining owner.
 
-WHEN `inheritor_scope` is `None`
-THE SYSTEM SHALL tear the session down
-    (the deleted conversation was the last live owner — excluding it from the enumeration is what makes this reachable)
+WHEN there is no retaining owner under the applicable lifecycle boundary
+THE SYSTEM SHALL tear down the browser session
+AND failures of per-resource kills SHALL be logged and handled by the owning cascade or durable retirement lifecycle.
 
-**Rationale:** Before this requirement, archive/abandon killed bash + tmux but leaked Chrome until Phoenix restart. The preservation signal is correct by construction — it asks "are my resources still owned by someone live other than me?" rather than relying on the implicit invariant "Worktree continuations always inherit the same worktree." Continuation is one way a scope outlives a conversation; a live sibling such as a Work-mode sub-agent sharing its parent's scope is another. The same shape applies to tmux (REQ-TMUX-WS-002) and the terminal (REQ-TERM-WS-001).
+The execution-row cascade rules in `browser-lifecycle.allium` describe the first boundary. Aggregate retirement is governed by `specs/bedrock/requirements.md` and its durable Close lifecycle; same-aggregate row preservation is not an aggregate retirement exemption.
 
 **User Stories:** US-2, US-3
 
@@ -760,29 +845,30 @@ The auto-mount trigger is the server-authoritative `browser_session_state` lifec
 
 ## Requirements Traceability
 
-| Requirement | User Story | MVP |
-|-------------|------------|-----|
-| REQ-BT-001: Navigate to URLs | US-1, US-2, US-3 | ✅ |
-| REQ-BT-002: Execute JavaScript | US-1, US-2 | ✅ |
-| REQ-BT-003: Take Screenshots | US-1, US-2 | ✅ |
-| REQ-BT-004: Capture Console Logs | US-1, US-2 | ✅ |
-| REQ-BT-005: Resize Viewport | US-1 | ✅ |
-| REQ-BT-006: Read Image Files | US-1, US-2 | ✅ |
-| REQ-BT-007: Reliable Browser Availability | US-1, US-2, US-3 | ✅ |
-| REQ-BT-008: Reliable Element Clicking | US-2 | ✅ |
-| REQ-BT-009: Reliable Text Input | US-2 | ✅ |
-| REQ-BT-010: Implicit Session Model | US-1, US-2, US-3 | ✅ |
-| REQ-BT-011: State Persistence | US-2 | ✅ |
-| REQ-BT-012: Stateless Tools with Context | US-1, US-2, US-3 | ✅ |
-| REQ-BT-013: Wait for Async Page Elements | US-1, US-2 | ✅ |
-| REQ-BT-014: Accurate Console Log Object Representation | US-1, US-2 | ✅ |
-| REQ-BT-015: Access to Full Console Log Content | US-1, US-2 | 🟡 |
-| REQ-BT-016: Keyboard Shortcut Input | US-2 | ✅ |
-| REQ-BT-017: React Component Access | US-1, US-2 | ✅ |
-| REQ-BT-018: Live Browser View Side Panel | US-4, US-1, US-2 | ✅ |
-| REQ-BT-019: Systematic Web Performance Testing | US-5, US-1, US-2 | 🟡 |
-| REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
-| REQ-BT-021: Network Request Source | US-3 | ❌ |
-| REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |
-| REQ-BT-023: Multi-Context Console | US-3 | ❌ |
-| REQ-BT-024: Capture Network Requests | US-1, US-2 | ❌ |
+| Requirement | User Story |
+|-------------|------------|
+| REQ-BT-001: Navigate to URLs | US-1, US-2, US-3 |
+| REQ-BT-002: Execute JavaScript | US-1, US-2 |
+| REQ-BT-003: Take Screenshots | US-1, US-2 |
+| REQ-BT-004: Capture Console Logs | US-1, US-2 |
+| REQ-BT-005: Resize Viewport | US-1 |
+| REQ-BT-006: Read Image Files | US-1, US-2 |
+| REQ-BT-007: Reliable Browser Availability | US-1, US-2, US-3 |
+| REQ-BT-008: Reliable Element Clicking | US-2 |
+| REQ-BT-009: Reliable Text Input | US-2 |
+| REQ-BT-010: Implicit Session Model | US-1, US-2, US-3 |
+| REQ-BT-011: State Persistence | US-2 |
+| REQ-BT-012: Stateless Tools with Context | US-1, US-2, US-3 |
+| REQ-BT-013: Wait for Async Page Elements | US-1, US-2 |
+| REQ-BT-014: Accurate Console Log Object Representation | US-1, US-2 |
+| REQ-BT-015: Access to Full Console Log Content | US-1, US-2 |
+| REQ-BT-016: Keyboard Shortcut Input | US-2 |
+| REQ-BT-017: React Component Access | US-1, US-2 |
+| REQ-BT-018: Live Browser View Side Panel | US-4, US-1, US-2 |
+| REQ-BT-019: Systematic Web Performance Testing | US-5, US-1, US-2 |
+| REQ-BT-020: Service Worker Inspection | US-3 |
+| REQ-BT-021: Network Request Source | US-3 |
+| REQ-BT-022: Offline Mode Simulation | US-3 |
+| REQ-BT-023: Multi-Context Console | US-3 |
+| REQ-BT-024: Capture Network Requests | US-1, US-2 |
+| REQ-BT-025: Accessibility Snapshots and Element References | US-1, US-2 |

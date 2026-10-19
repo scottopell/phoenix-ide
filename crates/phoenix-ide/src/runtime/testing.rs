@@ -1256,6 +1256,16 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn read_message_continuation_opening(
+        &self,
+        _message_id: &str,
+    ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
+        if *self.fail_continuation_handoff_provenance.lock().unwrap() {
+            return Err("injected continuation handoff provenance failure".into());
+        }
+        Ok(None)
+    }
+
     async fn has_pending_continuation_opening(&self, _conv_id: &str) -> Result<bool, String> {
         Ok(false)
     }
@@ -4542,7 +4552,7 @@ mod tests {
                         SseEvent::Token { .. } => {
                             last_token_idx = Some(idx);
                         }
-                        SseEvent::Message { message } => {
+                        SseEvent::Message { message, .. } => {
                             if matches!(message.message_type, MessageType::Agent)
                                 && first_agent_msg_idx.is_none()
                             {

@@ -237,10 +237,64 @@ pub struct UpgradeModelRequest {
     pub service_tier: Option<phoenix_core::domain::llm_types::ServiceTier>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatExpansionPolicy {
+    #[default]
+    ExpandReferences,
+    LiteralText,
+}
+
+impl From<ChatExpansionPolicy> for crate::send_chat_service::MessageExpansionPolicy {
+    fn from(value: ChatExpansionPolicy) -> Self {
+        match value {
+            ChatExpansionPolicy::ExpandReferences => Self::ExpandReferences,
+            ChatExpansionPolicy::LiteralText => Self::LiteralText,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn chat_expansion_policy_is_closed_and_defaults_to_references() {
+    let request = |policy: Option<serde_json::Value>| {
+        let mut body = serde_json::json!({"text": "/literal @file:missing", "message_id": "m"});
+        if let Some(policy) = policy {
+            body["expansion_policy"] = policy;
+        }
+        serde_json::from_value::<ChatRequest>(body)
+    };
+    assert_eq!(
+        request(None).unwrap().expansion_policy,
+        ChatExpansionPolicy::ExpandReferences
+    );
+    for (wire, expected) in [
+        ("expand_references", ChatExpansionPolicy::ExpandReferences),
+        ("literal_text", ChatExpansionPolicy::LiteralText),
+    ] {
+        assert_eq!(
+            request(Some(serde_json::json!(wire)))
+                .unwrap()
+                .expansion_policy,
+            expected
+        );
+    }
+    for invalid in [
+        serde_json::json!("generated_predecessor_context"),
+        serde_json::json!("future"),
+        serde_json::Value::Null,
+        serde_json::json!(true),
+    ] {
+        assert!(request(Some(invalid)).is_err());
+    }
+}
+
 /// Request to send a chat message
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub text: String,
+    #[serde(default)]
+    pub expansion_policy: ChatExpansionPolicy,
     /// Client-generated UUID - the canonical identifier for this message
     /// Enables idempotent retries (sending same `message_id` twice = no duplicate)
     pub message_id: String,
@@ -284,12 +338,6 @@ pub struct AttachmentUploadResponse {
 pub struct ImageAttachment {
     pub data: String,
     pub media_type: String,
-}
-
-/// Request to rename a conversation
-#[derive(Debug, Deserialize)]
-pub struct RenameRequest {
-    pub name: String,
 }
 
 /// Response with a list of conversations
@@ -425,7 +473,85 @@ pub enum ProductConversationCloseUnavailableReasonView {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ProductConversationSnapshotView {
+#[allow(clippy::struct_field_names)]
+pub struct ContinuationOpeningEdgeView {
+    pub product_conversation_id: String,
+    pub predecessor_transcript_row_id: String,
+    pub successor_transcript_row_id: String,
+    pub continuation_message_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ContinuationOpeningPresentationView {
+    Boundary,
+    SeparateMessage,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ContinuationOpeningView {
+    None,
+    Pending {
+        edge: ContinuationOpeningEdgeView,
+        client_turn_key: String,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    },
+    Accepted {
+        edge: ContinuationOpeningEdgeView,
+        accepted_message_id: String,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+        presentation: ContinuationOpeningPresentationView,
+    },
+}
+
+impl From<crate::db::ContinuationOpeningRead> for ContinuationOpeningView {
+    fn from(read: crate::db::ContinuationOpeningRead) -> Self {
+        use crate::db::{ContinuationOpeningPresentation, ContinuationOpeningRead};
+        let edge_view = |edge: crate::db::ContinuationOpeningEdge| ContinuationOpeningEdgeView {
+            product_conversation_id: edge.product_conversation_id.to_string(),
+            predecessor_transcript_row_id: edge.predecessor_transcript_row_id,
+            successor_transcript_row_id: edge.successor_transcript_row_id,
+            continuation_message_id: edge.continuation_message_id,
+        };
+        match read {
+            ContinuationOpeningRead::None => Self::None,
+            ContinuationOpeningRead::Pending {
+                edge,
+                client_turn_key,
+                opening_authority,
+            } => Self::Pending {
+                edge: edge_view(edge),
+                client_turn_key: client_turn_key.to_string(),
+                opening_authority,
+            },
+            ContinuationOpeningRead::Accepted {
+                edge,
+                accepted_message_id,
+                opening_authority,
+                presentation,
+            } => Self::Accepted {
+                edge: edge_view(edge),
+                accepted_message_id,
+                opening_authority,
+                presentation: match presentation {
+                    ContinuationOpeningPresentation::Boundary => {
+                        ContinuationOpeningPresentationView::Boundary
+                    }
+                    ContinuationOpeningPresentation::SeparateMessage => {
+                        ContinuationOpeningPresentationView::SeparateMessage
+                    }
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationSnapshotMetadataView {
     pub product_conversation_id: String,
     pub close: Option<ProductConversationCloseView>,
     pub canonical_route: String,
@@ -434,12 +560,70 @@ pub struct ProductConversationSnapshotView {
     pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
     pub latest_transcript_row_id: String,
     pub writable_transcript_row_id: Option<String>,
+    pub latest_opening: ContinuationOpeningView,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
     pub work_identity: Option<ProductConversationWorkIdentityView>,
     pub source: Option<ProductConversationSourceView>,
     pub chain_qa_compatibility: Option<ProductConversationChainQaCompatibilityView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationHistorySnapshotView {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub metadata: ProductConversationSnapshotMetadataView,
+    pub segments: Vec<ConversationHistorySegmentView>,
+    pub boundaries: Vec<ConversationHistoryBoundaryView>,
+    pub before: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConversationHistorySegmentView {
+    pub segment_ordinal: i64,
+    pub transcript_row_id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub messages: Vec<crate::api::wire::EnrichedMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationSnapshotView {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub metadata: ProductConversationSnapshotMetadataView,
     pub segments: Vec<ProductConversationSegmentView>,
+    pub before: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConversationHistoryBoundaryView {
+    pub message_id: String,
+    pub represented_successor_opening_message_id: Option<String>,
+    pub predecessor_transcript_row_id: String,
+    pub successor_transcript_row_id: String,
+    pub segment_ordinal: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CoordinatorConversationSnapshotView {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub requested_transcript_row_id: String,
+    pub canonical_root: ProductConversationTranscriptRowView,
+    pub latest_transcript_row_id: String,
+    pub writable_transcript_row_id: Option<String>,
+    pub latest_opening: ContinuationOpeningView,
+    pub updated_at: String,
+    pub segments: Vec<ConversationHistorySegmentView>,
+    pub boundaries: Vec<ConversationHistoryBoundaryView>,
     pub before: Option<String>,
     pub has_older: bool,
 }

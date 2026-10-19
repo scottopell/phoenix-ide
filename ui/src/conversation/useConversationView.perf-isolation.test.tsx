@@ -180,10 +180,11 @@ describe('useConversationView perf isolation (Finding B)', () => {
     // view — the isolation is selective, not a dead subscription.
     act(() => {
       store!.dispatch(SLUG, {
-        type: 'sse_message',
+        type: 'sse_message', opening: null,
         epoch: 1,
         sequenceId: 4,
         message: {
+          event_presentation: null,
           message_id: 'm1',
           message_type: 'assistant',
           content: [{ type: 'text', text: 'hi' }],

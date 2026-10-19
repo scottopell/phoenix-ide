@@ -3,7 +3,7 @@
 //! REQ-API-005: Real-time Streaming
 //!
 //! The serialization boundary lives in [`super::wire::SseWireEvent`]: every
-//! broadcast [`SseEvent`] is `From`-converted into the typed wire enum and
+//! broadcast [`SseEvent`] is asynchronously projected into the typed wire enum and
 //! then through `serde_json::to_string`. See `super::wire` for the rationale
 //! and for the ts-rs-driven TS codegen that downstream clients consume.
 
@@ -62,15 +62,102 @@ impl SseStreamAudience {
             if let SseEvent::Init {
                 steering_messages,
                 pending_events,
+                opening,
                 ..
             } = &mut event
             {
                 steering_messages.clear();
-                pending_events.retain(|pending| self.allows(pending));
+                if matches!(
+                    opening,
+                    Some(super::types::ContinuationOpeningView::Pending { .. })
+                ) {
+                    *opening = None;
+                }
+                *pending_events = std::mem::take(pending_events)
+                    .into_iter()
+                    .filter_map(|pending| self.prepare(pending))
+                    .collect();
+            }
+        }
+        if matches!(self, Self::SharedTranscript) {
+            if let SseEvent::MessageUpdated { opening, .. } | SseEvent::Message { opening, .. } =
+                &mut event
+            {
+                if matches!(
+                    opening,
+                    Some(super::types::ContinuationOpeningView::Pending { .. })
+                ) {
+                    *opening = None;
+                }
             }
         }
         Some(event)
     }
+}
+
+async fn enrich_update_opening(
+    db: &crate::db::Database,
+    event: &mut SseEvent,
+) -> Result<(), crate::db::DbError> {
+    if let SseEvent::MessageUpdated {
+        message_id,
+        transcript_generation,
+        content: Some(content),
+        opening,
+        display_data,
+        duration_ms,
+        ..
+    } = event
+    {
+        use phoenix_db::ContinuationOpeningUpdateRead;
+        *opening = match db
+            .read_message_continuation_opening_at_update(
+                message_id,
+                *transcript_generation,
+                content,
+            )
+            .await?
+        {
+            None => None,
+            Some(ContinuationOpeningUpdateRead::Current(read)) => Some(read.into()),
+            Some(ContinuationOpeningUpdateRead::Superseded {
+                content: committed_content,
+                transcript_generation: committed_generation,
+                display_data: committed_display,
+                opening: read,
+            }) => {
+                tracing::debug!(%message_id, ?transcript_generation, committed_generation,
+                    "reconciling superseded SSE opening update from committed state");
+                *content = committed_content;
+                *transcript_generation = Some(committed_generation);
+                *duration_ms = committed_display
+                    .as_ref()
+                    .and_then(|display| display.get("duration_ms"))
+                    .and_then(serde_json::Value::as_u64);
+                *display_data = committed_display;
+                Some(read.into())
+            }
+        };
+    }
+    Ok(())
+}
+
+async fn prepare_sse_delivery(
+    db: &crate::db::Database,
+    event: SseEvent,
+    audience: SseStreamAudience,
+) -> Result<Option<SseEvent>, crate::db::DbError> {
+    let Some(mut event) = audience.prepare(event) else {
+        return Ok(None);
+    };
+    if let SseEvent::Init { pending_events, .. } = &mut event {
+        for pending in pending_events {
+            enrich_update_opening(db, pending).await?;
+        }
+    } else {
+        enrich_update_opening(db, &mut event).await?;
+    }
+    Ok(audience.prepare(event))
 }
 
 /// Short-lived trace for the work required to produce the first usable SSE
@@ -146,47 +233,56 @@ fn conversation_keep_alive() -> KeepAlive {
 /// events long enough to mask client UI as "stuck on stale phase" between
 /// transitions. No-op for TCP-level forwarders, harmless either way.
 pub fn sse_stream(
+    db: crate::db::Database,
     conv_id: String,
     init_event: SseEvent,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
     init_trace: Option<SseInitTrace>,
     audience: SseStreamAudience,
 ) -> impl IntoResponse {
+    let init_db = db.clone();
     let init = futures::stream::once(async move {
         let serialization_started = std::time::Instant::now();
-        let event = sse_event_to_axum(
-            audience
-                .prepare(init_event)
-                .expect("init is visible to every SSE audience"),
-        );
+        let event = prepare_sse_delivery(&init_db, init_event, audience)
+            .await?
+            .expect("init is visible to every SSE audience");
+        let event = project_sse_event(&init_db, audience, event).await;
         if let Some(trace) = init_trace {
             trace.record_ms("stream.serialization_ms", serialization_started.elapsed());
             trace.record_ms("stream.time_to_init_ms", trace.started.elapsed());
             drop(trace);
         }
-        Ok::<Event, Infallible>(event)
+        Ok::<_, crate::db::DbError>(Some(event))
     });
 
     let broadcasts = BroadcastStream::new(broadcast_rx)
         .take_while(move |result| match result {
             Err(BroadcastStreamRecvError::Lagged(n)) => {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    lagged_by = n,
-                    "SSE broadcast lagged; closing stream so client reconnects and resyncs"
-                );
+                tracing::warn!(conv_id = %conv_id, lagged_by = n,
+                    "SSE broadcast lagged; closing stream so client reconnects and resyncs");
                 false
             }
             _ => true,
         })
-        .filter_map(move |result| match result {
-            Ok(event) => audience
-                .prepare(event)
-                .map(|event| Ok(sse_event_to_axum(event))),
-            Err(_) => None, // Lagged already closed the stream above
+        .then(move |result| {
+            let db = db.clone();
+            async move {
+                let event = result.expect("lagged stream is closed before delivery");
+                match prepare_sse_delivery(&db, event, audience).await? {
+                    Some(event) => Ok(Some(project_sse_event(&db, audience, event).await)),
+                    None => Ok(None),
+                }
+            }
         });
 
-    let combined = init.chain(broadcasts);
+    let combined = init.chain(broadcasts)
+        .take_while(|result| {
+            if let Err(error) = result {
+                tracing::error!(%error, "SSE opening observation mismatch/read failed; closing stream for reconciliation");
+                false
+            } else { true }
+        })
+        .filter_map(|result| result.ok().flatten().map(Ok::<_, Infallible>));
 
     // Typed `ping` event with non-empty data so the browser's EventSource
     // observes it via an explicit listener and the heartbeat watchdog can
@@ -204,9 +300,10 @@ pub fn sse_stream(
 }
 
 fn aggregate_broadcast_events(
+    db: crate::db::Database,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    BroadcastStream::new(broadcast_rx)
+    let events = BroadcastStream::new(broadcast_rx)
         .take_while(|result| match result {
             Err(BroadcastStreamRecvError::Lagged(n)) => {
                 tracing::warn!(
@@ -217,29 +314,58 @@ fn aggregate_broadcast_events(
             }
             _ => true,
         })
-        .filter_map(|result| match result {
-            Ok(event) => Some(Ok(sse_event_to_axum(event))),
-            Err(_) => None,
-        })
+        .filter_map(Result::ok);
+    futures::StreamExt::then(events, move |event| {
+        let db = db.clone();
+        async move { Ok(project_sse_event(&db, SseStreamAudience::Authenticated, event).await) }
+    })
 }
 
 pub(crate) fn aggregate_event_stream(
+    db: crate::db::Database,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
 ) -> impl IntoResponse {
-    let sse =
-        Sse::new(aggregate_broadcast_events(broadcast_rx)).keep_alive(conversation_keep_alive());
+    let sse = Sse::new(aggregate_broadcast_events(db, broadcast_rx))
+        .keep_alive(conversation_keep_alive());
     let mut headers = HeaderMap::new();
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     (headers, sse)
 }
 
+async fn project_sse_event(
+    db: &crate::db::Database,
+    audience: SseStreamAudience,
+    event: SseEvent,
+) -> Event {
+    wire_event_to_axum(&project_sse_wire(db, audience, event).await)
+}
+
+async fn project_sse_wire(
+    db: &crate::db::Database,
+    audience: SseStreamAudience,
+    event: SseEvent,
+) -> SseWireEvent {
+    use super::event_presentation::{event_messages, EventPresentations};
+    let presentations = match audience {
+        SseStreamAudience::Authenticated => {
+            EventPresentations::load(db, event_messages(&event)).await
+        }
+        SseStreamAudience::SharedTranscript => EventPresentations::redacted(),
+    };
+    SseWireEvent::with_presentations(event, &presentations)
+}
+
+#[cfg(test)]
 fn sse_event_to_axum(event: SseEvent) -> Event {
-    let wire: SseWireEvent = event.into();
+    wire_event_to_axum(&event.into())
+}
+
+fn wire_event_to_axum(wire: &SseWireEvent) -> Event {
     let event_type = wire.event_type();
     // SseWireEvent derives Serialize over types that themselves derive
     // Serialize (or carry `serde_json::Value`). `to_string` cannot fail
     // at this layer; if it did, we'd want to know loudly.
-    let data = serde_json::to_string(&wire).expect("SseWireEvent is always serializable");
+    let data = serde_json::to_string(wire).expect("SseWireEvent is always serializable");
     Event::default().event(event_type).data(data)
 }
 
@@ -280,6 +406,7 @@ mod tests {
                 pending_events,
                 pending_truncated,
                 transcript_generation,
+                opening,
             } => {
                 let transcript_coverage = transcript.coverage();
                 let enriched_msgs: Vec<Value> = transcript
@@ -315,18 +442,21 @@ mod tests {
                     "pending_anchor_sequence_id": pending_anchor_sequence_id,
                     "pending_events": pending_json,
                     "pending_truncated": pending_truncated,
+                    "opening": opening,
                 })
             }
-            SseEvent::Message { message } => {
+            SseEvent::Message { message, opening } => {
                 let sequence_id = message.sequence_id;
                 let message_value = enrich_message_for_api(message);
                 json!({
                     "type": "message",
                     "sequence_id": sequence_id,
                     "message": message_value,
+                    "opening": opening,
                 })
             }
             SseEvent::MessageUpdated {
+                opening,
                 sequence_id,
                 message_id,
                 transcript_generation,
@@ -336,6 +466,7 @@ mod tests {
             } => {
                 let mut obj = json!({
                     "type": "message_updated",
+                    "opening": opening,
                     "sequence_id": sequence_id,
                     "message_id": message_id,
                     "transcript_generation": transcript_generation,
@@ -562,7 +693,7 @@ mod tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }
@@ -653,9 +784,108 @@ mod tests {
     // Parity tests — one per SseEvent variant
     // ------------------------------------------------------------------
 
+    #[tokio::test]
+    async fn event_projection_matches_rest_init_pending_live_and_aggregate_and_redacts_share() {
+        let (db, messages) = super::super::event_presentation::tests::fixture(1).await;
+        let message = messages[0].clone();
+        let rest = super::super::event_presentation::enrich_messages(&db, &messages).await;
+        let expected = serde_json::to_value(&rest[0]).unwrap();
+        let live_event = SseEvent::Message {
+            message: message.clone(),
+            opening: None,
+        };
+        let prepared =
+            prepare_sse_delivery(&db, live_event.clone(), SseStreamAudience::Authenticated)
+                .await
+                .unwrap()
+                .unwrap();
+        let live = project_sse_wire(&db, SseStreamAudience::Authenticated, prepared).await;
+        let value = serde_json::to_value(live).unwrap();
+        assert_eq!(value["message"], expected);
+        assert_eq!(value.get("opening"), Some(&Value::Null));
+        let init = SseEvent::Init {
+            sequence_id: 1,
+            conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
+            transcript: crate::runtime::InitTranscript::Complete(messages),
+            opening: None,
+            steering_messages: Vec::new(),
+            agent_working: false,
+            presentation_mode: "idle".into(),
+            last_sequence_id: 1,
+            stream_incarnation: "test-stream".into(),
+            context_window_size: 0,
+            project_name: None,
+            pending_anchor_sequence_id: 0,
+            pending_events: vec![live_event.clone()],
+            pending_truncated: false,
+        };
+        let projected = project_sse_wire(&db, SseStreamAudience::Authenticated, init.clone()).await;
+        let value = serde_json::to_value(projected).unwrap();
+        assert_eq!(value["messages"][0], expected);
+        assert_eq!(value["pending_events"][0]["message"], expected);
+        for transcript in [
+            crate::runtime::InitTranscript::Tail(vec![message.clone()]),
+            crate::runtime::InitTranscript::Preserve,
+        ] {
+            let preserve = matches!(&transcript, crate::runtime::InitTranscript::Preserve);
+            let mut variant = init.clone();
+            if let SseEvent::Init {
+                transcript: rows,
+                pending_events,
+                ..
+            } = &mut variant
+            {
+                *rows = transcript;
+                pending_events.push(init.clone());
+            }
+            let collected = super::super::event_presentation::event_messages(&variant);
+            assert_eq!(collected.len(), if preserve { 3 } else { 4 });
+            let wire = project_sse_wire(&db, SseStreamAudience::Authenticated, variant).await;
+            let value = serde_json::to_value(wire).unwrap();
+            assert_eq!(
+                value["messages"].as_array().unwrap().len(),
+                usize::from(!preserve)
+            );
+            assert_eq!(value["pending_events"][0]["message"], expected);
+            assert_eq!(value["pending_events"][1]["messages"][0], expected);
+            assert_eq!(
+                value["pending_events"][1]["pending_events"][0]["message"],
+                expected
+            );
+        }
+        let prepared = prepare_sse_delivery(&db, init, SseStreamAudience::SharedTranscript)
+            .await
+            .unwrap()
+            .unwrap();
+        let shared = project_sse_wire(&db, SseStreamAudience::SharedTranscript, prepared).await;
+        let value = serde_json::to_value(shared).unwrap();
+        for projected in [
+            &value["messages"][0],
+            &value["pending_events"][0]["message"],
+        ] {
+            assert_eq!(projected["content"], expected["content"]);
+            assert_eq!(projected["event_presentation"]["reason"], "redacted");
+            assert!(projected["event_presentation"]
+                .get("display_name")
+                .is_none());
+        }
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        tx.send(live_event.clone()).unwrap();
+        let expected_event =
+            project_sse_event(&db, SseStreamAudience::Authenticated, live_event).await;
+        let mut stream = Box::pin(aggregate_broadcast_events(db, rx));
+        let aggregate_event = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            format!("{aggregate_event:?}"),
+            format!("{expected_event:?}")
+        );
+    }
+
     #[test]
     fn parity_init() {
         let event = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 42,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -716,9 +946,13 @@ mod tests {
                 presentation_mode: "working".to_string(),
                 state_updated_at: ts(),
             },
-            SseEvent::Message { message: eager },
+            SseEvent::Message {
+                opening: None,
+                message: eager,
+            },
         ];
         let event = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 45,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -766,6 +1000,7 @@ mod tests {
     #[test]
     fn parity_init_truncated() {
         let event = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 99,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -788,8 +1023,42 @@ mod tests {
     }
 
     #[test]
+    fn parity_opening_observation_is_envelope_authority_not_message_content() {
+        let opening = super::super::types::ContinuationOpeningView::Accepted {
+            edge: super::super::types::ContinuationOpeningEdgeView {
+                product_conversation_id: "product".into(), predecessor_transcript_row_id: "parent".into(),
+                successor_transcript_row_id: "successor".into(), continuation_message_id: "boundary".into(),
+            },
+            accepted_message_id: "accepted".into(),
+            opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            presentation: super::super::types::ContinuationOpeningPresentationView::Boundary,
+        };
+        let event = SseEvent::MessageUpdated {
+            sequence_id: 5,
+            message_id: "accepted".into(),
+            display_data: None,
+            content: None,
+            duration_ms: None,
+            transcript_generation: Some(1),
+            opening: Some(opening),
+        };
+        assert_eq!(
+            typed_sse_event_to_value(&event),
+            legacy_sse_event_to_json(&event)
+        );
+        assert_eq!(
+            typed_sse_event_to_value(&event)["opening"]["status"],
+            "accepted"
+        );
+        assert!(typed_sse_event_to_value(&event)["opening"]
+            .get("summary")
+            .is_none());
+    }
+
+    #[test]
     fn parity_message_user() {
         let event = SseEvent::Message {
+            opening: None,
             message: fixture_user_message(),
         };
         assert_parity(&event);
@@ -802,6 +1071,7 @@ mod tests {
         // a `display` field on matching bash tool_use blocks. The typed
         // path must produce the same merged content.
         let event = SseEvent::Message {
+            opening: None,
             message: fixture_agent_message_with_bash(),
         };
         assert_parity(&event);
@@ -826,6 +1096,7 @@ mod tests {
     #[test]
     fn parity_message_updated_with_display_data() {
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 7,
             message_id: "msg-abc".to_string(),
             transcript_generation: Some(3),
@@ -840,6 +1111,7 @@ mod tests {
     fn parity_message_updated_with_content() {
         use phoenix_llm::ContentBlock;
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 9,
             message_id: "msg-def".to_string(),
             transcript_generation: Some(4),
@@ -855,6 +1127,7 @@ mod tests {
     #[test]
     fn parity_message_updated_both_nulls() {
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 11,
             message_id: "msg-xyz".to_string(),
             transcript_generation: Some(5),
@@ -869,6 +1142,7 @@ mod tests {
     fn parity_message_updated_with_duration_ms() {
         // Typed `duration_ms` must appear in the serialized output.
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 12,
             message_id: "msg-tool-result".to_string(),
             transcript_generation: Some(6),
@@ -1206,6 +1480,7 @@ mod tests {
     #[test]
     fn shared_audience_filters_steering_from_init_and_replay() {
         let init = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: 24,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -1307,6 +1582,7 @@ mod tests {
         // `applyIfNewer` guard on its live delivery.
         let init_seq = std::cmp::max(initial_last_seq, highest_pending_seq);
         let init = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -1407,6 +1683,7 @@ mod tests {
 
         let init_seq = std::cmp::max(0_i64, highest);
         let init = SseEvent::Init {
+            opening: Some(crate::api::types::ContinuationOpeningView::None),
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
@@ -1439,7 +1716,10 @@ mod tests {
         tx.send(event()).unwrap();
         tx.send(event()).unwrap();
 
-        let mut stream = Box::pin(aggregate_broadcast_events(rx));
+        let mut stream = Box::pin(aggregate_broadcast_events(
+            crate::db::Database::open_in_memory().await.unwrap(),
+            rx,
+        ));
         assert!(stream.next().await.is_none());
     }
 
@@ -1455,11 +1735,429 @@ mod tests {
         );
     }
 
+    fn update_test_init(pending_events: Vec<SseEvent>) -> SseEvent {
+        SseEvent::Init {
+            opening: Some(super::super::types::ContinuationOpeningView::None),
+            sequence_id: 24,
+            conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 2,
+            transcript: crate::runtime::InitTranscript::Complete(Vec::new()),
+            steering_messages: vec![],
+            agent_working: false,
+            presentation_mode: "idle".into(),
+            last_sequence_id: 24,
+            stream_incarnation: "test-stream".into(),
+            context_window_size: 0,
+            project_name: None,
+            pending_anchor_sequence_id: 20,
+            pending_events,
+            pending_truncated: false,
+        }
+    }
+
+    #[test]
+    fn shared_audience_redacts_pending_keys_in_live_and_replayed_observations() {
+        let pending = super::super::types::ContinuationOpeningView::Pending {
+            edge: super::super::types::ContinuationOpeningEdgeView {
+                product_conversation_id: "product".into(),
+                predecessor_transcript_row_id: "parent".into(),
+                successor_transcript_row_id: "child".into(),
+                continuation_message_id: "boundary".into(),
+            },
+            client_turn_key: "private-unpublished-key".into(),
+            opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+        };
+        let event = SseEvent::MessageUpdated {
+            opening: Some(pending.clone()),
+            sequence_id: 22,
+            message_id: "opening-key".into(),
+            transcript_generation: None,
+            display_data: None,
+            content: None,
+            duration_ms: None,
+        };
+        for mut carrier in [event.clone(), update_test_init(vec![event])] {
+            if let SseEvent::Init { opening, .. } = &mut carrier {
+                *opening = Some(pending.clone());
+            }
+            let authenticated: SseWireEvent = SseStreamAudience::Authenticated
+                .prepare(carrier.clone())
+                .unwrap()
+                .into();
+            assert!(serde_json::to_string(&authenticated)
+                .unwrap()
+                .contains("private-unpublished-key"));
+            let shared: SseWireEvent = SseStreamAudience::SharedTranscript
+                .prepare(carrier)
+                .unwrap()
+                .into();
+            assert!(!serde_json::to_string(&shared)
+                .unwrap()
+                .contains("private-unpublished-key"));
+        }
+    }
+
+    fn decode_update_test_chunk(chunk: &str) -> (i64, Value) {
+        let payload = chunk
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("event has JSON data");
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        let id = payload["sequence_id"]
+            .as_i64()
+            .expect("sequenced event has a payload cursor");
+        (id, payload)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn delayed_update_reconciles_committed_content_without_poisoning_reconnect() {
+        use phoenix_core::domain::db_schema::ContinuationContent;
+        use phoenix_db::{ContinueOutcome, NewContinuationDispatchIntent};
+        use phoenix_workflow::ClientTurnKey;
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("update-root", "update-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let restored = MessageContent::Continuation(ContinuationContent {
+            summary: "context".into(),
+        });
+        db.add_message("boundary", &root.id, &restored, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "context".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let (outcome, _) = db
+            .continue_conversation_with_intent(
+                &root.id,
+                NewContinuationDispatchIntent::generated_predecessor_context(
+                    ClientTurnKey::try_from("opening-key").unwrap(),
+                    "context".into(),
+                ),
+            )
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected successor");
+        };
+        db.add_message("opening-key", &successor.id, &restored, None, None)
+            .await
+            .unwrap();
+        let edited = MessageContent::Continuation(ContinuationContent {
+            summary: "edit A".into(),
+        });
+        let mut delayed = SseEvent::MessageUpdated {
+            opening: None,
+            sequence_id: 22,
+            message_id: "opening-key".into(),
+            transcript_generation: Some(1),
+            display_data: Some(json!({"stale-display": true})),
+            content: Some(edited.clone()),
+            duration_ms: None,
+        };
+        let ordinary = MessageContent::Continuation(ContinuationContent {
+            summary: "owed ordinary edit".into(),
+        });
+        db.add_message("ordinary-key", &successor.id, &ordinary, None, None)
+            .await
+            .unwrap();
+        for (generation, content) in [(1, &edited), (3, &restored)] {
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = 'opening-key'")
+                .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE conversations SET transcript_generation = ?1 WHERE id = ?2")
+                .bind(generation)
+                .bind(&successor.id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            if generation == 1 {
+                let committed = db.get_message_by_id("opening-key").await.unwrap();
+                let committed_generation = db
+                    .get_conversation(&successor.id)
+                    .await
+                    .unwrap()
+                    .transcript_generation;
+                if let SseEvent::MessageUpdated {
+                    content,
+                    transcript_generation,
+                    ..
+                } = &mut delayed
+                {
+                    *content = Some(committed.content);
+                    *transcript_generation = Some(committed_generation);
+                }
+            }
+        }
+        for audience in [
+            SseStreamAudience::Authenticated,
+            SseStreamAudience::SharedTranscript,
+        ] {
+            let broadcaster = crate::runtime::SseBroadcaster::new(16, 20);
+            let live_rx = broadcaster.subscribe();
+            let live_cursor = broadcaster.current_seq();
+            broadcaster
+                .send_seq(|sequence_id| {
+                    let mut event = delayed.clone();
+                    if let SseEvent::MessageUpdated {
+                        sequence_id: seq, ..
+                    } = &mut event
+                    {
+                        *seq = sequence_id;
+                    }
+                    event
+                })
+                .unwrap();
+            broadcaster
+                .send_seq(|sequence_id| SseEvent::MessageUpdated {
+                    opening: None,
+                    sequence_id,
+                    message_id: "ordinary-key".into(),
+                    transcript_generation: Some(2),
+                    display_data: Some(json!({"owed": true})),
+                    content: Some(ordinary.clone()),
+                    duration_ms: None,
+                })
+                .unwrap();
+            broadcaster
+                .send_seq(|sequence_id| SseEvent::Token {
+                    sequence_id,
+                    text: "owed-token".into(),
+                    request_id: "update-test".into(),
+                })
+                .unwrap();
+
+            // Use the same durable read/fence as the init handler, not an empty fixture snapshot.
+            let conversation = db.get_conversation(&successor.id).await.unwrap();
+            let messages = db.get_messages(&successor.id).await.unwrap();
+            let opening = db
+                .read_continuation_opening_at_snapshot(
+                    &successor.id,
+                    conversation.transcript_generation,
+                    messages.iter().map(|message| message.sequence_id).max(),
+                )
+                .await
+                .unwrap();
+            let make_init = |cursor, pending_events| {
+                let mut init = update_test_init(pending_events);
+                if let SseEvent::Init {
+                    conversation: view,
+                    transcript,
+                    opening: observation,
+                    transcript_generation,
+                    sequence_id,
+                    last_sequence_id,
+                    stream_incarnation,
+                    ..
+                } = &mut init
+                {
+                    view.inner = crate::runtime::PresentationConversation(conversation.clone());
+                    *transcript = crate::runtime::InitTranscript::Complete(messages.clone());
+                    *observation = Some(opening.clone().into());
+                    *transcript_generation = conversation.transcript_generation;
+                    *sequence_id = cursor;
+                    *last_sequence_id = cursor;
+                    *stream_incarnation = broadcaster.stream_incarnation().into();
+                }
+                init
+            };
+            let response = sse_stream(
+                db.clone(),
+                successor.id.clone(),
+                make_init(live_cursor, vec![]),
+                live_rx,
+                None,
+                audience,
+            )
+            .into_response();
+            let mut body = response.into_body().into_data_stream();
+            let mut applied_cursor = live_cursor;
+            for (expected, expected_cursor) in [
+                ("event: init", 20),
+                ("restored-opening", 21),
+                ("owed ordinary edit", 22),
+                ("owed-token", 23),
+            ] {
+                let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+                    .await
+                    .expect("stream makes progress")
+                    .expect("stream must not close")
+                    .unwrap();
+                let chunk = String::from_utf8(chunk.to_vec()).unwrap();
+                let (cursor, payload) = decode_update_test_chunk(&chunk);
+                assert_eq!(cursor, expected_cursor);
+                if expected == "event: init" {
+                    assert!(chunk.contains(expected), "{chunk}");
+                    assert_eq!(payload["last_sequence_id"], applied_cursor);
+                } else {
+                    assert_eq!(cursor, applied_cursor + 1, "event must be applicable");
+                    applied_cursor = cursor;
+                    if expected != "restored-opening" {
+                        assert!(chunk.contains(expected), "{chunk}");
+                    }
+                }
+                assert!(!chunk.contains("stale-display"));
+                assert!(
+                    !chunk.contains("edit A"),
+                    "old content must not borrow current authority"
+                );
+                if expected == "restored-opening" {
+                    assert!(chunk.contains("boundary"));
+                    assert!(chunk.contains("context"));
+                    assert_eq!(payload["transcript_generation"], 3);
+                }
+            }
+            drop(body);
+            // The ring still holds the old event. Two reconnects must both reach init and live traffic.
+            for reconnect in 0..2 {
+                let rx = broadcaster.subscribe();
+                let (anchor, truncated, highest, pending) = broadcaster.snapshot_pending();
+                assert!(!truncated);
+                assert_eq!(
+                    pending.len(),
+                    3 + reconnect,
+                    "no owed event is removed from the shared ring"
+                );
+                let mut init = make_init(highest, pending);
+                if let SseEvent::Init {
+                    pending_anchor_sequence_id,
+                    sequence_id,
+                    last_sequence_id,
+                    ..
+                } = &mut init
+                {
+                    *pending_anchor_sequence_id = anchor;
+                    *sequence_id = highest;
+                    *last_sequence_id = highest;
+                }
+                let response =
+                    sse_stream(db.clone(), successor.id.clone(), init, rx, None, audience)
+                        .into_response();
+                let mut body = response.into_body().into_data_stream();
+                let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+                    .await
+                    .unwrap()
+                    .expect("reconnect must deliver current init")
+                    .unwrap();
+                let chunk = String::from_utf8(chunk.to_vec()).unwrap();
+                assert!(chunk.contains("event: init"));
+                let (cursor, payload) = decode_update_test_chunk(&chunk);
+                assert_eq!(cursor, highest);
+                assert_eq!(payload["last_sequence_id"], highest);
+                let mut replay_cursor = anchor;
+                for event in payload["pending_events"].as_array().unwrap() {
+                    let seq = event["sequence_id"].as_i64().unwrap();
+                    assert_eq!(seq, replay_cursor + 1, "replay event must be applicable");
+                    replay_cursor = seq;
+                }
+                assert_eq!(replay_cursor, highest);
+                assert_eq!(payload["pending_events"][0]["transcript_generation"], 3);
+                assert_eq!(payload["pending_events"][1]["transcript_generation"], 2);
+                assert_eq!(
+                    payload["pending_events"][1]["content"],
+                    ordinary.to_stored_json()
+                );
+                assert!(chunk.contains("context") && chunk.contains("boundary"));
+                assert!(chunk.contains("owed-token"));
+                assert!(!chunk.contains("stale-display"));
+                assert!(!chunk.contains("edit A"));
+                broadcaster
+                    .send_seq(|sequence_id| SseEvent::Token {
+                        sequence_id,
+                        text: "still-live".into(),
+                        request_id: "update-test".into(),
+                    })
+                    .unwrap();
+                let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+                    .await
+                    .unwrap()
+                    .expect("reconnected stream remains open")
+                    .unwrap();
+                let chunk = String::from_utf8(chunk.to_vec()).unwrap();
+                let (cursor, payload) = decode_update_test_chunk(&chunk);
+                assert_eq!(
+                    cursor,
+                    highest + 1,
+                    "post-reconnect token must be applicable"
+                );
+                assert_eq!(payload["text"], "still-live");
+            }
+            for generation in [None, Some(3), Some(4)] {
+                let mut wrong = delayed.clone();
+                if let SseEvent::MessageUpdated {
+                    transcript_generation,
+                    ..
+                } = &mut wrong
+                {
+                    *transcript_generation = generation;
+                }
+                assert!(matches!(
+                    prepare_sse_delivery(&db, wrong.clone(), audience).await,
+                    Err(crate::db::DbError::TranscriptSnapshotChanged)
+                ));
+                let (_tx, rx) = tokio::sync::broadcast::channel(8);
+                let response = sse_stream(
+                    db.clone(),
+                    successor.id.clone(),
+                    make_init(broadcaster.current_seq(), vec![wrong]),
+                    rx,
+                    None,
+                    audience,
+                )
+                .into_response();
+                let bytes = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    axum::body::to_bytes(response.into_body(), usize::MAX),
+                )
+                .await
+                .expect("invalid evidence still closes instead of skipping it")
+                .unwrap();
+                assert!(bytes.is_empty());
+            }
+        }
+        let latest = SseEvent::MessageUpdated {
+            opening: None,
+            sequence_id: 23,
+            message_id: "opening-key".into(),
+            transcript_generation: Some(3),
+            display_data: None,
+            content: Some(restored),
+            duration_ms: None,
+        };
+        let event = prepare_sse_delivery(&db, latest, SseStreamAudience::Authenticated)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            SseEvent::MessageUpdated {
+                opening: Some(super::super::types::ContinuationOpeningView::Accepted {
+                    presentation:
+                        super::super::types::ContinuationOpeningPresentationView::Boundary,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn axum_event_label_for_message_updated() {
         // Regression on the label the client registers via
         // `addEventListener`.
         let event = SseEvent::MessageUpdated {
+            opening: None,
             sequence_id: 42,
             message_id: "msg-abc".to_string(),
             transcript_generation: Some(9),

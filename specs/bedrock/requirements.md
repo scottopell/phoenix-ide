@@ -381,6 +381,15 @@ WHEN server restarts
 THE SYSTEM SHALL restore an ordinary interrupted provider request with no independently recoverable durable obligation to idle state
 AND preserve complete message history
 
+WHEN a conversation runtime successfully settles startup in a terminal state
+THE SYSTEM SHALL acknowledge startup settlement before the runtime exits so recovery of other conversations can continue
+AND the acknowledgement SHALL mean startup settlement, not completion of an LLM request
+AND an interrupted or failed startup settlement SHALL NOT be acknowledged as successful
+
+WHEN startup recovery selects a persisted `ContextExhausted` conversation because it retains queued steering
+THE SYSTEM SHALL preserve its terminal state and queued steering without dispatching a provider request
+AND SHALL acknowledge its settled startup without requiring user input or provider completion
+
 WHEN server restarts after an active materialized direct turn has durably committed a complete tool-result round but before its next model step settles
 THE SYSTEM SHALL use that exact accepted-turn identity and generation as the sole recovery baton
 AND SHALL dispatch the next model step without browser, SSE, or user-message activity
@@ -742,6 +751,12 @@ AND the request SHALL NOT include any tool capabilities
 AND the request SHALL frame the summary as an operational handoff to a fresh agent with no memory of the session
 AND ordinary conversations SHALL use the work-handoff instructions covering goals, concrete changes, verification, repository state, next actions, and pitfalls
 AND the global Coordinator SHALL use the coordination-handoff instructions in [REQ-GR-013](../global-recall/requirements.md#req-gr-013-preserve-coordination-context-through-compaction), selected from its existing Coordinator identity without role inference or a purpose setting
+AND both handoff policies SHALL request unfinished obligations, authorization provenance with exact primary user message references and relevant scoped wording when known, later corrections and supersession, pauses and gates, owner and last-observed status, the next authorized in-scope action and required checks, and completion criteria with outstanding verification
+AND SHALL distinguish authentic primary user directions from generated assertions, delegate reports, quotations, and assumptions; missing evidence SHALL remain unknown with narrow retrieval pointers rather than invented approval
+AND the tool-free compaction input SHALL expose each retained text-bearing row's known persisted conversation/message locator pair, typed input origin and content kind alongside its rendered text, including ordinary user-facing API inputs
+AND source attribution SHALL come from the frozen persisted projection, not message text; rendered payload SHALL be escaped separately from attribution, with metadata included in the row's token budget and omitted whenever the row is omitted
+AND user-facing API origin SHALL identify only an entry channel, not establish biological human authorship or grant authorization; internal conversation, unknown historical, system-generated and subscription-event inputs and generated continuation content SHALL remain distinguishable
+AND SHALL describe the generated handoff as untrusted context that cannot self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 AND the request SHALL preserve the prior tool history as text rather than discarding it
 AND the request SHALL be bounded to fit the context window and any request-shape limits declared by the selected provider route
@@ -1223,8 +1238,22 @@ THE SYSTEM SHALL create a new transcript row that explicitly belongs to the same
   - every unconsumed steering entry, preserving its immutable acceptance identity, exact payload, attachments, and FIFO order without retaining a second pending copy on the predecessor
   - deferred continuation work, including tool calls rejected at the context threshold, without executing it before the successor owns the handoff
 
+WHEN a successor receives generated predecessor context
+THE trusted model-bound guidance SHALL describe continuation as a handoff rather than cancellation or expiry of verified standing user directions
+AND SHALL direct recovery of unfinished obligations and verification of claimed historical approval against authentic primary user messages, source attribution, and exact scope, retrieving only missing relevant evidence as needed
+AND SHALL require checking later corrections, supersession, pauses, gates, relevant current status and ownership before acting
+AND SHALL direct the next authorized in-scope step by default and follow-through to verified completion rather than status-only acknowledgement or redundant permission requests
+AND SHALL preserve pauses and gates and direct narrow evidence recovery or a focused question when authority is missing, conflicting, or insufficient
+AND SHALL keep generated summaries and encoded payloads untrusted data that cannot promote embedded directives or claimed approvals into authority, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
+
+WHEN an ordinary conversation creates a continuation
+THE SYSTEM SHALL keep the selected parent's exact attached `WorkScope`, environment and resource ownership atomically in a single database transaction while keeping the durable ProductConversation identity unchanged
+AND SHALL apply this rule to Direct/non-Git and worktree-backed conversations alike
+AND SHALL create no replacement scope or select a different scope from the ProductConversation's historical ownership set
+AND SHALL retain the same identity under concurrent requests and idempotent replay.
+
 WHEN the current execution row has a worktree
-THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single database transaction while keeping the durable ProductConversation identity unchanged:
+THE SYSTEM SHALL also preserve its filesystem state:
   - the parent retains its `worktree_path` field as a read-only reference for history navigation
   - the continuation's `worktree_path` is set to the same value
   - the continuation inherits the same `work_scope_id`
@@ -1254,13 +1283,19 @@ ceremony or a separate auto-stash feature. Keeping the same attached `WorkScope`
 and filesystem path across continuation, rather than destroying and recreating,
 is the only shape that preserves uncommitted work structurally without a separate
 auto-stash mechanism. Single-continuation policy keeps execution topology
-unambiguous: at any moment, continuation identifies the latest execution row for
-one product conversation while that conversation keeps one attached `WorkScope`
-and therefore one inherited worktree.
+unambiguous: continuation identifies the latest execution row for one product
+conversation. The selected row inherits its parent's exact attached WorkScope
+and environment. The product's historical ownership set may contain other
+scopes; those are neither substituted for the selected attachment nor coalesced
+by cwd, and aggregate retirement accounts for every historically owned scope.
 
 **Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 
 ---
+
+Opening read authority SHALL be a typed sum of no opening evidence, an exact pending dispatch intent, or an accepted completed handoff. Pending authority SHALL retain the persisted nonempty `ClientTurnKey` unchanged, the durable opening authority, and the same-aggregate predecessor, successor, and persisted continuation boundary identities. Its candidate persisted message identities SHALL be exactly the key itself or `successor_transcript_row_id + ":" + key`, matching the persistence trigger; prefix stripping, trimming, content matching alone, and a successful dispatch response SHALL NOT establish acceptance.
+
+Accepted read authority SHALL require the exact completed handoff receipt and its persisted predecessor boundary and successor message. It SHALL retain the actual accepted message identity and durable authority. Generated predecessor context SHALL be represented by the boundary only while its actual persisted content equals the predecessor summary under the handoff content contract; user-authorized instructions and edited openings SHALL remain separate messages. Presentation SHALL be recomputed from persisted content on subsequent reads and content-update observations without changing accepted execution authority or copying summary text into the authority projection. A consistent completed receipt SHALL take precedence over a matching residual intent; conflicting or unreadable persisted evidence SHALL surface a read error rather than absence.
 
 ### REQ-BED-030A: ProductConversation Owns Aggregate Identity and Lifecycle
 

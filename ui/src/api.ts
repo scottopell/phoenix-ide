@@ -1,7 +1,12 @@
+import { observeViewResponse, type ViewResponseObserver } from './hooks/conversationViewResponse';
+
+type HistoryRequestCorrelation = { open_id?: string; request_id?: never } | { request_id: string; open_id?: never };
+
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import { ContinuationOpeningSchema } from './conversation/opening';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
 import type { SqliteReportWindow } from './generated/SqliteReportWindow';
@@ -88,6 +93,10 @@ export type { ProductConversationCloseUnavailableReasonView } from './generated/
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
+export type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
+import type { ProductConversationHistorySnapshotView } from './generated/ProductConversationHistorySnapshotView';
+export type { CoordinatorConversationSnapshotView } from './generated/CoordinatorConversationSnapshotView';
+import type { CoordinatorConversationSnapshotView } from './generated/CoordinatorConversationSnapshotView';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
@@ -212,11 +221,6 @@ export interface Conversation {
    *  action belongs on the continuation, enforced server-side with a 409
    *  `error_type = "continuation_exists"`). */
   continued_in_conv_id?: string | null;
-  /** User-set name for the chain rooted at this conversation (REQ-CHN-007).
-   *  Only meaningful on the root of a chain; non-root members will have
-   *  this absent or null. The sidebar falls back to the root conversation's
-   *  slug when this is null/absent. */
-  chain_name?: string | null;
   /** Server-computed presentation mode: idle | working | needs_action | error | done.
    *  Single source of truth for which visual indicator to render. */
   presentation_mode?: string;
@@ -673,6 +677,8 @@ export interface ToolCall {
 
 export type { InputOrigin } from './generated/InputOrigin';
 import type { InputOrigin } from './generated/InputOrigin';
+import type { EventPresentation } from './generated/EventPresentation';
+export type { EventPresentation } from './generated/EventPresentation';
 
 export interface Message {
   message_id: string;
@@ -681,6 +687,7 @@ export interface Message {
   message_type: 'user' | 'agent' | 'tool' | 'system' | 'error' | 'continuation' | 'skill';
   /** Synthetic UI messages may lack origin; authoritative wire messages require it. */
   origin?: InputOrigin;
+  event_presentation: EventPresentation | null;
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
@@ -1859,9 +1866,41 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to report product conversation open');
   },
 
+  async getCoordinatorHistory(
+    reference: string,
+    options?: { message_limit?: number; before?: string | null; onTelemetry?: ViewResponseObserver } & HistoryRequestCorrelation,
+  ): Promise<CoordinatorConversationSnapshotView> {
+    const params = new URLSearchParams();
+    if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
+    if (options?.before) params.set('before', options.before);
+    if (options?.open_id) params.set('open_id', options.open_id);
+    if (options?.request_id) params.set('request_id', options.request_id);
+    const response = await fetch(`/api/global/coordinator/history/${encodeURIComponent(reference)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
+    if (!response.ok) throw new ApiResponseError('Unable to read Global conversation history', response.status);
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
+  },
+
+  async getProductConversationHistorySnapshot(
+    productConversationId: string,
+    options?: { message_limit?: number; before?: string | null; onTelemetry?: ViewResponseObserver } & HistoryRequestCorrelation,
+  ): Promise<ProductConversationHistorySnapshotView> {
+    const params = new URLSearchParams({ boundary_representation: 'original_messages' });
+    if (options?.message_limit !== undefined) params.set('message_limit', String(options.message_limit));
+    if (options?.before) params.set('before', options.before);
+    if (options?.open_id) params.set('open_id', options.open_id);
+    if (options?.request_id) params.set('request_id', options.request_id);
+    const response = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}?${params}`);
+    observeViewResponse(response, options?.onTelemetry);
+    if (!response.ok) throw new ApiResponseError('Unable to read product conversation history', response.status);
+    const snapshot = await response.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
+  },
+
   async getProductConversationSnapshot(
     productConversationId: string,
-    options?: { message_limit?: number; before?: string | null; open_id?: string },
+    options?: { message_limit?: number; before?: string | null; open_id?: string; onTelemetry?: ViewResponseObserver },
   ): Promise<ProductConversationSnapshotViewType> {
     const params = new URLSearchParams();
     if (typeof options?.message_limit === 'number') {
@@ -1877,13 +1916,15 @@ export const api = {
     const resp = await fetch(
       `/api/product-conversations/${encodeURIComponent(productConversationId)}${query ? `?${query}` : ''}`,
     );
+    observeViewResponse(resp, options?.onTelemetry);
     if (!resp.ok) {
       const detail = resp.status === 404
         ? 'Conversation not found'
         : 'Failed to fetch product conversation snapshot';
       throw new ApiResponseError(detail, resp.status);
     }
-    return resp.json();
+    const snapshot = await resp.json();
+    return { ...snapshot, latest_opening: v.parse(ContinuationOpeningSchema, snapshot.latest_opening) };
   },
 
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {
@@ -2212,19 +2253,6 @@ export const api = {
     return resp.json();
   },
 
-  async renameConversation(convId: string, name: string): Promise<{ conversation: Conversation }> {
-    const resp = await fetch(`/api/conversations/${convId}/rename`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error || 'Failed to rename');
-    }
-    return resp.json();
-  },
-
   async closeProductConversation(reference: string): Promise<void> {
     const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/close`, {
       method: 'POST',
@@ -2252,13 +2280,16 @@ export const api = {
     return resp.json();
   },
 
-  async regenerateConversationName(convId: string): Promise<{ conversation: Conversation }> {
-    const resp = await fetch(`/api/conversations/${convId}/regenerate-name`, {
+  async regenerateProductConversationName(reference: string): Promise<ProductConversationListRowType> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/regenerate-name`, {
       method: 'POST',
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to generate name');
+      if (resp.status === 409 && typeof err.error_type === 'string') {
+        throw new ConflictError(err as ConflictErrorDetail);
+      }
+      throw new Error(err.error || 'Failed to generate product conversation name');
     }
     return resp.json();
   },
@@ -2758,47 +2789,6 @@ export const api = {
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to submit question');
-    }
-    return resp.json();
-  },
-
-  /** PATCH /api/chains/:rootId/name — set or clear the user-overridden
-   *  chain name. Pass `null` to clear; the server falls back to the chain
-   *  root's title for `display_name`. Returns the refreshed `ChainView`. */
-  async setChainName(
-    rootId: string,
-    name: string | null,
-  ): Promise<ChainViewType> {
-    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/name`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    if (resp.status === 404) throw new Error('Chain not found');
-    if (resp.status === 409) {
-      const err = await resp.json();
-      throw new ConflictError(err as ConflictErrorDetail);
-    }
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to set chain name');
-    }
-    return resp.json();
-  },
-
-  /** POST /api/chains/:rootId/regenerate-name — re-summarize the chain's
-   *  content into a fresh name and persist it. No request body; the root id
-   *  is the only input. Returns the refreshed `ChainView` (same shape as
-   *  `setChainName`). On any failure the server leaves the name unchanged. */
-  async regenerateChainName(rootId: string): Promise<ChainViewType> {
-    const resp = await fetch(
-      `/api/chains/${encodeURIComponent(rootId)}/regenerate-name`,
-      { method: 'POST' },
-    );
-    if (resp.status === 404) throw new Error('Chain not found');
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to regenerate chain name');
     }
     return resp.json();
   },

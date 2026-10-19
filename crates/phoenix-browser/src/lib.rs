@@ -7,9 +7,13 @@
 //! phoenix-tools, which depends on this crate. See `specs/browser-tool/` for
 //! the behavioural contract.
 
+mod cdp;
+mod navigation;
+pub mod process_group;
 pub mod react;
 pub mod screencast;
 pub mod session;
+pub mod snapshot;
 
 pub use screencast::{ScreencastBroker, ScreencastEvent};
 pub use session::{

@@ -407,7 +407,7 @@ async fn process_claimed_product_creation(
         seed_parent_id: None,
         seed_label: None,
         continued_in_conv_id: None,
-        chain_name: None,
+
         llm_language: job.intent.llm_language,
         spawned_from_conversation_id: None,
     };
@@ -2196,6 +2196,11 @@ async fn provision_conversation(
         .await
         .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
 
+    let name_baseline = manager
+        .db()
+        .capture_conversation_name_baseline(&job.conversation_id)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
     let seed_title = intent.seed_label.clone().filter(|s| !s.trim().is_empty());
     let mut title_source = intent.text.trim().to_string();
     if !images.is_empty() {
@@ -2322,6 +2327,7 @@ async fn provision_conversation(
                 &job.id,
                 &claim,
                 &job.conversation_id,
+                &name_baseline,
                 &ConversationCreationMetadataUpdate {
                     slug: Some(slug.clone()),
                     title: Some(title.clone()),
@@ -2871,7 +2877,7 @@ mod product_creation_delivery_replay_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id: None,
-            chain_name: None,
+
             llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
         }
@@ -5539,8 +5545,23 @@ fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
         AppError::Internal(message) | AppError::TypedInternal { message, .. } => {
             (message, ErrorKind::ServerError)
         }
+        AppError::TranscriptSnapshotChanged => (
+            "transcript changed during opening observation read".to_string(),
+            ErrorKind::ServerError,
+        ),
         AppError::Forbidden(message) => (message, ErrorKind::Auth),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_instability_maps_to_server_error() {
+    let (message, kind) = app_error_to_kind(AppError::TranscriptSnapshotChanged);
+    assert_eq!(
+        message,
+        "transcript changed during opening observation read"
+    );
+    assert!(matches!(kind, ErrorKind::ServerError));
 }
 
 #[cfg(test)]

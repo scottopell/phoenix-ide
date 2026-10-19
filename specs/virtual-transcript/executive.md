@@ -16,6 +16,12 @@ Virtual Transcript is the platform-neutral contract and Phoenix-owned web implem
 - `specs/virtual-transcript/virtual_transcript.allium` — reducer-aligned positioning and measurement lifecycle.
 - `specs/messagelist-render-units/` — render-unit construction and conversation scroll ownership policy.
 
+## Directional start alignment
+
+`VirtualTranscript` shares native start-position readback and a single bounded conservative overshoot correction between immediate and deferred target execution. `MessageList` explicitly selects continuity positioning for prefix restoration, excluding it from directional correction. Component coverage includes nearest-integer scroll quantization, accepted fractional positions, integer controls, nonzero target/start offsets, zero/upper clamps, final anchor preservation after header resize, own-write echoes, and no-op user scrolling. Existing hidden authority/supersession and end/tail/restore tests remain in the focused validation set. Source regression coverage does not establish actual browser qualification of a corrected artifact. Typed physical anchors retain directional-start intent through same-anchor measurement updates, including a header ref mounting after an initial zero-header jump. The late-header regression exercises that callback path and checks accepted-fraction, continuity, interruption, cancellation, replacement, subsequent fractional resize, and same-key item-change controls. Final applied anchors are returned through physical-change processing rather than overwritten by pre-write anchors.
+
+Successful finish execution calls `completePosition` before parent notification, transferring matching command ownership to a settled geometric anchor scoped by the history-view key. `interruptPosition` handles accepted user takeover and detach even without a native scroll event; replacement/view changes retire settled ownership. The real reducer/executor parent fixture covers applied → idle authority removal → late header mounting, distinct from constant-authority component cases. Command finish and position counts remain exact-once. Post-settlement controls cover scroll, takeover without scroll, cancellation, replacement, stale completion, and same-conversation view reset. ADR-120 records the capability/geometry lifetime distinction. Actual corrected-artifact qualification is not established by these source tests.
+
 ## Verification matrix
 
 | Requirement | Verification |

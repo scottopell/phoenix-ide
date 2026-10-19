@@ -11,6 +11,13 @@ import { ViewerSlotProvider } from './contexts/ViewerSlotContext';
 import { installProductConversationFixtureApi } from './fixtures/productConversation/mockApi';
 import { getProductConversationScenario } from './fixtures/productConversation/scenarios';
 
+vi.mock('./hooks/conversationViewTelemetry', async importOriginal => {
+  const actual = await importOriginal<typeof import('./hooks/conversationViewTelemetry')>();
+  return { ...actual, ViewJourneyReporter: class extends actual.ViewJourneyReporter {
+    constructor() { super({ sampleRate: 1, send: async () => new Response(null, { status: 204 }) }); }
+  } };
+});
+
 const origin = '/global/coordinator?reference=origin%3Arow#message-origin';
 const suffix = '?reference=destination%3Arow#message-history-4';
 const route = vi.hoisted(() => ({ destination: '' }));
@@ -63,7 +70,7 @@ describe('App Markdown alias navigation', () => {
 
       fireEvent.click(await screen.findByRole('link', { name: 'Conversation citation' }));
       await waitFor(() => expect(screen.getByTestId('route').textContent).toBe(`/c/product-alpha${suffix}`));
-      expect(lookup).toHaveBeenCalledWith(alias.split('/').at(-1), { message_limit: 1 });
+      expect(lookup).toHaveBeenCalledWith(alias.split('/').at(-1), { message_limit: 1, open_id: expect.any(String), onTelemetry: expect.any(Function) });
       expect(await screen.findByTestId('product-conversation-page', {}, { timeout: 5_000 })).toBeInTheDocument();
       const breadcrumb = await screen.findByRole('link', { name: '← from: Coordinator' });
       expect(breadcrumb).toHaveAttribute('href', origin);

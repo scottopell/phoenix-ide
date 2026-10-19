@@ -8,6 +8,7 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import base64
 import contextvars
 import contextlib
 import dataclasses
@@ -24,7 +25,9 @@ import re
 import resource
 import shutil
 import signal
+import stat
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -6871,12 +6874,13 @@ def _validate_spears_v2_shape(specs_root: Path) -> SpearsV2ShapeResult:
 
     if numbered:
         nums = [n for n, _ in numbered]
-        expected = list(range(0, max(nums) + 1))
-        if nums != expected:
-            errors.append(
-                "specs/adrs/: ADR numbers must be sequential without gaps "
-                f"(found {', '.join(f'{n:03d}' for n in nums)})"
-            )
+        if 0 not in nums:
+            errors.append("specs/adrs/: ADR numbering must start at 000")
+        seen: set[int] = set()
+        for num, path in numbered:
+            if num in seen:
+                errors.append(f"{rel(path)}: duplicate ADR number {num:03d}")
+            seen.add(num)
     else:
         errors.append("specs/adrs/: at least one numbered ADR is required")
 
@@ -8155,15 +8159,35 @@ def _stage_systemd_root_handoff(
     files: list[tuple[str, Path]],
     *,
     noninteractive: bool = False,
+    bind_bundle: bool = True,
+    expected_helper_sha256: str | None = None,
+    expected_preparation_receipt_sha256: str | None = None,
 ) -> Path:
+    if re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        raise SystemExit("systemd handoff requires an exact transaction id")
     bundle = staging / "bundle.json"
-    _write_json_atomic(bundle, {
+    bundle_value = {
         "transaction_id": transaction_id,
         "files": [
-            {"name": name, "source": str(path), "sha256": _file_sha256(path)}
+            {
+                "name": name,
+                "source": str(path),
+                "sha256": expected_helper_sha256
+                if name == "helper.py" and expected_helper_sha256 is not None
+                else _file_sha256(path),
+            }
             for name, path in files
         ],
-    })
+    }
+    bundle_bytes = (json.dumps(bundle_value, indent=2, sort_keys=True) + "\n").encode()
+    bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
+    try:
+        helper_sha256 = next(
+            entry["sha256"] for entry in bundle_value["files"] if entry["name"] == "helper.py"
+        )
+    except StopIteration as exc:
+        raise SystemExit("systemd handoff bundle is missing helper.py") from exc
+    _write_json_atomic(bundle, bundle_value)
     bootstrap = SYSTEMD_DEPLOY_DIR / f"bootstrap-{transaction_id}"
     root_helper = bootstrap / "helper.py"
     sudo = ["sudo", "-n"] if noninteractive else ["sudo"]
@@ -8173,11 +8197,33 @@ def _stage_systemd_root_handoff(
 
         str(helper), str(root_helper),
     ], check=True)
+    try:
+        verified_helper = subprocess.run(
+            [*sudo, "sha256sum", str(root_helper)],
+            capture_output=True,
+            text=True,
+        )
+    except BaseException:
+        subprocess.run([*sudo, "rm", "-rf", str(bootstrap)], check=False)
+        raise
+    helper_output = (verified_helper.stdout or "").split(maxsplit=1)
+    if (verified_helper.returncode != 0 or not helper_output
+            or helper_output[0] != helper_sha256):
+        subprocess.run([*sudo, "rm", "-rf", str(bootstrap)], check=False)
+        raise SystemExit("systemd handoff bootstrap helper hash mismatch")
+    stage_command = [
+        *sudo, "python3", str(root_helper), "stage", "--bundle", str(bundle),
+    ]
+    if bind_bundle:
+        stage_command.extend(("--bundle-sha256", bundle_sha256))
+    if expected_preparation_receipt_sha256 is not None:
+        stage_command.extend((
+            "--expected-preparation-receipt-sha256",
+            expected_preparation_receipt_sha256,
+        ))
+    stage_command.extend(("--source-uid", str(os.getuid())))
     result = subprocess.run(
-        [
-            *sudo, "python3", str(root_helper), "stage",
-            "--bundle", str(bundle), "--source-uid", str(os.getuid()),
-        ],
+        stage_command,
         capture_output=True,
         text=True,
     )
@@ -8253,6 +8299,261 @@ def _launch_systemd_activation(
         raise SystemExit("systemd transient activation unit did not start; staged claim released")
 
 
+def cmd_prod_recover_systemd_current(transaction_id: str) -> None:
+    if sys.platform != "linux" or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        raise SystemExit("systemd current recovery requires Linux and an exact transaction id")
+    _require_noninteractive_sudo_ready()
+    manifest = SYSTEMD_TRANSACTION_ROOT / transaction_id / "manifest.json"
+    subprocess.run([
+        *_noninteractive_sudo_prefix(), "systemd-run", "--collect", "--no-block",
+        "--unit", f"phoenix-deploy-recover-{transaction_id}",
+        "--property=Type=oneshot", "python3", str(manifest.parent / "helper.py"),
+        "recover-current", "--manifest", str(manifest),
+    ], check=True)
+
+
+SYSTEMD_PROTECTED_TAG = "v0.13.0-rc.4"
+SYSTEMD_PROTECTED_COMMIT = "3f0ba4602faa71ebad5088e1ffc856f4c7d511d9"
+SYSTEMD_PROTECTED_VERSION = "0.13.0-rc.4"
+SYSTEMD_PROTECTED_ASSET = "phoenix_ide-x86_64-unknown-linux-musl"
+SYSTEMD_PROTECTED_ASSET_SHA256 = "bcb74d565c828843596e5109ea9034a2b0e505aab4ba6c18c5cca8e116f5677e"
+SYSTEMD_PROTECTED_REGISTRY_SHA256 = "700162dd8e41305546cf2acd2763bad5603c642840f5be851fb788353879a36a"
+SYSTEMD_PROTECTED_PROTOCOL = 2
+SYSTEMD_PREPARED_COMMIT = "237100c79d9ce672867b284167a099fa0b7a2bcf"
+SYSTEMD_PREPARED_VERSION = "0.13.0-rc.4"
+SYSTEMD_PREPARED_TARGET = "x86_64-unknown-linux-musl"
+SYSTEMD_PREPARED_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+SYSTEMD_PREPARED_OPERATION = "prepare-incident-237100-linux-x86_64"
+SYSTEMD_PREPARED_PAYLOAD = "phoenix_ide-x86_64-unknown-linux-musl-prepared-237100c79d9c"
+SYSTEMD_PREPARED_RECEIPT = "LINUX-PREPARATION-RECEIPT-x86_64-unknown-linux-musl.json"
+SYSTEMD_PREPARED_PROTOCOL = 3
+
+
+def _open_prepared_regular(source_directory_fd: int, source_name: str) -> int:
+    try:
+        source_fd = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_directory_fd)
+    except OSError as exc:
+        raise SystemExit(f"cannot open prepared systemd artifact {source_name}: {exc}") from exc
+    try:
+        source_mode = os.fstat(source_fd).st_mode
+    except BaseException:
+        os.close(source_fd)
+        raise
+    if not stat.S_ISREG(source_mode):
+        os.close(source_fd)
+        raise SystemExit("prepared systemd artifact entries must be regular files")
+    return source_fd
+
+
+def _copy_prepared_regular(source_fd: int, destination: Path, mode: int) -> str:
+    destination_fd = None
+    try:
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        digest = hashlib.sha256()
+        with os.fdopen(source_fd, "rb", closefd=False) as source_stream, os.fdopen(
+            destination_fd, "wb", closefd=False
+        ) as destination_stream:
+            while chunk := source_stream.read(1024 * 1024):
+                destination_stream.write(chunk)
+                digest.update(chunk)
+            destination_stream.flush()
+            os.fsync(destination_stream.fileno())
+        os.fchmod(destination_fd, mode)
+        _fsync_directory(destination.parent)
+        return digest.hexdigest()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+
+
+@dataclasses.dataclass(frozen=True)
+class VerifiedSystemdControllerHelper:
+    source: bytes
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.source).hexdigest()
+
+
+def _parse_prepared_receipt_with_verified_helper(
+    verified_helper: VerifiedSystemdControllerHelper,
+    receipt: bytes,
+) -> dict:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-",
+            "--parse-prepared-receipt",
+            base64.b64encode(receipt).decode("ascii"),
+        ],
+        input=verified_helper.source,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit("invalid Linux prepared artifact receipt")
+    try:
+        metadata = json.loads(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("exact controller helper returned invalid prepared receipt metadata") from exc
+    if not isinstance(metadata, dict):
+        raise SystemExit("exact controller helper returned invalid prepared receipt metadata")
+    return metadata
+
+
+def _materialize_verified_systemd_helper(
+    source_commit: str,
+    destination: Path,
+    source_kind: str,
+) -> VerifiedSystemdControllerHelper:
+    expected_sha256 = _materialize_source_file(
+        source_commit,
+        "scripts/systemd_deploy_helper.py",
+        destination,
+        source_kind,
+    )
+    source = destination.read_bytes()
+    if hashlib.sha256(source).hexdigest() != expected_sha256:
+        raise SystemExit("prepared systemd helper changed after exact controller materialization")
+    return VerifiedSystemdControllerHelper(source=source)
+
+
+def _prepare_linux_artifact(
+    directory: Path,
+    expected_full_commit: str,
+    controller_commit: str,
+    expected_receipt_sha256: str,
+    staging: Path,
+    verified_helper: VerifiedSystemdControllerHelper,
+) -> "ValidatedLinuxPreparedCandidate":
+    if expected_full_commit != SYSTEMD_PREPARED_COMMIT:
+        raise SystemExit("Linux prepared candidate requires exact app commit")
+    try:
+        source_directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise SystemExit(f"cannot open prepared systemd artifact directory: {exc}") from exc
+    receipt = staging / SYSTEMD_PREPARED_RECEIPT
+    binary = staging / "prepared-candidate"
+    receipt_fd = None
+    binary_fd = None
+    try:
+        directory_before = os.fstat(source_directory_fd)
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise SystemExit("Linux prepared artifact must be a real directory")
+        if set(os.listdir(source_directory_fd)) != {SYSTEMD_PREPARED_PAYLOAD, SYSTEMD_PREPARED_RECEIPT}:
+            raise SystemExit("Linux prepared artifact must contain only exact payload and receipt")
+        receipt_fd = _open_prepared_regular(source_directory_fd, SYSTEMD_PREPARED_RECEIPT)
+        binary_fd = _open_prepared_regular(source_directory_fd, SYSTEMD_PREPARED_PAYLOAD)
+        directory_after = os.fstat(source_directory_fd)
+        if (
+            directory_before.st_dev,
+            directory_before.st_ino,
+            directory_before.st_mtime_ns,
+            directory_before.st_ctime_ns,
+        ) != (
+            directory_after.st_dev,
+            directory_after.st_ino,
+            directory_after.st_mtime_ns,
+            directory_after.st_ctime_ns,
+        ):
+            raise SystemExit("Linux prepared artifact directory changed during validation")
+        receipt_sha = _copy_prepared_regular(receipt_fd, receipt, 0o600)
+        completed_receipt_fd = receipt_fd
+        receipt_fd = None
+        os.close(completed_receipt_fd)
+        if receipt_sha != expected_receipt_sha256:
+            raise SystemExit("Linux prepared receipt does not match independently authenticated digest")
+        metadata = _parse_prepared_receipt_with_verified_helper(
+            verified_helper,
+            receipt.read_bytes(),
+        )
+        if metadata["controller_commit"] != controller_commit:
+            raise SystemExit("Linux preparation receipt controller commit mismatch")
+        binary_sha = _copy_prepared_regular(binary_fd, binary, 0o700)
+        completed_binary_fd = binary_fd
+        binary_fd = None
+        os.close(completed_binary_fd)
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        if binary_fd is not None:
+            os.close(binary_fd)
+        os.close(source_directory_fd)
+    if metadata["sha256"][SYSTEMD_PREPARED_PAYLOAD] != binary_sha:
+        raise SystemExit("Linux prepared payload checksum mismatch")
+    try:
+        embedded = RuntimeIdentity.from_value(_binary_identity(binary))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit("Linux prepared payload has no valid embedded identity") from exc
+    if embedded != RuntimeIdentity(SYSTEMD_PREPARED_VERSION, SYSTEMD_PREPARED_COMMIT):
+        raise SystemExit("Linux prepared payload embedded identity mismatch")
+    if _file_sha256(binary) != binary_sha or _file_sha256(receipt) != receipt_sha:
+        raise SystemExit("Linux prepared artifact changed during validation")
+    return ValidatedLinuxPreparedCandidate(binary, receipt, binary_sha, receipt_sha, controller_commit)
+
+
+def _require_linux_prepared_unchanged(candidate: "ValidatedLinuxPreparedCandidate") -> None:
+    if any(not path.is_file() or path.is_symlink() or _file_sha256(path) != digest
+           for path, digest in ((candidate.binary, candidate.binary_sha256),
+                                (candidate.receipt, candidate.receipt_sha256))):
+        raise SystemExit("Linux prepared candidate or receipt changed during staging")
+
+
+def _require_exact_clean_controller_checkout(expected_commit: str) -> None:
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit("cannot verify the prepared systemd controller checkout") from exc
+    if head != expected_commit or dirty:
+        raise SystemExit(
+            "prepared systemd deployment requires a clean checkout at the exact --controller-source-commit"
+        )
+
+
+def _systemd_ordinary_database_preflight(prepared: "PreparedCandidate", staging: Path, environment: dict[str, str]) -> None:
+    import sqlite3
+    import urllib.parse
+    database = Path(environment.get("PHOENIX_DB_PATH", str(SYSTEMD_DB_PATH)))
+    if not database.exists():
+        artifacts = (PROD_INSTALL_DIR / "phoenix-ide", SYSTEMD_SERVICE_PATH, SYSTEMD_SOCKET_PATH,
+                     PROD_ENV_FILE, SYSTEMD_DEPLOYED_SHA_PATH)
+        if any(os.path.lexists(path) for path in artifacts) or _systemd_current_identity(environment) is not None:
+            raise SystemExit("installed systemd database missing; refusing handoff (not a first install)")
+        return
+    def evidence(path: Path) -> tuple[tuple[int, str], ...]:
+        with contextlib.closing(sqlite3.connect("file:" + urllib.parse.quote(str(path.resolve()), safe="/") + "?mode=ro", uri=True, timeout=2)) as db:
+            if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)] or db.execute("PRAGMA foreign_key_check").fetchall():
+                raise SystemExit("ordinary systemd database integrity/foreign-key check failed")
+            ledger = tuple(db.execute("SELECT version,name FROM _migrations ORDER BY version"))
+            if (not ledger or any(type(v) is not int or v < 1 or not isinstance(n, str) or not n for v, n in ledger)
+                    or tuple(v for v, _ in ledger) != tuple(sorted({v for v, _ in ledger}))):
+                raise SystemExit("ordinary candidate ledger must be nonempty, sorted and unique")
+            return ledger
+    try:
+        candidate_hash = _file_sha256(prepared.binary)
+        with tempfile.TemporaryDirectory(prefix="ordinary-candidate-target-", dir=staging) as temporary:
+            target = Path(temporary) / "fresh.sqlite"
+            subprocess.run([str(prepared.binary), "--migrate-only"], cwd="/",
+                           env={"PATH": "/usr/bin:/bin", "HOME": temporary, "PHOENIX_DB_PATH": str(target)},
+                           check=True, capture_output=True, text=True, timeout=900)
+            entries = evidence(target)
+        if _file_sha256(prepared.binary) != candidate_hash:
+            raise SystemExit("ordinary candidate changed during target derivation")
+        ledger = evidence(database)
+    except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        raise SystemExit("cannot derive/verify ordinary systemd candidate database target") from exc
+    if ledger != entries:
+        raise SystemExit("ordinary systemd pending migration interval is not qualified; use the explicit protected mode for the reviewed release")
+
+
 def native_prod_deploy(
     release: str | None = None,
     *,
@@ -8264,22 +8565,57 @@ def native_prod_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
+    controller.require_systemd_current(release)
+    if controller.transaction_id is not None and re.fullmatch(r"[0-9a-f]{32}", controller.transaction_id) is None:
+        raise SystemExit("systemd deployment requires a 32-character lowercase transaction id")
+    if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None:
+        controller_commit = controller.controller_source_commit
+        if controller_commit is None:
+            raise SystemExit("prepared systemd deployment requires an exact controller source commit")
+        _require_exact_clean_controller_checkout(controller_commit)
+    prepared_systemd_request = (
+        controller.enabled
+        and controller.systemd_current_schema_upgrade
+        and controller.prepared_artifact is not None
+    )
     if controller.enabled:
-        release, _expected_full_commit = controller.require_exact_release(release)
-        _require_noninteractive_sudo_ready()
+        if controller.prepared_artifact is None:
+            release, _expected_full_commit = controller.require_exact_release(release)
+        if not prepared_systemd_request:
+            _require_noninteractive_sudo_ready()
     elif not check_systemd_available():
         raise SystemExit("systemd is not available on this Linux host")
 
-    env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
-    env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
-    _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
-    service_user = detect_service_user()
+    if not prepared_systemd_request:
+        env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
+        env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
+        _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
+        service_user = detect_service_user()
     transaction_id = controller.transaction_id or uuid.uuid4().hex
 
     with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
         staging = Path(temporary)
+        helper = staging / "helper.py"
+        verified_controller_helper = (
+            _materialize_verified_systemd_helper(
+                controller.controller_source_commit,
+                helper,
+                ProdSourceKind.PREPARED_ARTIFACT.value,
+            )
+            if prepared_systemd_request
+            else None
+        )
         prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
+            _prepare_linux_artifact(
+                controller.prepared_artifact,
+                controller.expected_full_commit,
+                controller.controller_source_commit,
+                controller.expected_preparation_receipt_sha256,
+                staging,
+                verified_controller_helper,
+            )
+            if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None
+            else _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release
             else _prepare_local_candidate(
                 target=_linux_musl_target(),
@@ -8290,10 +8626,18 @@ def native_prod_deploy(
                 ),
             )
         )
+        if prepared_systemd_request:
+            _require_noninteractive_sudo_ready()
+            env_snapshot = _read_systemd_installed_env(noninteractive=True)
+            env_file_loaded = str(PROD_ENV_FILE)
+            _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
+            service_user = detect_service_user()
         candidate_binary = staging / "candidate-binary"
         if prepared.binary != candidate_binary:
             shutil.copy2(prepared.binary, candidate_binary)
         candidate_binary.chmod(0o700)
+        if isinstance(prepared, ValidatedLinuxPreparedCandidate) and _file_sha256(candidate_binary) != prepared.binary_sha256:
+            raise SystemExit("Linux prepared candidate changed while staging")
 
         candidate_env = staging / "candidate.env"
         candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
@@ -8319,19 +8663,55 @@ def native_prod_deploy(
         candidate_socket.write_text(generate_systemd_socket(config))
         candidate_socket.chmod(0o600)
 
-        helper = staging / "helper.py"
-        _materialize_source_file(
-            prepared.source_commit,
-            "scripts/systemd_deploy_helper.py",
-            helper,
-            prepared.source_kind.value,
+        if verified_controller_helper is not None:
+            expected_helper_sha256 = verified_controller_helper.digest()
+        else:
+            expected_helper_sha256 = _materialize_source_file(
+                controller.controller_source_commit or prepared.source_commit,
+                "scripts/systemd_deploy_helper.py",
+                helper,
+                prepared.source_kind.value,
+            )
+        registry = None
+        if controller.systemd_current_schema_upgrade:
+            if isinstance(prepared, ValidatedLinuxPreparedCandidate):
+                _require_linux_prepared_unchanged(prepared)
+            elif (prepared.release_tag != SYSTEMD_PROTECTED_TAG or prepared.release_commit != SYSTEMD_PROTECTED_COMMIT
+                    or prepared.source_commit != SYSTEMD_PROTECTED_COMMIT
+                    or prepared.identity != RuntimeIdentity(SYSTEMD_PROTECTED_VERSION, SYSTEMD_PROTECTED_COMMIT)
+                    or _file_sha256(candidate_binary) != SYSTEMD_PROTECTED_ASSET_SHA256):
+                raise SystemExit("protected systemd candidate is not the reviewed release")
+            registry = staging / "migrations.rs"
+            _materialize_source_file(prepared.source_commit, "crates/phoenix-db/src/migrations.rs", registry, prepared.source_kind.value)
+            expected_registry_sha = (SYSTEMD_PREPARED_REGISTRY_SHA256 if isinstance(prepared, ValidatedLinuxPreparedCandidate)
+                                     else SYSTEMD_PROTECTED_REGISTRY_SHA256)
+            if _file_sha256(registry) != expected_registry_sha:
+                raise SystemExit("protected systemd registry hash is not the reviewed release")
+        else:
+            _systemd_ordinary_database_preflight(dataclasses.replace(prepared, binary=candidate_binary), staging, env_snapshot)
+        is_prepared = isinstance(prepared, ValidatedLinuxPreparedCandidate)
+        expected_protocol = (SYSTEMD_PREPARED_PROTOCOL if is_prepared else SYSTEMD_PROTECTED_PROTOCOL
+                             if controller.systemd_current_schema_upgrade else SYSTEMD_HANDOFF_PROTOCOL_VERSION)
+        protocol_argument = (
+            "--protected-prepared-protocol-version" if is_prepared else
+            "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"
         )
-        protocol = subprocess.run(
-            [sys.executable, str(helper), "--protocol-version"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        if protocol != str(SYSTEMD_HANDOFF_PROTOCOL_VERSION):
-            raise SystemExit(f"systemd helper protocol mismatch: expected {SYSTEMD_HANDOFF_PROTOCOL_VERSION}, got {protocol!r}")
+        if is_prepared:
+            helper_bytes = helper.read_bytes()
+            if hashlib.sha256(helper_bytes).hexdigest() != expected_helper_sha256:
+                raise SystemExit("prepared systemd helper changed after exact controller materialization")
+            protocol_result = subprocess.run(
+                [sys.executable, "-", protocol_argument], input=helper_bytes,
+                capture_output=True, check=True,
+            )
+            protocol = protocol_result.stdout.decode().strip()
+        else:
+            protocol = subprocess.run(
+                [sys.executable, str(helper), protocol_argument],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        if protocol != str(expected_protocol):
+            raise SystemExit(f"systemd helper protocol mismatch: expected {expected_protocol}, got {protocol!r}")
 
         root_transaction = SYSTEMD_TRANSACTION_ROOT / transaction_id
         root_paths = {name: root_transaction / name for name in (
@@ -8339,14 +8719,23 @@ def native_prod_deploy(
             "rollback-binary", "rollback.service", "rollback.socket", "rollback.env", "helper.py",
         )}
         manifest = {
-            "manifest_version": SYSTEMD_HANDOFF_PROTOCOL_VERSION,
+            "manifest_version": expected_protocol,
+            **({
+                "mode": "systemd_schema65_to128",
+                "registry": _systemd_artifact(root_transaction / "migrations.rs", registry),
+                "database_path": env_snapshot.get("PHOENIX_DB_PATH", str(SYSTEMD_DB_PATH)),
+                "controller_source_commit": controller.controller_source_commit,
+                "controller_helper": _systemd_artifact(root_paths["helper.py"], helper),
+                **({"prepared_artifact_receipt": _systemd_artifact(root_transaction / SYSTEMD_PREPARED_RECEIPT, prepared.receipt)}
+                   if is_prepared else {"release_asset_name": controller.expected_asset_name,
+                                        "release_asset_sha256": controller.expected_asset_sha256}),
+            } if controller.systemd_current_schema_upgrade else {}),
             "transaction_id": transaction_id,
             "unit_name": PROD_SERVICE_NAME,
             "service_user": service_user,
             "source_kind": prepared.source_kind.value,
             "source_commit": prepared.source_commit,
-            "release_tag": prepared.release_tag,
-            "release_commit": prepared.release_commit,
+            **({} if is_prepared else {"release_tag": prepared.release_tag, "release_commit": prepared.release_commit}),
             "expected": prepared.identity.as_dict(),
             "previous": None,
             "expected_health_url": _prod_api_health_url(env_snapshot),
@@ -8386,14 +8775,29 @@ def native_prod_deploy(
             ("helper.py", helper),
             ("manifest.json", local_manifest),
         ]
+        if registry is not None:
+            files.append(("migrations.rs", registry))
+        if is_prepared:
+            _require_linux_prepared_unchanged(prepared)
+            files.append((SYSTEMD_PREPARED_RECEIPT, prepared.receipt))
         if env_snapshot:
             files.append(("candidate.env", candidate_env))
+        prepared_stage_kwargs = (
+            {
+                "expected_helper_sha256": expected_helper_sha256,
+                "expected_preparation_receipt_sha256": controller.expected_preparation_receipt_sha256,
+            }
+            if is_prepared
+            else {}
+        )
         root_manifest = _stage_systemd_root_handoff(
             staging,
             transaction_id,
             helper,
             files,
             noninteractive=controller.enabled,
+            bind_bundle=prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT,
+            **prepared_stage_kwargs,
         )
 
     _launch_systemd_activation(
@@ -8936,6 +9340,8 @@ def prod_daemon_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
+    if controller.systemd_current_schema_upgrade or controller.controller_source_commit is not None:
+        raise SystemExit("protected systemd current-schema mode cannot use this backend")
     if controller.enabled:
         release, _expected_full_commit = controller.require_exact_release(release)
     layout = _bare_layout()
@@ -9502,6 +9908,39 @@ class PreparedCandidate:
 
 
 @dataclasses.dataclass(frozen=True)
+class DisposableLaunchdValidationInputs:
+    prepared_artifact: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class DisposableLaunchdValidationReceipt:
+    transaction_id: str
+    root: Path
+    transaction_path: Path
+    manifest_path: Path
+    candidate_identity: RuntimeIdentity
+    rollback_identity: RuntimeIdentity
+    controller_source_commit: str
+    controller_helper_sha256: str
+    candidate_registry_sha256: str
+    database_ledger: tuple[tuple[int, str], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class ValidatedLinuxPreparedCandidate:
+    binary: Path
+    receipt: Path
+    binary_sha256: str
+    receipt_sha256: str
+    controller_commit: str
+    source_kind: ProdSourceKind = ProdSourceKind.PREPARED_ARTIFACT
+    source_commit: str = SYSTEMD_PREPARED_COMMIT
+    identity: RuntimeIdentity = RuntimeIdentity(SYSTEMD_PREPARED_VERSION, SYSTEMD_PREPARED_COMMIT)
+    release_tag: None = None
+    release_commit: None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class ProdDeployControllerOptions:
     enabled: bool = False
     exact_release_tag: str | None = None
@@ -9511,8 +9950,84 @@ class ProdDeployControllerOptions:
     transaction_id: str | None = None
     backend: str | None = None
     prepared_artifact: Path | None = None
+    expected_preparation_receipt_sha256: str | None = None
     paired_database_upgrade: bool = False
     current_schema_upgrade: bool = False
+    systemd_current_schema_upgrade: bool = False
+    controller_source_commit: str | None = None
+
+    def require_controller_source(self, release: str | None) -> None:
+        if self.expected_preparation_receipt_sha256 is not None and not self.systemd_current_schema_upgrade:
+            raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
+        if self.systemd_current_schema_upgrade:
+            self.require_systemd_current(release)
+            return
+        protected_release = (
+            self.current_schema_upgrade and release is not None
+            and self.prepared_artifact is None
+        )
+        if self.controller_source_commit is not None:
+            if re.fullmatch(r"[0-9a-f]{40}", self.controller_source_commit) is None:
+                raise SystemExit("--controller-source-commit must be a full 40-character lowercase git SHA")
+            if self.controller_source_commit == self.expected_full_commit:
+                raise SystemExit("--controller-source-commit must differ from the candidate release commit")
+            if not protected_release or self.paired_database_upgrade:
+                raise SystemExit("--controller-source-commit requires published release with --current-schema-upgrade")
+        if protected_release:
+            if self.controller_source_commit is None:
+                raise SystemExit("published release --current-schema-upgrade requires --controller-source-commit")
+            _parse_supported_release_tag(release)
+            if self.enabled:
+                self.require_exact_release(release)
+            elif re.fullmatch(r"[0-9a-f]{40}", self.expected_full_commit or "") is None:
+                raise SystemExit("--expected-full-commit must be a full 40-character lowercase git SHA")
+            if (
+                sys.platform != "darwin"
+                or self.backend not in (None, "launchd")
+                or self.require_backend() != "launchd"
+            ):
+                raise SystemExit("published release current-schema upgrade is supported only by macOS launchd")
+            if not self.enabled and any(value is not None for value in (
+                self.exact_release_tag, self.backend, self.expected_asset_name, self.expected_asset_sha256,
+            )):
+                raise SystemExit("hidden controller bindings require --controller-mode")
+        elif self.current_schema_upgrade and release is not None:
+            raise SystemExit("prepared artifact upgrade excludes --release")
+
+    def require_systemd_current(self, release: str | None) -> None:
+        if not self.systemd_current_schema_upgrade:
+            if self.controller_source_commit is not None:
+                raise SystemExit("--controller-source-commit requires --systemd-current-schema-upgrade")
+            if self.expected_preparation_receipt_sha256 is not None:
+                raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
+            return
+        import platform
+        if (not self.enabled or self.backend != "systemd" or sys.platform != "linux"
+                or platform.machine().lower() not in {"x86_64", "amd64"}
+                or self.current_schema_upgrade or self.paired_database_upgrade):
+            raise SystemExit("--systemd-current-schema-upgrade requires Linux x86_64 systemd controller mode only")
+        if self.prepared_artifact is not None:
+            if (release is not None or self.expected_full_commit != SYSTEMD_PREPARED_COMMIT
+                    or any(value is not None for value in (
+                        self.exact_release_tag, self.expected_asset_name, self.expected_asset_sha256,
+                    )) or re.fullmatch(r"[0-9a-f]{40}", self.controller_source_commit or "") is None
+                    or self.controller_source_commit == self.expected_full_commit
+                    or re.fullmatch(r"[0-9a-f]{64}", self.expected_preparation_receipt_sha256 or "") is None):
+                raise SystemExit(
+                    "protected Linux prepared artifact requires exact app SHA, separate controller, "
+                    "authenticated --expected-preparation-receipt-sha256 and no release pins"
+                )
+            return
+        if self.expected_preparation_receipt_sha256 is not None:
+            raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
+        self.require_exact_release(release)
+        if (release != SYSTEMD_PROTECTED_TAG or self.exact_release_tag != SYSTEMD_PROTECTED_TAG
+                or self.expected_full_commit != SYSTEMD_PROTECTED_COMMIT
+                or self.expected_asset_name != SYSTEMD_PROTECTED_ASSET
+                or self.expected_asset_sha256 != SYSTEMD_PROTECTED_ASSET_SHA256
+                or re.fullmatch(r"[0-9a-f]{40}", self.controller_source_commit or "") is None
+                or self.controller_source_commit == self.expected_full_commit):
+            raise SystemExit("protected systemd requires exact tag/commit/asset/SHA pins and a separate lowercase --controller-source-commit")
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -10069,6 +10584,29 @@ def _prepare_release_candidate(
     )
 
 
+PREPARED_SOURCE114_COMMIT = "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
+PREPARED_SOURCE114_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+
+
+def _macos_prepared_target() -> str:
+    machine = platform.machine().lower()
+    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
+    if target is None:
+        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    return target
+
+
+def _prepared_artifact_bundle_names(target: str) -> dict[str, str]:
+    short_commit = PREPARED_SOURCE114_COMMIT[:12]
+    return {
+        "receipt": f"PREPARATION-RECEIPT-{target}.json",
+        "standalone": f"phoenix_ide-{target}-prepared-{short_commit}",
+        "archive": f"Phoenix-macos-{target}-prepared-{short_commit}.zip",
+        "checksums": f"PREPARATION-SHA256SUMS-{target}",
+        "headless_acceptance": f"HEADLESS-ACCEPTANCE-{target}.json",
+    }
+
+
 def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> PreparedCandidate:
     """Validate one protected prepare-main standalone artifact without resigning it."""
     if sys.platform != "darwin":
@@ -10077,10 +10615,7 @@ def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> Pr
         raise SystemExit("--expected-full-commit must be a full 40-character lowercase git SHA")
     if not directory.is_dir() or directory.is_symlink():
         raise SystemExit("prepared artifact must be a real directory")
-    machine = platform.machine().lower()
-    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
-    if target is None:
-        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    target = _macos_prepared_target()
     receipt = directory / f"PREPARATION-RECEIPT-{target}.json"
     if not receipt.is_file() or receipt.is_symlink():
         raise SystemExit(f"prepared artifact is missing {receipt.name}")
@@ -10162,10 +10697,11 @@ def _prepare_local_candidate(
 
 
 _DEPLOY_TERMINAL_STATES = {
-    "committed", "precondition_failed", "activation_failed_rolled_back",
-    "activation_failed_rollback_failed", "activation_failed_database_committed",
-    "ordinary_activation_failed_forward_only",
-    "ordinary_activation_failed_rollback_failed", "rejected_concurrent",
+    "committed",
+    "precondition_failed",
+    "activation_failed_rolled_back",
+    "ordinary_activation_failed_rollback_failed",
+    "rejected_concurrent",
 }
 _RESTART_TERMINAL_STATES = {
     "committed", "precondition_failed", "restart_failed", "rejected_concurrent",
@@ -10182,18 +10718,26 @@ def _launchd_claim_lock():
         yield
 
 
-def _deploy_claim_owner() -> str | None:
+_UNREADABLE_CLAIM_OWNER = "<unreadable-claim>"
+
+
+def _claim_owner(path: Path) -> str | None:
+    if path.is_symlink() or (os.path.lexists(path) and not path.is_file()):
+        return _UNREADABLE_CLAIM_OWNER
     try:
-        return LAUNCHD_DEPLOY_ACTIVE_PATH.read_text().strip() or None
-    except OSError:
+        return path.read_text().strip() or _UNREADABLE_CLAIM_OWNER
+    except FileNotFoundError:
         return None
+    except OSError:
+        return _UNREADABLE_CLAIM_OWNER
+
+
+def _deploy_claim_owner() -> str | None:
+    return _claim_owner(LAUNCHD_DEPLOY_ACTIVE_PATH)
 
 
 def _restart_claim_owner() -> str | None:
-    try:
-        return LAUNCHD_RESTART_ACTIVE_PATH.read_text().strip() or None
-    except OSError:
-        return None
+    return _claim_owner(LAUNCHD_RESTART_ACTIVE_PATH)
 
 
 def _restart_transaction_status_path(transaction_id: str) -> Path:
@@ -10205,37 +10749,200 @@ def _status_is_terminal_for_owner(
     owner: str,
     terminal_states: set[str],
 ) -> bool:
+    if status_path == LAUNCHD_DEPLOY_STATUS_PATH:
+        repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / owner)
+        if repaired is not None:
+            return repaired
     try:
+        if status_path.is_symlink() or not status_path.is_file():
+            return False
         status = json.loads(status_path.read_text())
+        if not isinstance(status, dict):
+            return False
+        state = status.get("state")
         if (
-            status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
-            and (status.get("state") == "activation_failed_rollback_failed"
-                 or (status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None))
+            (status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
+             or (status.get("source_kind") == ProdSourceKind.PUBLISHED_RELEASE.value
+                 and status.get("prepared_mode") == "current_schema"))
+            and (state == "activation_failed_rollback_failed"
+                 or (state == "activation_failed_rolled_back" and status.get("recovery_mode") is not None))
         ):
             return False
-        return (
-            status.get("transaction_id") == owner
-            and status.get("state") in terminal_states
-            and not status.get("finalization_pending", False)
-        )
+        if status_path != LAUNCHD_DEPLOY_STATUS_PATH:
+            return (
+                status.get("transaction_id") == owner
+                and isinstance(state, str)
+                and state in terminal_states
+                and not status.get("finalization_pending", False)
+            )
+        if (
+            status.get("transaction_id") != owner
+            or not isinstance(state, str)
+            or state not in terminal_states
+            or status.get("finalization_pending") is not False
+            or "rollback_failure" not in status
+            or status.get("rollback_failure") is not None
+        ):
+            return False
+        source_kind = status.get("source_kind")
+        if source_kind not in {
+            ProdSourceKind.LOCAL_HEAD.value,
+            ProdSourceKind.PUBLISHED_RELEASE.value,
+            ProdSourceKind.PREPARED_ARTIFACT.value,
+        }:
+            return False
+        transaction = LAUNCHD_DEPLOY_DIR / "transactions" / owner
+        manifest_path = transaction / "manifest.json"
+        if os.path.lexists(manifest_path):
+            kind = _deploy_manifest_kind(transaction)
+            if kind is DeployManifestKind.UNKNOWN:
+                return False
+            if not _deploy_status_matches_manifest(
+                transaction, json.loads(manifest_path.read_text()), status, kind,
+            ):
+                return False
+        elif not _deploy_source_matches_mode(source_kind, status.get("prepared_mode")):
+            return False
+        return True
     except (OSError, json.JSONDecodeError):
         return False
 
 
-def _transaction_has_paired_manifest(transaction: Path) -> bool:
-    """Fail closed when deciding whether a transaction may be pruned."""
-    manifest = transaction / "manifest.json"
+def _deploy_unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+class DeployManifestKind(enum.Enum):
+    ORDINARY = "ordinary"
+    ORDINARY_FORWARD = "ordinary_forward"
+    PAIRED = "paired"
+    CURRENT_SCHEMA = "current_schema"
+    UNKNOWN = "unknown"
+
+
+def _deploy_source_matches_mode(source_kind: object, prepared_mode: object) -> bool:
+    if prepared_mode == "paired":
+        return source_kind == "prepared_artifact"
+    if prepared_mode == "current_schema":
+        return source_kind in ("prepared_artifact", "published_release")
+    return prepared_mode is None and source_kind in ("local_head", "published_release")
+
+
+def _deploy_manifest_kind(transaction: Path) -> DeployManifestKind:
+    manifest_path = transaction / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return DeployManifestKind.UNKNOWN
     try:
-        payload = json.loads(manifest.read_text())
-    except FileNotFoundError:
-        return True
-    except (OSError, json.JSONDecodeError):
-        return True
+        payload = json.loads(
+            manifest_path.read_text(), object_pairs_hook=_deploy_unique_json_object
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        return DeployManifestKind.UNKNOWN
+    if not isinstance(payload, dict) or not isinstance(payload.get("source_kind"), str):
+        return DeployManifestKind.UNKNOWN
+    mode_payloads = {
+        DeployManifestKind.PAIRED: payload.get("paired_database_upgrade"),
+        DeployManifestKind.CURRENT_SCHEMA: payload.get("current_schema_upgrade"),
+        DeployManifestKind.ORDINARY_FORWARD: payload.get(
+            "ordinary_forward_migration"
+        ),
+    }
+    prepared_fields = {
+        "database_path", "backup_path", "proof_path", "controller_source_commit",
+        "controller_helper_path", "controller_helper_sha256",
+    }
+    registry_fields = {"migration_registry_path", "migration_registry_sha256"}
+    required_fields = {
+        DeployManifestKind.PAIRED: prepared_fields,
+        DeployManifestKind.CURRENT_SCHEMA: prepared_fields | registry_fields,
+        DeployManifestKind.ORDINARY_FORWARD: {
+            "database_path", "helper_path", "helper_sha256",
+        } | registry_fields,
+    }
+    prepared_source114_fields = required_fields[DeployManifestKind.CURRENT_SCHEMA] | {
+        "prepared_source_baseline", "candidate_registry_expected_sha256",
+    }
+    for kind, value in mode_payloads.items():
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            return DeployManifestKind.UNKNOWN
+        if kind is DeployManifestKind.CURRENT_SCHEMA and value.keys() == prepared_source114_fields:
+            if (
+                type(value["prepared_source_baseline"]) is not int
+                or value["prepared_source_baseline"] != 114
+                or any(
+                    not isinstance(field, str) or not field.strip()
+                    for key, field in value.items()
+                    if key != "prepared_source_baseline"
+                )
+            ):
+                return DeployManifestKind.UNKNOWN
+        elif (
+            value.keys() != required_fields[kind]
+            or any(not isinstance(field, str) or not field.strip() for field in value.values())
+        ):
+            return DeployManifestKind.UNKNOWN
+    modes = {
+        kind: isinstance(value, dict) for kind, value in mode_payloads.items()
+    }
+    selected = [kind for kind, present in modes.items() if present]
+    if len(selected) > 1:
+        return DeployManifestKind.UNKNOWN
+    if selected:
+        kind = selected[0]
+        source_kind = payload.get("source_kind")
+        if kind in {DeployManifestKind.PAIRED, DeployManifestKind.CURRENT_SCHEMA}:
+            if not _deploy_source_matches_mode(source_kind, kind.value):
+                return DeployManifestKind.UNKNOWN
+        elif source_kind not in {"local_head", "published_release"}:
+            return DeployManifestKind.UNKNOWN
+        return kind
+    if payload.get("source_kind") in {"local_head", "published_release"}:
+        return DeployManifestKind.ORDINARY
+    return DeployManifestKind.UNKNOWN
+
+
+def _deploy_status_matches_manifest(
+    transaction: Path, payload: object, status: object, expected_kind: DeployManifestKind,
+) -> bool:
+    if not isinstance(payload, dict) or not isinstance(status, dict):
+        return False
+    if expected_kind is DeployManifestKind.UNKNOWN or _deploy_manifest_kind(transaction) is not expected_kind:
+        return False
+    prepared_mode = {
+        DeployManifestKind.PAIRED: "paired",
+        DeployManifestKind.CURRENT_SCHEMA: "current_schema",
+    }.get(expected_kind)
     return (
-        not isinstance(payload, dict)
-        or payload.get("paired_database_upgrade") is not None
-        or payload.get("current_schema_upgrade") is not None
+        status.get("source_kind") == payload.get("source_kind")
+        and status.get("prepared_mode") == prepared_mode
     )
+
+
+def _probe_deploy_helper_absence(label: str) -> bool:
+    uid = os.getuid()
+    result = subprocess.run(
+        ["launchctl", "print", f"gui/{uid}/{label}"], capture_output=True, text=True,
+    )
+    return result.returncode != 0 and re.search(
+        r'^\s*Could not find service "' + re.escape(label)
+        + r'" in domain (?:gui/' + str(uid) + r'|for user gui: ' + str(uid) + r')\s*$',
+        result.stdout + "\n" + result.stderr, re.MULTILINE,
+    ) is not None
+
+
+def _transaction_must_be_retained(transaction: Path) -> bool:
+    return _deploy_manifest_kind(transaction) in {
+        DeployManifestKind.PAIRED,
+        DeployManifestKind.CURRENT_SCHEMA,
+        DeployManifestKind.UNKNOWN,
+    }
 
 
 def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transaction_id: str) -> None:
@@ -10252,7 +10959,7 @@ def _prune_launchd_deploy_transactions(transactions_dir: Path, current_transacti
         )
     except OSError:
         return
-    prunable = [path for path in old_transactions if not _transaction_has_paired_manifest(path)]
+    prunable = [path for path in old_transactions if not _transaction_must_be_retained(path)]
     for old in prunable[5:]:
         shutil.rmtree(old, ignore_errors=True)
 
@@ -10262,6 +10969,25 @@ def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
         return False
     try:
         LAUNCHD_DEPLOY_ACTIVE_PATH.unlink()
+        try:
+            _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
+        except OSError:
+            try:
+                fd = os.open(
+                    LAUNCHD_DEPLOY_ACTIVE_PATH,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            else:
+                try:
+                    os.write(fd, f"{transaction_id}\n".encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                _fsync_directory(LAUNCHD_DEPLOY_ACTIVE_PATH.parent)
+            raise
         return True
     except FileNotFoundError:
         return False
@@ -10291,22 +11017,41 @@ def _release_launchd_restart_claim(transaction_id: str) -> bool:
 def _paired_recovery_refusal(owner: str | None) -> str | None:
     if owner is None:
         return None
-    try:
-        status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
+    repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / owner)
+    if repaired is True:
+        return None
+    if repaired is False:
+        return (f"current-schema repair for {owner} is selected or its evidence is malformed. "
+                f"Retain the original claim and both proofs; use ./dev.py prod resume-current-repair {owner}. "
+                "Never finalize the original candidate or start a predecessor.")
+    status_entry_exists = os.path.lexists(LAUNCHD_DEPLOY_STATUS_PATH)
+    status_entry_invalid = LAUNCHD_DEPLOY_STATUS_PATH.is_symlink() or (
+        status_entry_exists and not LAUNCHD_DEPLOY_STATUS_PATH.is_file()
+    )
+    if status_entry_invalid or not status_entry_exists:
         status = {}
+    else:
+        try:
+            status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+        except (OSError, json.JSONDecodeError):
+            status = {}
     if not isinstance(status, dict):
         status = {}
-    try:
-        manifest = json.loads((LAUNCHD_DEPLOY_DIR / "transactions" / owner / "manifest.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        manifest = {}
-    if not isinstance(manifest, dict):
-        manifest = {}
-    paired = manifest.get("paired_database_upgrade") is not None or manifest.get("source_kind") == "prepared_artifact" or status.get("source_kind") == "prepared_artifact"
-    current_schema = manifest.get("current_schema_upgrade") is not None
-    ordinary_forward = manifest.get("ordinary_forward_migration") is not None
+    transaction = LAUNCHD_DEPLOY_DIR / "transactions" / owner
+    kind = _deploy_manifest_kind(transaction)
+    paired = kind in {
+        DeployManifestKind.PAIRED,
+        DeployManifestKind.CURRENT_SCHEMA,
+    }
+    current_schema = kind is DeployManifestKind.CURRENT_SCHEMA
+    ordinary_forward = kind is DeployManifestKind.ORDINARY_FORWARD
     owner_status = status.get("transaction_id") == owner
+    if kind is DeployManifestKind.UNKNOWN:
+        return (
+            f"deployment transaction {owner} has missing, unreadable, or inconsistent mode evidence. "
+            "Do not remove its claim or transaction directory; do not invoke retained recovery until "
+            "the manifest mode is diagnosed."
+        )
     if not ordinary_forward and owner_status and status.get("state") in {
         "candidate_may_migrate",
         "ordinary_activation_failed_forward_only",
@@ -10324,6 +11069,35 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             f"ordinary forward activation {owner} may have committed migration 126/127 or coordinator-home initialization. "
             "Do not start the predecessor or remove the claim. Preserve the retained candidate and evidence; "
             f"after explicit forward-recovery authorization run ./dev.py prod resume-forward {owner}."
+        )
+    if (
+        owner_status
+        and status.get("state") == "precondition_failed"
+        and status.get("precondition_cleanup_completed") is True
+    ):
+        if kind not in {DeployManifestKind.PAIRED, DeployManifestKind.CURRENT_SCHEMA}:
+            return (
+                f"pre-stop capacity cleanup for {owner} completed, but claim release remains pending "
+                "and the retained mode cannot be verified. Preserve the claim for diagnosis."
+            )
+        command = "cleanup-current" if current_schema else "cleanup-paired"
+        return (
+            f"pre-stop capacity cleanup for {owner} completed without runtime/database action, "
+            "but its matching claim still requires durable release. After confirming the old helper "
+            f"is absent, retry ./dev.py prod {command} {owner}."
+        )
+    if owner_status and status.get("state") == "precondition_cleanup_pending":
+        if kind not in {DeployManifestKind.PAIRED, DeployManifestKind.CURRENT_SCHEMA}:
+            return (
+                f"pre-stop capacity cleanup for {owner} is pending, but its retained mode cannot be verified. "
+                "The service was not intentionally stopped. Preserve the claim and capacity evidence; "
+                "do not invoke cleanup or recovery until the manifest is diagnosed."
+            )
+        command = "cleanup-current" if current_schema else "cleanup-paired"
+        return (
+            f"pre-stop capacity cleanup for {owner} is pending; the service was not intentionally stopped. "
+            "Do not invoke database/runtime recovery or remove the claim. After confirming the old helper is absent, "
+            f"run ./dev.py prod {command} {owner}; it may remove only this transaction's unsnapshotted capacity files."
         )
     if current_schema and status.get("transaction_id") == owner and status.get("state") == "migration_started":
         return (
@@ -10351,10 +11125,11 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             f"{action}."
         )
     if paired and status.get("transaction_id") == owner and status.get("state") == "activation_failed_rolled_back" and status.get("recovery_mode") is not None:
+        command = "recover-current" if current_schema else "recover-paired"
         return (
-            f"paired predecessor completion {owner} still owns its claim. "
+            f"protected predecessor completion {owner} still owns its claim. "
             "Do not clear the marker or redeploy. After confirming the old helper is absent, "
-            f"run ./dev.py prod recover-paired {owner}; it verifies the checkpointed running predecessor "
+            f"run ./dev.py prod {command} {owner}; it verifies the checkpointed running predecessor "
             "and finalizes publication/status without snapshot replay."
         )
     resolved = status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed", "activation_failed_rolled_back"}
@@ -10375,6 +11150,81 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     return None
 
 
+def _markerless_status_is_resolved(status: dict[str, object]) -> bool:
+    owner = status.get("transaction_id")
+    if isinstance(owner, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", owner):
+        repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / owner)
+        if repaired is not None:
+            return repaired
+    transaction_id = status.get("transaction_id")
+    state = status.get("state")
+    source_kind = status.get("source_kind")
+    finalization_pending = status.get("finalization_pending", False)
+    rollback_failure = status.get("rollback_failure", None)
+    return (
+        isinstance(transaction_id, str)
+        and bool(transaction_id)
+        and source_kind in {
+            ProdSourceKind.LOCAL_HEAD.value,
+            ProdSourceKind.PUBLISHED_RELEASE.value,
+            ProdSourceKind.PREPARED_ARTIFACT.value,
+        }
+        and _deploy_source_matches_mode(source_kind, status.get("prepared_mode"))
+        and isinstance(state, str)
+        and state in _DEPLOY_TERMINAL_STATES
+        and finalization_pending is False
+        and rollback_failure is None
+    )
+
+
+def _markerless_operation_refusal() -> str | None:
+    malformed_refusal = (
+        "markerless deployment status is unreadable or malformed. Preserve it for diagnosis; "
+        "do not deploy, restart, or stop until ownership is established."
+    )
+    if LAUNCHD_DEPLOY_STATUS_PATH.is_symlink():
+        return malformed_refusal
+    if not LAUNCHD_DEPLOY_STATUS_PATH.exists():
+        return None
+    if not LAUNCHD_DEPLOY_STATUS_PATH.is_file():
+        return malformed_refusal
+    try:
+        status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return malformed_refusal
+    if not isinstance(status, dict):
+        return malformed_refusal
+    transaction_id = status.get("transaction_id", "unknown")
+    if isinstance(transaction_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+        repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id)
+        if repaired is False:
+            return (f"markerless current-schema repair {transaction_id} is unresolved; preserve both transactions "
+                    f"and establish exact parent ownership before prod resume-current-repair {transaction_id}.")
+    state = status.get("state", "unknown")
+    if _markerless_status_is_resolved(status):
+        return None
+    if state == "precondition_cleanup_pending":
+        return (
+            f"markerless pre-stop cleanup transaction {transaction_id} is unresolved. "
+            "Preserve its capacity evidence and establish ownership before any supported "
+            "completion, cleanup, or recovery operation."
+        )
+    if isinstance(state, str) and state in {
+        "candidate_may_migrate",
+        "ordinary_activation_failed_forward_only",
+    }:
+        return (
+            f"markerless forward-only transaction {transaction_id} is unresolved. "
+            "Preserve its candidate and evidence; establish ownership before any supported "
+            "completion or recovery operation."
+        )
+    return (
+        f"markerless deployment transaction {transaction_id} has unresolved state {state!r}. "
+        "Preserve its evidence and establish ownership before any supported completion, "
+        "cleanup, or recovery operation."
+    )
+
+
 def _claim_launchd_deploy(transaction_id: str, *, initial_status: dict | None = None) -> None:
     LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     LAUNCHD_DEPLOY_DIR.chmod(0o700)
@@ -10383,6 +11233,11 @@ def _claim_launchd_deploy(transaction_id: str, *, initial_status: dict | None = 
         refusal = _paired_recovery_refusal(owner)
         if refusal is not None:
             raise ConcurrentLaunchdOperation(refusal)
+
+        if owner is None:
+            markerless_refusal = _markerless_operation_refusal()
+            if markerless_refusal is not None:
+                raise ConcurrentLaunchdOperation(markerless_refusal)
 
         if owner and LAUNCHD_DEPLOY_STATUS_PATH.exists():
             if _status_is_terminal_for_owner(
@@ -10405,8 +11260,9 @@ def _claim_launchd_deploy(transaction_id: str, *, initial_status: dict | None = 
             )
         if owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
             raise ConcurrentLaunchdOperation(
-                f"another launchd deployment ({owner or 'unknown'}) is active or needs recovery. "
-                "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
+                f"another launchd deployment ({owner or 'unknown'}) is active or unresolved. "
+                "Run './dev.py prod status' and preserve its claim and evidence until the "
+                "supported completion or recovery path is established."
             )
         if initial_status is not None:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
@@ -10428,6 +11284,10 @@ def _claim_launchd_restart(transaction_id: str) -> None:
             refusal = _paired_recovery_refusal(deploy_owner)
             if refusal is not None:
                 raise ConcurrentLaunchdOperation(refusal)
+            if deploy_owner is None:
+                markerless_refusal = _markerless_operation_refusal()
+                if markerless_refusal is not None:
+                    raise ConcurrentLaunchdOperation(markerless_refusal)
             if deploy_owner and _status_is_terminal_for_owner(
                 LAUNCHD_DEPLOY_STATUS_PATH, deploy_owner, _DEPLOY_TERMINAL_STATES
             ):
@@ -10520,7 +11380,7 @@ def _materialize_source_file(
     source_path: str,
     destination: Path,
     source_kind: str,
-) -> None:
+) -> str:
     if source_kind == "local_head":
         result = subprocess.run(
             ["git", "show", f"{source_commit}:{source_path}"],
@@ -10534,8 +11394,37 @@ def _materialize_source_file(
         )
     if result.returncode != 0 or not result.stdout:
         raise SystemExit(f"selected source {source_commit} has no {source_path}")
-    destination.write_bytes(result.stdout)
-    destination.chmod(0o700)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(result.stdout)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+        return hashlib.sha256(result.stdout).hexdigest()
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _preflight_ordinary_launchd_policy(manifest_path: Path, helper: Path) -> None:
+    """Run the immutable ordinary transaction's staged policy before handoff."""
+    import runpy
+
+    payload = json.loads(manifest_path.read_text())
+    ordinary = payload.get("ordinary_forward_migration")
+    if (
+        not isinstance(ordinary, dict)
+        or ordinary.get("helper_path") != str(helper)
+        or helper.is_symlink()
+        or not helper.is_file()
+        or ordinary.get("helper_sha256") != _file_sha256(helper)
+    ):
+        raise SystemExit("ordinary policy helper does not match retained transaction evidence")
+    policy = runpy.run_path(str(helper))
+    policy["ordinary_forward_policy_applies"](policy["Manifest"].load(manifest_path))
 
 
 def _materialize_helper(source_commit: str, destination: Path, source_kind: str) -> None:
@@ -10544,6 +11433,351 @@ def _materialize_helper(source_commit: str, destination: Path, source_kind: str)
         "scripts/launchd_deploy_helper.py",
         destination,
         source_kind,
+    )
+
+
+def _stage_disposable_validation_file(source: Path, destination: Path, mode: int) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with source.open("rb") as input_stream, os.fdopen(fd, "wb") as output_stream:
+            fd = -1
+            shutil.copyfileobj(input_stream, output_stream)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(destination.parent)
+
+
+def _write_disposable_validation_bytes(
+    destination: Path, content: bytes, mode: int
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(destination.parent)
+
+
+def _fsync_disposable_validation_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    _fsync_directory(path.parent)
+
+
+def _disposable_launchd_validation_plist(
+    *, label: str, target_binary: Path, database: Path, port: int
+) -> bytes:
+    return plistlib.dumps(
+        {
+            "Label": label,
+            "ProgramArguments": [str(target_binary)],
+            "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
+            "KeepAlive": True,
+            "Sockets": {
+                "Listeners": {"SockServiceName": str(port), "SockType": "stream"}
+            },
+        },
+        fmt=plistlib.FMT_XML,
+    )
+
+
+def _create_disposable_source114_database(
+    database: Path, target_ledger: tuple[tuple[int, str], ...]
+) -> tuple[tuple[int, str], ...]:
+    import sqlite3
+
+    source_ledger = tuple(item for item in target_ledger if item[0] <= 114)
+    if not source_ledger or source_ledger[-1][0] != 114:
+        raise SystemExit("exact candidate registry lacks the source114 baseline")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO _migrations (version, name) VALUES (?, ?)", source_ledger
+        )
+        connection.executescript(
+            """
+            CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                product_conversation_id TEXT
+                    REFERENCES product_conversations(id) ON DELETE CASCADE
+            );
+            CREATE TABLE product_conversation_sources (
+                target_product_conversation_id TEXT PRIMARY KEY
+                    REFERENCES product_conversations(id) ON DELETE CASCADE,
+                source_product_conversation_id TEXT NOT NULL,
+                source_conversation_id TEXT NOT NULL,
+                relation_kind TEXT NOT NULL,
+                relation_key TEXT NOT NULL,
+                created_at_us INTEGER NOT NULL
+            );
+            """
+        )
+    database.chmod(0o600)
+    _fsync_disposable_validation_file(database)
+    return source_ledger
+
+
+def _disposable_validation_tree_witness(
+    root: Path,
+) -> tuple[tuple[str, str, int, int, int], ...]:
+    witness = []
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item))]:
+        relative = str(path.relative_to(root))
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            content = f"symlink:{os.readlink(path)}"
+        elif stat.S_ISREG(metadata.st_mode):
+            content = f"file:{_file_sha256(path)}"
+        elif stat.S_ISDIR(metadata.st_mode):
+            content = "directory"
+        else:
+            content = f"other:{stat.S_IFMT(metadata.st_mode)}"
+        witness.append(
+            (
+                relative,
+                content,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+        )
+    return tuple(witness)
+
+
+def prepare_disposable_launchd_validation(
+    inputs: DisposableLaunchdValidationInputs,
+) -> DisposableLaunchdValidationReceipt:
+    """Stage and validate one exact prepared handoff without activation authority."""
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if dirty:
+        raise SystemExit("disposable validation requires a clean controller source tree")
+    controller_source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", controller_source_commit) is None
+        or controller_source_commit == PREPARED_SOURCE114_COMMIT
+    ):
+        raise SystemExit("disposable validation requires an independent controller commit")
+    root = Path(tempfile.mkdtemp(prefix="phoenix-launchd-validation-"))
+    try:
+        root = root.resolve()
+        root.chmod(0o700)
+        return _prepare_disposable_launchd_validation(inputs, root, controller_source_commit)
+    except BaseException:
+        shutil.rmtree(root)
+        raise
+
+
+def _prepare_disposable_launchd_validation(
+    inputs: DisposableLaunchdValidationInputs,
+    root: Path,
+    controller_source_commit: str,
+) -> DisposableLaunchdValidationReceipt:
+    import runpy
+
+    target = _macos_prepared_target()
+    bundle_names = _prepared_artifact_bundle_names(target)
+    expected_names = set(bundle_names.values())
+    source = inputs.prepared_artifact
+    if not stat.S_ISDIR(source.lstat().st_mode):
+        raise SystemExit("prepared artifact must be a real directory")
+    entries = {entry.name: entry for entry in source.iterdir()}
+    if entries.keys() != expected_names:
+        raise SystemExit("disposable prepared artifact does not match the exact retained bundle")
+    if any(not stat.S_ISREG(entry.lstat().st_mode) for entry in entries.values()):
+        raise SystemExit("disposable prepared artifact entries must be regular non-symlink files")
+
+    checksum_entries: dict[str, str] = {}
+    for line in entries[bundle_names["checksums"]].read_text().splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            raise SystemExit("prepared artifact checksum manifest is malformed")
+        digest, name = fields[0].lower(), fields[1].lstrip("*")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or name in checksum_entries:
+            raise SystemExit("prepared artifact checksum manifest is malformed")
+        checksum_entries[name] = digest
+    payload_names = {bundle_names["standalone"], bundle_names["archive"]}
+    if checksum_entries.keys() != payload_names:
+        raise SystemExit("prepared artifact checksum manifest has the wrong payload set")
+    try:
+        receipt = json.loads(entries[bundle_names["receipt"]].read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("prepared artifact receipt is unreadable") from exc
+    if not isinstance(receipt, dict) or receipt.get("sha256") != checksum_entries:
+        raise SystemExit("prepared artifact receipt and checksum manifest disagree")
+    for name, digest in checksum_entries.items():
+        if _file_sha256(entries[name]) != digest:
+            raise SystemExit(f"prepared artifact payload checksum mismatch: {name}")
+
+    staged_artifact = root / "prepared-artifact"
+    staged_artifact.mkdir(mode=0o700)
+    for name in (bundle_names["receipt"], bundle_names["standalone"]):
+        _stage_disposable_validation_file(entries[name], staged_artifact / name, 0o600)
+    prepared = _prepare_prepared_artifact(staged_artifact, PREPARED_SOURCE114_COMMIT)
+    token = hashlib.sha256(f"{root}:{controller_source_commit}".encode()).hexdigest()[:20]
+    transaction_id = f"validation-{token}"
+    transactions = root / "transactions"
+    transactions.mkdir(mode=0o700)
+    transaction = transactions / transaction_id
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "candidate-phoenix-ide"
+    rollback = transaction / "rollback-phoenix-ide"
+    candidate_plist = transaction / "candidate.plist"
+    rollback_plist = transaction / "rollback.plist"
+    target_binary = root / "target" / "phoenix-ide"
+    target_plist = root / "target" / "phoenix.plist"
+    helper = transaction / "activate.py"
+    registry = transaction / "migrations.rs"
+    database = transaction / "application.sqlite3"
+    manifest_path = transaction / "manifest.json"
+    _stage_disposable_validation_file(prepared.binary, candidate, 0o755)
+    rollback_identity = RuntimeIdentity(version="0.0.0", git_sha="a" * 40)
+    _write_disposable_validation_bytes(
+        rollback, b"disposable rollback witness; never executable\n", 0o600
+    )
+    label = f"test.disposable.phoenix.validation.{token}"
+    first_port = 40_000 + int(token[:4], 16) % 10_000
+    _write_disposable_validation_bytes(
+        candidate_plist,
+        _disposable_launchd_validation_plist(
+            label=label, target_binary=target_binary, database=database, port=first_port
+        ),
+        0o600,
+    )
+    _write_disposable_validation_bytes(
+        rollback_plist,
+        _disposable_launchd_validation_plist(
+            label=label, target_binary=target_binary, database=database, port=first_port + 1
+        ),
+        0o600,
+    )
+    _materialize_helper(controller_source_commit, helper, "local_head")
+    _materialize_source_file(
+        PREPARED_SOURCE114_COMMIT,
+        "crates/phoenix-db/src/migrations.rs",
+        registry,
+        "local_head",
+    )
+    registry.chmod(0o600)
+    _fsync_disposable_validation_file(helper)
+    _fsync_disposable_validation_file(registry)
+    if _file_sha256(registry) != PREPARED_SOURCE114_REGISTRY_SHA256:
+        raise SystemExit(
+            "disposable candidate registry differs from exact source114 evidence"
+        )
+    helper_protocol = subprocess.run(
+        [sys.executable, str(helper), "--protocol-version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if helper_protocol != str(LAUNCHD_HANDOFF_PROTOCOL_VERSION):
+        raise SystemExit("disposable retained helper protocol is unsupported")
+    policy = runpy.run_path(str(helper))
+    target_ledger = policy["migration_registry"](registry)
+    source_ledger = _create_disposable_source114_database(database, target_ledger)
+    helper_label = f"com.phoenix-ide.deploy.{transaction_id}"
+    upgrade = {
+        "database_path": str(database),
+        "backup_path": str(transaction / "database-backup.sqlite3"),
+        "proof_path": str(transaction / "database-proof.json"),
+        "controller_source_commit": controller_source_commit,
+        "controller_helper_path": str(helper),
+        "controller_helper_sha256": _file_sha256(helper),
+        "migration_registry_path": str(registry),
+        "migration_registry_sha256": _file_sha256(registry),
+        "prepared_source_baseline": 114,
+        "candidate_registry_expected_sha256": PREPARED_SOURCE114_REGISTRY_SHA256,
+    }
+    manifest = {
+        "manifest_version": LAUNCHD_HANDOFF_PROTOCOL_VERSION,
+        "transaction_id": transaction_id,
+        "source_kind": prepared.source_kind.value,
+        "source_commit": prepared.source_commit,
+        "release_tag": prepared.release_tag,
+        "release_commit": prepared.release_commit,
+        "expected": dataclasses.asdict(prepared.identity),
+        "previous": dataclasses.asdict(rollback_identity),
+        "previous_deployed_sha": rollback_identity.git_sha,
+        "candidate_binary": str(candidate),
+        "candidate_binary_sha256": _file_sha256(candidate),
+        "candidate_plist": str(candidate_plist),
+        "candidate_plist_sha256": _file_sha256(candidate_plist),
+        "rollback_binary": str(rollback),
+        "rollback_binary_sha256": _file_sha256(rollback),
+        "rollback_plist": str(rollback_plist),
+        "rollback_plist_sha256": _file_sha256(rollback_plist),
+        "target_binary": str(target_binary),
+        "target_plist": str(target_plist),
+        "label": label,
+        "helper_label": helper_label,
+        "uid": os.getuid(),
+        "health_url": f"http://127.0.0.1:{first_port}/api/version",
+        "health_insecure_tls": False,
+        "previous_health_url": f"http://127.0.0.1:{first_port + 1}/api/version",
+        "previous_health_insecure_tls": False,
+        "previous_health_json": True,
+        "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
+        "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
+        "active_path": str(root / "evidence" / "active"),
+        "status_path": str(root / "evidence" / "status.json"),
+        "deployed_sha_path": str(root / "evidence" / "deployed.sha"),
+        "lock_path": str(root / "evidence" / "deploy.lock"),
+        "claim_lock_path": str(root / "evidence" / "claim.lock"),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "current_schema_upgrade": upgrade,
+    }
+    _write_json_atomic(manifest_path, manifest)
+    if _deploy_manifest_kind(transaction) is not DeployManifestKind.CURRENT_SCHEMA:
+        raise SystemExit(
+            "disposable manifest was not classified as exact current-schema evidence"
+        )
+    tree_before_validation = _disposable_validation_tree_witness(root)
+    loaded = policy["Manifest"].load(manifest_path)
+    validated = policy["validate_pre_disruption_handoff"](loaded)
+    if _disposable_validation_tree_witness(root) != tree_before_validation:
+        raise SystemExit("disposable helper validation mutated retained evidence")
+    if (
+        validated.candidate_binary != candidate
+        or validated.candidate_plist != candidate_plist
+        or validated.rollback != (rollback, rollback_plist)
+    ):
+        raise SystemExit("disposable helper validation returned mismatched evidence")
+    return DisposableLaunchdValidationReceipt(
+        transaction_id=transaction_id,
+        root=root,
+        transaction_path=transaction,
+        manifest_path=manifest_path,
+        candidate_identity=prepared.identity,
+        rollback_identity=rollback_identity,
+        controller_source_commit=controller_source_commit,
+        controller_helper_sha256=_file_sha256(helper),
+        candidate_registry_sha256=_file_sha256(registry),
+        database_ledger=source_ledger,
     )
 
 
@@ -10566,6 +11800,119 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
+def _verified_retained_helper_label(payload: dict, transaction_id: str) -> str:
+    expected = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
+    if payload.get("transaction_id") != transaction_id:
+        raise SystemExit("retained manifest transaction identity does not match")
+    if payload.get("helper_label") != expected:
+        raise SystemExit("retained deployment helper label is invalid")
+    return expected
+
+
+def cmd_prod_cleanup_precondition(
+    transaction_id: str, *, current_schema: bool = False
+) -> None:
+    mode_name = "current-schema" if current_schema else "paired"
+    mode_key = "current_schema_upgrade" if current_schema else "paired_database_upgrade"
+    helper_command = "cleanup-current" if current_schema else "cleanup-paired"
+    if (
+        sys.platform != "darwin"
+        or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id)
+        or transaction_id in {".", ".."}
+    ):
+        raise SystemExit(f"{mode_name} pre-stop cleanup requires macOS and a safe transaction ID")
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    manifest_path = staging / "manifest.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise SystemExit("pre-stop cleanup requires a regular non-symlink manifest")
+    if (
+        not LAUNCHD_DEPLOY_STATUS_PATH.is_file()
+        or LAUNCHD_DEPLOY_STATUS_PATH.is_symlink()
+    ):
+        raise SystemExit("pre-stop cleanup requires a regular non-symlink status")
+    payload = json.loads(manifest_path.read_text())
+    status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+    upgrade = payload.get(mode_key)
+    if (
+        not isinstance(upgrade, dict)
+        or _deploy_manifest_kind(staging)
+        is not (
+            DeployManifestKind.CURRENT_SCHEMA
+            if current_schema
+            else DeployManifestKind.PAIRED
+        )
+        or status.get("transaction_id") != transaction_id
+        or not _deploy_status_matches_manifest(
+            staging, payload, status,
+            DeployManifestKind.CURRENT_SCHEMA if current_schema else DeployManifestKind.PAIRED,
+        )
+        or not (
+            status.get("state") == "precondition_cleanup_pending"
+            or (
+                status.get("state") == "precondition_failed"
+                and status.get("precondition_cleanup_completed") is True
+            )
+        )
+        or _deploy_claim_owner() != transaction_id
+    ):
+        raise SystemExit(
+            f"pre-stop cleanup requires the matching retained {mode_name} transaction and claim"
+        )
+    proof = Path(upgrade["proof_path"])
+    if proof.exists() or proof.is_symlink():
+        raise SystemExit("pre-stop cleanup refuses a transaction with snapshot proof")
+    helper = Path(upgrade["controller_helper_path"])
+    if (
+        helper.parent != staging
+        or helper.is_symlink()
+        or _file_sha256(helper) != upgrade.get("controller_helper_sha256")
+    ):
+        raise SystemExit(f"retained {mode_name} controller helper binding is invalid")
+    label = _verified_retained_helper_label(payload, transaction_id)
+    interpreter = Path(sys.executable).resolve()
+    probe = subprocess.run(
+        [str(interpreter), "-c", "import fcntl, plistlib, sqlite3"],
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        raise SystemExit("active Python interpreter cannot run retained cleanup helper")
+    absence = subprocess.run(
+        [
+            str(interpreter),
+            str(helper),
+            "--probe-service-absence",
+            label,
+            "--uid",
+            str(os.getuid()),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if absence.returncode != 0:
+        raise SystemExit(f"{mode_name} helper absence is unconfirmed; inspect it before cleanup")
+    plist = plistlib.loads(
+        _helper_plist(
+            label,
+            helper,
+            manifest_path,
+            staging / "cleanup.log",
+            interpreter,
+        )
+    )
+    plist["ProgramArguments"][2] = helper_command
+    helper_plist = staging / "cleanup-helper.plist"
+    helper_plist.write_bytes(plistlib.dumps(plist))
+    helper_plist.chmod(0o600)
+    subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)],
+        check=True,
+    )
+    print(
+        f"Verified {mode_name} pre-stop cleanup handed to retained controller for "
+        f"{transaction_id}; the service and database are not part of this operation."
+    )
+
+
 def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = False) -> None:
     mode_name = "current-schema" if current_schema else "paired"
     mode_key = "current_schema_upgrade" if current_schema else "paired_database_upgrade"
@@ -10574,11 +11921,16 @@ def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = Fals
         raise SystemExit(f"{mode_name} finalization requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"
+    if _current_repair_resolution(staging) is not None:
+        raise SystemExit(f"original finalization fenced by repair child; use prod resume-current-repair {transaction_id}")
     payload = json.loads(manifest_path.read_text())
     status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
     owner = _deploy_claim_owner()
     allowed_states = {"committed", "migration_started"} if current_schema else {"committed"}
-    if status.get("transaction_id") != transaction_id or status.get("state") not in allowed_states or payload.get(mode_key) is None:
+    if status.get("transaction_id") != transaction_id or status.get("state") not in allowed_states or not _deploy_status_matches_manifest(
+        staging, payload, status,
+        DeployManifestKind.CURRENT_SCHEMA if current_schema else DeployManifestKind.PAIRED,
+    ):
         raise SystemExit(f"finalization requires retained committed {mode_name} database evidence")
     if owner != transaction_id and (owner is not None or status.get("finalization_pending")):
         raise SystemExit(f"{mode_name} finalization claim mismatch")
@@ -10589,7 +11941,7 @@ def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = Fals
     interpreter = subprocess.run([sys.executable, "-c", "import fcntl, plistlib, ssl, urllib.request"], capture_output=True, text=True)
     if interpreter.returncode != 0:
         raise SystemExit("current interpreter cannot run retained paired finalization helper")
-    label = payload["helper_label"]
+    label = _verified_retained_helper_label(payload, transaction_id)
     absence = subprocess.run([sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
     if absence.returncode != 0:
         raise SystemExit("previous activation helper absence is unconfirmed")
@@ -10598,6 +11950,201 @@ def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = Fals
         raise SystemExit(f"{mode_name} finalization refused/failed; claim retained: {result.stderr.strip()}")
     action = "candidate start/publication only; no database mutation" if current_schema else "no runtime/database action"
     print(f"{mode_name.capitalize()} finalization complete: {transaction_id}; {action}.")
+
+
+def _current_repair_module(source: Path | None = None):
+    import importlib.util
+    name = "phoenix_current_repair_controller"
+    spec = importlib.util.spec_from_file_location(name, source or ROOT / "scripts/launchd_deploy_helper.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError("repair helper import unavailable")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        # Compile verified source directly; never consume an unbound cached .pyc.
+        exec(compile(Path(spec.origin).read_bytes(), spec.origin, "exec"), module.__dict__)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
+    return module
+
+
+def _current_repair_path(transaction_id: str) -> Path:
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+        raise SystemExit("current-schema repair requires macOS and a safe exact transaction ID")
+    return LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id / "current-schema-repair" / "manifest.json"
+
+
+def _current_repair_resolution(transaction: Path) -> bool | None:
+    child = transaction / "current-schema-repair"
+    path = child / "manifest.json"
+    if not os.path.lexists(path) and not child.is_symlink():
+        return None
+    try:
+        helper = _current_repair_module()
+        _repair, parent, status = helper.classify_current_repair(path)
+        terminal = status.state == "committed" and not status.finalization_pending
+        claim_owner = _claim_owner(Path(parent.active_path))
+        claim_released = claim_owner is None or (
+            claim_owner != _UNREADABLE_CLAIM_OWNER
+            and claim_owner != parent.transaction_id
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", claim_owner) is not None
+        )
+        return terminal and claim_released
+    except Exception:
+        return False
+
+
+def _handoff_current_repair(path: Path, *, resume: bool) -> None:
+    controller = _current_repair_module()
+    retained = path.parent / "helper.py"
+    try:
+        repair, parent = controller._current_repair_routing(path)
+        with Path(parent.lock_path).open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise controller.ConcurrentDeploy("another operation owns current-schema repair") from exc
+            controller._repair_private(retained)
+            controller.verify_staged(str(retained), repair.helper_sha256, "repair retained helper")
+            helper = _current_repair_module(retained)
+            repair, parent, _status = helper.validate_current_repair(path, running_helper=False)
+            helper.require_launchd_absence(parent.helper_label, parent.uid)
+            helper.require_launchd_absence(repair.helper_label, parent.uid)
+            command = "resume-current-repair" if resume else "activate-current-repair"
+            runner = plistlib.loads(_helper_plist(repair.helper_label, retained, path,
+                                                 path.parent / "helper.log", Path(sys.executable).resolve()))
+            runner["ProgramArguments"][2] = command
+            helper.atomic_write(path.parent / "runner.plist", plistlib.dumps(runner))
+        subprocess.run(["launchctl", "bootstrap", f"gui/{parent.uid}", str(path.parent / "runner.plist")], check=True)
+    except Exception:
+        try:
+            controller.stop_invalid_current_repair(path)
+        except Exception:
+            print("Repair teardown could not be confirmed through exact parent ownership; retain claim/evidence.", file=sys.stderr)
+        raise
+    print(f"Exact current-schema repair handed off for {parent.transaction_id}; inspect prod status. Parent audit status is unchanged.")
+
+
+def _clean_unsealed_current_repair(directory: Path, helper) -> None:
+    if not os.path.lexists(directory):
+        return
+    helper._private_transaction_dir(directory)
+    if os.path.lexists(directory / "manifest.json") or os.path.lexists(directory / "proof.json"):
+        raise SystemExit("repair already sealed or checkpointed; use resume-current-repair")
+    status_path = directory / "status.json"
+    if os.path.lexists(status_path):
+        raw = helper._repair_json(status_path)
+        try:
+            status = helper.CurrentSchemaRepairStatus.load(status_path, raw.get("manifest_sha256"))
+        except Exception as exc:
+            raise SystemExit("unsealed repair status malformed; preserve for diagnosis") from exc
+        if status.state != "prepared" or status.resume_from is not None or status.proof_sha256 is not None or status.finalization_pending:
+            raise SystemExit("unsealed repair has ambiguous checkpoint evidence; preserve for diagnosis")
+    owned = {"candidate", "candidate.plist", "migrations.rs", "helper.py", "receipt.json", "status.json", "parent-status.json"}
+    entries = list(directory.iterdir())
+    for entry in entries:
+        if entry.name not in owned and not any(entry.name.startswith(f".{name}.") for name in owned | {"manifest.json"}):
+            raise SystemExit("unsealed repair contains unrecognized evidence; preserve for diagnosis")
+        helper._repair_private(entry)
+    for entry in entries:
+        entry.unlink()
+    helper.fsync_dir(directory)
+    directory.rmdir()
+    helper.fsync_dir(directory.parent)
+
+
+def cmd_prod_repair_current(transaction_id: str, prepared_artifact: Path, expected_full_commit: str) -> None:
+    path = _current_repair_path(transaction_id)
+    helper = _current_repair_module()
+    if expected_full_commit != helper.CURRENT_REPAIR_COMMIT:
+        raise SystemExit("repair requires the single exact merged repair candidate pin")
+    if os.path.lexists(path) or path.parent.is_symlink():
+        try:
+            helper.classify_current_repair(path)
+        except Exception as exc:
+            raise SystemExit("current-schema repair child is selected but malformed; preserve it and use resume-current-repair for diagnosis") from exc
+        raise SystemExit("current-schema repair is already sealed; use resume-current-repair")
+    controller = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    if dirty or not re.fullmatch(r"[0-9a-f]{40}", controller) or controller == expected_full_commit:
+        raise SystemExit("repair preparation requires a clean, separate exact controller checkout")
+    parent_path = path.parent.parent / "manifest.json"
+    parent, _proof = helper.validate_current_repair_parent(parent_path)
+    with Path(parent.lock_path).open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit("another operation owns current-schema repair") from exc
+        parent, proof = helper.validate_current_repair_parent(parent_path)
+        if parent.transaction_id != transaction_id:
+            raise SystemExit("repair transaction ID mismatch")
+        helper.require_launchd_absence(parent.helper_label, parent.uid)
+        helper.require_launchd_absence(f"{parent.helper_label}.current-schema-repair", parent.uid)
+        helper.require_launchd_absence(parent.label, parent.uid)
+        helper.validate_current_repair_runtime_fence_source(parent)
+        helper.assert_database_exclusive(parent)
+        helper.validate_current_schema_database(Path(parent.current_schema_upgrade.database_path),
+                                               helper._current_schema_registry(parent), source_kind=parent.source_kind,
+                                               manifest=parent, migrated=True)
+        helper._repair_capacity(parent, reservation_required=True)
+        prepared = _prepare_prepared_artifact(prepared_artifact, expected_full_commit)
+        if (prepared.identity.version != helper.CURRENT_REPAIR_VERSION or prepared.identity.git_sha != expected_full_commit
+                or prepared.source_commit != expected_full_commit or prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT):
+            raise SystemExit("repair artifact identity/source differs from qualification")
+        _clean_unsealed_current_repair(path.parent, helper)
+        path.parent.mkdir(mode=0o700)
+        helper.fsync_dir(path.parent.parent)
+        helper.atomic_write(path.parent / "candidate", prepared.binary.read_bytes(), 0o700)
+        helper.atomic_write(path.parent / "candidate.plist", Path(parent.candidate_plist).read_bytes())
+        helper.atomic_write(path.parent / "parent-status.json", Path(parent.status_path).read_bytes())
+        target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}[platform.machine().lower()]
+        receipt = prepared_artifact / f"PREPARATION-RECEIPT-{target}.json"
+        helper.atomic_write(path.parent / "receipt.json", receipt.read_bytes())
+        _materialize_helper(controller, path.parent / "helper.py", "local_head")
+        _materialize_source_file(expected_full_commit, "crates/phoenix-db/src/migrations.rs", path.parent / "migrations.rs", "local_head")
+        for evidence in (path.parent / "helper.py", path.parent / "migrations.rs"):
+            evidence.chmod(0o600)
+            with evidence.open("rb") as stream:
+                os.fsync(stream.fileno())
+        if _file_sha256(path.parent / "helper.py") != _file_sha256(ROOT / "scripts/launchd_deploy_helper.py"):
+            raise SystemExit("repair helper is not the clean controller's exact bytes")
+        if (_file_sha256(path.parent / "migrations.rs") != helper.CURRENT_REPAIR_REGISTRY_SHA256
+                or [list(item) for item in helper.migration_registry(path.parent / "migrations.rs")] != proof["target_ledger"]):
+            raise SystemExit("repair immutable git registry differs from qualified original target128")
+        repair = helper.CurrentSchemaRepairManifest(
+            protocol_version=1, parent_manifest_path=str(parent_path),
+            parent_manifest_sha256=_file_sha256(parent_path), parent_status_sha256=_file_sha256(path.parent / "parent-status.json"),
+            parent_proof_sha256=_file_sha256(Path(parent.current_schema_upgrade.proof_path)),
+            source_commit=expected_full_commit, version=helper.CURRENT_REPAIR_VERSION, controller_source_commit=controller,
+            helper_sha256=_file_sha256(path.parent / "helper.py"), candidate_sha256=_file_sha256(path.parent / "candidate"),
+            registry_sha256=_file_sha256(path.parent / "migrations.rs"), plist_sha256=_file_sha256(path.parent / "candidate.plist"),
+            receipt_sha256=_file_sha256(path.parent / "receipt.json"), helper_label=f"{parent.helper_label}.current-schema-repair",
+        )
+        helper.validate_current_repair_staging(
+            repair,
+            parent,
+            proof,
+            path.parent,
+            running_helper=False,
+        )
+        encoded = (json.dumps(dataclasses.asdict(repair), sort_keys=True) + "\n").encode()
+        status = helper.CurrentSchemaRepairStatus(1, hashlib.sha256(encoded).hexdigest(), "prepared", None, None, False, None)
+        helper.atomic_write(path.parent / "status.json", (json.dumps(dataclasses.asdict(status), sort_keys=True) + "\n").encode())
+        helper.fsync_dir(path.parent)
+        helper.install_current_repair_runtime_fence(parent)
+        helper.atomic_write(path, encoded)  # Seal last: no helper has activation authority before this publication.
+        helper.validate_current_repair(path, running_helper=False)
+    _handoff_current_repair(path, resume=False)
+
+
+def cmd_prod_resume_current_repair(transaction_id: str) -> None:
+    path = _current_repair_path(transaction_id)
+    _handoff_current_repair(path, resume=True)
 
 
 def cmd_prod_resume_forward(transaction_id: str) -> None:
@@ -10610,6 +12157,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     forward = payload.get("ordinary_forward_migration")
     if (
         not isinstance(forward, dict)
+        or not _deploy_status_matches_manifest(staging, payload, status, DeployManifestKind.ORDINARY_FORWARD)
         or status.get("transaction_id") != transaction_id
         or status.get("state") not in {"candidate_may_migrate", "ordinary_activation_failed_forward_only"}
         or _deploy_claim_owner() != transaction_id
@@ -10618,7 +12166,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     helper = Path(forward["helper_path"])
     if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != forward.get("helper_sha256"):
         raise SystemExit("retained forward helper binding is invalid")
-    label = payload["helper_label"]
+    label = _verified_retained_helper_label(payload, transaction_id)
     absence = subprocess.run(
         [sys.executable, str(helper), "--probe-service-absence", label, "--uid", str(os.getuid())],
         capture_output=True,
@@ -10634,6 +12182,16 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     if result.returncode != 0:
         raise SystemExit(f"forward recovery failed; claim retained: {result.stderr.strip()}")
     print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
+
+
+def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:
+    prefix = f".{evidence.name}."
+    with os.scandir(evidence.parent) as entries:
+        return tuple(
+            evidence.parent / entry.name
+            for entry in entries
+            if entry.name.startswith(prefix)
+        )
 
 
 def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False) -> None:
@@ -10663,10 +12221,27 @@ def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False
         raise SystemExit(
             "current-schema offline migration was invoked or may have committed writes; predecessor recovery is forbidden"
         )
-    if not manifest_path.exists() or recovery_status.get("state") in {"preparing", "prepared"}:
+    if recovery_status.get("transaction_id") == transaction_id and (
+        recovery_status.get("state") == "precondition_cleanup_pending"
+        or (
+            recovery_status.get("state") == "precondition_failed"
+            and recovery_status.get("precondition_cleanup_completed") is True
+        )
+    ):
+        refusal = _paired_recovery_refusal(transaction_id)
+        raise SystemExit(
+            refusal
+            or "pre-stop capacity cleanup cannot enter database/runtime recovery"
+        )
+    manifest_entry_exists = os.path.lexists(manifest_path)
+    if manifest_entry_exists and (
+        manifest_path.is_symlink() or not manifest_path.is_file()
+    ):
+        raise SystemExit("interrupted preparation manifest is not a regular file")
+    if not manifest_entry_exists or recovery_status.get("state") in {"preparing", "prepared"}:
         with _launchd_claim_lock():
             status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-            if _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or status.get("source_kind") != "prepared_artifact" or status.get("state") not in {"preparing", "prepared"}:
+            if _deploy_claim_owner() != transaction_id or status.get("transaction_id") != transaction_id or not _deploy_source_matches_mode(status.get("source_kind"), "current_schema" if current_schema else "paired") or status.get("state") not in {"preparing", "prepared"}:
                 raise SystemExit("pre-handoff recovery must own an interrupted paired preparation")
             owner_pid = status.get("preparing_pid")
             if not isinstance(owner_pid, int) or owner_pid <= 0:
@@ -10677,14 +12252,42 @@ def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False
                 pass
             else:
                 raise SystemExit("preparation process is still alive; ownership cannot be released")
+            expected_prepared_mode = "current_schema" if current_schema else "paired"
+            if status.get("prepared_mode") != expected_prepared_mode:
+                raise SystemExit(
+                    f"interrupted preparation does not prove {mode_name} recovery mode"
+                )
             label = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
-            probe_helper = Path(__file__).resolve().parent / "scripts" / "launchd_deploy_helper.py"
-            result = subprocess.run([sys.executable, str(probe_helper), "--probe-service-absence", label, "--uid", str(os.getuid())], capture_output=True, text=True)
-            if result.returncode != 0:
-                raise SystemExit("pre-manifest helper absence is unconfirmed")
-            if manifest_path.exists():
+            if manifest_entry_exists:
+                expected_kind = (
+                    DeployManifestKind.CURRENT_SCHEMA
+                    if current_schema
+                    else DeployManifestKind.PAIRED
+                )
                 abandoned = json.loads(manifest_path.read_text())
-                upgrade = abandoned.get(mode_key)
+                if not _deploy_status_matches_manifest(staging, abandoned, status, expected_kind):
+                    raise SystemExit(
+                        f"interrupted preparation does not match {mode_name} recovery mode"
+                    )
+                upgrade = abandoned[mode_key]
+                label = _verified_retained_helper_label(abandoned, transaction_id)
+                probe_helper = Path(upgrade["controller_helper_path"])
+                if (
+                    probe_helper.parent != staging
+                    or probe_helper.is_symlink()
+                    or not probe_helper.is_file()
+                    or _file_sha256(probe_helper) != upgrade["controller_helper_sha256"]
+                ):
+                    raise SystemExit(f"retained {mode_name} controller helper binding is invalid")
+                result = subprocess.run(
+                    [sys.executable, str(probe_helper), "--probe-service-absence", label, "--uid", str(os.getuid())],
+                    capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    raise SystemExit("pre-manifest helper absence is unconfirmed")
+            elif not _probe_deploy_helper_absence(label):
+                raise SystemExit("pre-manifest helper absence is unconfirmed")
+            if manifest_entry_exists:
                 if upgrade is not None:
                     proof = Path(upgrade["proof_path"])
                     backup = Path(upgrade["backup_path"])
@@ -10692,32 +12295,75 @@ def cmd_prod_recover_paired(transaction_id: str, *, current_schema: bool = False
                     reserve = database.parent / f".{database.name}.restore-{transaction_id}"
                     if backup.parent != staging or proof.parent != staging or proof.exists() or proof.is_symlink():
                         raise SystemExit("abandonment allocation context is ambiguous")
-                    for allocation in (backup, reserve):
-                        if allocation.is_symlink():
-                            raise SystemExit("abandonment allocation is symlink")
-                        allocation.unlink(missing_ok=True)
-                        directory = os.open(allocation.parent, os.O_RDONLY | os.O_DIRECTORY)
-                        try:
-                            os.fsync(directory)
-                        finally:
-                            os.close(directory)
-            status.update(
-                state="precondition_failed",
-                updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                failure="interrupted preparation ended before activation handoff",
-            )
-            _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
-            _release_launchd_deploy_claim_unlocked(transaction_id)
+                    capacity_evidence = staging / "capacity.json"
+                    try:
+                        cleanup_paths = {backup, reserve, capacity_evidence}
+                        for evidence in (capacity_evidence, proof):
+                            cleanup_paths.update(_atomic_write_temporary_paths(evidence))
+                        for allocation in (backup, reserve):
+                            cleanup_paths.update(
+                                allocation.with_name(allocation.name + suffix)
+                                for suffix in ("-journal", "-wal", "-shm")
+                            )
+                        for allocation in cleanup_paths:
+                            if allocation.is_symlink():
+                                raise OSError("abandonment allocation is symlink")
+                            allocation.unlink(missing_ok=True)
+                        for parent in {path.parent for path in cleanup_paths}:
+                            directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                            try:
+                                os.fsync(directory)
+                            finally:
+                                os.close(directory)
+                    except OSError as cleanup_error:
+                        status.update(
+                            state="precondition_cleanup_pending",
+                            updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            failure="interrupted preparation ended before activation handoff",
+                            cleanup_failure=str(cleanup_error),
+                            precondition_cleanup_completed=False,
+                        )
+                        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
+                        raise SystemExit(
+                            "interrupted preparation cleanup is incomplete; ownership retained"
+                        ) from cleanup_error
+            try:
+                status.update(
+                    state="precondition_failed",
+                    updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    failure="interrupted preparation ended before activation handoff",
+                    cleanup_failure=None,
+                    precondition_cleanup_completed=True,
+                    finalization_pending=False,
+                    rollback_failure=None,
+                )
+                _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
+                if not _release_launchd_deploy_claim_unlocked(transaction_id):
+                    raise OSError("matching deployment claim was not durably released")
+            except OSError as completion_error:
+                status.update(
+                    state="precondition_cleanup_pending",
+                    updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    cleanup_failure=str(completion_error),
+                    precondition_cleanup_completed=False,
+                )
+                _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, status)
+                raise SystemExit(
+                    "interrupted preparation completion is not durable; ownership retained"
+                ) from completion_error
         print(f"Interrupted pre-handoff {mode_name} preparation verified; runtime/database untouched and ownership released.")
         return
     payload = json.loads(manifest_path.read_text())
     upgrade = payload.get(mode_key)
-    if not isinstance(upgrade, dict) or _paired_recovery_refusal(transaction_id) is None or _deploy_claim_owner() != transaction_id:
+    if not _deploy_status_matches_manifest(
+        staging, payload, recovery_status,
+        DeployManifestKind.CURRENT_SCHEMA if current_schema else DeployManifestKind.PAIRED,
+    ) or _paired_recovery_refusal(transaction_id) is None or _deploy_claim_owner() != transaction_id:
         raise SystemExit(f"no matching failed {mode_name} transaction owns recovery")
     helper = Path(upgrade["controller_helper_path"])
     if helper.parent != staging or helper.is_symlink() or _file_sha256(helper) != upgrade["controller_helper_sha256"]:
         raise SystemExit(f"retained {mode_name} controller helper binding is invalid")
-    label = payload["helper_label"]
+    label = _verified_retained_helper_label(payload, transaction_id)
     interpreter = Path(sys.executable).resolve()
     probe = subprocess.run([str(interpreter), "-c", "import fcntl, plistlib, ssl, urllib.request, sqlite3"], capture_output=True)
     if probe.returncode != 0:
@@ -10766,7 +12412,9 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
 
 def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = None) -> tuple[dict[str, str], Path | None]:
     env: dict[str, str] = {}
-    if controller is not None and (controller.enabled or controller.prepared_artifact is not None):
+    if controller is not None and (
+        controller.enabled or controller.prepared_artifact is not None or controller.current_schema_upgrade
+    ):
         try:
             installed = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
             installed.pop("PHOENIX_VERSION", None)
@@ -10789,11 +12437,18 @@ def launchd_prod_deploy(
     import uuid
 
     controller = controller or ProdDeployControllerOptions()
+    if controller.systemd_current_schema_upgrade:
+        raise SystemExit("protected systemd current-schema mode cannot use this backend")
+    controller.require_controller_source(release)
     if controller.enabled and controller.prepared_artifact is None:
         release, _expected_full_commit = controller.require_exact_release(release)
-    if controller.current_schema_upgrade and (
+    if controller.paired_database_upgrade and (controller.prepared_artifact is None or release is not None):
+        raise SystemExit("paired database upgrade requires a prepared artifact and excludes --release")
+    if controller.current_schema_upgrade and controller.prepared_artifact is not None and release is not None:
+        raise SystemExit("prepared artifact upgrade excludes --release")
+    if controller.current_schema_upgrade and release is None and (
         controller.paired_database_upgrade or controller.prepared_artifact is None
-        or controller.expected_full_commit is None or release is not None
+        or controller.expected_full_commit is None
     ):
         raise SystemExit("--current-schema-upgrade requires --prepared-artifact and --expected-full-commit, excludes --paired-database-upgrade and --release")
     installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if (controller.paired_database_upgrade or controller.current_schema_upgrade) and LAUNCHD_PLIST_PATH.is_file() else None
@@ -10813,9 +12468,17 @@ def launchd_prod_deploy(
     release_commit = None
     release_tag = release
     selected_identity: RuntimeIdentity | None = None
+    prepared_mode = (
+        "current_schema"
+        if controller.current_schema_upgrade
+        else "paired"
+        if controller.paired_database_upgrade
+        else None
+    )
     initial_status = {
         "transaction_id": transaction_id, "state": "preparing",
         "preparing_pid": os.getpid(), "source_kind": source_kind,
+        "prepared_mode": prepared_mode,
         "source_commit": source_commit, "release_commit": release_commit,
         "release_tag": release_tag, "expected_version": None, "expected_git_sha": None,
         "created_at": claimed_at, "updated_at": claimed_at,
@@ -10894,7 +12557,7 @@ def launchd_prod_deploy(
         env_file = _env_file
         if env_file:
             print(f"  Loaded env from {env_file}")
-        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT or controller.current_schema_upgrade:
             path_str = env_overrides.get("PATH")
             if not path_str:
                 raise SystemExit("prepared-artifact deployment requires installed launchd PATH")
@@ -10903,7 +12566,7 @@ def launchd_prod_deploy(
             path_str, path_source = capture_login_shell_path()
         print_launchd_path_report(path_str, path_source)
         plist_content = generate_launchd_plist(selected_identity.version, extra_env=env_overrides, path_override=path_str)
-        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
+        if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT or controller.current_schema_upgrade:
             installed_config = dict(env_overrides)
             installed_config["PHOENIX_VERSION"] = selected_identity.version
             paired_plist = plistlib.loads(plist_content.encode())
@@ -10913,6 +12576,9 @@ def launchd_prod_deploy(
         candidate_plist.write_text(plist_content)
         candidate_plist.chmod(0o600)
         subprocess.run(["plutil", "-lint", str(candidate_plist)], check=True, capture_output=True)
+        candidate_database_path = str(
+            _launchd_env_from_plist(candidate_plist).get("PHOENIX_DB_PATH", PROD_DB_PATH)
+        )
 
         rollback_binary = staging / "rollback-phoenix-ide"
         rollback_plist = staging / "rollback.plist"
@@ -10938,18 +12604,34 @@ def launchd_prod_deploy(
             ) = _resolve_rollback_identity(rollback_binary, previous_env)
 
         helper = staging / "activate.py"
-        controller_source_commit = None
+        controller_source_commit = controller.controller_source_commit
         if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
             controller_source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
             if re.fullmatch(r"[0-9a-f]{40}", controller_source_commit) is None:
                 raise SystemExit("controller source commit is not a full lowercase git SHA")
             if subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip():
                 raise SystemExit("prepared-artifact deployment requires a clean controller checkout")
-        _materialize_helper(controller_source_commit or source_commit, helper, "local_head" if controller_source_commit else source_kind)
+        _materialize_helper(
+            controller_source_commit or source_commit, helper,
+            "published_release" if controller.controller_source_commit is not None
+            else "local_head" if controller_source_commit else source_kind,
+        )
+        prepared_source114 = (
+            controller.current_schema_upgrade
+            and prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT
+            and prepared.source_commit == PREPARED_SOURCE114_COMMIT
+        )
+        if prepared_source114 and (
+            selected_identity.git_sha != PREPARED_SOURCE114_COMMIT
+            or controller.expected_full_commit != PREPARED_SOURCE114_COMMIT
+            or controller_source_commit == PREPARED_SOURCE114_COMMIT
+        ):
+            raise SystemExit("exact prepared source114 requires receipt-bound candidate and different clean controller")
         migration_registry = None
         ordinary_forward_migration = (
             prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT
-            and previous_identity is not None
+            and not controller.current_schema_upgrade
+            and Path(candidate_database_path).exists()
         )
         if controller.current_schema_upgrade or ordinary_forward_migration:
             migration_registry = staging / "migrations.rs"
@@ -10957,9 +12639,11 @@ def launchd_prod_deploy(
                 source_commit,
                 "crates/phoenix-db/src/migrations.rs",
                 migration_registry,
-                "local_head" if controller.current_schema_upgrade else source_kind,
+                "local_head" if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT else source_kind,
             )
             migration_registry.chmod(0o600)
+            if prepared_source114 and _file_sha256(migration_registry) != PREPARED_SOURCE114_REGISTRY_SHA256:
+                raise SystemExit("exact prepared source114 candidate registry SHA-256 mismatch")
         python_executable = Path(sys.executable).resolve()
         protocol = subprocess.run(
             [str(python_executable), str(helper), "--protocol-version"],
@@ -11029,7 +12713,7 @@ def launchd_prod_deploy(
             "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
             "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
             "paired_database_upgrade": ({
-                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                "database_path": candidate_database_path,
                 "backup_path": str(staging / "database-backup.sqlite3"),
                 "proof_path": str(staging / "database-backup-proof.json"),
                 "controller_source_commit": controller_source_commit,
@@ -11037,7 +12721,11 @@ def launchd_prod_deploy(
                 "controller_helper_path": str(helper) if controller_source_commit else None,
             } if controller.paired_database_upgrade else None),
             **({"current_schema_upgrade": {
-                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                **({
+                    "prepared_source_baseline": 114,
+                    "candidate_registry_expected_sha256": PREPARED_SOURCE114_REGISTRY_SHA256,
+                } if prepared_source114 else {}),
+                "database_path": candidate_database_path,
                 "backup_path": str(staging / "database-backup.sqlite3"),
                 "proof_path": str(staging / "database-backup-proof.json"),
                 "controller_source_commit": controller_source_commit,
@@ -11047,7 +12735,7 @@ def launchd_prod_deploy(
                 "migration_registry_path": str(migration_registry),
             }} if controller.current_schema_upgrade else {}),
             **({"ordinary_forward_migration": {
-                "database_path": str(_launchd_env_from_plist(LAUNCHD_PLIST_PATH).get("PHOENIX_DB_PATH", PROD_DB_PATH)),
+                "database_path": candidate_database_path,
                 "helper_sha256": _file_sha256(helper),
                 "helper_path": str(helper),
                 "migration_registry_sha256": _file_sha256(migration_registry),
@@ -11057,6 +12745,8 @@ def launchd_prod_deploy(
         }
         _write_json_atomic(staging / "manifest.json", manifest)
         (staging / "manifest.json").chmod(0o400)
+        if ordinary_forward_migration:
+            _preflight_ordinary_launchd_policy(staging / "manifest.json", helper)
         retained_artifacts = [
             candidate_binary, candidate_plist, helper, helper_plist, staging / "manifest.json",
         ]
@@ -11070,6 +12760,7 @@ def launchd_prod_deploy(
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared",
             "preparing_pid": os.getpid(), "source_kind": source_kind,
+            "prepared_mode": prepared_mode,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
             "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
             "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
@@ -11104,6 +12795,7 @@ def launchd_prod_deploy(
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
                 "transaction_id": transaction_id, "state": "precondition_failed",
                 "source_kind": source_kind,
+                "prepared_mode": prepared_mode,
                 "source_commit": source_commit,
                 "release_commit": release_commit,
                 "release_tag": release_tag,
@@ -11111,6 +12803,7 @@ def launchd_prod_deploy(
                 "expected_git_sha": selected_identity.git_sha if selected_identity is not None else None,
                 "created_at": claimed_at, "updated_at": failed_at,
                 "failure": f"{type(exc).__name__}: preparation failed before handoff",
+                "finalization_pending": False,
                 "rollback_failure": None,
             })
             terminal_status_written = True
@@ -11438,15 +13131,44 @@ def _print_launchd_restart_status() -> None:
 
 def _print_launchd_deploy_status() -> None:
     owner = _deploy_claim_owner()
+    refusal = None
+    markerless_unresolved = False
     if owner is not None:
         refusal = _paired_recovery_refusal(owner)
         if refusal is not None:
             print(f"    RECOVERY: {refusal}")
-    if not LAUNCHD_DEPLOY_STATUS_PATH.exists():
+    status_entry_exists = os.path.lexists(LAUNCHD_DEPLOY_STATUS_PATH)
+    status_entry_invalid = LAUNCHD_DEPLOY_STATUS_PATH.is_symlink() or (
+        status_entry_exists and not LAUNCHD_DEPLOY_STATUS_PATH.is_file()
+    )
+    if status_entry_invalid:
+        if owner is not None:
+            print(f"  Active deploy: status unavailable ({owner})")
+        else:
+            markerless_refusal = _markerless_operation_refusal()
+            if markerless_refusal is not None:
+                print(f"    UNRESOLVED: {markerless_refusal}")
+        print("  Last deploy: unreadable status evidence (non-regular or symlinked)")
+        return
+    if not status_entry_exists:
+        if owner is not None:
+            print(f"  Active deploy: status unavailable ({owner})")
         return
     try:
         deploy = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+        if not isinstance(deploy, dict):
+            raise ValueError("deployment status is not an object")
+        if owner is not None and deploy.get("transaction_id") != owner:
+            print(
+                f"  Active deploy: status unavailable/mismatched ({owner}); "
+                f"last status belongs to {deploy.get('transaction_id', 'unknown')}"
+            )
         print(f"  Last deploy: {deploy.get('state', 'unknown')} ({deploy.get('transaction_id', 'unknown')})")
+        transaction_id = deploy.get("transaction_id")
+        if isinstance(transaction_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+            repaired = _current_repair_resolution(LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id)
+            if repaired is not None:
+                print(f"    Current-schema repair: {'committed' if repaired else 'pending/invalid; use prod resume-current-repair ' + transaction_id}; parent status is audit evidence")
         source = deploy.get("source_kind") or "unknown"
         if deploy.get("release_tag"):
             source += f" {deploy['release_tag']}"
@@ -11459,11 +13181,81 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Failure: {deploy['failure']}")
         if deploy.get("rollback_failure"):
             print(f"    Rollback failure: {deploy['rollback_failure']}")
+        if deploy.get("cleanup_failure"):
+            print(f"    Pre-stop cleanup failure: {deploy['cleanup_failure']}")
         if deploy.get("committed_diagnostic"):
             print(f"    Committed warning: {deploy['committed_diagnostic']}")
-        refusal = _paired_recovery_refusal(owner or deploy.get("transaction_id"))
-        if owner is None and refusal is not None:
-            print(f"    RECOVERY: {refusal}")
+        if owner is None:
+            transaction_id = deploy.get("transaction_id")
+            transaction = (
+                LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+                if isinstance(transaction_id, str)
+                else None
+            )
+            kind = (
+                _deploy_manifest_kind(transaction)
+                if transaction is not None
+                else DeployManifestKind.UNKNOWN
+            )
+            prepared = kind in {
+                DeployManifestKind.PAIRED,
+                DeployManifestKind.CURRENT_SCHEMA,
+            }
+            ordinary_forward = kind is DeployManifestKind.ORDINARY_FORWARD
+            resolved = _markerless_status_is_resolved(deploy)
+            forward_only_state = deploy.get("state") in {
+                "candidate_may_migrate",
+                "ordinary_activation_failed_forward_only",
+            }
+            ordinary_forward_only = ordinary_forward and forward_only_state
+            conflicting_forward_state = forward_only_state and not ordinary_forward
+            unknown_unresolved = kind is DeployManifestKind.UNKNOWN and not resolved
+            markerless_unresolved = (
+                (prepared and not resolved)
+                or ordinary_forward_only
+                or conflicting_forward_state
+                or unknown_unresolved
+            )
+            if deploy.get("state") == "precondition_cleanup_pending":
+                print(
+                    "    UNRESOLVED: pre-stop capacity cleanup is pending without its active claim owner. "
+                    "Preserve the transaction and capacity files; do not invoke cleanup or recovery "
+                    "until claim/status ownership is diagnosed."
+                )
+            elif conflicting_forward_state:
+                print(
+                    "    UNRESOLVED: forward-only status conflicts with the retained ordinary manifest. "
+                    "Preserve its candidate and evidence; do not redeploy or invoke recovery until "
+                    "the manifest/status mismatch is diagnosed."
+                )
+            elif ordinary_forward_only:
+                print(
+                    "    UNRESOLVED: ordinary forward-only transaction status has no active claim owner. "
+                    "Preserve its candidate and evidence; do not start the predecessor, redeploy, "
+                    "or recreate or clear markers until claim/status ownership is diagnosed. "
+                    "After an actual matching claim exists and forward recovery is explicitly authorized, "
+                    f"the supported path is ./dev.py prod resume-forward {transaction_id}."
+                )
+            elif prepared and not resolved:
+                print(
+                    "    UNRESOLVED: prepared transaction status has no active claim owner. "
+                    "Preserve its evidence; do not redeploy, clear markers, or invoke recovery "
+                    "until claim/status ownership is diagnosed."
+                )
+            elif unknown_unresolved and deploy.get("source_kind") in {
+                "local_head",
+                "published_release",
+            }:
+                print(
+                    "    UNRESOLVED: ordinary transaction manifest is missing, unreadable, or inconsistent. "
+                    "Preserve its evidence; inspect the activation log and confirm no helper is running "
+                    "before retrying. No retained recovery command is available."
+                )
+            elif unknown_unresolved:
+                print(
+                    "    UNRESOLVED: transaction mode cannot be verified from its retained manifest. "
+                    "Preserve its evidence; do not invoke recovery until ownership and mode are diagnosed."
+                )
         if deploy.get("state") in {"preparing", "prepared", "activating"}:
             age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])
             stale_after = (
@@ -11474,9 +13266,13 @@ def _print_launchd_deploy_status() -> None:
             if age.total_seconds() > stale_after:
                 if refusal is not None:
                     print("    STALE: paired recovery remains unresolved; follow RECOVERY above")
+                elif markerless_unresolved:
+                    print("    STALE: transaction status remains unresolved without an active claim owner; preserve evidence for diagnosis")
                 else:
-                    print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
+                    print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running")
     except Exception as exc:
+        if owner is not None:
+            print(f"  Active deploy: status unavailable ({owner})")
         print(f"  Last deploy: unreadable status ({type(exc).__name__})")
 
 
@@ -11554,16 +13350,18 @@ def cmd_prod_deploy(
 ):
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
+    controller.require_controller_source(release)
     upgrade_modes = (controller.paired_database_upgrade, controller.current_schema_upgrade)
     if all(upgrade_modes):
         raise SystemExit("--paired-database-upgrade and --current-schema-upgrade are mutually exclusive")
     if controller.expected_full_commit is not None and release is None and controller.prepared_artifact is None and not any(upgrade_modes):
         raise SystemExit("--expected-full-commit requires all prepared upgrade options or an exact release controller")
-    if (controller.prepared_artifact is not None or any(upgrade_modes)) and (
+    if not (release is not None and controller.current_schema_upgrade and controller.prepared_artifact is None) and not controller.systemd_current_schema_upgrade and (controller.prepared_artifact is not None or any(upgrade_modes)) and (
         controller.prepared_artifact is None or controller.expected_full_commit is None or not any(upgrade_modes)
     ):
         raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together")
-    if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):
+    if (controller.prepared_artifact is not None and not controller.systemd_current_schema_upgrade
+            and (sys.platform != "darwin" or controller.backend not in (None, "launchd"))):
         raise SystemExit("prepared artifact upgrade is supported only by macOS launchd")
     if controller.prepared_artifact is not None and release:
         raise SystemExit("prepared artifact upgrade excludes --release")
@@ -11582,7 +13380,7 @@ def cmd_prod_deploy(
         print()
 
     if env == "launchd":
-        if controller.enabled or controller.prepared_artifact is not None:
+        if controller.enabled or controller.prepared_artifact is not None or controller.current_schema_upgrade:
             launchd_prod_deploy(release, controller=controller)
         else:
             launchd_prod_deploy(
@@ -11643,12 +13441,17 @@ def cmd_prod_status():
 
 def cmd_prod_stop():
     """Stop production service (auto-detects environment)."""
-    refusal = _paired_recovery_refusal(_deploy_claim_owner())
-    if refusal is not None:
-        raise SystemExit(refusal)
     env = detect_prod_env()
 
     if env == "launchd":
+        owner = _deploy_claim_owner()
+        refusal = _paired_recovery_refusal(owner)
+        if refusal is not None:
+            raise SystemExit(refusal)
+        if owner is None:
+            markerless_refusal = _markerless_operation_refusal()
+            if markerless_refusal is not None:
+                raise SystemExit(markerless_refusal)
         launchd_prod_stop()
     elif env == "native":
         native_prod_stop()
@@ -11926,7 +13729,10 @@ def main():
     deploy_parser = prod_sub.add_parser(
         "deploy",
         help="Deploy local HEAD, or use --release TAG|latest for a published macOS release",
-        epilog="Positional versions were removed; use --release vX.Y.Z (there is no local build-from-tag mode).",
+        epilog=("Positional versions were removed; use --release vX.Y.Z (there is no local build-from-tag mode). "
+                "Protected macOS launchd release upgrade: --release TAG --expected-full-commit CANDIDATE_SHA "
+                "--controller-source-commit CONTROLLER_SHA --current-schema-upgrade. "
+                "Use an exact tag and distinct full lowercase SHAs; no controller-mode flags are required."),
     )
     deploy_parser.add_argument(
         "--release", metavar="TAG|latest",
@@ -11945,14 +13751,30 @@ def main():
     )
     deploy_parser.add_argument("--controller-release-tag", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-full-commit", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--controller-source-commit", help="Exact helper/controller source SHA for protected current-schema release deployment")
     deploy_parser.add_argument("--controller-expected-asset-name", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
-    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
-    deploy_parser.add_argument("--expected-full-commit", help="Exact full SHA for --prepared-artifact")
+    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepared artifact directory (macOS launchd or Linux systemd)")
+    deploy_parser.add_argument(
+        "--expected-preparation-receipt-sha256",
+        help="Authenticated exact receipt-byte SHA-256 for protected prepared Linux systemd deployment",
+    )
+    deploy_parser.add_argument("--expected-full-commit", help="Exact full lowercase candidate SHA for --prepared-artifact or protected --release upgrade")
     upgrade_group = deploy_parser.add_mutually_exclusive_group()
     upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
-    upgrade_group.add_argument("--current-schema-upgrade", action="store_true", help="Explicit current-schema prepared-artifact database upgrade")
+    upgrade_group.add_argument("--current-schema-upgrade", action="store_true", help="Explicit protected current-schema database upgrade")
+    upgrade_group.add_argument("--systemd-current-schema-upgrade", action="store_true", help="Protected exact-schema65 to release128 systemd controller upgrade")
+    cleanup_parser = prod_sub.add_parser(
+        "cleanup-paired",
+        help="Finish retained pre-stop paired capacity cleanup without runtime/database action",
+    )
+    cleanup_parser.add_argument("transaction_id")
+    cleanup_current_parser = prod_sub.add_parser(
+        "cleanup-current",
+        help="Finish retained pre-stop current-schema capacity cleanup without runtime/database action",
+    )
+    cleanup_current_parser.add_argument("transaction_id")
     recover_parser = prod_sub.add_parser("recover-paired", help="Verify and restore a retained failed paired transaction")
     recover_parser.add_argument("transaction_id")
     finalize_parser = prod_sub.add_parser("finalize-paired", help="Finalize retained committed paired publication/cleanup without runtime or database changes")
@@ -11961,8 +13783,21 @@ def main():
     recover_current_parser.add_argument("transaction_id")
     finalize_current_parser = prod_sub.add_parser("finalize-current", help="Finalize a committed current-schema candidate without rerunning offline migration or snapshot restore")
     finalize_current_parser.add_argument("transaction_id")
+    repair_current_parser = prod_sub.add_parser("repair-current", help="Seal the exact pinned current-schema forward replacement (requires separate qualification)")
+    repair_current_parser.add_argument("transaction_id")
+    repair_current_parser.add_argument("--prepared-artifact", type=Path, required=True)
+    repair_current_parser.add_argument("--expected-full-commit", required=True)
+    resume_current_repair_parser = prod_sub.add_parser("resume-current-repair", help="Resume only the retained sealed current-schema repair child")
+    resume_current_repair_parser.add_argument("transaction_id")
     resume_forward_parser = prod_sub.add_parser("resume-forward", help="Resume only the exact retained forward candidate after predecessor rollback became unsafe")
     resume_forward_parser.add_argument("transaction_id")
+    recover_systemd = prod_sub.add_parser(
+        "recover-systemd-current",
+        help="Recover one protected systemd transaction: proven predecessor before marker, exact candidate after marker",
+        description="Explicit retained systemd recovery only. Without a marker, restore the proven unchanged captured predecessor; "
+                    "with a marker, stop both units before validation and recover only the exact candidate. Never replay a database backup.",
+    )
+    recover_systemd.add_argument("transaction_id", help="Exact active protected transaction id (32 lowercase hexadecimal characters)")
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
@@ -12130,25 +13965,38 @@ def main():
                 pretty=pretty,
                 controller=ProdDeployControllerOptions(
                     enabled=args.controller_mode,
+                    controller_source_commit=args.controller_source_commit,
                     exact_release_tag=args.controller_release_tag,
                     expected_full_commit=args.expected_full_commit or args.controller_expected_full_commit,
                     expected_asset_name=args.controller_expected_asset_name,
                     expected_asset_sha256=args.controller_expected_asset_sha256,
                     transaction_id=args.transaction_id,
                     prepared_artifact=args.prepared_artifact,
+                    expected_preparation_receipt_sha256=args.expected_preparation_receipt_sha256,
                     paired_database_upgrade=args.paired_database_upgrade,
                     current_schema_upgrade=args.current_schema_upgrade,
+                    systemd_current_schema_upgrade=args.systemd_current_schema_upgrade,
                     backend=args.controller_backend,
                 ),
             )
+        elif args.prod_command == "cleanup-paired":
+            cmd_prod_cleanup_precondition(args.transaction_id)
+        elif args.prod_command == "cleanup-current":
+            cmd_prod_cleanup_precondition(args.transaction_id, current_schema=True)
         elif args.prod_command == "recover-paired":
             cmd_prod_recover_paired(args.transaction_id)
         elif args.prod_command == "finalize-paired":
             cmd_prod_finalize_paired(args.transaction_id)
+        elif args.prod_command == "recover-systemd-current":
+            cmd_prod_recover_systemd_current(args.transaction_id)
         elif args.prod_command == "recover-current":
             cmd_prod_recover_paired(args.transaction_id, current_schema=True)
         elif args.prod_command == "finalize-current":
             cmd_prod_finalize_paired(args.transaction_id, current_schema=True)
+        elif args.prod_command == "repair-current":
+            cmd_prod_repair_current(args.transaction_id, args.prepared_artifact, args.expected_full_commit)
+        elif args.prod_command == "resume-current-repair":
+            cmd_prod_resume_current_repair(args.transaction_id)
         elif args.prod_command == "resume-forward":
             cmd_prod_resume_forward(args.transaction_id)
         elif args.prod_command == "status":

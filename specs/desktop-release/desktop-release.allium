@@ -3,7 +3,7 @@
 --
 -- Scope: exact-tag gating, paired architecture-specific helper/app builds,
 -- Developer ID signing, notarization, and private publication preparation.
--- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010.
+-- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010/011/012/013.
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }
@@ -134,11 +134,24 @@ entity DesktopPreparation {
     verified: Boolean
 }
 
+entity IncidentPreparation {
+    identity: PreparationIdentity
+    controller_commit: FullCommitIdentity
+    apple_silicon_pair: ArchitecturePair
+    verified: Boolean
+}
+
+entity LinuxIncidentPreparation {
+    verified: Boolean
+}
+
 surface DesktopReleaseWorkflow {
     context gate: ReleaseGate
     context pair: ArchitecturePair
     context publication: ReleasePublication
     context preparation: DesktopPreparation
+    context incident: IncidentPreparation
+    context linux_incident: LinuxIncidentPreparation
 
     provides:
         ReleaseTagCreated(gate)
@@ -161,6 +174,8 @@ surface DesktopReleaseWorkflow {
         PublishedReleaseRetried(gate, publication)
         PublishedReleaseMismatchFound(publication)
         ProtectedPreparationRequested(preparation)
+        ExactArmIncidentPreparationRequested(incident)
+        ExactLinuxIncidentPreparationRequested(linux_incident)
 }
 
 -- Helpers
@@ -223,8 +238,12 @@ surface DesktopReleaseWorkflow {
 --   candidate.apple_silicon_pair.native_acceptance = passed and
 --   candidate.intel_pair.native_acceptance = passed.
 -- exact_inaccessible_assets_and_digests(publication) -> Boolean
---   consumer-inaccessible publication work contains exactly the eight required
---   non-manifest assets and SHA256SUMS, whose entries and reported digests match.
+--   consumer-inaccessible publication work contains exactly the six server,
+--   four browser CLI, and two desktop assets plus SHA256SUMS, whose entries and
+--   reported digests match. Historical tagged sources without the browser CLI
+--   entrypoint require only the six server and two desktop assets.
+--   Browser CLI assets pass native browser-free discovery; macOS browser bytes
+--   pass configured Developer ID/team verification and accepted notarization.
 -- required_architecture_pairs_validated(publication) -> Boolean
 --   publication.apple_silicon_pair and publication.intel_pair have distinct
 --   targets, matching release identities, verified helper/app artifacts, and
@@ -259,6 +278,61 @@ surface DesktopReleaseWorkflow {
 --   verification results, notarization submission identity, and independently
 --   rechecked artifact digests without protected credential material; they are
 --   not attached to or published as a GitHub Release.
+-- linux_incident_has_exact_source_and_controller(incident) -> Boolean
+--   REQ-DESKTOP-REL-013: only prepare-incident-237100-linux-x86_64 is admitted,
+--   with no candidate/target/tag selection. The immutable candidate, exact source
+--   version, complete registry digest, origin/main ancestry and distinct workflow
+--   controller match the requirement; the target is x86_64-unknown-linux-musl.
+-- linux_incident_has_closed_payload_and_receipt(incident) -> Boolean
+--   The artifact is a verified nonempty static ELF64 x86-64 binary with exact
+--   embedded candidate identity. The Actions payload contains exactly that named
+--   binary and one schema-1 receipt. The receipt's only top-level fields are
+--   schema=1, operation, target, version, commit, controller_commit,
+--   registry_sha256, positive-integer run_id/run_attempt, event, ref, sha256,
+--   and checks. Operation/target/version/commit/controller/registry/event/ref
+--   are fixed by REQ-DESKTOP-REL-013. sha256 has only the prepared basename;
+--   checks has only clean_source/static_elf/embedded_identity, each verified.
+--   No manifest, extra receipt field, or runtime data is retained. Exact finalized
+--   receipt bytes are hashed. Only after successful upload, authenticated run
+--   evidence and successful job outputs publish receipt_sha256 and artifact_id,
+--   bound to repository/workflow, run ID/attempt, full app/controller commits and
+--   receipt basename. Failed validation/upload publishes no success evidence.
+--   The independent receipt-byte expectation is not an archive digest, self-hash
+--   or third payload file, and is obtained from authenticated selected run evidence
+--   rather than the mutable local payload directory.
+-- linux_incident_has_no_release_or_deployment_authority(incident) -> Boolean
+--   No tag creation/move, release mutation/publication, deployment, installation,
+--   compatibility admission, or general Linux/other-candidate preparation is
+--   authorized. The ARM operation and normal macOS preparation/release are unchanged.
+--
+-- incident_has_exact_source_and_controller(incident) -> Boolean
+--   REQ-DESKTOP-REL-012: only operation prepare-incident-237100-arm64 is admitted,
+--   with no candidate/target/tag selection. The fixed candidate/version/registry
+--   object digest match that requirement, and candidate is an ancestor of origin/main.
+--   A distinct exact workflow controller materializes outside the clean candidate
+--   workspace after native build, without altering candidate source or identity.
+-- incident_security_and_native_checks_pass(incident) -> Boolean
+--   incident.apple_silicon_pair is aarch64-apple-darwin with the exact incident
+--   identity, verified standalone/app, validated notarization, and passed native
+--   acceptance. All candidate-owned signing, Apple acceptance, stapling, Gatekeeper,
+--   helper bytes, checksum and protected-material cleanup gates remain mandatory.
+--   Only the exact temporary ARM app staple/validate commands receive the bounded
+--   code-68 retry policy under REQ-DESKTOP-REL-012; 65 and other codes fail immediately.
+--   Four attempts at 45 seconds plus 10/30/60-second delays schedule at most 280
+--   seconds within a 300-second execution/retry budget per invocation.
+--   Timeout/cancellation SIGKILLs the process group and reaps the child before
+--   failing packaging. Mandatory reap can exceed the budget in uninterruptible
+--   kernel sleep; no absolute hard wall is guaranteed. The protected packaging
+--   step has a 30-minute runner guard separate from the native build.
+--   Other xcrun calls delegate unchanged without additional argument logging.
+-- incident_has_sanitized_evidence_only(incident) -> Boolean
+--   Retained Actions payloads have unchanged schema-1 preparation receipts and
+--   separate provenance with exact operation/controller/candidate/target/run/attempt
+--   and retry policy. Stapler child output is suppressed; retry logs are static.
+--   Incident evidence qualifies only ARM, never the normal two-architecture path.
+-- incident_has_no_release_or_deployment_authority(incident) -> Boolean
+--   No tag creation/move, release mutation/publication, deployment, installation,
+--   or compatibility expansion is authorized; normal preparation/release are unchanged.
 -- publication_has_workflow_sole_writer(publication) -> Boolean
 --   no other release workflow can concurrently create a tag or mutate publication.
 -- public_release_differs(publication) -> Boolean
@@ -472,6 +546,38 @@ rule ProtectedMainPreparationProducesActionsEvidence {
     ensures: preparation_has_no_release_authority(preparation)
     ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
     ensures: preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))
+}
+
+rule ExactLinuxIncidentPreparationProducesClosedEvidence {
+    when: ExactLinuxIncidentPreparationRequested(incident)
+    requires: linux_incident_has_exact_source_and_controller(incident)
+    ensures: linux_incident_has_no_release_or_deployment_authority(incident)
+    ensures: incident.verified = linux_incident_has_closed_payload_and_receipt(incident)
+}
+
+invariant VerifiedLinuxIncidentHasExactClosedEvidence {
+    LinuxIncidentPreparation.verified implies (
+        linux_incident_has_exact_source_and_controller(LinuxIncidentPreparation) and
+        linux_incident_has_closed_payload_and_receipt(LinuxIncidentPreparation) and
+        linux_incident_has_no_release_or_deployment_authority(LinuxIncidentPreparation)
+    )
+}
+
+rule ExactArmIncidentPreparationProducesSeparateEvidence {
+    when: ExactArmIncidentPreparationRequested(incident)
+    requires: incident_has_exact_source_and_controller(incident)
+    ensures: incident_has_no_release_or_deployment_authority(incident)
+    ensures: incident_security_and_native_checks_pass(incident) implies incident_has_sanitized_evidence_only(incident)
+    ensures: incident.verified = incident_security_and_native_checks_pass(incident)
+}
+
+invariant VerifiedIncidentHasOnlyExactArmAcceptance {
+    IncidentPreparation.verified implies (
+        incident_has_exact_source_and_controller(IncidentPreparation) and
+        incident_security_and_native_checks_pass(IncidentPreparation) and
+        incident_has_sanitized_evidence_only(IncidentPreparation) and
+        incident_has_no_release_or_deployment_authority(IncidentPreparation)
+    )
 }
 
 invariant PublicReleaseIsExact {

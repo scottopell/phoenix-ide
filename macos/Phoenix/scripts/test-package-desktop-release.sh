@@ -109,6 +109,11 @@ cat >"$tmp/bin/xcrun" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 printf '%s\n' "$*" >> "${XCRUN_LOG:?}"
+if [[ "${1:-}" == stapler && "${2:-}" == "${FAKE_STAPLER_FAILURE_ACTION:-}" ]]; then
+  echo 'SECRET-STAPLER-OUTPUT'
+  echo 'SECRET-STAPLER-ERROR' >&2
+  exit 68
+fi
 if [[ "${1:-}" == notarytool && "${2:-}" == submit ]]; then
   printf '{"id":"submission-fixture","status":"%s"}\n' "${FAKE_NOTARY_STATUS:-Accepted}"
   exit "${FAKE_NOTARY_EXIT:-0}"
@@ -352,5 +357,48 @@ fi
 grep -F 'stapler staple' "$tmp/xcrun.log" >/dev/null
 grep -F 'stapler validate' "$tmp/xcrun.log" >/dev/null
 grep -F -- '--assess --type execute --verbose=2' "$tmp/spctl.log" >/dev/null
+
+# Fixture-only controller timings and delegate; production policy has no overrides.
+python3 - "$root/scripts/incident_stapler_controller.py" "$tmp/bin/xcrun" "$tmp/incident-xcrun" <<'PY'
+from pathlib import Path
+import sys
+
+source, delegate, wrapper = map(Path, sys.argv[1:])
+text = source.read_text().replace('REAL_XCRUN = "/usr/bin/xcrun"', f'REAL_XCRUN = {str(delegate)!r}')
+text = text.replace('DELAYS = (10, 30, 60)', 'DELAYS = (0, 0, 0)')
+text = text.replace('COMMAND_TIMEOUT = 45', 'COMMAND_TIMEOUT = 1')
+text = text.replace('TOTAL_TIMEOUT = 300', 'TOTAL_TIMEOUT = 5')
+wrapper.write_text(text)
+wrapper.chmod(0o700)
+PY
+export RUNNER_TEMP="$tmp/runner"
+export FAKE_EMBEDDED_VERSION=0.13.0-rc.4
+export FAKE_EMBEDDED_SHA=237100c79d9ce672867b284167a099fa0b7a2bcf
+export FAKE_CHECKOUT_COMMIT=$FAKE_EMBEDDED_SHA
+for action in staple validate; do
+  out="$tmp/exhausted-$action"
+  mkdir -p "$out"
+  : > "$tmp/xcrun.log"
+  : > "$tmp/spctl.log"
+  if FAKE_STAPLER_FAILURE_ACTION=$action XCRUN="$tmp/incident-xcrun" \
+    "$root/macos/Phoenix/scripts/package-desktop-release.sh" \
+      "$tmp/sidecar" aarch64-apple-darwin v0.13.0-rc.4 \
+      "$FAKE_EMBEDDED_SHA" "$out" "$out/receipt.json" >"$out/stdout" 2>"$out/stderr"; then
+    echo "expected exhausted $action controller to fail packaging" >&2
+    exit 1
+  fi
+  [[ $(grep -c "^stapler $action " "$tmp/xcrun.log") -eq 4 ]]
+  [[ $(grep -c '^notarytool submit ' "$tmp/xcrun.log") -eq 1 ]]
+  [[ ! -e "$out/receipt.json" ]]
+  [[ ! -e "$out/Phoenix-macos-aarch64-apple-darwin-v0.13.0-rc.4.zip" ]]
+  [[ ! -s "$tmp/spctl.log" ]]
+  [[ ! -s "$out/stdout" ]]
+  ! grep -q 'SECRET-STAPLER' "$out/stderr"
+  if [[ $action == staple ]]; then
+    ! grep -q '^stapler validate ' "$tmp/xcrun.log"
+  else
+    [[ $(grep -c '^stapler staple ' "$tmp/xcrun.log") -eq 1 ]]
+  fi
+done
 
 echo "desktop release packaging regression checks passed"

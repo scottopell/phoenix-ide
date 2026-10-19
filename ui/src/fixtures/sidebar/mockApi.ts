@@ -12,7 +12,6 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
     getProjects: api.getProjects,
     listModels: api.listModels,
     listProductConversations: api.listProductConversations,
-    renameConversation: api.renameConversation,
     archiveConversation: api.archiveConversation,
     archiveChain: api.archiveChain,
     renameProductConversation: api.renameProductConversation,
@@ -37,22 +36,6 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
     credential_status: 'not_configured',
   });
   api.listProductConversations = async () => ({ product_conversations: data.productConversations?.[scenarioId] ?? [] });
-  api.renameConversation = async (id: string, name: string) => ({
-    conversation: {
-      id,
-      slug: name,
-      title: name,
-      model: 'fixture',
-      cwd: '/tmp/sidebar-fixture',
-      created_at: new Date(0).toISOString(),
-      updated_at: new Date(0).toISOString(),
-      message_count: 0,
-      archived: false,
-      browser_session_active: false,
-      terminal_uses_tmux: false,
-      work_scope_key: `conversation:${id}`,
-    },
-  });
   api.renameProductConversation = async (reference: string, title: string) => {
     const row = data.productConversations?.[scenarioId]?.find((candidate) => candidate.product_conversation_id === reference);
     if (!row) throw new Error(`Unknown product conversation fixture: ${reference}`);
@@ -73,7 +56,6 @@ export function installSidebarFixtureApi(data: SidebarFixtureData, scenarioId: k
     api.getProjects = original.getProjects;
     api.listModels = original.listModels;
     api.listProductConversations = original.listProductConversations;
-    api.renameConversation = original.renameConversation;
     api.archiveConversation = original.archiveConversation;
     api.archiveChain = original.archiveChain;
     api.renameProductConversation = original.renameProductConversation;

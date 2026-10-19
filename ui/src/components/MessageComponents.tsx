@@ -1,3 +1,4 @@
+import { ConversationEventCard } from './ConversationEventCard';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import { SvgArtifactCard } from './SvgArtifactCard';
 import { svgArtifactFromResult } from './svgArtifact';
@@ -18,6 +19,7 @@ import { svgArtifactFromResult } from './svgArtifact';
 import React, { memo, useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { MessageReviewAction } from './MessageReviewAction';
+import { AssistantMessageChrome, AssistantMessageMetadata } from './AssistantMessageChrome';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import { MarkdownRenderer } from './MarkdownRenderer';
@@ -34,6 +36,7 @@ import { useIsDesktop } from '../hooks';
 import { useDensity } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
+import { SubAgentTaskDetails } from './SubAgentTaskDetails';
 
 import { linkifyText } from '../utils/linkify';
 import { getMessageMarkdown } from '../utils/messageCopy';
@@ -383,6 +386,38 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
 
+  const body = (
+    <div className="message-content">
+      <span data-fragment-id="message-text">
+        {activeHighlight?.owner === 'message-text' && activeHighlight.fragmentId === 'message-text'
+          ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+          : <SkillCommandText text={text} />}
+      </span>
+      {images.length > 0 && (
+        <div className="message-images">
+          {images.map((img, idx) => (
+            <img
+              key={idx}
+              src={`data:${img.media_type};base64,${img.data}`}
+              alt={`Attachment ${idx + 1}`}
+              className="message-image"
+            />
+          ))}
+        </div>
+      )}
+      <FileChips files={files} activeHighlight={activeHighlight} />
+    </div>
+  );
+  if (message.origin?.kind === 'subscription_event') {
+    return (
+      <div id={`message-${message.message_id}`} className="message meta conversation-event-message" data-sequence-id={message.sequence_id}>
+        <ConversationEventCard presentation={message.event_presentation} eventId={message.origin.event_id} originalText={text} activeHighlight={activeHighlight}>
+          {body}
+        </ConversationEventCard>
+      </div>
+    );
+  }
+
   return (
     <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
@@ -399,26 +434,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           <MessageCopyButton message={message} title={message.origin?.kind === 'system_generated' ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
-      <div className="message-content">
-        <span data-fragment-id="message-text">
-          {activeHighlight?.owner === 'message-text'
-            ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
-            : <SkillCommandText text={text} />}
-        </span>
-        {images.length > 0 && (
-          <div className="message-images">
-            {images.map((img, idx) => (
-              <img
-                key={idx}
-                src={`data:${img.media_type};base64,${img.data}`}
-                alt={`Attachment ${idx + 1}`}
-                className="message-image"
-              />
-            ))}
-          </div>
-        )}
-        <FileChips files={files} activeHighlight={activeHighlight} />
-      </div>
+      {body}
     </div>
   );
 }
@@ -1283,35 +1299,26 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   return (
     <div
       id={`message-${message.message_id}`}
-      className="message agent"
+      className="message agent assistant-message"
       data-sequence-id={message.sequence_id}
       data-message-id={message.message_id}
       data-inline-reaction-message={message.message_id}
       data-message-occurrence={(message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken}
     >
-      {!suppressMessageCopy && !isFirstInTurn && (
-        <div className="message-mobile-copy-row">
-          <MessageReviewAction message={message} />
-          <MessageCopyButton message={message} title="Copy Phoenix message" />
-        </div>
-      )}
-      {isFirstInTurn && (
-        <div className="message-header">
-          <span className="message-sender">Phoenix</span>
-          {timestamp && (
-            <span className="message-time" title={new Date(timestamp).toLocaleString()}>
-              {formatMessageTime(timestamp)}
-            </span>
-          )}
-          <AgentRetryBadge message={message} />
-          {!suppressMessageCopy && (
-            <span className="message-header-actions">
-              <MessageReviewAction message={message} />
-              <MessageCopyButton message={message} title="Copy Phoenix message" />
-            </span>
-          )}
-        </div>
-      )}
+      <AssistantMessageChrome
+        isFirstInTurn={isFirstInTurn}
+        metadata={(
+          <AssistantMessageMetadata timestamp={timestamp} formattedTime={formatMessageTime(timestamp)}>
+            <AgentRetryBadge message={message} />
+          </AssistantMessageMetadata>
+        )}
+        actions={!suppressMessageCopy && (
+          <>
+            <MessageReviewAction message={message} />
+            <MessageCopyButton message={message} title="Copy Phoenix message" />
+          </>
+        )}
+      />
       <div className="message-content">
         {(() => {
           // In compact mode, all of a turn's tool blocks collapse into one
@@ -3349,10 +3356,15 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
  * card. Owns its own read-only stream; `running` is the card's authoritative
  * status (the card is mounted whenever it's visible).
  */
-function ChildConversationActivity({ agentId, expanded, running, finalResult }: { agentId: string; expanded: boolean; running: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
+function ChildConversationActivity({ agentId, task, expanded, running, finalResult }: { agentId: string; task: string; expanded: boolean; running: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
   const inline = useConversationInlineStream(agentId, expanded, running);
   if (!expanded) return null;
-  return <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />;
+  return (
+    <>
+      <SubAgentTaskDetails task={task} inline={inline} />
+      <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />
+    </>
+  );
 }
 
 function SubAgentActivityCard({
@@ -3409,6 +3421,7 @@ function SubAgentActivityCard({
       {!isActive && (
         <ChildConversationActivity
           agentId={agentId}
+          task={task}
           expanded={expanded}
           running={running}
           finalResult={resultText ? { text: resultText, statusClass } : undefined}

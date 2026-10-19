@@ -224,3 +224,23 @@
     min-height: 44px;
   }
 }
+
+.conversation-history-boundary {
+  color: var(--text-muted, #888);
+  border-block: 1px solid var(--border-color, #444);
+  padding-block: 4px;
+  font-size: 0.85em;
+}
+
+.conversation-history-boundary summary { cursor: pointer; }
+
+.conversation-history-boundary-provenance {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 8px;
+}
+
+.conversation-history-boundary-provenance dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

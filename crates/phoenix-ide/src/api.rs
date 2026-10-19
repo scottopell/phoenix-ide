@@ -11,6 +11,7 @@ mod chains;
 pub mod codex_login;
 mod deployment;
 mod discovery;
+mod event_presentation;
 pub(crate) mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
@@ -30,6 +31,7 @@ mod svg_artifacts;
 mod terminal_ws;
 mod types;
 pub(crate) mod usage;
+mod view_journey;
 pub(crate) mod wire;
 pub(crate) mod work_scope_load;
 

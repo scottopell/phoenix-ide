@@ -5,6 +5,7 @@ import { MessageReviewAction, MessageReviewEnabledContext } from './MessageRevie
 import { OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 
 const message: Message = {
+  event_presentation: null,
   message_id: 'answer', sequence_id: 2, message_type: 'agent',
   conversation_id: 'earlier-row', created_at: '2026-09-19T12:00:00Z',
   content: [{ type: 'tool_use', id: 'read', name: 'bash', input: { command: 'pwd' } }],

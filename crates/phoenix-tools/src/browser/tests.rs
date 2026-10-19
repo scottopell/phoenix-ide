@@ -4,6 +4,7 @@
 
 use super::profile::BrowserProfileTool;
 use super::tools::*;
+use super::BrowserSnapshotTool;
 use crate::{Tool, ToolContext};
 use phoenix_browser::BrowserSessionManager;
 use serde_json::json;
@@ -12,6 +13,21 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn screenshot_path_preflight_rejects_invalid_destinations_without_a_browser() {
+    for path in ["", "relative.png", "/tmp/invalid\0.png"] {
+        let error = super::BrowserOperation::TakeScreenshot
+            .validate_input(json!({"path":path}))
+            .await
+            .expect_err("invalid output path");
+        assert!(error.output().contains("nonempty absolute path"));
+    }
+    assert!(super::BrowserOperation::TakeScreenshot
+        .validate_input(json!({"path":"/missing-parent/output.png"}))
+        .await
+        .is_ok());
+}
 
 fn scope(id: &str) -> phoenix_core::work_scope::ResourceScopeKey {
     phoenix_core::work_scope::ResourceScopeKey::Work(
@@ -328,6 +344,22 @@ async fn test_browser_eval_local() {
         "Arithmetic wrong: {}",
         result.output()
     );
+
+    for (expression, rendered) in [
+        ("null", "null"),
+        ("undefined", "undefined"),
+        ("123n", "123n"),
+    ] {
+        let result = eval_tool
+            .run(json!({"expression":expression}), ctx.clone())
+            .await;
+        assert!(result.is_success(), "{expression}: {}", result.output());
+        assert_eq!(
+            result.output(),
+            format!("<javascript_result>{rendered}</javascript_result>")
+        );
+        assert!(result.display_data().is_none());
+    }
 
     let resize = BrowserResizeTool
         .run(json!({"width": 1024, "height": 768}), ctx.clone())
@@ -789,9 +821,6 @@ async fn test_browser_screenshot_local() {
         result.output()
     );
 
-    // The screenshot must flow to the LLM via the typed `images` channel,
-    // not via `display_data` (which is UI-only and never threaded to the
-    // LLM). Mirrors the read_image.rs regression assertion.
     assert_eq!(
         result.images().len(),
         1,
@@ -803,10 +832,38 @@ async fn test_browser_screenshot_local() {
         result.images()[0].data.starts_with("iVBORw0KGgo"),
         "image data is not a valid PNG (base64 should start with iVBORw0KGgo)"
     );
-    assert!(
-        result.display_data().is_none(),
-        "browser_take_screenshot must not duplicate the image payload into display_data, got {:?}",
-        result.display_data()
+    let metadata = result.display_data().unwrap().as_object().unwrap();
+    assert_eq!(
+        metadata.len(),
+        1,
+        "UI metadata carries only the saved artifact handle"
+    );
+    let path = metadata["artifact_path"].as_str().unwrap();
+    let saved = tokio::fs::read(path).await.unwrap();
+    assert_eq!(
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &saved),
+        result.images()[0].data
+    );
+    tokio::fs::remove_file(path).await.unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let chosen = directory.path().join("chosen screenshot.png");
+    let result = screenshot_tool
+        .run(json!({"path":chosen}), ctx.clone())
+        .await;
+    assert!(result.is_success(), "{}", result.output());
+    assert_eq!(
+        result.display_data().unwrap()["artifact_path"],
+        json!(chosen)
+    );
+    assert_eq!(result.images().len(), 1);
+    assert_eq!(
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &result.images()[0].data
+        )
+        .unwrap(),
+        tokio::fs::read(&chosen).await.unwrap()
     );
 
     shutdown_test(manager, server).await;
@@ -2791,4 +2848,397 @@ async fn browser_lifecycle_ownership_topologies_share_serialized_fixture() {
         .await
         .expect("browser shutdown");
     outcome.expect("browser lifecycle scenario");
+}
+
+fn snapshot_refs(output: &str, role_and_name: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| line.contains(role_and_name))
+        .filter_map(|line| {
+            let (_, reference) = line.split_once("[@")?;
+            let (reference, _) = reference.split_once(']')?;
+            Some(format!("@{reference}"))
+        })
+        .collect()
+}
+
+async fn snapshot_text(ctx: &ToolContext, interactive: bool) -> String {
+    let result = BrowserSnapshotTool
+        .run(json!({"interactive": interactive}), ctx.clone())
+        .await;
+    assert!(result.is_success(), "snapshot failed: {}", result.output());
+    result.output().to_string()
+}
+
+async fn assert_browser_expression(ctx: &ToolContext, expression: &str) {
+    let result = BrowserEvalTool
+        .run(json!({"expression": expression}), ctx.clone())
+        .await;
+    assert!(result.is_success(), "eval failed: {}", result.output());
+    assert!(
+        result.output().contains("true"),
+        "{expression}: {}",
+        result.output()
+    );
+}
+
+async fn assert_stale_click(ctx: &ToolContext, reference: &str) {
+    let result = BrowserClickTool
+        .run(json!({"ref": reference}), ctx.clone())
+        .await;
+    assert!(
+        !result.is_success(),
+        "stale reference succeeded: {}",
+        result.output()
+    );
+    assert!(
+        result.output().contains("browser_snapshot"),
+        "no recovery instruction: {}",
+        result.output()
+    );
+}
+
+#[tokio::test]
+async fn rejected_reference_leaves_selector_and_key_input_available() {
+    require_chrome!();
+    let (ctx, manager) = test_context("rejected-ref-next-input");
+    let html = "<button id=original>Reject me</button><button id=other>Other</button><button id=recovery onclick=window.recovered++>Recover</button><input id=text><script>window.recovered=0; original.onpointerdown=e=>other.setPointerCapture(e.pointerId)</script>";
+    let opened = BrowserNavigateTool
+        .run(json!({"url":format!("data:text/html,{html}")}), ctx.clone())
+        .await;
+    assert!(opened.is_success(), "{}", opened.output());
+    let snapshot = snapshot_text(&ctx, true).await;
+    let reference = snapshot_refs(&snapshot, "button \"Reject me\"")[0].clone();
+    let rejected = BrowserClickTool
+        .run(json!({"ref":reference}), ctx.clone())
+        .await;
+    assert!(!rejected.is_success(), "retargeted ref click succeeded");
+    let clicked = BrowserClickTool
+        .run(json!({"selector":"#recovery"}), ctx.clone())
+        .await;
+    assert!(clicked.is_success(), "{}", clicked.output());
+    let typed = BrowserTypeTool
+        .run(json!({"selector":"#text","text":"s"}), ctx.clone())
+        .await;
+    assert!(typed.is_success(), "{}", typed.output());
+    let keyed = BrowserKeyPressTool
+        .run(json!({"key":"x"}), ctx.clone())
+        .await;
+    assert!(keyed.is_success(), "{}", keyed.output());
+    assert_browser_expression(
+        &ctx,
+        "window.recovered===1 && document.getElementById('text').value==='sx'",
+    )
+    .await;
+    manager.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_interactions_reject_ambiguous_or_missing_targets_without_chrome() {
+    // REQ-BT-008, REQ-BT-009: invalid target combinations fail before browser acquisition.
+    let (ctx, manager) = test_context("snapshot-invalid-targets");
+    for target in [
+        json!({}),
+        json!({"selector": "button", "ref": "@invalid:1"}),
+        json!({"selector": "button", "ref": null}),
+        json!({"selector": null}),
+        json!({"ref": null}),
+    ] {
+        let click = BrowserClickTool.run(target.clone(), ctx.clone()).await;
+        assert!(!click.is_success(), "click accepted {target}");
+        let mut type_args = target;
+        type_args["text"] = json!("hello");
+        let typed = BrowserTypeTool.run(type_args.clone(), ctx.clone()).await;
+        assert!(!typed.is_success(), "type accepted {type_args}");
+    }
+    for schema in [
+        BrowserClickTool.input_schema(),
+        BrowserTypeTool.input_schema(),
+        BrowserSnapshotTool.input_schema(),
+    ] {
+        for combinator in ["oneOf", "allOf", "anyOf"] {
+            assert!(
+                schema.get(combinator).is_none(),
+                "provider-incompatible top-level {combinator}: {schema}"
+            );
+        }
+    }
+    assert!(!manager.is_active(&ctx.work_scope).await);
+    manager.shutdown_all().await.expect("browser shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn browser_snapshot_accessibility_and_native_reference_interactions() {
+    require_chrome!();
+    // REQ-BT-025: duplicate labels, AX states, ignored nodes, shadow DOM, and iframe scope.
+    let server = TestServer::start(r#"<!doctype html><html><body>
+      <main aria-label="Checkout"><h1>Order details</h1>
+        <div role="none"><button id="first" onclick="window.chosen=1">Choose</button></div>
+        <button id="second" onclick="window.chosen=2">Choose</button>
+        <button id="hover-replace" onmouseenter="this.outerHTML='<button onclick=window.wrongHoverClick=true>Replacement</button>'">Hover target</button>
+        <label>Customer<input id="customer" value="before" oninput="window.typed=this.value"></label>
+        <label><input type="checkbox" checked>Subscribe</label>
+        <button disabled>Unavailable</button><button aria-expanded="true">Options</button>
+        <img alt=""><span aria-hidden="true">Decorative secret</span>
+        <div id="shadow"></div>
+        <div id="shadow-host" role="button" tabindex="0" onclick="window.hostClicked=true"></div>
+        <div id="closed-shadow"></div>
+        <iframe srcdoc="<button>Frame secret</button>"></iframe>
+      </main><script>
+      window.chosen=0;
+      document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML=
+        '<button onclick="window.shadowClicked=true">Shadow action</button>';
+      document.querySelector('#shadow-host').attachShadow({mode:'open'}).innerHTML='<span>Host action</span>';
+      const closedRoot = document.querySelector('#closed-shadow').attachShadow({mode:'closed'});
+      closedRoot.innerHTML='<button>Closed action</button><label>Closed field<input></label>';
+      closedRoot.querySelector('button').onclick=()=>window.closedClicked=true;
+      closedRoot.querySelector('input').oninput=event=>window.closedTyped=event.target.value;
+      </script></body></html>"#).await;
+    let (ctx, manager) = test_context("snapshot-native");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(nav.is_success(), "{}", nav.output());
+        let full = snapshot_text(&ctx, false).await;
+        assert!(full.contains("main \"Checkout\""), "{full}");
+        assert!(full.contains("heading \"Order details\""), "{full}");
+        assert!(
+            full.contains("checked") && full.contains("disabled") && full.contains("expanded"),
+            "{full}"
+        );
+        assert!(
+            !full.contains("Decorative secret") && !full.contains("Frame secret"),
+            "{full}"
+        );
+        let parent = full
+            .lines()
+            .find(|line| line.contains("main \"Checkout\""))
+            .unwrap();
+        let child = full
+            .lines()
+            .find(|line| line.contains("button \"Choose\""))
+            .unwrap();
+        assert!(
+            child.len() - child.trim_start().len() > parent.len() - parent.trim_start().len(),
+            "{full}"
+        );
+        let choices = snapshot_refs(&full, "button \"Choose\"");
+        assert_eq!(choices.len(), 2, "{full}");
+        assert_ne!(choices[0], choices[1]);
+        let click = BrowserClickTool
+            .run(json!({"ref": choices[1]}), ctx.clone())
+            .await;
+        assert!(click.is_success(), "{}", click.output());
+        assert_browser_expression(&ctx, "window.chosen === 2").await;
+        let customer = snapshot_refs(&full, "textbox \"Customer\"");
+        assert_eq!(customer.len(), 1, "{full}");
+        let typed = BrowserTypeTool
+            .run(
+                json!({"ref": customer[0], "text": "Ada", "clear": true}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(typed.is_success(), "{}", typed.output());
+        assert_browser_expression(
+            &ctx,
+            "window.typed === 'Ada' && document.querySelector('#customer').value === 'Ada'",
+        )
+        .await;
+        let timed_out = BrowserTypeTool
+            .run(json!({"ref": customer[0], "text": "x".repeat(1000), "timeout": "1ms"}), ctx.clone())
+            .await;
+        assert!(!timed_out.is_success(), "long typing must exceed the tiny budget");
+        assert!(timed_out.output().contains("partial text insertion may already have happened"), "{}", timed_out.output());
+        assert!(timed_out.output().contains("do not append the full text blindly"), "{}", timed_out.output());
+        let shadow = snapshot_refs(&full, "button \"Shadow action\"");
+        assert_eq!(shadow.len(), 1, "{full}");
+        let click = BrowserClickTool
+            .run(json!({"ref": shadow[0]}), ctx.clone())
+            .await;
+        assert!(click.is_success(), "{}", click.output());
+        assert_browser_expression(&ctx, "window.shadowClicked === true").await;
+        let host = snapshot_refs(&full, "button \"Host action\"");
+        assert_eq!(host.len(), 1, "{full}");
+        let click = BrowserClickTool
+            .run(json!({"ref": host[0]}), ctx.clone())
+            .await;
+        assert!(click.is_success(), "{}", click.output());
+        assert_browser_expression(&ctx, "window.hostClicked === true").await;
+        let hover = snapshot_refs(&full, "button \"Hover target\"");
+        assert_eq!(hover.len(), 1, "{full}");
+        assert_stale_click(&ctx, &hover[0]).await;
+        assert_browser_expression(&ctx, "!window.wrongHoverClick && !document.querySelector('#hover-replace')").await;
+        let closed_button = snapshot_refs(&full, "button \"Closed action\"");
+        assert_eq!(closed_button.len(), 1, "{full}");
+        let clicked = BrowserClickTool.run(json!({"ref": closed_button[0]}), ctx.clone()).await;
+        assert!(clicked.is_success(), "{}", clicked.output());
+        assert_browser_expression(&ctx, "window.closedClicked === true").await;
+        let closed_input = snapshot_refs(&full, "textbox \"Closed field\"");
+        assert_eq!(closed_input.len(), 1, "{full}");
+        let typed = BrowserTypeTool.run(json!({"ref": closed_input[0], "text": "closed", "clear": true}), ctx.clone()).await;
+        assert!(typed.is_success(), "{}", typed.output());
+        assert_browser_expression(&ctx, "window.closedTyped === 'closed' && document.querySelector('#closed-shadow').shadowRoot === null").await;
+        let filtered = snapshot_text(&ctx, true).await;
+        assert!(
+            !filtered.contains("heading \"Order details\""),
+            "{filtered}"
+        );
+        assert_eq!(
+            snapshot_refs(&filtered, "button \"Choose\"").len(),
+            2,
+            "{filtered}"
+        );
+        assert_stale_click(&ctx, &choices[0]).await;
+        let click = BrowserClickTool
+            .run(json!({"selector": "#first", "wait": true}), ctx.clone())
+            .await;
+        assert!(click.is_success(), "{}", click.output());
+        let typed = BrowserTypeTool
+            .run(json!({"selector": "#customer", "text": "!"}), ctx.clone())
+            .await;
+        assert!(typed.is_success(), "{}", typed.output());
+        assert_browser_expression(&ctx, "window.chosen === 1 && window.typed === 'Ada!'").await;
+        assert_browser_expression(&ctx, "document.body.replaceChildren(); for (let i=0;i<2100;i++) { const button=document.createElement('button'); button.textContent='Bulk '+i; button.onclick=()=>window.bulkClicked=i; document.body.appendChild(button); } true").await;
+        let spilled = BrowserSnapshotTool.run(json!({"interactive": true}), ctx.clone()).await;
+        assert!(spilled.is_success(), "{}", spilled.output());
+        assert!(spilled.output().contains("[TRUNCATED:"), "inline truncation notice missing: {}", spilled.output());
+        let path = spilled.output().strip_prefix("Accessibility snapshot saved to ")
+            .and_then(|suffix| suffix.split_once(". Read this file"))
+            .map(|(path, _)| path)
+            .expect("snapshot artifact path");
+        let artifact = tokio::fs::read_to_string(path).await.expect("read snapshot artifact");
+        tokio::fs::remove_file(path).await.expect("remove snapshot artifact");
+        assert!(artifact.len() > 4096 && artifact.len() <= 256 * 1024);
+        assert!(artifact.contains("[TRUNCATED:"));
+        assert_eq!(artifact.lines().filter(|line| line.trim_start().starts_with("- ")).count(), 2000);
+        let reference = snapshot_refs(&artifact, "button \"Bulk 0\"");
+        assert_eq!(reference.len(), 1);
+        let clicked = BrowserClickTool.run(json!({"ref": reference[0]}), ctx.clone()).await;
+        assert!(clicked.is_success(), "{}", clicked.output());
+        assert_browser_expression(&ctx, "window.bulkClicked === 0").await;
+    })
+    .await;
+    shutdown_test(manager, server).await;
+    outcome.expect("accessibility and native reference journey");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn browser_snapshot_refs_reject_replacement_navigation_and_other_sessions() {
+    require_chrome!();
+    // REQ-BT-025: references never retarget by label or selector.
+    let server = TestServer::start(
+        r#"<!doctype html><html><body>
+      <button id="target" onclick="window.clicked=true">Target</button>
+      <input aria-label="Field"><script>window.clicked=false</script>
+      </body></html>"#,
+    )
+    .await;
+    let (ctx, manager) = test_context("snapshot-lifetime");
+    let (other, other_manager) = test_context("snapshot-other");
+    let scenarios_manager = manager.clone();
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav = BrowserNavigateTool.run(json!({"url": url}), ctx.clone()).await;
+        assert!(nav.is_success(), "{}", nav.output());
+        let original = snapshot_text(&ctx, true).await;
+        let target = snapshot_refs(&original, "button \"Target\"")[0].clone();
+        let input = snapshot_refs(&original, "textbox \"Field\"")[0].clone();
+        let nav = BrowserNavigateTool.run(json!({"url": url}), other.clone()).await;
+        assert!(nav.is_success(), "{}", nav.output());
+        assert_stale_click(&other, &target).await;
+        assert_browser_expression(&ctx, "document.querySelector('#target').outerHTML = document.querySelector('#target').outerHTML; true").await;
+        assert_stale_click(&ctx, &target).await;
+        assert_browser_expression(&ctx, "window.clicked === false").await;
+        // A neighboring DOM replacement does not invalidate the surviving input node.
+        let typed = BrowserTypeTool.run(json!({"ref": input, "text": "retained"}), ctx.clone()).await;
+        assert!(typed.is_success(), "{}", typed.output());
+        let refreshed = snapshot_text(&ctx, true).await;
+        let target = snapshot_refs(&refreshed, "button \"Target\"")[0].clone();
+        let failed = BrowserSnapshotTool.run(json!({"timeout": "0s"}), ctx.clone()).await;
+        assert!(!failed.is_success(), "zero-budget collection unexpectedly succeeded: {}", failed.output());
+        assert_stale_click(&ctx, &target).await;
+        let refreshed = snapshot_text(&ctx, true).await;
+        let target = snapshot_refs(&refreshed, "button \"Target\"")[0].clone();
+        let eval = BrowserEvalTool.run(json!({"expression": "location.reload(); 'reloading'"}), ctx.clone()).await;
+        assert!(eval.is_success(), "{}", eval.output());
+        let ready = BrowserWaitForSelectorTool.run(json!({"selector": "#target"}), ctx.clone()).await;
+        assert!(ready.is_success(), "{}", ready.output());
+        assert_stale_click(&ctx, &target).await;
+        let refreshed = snapshot_text(&ctx, true).await;
+        let target = snapshot_refs(&refreshed, "button \"Target\"")[0].clone();
+        let nav = BrowserNavigateTool.run(json!({"url": url}), ctx.clone()).await;
+        assert!(nav.is_success(), "{}", nav.output());
+        assert_stale_click(&ctx, &target).await;
+        let refreshed = snapshot_text(&ctx, true).await;
+        let target = snapshot_refs(&refreshed, "button \"Target\"")[0].clone();
+        scenarios_manager.kill_session(&ctx.work_scope).await.expect("kill original browser");
+        let nav = BrowserNavigateTool.run(json!({"url": url}), ctx.clone()).await;
+        assert!(nav.is_success(), "{}", nav.output());
+        assert_stale_click(&ctx, &target).await;
+        assert_browser_expression(&ctx, "window.clicked === false").await;
+    }).await;
+    other_manager
+        .shutdown_all()
+        .await
+        .expect("other browser shutdown");
+    shutdown_test(manager, server).await;
+    outcome.expect("reference lifetime journey");
+}
+
+#[tokio::test]
+async fn browser_snapshot_refs_trigger_react_handlers() {
+    require_chrome!();
+    // REQ-BT-008, REQ-BT-009, REQ-BT-025: real framework dispatch through reference targeting.
+    let html = format!(
+        r#"<!doctype html><html><body><div id="root"></div>
+      <script>{REACT_UMD}</script><script>{REACT_DOM_PRODUCTION_UMD}</script><script>
+      function App() {{
+        var count = React.useState(0), name = React.useState('');
+        return React.createElement('main', null,
+          React.createElement('button', {{id:'increment', onClick:()=>count[1](count[0]+1)}}, 'Increment'),
+          React.createElement('input', {{'aria-label':'React name', value:name[0], onChange:e=>name[1](e.target.value)}}),
+          React.createElement('output', {{id:'result'}}, count[0]+':'+name[0]));
+      }}
+      ReactDOM.createRoot(document.querySelector('#root')).render(React.createElement(App));
+      </script></body></html>"#
+    );
+    let server = TestServer::start(&html).await;
+    let (ctx, manager) = test_context("snapshot-react");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(nav.is_success(), "{}", nav.output());
+        let ready = BrowserWaitForSelectorTool
+            .run(json!({"selector": "#increment"}), ctx.clone())
+            .await;
+        assert!(ready.is_success(), "{}", ready.output());
+        let snapshot = snapshot_text(&ctx, true).await;
+        let button = snapshot_refs(&snapshot, "button \"Increment\"")[0].clone();
+        let input = snapshot_refs(&snapshot, "textbox \"React name\"")[0].clone();
+        let click = BrowserClickTool
+            .run(json!({"ref": button}), ctx.clone())
+            .await;
+        assert!(click.is_success(), "{}", click.output());
+        let typed = BrowserTypeTool
+            .run(
+                json!({"ref": input, "text": "Ada", "clear": true}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(typed.is_success(), "{}", typed.output());
+        assert_browser_expression(
+            &ctx,
+            "document.querySelector('#result').textContent === '1:Ada'",
+        )
+        .await;
+    })
+    .await;
+    shutdown_test(manager, server).await;
+    outcome.expect("React reference interaction journey");
 }

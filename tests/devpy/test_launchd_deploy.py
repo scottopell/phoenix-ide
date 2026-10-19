@@ -9,6 +9,7 @@ import os
 import plistlib
 import subprocess
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,86 @@ def load(path, name):
 
 
 helper = load(ROOT / "scripts" / "launchd_deploy_helper.py", "launchd_deploy_helper_test")
+
+
+class ManifestShapeTests(unittest.TestCase):
+    def test_load_rejects_malformed_mode_objects_and_field_types(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root)
+            path = root / "manifest.json"
+            for mode in ("paired_database_upgrade", "current_schema_upgrade", "ordinary_forward_migration"):
+                complete = mode_evidence(root, mode)
+                path.write_text(json.dumps(dataclasses.asdict(manifest) | {mode: complete}))
+                self.assertIsNotNone(getattr(helper.Manifest.load(path), mode))
+                malformed = [{}, [], "", False, 0, "mode"]
+                for field in complete:
+                    malformed.append({key: value for key, value in complete.items() if key != field})
+                    for wrong in (None, False, 1, [], {}, ""):
+                        malformed.append(complete | {field: wrong})
+                malformed.append(complete | {"unknown": "extra"})
+                for value in malformed:
+                    with self.subTest(mode=mode, value=value):
+                        path.write_text(json.dumps(dataclasses.asdict(manifest) | {mode: value}))
+                        with self.assertRaises(helper.ActivationError):
+                            helper.Manifest.load(path)
+
+    def test_load_wraps_top_level_and_identity_shape_type_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            payload = dataclasses.asdict(make_manifest(root))
+            path = root / "manifest.json"
+            malformed = [[], None, {}, payload | {"expected": {}}, payload | {"previous": {}},
+                         payload | {"expected": {"version": 2, "git_sha": "a" * 40}},
+                         payload | {"uid": "501"}, payload | {"health_insecure_tls": 1}]
+            malformed.extend({key: value for key, value in payload.items() if key != missing}
+                             for missing in ("expected", "transaction_id", "candidate_binary"))
+            for value in malformed:
+                with self.subTest(value=value):
+                    path.write_text(json.dumps(value))
+                    with self.assertRaises(helper.ActivationError):
+                        helper.Manifest.load(path)
+
+    def test_helper_admission_rejects_source_and_mode_cross_matrix_without_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = make_manifest(root)
+            for mode, record_type in (("paired_database_upgrade", helper.PairedDatabaseUpgrade),
+                                      ("current_schema_upgrade", helper.CurrentSchemaUpgrade)):
+                for source in (("prepared_artifact",) if mode == "paired_database_upgrade" else
+                               ("prepared_artifact", "published_release")):
+                    manifest = dataclasses.replace(base, source_kind=source,
+                        **{mode: record_type(**mode_evidence(root, mode))})
+                    for action, state in (("cleanup_precondition_capacity", "precondition_cleanup_pending"),
+                                          ("finalize_paired", "committed"),
+                                          ("recover_paired", "activation_failed_rollback_failed")):
+                        for status_source in (None, "prepared_artifact", "published_release", "local_head", "invalid"):
+                            for prepared_mode in (None, "paired", "current_schema", "invalid"):
+                                expected_mode = "paired" if mode == "paired_database_upgrade" else "current_schema"
+                                if status_source == source and prepared_mode == expected_mode:
+                                    continue
+                                with self.subTest(mode=mode, source=source, action=action,
+                                                  status_source=status_source, prepared_mode=prepared_mode):
+                                    status = {"transaction_id": manifest.transaction_id, "state": state}
+                                    if status_source is not None:
+                                        status["source_kind"] = status_source
+                                    if prepared_mode is not None:
+                                        status["prepared_mode"] = prepared_mode
+                                    Path(manifest.status_path).write_text(json.dumps(status))
+                                    Path(manifest.active_path).write_text(manifest.transaction_id)
+                                    before = Path(manifest.status_path).read_bytes()
+                                    with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+                                        helper, "validate_manifest_mode"
+                                    ), mock.patch.object(helper, "Launchctl") as launchctl, mock.patch.object(
+                                        helper.subprocess, "run"
+                                    ) as run, mock.patch.object(helper, "_remove_capacity_files") as remove:
+                                        with self.assertRaises(helper.ActivationError):
+                                            getattr(helper, action)(manifest, current_schema=mode == "current_schema_upgrade")
+                                        launchctl.assert_not_called()
+                                        run.assert_not_called()
+                                        remove.assert_not_called()
+                                    self.assertEqual(Path(manifest.status_path).read_bytes(), before)
+                                    self.assertEqual(Path(manifest.active_path).read_text(), manifest.transaction_id)
 
 
 class FakeClock:
@@ -62,6 +143,29 @@ class FakeLaunchctl:
         return 101
 
 
+def mode_evidence(transaction: Path, mode="paired_database_upgrade"):
+    script = transaction / "retained-helper.py"
+    script.write_bytes(b"retained controller helper")
+    prepared = {
+        "database_path": str(transaction.parent / "prod.db"),
+        "backup_path": str(transaction / "backup.sqlite3"),
+        "proof_path": str(transaction / "proof.json"),
+        "controller_source_commit": "c" * 40,
+        "controller_helper_path": str(script),
+        "controller_helper_sha256": helper.sha256(script),
+    }
+    registry = {
+        "migration_registry_path": str(transaction / "migrations.rs"),
+        "migration_registry_sha256": "d" * 64,
+    }
+    if mode == "current_schema_upgrade":
+        return prepared | registry
+    if mode == "ordinary_forward_migration":
+        return {"database_path": prepared["database_path"], "helper_path": str(script),
+                "helper_sha256": helper.sha256(script)} | registry
+    return prepared
+
+
 def make_manifest(root: Path, *, expected=None, previous=None):
     source_commit = "b" * 40
     expected = expected or helper.Identity("2.0.0", source_commit)
@@ -87,7 +191,7 @@ def make_manifest(root: Path, *, expected=None, previous=None):
         rollback_binary=str(files["rollback_binary"]), rollback_binary_sha256=helper.sha256(files["rollback_binary"]),
         rollback_plist=str(files["rollback_plist"]), rollback_plist_sha256=helper.sha256(files["rollback_plist"]),
         target_binary=str(root / "live-binary"), target_plist=str(root / "live.plist"),
-        label="test.phoenix.server", helper_label="test.phoenix.deploy", uid=os.getuid(), health_url="http://127.0.0.1:1/api/version",
+        label="test.phoenix.server", helper_label="com.phoenix-ide.deploy.tx", uid=os.getuid(), health_url="http://127.0.0.1:1/api/version",
         health_insecure_tls=False, active_path=str(root / "active"), status_path=str(root / "status.json"),
         previous_health_url="http://127.0.0.1:2/api/version", previous_health_insecure_tls=False,
         previous_health_json=True,
@@ -127,6 +231,138 @@ def make_paired_manifest(root: Path, database: Path) -> helper.Manifest:
 
 
 class ActivationTests(unittest.TestCase):
+    def test_pre_disruption_handoff_is_read_only_and_returns_activation_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(
+                root,
+                previous=helper.Identity("1.0.0", "a" * 40),
+            )
+            before = {path: path.read_bytes() for path in root.iterdir() if path.is_file()}
+
+            validated = helper.validate_pre_disruption_handoff(manifest)
+
+            self.assertEqual(validated.candidate_binary, Path(manifest.candidate_binary))
+            self.assertEqual(validated.candidate_plist, Path(manifest.candidate_plist))
+            self.assertEqual(
+                validated.rollback,
+                (Path(manifest.rollback_binary), Path(manifest.rollback_plist)),
+            )
+            self.assertEqual(
+                before,
+                {path: path.read_bytes() for path in root.iterdir() if path.is_file()},
+            )
+            self.assertFalse(Path(manifest.status_path).exists())
+            self.assertFalse(Path(manifest.active_path).exists())
+
+    def test_read_only_paired_path_validation_never_creates_transaction_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "missing" / "transaction"
+            manifest = dataclasses.replace(
+                make_manifest(root),
+                paired_database_upgrade=helper.PairedDatabaseUpgrade(
+                    database_path=str(root / "prod.db"),
+                    backup_path=str(transaction / "backup.sqlite3"),
+                    proof_path=str(transaction / "proof.json"),
+                    controller_source_commit="c" * 40,
+                    controller_helper_sha256="d" * 64,
+                    controller_helper_path=str(root / "controller-helper.py"),
+                ),
+            )
+
+            with self.assertRaisesRegex(helper.ActivationError, "transaction directory is unavailable"):
+                helper._paired_path_context(manifest, prepare_transaction=False)
+            self.assertFalse(transaction.exists())
+            self.assertFalse(transaction.parent.exists())
+
+    def test_exact_prepared_source114_handoff_binds_plist_and_timeouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root)
+            target_binary = Path(manifest.target_binary)
+            candidate_plist = Path(manifest.candidate_plist)
+            rollback_plist = Path(manifest.rollback_plist)
+            bound_plist = plistlib.dumps(
+                {
+                    "Label": manifest.label,
+                    "ProgramArguments": [str(target_binary)],
+                }
+            )
+            candidate_plist.write_bytes(bound_plist)
+            rollback_plist.write_bytes(bound_plist)
+            upgrade = helper.PreparedSource114Upgrade(
+                database_path=str(root / "prod.db"),
+                backup_path=str(root / "backup.sqlite3"),
+                proof_path=str(root / "proof.json"),
+                controller_source_commit="c" * 40,
+                controller_helper_sha256="d" * 64,
+                controller_helper_path=str(root / "controller-helper.py"),
+                migration_registry_path=str(root / "migrations.rs"),
+                migration_registry_sha256="e" * 64,
+                prepared_source_baseline=114,
+                candidate_registry_expected_sha256="f" * 64,
+            )
+            manifest = dataclasses.replace(
+                manifest,
+                source_kind="prepared_artifact",
+                release_tag=None,
+                release_commit=None,
+                candidate_plist_sha256=helper.sha256(candidate_plist),
+                rollback_plist_sha256=helper.sha256(rollback_plist),
+                transition_timeout_secs=helper.DEFAULT_TRANSITION_TIMEOUT_SECS,
+                health_timeout_secs=helper.DEFAULT_HEALTH_TIMEOUT_SECS,
+                current_schema_upgrade=upgrade,
+            )
+            with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+                helper, "validate_manifest_mode"
+            ), mock.patch.object(
+                helper,
+                "_current_schema_registry",
+                side_effect=AssertionError("database registry opened by read-only handoff"),
+            ), mock.patch.object(
+                helper,
+                "validate_current_schema_database",
+                side_effect=AssertionError("database opened by read-only handoff"),
+            ):
+                validated = helper.validate_pre_disruption_handoff(manifest)
+            self.assertEqual(validated.candidate_plist, candidate_plist)
+
+            candidate_plist.write_bytes(plistlib.dumps({"Program": str(target_binary)}))
+            manifest = dataclasses.replace(
+                manifest,
+                candidate_plist_sha256=helper.sha256(candidate_plist),
+            )
+            with mock.patch.object(helper, "validate_manifest_identities"), mock.patch.object(
+                helper, "validate_manifest_mode"
+            ):
+                with self.assertRaisesRegex(helper.ActivationError, "label does not match"):
+                    helper.validate_pre_disruption_handoff(manifest)
+
+            manifest = dataclasses.replace(
+                manifest,
+                transition_timeout_secs=helper.DEFAULT_TRANSITION_TIMEOUT_SECS + 1,
+            )
+            with self.assertRaisesRegex(helper.ActivationError, "transition_timeout_secs"):
+                helper.validate_pre_disruption_handoff(manifest)
+
+    def test_activation_consumes_pre_disruption_handoff_before_preparing_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = FakeLaunchctl(manifest)
+            launchctl.events = []
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(
+                helper,
+                "validate_pre_disruption_handoff",
+                side_effect=helper.ActivationError("read-only admission rejected"),
+            ) as validate, mock.patch.object(helper, "prepare_atomic_install") as prepare:
+                with self.assertRaisesRegex(helper.ActivationError, "read-only admission rejected"):
+                    helper.activate(manifest)
+            validate.assert_called_once_with(manifest)
+            prepare.assert_not_called()
+            self.assertNotIn("stop", launchctl.events)
+            self.assertNotIn("start", launchctl.events)
+
     def test_paired_sqlite_backup_is_private_and_context_bound(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as td:
@@ -609,6 +845,11 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual(status["recovery_mode"], "snapshot_restored")
             self.assertTrue((Path(td) / "active").exists())
             manifest, database, _binary, _plist, copied_helper = fixture
+            retained = Path(td) / "transactions" / manifest.transaction_id
+            retained.mkdir(parents=True)
+            (retained / "manifest.json").write_text(
+                json.dumps(helper.dataclasses.asdict(manifest))
+            )
             dev = load(ROOT / "dev.py", "devpy_fault_reentry_test")
             with mock.patch.object(dev, "LAUNCHD_DEPLOY_DIR", Path(td)), mock.patch.object(dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(manifest.active_path)), mock.patch.object(dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(manifest.status_path)), mock.patch.object(dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "claim.lock"), mock.patch.object(dev, "LAUNCHD_RESTART_ACTIVE_PATH", Path(td) / "restart-active"), mock.patch.object(dev, "LAUNCHD_RESTART_DIR", Path(td) / "restart"):
                 self.assertIn("recover-paired", dev._paired_recovery_refusal(manifest.transaction_id))
@@ -769,7 +1010,9 @@ class ActivationTests(unittest.TestCase):
                         else:
                             self.assertEqual(helper.recover_paired(manifest), "activation_failed_rollback_failed")
                     self.assertTrue(Path(manifest.active_path).exists())
-                    self.assertTrue(reserved.restore_path.exists())
+                    self.assertFalse(reserved.backup_path.exists())
+                    self.assertFalse(reserved.restore_path.exists())
+                    self.assertFalse(helper._capacity_observation_path(reserved).exists())
                     backend.events.clear()
                     self.assertEqual(helper.recover_paired(manifest), "activation_failed_rolled_back")
                     self.assertEqual(backend.events, [])
@@ -958,7 +1201,18 @@ class ActivationTests(unittest.TestCase):
     def test_real_reservation_enospc_is_reported_before_production_stop(self):
         with tempfile.TemporaryDirectory() as td:
             manifest, *_ = self._full_paired_fixture(Path(td))
-            with mock.patch.object(helper.os, "open", side_effect=OSError(28, "No space left on device")), self.assertRaisesRegex(helper.ActivationError, "reserve paired database capacity"):
+            original_open = helper.os.open
+
+            def fail_file_creation(path, flags, *args, **kwargs):
+                if flags & helper.os.O_CREAT:
+                    raise OSError(28, "No space left on device")
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                helper.os, "open", side_effect=fail_file_creation
+            ), self.assertRaisesRegex(
+                helper.ActivationError, "reserve paired database capacity"
+            ):
                 helper.reserve_database_capacity(manifest)
 
     def test_each_reservation_creation_fsyncs_its_parent(self):
@@ -1440,7 +1694,7 @@ class ActivationTests(unittest.TestCase):
             self.assertFalse(helper.release_claim(manifest))
             self.assertEqual("newer-transaction\n", claim.read_text())
 
-    def test_helper_requests_bootout_even_when_manifest_is_malformed(self):
+    def test_helper_does_not_bootout_when_manifest_is_malformed(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = Path(td) / "manifest.json"
             manifest.write_text("not-json")
@@ -1449,7 +1703,7 @@ class ActivationTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(helper, "request_helper_bootout") as bootout:
                 self.assertEqual(1, helper.main())
-            bootout.assert_called_once_with(os.getuid(), "test.helper")
+            bootout.assert_not_called()
 
     def test_helper_requests_bootout_on_concurrent_rejection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1789,6 +2043,11 @@ class PreparationTests(unittest.TestCase):
             status = root / "status.json"
             active.write_text("broken-pair\n")
             status.write_text(json.dumps({"transaction_id": "broken-pair", "state": "activation_failed_rollback_failed", "source_kind": "prepared_artifact"}))
+            transaction = root / "transactions" / "broken-pair"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(root)})
+            )
             with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), \
                  mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), \
                  mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), \
@@ -1803,6 +2062,110 @@ class PreparationTests(unittest.TestCase):
                     self.assertIn("recover-paired", str(error.exception))
                     self.assertNotIn("remove the marker", str(error.exception))
                     self.assertEqual(active.read_text(), "broken-pair\n")
+
+    def test_terminal_prepared_claim_requires_manifest_matching_mode(self):
+        cases = (
+            ("paired_database_upgrade", "paired", "current_schema"),
+            ("current_schema_upgrade", "current_schema", "paired"),
+        )
+        for manifest_key, expected_mode, conflicting_mode in cases:
+            for admission_name in ("_claim_launchd_deploy", "_claim_launchd_restart"):
+                with self.subTest(
+                    expected_mode=expected_mode, admission=admission_name
+                ), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    owner = f"terminal-{expected_mode}"
+                    active = root / "active"
+                    active.write_text(owner + "\n")
+                    status = root / "status.json"
+                    status.write_text(
+                        json.dumps(
+                            {
+                                "transaction_id": owner,
+                                "state": "committed",
+                                "source_kind": "prepared_artifact",
+                                "prepared_mode": conflicting_mode,
+                                "finalization_pending": False,
+                                "rollback_failure": None,
+                            }
+                        )
+                    )
+                    transaction = root / "transactions" / owner
+                    transaction.mkdir(parents=True)
+                    (transaction / "manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "source_kind": "prepared_artifact",
+                                manifest_key: mode_evidence(transaction, manifest_key),
+                            }
+                        )
+                    )
+
+                    with mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_DIR", root
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+                    ), mock.patch.object(
+                        self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+                    ), mock.patch.object(
+                        self.dev,
+                        "LAUNCHD_RESTART_ACTIVE_PATH",
+                        root / "restart-active",
+                    ):
+                        self.assertFalse(
+                            self.dev._status_is_terminal_for_owner(
+                                status, owner, self.dev._DEPLOY_TERMINAL_STATES
+                            )
+                        )
+                        admission = getattr(self.dev, admission_name)
+                        with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                            admission("new-operation")
+
+                    self.assertEqual(active.read_text(), owner + "\n")
+
+    def test_ordinary_rollback_failure_releases_only_its_matching_terminal_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active = root / "active"
+            active.write_text("failed-ordinary\n")
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "failed-ordinary",
+                        "state": "ordinary_activation_failed_rollback_failed",
+                        "source_kind": "local_head",
+                        "finalization_pending": False,
+                        "rollback_failure": None,
+                    }
+                )
+            )
+            transaction = root / "transactions" / "failed-ordinary"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps({"source_kind": "local_head"})
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                self.dev._claim_launchd_deploy(
+                    "next", initial_status={"transaction_id": "next", "state": "preparing"}
+                )
+
+            self.assertEqual(active.read_text().strip(), "next")
+            self.assertEqual(json.loads(status.read_text())["transaction_id"], "next")
 
     def test_forward_only_claim_survives_unreadable_retained_manifest(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1856,12 +2219,12 @@ class PreparationTests(unittest.TestCase):
             transaction.mkdir(parents=True)
             retained = transaction / "helper.py"
             retained.write_text("retained helper")
-            payload = {"source_kind": "prepared_artifact", "paired_database_upgrade": {"controller_helper_path": str(retained), "controller_helper_sha256": self.dev._file_sha256(retained)}, "helper_label": "com.phoenix-ide.deploy.checkpoint"}
+            payload = {"transaction_id": "checkpoint", "source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(transaction) | {"controller_helper_path": str(retained), "controller_helper_sha256": self.dev._file_sha256(retained)}, "helper_label": "com.phoenix-ide.deploy.checkpoint"}
             (transaction / "manifest.json").write_text(json.dumps(payload))
             active = root / "active"
             active.write_text("checkpoint")
             status = root / "status.json"
-            status.write_text(json.dumps({"transaction_id": "checkpoint", "state": "activation_failed_rolled_back", "source_kind": "prepared_artifact", "recovery_mode": "snapshot_restored"}))
+            status.write_text(json.dumps({"transaction_id": "checkpoint", "state": "activation_failed_rolled_back", "source_kind": "prepared_artifact", "prepared_mode": "paired", "recovery_mode": "snapshot_restored"}))
             with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as backend, mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
                 self.dev.cmd_prod_recover_paired("checkpoint")
                 release.assert_not_called()
@@ -1897,11 +2260,25 @@ class PreparationTests(unittest.TestCase):
             active = root / "active"
             status = root / "status.json"
             active.write_text("early\n")
-            status.write_text(json.dumps({"transaction_id": "early", "source_kind": "prepared_artifact", "state": "preparing", "preparing_pid": 123, "updated_at": "2026-10-04T00:00:00Z"}))
-            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            status.write_text(json.dumps({"transaction_id": "early", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "preparing", "preparing_pid": 123, "updated_at": "2026-10-04T00:00:00Z"}))
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 113, "", f'Could not find service "com.phoenix-ide.deploy.early" in domain gui/{os.getuid()}')):
                 self.dev.cmd_prod_recover_paired("early")
             self.assertFalse(active.exists())
-            self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
+            terminal = json.loads(status.read_text())
+            self.assertEqual(terminal["state"], "precondition_failed")
+            self.assertIs(terminal["finalization_pending"], False)
+            self.assertIsNone(terminal["rollback_failure"])
+            self.assertTrue(self.dev._markerless_status_is_resolved(terminal))
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ):
+                self.assertTrue(
+                    self.dev._status_is_terminal_for_owner(
+                        status, "early", self.dev._DEPLOY_TERMINAL_STATES
+                    )
+                )
 
     def test_finalization_controller_uses_retained_helper_without_bootstrap(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1910,10 +2287,10 @@ class PreparationTests(unittest.TestCase):
             staging.mkdir(parents=True)
             script = staging / "launchd_deploy_helper.py"
             script.write_bytes(b"retained helper")
-            (staging / "manifest.json").write_text(json.dumps({"transaction_id": "pending", "helper_label": "dev.activation.pending", "paired_database_upgrade": {"controller_helper_sha256": self.dev._file_sha256(script), "controller_helper_path": str(script)}}))
+            (staging / "manifest.json").write_text(json.dumps({"transaction_id": "pending", "source_kind": "prepared_artifact", "helper_label": "com.phoenix-ide.deploy.pending", "paired_database_upgrade": mode_evidence(staging) | {"controller_helper_sha256": self.dev._file_sha256(script), "controller_helper_path": str(script)}}))
             active, status = root / "active", root / "status.json"
             active.write_text("pending\n")
-            status.write_text(json.dumps({"transaction_id": "pending", "state": "committed", "finalization_pending": True}))
+            status.write_text(json.dumps({"transaction_id": "pending", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "committed", "finalization_pending": True}))
             import builtins
             original_import = builtins.__import__
 
@@ -1940,7 +2317,7 @@ class PreparationTests(unittest.TestCase):
             root = Path(td)
             staging = root / "transactions" / "committed"
             staging.mkdir(parents=True)
-            (staging / "manifest.json").write_text(json.dumps({"paired_database_upgrade": {}}))
+            (staging / "manifest.json").write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(root)}))
             active, status = root / "active", root / "status.json"
             active.write_text("committed\n")
             payload = {"transaction_id": "committed", "source_kind": "prepared_artifact", "state": "committed", "finalization_pending": True}
@@ -1958,15 +2335,19 @@ class PreparationTests(unittest.TestCase):
             staging = root / "transactions" / "preparing"
             staging.mkdir(parents=True)
             manifest = staging / "manifest.json"
-            manifest.write_text(json.dumps({"paired_database_upgrade": {"backup_path": str(staging / "backup.sqlite3"), "proof_path": str(staging / "proof.json"), "database_path": str(root / "prod.db")}}))
+            manifest.write_text(json.dumps({"transaction_id": "preparing", "helper_label": "com.phoenix-ide.deploy.preparing", "source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(staging) | {"database_path": str(root / "prod.db")}}))
             active, status = root / "active", root / "status.json"
             active.write_text("preparing\n")
-            status.write_text(json.dumps({"transaction_id": "preparing", "source_kind": "prepared_artifact", "state": "preparing", "preparing_pid": 123}))
+            status.write_text(json.dumps({"transaction_id": "preparing", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "preparing", "preparing_pid": 123}))
             with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
                 self.dev.cmd_prod_recover_paired("preparing")
             self.assertEqual(run.call_count, 1)
             self.assertNotIn("bootstrap", run.call_args.args[0])
-            self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
+            terminal = json.loads(status.read_text())
+            self.assertEqual(terminal["state"], "precondition_failed")
+            self.assertIs(terminal["finalization_pending"], False)
+            self.assertIsNone(terminal["rollback_failure"])
+            self.assertTrue(self.dev._markerless_status_is_resolved(terminal))
             self.assertFalse(active.exists())
             self.assertIn("backup_path", json.loads(manifest.read_text())["paired_database_upgrade"])
 
@@ -1975,14 +2356,16 @@ class PreparationTests(unittest.TestCase):
             root = Path(td)
             staging = root / "transactions" / "prepared"
             staging.mkdir(parents=True)
-            (staging / "manifest.json").write_text(json.dumps({"paired_database_upgrade": {"backup_path": str(staging / "backup.sqlite3"), "proof_path": str(staging / "proof.json"), "database_path": str(root / "prod.db")}}))
+            (staging / "manifest.json").write_text(json.dumps({"transaction_id": "prepared", "helper_label": "com.phoenix-ide.deploy.prepared", "source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(staging) | {"database_path": str(root / "prod.db")}}))
             active, status = root / "active", root / "status.json"
             active.write_text("prepared\n")
-            status.write_text(json.dumps({"transaction_id": "prepared", "source_kind": "prepared_artifact", "state": "prepared", "preparing_pid": 123}))
+            status.write_text(json.dumps({"transaction_id": "prepared", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "prepared", "preparing_pid": 123}))
             backup = staging / "backup.sqlite3"
             reserve = root / ".prod.db.restore-prepared"
+            capacity_evidence = staging / "capacity.json"
             backup.write_bytes(b"allocated seed")
             reserve.write_bytes(b"allocated restore")
+            capacity_evidence.write_text("capacity evidence")
             with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
                 self.dev.cmd_prod_recover_paired("prepared")
             self.assertEqual(run.call_count, 1)
@@ -1991,6 +2374,244 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(json.loads(status.read_text())["state"], "precondition_failed")
             self.assertFalse(backup.exists())
             self.assertFalse(reserve.exists())
+            self.assertFalse(capacity_evidence.exists())
+
+    def test_pre_handoff_cleanup_failure_enters_cleanup_pending_and_retains_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction_id = "cleanup-failure"
+            staging = root / "transactions" / transaction_id
+            staging.mkdir(parents=True)
+            database = root / "prod.db"
+            backup = staging / "backup.sqlite3"
+            proof = staging / "proof.json"
+            restore = root / f".prod.db.restore-{transaction_id}"
+            capacity = staging / "capacity.json"
+            (staging / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "transaction_id": transaction_id,
+                        "helper_label": f"com.phoenix-ide.deploy.{transaction_id}",
+                        "source_kind": "prepared_artifact",
+                        "paired_database_upgrade": {
+                            **mode_evidence(staging),
+                            "backup_path": str(backup),
+                            "proof_path": str(proof),
+                            "database_path": str(database),
+                        },
+                    }
+                )
+            )
+            for path in (backup, restore, capacity):
+                path.write_text("reserved")
+            active = root / "active"
+            status = root / "status.json"
+            active.write_text(transaction_id + "\n")
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": transaction_id,
+                        "source_kind": "prepared_artifact",
+                        "prepared_mode": "paired",
+                        "state": "prepared",
+                        "preparing_pid": 123,
+                    }
+                )
+            )
+            fsync_calls = 0
+
+            def fail_first_fsync(_fd):
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 1:
+                    raise OSError("fsync failed")
+
+            with mock.patch.object(
+                self.dev.sys, "platform", "darwin"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev.os, "kill", side_effect=ProcessLookupError
+            ), mock.patch.object(
+                self.dev.os, "fsync", side_effect=fail_first_fsync
+            ), mock.patch.object(
+                self.dev.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit, "cleanup is incomplete"
+                ):
+                    self.dev.cmd_prod_recover_paired(transaction_id)
+
+            self.assertEqual(active.read_text().strip(), transaction_id)
+            pending = json.loads(status.read_text())
+            self.assertEqual(pending["state"], "precondition_cleanup_pending")
+            self.assertIn("fsync failed", pending["cleanup_failure"])
+
+    def test_pre_handoff_abandonment_rejects_wrong_recovery_mode_without_mutation(self):
+        cases = (
+            ("paired_database_upgrade", True),
+            ("current_schema_upgrade", False),
+        )
+        for retained_mode, request_current in cases:
+            with self.subTest(
+                retained_mode=retained_mode, request_current=request_current
+            ), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                transaction_id = "wrong-mode"
+                staging = root / "transactions" / transaction_id
+                staging.mkdir(parents=True)
+                database = root / "prod.db"
+                backup = staging / "backup.sqlite3"
+                proof = staging / "proof.json"
+                restore = root / f".prod.db.restore-{transaction_id}"
+                capacity = staging / "capacity.json"
+                (staging / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "source_kind": "prepared_artifact",
+                            retained_mode: {
+                                "backup_path": str(backup),
+                                "proof_path": str(proof),
+                                "database_path": str(database),
+                            },
+                        }
+                    )
+                )
+                active = root / "active"
+                status = root / "status.json"
+                active.write_text(transaction_id + "\n")
+                original_status = {
+                    "transaction_id": transaction_id,
+                    "source_kind": "prepared_artifact",
+                    "prepared_mode": (
+                        "paired"
+                        if retained_mode == "paired_database_upgrade"
+                        else "current_schema"
+                    ),
+                    "state": "prepared",
+                    "preparing_pid": 123,
+                }
+                status.write_text(json.dumps(original_status))
+                backup.write_text("backup reservation")
+                restore.write_text("restore reservation")
+                capacity.write_text("capacity evidence")
+                with mock.patch.object(
+                    self.dev.sys, "platform", "darwin"
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_DIR", root
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+                ), mock.patch.object(
+                    self.dev.os, "kill", side_effect=ProcessLookupError
+                ), mock.patch.object(
+                    self.dev.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ):
+                    with self.assertRaisesRegex(
+                        SystemExit, "does not (?:prove|match) .* recovery mode"
+                    ):
+                        self.dev.cmd_prod_recover_paired(
+                            transaction_id, current_schema=request_current
+                        )
+
+                self.assertEqual(active.read_text().strip(), transaction_id)
+                self.assertEqual(json.loads(status.read_text()), original_status)
+                self.assertTrue(backup.exists())
+                self.assertTrue(restore.exists())
+                self.assertTrue(capacity.exists())
+
+    def test_dangling_manifest_refuses_pre_handoff_abandonment_without_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction_id = "dangling-manifest"
+            staging = root / "transactions" / transaction_id
+            staging.mkdir(parents=True)
+            (staging / "manifest.json").symlink_to(staging / "missing-manifest")
+            active = root / "active"
+            status = root / "status.json"
+            active.write_text(transaction_id + "\n")
+            payload = {
+                "transaction_id": transaction_id,
+                "source_kind": "prepared_artifact",
+                "prepared_mode": "paired",
+                "state": "preparing",
+                "preparing_pid": 123,
+            }
+            status.write_text(json.dumps(payload))
+            with mock.patch.object(
+                self.dev.sys, "platform", "darwin"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ):
+                with self.assertRaisesRegex(SystemExit, "not a regular file"):
+                    self.dev.cmd_prod_recover_paired(transaction_id)
+            self.assertEqual(active.read_text().strip(), transaction_id)
+            self.assertEqual(json.loads(status.read_text()), payload)
+
+    def test_manifest_absent_abandonment_requires_persisted_exact_mode(self):
+        for prepared_mode, request_current in (("paired", True), ("current_schema", False), (None, False)):
+            with self.subTest(
+                prepared_mode=prepared_mode, request_current=request_current
+            ), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                transaction_id = "manifest-absent"
+                (root / "transactions" / transaction_id).mkdir(parents=True)
+                active = root / "active"
+                status = root / "status.json"
+                active.write_text(transaction_id + "\n")
+                payload = {
+                    "transaction_id": transaction_id,
+                    "source_kind": "prepared_artifact",
+                    "state": "preparing",
+                    "preparing_pid": 123,
+                }
+                if prepared_mode is not None:
+                    payload["prepared_mode"] = prepared_mode
+                status.write_text(json.dumps(payload))
+                with mock.patch.object(
+                    self.dev.sys, "platform", "darwin"
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_DIR", root
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+                ), mock.patch.object(
+                    self.dev.os, "kill", side_effect=ProcessLookupError
+                ), mock.patch.object(
+                    self.dev.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ):
+                    with self.assertRaisesRegex(
+                        SystemExit, "does not prove .* recovery mode"
+                    ):
+                        self.dev.cmd_prod_recover_paired(
+                            transaction_id, current_schema=request_current
+                        )
+                self.assertTrue(active.exists())
+                self.assertEqual(json.loads(status.read_text()), payload)
 
     def test_status_recovers_paired_guidance_from_claim_without_readable_status(self):
         for contents in (None, "{", "[]", "null"):
@@ -1998,7 +2619,7 @@ class PreparationTests(unittest.TestCase):
                 root = Path(td)
                 staging = root / "transactions" / "lost"
                 staging.mkdir(parents=True)
-                (staging / "manifest.json").write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {}}))
+                (staging / "manifest.json").write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(root)}))
                 active, status = root / "active", root / "status.json"
                 active.write_text("lost\n")
                 if contents is not None:
@@ -2010,11 +2631,127 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn("Do not remove", output.getvalue())
                 self.assertTrue(active.exists())
 
+    def test_status_always_reports_active_owner_when_last_status_mismatches(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active = root / "active"
+            status = root / "status.json"
+            active.write_text("actual-owner\n")
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "older-terminal",
+                        "state": "committed",
+                        "source_kind": "local_head",
+                    }
+                )
+            )
+            output = io.StringIO()
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), contextlib.redirect_stdout(output):
+                self.dev._print_launchd_deploy_status()
+
+            rendered = output.getvalue()
+            self.assertIn("Active deploy: status unavailable/mismatched (actual-owner)", rendered)
+            self.assertIn("Last deploy: committed (older-terminal)", rendered)
+
+            status.unlink()
+            output = io.StringIO()
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), contextlib.redirect_stdout(output):
+                self.dev._print_launchd_deploy_status()
+            self.assertIn("Active deploy: status unavailable (actual-owner)", output.getvalue())
+
+    def test_active_nonregular_status_is_rejected_before_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active = root / "active"
+            status = root / "status.json"
+            active.write_text("actual-owner\n")
+            os.mkfifo(status)
+            real_read_text = Path.read_text
+
+            def reject_status_read(path, *args, **kwargs):
+                if path == status:
+                    raise AssertionError("non-regular status must not be read")
+                return real_read_text(path, *args, **kwargs)
+
+            output = io.StringIO()
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ), mock.patch.object(
+                Path, "read_text", reject_status_read
+            ), contextlib.redirect_stdout(output):
+                self.dev._print_launchd_deploy_status()
+                with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                    self.dev._claim_launchd_restart("next-restart")
+
+            rendered = output.getvalue()
+            self.assertIn("Active deploy: status unavailable (actual-owner)", rendered)
+            self.assertIn("non-regular or symlinked", rendered)
+            self.assertEqual(active.read_text(), "actual-owner\n")
+            self.assertTrue(status.exists())
+
+    def test_status_surfaces_symlinked_markerless_evidence_as_unresolved(self):
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                status = root / "status.json"
+                target = root / "status-target.json"
+                if not dangling:
+                    target.write_text(
+                        json.dumps(
+                            {
+                                "transaction_id": "terminal",
+                                "state": "committed",
+                                "source_kind": "local_head",
+                            }
+                        )
+                    )
+                status.symlink_to(target)
+                output = io.StringIO()
+                with mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                ), contextlib.redirect_stdout(output):
+                    self.dev._print_launchd_deploy_status()
+
+                rendered = output.getvalue()
+                self.assertIn("UNRESOLVED: markerless deployment status", rendered)
+                self.assertIn("non-regular or symlinked", rendered)
+                self.assertNotIn("Last deploy: committed", rendered)
+
     def test_pending_paired_commit_blocks_admission_without_authorizing_rollback(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             status = root / "status.json"
             status.write_text(json.dumps({"transaction_id": "pending", "source_kind": "prepared_artifact", "state": "committed", "finalization_pending": True}))
+            transaction = root / "transactions" / "pending"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(root)})
+            )
             with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status):
                 guidance = self.dev._paired_recovery_refusal("pending")
             self.assertIn("pending publication/cleanup", guidance)
@@ -2092,7 +2829,7 @@ class PreparationTests(unittest.TestCase):
                 root = Path(td)
                 active, status = root / "active", root / "status.json"
                 active.write_text("early\n")
-                payload = {"transaction_id": "early", "state": "preparing", "source_kind": "prepared_artifact"}
+                payload = {"transaction_id": "early", "state": "preparing", "source_kind": "prepared_artifact", "prepared_mode": "paired"}
                 if not missing_pid:
                     payload["preparing_pid"] = 123
                 status.write_text(json.dumps(payload))
@@ -2109,7 +2846,7 @@ class PreparationTests(unittest.TestCase):
             active = root / "active"
             status = root / "status.json"
             active.write_text("live\n")
-            status.write_text(json.dumps({"transaction_id": "live", "source_kind": "prepared_artifact", "state": "preparing", "preparing_pid": 123}))
+            status.write_text(json.dumps({"transaction_id": "live", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "preparing", "preparing_pid": 123}))
             with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev.os, "kill") as kill:
                 kill.return_value = None
                 with self.assertRaisesRegex(SystemExit, "still alive"):
@@ -2123,16 +2860,199 @@ class PreparationTests(unittest.TestCase):
             transaction.mkdir(parents=True)
             retained = transaction / "helper.py"
             retained.write_text("retained helper")
-            payload = {"paired_database_upgrade": {"controller_helper_path": str(retained), "controller_helper_sha256": self.dev._file_sha256(retained)}, "helper_label": "com.phoenix-ide.deploy.failed-pair"}
+            payload = {"transaction_id": "failed.pair", "source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(transaction) | {"controller_helper_path": str(retained), "controller_helper_sha256": self.dev._file_sha256(retained)}, "helper_label": "com.phoenix-ide.deploy.failed.pair"}
             (transaction / "manifest.json").write_text(json.dumps(payload))
             active = root / "active"
             active.write_text("failed.pair\n")
-            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "_deploy_claim_owner", return_value="failed.pair"), mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="retain claim"), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as run:
+            status = root / "status.json"
+            status.write_text(json.dumps({"transaction_id": "failed.pair", "source_kind": "prepared_artifact", "prepared_mode": "paired", "state": "activation_failed_rollback_failed"}))
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "_deploy_claim_owner", return_value="failed.pair"), mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="retain claim"), mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as run:
                 with self.assertRaisesRegex(SystemExit, "active Python interpreter"):
                     self.dev.cmd_prod_recover_paired("failed.pair")
             self.assertFalse((transaction / "recovery-helper.plist").exists())
             self.assertEqual("failed.pair", active.read_text().strip())
             self.assertIn("sqlite3", run.call_args.args[0][-1])
+
+    def test_recover_current_refuses_precondition_cleanup_before_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "failed.current"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "current_schema_upgrade": mode_evidence(transaction, "current_schema_upgrade"),
+                    }
+                )
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "failed.current",
+                        "state": "precondition_cleanup_pending",
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev.sys, "platform", "darwin"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "_deploy_claim_owner", return_value="failed.current"
+            ), mock.patch.object(self.dev.subprocess, "run") as backend:
+                with self.assertRaisesRegex(SystemExit, "cleanup"):
+                    self.dev.cmd_prod_recover_paired(
+                        "failed.current", current_schema=True
+                    )
+
+            backend.assert_not_called()
+
+    def test_precondition_cleanup_handoff_uses_cleanup_only_helper_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "failed.current"
+            transaction.mkdir(parents=True)
+            retained = transaction / "helper.py"
+            retained.write_text("retained helper")
+            payload = {
+                "source_kind": "prepared_artifact",
+                "transaction_id": "failed.current",
+                "current_schema_upgrade": {
+                    **mode_evidence(transaction, "current_schema_upgrade"),
+                    "controller_helper_path": str(retained),
+                    "controller_helper_sha256": self.dev._file_sha256(retained),
+                    "proof_path": str(transaction / "proof.json"),
+                },
+                "helper_label": "com.phoenix-ide.deploy.failed.current",
+            }
+            (transaction / "manifest.json").write_text(json.dumps(payload))
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "failed.current",
+                        "source_kind": "prepared_artifact",
+                        "prepared_mode": "current_schema",
+                        "state": "precondition_cleanup_pending",
+                    }
+                )
+            )
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(
+                self.dev.sys, "platform", "darwin"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "_deploy_claim_owner", return_value="failed.current"
+            ), mock.patch.object(
+                self.dev.subprocess, "run", side_effect=[completed, completed, completed]
+            ) as backend:
+                self.dev.cmd_prod_cleanup_precondition(
+                    "failed.current", current_schema=True
+                )
+
+            plist = plistlib.loads((transaction / "cleanup-helper.plist").read_bytes())
+            self.assertEqual(plist["ProgramArguments"][2], "cleanup-current")
+            commands = [call.args[0] for call in backend.call_args_list]
+            self.assertFalse(any("recover-current" in command for command in commands))
+            self.assertFalse(any("recover-paired" in command for command in commands))
+            self.assertEqual(commands[-1][0:2], ["launchctl", "bootstrap"])
+
+    def test_precondition_cleanup_controller_requires_exact_persisted_mode(self):
+        for prepared_mode in (None, "paired"):
+            with self.subTest(prepared_mode=prepared_mode), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                transaction = root / "transactions" / "failed.current"
+                transaction.mkdir(parents=True)
+                retained = transaction / "helper.py"
+                retained.write_text("retained helper")
+                (transaction / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "source_kind": "prepared_artifact",
+                            "transaction_id": "failed.current",
+                            "current_schema_upgrade": {
+                                **mode_evidence(transaction, "current_schema_upgrade"),
+                                "controller_helper_path": str(retained),
+                                "controller_helper_sha256": self.dev._file_sha256(retained),
+                                "proof_path": str(transaction / "proof.json"),
+                            },
+                            "helper_label": "com.phoenix-ide.deploy.failed.current",
+                        }
+                    )
+                )
+                status = root / "status.json"
+                status_payload = {
+                    "transaction_id": "failed.current",
+                    "state": "precondition_cleanup_pending",
+                }
+                if prepared_mode is not None:
+                    status_payload["prepared_mode"] = prepared_mode
+                status.write_text(json.dumps(status_payload))
+                original_status = status.read_bytes()
+
+                with mock.patch.object(
+                    self.dev.sys, "platform", "darwin"
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_DIR", root
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                ), mock.patch.object(
+                    self.dev, "_deploy_claim_owner", return_value="failed.current"
+                ), mock.patch.object(self.dev.subprocess, "run") as backend:
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "matching retained current-schema transaction and claim",
+                    ):
+                        self.dev.cmd_prod_cleanup_precondition(
+                            "failed.current", current_schema=True
+                        )
+
+                backend.assert_not_called()
+                self.assertEqual(status.read_bytes(), original_status)
+
+    def test_precondition_cleanup_controller_rejects_symlinked_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "failed.current"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text("{}")
+            status_target = root / "status-target.json"
+            status_target.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "failed.current",
+                        "state": "precondition_cleanup_pending",
+                    }
+                )
+            )
+            status = root / "status.json"
+            status.symlink_to(status_target)
+
+            with mock.patch.object(
+                self.dev.sys, "platform", "darwin"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(self.dev.subprocess, "run") as backend:
+                with self.assertRaisesRegex(SystemExit, "regular non-symlink status"):
+                    self.dev.cmd_prod_cleanup_precondition(
+                        "failed.current", current_schema=True
+                    )
+
+            backend.assert_not_called()
+            self.assertTrue(status.is_symlink())
+            self.assertEqual(
+                json.loads(status_target.read_text())["state"],
+                "precondition_cleanup_pending",
+            )
 
     def test_supported_recovery_handoff_uses_retained_helper_without_clearing_claim(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2141,9 +3061,20 @@ class PreparationTests(unittest.TestCase):
             transaction.mkdir(parents=True)
             retained = transaction / "helper.py"
             retained.write_text("retained helper")
-            payload = {"paired_database_upgrade": {"controller_helper_path": str(retained), "controller_helper_sha256": self.dev._file_sha256(retained)}, "helper_label": "com.phoenix-ide.deploy.failed-pair"}
+            payload = {"transaction_id": "failed.pair", "source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(transaction) | {"controller_helper_path": str(retained), "controller_helper_sha256": self.dev._file_sha256(retained)}, "helper_label": "com.phoenix-ide.deploy.failed.pair"}
             (transaction / "manifest.json").write_text(json.dumps(payload))
-            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "_deploy_claim_owner", return_value="failed.pair"), mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="retain claim"), mock.patch.object(self.dev.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 0, "", "")]) as backend, mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "failed.pair",
+                        "source_kind": "prepared_artifact",
+                        "prepared_mode": "paired",
+                        "state": "activation_failed_rollback_failed",
+                    }
+                )
+            )
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "_deploy_claim_owner", return_value="failed.pair"), mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="retain claim"), mock.patch.object(self.dev.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 0, "", "")]) as backend, mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
                 self.dev.cmd_prod_recover_paired("failed.pair")
                 release.assert_not_called()
                 plist = plistlib.loads((transaction / "recovery-helper.plist").read_bytes())
@@ -2159,11 +3090,27 @@ class PreparationTests(unittest.TestCase):
             for i in range(8):
                 ordinary = root / f"ordinary-{i}"
                 ordinary.mkdir()
-                (ordinary / "manifest.json").write_text(json.dumps({"paired_database_upgrade": None}))
+                (ordinary / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "source_kind": "local_head",
+                            "paired_database_upgrade": None,
+                        }
+                    )
+                )
                 os.utime(ordinary, (100 + i, 100 + i))
             for name, content in (
-                ("paired", json.dumps({"paired_database_upgrade": {"backup_path": "private"}})),
-                ("current-historical", json.dumps({"current_schema_upgrade": {"backup_path": "private"}})),
+                ("paired", json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {"backup_path": "private"}})),
+                ("current-historical", json.dumps({"source_kind": "prepared_artifact", "current_schema_upgrade": {"backup_path": "private"}})),
+                (
+                    "forward",
+                    json.dumps(
+                        {
+                            "source_kind": "local_head",
+                            "ordinary_forward_migration": {"database_path": "/db"},
+                        }
+                    ),
+                ),
                 ("unreadable", "invalid-json"),
                 ("unknown", None),
             ):
@@ -2177,6 +3124,7 @@ class PreparationTests(unittest.TestCase):
                 sorted(p.name for p in root.iterdir()),
                 [
                     "current-historical",
+                    "forward",
                     "ordinary-3",
                     "ordinary-4",
                     "ordinary-5",
@@ -2187,6 +3135,642 @@ class PreparationTests(unittest.TestCase):
                     "unreadable",
                 ],
             )
+
+    def test_claim_refuses_markerless_forward_only_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "retained",
+                        "state": "candidate_may_migrate",
+                        "source_kind": "local_head",
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                with self.assertRaisesRegex(
+                    self.dev.ConcurrentLaunchdOperation,
+                    "markerless forward-only transaction retained",
+                ):
+                    self.dev._claim_launchd_deploy("new")
+
+            self.assertFalse((root / "active").exists())
+            self.assertEqual(
+                json.loads(status.read_text())["transaction_id"], "retained"
+            )
+
+    def test_markerless_cleanup_pending_fences_deploy_restart_and_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "cleanup",
+                        "state": "precondition_cleanup_pending",
+                        "source_kind": "prepared_artifact",
+                    }
+                )
+            )
+            patches = (
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root),
+                mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+                ),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status),
+                mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+                ),
+                mock.patch.object(
+                    self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+                ),
+                mock.patch.object(
+                    self.dev,
+                    "LAUNCHD_RESTART_ACTIVE_PATH",
+                    root / "restart-active",
+                ),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                with self.assertRaisesRegex(
+                    self.dev.ConcurrentLaunchdOperation,
+                    "markerless pre-stop cleanup",
+                ):
+                    self.dev._claim_launchd_deploy("new")
+                with self.assertRaisesRegex(
+                    self.dev.ConcurrentLaunchdOperation,
+                    "markerless pre-stop cleanup",
+                ):
+                    self.dev._claim_launchd_restart("restart")
+                with mock.patch.object(
+                    self.dev, "detect_prod_env", return_value="launchd"
+                ) as detect_environment:
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "markerless pre-stop cleanup",
+                    ):
+                        self.dev.cmd_prod_stop()
+                    detect_environment.assert_called_once_with()
+
+            self.assertFalse((root / "active").exists())
+            self.assertFalse((root / "restart-active").exists())
+
+    def test_active_owner_terminal_proof_requires_regular_exact_status(self):
+        malformed = (
+            {"transaction_id": "owner", "state": "committed", "finalization_pending": []},
+            {"transaction_id": "owner", "state": "committed", "rollback_failure": {}},
+            {
+                "transaction_id": "owner",
+                "state": "committed",
+                "source_kind": "local_head",
+                "finalization_pending": False,
+            },
+            {
+                "transaction_id": "owner",
+                "state": "committed",
+                "finalization_pending": False,
+                "rollback_failure": None,
+            },
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active = root / "active"
+            status = root / "status.json"
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                for payload in malformed:
+                    with self.subTest(payload=payload):
+                        active.write_text("owner\n")
+                        status.unlink(missing_ok=True)
+                        status.write_text(json.dumps(payload))
+                        with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                            self.dev._claim_launchd_deploy("new")
+                        self.assertEqual(active.read_text().strip(), "owner")
+                external = root / "external-status.json"
+                external.write_text(
+                    json.dumps({"transaction_id": "owner", "state": "committed"})
+                )
+                active.write_text("owner\n")
+                status.unlink()
+                status.symlink_to(external)
+                with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                    self.dev._claim_launchd_deploy("new")
+                self.assertEqual(active.read_text().strip(), "owner")
+
+    def test_unreadable_active_markers_fence_operations_before_status_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            deploy_active = root / "active"
+            restart_active = root / "restart-active"
+            status = root / "status.json"
+            original = json.dumps(
+                {
+                    "transaction_id": "terminal",
+                    "state": "committed",
+                    "source_kind": "local_head",
+                    "finalization_pending": False,
+                    "rollback_failure": None,
+                }
+            )
+            status.write_text(original)
+            deploy_active.symlink_to(root / "missing-deploy-owner")
+            restart_active.symlink_to(root / "missing-restart-owner")
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", deploy_active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", restart_active
+            ):
+                with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                    self.dev._claim_launchd_deploy("new")
+                with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                    self.dev._claim_launchd_restart("new")
+                with mock.patch.object(
+                    self.dev, "detect_prod_env", return_value="launchd"
+                ) as detect_environment:
+                    with self.assertRaises(SystemExit):
+                        self.dev.cmd_prod_stop()
+                    detect_environment.assert_called_once_with()
+            self.assertEqual(status.read_text(), original)
+
+    def test_claim_release_fsync_failure_restores_visible_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active = root / "active"
+            active.write_text("owner\n")
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "_fsync_directory",
+                side_effect=[OSError("fsync failed"), None],
+            ) as fsync_directory:
+                with self.assertRaisesRegex(OSError, "fsync failed"):
+                    self.dev._release_launchd_deploy_claim("owner")
+            self.assertEqual(fsync_directory.call_args_list, [mock.call(active.parent)] * 2)
+            self.assertEqual(active.read_text(), "owner\n")
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(
+                self.dev, "_fsync_directory",
+                side_effect=[OSError("unlink fsync failed"), OSError("restored claim fsync failed")],
+            ) as fsync_directory:
+                with self.assertRaisesRegex(OSError, "restored claim fsync failed"):
+                    self.dev._release_launchd_deploy_claim_unlocked("owner")
+            self.assertEqual(fsync_directory.call_args_list, [mock.call(active.parent)] * 2)
+            self.assertEqual(active.read_text(), "owner\n")
+
+    def test_symlinked_manifest_is_unknown_and_retained_by_pruning(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transactions = root / "transactions"
+            transactions.mkdir()
+            external = root / "external-manifest.json"
+            external.write_text(json.dumps({"source_kind": "local_head"}))
+            retained = transactions / "symlinked"
+            retained.mkdir()
+            (retained / "manifest.json").symlink_to(external)
+            os.utime(retained, (1, 1))
+            for index in range(4):
+                ordinary = transactions / f"ordinary-{index}"
+                ordinary.mkdir()
+                (ordinary / "manifest.json").write_text(
+                    json.dumps({"source_kind": "local_head"})
+                )
+                os.utime(ordinary, (100 + index, 100 + index))
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root):
+                self.assertIs(
+                    self.dev._deploy_manifest_kind(retained),
+                    self.dev.DeployManifestKind.UNKNOWN,
+                )
+                self.dev._prune_launchd_deploy_transactions(transactions, "current")
+            self.assertTrue(retained.exists())
+
+    def test_manifest_mode_requires_exact_source_kind(self):
+        payloads = (
+            {"source_kind": "prepared_artifac", "paired_database_upgrade": {}},
+            {"source_kind": "local_head", "paired_database_upgrade": {}},
+            {"source_kind": "prepared_artifact", "ordinary_forward_migration": {}},
+            {"source_kind": "unknown", "ordinary_forward_migration": {}},
+            {"ordinary_forward_migration": {}},
+        )
+        with tempfile.TemporaryDirectory() as td:
+            transaction = Path(td)
+            manifest = transaction / "manifest.json"
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    manifest.write_text(json.dumps(payload))
+                    self.assertIs(
+                        self.dev._deploy_manifest_kind(transaction),
+                        self.dev.DeployManifestKind.UNKNOWN,
+                    )
+
+    def test_malformed_mode_payload_is_unknown_and_has_no_recovery_guidance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "source_kind": "local_head",
+                        "ordinary_forward_migration": [],
+                    }
+                )
+            )
+            self.assertIs(
+                self.dev._deploy_manifest_kind(transaction),
+                self.dev.DeployManifestKind.UNKNOWN,
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "candidate_may_migrate",
+                        "source_kind": "local_head",
+                        "updated_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("manifest/status mismatch", rendered)
+        self.assertNotIn("resume-forward", rendered)
+        self.assertNotIn("recover-", rendered)
+
+    def test_forward_only_owner_is_never_terminal_when_manifest_conflicts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            active = root / "active"
+            active.write_text("tx")
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "ordinary_activation_failed_forward_only",
+                        "source_kind": "local_head",
+                        "finalization_pending": False,
+                    }
+                )
+            )
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps({"source_kind": "local_head"})
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                self.assertFalse(
+                    self.dev._status_is_terminal_for_owner(
+                        status,
+                        "tx",
+                        self.dev._DEPLOY_TERMINAL_STATES,
+                    )
+                )
+                with self.assertRaisesRegex(
+                    self.dev.ConcurrentLaunchdOperation,
+                    "another launchd deployment .* is active or unresolved",
+                ):
+                    self.dev._claim_launchd_deploy("new")
+
+            self.assertEqual(active.read_text(), "tx")
+            self.assertEqual(json.loads(status.read_text())["transaction_id"], "tx")
+
+    def test_non_object_markerless_status_refuses_operations_cleanly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            status.write_text("[]")
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                with self.assertRaisesRegex(
+                    self.dev.ConcurrentLaunchdOperation,
+                    "status is unreadable or malformed",
+                ):
+                    self.dev._claim_launchd_deploy("new")
+
+            self.assertFalse((root / "active").exists())
+
+    def test_markerless_status_partition_fails_closed_except_proven_terminal(self):
+        unresolved = (
+            ("preparing", False),
+            ("prepared", False),
+            ("activating", False),
+            ("migration_started", False),
+            ("activation_failed_database_committed", False),
+            ("activation_failed_rollback_failed", False),
+            ("candidate_may_migrate", False),
+            ("ordinary_activation_failed_forward_only", False),
+            ("committed", True),
+            ("unknown_state", False),
+        )
+        resolved = (
+            "committed",
+            "precondition_failed",
+            "activation_failed_rolled_back",
+            "ordinary_activation_failed_rollback_failed",
+            "rejected_concurrent",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            status_path = Path(td) / "status.json"
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path
+            ):
+                for state, finalization_pending in unresolved:
+                    with self.subTest(state=state, finalization_pending=finalization_pending):
+                        status_path.write_text(
+                            json.dumps(
+                                {
+                                    "transaction_id": "markerless",
+                                    "state": state,
+                                    "source_kind": "local_head",
+                                    "finalization_pending": finalization_pending,
+                                }
+                            )
+                        )
+                        self.assertIsNotNone(self.dev._markerless_operation_refusal())
+                for state in resolved:
+                    with self.subTest(state=state):
+                        status_path.write_text(
+                            json.dumps(
+                                {
+                                    "transaction_id": "markerless",
+                                    "state": state,
+                                    "source_kind": "local_head",
+                                    "finalization_pending": False,
+                                }
+                            )
+                        )
+                        self.assertIsNone(self.dev._markerless_operation_refusal())
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "transaction_id": "markerless",
+                            "state": "activation_failed_rolled_back",
+                            "source_kind": "local_head",
+                            "rollback_failure": "not actually resolved",
+                        }
+                    )
+                )
+                self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+    def test_markerless_terminal_source_mode_cross_matrix_refuses_contradictions(self):
+        admitted = {
+            ("local_head", None),
+            ("published_release", None),
+            ("published_release", "current_schema"),
+            ("prepared_artifact", "paired"),
+            ("prepared_artifact", "current_schema"),
+        }
+        states = ("committed", "precondition_failed", "activation_failed_rolled_back",
+                  "ordinary_activation_failed_rollback_failed", "rejected_concurrent")
+        with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
+            root = Path(td)
+            status = root / "status.json"
+            active = root / "active"
+            for name, value in {
+                "LAUNCHD_DEPLOY_DIR": root,
+                "LAUNCHD_DEPLOY_STATUS_PATH": status,
+                "LAUNCHD_DEPLOY_ACTIVE_PATH": active,
+                "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH": root / "claim.lock",
+                "LAUNCHD_RESTART_ACTIVE_PATH": root / "restart-active",
+            }.items():
+                stack.enter_context(mock.patch.object(self.dev, name, value))
+            stack.enter_context(mock.patch.object(self.dev, "_restart_claim_owner", return_value=None))
+            for source in ("local_head", "published_release", "prepared_artifact"):
+                for mode in (None, "paired", "current_schema", "invalid"):
+                    for state in states:
+                        with self.subTest(source=source, mode=mode, state=state):
+                            payload = {
+                                "transaction_id": "markerless", "source_kind": source,
+                                "prepared_mode": mode, "state": state,
+                                "finalization_pending": False, "rollback_failure": None,
+                            }
+                            status.write_text(json.dumps(payload))
+                            before = status.read_bytes()
+                            coherent = (source, mode) in admitted
+                            self.assertEqual(self.dev._markerless_status_is_resolved(payload), coherent)
+                            if coherent:
+                                self.assertIsNone(self.dev._markerless_operation_refusal())
+                            else:
+                                self.assertIsNotNone(self.dev._markerless_operation_refusal())
+                                with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                                    self.dev._claim_launchd_deploy("replacement", initial_status={"state": "preparing"})
+                                with mock.patch("builtins.print") as output:
+                                    self.dev._print_launchd_deploy_status()
+                                rendered = " ".join(str(call) for call in output.call_args_list)
+                                self.assertIn("UNRESOLVED:", rendered)
+                                self.assertNotIn("RECOVERY:", rendered)
+                            self.assertEqual(status.read_bytes(), before)
+                            self.assertFalse(active.exists())
+
+    def test_markerless_terminal_status_requires_exact_field_shapes(self):
+        malformed = (
+            {
+                "transaction_id": "tx",
+                "state": "committed",
+                "source_kind": "local_head",
+                "finalization_pending": [],
+            },
+            {
+                "transaction_id": "tx",
+                "state": "committed",
+                "source_kind": "local_head",
+                "rollback_failure": {},
+            },
+            {"transaction_id": "tx", "state": ["committed"], "source_kind": "local_head"},
+            {"transaction_id": "tx", "state": "committed"},
+            {"transaction_id": "tx", "state": "committed", "source_kind": "typo"},
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status_path = root / "status.json"
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path
+            ):
+                for payload in malformed:
+                    with self.subTest(payload=payload):
+                        status_path.unlink(missing_ok=True)
+                        status_path.write_text(json.dumps(payload))
+                        self.assertIsNotNone(self.dev._markerless_operation_refusal())
+                status_path.unlink()
+                status_path.symlink_to(root / "missing-status")
+                self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+    def test_invalid_json_markerless_status_fences_deploy_restart_and_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            status.write_text("{")
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_DIR", root / "restart"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart-active"
+            ):
+                for admission in (
+                    self.dev._claim_launchd_deploy,
+                    self.dev._claim_launchd_restart,
+                ):
+                    with self.subTest(admission=admission.__name__), self.assertRaisesRegex(
+                        self.dev.ConcurrentLaunchdOperation,
+                        "status is unreadable or malformed",
+                    ):
+                        admission("new")
+                with mock.patch.object(
+                    self.dev, "detect_prod_env", return_value="launchd"
+                ) as detect_environment:
+                    with self.assertRaisesRegex(
+                        SystemExit, "status is unreadable or malformed"
+                    ):
+                        self.dev.cmd_prod_stop()
+                    detect_environment.assert_called_once_with()
+
+            self.assertFalse((root / "active").exists())
+            self.assertFalse((root / "restart-active").exists())
+
+    def test_prod_stop_ignores_launchd_fences_for_native_backend(self):
+        with mock.patch.object(
+            self.dev, "detect_prod_env", return_value="native"
+        ), mock.patch.object(
+            self.dev, "_deploy_claim_owner"
+        ) as claim_owner, mock.patch.object(
+            self.dev, "_markerless_operation_refusal"
+        ) as markerless_refusal, mock.patch.object(
+            self.dev, "native_prod_stop"
+        ) as native_stop:
+            self.dev.cmd_prod_stop()
+
+        claim_owner.assert_not_called()
+        markerless_refusal.assert_not_called()
+        native_stop.assert_called_once_with()
+
+    def test_unreadable_markerless_status_refuses_operations(self):
+        with tempfile.TemporaryDirectory() as td:
+            status = Path(td) / "status.json"
+            status.write_text("retained")
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                Path, "read_text", side_effect=PermissionError("denied")
+            ):
+                refusal = self.dev._markerless_operation_refusal()
+
+        self.assertIn("unreadable or malformed", refusal)
+
+    def test_cleanup_controller_rejects_invalid_label_before_subprocess(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "failed.current"
+            transaction.mkdir(parents=True)
+            retained = transaction / "helper.py"
+            retained.write_text("retained helper")
+            (transaction / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "failed.current",
+                        "source_kind": "prepared_artifact",
+                        "current_schema_upgrade": {
+                            **mode_evidence(transaction, "current_schema_upgrade"),
+                            "controller_helper_path": str(retained),
+                            "controller_helper_sha256": self.dev._file_sha256(retained),
+                            "proof_path": str(transaction / "proof.json"),
+                        },
+                        "helper_label": "test.phoenix.server",
+                    }
+                )
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "failed.current",
+                        "source_kind": "prepared_artifact",
+                        "prepared_mode": "current_schema",
+                        "state": "precondition_cleanup_pending",
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev.sys, "platform", "darwin"
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "_deploy_claim_owner", return_value="failed.current"
+            ), mock.patch.object(self.dev.subprocess, "run") as backend:
+                with self.assertRaisesRegex(SystemExit, "helper label is invalid"):
+                    self.dev.cmd_prod_cleanup_precondition(
+                        "failed.current", current_schema=True
+                    )
+
+            backend.assert_not_called()
 
     def test_claim_release_is_transaction_owned(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -2504,9 +4088,13 @@ class PreparationTests(unittest.TestCase):
             self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
 
     def test_prod_stop_refuses_pending_paired_finalization(self):
-        with mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="pending finalization"), mock.patch.object(self.dev, "detect_prod_env") as detect, self.assertRaisesRegex(SystemExit, "pending finalization"):
+        with mock.patch.object(
+            self.dev, "_paired_recovery_refusal", return_value="pending finalization"
+        ), mock.patch.object(
+            self.dev, "detect_prod_env", return_value="launchd"
+        ) as detect, self.assertRaisesRegex(SystemExit, "pending finalization"):
             self.dev.cmd_prod_stop()
-        detect.assert_not_called()
+        detect.assert_called_once_with()
 
     def test_prod_stop_uses_service_target_and_requires_absence(self):
         success = subprocess.CompletedProcess([], 0, "", "")
@@ -2518,7 +4106,8 @@ class PreparationTests(unittest.TestCase):
             self.dev._launchd_stop_if_loaded()
 
     def test_activation_sqlite_interpreter_probe_failure_prevents_bootstrap(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "PROD_DB_PATH", Path(td) / "prod.db"):
             root = Path(td)
             candidate = root / "candidate"
             candidate.write_bytes(b"candidate")
@@ -2567,10 +4156,13 @@ class PreparationTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     self.dev.launchd_prod_deploy(controller=controller)
             self.assertEqual((root / "deploy" / "active").read_text().strip(), "interrupted")
-            self.assertEqual(json.loads((root / "deploy" / "status.json").read_text())["state"], "prepared")
+            status = json.loads((root / "deploy" / "status.json").read_text())
+            self.assertEqual(status["state"], "prepared")
+            self.assertEqual(status["prepared_mode"], "paired")
 
     def test_precondition_failure_records_typed_candidate_identity(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "PROD_DB_PATH", Path(td) / "prod.db"):
             root = Path(td)
             candidate = root / "built-phoenix"
             candidate.write_bytes(b"candidate")
@@ -2590,29 +4182,45 @@ class PreparationTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, "1\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active_path), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", root / "deploy" / "activate.lock"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root / "install"), \
-                 mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", root / "service.plist"), \
-                 mock.patch.object(self.dev, "PROD_SHA_PATH", root / "deployed.sha"), \
-                 mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
-                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
-                 mock.patch.object(self.dev, "_prepare_local_candidate", return_value=prepared), \
-                 mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
-                 mock.patch.object(self.dev, "capture_login_shell_path", return_value=("/bin", "test")), \
-                 mock.patch.object(self.dev, "print_launchd_path_report"), \
-                 mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_text("# retained helper\n")), \
-                 mock.patch.object(self.dev, "_ensure_newsyslog_config", side_effect=SystemExit("sudo required")), \
-                 mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+            patches = (
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active_path),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", root / "deploy" / "activate.lock"),
+                mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path),
+                mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"),
+                mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root / "install"),
+                mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", root / "service.plist"),
+                mock.patch.object(self.dev, "PROD_SHA_PATH", root / "deployed.sha"),
+                mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)),
+                mock.patch.object(self.dev, "_preflight_prod_bind_auth"),
+                mock.patch.object(self.dev, "_prepare_local_candidate", return_value=prepared),
+                mock.patch.object(self.dev, "_binary_identity", return_value=identity),
+                mock.patch.object(self.dev, "capture_login_shell_path", return_value=("/bin", "test")),
+                mock.patch.object(self.dev, "print_launchd_path_report"),
+                mock.patch.object(
+                    self.dev,
+                    "_materialize_helper",
+                    side_effect=lambda _commit, path, _kind: path.write_text("# retained helper\n"),
+                ),
+                mock.patch.object(
+                    self.dev,
+                    "_ensure_newsyslog_config",
+                    side_effect=SystemExit("sudo required"),
+                ),
+                mock.patch.object(self.dev.subprocess, "run", side_effect=run),
+            )
+            with contextlib.ExitStack() as stack:
+                for patcher in patches:
+                    stack.enter_context(patcher)
                 with self.assertRaisesRegex(SystemExit, "sudo required"):
                     self.dev.launchd_prod_deploy()
 
             status = json.loads(status_path.read_text())
             self.assertEqual("precondition_failed", status["state"])
+            self.assertIs(status["finalization_pending"], False)
+            self.assertIsNone(status["rollback_failure"])
+            self.assertTrue(self.dev._markerless_status_is_resolved(status))
             self.assertEqual(identity.version, status["expected_version"])
             self.assertEqual(identity.git_sha, status["expected_git_sha"])
             self.assertFalse(active_path.exists())
@@ -2772,10 +4380,16 @@ class PreparationTests(unittest.TestCase):
             self.assertIn(asset, workflow)
         self.assertIn("SHA256SUMS", workflow)
         self.assertIn('missing required release asset: $asset', workflow)
-        self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
-        self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
-        self.assertIn("runner: macos-15-intel", workflow)
-        self.assertIn("runner: macos-15", workflow)
+        before, preparation_and_after = workflow.split("\n  build-incident-linux:", 1)
+        preparation, after = preparation_and_after.split("\n  build-macos:", 1)
+        release_jobs = before + "\n  build-macos:" + after
+        self.assertEqual(2, release_jobs.count("git restore ui/dist/.gitkeep"))
+        self.assertEqual(4, release_jobs.count('test -z "$(git status --porcelain)"'))
+        self.assertEqual(1, preparation.count("git restore ui/dist/.gitkeep"))
+        self.assertEqual(1, preparation.count('test -z "$(git status --porcelain)"'))
+        self.assertIn("cargo build --locked --profile release-min", preparation)
+        self.assertIn('"runner":"macos-15-intel"', workflow)
+        self.assertIn('"runner":"macos-15"', workflow)
         self.assertIn("runner: ubuntu-24.04-arm", workflow)
         self.assertIn("runner: ubuntu-latest", workflow)
         self.assertNotIn("runner: macos-14", workflow)
@@ -2822,14 +4436,368 @@ class PreparationTests(unittest.TestCase):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 status = root / "status.json"
+                active = root / "active"
+                active.write_text("tx\n")
                 status.write_text(json.dumps({"transaction_id": "tx", "state": state, "source_kind": "prepared_artifact", "updated_at": stale}))
-                with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch("builtins.print") as output:
+                transaction = root / "transactions" / "tx"
+                transaction.mkdir(parents=True)
+                (transaction / "manifest.json").write_text(
+                    json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": mode_evidence(root)})
+                )
+                with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch("builtins.print") as output:
                     self.dev._print_launchd_deploy_status()
                 rendered = " ".join(str(c) for c in output.call_args_list)
                 self.assertIn("recover-paired", rendered)
                 self.assertIn("Do not remove", rendered)
                 self.assertNotIn("clearing the active marker", rendered)
                 self.assertNotIn("unreadable status", rendered)
+
+    def test_markerless_ordinary_forward_status_preserves_forward_only_guidance(self):
+        for state in (
+            "candidate_may_migrate",
+            "ordinary_activation_failed_forward_only",
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                transaction = root / "transactions" / "tx"
+                transaction.mkdir(parents=True)
+                (transaction / "manifest.json").write_text(
+                    json.dumps({"source_kind": "local_head", "ordinary_forward_migration": mode_evidence(root, "ordinary_forward_migration")})
+                )
+                status = root / "status.json"
+                status.write_text(
+                    json.dumps(
+                        {
+                            "transaction_id": "tx",
+                            "state": state,
+                            "source_kind": "local_head",
+                            "finalization_pending": True,
+                            "updated_at": datetime.datetime.now(
+                                datetime.timezone.utc
+                            ).isoformat(),
+                        }
+                    )
+                )
+                with mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_DIR", root
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+                ), mock.patch("builtins.print") as output:
+                    self.dev._print_launchd_deploy_status()
+
+                rendered = " ".join(str(call) for call in output.call_args_list)
+                self.assertIn("UNRESOLVED:", rendered)
+                self.assertIn("no active claim owner", rendered)
+                self.assertIn("forward-only", rendered)
+                self.assertIn("resume-forward tx", rendered)
+                self.assertNotIn("recover-paired", rendered)
+                self.assertNotIn("recover-current", rendered)
+
+    def test_markerless_forward_state_with_ordinary_manifest_warns_of_conflict(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps({"source_kind": "local_head"})
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "candidate_may_migrate",
+                        "source_kind": "local_head",
+                        "updated_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("forward-only status conflicts", rendered)
+        self.assertIn("do not redeploy", rendered)
+        self.assertNotIn("resume-forward", rendered)
+        self.assertNotIn("recover-", rendered)
+
+    def test_markerless_pre_activation_ordinary_status_has_no_forward_recovery_advice(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps({"source_kind": "local_head", "ordinary_forward_migration": mode_evidence(root, "ordinary_forward_migration")})
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "preparing",
+                        "source_kind": "local_head",
+                        "updated_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertNotIn("forward-only", rendered)
+        self.assertNotIn("resume-forward", rendered)
+        self.assertNotIn("recover-", rendered)
+
+    def test_markerless_committed_ordinary_forward_status_is_terminal(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps({"source_kind": "local_head", "ordinary_forward_migration": mode_evidence(root, "ordinary_forward_migration")})
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "committed",
+                        "source_kind": "local_head",
+                        "finalization_pending": False,
+                        "updated_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertNotIn("UNRESOLVED:", rendered)
+        self.assertNotIn("resume-forward", rendered)
+        self.assertNotIn("recover-", rendered)
+
+    def test_markerless_unreadable_ordinary_manifest_is_not_classified_as_paired(self):
+        stale = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(minutes=7)
+        ).isoformat()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text("not-json")
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "preparing",
+                        "source_kind": "local_head",
+                        "updated_at": stale,
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("ordinary transaction manifest", rendered)
+        self.assertIn("confirm no helper is running before retrying", rendered)
+        self.assertNotIn("prepared transaction", rendered)
+        self.assertNotIn("recover-paired", rendered)
+        self.assertNotIn("recover-current", rendered)
+
+    def test_precondition_cleanup_pending_advises_cleanup_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            helper_path = transaction / "activate.py"
+            helper_path.write_text("retained helper")
+            (transaction / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "current_schema_upgrade": {
+                            **mode_evidence(transaction, "current_schema_upgrade"),
+                            "controller_helper_path": str(helper_path),
+                            "controller_helper_sha256": "hash",
+                        },
+                    }
+                )
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "precondition_cleanup_pending",
+                        "source_kind": "prepared_artifact",
+                        "failure": "reservation failed",
+                        "cleanup_failure": "fsync uncertain",
+                        "updated_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                )
+            )
+            active = root / "active"
+            active.write_text("tx")
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("cleanup-current tx", rendered)
+        self.assertIn("service was not intentionally stopped", rendered)
+        self.assertNotIn("recover-current", rendered)
+        self.assertNotIn("recover-paired", rendered)
+
+    def test_markerless_unknown_prepared_status_warns_without_recovery_command(self):
+        stale = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(minutes=7)
+        ).isoformat()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            active = root / "active"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "activating",
+                        "source_kind": "prepared_artifact",
+                        "updated_at": stale,
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("UNRESOLVED:", rendered)
+        self.assertIn("mode cannot be verified", rendered)
+        self.assertIn("preserve evidence", rendered.lower())
+        self.assertNotIn("prepared transaction", rendered)
+        self.assertNotIn("recover-paired", rendered)
+        self.assertNotIn("clearing the active marker", rendered)
+
+    def test_markerless_paired_status_warns_without_recovery_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "transactions" / "tx"
+            transaction.mkdir(parents=True)
+            (transaction / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "source_kind": "prepared_artifact",
+                        "paired_database_upgrade": mode_evidence(transaction),
+                    }
+                )
+            )
+            status = root / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "activating",
+                        "source_kind": "prepared_artifact",
+                        "updated_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("prepared transaction status has no active claim owner", rendered)
+        self.assertNotIn("recover-paired", rendered)
+        self.assertNotIn("recover-current", rendered)
+
+    def test_markerless_verified_predecessor_status_does_not_prescribe_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            active = root / "active"
+            status.write_text(
+                json.dumps(
+                    {
+                        "transaction_id": "tx",
+                        "state": "activation_failed_rolled_back",
+                        "source_kind": "prepared_artifact",
+                        "recovery_mode": "unchanged_predecessor",
+                        "finalization_pending": False,
+                        "updated_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                )
+            )
+            with mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_DIR", root
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+            ), mock.patch.object(
+                self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active
+            ), mock.patch("builtins.print") as output:
+                self.dev._print_launchd_deploy_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("activation_failed_rolled_back", rendered)
+        self.assertNotIn("RECOVERY:", rendered)
+        self.assertNotIn("recover-paired", rendered)
 
     def test_preparing_transaction_reports_stale_recovery(self):
         stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=7)).isoformat()
@@ -2882,13 +4850,395 @@ class PreparationTests(unittest.TestCase):
         )
         self.assertIn("64    *  BJN", config)
 
+class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dev = load(ROOT / "dev.py", "devpy_protected_release_retained_test")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.staging = self.root / "transactions" / "protected"
+        self.staging.mkdir(parents=True)
+        self.active = self.root / "active"
+        self.active.write_text("protected\n")
+        self.status = self.root / "status.json"
+        self.script = self.staging / "retained.py"
+        self.script.write_bytes(b"pinned controller helper")
+        self.upgrade = {
+            "controller_helper_path": str(self.script),
+            "controller_helper_sha256": self.dev._file_sha256(self.script),
+            "controller_source_commit": "c" * 40,
+            "database_path": str(self.root / "prod.db"),
+            "backup_path": str(self.staging / "backup.db"),
+            "proof_path": str(self.staging / "proof.json"),
+            "migration_registry_path": str(self.staging / "migrations.rs"),
+            "migration_registry_sha256": "d" * 64,
+        }
+        self.manifest = self.staging / "manifest.json"
+        self.payload = {
+            "transaction_id": "protected", "helper_label": "com.phoenix-ide.deploy.protected",
+            "source_kind": "published_release", "current_schema_upgrade": self.upgrade,
+        }
+        self.manifest.write_text(json.dumps(self.payload))
+        for name, value in {
+            "LAUNCHD_DEPLOY_DIR": self.root,
+            "LAUNCHD_DEPLOY_ACTIVE_PATH": self.active,
+            "LAUNCHD_DEPLOY_STATUS_PATH": self.status,
+            "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH": self.root / "claim.lock",
+        }.items():
+            patcher = mock.patch.object(self.dev, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(self.dev.sys, "platform", "darwin")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_status(self, state, **fields):
+        payload = {
+            "transaction_id": "protected", "source_kind": "published_release",
+            "prepared_mode": "current_schema", "state": state,
+            "finalization_pending": False, "rollback_failure": None,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        payload.update(fields)
+        self.status.write_text(json.dumps(payload))
+        return payload
+
+    def test_classification_keeps_paired_prepared_only_and_current_release_protected(self):
+        for source in ("prepared_artifact", "published_release", "local_head", "unknown"):
+            for mode, kind in (("paired_database_upgrade", self.dev.DeployManifestKind.PAIRED),
+                               ("current_schema_upgrade", self.dev.DeployManifestKind.CURRENT_SCHEMA)):
+                with self.subTest(source=source, mode=mode):
+                    self.manifest.write_text(json.dumps({"source_kind": source, mode: mode_evidence(self.staging, mode)}))
+                    admitted = source == "prepared_artifact" or (source == "published_release" and mode == "current_schema_upgrade")
+                    expected = kind if admitted else self.dev.DeployManifestKind.UNKNOWN
+                    self.assertIs(self.dev._deploy_manifest_kind(self.staging), expected)
+                    self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+
+    def test_classifier_rejects_empty_missing_and_wrong_type_mode_fields(self):
+        for mode, source, kind in (
+            ("paired_database_upgrade", "prepared_artifact", self.dev.DeployManifestKind.PAIRED),
+            ("current_schema_upgrade", "prepared_artifact", self.dev.DeployManifestKind.CURRENT_SCHEMA),
+            ("current_schema_upgrade", "published_release", self.dev.DeployManifestKind.CURRENT_SCHEMA),
+            ("ordinary_forward_migration", "published_release", self.dev.DeployManifestKind.ORDINARY_FORWARD),
+        ):
+            complete = mode_evidence(self.staging, mode)
+            self.manifest.write_text(json.dumps({"source_kind": source, mode: complete}))
+            self.assertIs(self.dev._deploy_manifest_kind(self.staging), kind)
+            loadable = self.staging / "loadable.json"
+            loadable.write_text(json.dumps(dataclasses.asdict(make_manifest(self.staging)) | {
+                "source_kind": source, mode: complete,
+            }))
+            loaded = helper.Manifest.load(loadable)
+            self.assertEqual(dataclasses.asdict(getattr(loaded, mode)), complete)
+            self.write_status("committed", source_kind=source, prepared_mode=(
+                kind.value if kind in {self.dev.DeployManifestKind.PAIRED, self.dev.DeployManifestKind.CURRENT_SCHEMA} else None
+            ))
+            self.assertTrue(self.dev._status_is_terminal_for_owner(
+                self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES,
+            ))
+            malformed = [{}, [], "", False, 0]
+            for field in complete:
+                malformed.append({key: value for key, value in complete.items() if key != field})
+                malformed.extend(complete | {field: wrong} for wrong in (None, False, 1, [], {}, ""))
+            malformed.append(complete | {"unexpected": "field"})
+            for value in malformed:
+                with self.subTest(mode=mode, value=value):
+                    self.manifest.write_text(json.dumps({"source_kind": source, mode: value}))
+                    self.assertIs(self.dev._deploy_manifest_kind(self.staging), self.dev.DeployManifestKind.UNKNOWN)
+                    self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+                    self.assertFalse(self.dev._status_is_terminal_for_owner(
+                        self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES,
+                    ))
+                    for admission in (self.dev._claim_launchd_deploy, self.dev._claim_launchd_restart):
+                        with mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", self.root / "restart"), mock.patch.object(
+                            self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", self.root / "restart-active",
+                        ), self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                            admission("new-operation")
+                        self.assertEqual(self.active.read_text(), "protected\n")
+
+    def test_classifier_accepts_only_complete_typed_prepared_source114_evidence(self):
+        qualified = mode_evidence(self.staging, "current_schema_upgrade") | {
+            "prepared_source_baseline": 114,
+            "candidate_registry_expected_sha256": self.dev.PREPARED_SOURCE114_REGISTRY_SHA256,
+        }
+        self.manifest.write_text(json.dumps({
+            "source_kind": "prepared_artifact",
+            "current_schema_upgrade": qualified,
+        }))
+        self.assertIs(
+            self.dev._deploy_manifest_kind(self.staging),
+            self.dev.DeployManifestKind.CURRENT_SCHEMA,
+        )
+        loadable = self.staging / "qualified-loadable.json"
+        loadable.write_text(json.dumps(dataclasses.asdict(make_manifest(self.staging)) | {
+            "source_kind": "prepared_artifact",
+            "current_schema_upgrade": qualified,
+        }))
+        loaded = helper.Manifest.load(loadable)
+        self.assertIsInstance(loaded.current_schema_upgrade, helper.PreparedSource114Upgrade)
+
+        for changed in (
+            qualified | {"prepared_source_baseline": 113},
+            qualified | {"prepared_source_baseline": "114"},
+            qualified | {"candidate_registry_expected_sha256": ""},
+            {key: value for key, value in qualified.items() if key != "prepared_source_baseline"},
+            qualified | {"unexpected": "field"},
+        ):
+            with self.subTest(changed=changed):
+                self.manifest.write_text(json.dumps({
+                    "source_kind": "prepared_artifact",
+                    "current_schema_upgrade": changed,
+                }))
+                self.assertIs(
+                    self.dev._deploy_manifest_kind(self.staging),
+                    self.dev.DeployManifestKind.UNKNOWN,
+                )
+                self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+
+    def test_controller_admission_rejects_status_source_mode_cross_matrix(self):
+        for mode in ("paired_database_upgrade", "current_schema_upgrade"):
+            current = mode == "current_schema_upgrade"
+            for source in (("prepared_artifact", "published_release") if current else ("prepared_artifact",)):
+                payload = {"transaction_id": "protected", "helper_label": "com.phoenix-ide.deploy.protected",
+                           "source_kind": source, mode: mode_evidence(self.staging, mode)}
+                self.manifest.write_text(json.dumps(payload))
+                for action, state in (("cmd_prod_cleanup_precondition", "precondition_cleanup_pending"),
+                                      ("cmd_prod_finalize_paired", "committed"),
+                                      ("cmd_prod_recover_paired", "prepared"),
+                                      ("cmd_prod_recover_paired", "activation_failed_rollback_failed")):
+                    for status_source in (None, "prepared_artifact", "published_release", "local_head", "invalid"):
+                        for prepared_mode in (None, "paired", "current_schema", "invalid"):
+                            if source == status_source and prepared_mode == ("current_schema" if current else "paired"):
+                                continue
+                            with self.subTest(mode=mode, source=source, action=action, state=state,
+                                              status_source=status_source, prepared_mode=prepared_mode):
+                                status = self.write_status(state, source_kind=status_source, prepared_mode=prepared_mode, preparing_pid=123)
+                                with mock.patch.object(self.dev.subprocess, "run") as run, mock.patch.object(
+                                    self.dev.os, "kill", side_effect=ProcessLookupError
+                                ):
+                                    with self.assertRaises(SystemExit):
+                                        getattr(self.dev, action)("protected", current_schema=current)
+                                    run.assert_not_called()
+                                self.assertEqual(json.loads(self.status.read_text()), status)
+                                self.assertTrue(self.active.exists())
+
+    def test_pre_handoff_recovery_never_uses_dirty_checkout_and_checks_retained_hash(self):
+        dirty = self.root / "dirty-checkout"
+        (dirty / "scripts").mkdir(parents=True)
+        checkout_script = dirty / "scripts/launchd_deploy_helper.py"
+        checkout_script.write_text("raise RuntimeError('must never run')")
+        for has_manifest in (False, True):
+            self.active.write_text("protected\n")
+            self.write_status("prepared", preparing_pid=123)
+            if has_manifest:
+                self.manifest.write_text(json.dumps(self.payload))
+            else:
+                self.manifest.unlink(missing_ok=True)
+            result = (subprocess.CompletedProcess([], 0, "", "") if has_manifest else
+                      subprocess.CompletedProcess([], 113, "", f'Could not find service "com.phoenix-ide.deploy.protected" in domain gui/{os.getuid()}'))
+            with mock.patch.object(self.dev, "ROOT", dirty), mock.patch.object(
+                self.dev.os, "kill", side_effect=ProcessLookupError
+            ), mock.patch.object(self.dev.subprocess, "run", return_value=result) as run:
+                self.dev.cmd_prod_recover_paired("protected", current_schema=True)
+            self.assertNotIn(str(checkout_script), run.call_args.args[0])
+            self.assertEqual(run.call_args.args[0][1], str(self.script) if has_manifest else "print")
+        self.active.write_text("protected\n")
+        self.manifest.write_text(json.dumps(self.payload))
+        self.write_status("prepared", preparing_pid=123)
+        self.script.write_text("tampered retained helper")
+        before = self.status.read_bytes()
+        with mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(
+            self.dev.subprocess, "run"
+        ) as run:
+            with self.assertRaisesRegex(SystemExit, "helper binding"):
+                self.dev.cmd_prod_recover_paired("protected", current_schema=True)
+            run.assert_not_called()
+        self.assertEqual(self.status.read_bytes(), before)
+        self.assertTrue(self.active.exists())
+
+    def test_manifestless_absence_probe_requires_exact_label_domain_and_failure(self):
+        label = "com.phoenix-ide.deploy.protected"
+        for returncode, output, admitted in (
+            (113, f'Could not find service "{label}" in domain gui/{os.getuid()}', True),
+            (113, f'Could not find service "{label}" in domain for user gui: {os.getuid()}', True),
+            (0, f'Could not find service "{label}" in domain gui/{os.getuid()}', False),
+            (113, f'Could not find service "other" in domain gui/{os.getuid()}', False),
+            (113, f'Could not find service "{label}" in domain gui/{os.getuid() + 1}', False),
+            (113, "permission denied", False),
+        ):
+            with self.subTest(output=output, returncode=returncode), mock.patch.object(
+                self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], returncode, "", output)
+            ):
+                self.assertIs(self.dev._probe_deploy_helper_absence(label), admitted)
+
+    def test_terminal_release_status_requires_matching_source_mode_and_no_pending_recovery(self):
+        for state in ("committed", "precondition_failed", "activation_failed_rolled_back"):
+            self.write_status(state)
+            self.assertTrue(self.dev._status_is_terminal_for_owner(self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES))
+        for fields in ({"finalization_pending": True}, {"recovery_mode": "unchanged_source"},
+                       {"source_kind": "prepared_artifact"}, {"prepared_mode": "paired"}):
+            with self.subTest(fields=fields):
+                self.write_status("activation_failed_rolled_back", **fields)
+                self.assertFalse(self.dev._status_is_terminal_for_owner(self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES))
+
+    def test_pre_handoff_release_abandonment_cleans_allocations_without_runtime_action(self):
+        for state, has_manifest in (("preparing", False), ("preparing", True), ("prepared", True)):
+            with self.subTest(state=state, has_manifest=has_manifest):
+                self.active.write_text("protected\n")
+                self.write_status(state, preparing_pid=123)
+                if has_manifest:
+                    self.manifest.write_text(json.dumps(self.payload))
+                else:
+                    self.manifest.unlink(missing_ok=True)
+                allocations = [Path(self.upgrade["backup_path"]), self.root / ".prod.db.restore-protected", self.staging / "capacity.json"]
+                if has_manifest:
+                    for path in allocations:
+                        path.write_bytes(b"allocation")
+                with mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(
+                    self.dev.subprocess, "run", return_value=(
+                        subprocess.CompletedProcess([], 0, "", "") if has_manifest else
+                        subprocess.CompletedProcess([], 113, "", f'Could not find service "com.phoenix-ide.deploy.protected" in domain gui/{os.getuid()}')
+                    ),
+                ) as run, mock.patch.object(self.dev, "ROOT", self.root / "nonexistent-checkout"):
+                    self.dev.cmd_prod_recover_paired("protected", current_schema=True)
+                self.assertEqual(run.call_count, 1)
+                if has_manifest:
+                    self.assertEqual(run.call_args.args[0][1], str(self.script))
+                    self.assertIn("--probe-service-absence", run.call_args.args[0])
+                else:
+                    self.assertEqual(run.call_args.args[0], ["launchctl", "print", f"gui/{os.getuid()}/com.phoenix-ide.deploy.protected"])
+                self.assertFalse(self.active.exists())
+                self.assertTrue(all(not path.exists() for path in allocations))
+                self.assertTrue(self.dev._status_is_terminal_for_owner(self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES))
+
+    def test_pre_handoff_cleanup_enumeration_failure_retains_claim(self):
+        for mode, source in (
+            ("paired_database_upgrade", "prepared_artifact"),
+            ("current_schema_upgrade", "prepared_artifact"),
+            ("current_schema_upgrade", "published_release"),
+        ):
+            with self.subTest(mode=mode, source=source):
+                current_schema = mode == "current_schema_upgrade"
+                upgrade = mode_evidence(self.staging, mode)
+                self.manifest.write_text(json.dumps({
+                    "transaction_id": "protected", "helper_label": self.payload["helper_label"],
+                    "source_kind": source, mode: upgrade,
+                }))
+                self.write_status("prepared", source_kind=source,
+                                  prepared_mode="current_schema" if current_schema else "paired",
+                                  preparing_pid=123)
+                backup = Path(upgrade["backup_path"])
+                backup.write_bytes(b"allocation")
+                with mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(
+                    self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ) as run, mock.patch.object(
+                    self.dev.os, "scandir", side_effect=PermissionError("enumeration denied"),
+                ):
+                    with self.assertRaisesRegex(SystemExit, "cleanup is incomplete"):
+                        self.dev.cmd_prod_recover_paired("protected", current_schema=current_schema)
+                self.assertEqual(run.call_count, 1)
+                self.assertIn("--probe-service-absence", run.call_args.args[0])
+                self.assertEqual(self.active.read_text(), "protected\n")
+                self.assertTrue(backup.exists())
+                pending = json.loads(self.status.read_text())
+                self.assertEqual(pending["state"], "precondition_cleanup_pending")
+                self.assertFalse(pending["precondition_cleanup_completed"])
+                self.assertIn("enumeration denied", pending["cleanup_failure"])
+
+    def test_pre_handoff_release_cleanup_failure_retains_claim_and_cleanup_only_guidance(self):
+        self.write_status("prepared", preparing_pid=123)
+        reserve = self.root / ".prod.db.restore-protected"
+        reserve.write_bytes(b"allocation")
+        real_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == reserve:
+                raise OSError("injected cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(self.dev.os, "kill", side_effect=ProcessLookupError), mock.patch.object(
+            self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ), mock.patch.object(Path, "unlink", unlink):
+            with self.assertRaisesRegex(SystemExit, "cleanup is incomplete"):
+                self.dev.cmd_prod_recover_paired("protected", current_schema=True)
+        self.assertTrue(self.active.exists())
+        self.assertTrue(reserve.exists())
+        self.assertEqual(json.loads(self.status.read_text())["state"], "precondition_cleanup_pending")
+        guidance = self.dev._paired_recovery_refusal("protected")
+        self.assertIn("cleanup-current", guidance)
+        self.assertNotIn("prod recover-current", guidance)
+
+    def test_cleanup_release_uses_retained_helper_only(self):
+        self.write_status("precondition_cleanup_pending")
+        with mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            self.dev.cmd_prod_cleanup_precondition("protected", current_schema=True)
+        self.assertEqual(run.call_args_list[1].args[0][1], str(self.script))
+        plist = plistlib.loads((self.staging / "cleanup-helper.plist").read_bytes())
+        self.assertEqual(plist["ProgramArguments"][1:3], [str(self.script), "cleanup-current"])
+        self.assertIn("bootstrap", run.call_args.args[0])
+        self.assertTrue(self.active.exists())
+
+    def test_finalize_release_uses_retained_helper_without_reselecting_source(self):
+        for state in ("committed", "migration_started"):
+            with self.subTest(state=state):
+                self.write_status(state, finalization_pending=True)
+                with mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                    self.dev.cmd_prod_finalize_paired("protected", current_schema=True)
+                self.assertEqual(run.call_args.args[0][1:3], [str(self.script), "finalize-current"])
+                self.assertFalse(any("bootstrap" in call.args[0] for call in run.call_args_list))
+                self.assertEqual(run.call_count, 3)
+
+    def test_recover_release_uses_retained_helper_and_current_recovery_guidance(self):
+        self.write_status("activation_failed_rollback_failed")
+        self.assertIn("recover-current", self.dev._paired_recovery_refusal("protected"))
+        with mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            self.dev.cmd_prod_recover_paired("protected", current_schema=True)
+        self.assertEqual(run.call_args_list[1].args[0][1], str(self.script))
+        plist = plistlib.loads((self.staging / "recovery-helper.plist").read_bytes())
+        self.assertEqual(plist["ProgramArguments"][1:3], [str(self.script), "recover-current"])
+        self.assertIn("bootstrap", run.call_args.args[0])
+        self.assertTrue(self.active.exists())
+        self.write_status("committed", finalization_pending=True)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.dev._print_launchd_deploy_status()
+        self.assertIn("finalize-current", output.getvalue())
+        self.assertNotIn("inconsistent mode", output.getvalue())
+        self.write_status("activation_failed_rolled_back", recovery_mode="unchanged_source")
+        guidance = self.dev._paired_recovery_refusal("protected")
+        self.assertIn("prod recover-current", guidance)
+        self.assertNotIn("prod recover-paired", guidance)
+
+    def test_direct_release_paired_entry_refuses_before_claim(self):
+        controller = self.dev.ProdDeployControllerOptions(paired_database_upgrade=True)
+        with mock.patch.object(self.dev, "_claim_launchd_deploy") as claim:
+            with self.assertRaisesRegex(SystemExit, "requires a prepared artifact"):
+                self.dev.launchd_prod_deploy("v2.0.0", controller=controller)
+        claim.assert_not_called()
+
+    def test_published_paired_mode_refuses_cleanup_finalize_and_recover(self):
+        self.payload["paired_database_upgrade"] = self.payload.pop("current_schema_upgrade")
+        self.manifest.write_text(json.dumps(self.payload))
+        for command, state in ((self.dev.cmd_prod_cleanup_precondition, "precondition_cleanup_pending"),
+                               (self.dev.cmd_prod_finalize_paired, "committed"),
+                               (self.dev.cmd_prod_recover_paired, "activation_failed_rollback_failed")):
+            self.write_status(state, prepared_mode="paired")
+            with self.subTest(command=command.__name__), mock.patch.object(self.dev.subprocess, "run") as run:
+                with self.assertRaises(SystemExit):
+                    command("protected")
+                run.assert_not_called()
+
+
 class LaunchdControllerDurabilityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_controller_durability_test")
 
     @contextlib.contextmanager
-    def deployment(self, *, paired=True, current=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False):
+    def deployment(self, *, paired=True, current=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False, candidate_commit="a" * 40, controller_commit="d" * 40, registry_bytes=b"candidate registry bytes\n"):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             root = Path(td)
             deploy = root / "deploy"
@@ -2901,14 +5251,17 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             env = {"PATH": "/test", "PHOENIX_PASSWORD": "test-only"}
             plist = plistlib.dumps({"EnvironmentVariables": env})
             if predecessor:
+                (root / "prod.db").touch()
                 (installed / "phoenix-ide").write_bytes(b"previous")
                 target_plist.write_bytes(plist)
-            identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
+            identity = self.dev.RuntimeIdentity("2.0.0", candidate_commit)
             previous = self.dev.RuntimeIdentity("1.0.0", "b" * 40)
             prepared = self.dev.PreparedCandidate(
                 binary=candidate,
-                source_kind=self.dev.ProdSourceKind.PREPARED_ARTIFACT if paired else self.dev.ProdSourceKind.LOCAL_HEAD,
+                source_kind=self.dev.ProdSourceKind.PUBLISHED_RELEASE if release else self.dev.ProdSourceKind.PREPARED_ARTIFACT if paired else self.dev.ProdSourceKind.LOCAL_HEAD,
                 source_commit=identity.git_sha, identity=identity,
+                release_tag="v2.0.0" if release else None,
+                release_commit=identity.git_sha if release else None,
             )
             controller = self.dev.ProdDeployControllerOptions(
                 transaction_id="durability", prepared_artifact=root if paired else None,
@@ -2916,6 +5269,13 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 paired_database_upgrade=paired and not current,
                 current_schema_upgrade=current,
             )
+            if release:
+                controller = dataclasses.replace(
+                    controller, enabled=not public, backend=None if public else "launchd",
+                    exact_release_tag=None if public else "v2.0.0",
+                    expected_full_commit=identity.git_sha,
+                    controller_source_commit="c" * 40 if current else None,
+                )
             events = []
             real_fsync = os.fsync
             real_sync_dir = self.dev._fsync_directory
@@ -2950,11 +5310,14 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             def run(command, **_kwargs):
                 events.append(("command", tuple(command)))
                 if "rev-parse" in command:
-                    return subprocess.CompletedProcess(command, 0, "d" * 40, "")
+                    return subprocess.CompletedProcess(command, 0, controller_commit, "")
                 if command[:2] == ["git", "status"] and dirty:
                     return subprocess.CompletedProcess(command, 0, " M dev.py\n", "")
                 if command[:2] == ["git", "show"]:
-                    return subprocess.CompletedProcess(command, 0, b"candidate registry bytes\n", b"")
+                    return subprocess.CompletedProcess(command, 0, registry_bytes, b"")
+                if command[:2] == ["gh", "api"]:
+                    contents = b"controller helper bytes\n" if "launchd_deploy_helper.py" in command[2] else b"release registry bytes\n"
+                    return subprocess.CompletedProcess(command, 0, contents, b"")
                 if "bootstrap" in command and interrupt_handoff:
                     real_write(
                         deploy / "status.json",
@@ -2977,6 +5340,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 "LAUNCHD_INSTALL_DIR": installed,
                 "LAUNCHD_PLIST_PATH": target_plist,
                 "PROD_SHA_PATH": root / "deployed.sha",
+                "PROD_DB_PATH": root / "prod.db",
             }
             for name, value in patches.items():
                 stack.enter_context(mock.patch.object(self.dev, name, value))
@@ -2986,6 +5350,8 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 "_preflight_prod_bind_auth": {},
                 "_prepare_prepared_artifact": {"return_value": prepared},
                 "_prepare_local_candidate": {"return_value": prepared},
+                "_prepare_release_candidate": {"return_value": prepared},
+                "_preflight_ordinary_launchd_policy": {"side_effect": lambda path, staged_helper: events.append(("ordinary_policy", path, staged_helper))},
                 "_binary_identity": {"return_value": identity},
                 "_resolve_rollback_identity": {"return_value": (previous, "http://localhost:8031/api/version", False, True)},
                 "_materialize_helper": {"side_effect": lambda _commit, path, _kind: path.write_text("# retained helper\n")},
@@ -3002,6 +5368,216 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(self.dev.os, "fsync", side_effect=fsync))
             stack.enter_context(mock.patch.object(self.dev.subprocess, "run", side_effect=run))
             yield staging, controller, events
+
+    def test_release_current_schema_fetches_distinct_pinned_helper_and_release_registry(self, public=False):
+        materialize = self.dev._materialize_helper
+        with self.deployment(paired=False, current=True, release=True, public=public, dirty=True) as (staging, controller, events), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "_materialize_helper", side_effect=materialize), \
+             mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=AssertionError("dirty checkout policy must not run")) as policy, \
+             mock.patch.object(self.dev, "ROOT", staging / "nonexistent-checkout"):
+            self.dev.launchd_prod_deploy("v2.0.0", controller=controller)
+            policy.assert_not_called()
+            manifest = json.loads((staging / "manifest.json").read_text())
+            self.assertEqual(manifest["source_kind"], "published_release")
+            self.assertEqual(manifest["source_commit"], "a" * 40)
+            self.assertEqual(manifest["release_commit"], "a" * 40)
+            self.assertEqual(manifest["expected"]["git_sha"], "a" * 40)
+            current = manifest["current_schema_upgrade"]
+            self.assertEqual(current["controller_source_commit"], "c" * 40)
+            self.assertEqual(current["controller_helper_sha256"], self.dev._file_sha256(staging / "activate.py"))
+            self.assertEqual(current["migration_registry_sha256"], self.dev._file_sha256(staging / "migrations.rs"))
+            self.assertEqual((staging / "activate.py").read_bytes(), b"controller helper bytes\n")
+            self.assertEqual((staging / "migrations.rs").read_bytes(), b"release registry bytes\n")
+            self.assertNotIn("ordinary_forward_migration", manifest)
+            requests = [event[1][2] for event in events if event[0] == "command" and event[1][:2] == ("gh", "api")]
+            self.assertEqual(requests, [
+                "repos/scottopell/phoenix-ide/contents/scripts/launchd_deploy_helper.py?ref=" + "c" * 40,
+                "repos/scottopell/phoenix-ide/contents/crates/phoenix-db/src/migrations.rs?ref=" + "a" * 40,
+            ])
+            self.assertFalse(any(event[0] == "command" and event[1][0] == "git" for event in events))
+
+    def test_public_release_current_schema_preserves_distinct_helper_and_release_provenance(self):
+        self.test_release_current_schema_fetches_distinct_pinned_helper_and_release_registry(public=True)
+
+    def test_public_protected_release_uses_installed_environment_without_checkout_env(self):
+        read_env = self.dev._launchd_candidate_env
+        with self.deployment(paired=False, current=True, release=True, public=True) as (staging, controller, events):
+            self.assertFalse(controller.enabled)
+            self.assertIsNone(controller.prepared_artifact)
+            database = self.dev.PROD_DB_PATH.with_name("installed-custom.db")
+            database.touch()
+            installed_env = {
+                "PATH": "/installed/bin:/usr/bin",
+                "PHOENIX_PASSWORD": "installed-test-credential",
+                "PHOENIX_DB_PATH": str(database),
+                "PHOENIX_VERSION": "1.0.0",
+            }
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": installed_env}))
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 mock.patch.object(self.dev, "_launchd_candidate_env", side_effect=read_env), \
+                 mock.patch.object(self.dev, "_load_env_file", side_effect=AssertionError("checkout environment must not load")) as load_env, \
+                 mock.patch.object(self.dev, "capture_login_shell_path", side_effect=AssertionError("installed PATH required")) as login_path:
+                self.dev.launchd_prod_deploy("v2.0.0", controller=controller)
+                load_env.assert_not_called()
+                login_path.assert_not_called()
+                expected_env = installed_env | {"PHOENIX_VERSION": "2.0.0"}
+                candidate = plistlib.loads((staging / "candidate.plist").read_bytes())
+                self.assertEqual(candidate["EnvironmentVariables"], expected_env)
+                preflight_env = {key: value for key, value in installed_env.items() if key != "PHOENIX_VERSION"}
+                self.assertEqual(self.dev._preflight_prod_bind_auth.call_args_list, [
+                    mock.call(preflight_env, socket_activated=True),
+                    mock.call(preflight_env, socket_activated=True),
+                ])
+                self.assertEqual(self.dev.generate_launchd_plist.call_args.kwargs["path_override"], installed_env["PATH"])
+            manifest = json.loads((staging / "manifest.json").read_text())
+            self.assertEqual(manifest["current_schema_upgrade"]["database_path"], str(database))
+            self.assertIn(("status", "prepared"), events)
+            self.assertTrue(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_public_protected_release_unreadable_installed_plist_fails_before_claim_or_handoff(self):
+        read_env = self.dev._launchd_candidate_env
+        for missing in (False, True):
+            with self.subTest(missing=missing), self.deployment(paired=False, current=True, release=True, public=True) as (staging, controller, events):
+                if missing:
+                    self.dev.LAUNCHD_PLIST_PATH.unlink()
+                else:
+                    self.dev.LAUNCHD_PLIST_PATH.write_bytes(b"not a plist")
+                with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_launchd_candidate_env", side_effect=read_env), \
+                     mock.patch.object(self.dev, "_load_env_file", side_effect=AssertionError("checkout environment must not load")) as load_env, \
+                     mock.patch.object(self.dev, "_claim_launchd_deploy") as claim:
+                    with self.assertRaisesRegex(SystemExit, "installed launchd configuration is unreadable"):
+                        self.dev.launchd_prod_deploy("v2.0.0", controller=controller)
+                    load_env.assert_not_called()
+                    claim.assert_not_called()
+                    self.dev._prepare_release_candidate.assert_not_called()
+                self.assertFalse(staging.exists())
+                self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                self.assertFalse(any(event[0] == "command" for event in events))
+
+    def test_ordinary_controller_preflight_failure_prevents_handoff_for_all_sources(self):
+        for release in (False, True):
+            with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events), \
+                 mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=RuntimeError("unqualified interval")) as policy:
+                with self.assertRaisesRegex(RuntimeError, "unqualified interval"):
+                    self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+                policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
+                self.assertIn(("status", "precondition_failed"), events)
+                self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_existing_database_without_predecessor_fails_policy_before_handoff(self):
+        preflight = self.dev._preflight_ordinary_launchd_policy
+        registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        for release in (False, True):
+            with self.subTest(release=release), self.deployment(paired=False, release=release, predecessor=False) as (staging, controller, events):
+                database = staging.parents[2] / "configured.db"
+                with sqlite3.connect(database) as connection:
+                    connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                    connection.executemany(
+                        "INSERT INTO _migrations VALUES (?, ?)",
+                        [
+                            entry
+                            for entry in helper.migration_registry(
+                                registry, qualified_current_target=False,
+                            )
+                            if entry[0] <= 114
+                        ],
+                    )
+                before = database.read_bytes()
+                env = {"PATH": "/test", "PHOENIX_DB_PATH": str(database)}
+                plist = plistlib.dumps({"EnvironmentVariables": env}).decode()
+
+                def materialize(_commit, source_path, destination, _kind):
+                    self.assertEqual(source_path, "crates/phoenix-db/src/migrations.rs")
+                    destination.write_bytes(registry.read_bytes())
+
+                with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(env, None)), \
+                     mock.patch.object(self.dev, "generate_launchd_plist", return_value=plist), \
+                     mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_bytes(Path(helper.__file__).read_bytes())), \
+                     mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
+                     mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=preflight) as policy:
+                    with self.assertRaisesRegex(RuntimeError, "ordinary pending migration interval is not qualified"):
+                        self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+
+                policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
+                manifest = json.loads((staging / "manifest.json").read_text())
+                self.assertEqual(manifest["source_kind"], "published_release" if release else "local_head")
+                self.assertIsNone(manifest["previous"])
+                ordinary = manifest["ordinary_forward_migration"]
+                self.assertEqual(ordinary["database_path"], str(database))
+                self.assertEqual(ordinary["migration_registry_sha256"], self.dev._file_sha256(staging / "migrations.rs"))
+                self.assertEqual(ordinary["helper_sha256"], self.dev._file_sha256(staging / "activate.py"))
+                self.assertEqual(database.read_bytes(), before)
+                self.assertFalse(self.dev.PROD_DB_PATH.exists())
+                self.assertFalse((self.dev.LAUNCHD_INSTALL_DIR / "phoenix-ide").exists())
+                self.assertFalse(self.dev.LAUNCHD_PLIST_PATH.exists())
+                self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                self.assertIn(("status", "precondition_failed"), events)
+                self.assertNotIn(("status", "prepared"), events)
+                self.assertFalse(any(event[0] == "command" and event[1][0] == "launchctl" for event in events))
+
+    def test_fresh_database_path_switch_preserves_predecessor_rollback(self):
+        for release in (False, True):
+            with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events):
+                old_database = self.dev.PROD_DB_PATH
+                old_database.write_bytes(b"predecessor data")
+                new_database = old_database.with_name("fresh.db")
+                old_env = {"PATH": "/test", "PHOENIX_DB_PATH": str(old_database)}
+                self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": old_env}))
+                new_env = old_env | {"PHOENIX_DB_PATH": str(new_database)}
+                with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(new_env, None)), \
+                     mock.patch.object(self.dev, "generate_launchd_plist", return_value=plistlib.dumps({"EnvironmentVariables": new_env}).decode()), \
+                     mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=AssertionError("fresh DB has no migration interval")) as policy:
+                    self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+                policy.assert_not_called()
+                manifest = helper.Manifest.load(staging / "manifest.json")
+                self.assertIsNone(manifest.ordinary_forward_migration)
+                self.assertFalse((staging / "migrations.rs").exists())
+                self.assertFalse(new_database.exists())
+                self.assertIsNotNone(manifest.previous)
+
+                def health(manifest_arg, expected, **_kwargs):
+                    if expected == manifest.expected:
+                        new_database.write_bytes(b"candidate data")
+                        raise helper.ActivationError("candidate health failed")
+                    self.assertEqual(expected, manifest.previous)
+                    restored = plistlib.loads(Path(manifest_arg.target_plist).read_bytes())
+                    self.assertEqual(restored["EnvironmentVariables"]["PHOENIX_DB_PATH"], str(old_database))
+                    self.assertEqual(old_database.read_bytes(), b"predecessor data")
+
+                with mock.patch.object(helper, "validate_manifest_identities"), \
+                     mock.patch.object(helper, "Launchctl") as launchctl, \
+                     mock.patch.object(helper, "wait_for_identity", side_effect=health):
+                    launchctl.return_value.stop.return_value = 123
+                    state = helper.activate(manifest)
+                self.assertEqual(state, "activation_failed_rolled_back")
+                self.assertEqual(launchctl.return_value.start.call_count, 2)
+                self.assertEqual(Path(manifest.target_binary).read_bytes(), b"previous")
+                self.assertEqual(new_database.read_bytes(), b"candidate data")
+                self.assertEqual(old_database.read_bytes(), b"predecessor data")
+                self.assertTrue(helper.status_is_durable_terminal(manifest))
+                self.assertTrue(helper.release_durable_terminal_claim(manifest))
+                self.assertFalse(Path(manifest.active_path).exists())
+
+    def test_empty_first_install_skips_migration_policy_for_local_and_release(self):
+        for release in (False, True):
+            with self.subTest(release=release), self.deployment(paired=False, release=release, predecessor=False) as (staging, controller, events), \
+                 mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=AssertionError("empty install has no migration interval")) as policy:
+                self.assertFalse(self.dev.PROD_DB_PATH.exists())
+                self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+                policy.assert_not_called()
+                manifest = json.loads((staging / "manifest.json").read_text())
+                self.assertIsNone(manifest["previous"])
+                self.assertNotIn("ordinary_forward_migration", manifest)
+                self.assertFalse((staging / "migrations.rs").exists())
+                self.assertFalse(self.dev.PROD_DB_PATH.exists())
+                self.assertIn(("status", "prepared"), events)
+                self.assertTrue(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
 
     def test_ordinary_forward_installer_binds_candidate_registry_and_helper(self):
         with self.deployment(paired=False, current=False) as (staging, controller, events):
@@ -3061,6 +5637,42 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             self.assertLess(events.index(("file", "migrations.rs")), prepared)
             self.assertLess(events.index(("directory", staging)), prepared)
             self.assertLess(prepared, next(i for i, event in enumerate(events) if event[0] == "command" and "bootstrap" in event[1]))
+
+    def test_prepared114_receipt_candidate_gets_typed_evidence_from_exact_git_object(self):
+        commit = self.dev.PREPARED_SOURCE114_COMMIT
+        registry_bytes = subprocess.check_output(
+            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
+        )
+        with self.deployment(current=True, candidate_commit=commit, registry_bytes=registry_bytes) as (staging, controller, events), \
+             mock.patch.object(self.dev, "ROOT", staging / "different-controller-checkout"):
+            self.dev.launchd_prod_deploy(controller=controller)
+            manifest = json.loads((staging / "manifest.json").read_text())
+            current = manifest["current_schema_upgrade"]
+            self.assertEqual(manifest["source_commit"], commit)
+            self.assertEqual(manifest["expected"]["git_sha"], commit)
+            self.assertEqual(current["prepared_source_baseline"], 114)
+            self.assertEqual(current["candidate_registry_expected_sha256"], self.dev.PREPARED_SOURCE114_REGISTRY_SHA256)
+            self.assertEqual(current["migration_registry_sha256"], self.dev.PREPARED_SOURCE114_REGISTRY_SHA256)
+            self.assertEqual(current["controller_source_commit"], "d" * 40)
+            self.assertEqual((staging / "migrations.rs").read_bytes(), registry_bytes)
+            self.assertIn(("command", ("git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs")), events)
+            self.assertFalse(any(event[0] == "command" and event[1][:2] == ("gh", "api") for event in events))
+        with self.deployment(current=True) as (staging, controller, _events):
+            self.dev.launchd_prod_deploy(controller=controller)
+            current = json.loads((staging / "manifest.json").read_text())["current_schema_upgrade"]
+            self.assertNotIn("prepared_source_baseline", current)
+            self.assertNotIn("candidate_registry_expected_sha256", current)
+
+    def test_prepared114_controller_rejects_bad_registry_same_controller_and_dirty_checkout(self):
+        commit = self.dev.PREPARED_SOURCE114_COMMIT
+        for options, error in (({}, "registry SHA-256 mismatch"),
+                               ({"controller_commit": commit}, "different clean controller"),
+                               ({"dirty": True}, "clean controller checkout")):
+            with self.subTest(options=options), self.deployment(current=True, candidate_commit=commit, **options) as (staging, controller, events):
+                with self.assertRaisesRegex(SystemExit, error):
+                    self.dev.launchd_prod_deploy(controller=controller)
+                self.assertNotIn(("status", "prepared"), events)
+                self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
 
     def test_current_schema_rejects_dirty_controller_before_staging_registry(self):
         with self.deployment(current=True, dirty=True) as (staging, controller, events):
@@ -3304,6 +5916,105 @@ class PreparedArtifactTests(unittest.TestCase):
             self.dev.cmd_prod_deploy(controller=controller)
         deploy.assert_called_once_with(None, controller=controller)
         check.assert_not_called()
+
+    def test_public_current_schema_release_command_parses_and_dispatches_without_hidden_flags(self):
+        argv = ["dev.py", "prod", "deploy", "--release", "v2.0.0",
+                "--expected-full-commit", "a" * 40,
+                "--controller-source-commit", "c" * 40, "--current-schema-upgrade"]
+        with mock.patch.object(self.dev.sys, "argv", argv), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check, \
+             mock.patch.object(self.dev.sys.stdout, "reconfigure"), \
+             mock.patch.object(self.dev.sys.stderr, "reconfigure"):
+            self.dev.main()
+        options = deploy.call_args.kwargs["controller"]
+        self.assertEqual(deploy.call_args.args, ("v2.0.0",))
+        self.assertFalse(options.enabled)
+        self.assertIsNone(options.backend)
+        self.assertIsNone(options.exact_release_tag)
+        self.assertIsNone(options.expected_asset_name)
+        self.assertIsNone(options.expected_asset_sha256)
+        self.assertEqual(options.expected_full_commit, "a" * 40)
+        self.assertEqual(options.controller_source_commit, "c" * 40)
+        self.assertTrue(options.current_schema_upgrade)
+        check.assert_not_called()
+
+    def test_public_protected_release_option_matrix(self):
+        valid = self.dev.ProdDeployControllerOptions(
+            expected_full_commit="a" * 40, controller_source_commit="c" * 40,
+            current_schema_upgrade=True,
+        )
+        invalid = [
+            (None, valid), ("latest", valid), ("stable", valid), ("v2", valid),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit=None)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="c" * 12)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="C" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="a" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, expected_full_commit=None)),
+            ("v2.0.0", dataclasses.replace(valid, expected_full_commit="a" * 12)),
+            ("v2.0.0", dataclasses.replace(valid, expected_full_commit="A" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, current_schema_upgrade=False)),
+            ("v2.0.0", dataclasses.replace(valid, paired_database_upgrade=True)),
+            ("v2.0.0", dataclasses.replace(valid, prepared_artifact=Path("prepared"))),
+        ]
+        for release, options in invalid:
+            for entry in (self.dev.cmd_prod_deploy, self.dev.launchd_prod_deploy):
+                with self.subTest(release=release, options=options, entry=entry.__name__), \
+                     mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+                     mock.patch.object(self.dev, "cmd_check") as check, self.assertRaises(SystemExit):
+                    entry(release, controller=options)
+                claim.assert_not_called()
+                check.assert_not_called()
+        for platform, backend in (("linux", "native"), ("darwin", "daemon")):
+            with self.subTest(platform=platform, backend=backend), \
+                 mock.patch.object(self.dev.sys, "platform", platform), \
+                 mock.patch.object(self.dev, "detect_prod_env", return_value=backend), \
+                 mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+                 self.assertRaisesRegex(SystemExit, "only by macOS launchd"):
+                self.dev.cmd_prod_deploy("v2.0.0", controller=valid)
+            claim.assert_not_called()
+
+    def test_protected_release_controller_option_matrix(self):
+        valid = self.dev.ProdDeployControllerOptions(
+            enabled=True, backend="launchd", exact_release_tag="v2.0.0",
+            expected_full_commit="a" * 40, controller_source_commit="c" * 40,
+            current_schema_upgrade=True,
+        )
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check:
+            self.dev.cmd_prod_deploy("v2.0.0", controller=valid)
+            deploy.assert_called_once_with("v2.0.0", controller=valid)
+            check.assert_not_called()
+        invalid = (
+            (None, valid),
+            ("v2.0.0", dataclasses.replace(valid, enabled=False)),  # hidden bindings without controller mode
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit=None)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="c" * 12)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="C" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, controller_source_commit="a" * 40)),
+            ("v2.0.0", dataclasses.replace(valid, current_schema_upgrade=False)),
+            ("v2.0.0", dataclasses.replace(valid, paired_database_upgrade=True)),
+            ("v2.0.0", dataclasses.replace(valid, prepared_artifact=Path("prepared"))),
+            ("v2.0.0", dataclasses.replace(valid, backend="systemd")),
+            ("v2.0.0", dataclasses.replace(valid, expected_full_commit=None)),
+            ("v2.0.0", dataclasses.replace(valid, exact_release_tag=None)),
+            ("latest", valid),
+        )
+        for release, options in invalid:
+            for entry in (self.dev.cmd_prod_deploy, self.dev.launchd_prod_deploy):
+                with self.subTest(release=release, options=options, entry=entry.__name__), \
+                     mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+                     mock.patch.object(self.dev, "cmd_check") as check, \
+                     self.assertRaises(SystemExit):
+                    entry(release, controller=options)
+                claim.assert_not_called()
+                check.assert_not_called()
+        with mock.patch.object(self.dev.sys, "platform", "linux"), self.assertRaisesRegex(SystemExit, "only by macOS launchd"):
+            self.dev.cmd_prod_deploy("v2.0.0", controller=valid)
 
     def test_current_schema_options_require_triad_and_exclude_release(self):
         controller = self.dev.ProdDeployControllerOptions(

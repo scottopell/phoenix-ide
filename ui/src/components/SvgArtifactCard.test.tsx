@@ -6,7 +6,7 @@ import type { Message } from '../api';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 
 const artifact: SvgArtifact = { artifact_id: 'artifact-1', conversation_id: 'conv-1', title: 'Disk usage', description: 'Directory sizes in GiB.', width: 800, height: 400, validation: 'accepted_static_svg' };
-const result = (value: unknown): Message => ({ message_id: 'm', conversation_id: 'conv-1', sequence_id: 2, message_type: 'tool', content: { tool_use_id: 'tool-1', content: JSON.stringify(value), is_error: false }, display_data: null, created_at: '' });
+const result = (value: unknown): Message => ({ event_presentation: null, message_id: 'm', conversation_id: 'conv-1', sequence_id: 2, message_type: 'tool', content: { tool_use_id: 'tool-1', content: JSON.stringify(value), is_error: false }, display_data: null, created_at: '' });
 afterEach(() => vi.unstubAllGlobals());
 
 describe('SVG artifact presentation', () => {

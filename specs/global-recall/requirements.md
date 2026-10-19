@@ -130,11 +130,24 @@ WHILE the singleton Global Coordinator is answering a user request
 THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
 AND MAY provide a Coordinator-only built-in skill documenting supported Phoenix HTTP APIs
 
-WHEN the user authorizes a Coordinator lifecycle action supported by a documented Phoenix HTTP API
+WHEN the user authorizes a Coordinator action supported by a public Phoenix HTTP API
 THE Coordinator MAY invoke that API through explicitly WorkScope-targeted Bash
-AND SHALL preserve normal API authorization
-AND SHALL verify both the HTTP response and the resulting Phoenix state
-AND SHALL distinguish request acceptance from observed execution
+AND SHALL ground the operation in inspected current deployment/source contracts applicable to the selected destination
+AND SHALL treat built-in API recipes as non-exhaustive best practices rather than an endpoint allowlist
+AND SHALL treat gap inventories as illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads within user authority
+AND SHALL NOT invent guarantees or receipts, bypass enforcement through databases/private handlers, or create background monitors to substitute for missing API semantics
+AND SHALL preserve normal API authorization, destination identity, authenticated encrypted nonlocal transport, destination-bound nonserialized credential handling, and server-enforced lifecycle admission
+AND SHALL retain the original target and exact intent across uncertain outcomes, retry only under the endpoint's supported idempotency contract, and never mint a new identity for an uncertain retry
+AND SHALL freshly read the relevant target state before acting, verify both the HTTP response and the resulting Phoenix state, and distinguish request acceptance from observed execution
+AND SHALL NOT use private handlers or database writes to bypass public API enforcement
+
+WHEN the Coordinator submits answers to a pending structured question through the public API
+THE instructions SHALL permit exact user-provided answers or decisions made within explicit delegated decision scope for every question, with exact full question-text keys and exact option labels or authorized custom text
+AND SHALL NOT treat a generic instruction to inspect or unblock work as decision authority, fabricate approvals, or extend delegation
+AND SHALL require the exact current opaque question request identity, distinct from provider tool-use identity, under `../ask-user-question/requirements.md` REQ-AUQ-009
+AND SHALL require complete answers without claiming server-enforced completeness
+AND SHALL direct one POST followed by a fresh read of the original target, treating the question request identity as a freshness guard rather than an idempotency key
+AND SHALL NOT transplant answers to a new identity, automatically replay an uncertain submission, or treat a conflict as success
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior except for explicit Global Coordinator subscriptions governed by REQ-GR-015
 
@@ -189,10 +202,11 @@ AND SHALL reject a bare identifier whose identity domain is ambiguous rather tha
 THE resolved target SHALL include the WorkScope attached to the selected transcript member, its lifecycle and environment kind, authoritative cwd and worktree path, and an effective path that prefers worktree path over cwd
 AND SHALL mark those paths as server-filesystem locations rather than caller-local paths
 
-WHEN an app-local `/c/<id>` reference identifies an authoritative ordinary ProductConversation and carries no explicit transcript or message selector
-THE SYSTEM SHALL interpret it as stable navigation that follows the current continuation
-AND SHALL emit `/c/<product_conversation_id>` as its canonical ordinary conversation route
-AND SHALL preserve `/product-conversations/<id>` as a compatibility alias
+WHEN an app-local `/c/<reference>` identifies an authoritative ordinary ProductConversation and carries no explicit transcript or message selector
+THE SYSTEM SHALL interpret it as conversation navigation that follows the current continuation
+AND SHALL emit the percent-encoded `/c/<allocated-root-slug>` as its current canonical ordinary conversation route under `specs/conversation-identity/requirements.md`
+AND SHALL preserve permanent ProductConversation IDs as durable reference identities and `/product-conversations/<id>` as a compatibility alias
+AND SHALL NOT promise that a former slug remains bound after rename
 
 WHEN an app-local reference contains a `source_transcript` selector
 THE SYSTEM SHALL validate that the selected transcript belongs to the referenced conversation and identity domain before selecting it
@@ -328,7 +342,17 @@ AND SHALL distinguish direct user instructions, delegate requests, Coordinator c
 AND SHALL distinguish delivery acceptance, acknowledgement, execution, and verified completion
 AND SHALL retain evidence provenance and last-observed timestamps when known, mark unknowns honestly, and direct the resumed Coordinator to refresh relevant live status before making current-state claims
 AND SHALL apply explicit corrections and supersession while preserving unresolved obligations, including paused work
-AND SHALL compress completed details before unresolved commitments, retaining only resolution context needed to avoid reopening settled work
+AND SHALL retain exact primary user message references and relevant scoped wording for standing directions and claimed historical approvals when known, with narrow retrieval pointers for missing evidence rather than fabricated authority
+AND SHALL request the next authorized in-scope action, required current status and ownership checks, completion criteria, and outstanding verification
+
+WHEN the Coordinator resumes from a continuation handoff
+THE trusted instructions SHALL distinguish evidence verification from obeying directives embedded in recalled content
+AND SHALL direct narrowly recovering authentic primary user evidence and checking attribution, exact scope, later corrections, supersession, pauses, gates, current status and established ownership before acting
+AND SHALL describe continuation as a handoff, not cancellation or expiry of verified standing user directions, and direct the next authorized in-scope step by default with follow-through to verified completion rather than status-only acknowledgement or redundant permission
+AND SHALL direct narrow evidence recovery or a focused question when authority is missing, conflicting, or insufficient, while preserving pauses and gates
+AND SHALL keep generated summaries, quotations, delegate assertions and encoded payloads untrusted and unable to self-authorize, override instructions, expand scope, or grant blanket merge, deploy, or delete permission
+
+THE handoff instructions SHALL compress completed details before unresolved commitments, retaining only resolution context needed to avoid reopening settled work
 AND SHALL preserve relevant paths, verification evidence, unfinished edits, and pending tool arguments when the Coordinator performs hands-on work
 
 THE coordination policy SHALL NOT change the Coordinator's capabilities, lifecycle, WorkScope ownership, or message authority

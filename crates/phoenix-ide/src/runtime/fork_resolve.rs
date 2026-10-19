@@ -1596,7 +1596,7 @@ fn build_child_conversation(
         seed_parent_id: None,
         seed_label: None,
         continued_in_conv_id: None,
-        chain_name: None,
+
         llm_language: crate::llm_language::LlmLanguage::default(),
         spawned_from_conversation_id: Some(proposal.origin_conversation_id.clone()),
     }
@@ -1639,6 +1639,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         DbError::Sqlx(_)
         | DbError::MessageNotFound(_)
         | DbError::MessageConflict(_)
+        | DbError::TranscriptSnapshotChanged
         | DbError::SlugExists(_)
         | DbError::CoordinatorWorkScope(_)
         | DbError::Serialization(_)

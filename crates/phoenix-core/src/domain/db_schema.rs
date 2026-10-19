@@ -548,13 +548,6 @@ pub struct Conversation {
     /// `#[serde(default)]` handles old DB rows that predate this column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_in_conv_id: Option<String>,
-    /// User-set name for the chain rooted at this conversation
-    /// (REQ-CHN-007). Only meaningful on the root of a chain; ignored at
-    /// read time on non-root members. NULL means "use this conversation's
-    /// title as the displayed chain name." `#[serde(default)]` handles old
-    /// DB rows that predate this column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_name: Option<String>,
     /// LLM-facing prose language fixed at creation (e.g. `phoenix-native`,
     /// `caveman`). Chain continuations and sub-agents inherit it.
     /// `#[serde(default)]` handles old DB rows that predate this column.
@@ -2223,7 +2216,7 @@ mod conversation_serde_tests {
             seed_parent_id: None,
             seed_label: None,
             continued_in_conv_id,
-            chain_name: None,
+
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }
