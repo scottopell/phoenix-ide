@@ -177,4 +177,4 @@ After finalizing the validated receipt, the workflow SHALL hash its exact bytes.
 
 This operation SHALL NOT create or move tags, mutate or publish GitHub Releases, deploy, install, or expand compatibility admission under `specs/compatibility/requirements.md` REQ-COMP-015. It SHALL NOT authorize any other candidate, version, Linux architecture/target, operation, or ordinary preparation/release behavior. Its Linux target does not alter REQ-DESKTOP-REL-012's ARM-only operation or the normal two-architecture macOS preparation/release requirements.
 
-In `specs/compatibility/requirements.md`, this prepared artifact is not a compatibility-admitted source or authorization for bare-Linux activation, migration, downgrade, rollback, or any deployment facility.
+Artifact production alone grants no deployment or compatibility authority. The exact prepared-systemd source is admitted only under `specs/compatibility/requirements.md` REQ-COMP-016 and `specs/production-deployment/requirements.md` REQ-PD-029, including independent receipt-digest admission. No bare-Linux activation, downgrade, predecessor rollback, or other deployment source is admitted.

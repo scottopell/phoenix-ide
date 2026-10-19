@@ -673,7 +673,7 @@ class LinuxReceiptEvidenceTests(unittest.TestCase):
         self.assertIn("artifact_id: ${{ steps.evidence.outputs.artifact_id }}", job)
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("always()", evidence)
-        shell = step_shell("Publish authenticated Linux receipt evidence")
+        shell = textwrap.dedent(evidence.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as temp:
             summary, output = Path(temp) / "summary", Path(temp) / "output"
             env = dict(os.environ, RECEIPT_SHA256="a" * 64, ARTIFACT_ID="42",
