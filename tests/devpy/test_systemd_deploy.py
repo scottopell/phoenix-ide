@@ -801,7 +801,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
 
     def test_linux_prepared_manifest_retains_receipt_and_separate_provenance(self):
         import platform
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as registry_dir:
             base = Path(td)
             binary, receipt = self.linux_prepared_directory(base)
             from scripts import systemd_deploy_helper as linux_helper
@@ -813,7 +813,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 registry_match.group(2), count=1, flags=re.DOTALL,
             )
             self.assertEqual(removed, 1)
-            historical_registry = base / "qualified-128-migrations.rs"
+            historical_registry = Path(registry_dir) / "qualified-128-migrations.rs"
             historical_registry.write_text(registry_source[:registry_match.start(2)] + historical_entries
                                            + registry_source[registry_match.end(2):])
             registry_sha = self.dev._file_sha256(historical_registry)

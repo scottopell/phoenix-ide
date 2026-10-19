@@ -2,39 +2,35 @@
 
 ## Requirements Summary
 
-The chains spec describes the normative unified ProductConversation surface for continuation-linked transcript history and read-only recall. The shipped implementation still uses a derived root-keyed chain identity, dedicated chain page, persisted chain Q&A, and editable chain naming as compatibility behavior.
+The chains spec describes one ProductConversation with continuation-linked transcript history and read-only recall. The naming source in PR #951 makes the root title authoritative and retires duplicate naming mutations. Legacy root-keyed Q&A persistence and archive/delete compatibility surfaces remain; this is not a claim that every chain-specific lifecycle divergence is removed.
 
-## Current Reality
+## Current Source Reality
 
-Chains are still fully shipped current behavior. The UI still exposes a dedicated chain route (`/chains/:rootConvId`), chain grouping in the sidebar, chain archive/delete endpoints, and chain Q&A streaming. This remains an explicit implementation divergence from the newer unified-conversation normative direction: continuation is still surfaced as a first-class chain product concept rather than only as one conversation with multiple transcript segments.
+`/chains/:rootConvId` redirects to the ordinary conversation surface. The unrouted ChainPage management implementation is retired; its live `ChainQaColumn` is retained within ProductConversationPage. Sidebar/list naming uses ProductConversation identity and authoritative aggregate responses. The backend retains root-keyed chain snapshot, Q&A and archive/delete compatibility routes, but not chain-name or transcript-name mutation routes. Historical read aliases, immutable UUIDs and exact evidence are preserved.
 
-Code anchors for that current reality include `crates/phoenix-ide/src/api/chains.rs`, route registration in `crates/phoenix-ide/src/api/handlers.rs`, lazy `ChainPage` routing in `ui/src/App.tsx`, and sidebar navigation to `/chains/...` in `ui/src/components/ConversationList.tsx`.
+Code anchors are `api/chains.rs`, `api/handlers.rs`, `App.tsx`, `ProductConversationPage`, `ChainQaColumn` and `chainReducer`.
 
 ## Technical Summary
 
-The answer phase streams tokens immediately and emits `chain_qa_answer_reset`
-between rejected tool-calling attempts when a retry follows. Both page listeners
-clear only the matching question through `chainReducer`; failure preserves only
-the last attempt's partial text. Coverage includes the denied-call QA event
-sequence, request-budget exhaustion, wire serialization, and reducer isolation.
+Migration129 folds effective names into canonical root `title` and removes persisted `chain_name`; `chain_qa` remains persisted. Manual and generated naming share ProductConversation validation, immutable ownership, admission and transactional projection allocation. Generated work is fenced by an opaque naming revision, including A→B→A changes. ADR-131 records the authority decision; ADR-132 records audited mutation retirement.
 
-The staged v0.14 naming change removes persisted `chain_name` in migration 129 and routes legacy naming endpoints to the root title authority; `chain_qa` remains persisted. This is not deployed or compiled qualification. The chain page still resolves work identity from the active member, and chain-scoped SSE/Q&A remain separate from ordinary conversation SSE.
+Lineage Q&A retains its chain-scoped stream and reducer. The answer phase emits `chain_qa_answer_reset` between rejected tool-calling attempts; failure preserves only the final attempt's partial text. ProductConversationPage hosts the live Q&A component; direct component and routed Recall tests retain streaming, read-only and error/reask coverage.
 
-## Status Summary
+## Source Coverage and Remaining Gaps
 
-| Requirement | Status | Notes |
-|---|---|---|
-| **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ✅ Complete (legacy current reality) | Chain-scoped read-only Q&A remains shipped |
-| **REQ-CHN-002:** Continuation Lineage Is Navigation Topology, Not a Separate Product Entity | Not implemented | Shipped derived root-keyed chain identity and sidebar grouping remain; first-class ProductConversation aggregate identity is not yet the navigation authority. |
-| **REQ-CHN-003:** The Normal Conversation Surface Hosts Lineage History | Not implemented | Shipped behavior still uses the dedicated chain route/page. |
-| **REQ-CHN-004:** Lineage Q&A Streams on the Normal Conversation Surface | 🟡 Partial | Streaming lineage Q&A is shipped on the legacy chain page, not the normal ProductConversation surface. |
-| **REQ-CHN-005:** Q&A History Persists With the Product Conversation | 🟡 Partial | `chain_qa` persistence remains root-row/chain keyed rather than aggregate-owned. |
-| **REQ-CHN-006:** Independent Q&A Quality As History Accumulates | ✅ Complete (legacy current reality) | Stateless per-question invocation remains shipped. |
-| **REQ-CHN-007:** Conversation Title Belongs to the ProductConversation Aggregate | Staged backend implementation | Root title is sole name authority; migration 129 and focused regressions authored. Compiled and UI qualification remain pending; see `specs/conversation-identity/executive.md`. |
-| **REQ-CHN-008:** The Normal Conversation Surface Shows Work Identity for the Live Attached Scope | 🟡 Partial | Work identity is shipped on the legacy chain page rather than the normal ProductConversation surface. |
-| **REQ-CHN-009:** Lineage Q&A Is a Read-Only Agentic Loop Scoped to One Product Conversation | 🟡 Partial | The retrieval-backed loop is shipped but remains bound to root-keyed chain identity. |
-| **REQ-CHN-010:** No Separate Chain-Specific Lifecycle or Management Actions | Not implemented | Dedicated chain naming, archive/delete, and management endpoints remain shipped. |
+| Requirement | Source coverage / remaining gap |
+|---|---|
+| REQ-CHN-001 | Retrieval-backed read-only Q&A and persisted answers retained. |
+| REQ-CHN-002 | ProductConversation identity drives ordinary navigation; root-keyed compatibility representation remains in chain retrieval/Q&A. |
+| REQ-CHN-003 | Ordinary ProductConversation surface hosts lineage selection; legacy chain URL redirects. |
+| REQ-CHN-004 | Live `ChainQaColumn` is hosted on ProductConversationPage; separate chain-scoped SSE remains. |
+| REQ-CHN-005 | `chain_qa` persistence remains root-row keyed rather than aggregate-owned. |
+| REQ-CHN-006 | Stateless independent per-question invocation retained. |
+| REQ-CHN-007 | Root title is sole authority; migration129 and canonical manual/generated operations replace duplicate mutation routes. |
+| REQ-CHN-008 | Ordinary live conversation receives latest WorkScope identity; no separate ChainPage work-scope dock remains. |
+| REQ-CHN-009 | Retrieval loop remains read-only and lineage-scoped; root-keyed internals remain. |
+| REQ-CHN-010 | Duplicate naming mutations and unrouted chain management UI retired; archive/delete compatibility endpoints remain a lifecycle gap. |
 
-## Reconciliation Note
+## Qualification Boundary
 
-This executive intentionally reports chains as current implementation, not as the desired long-term product model. The unified lifecycle work in sibling specs aims to remove the dedicated chain page and treat continuation as one conversation aggregate, but that cutover has not landed in code.
+Naming cleanup source `c1ed17600` passed exact normal CI39187737093 and macOS39187737161 with a clean exact-head review. Installer/producer actual main is integrated in this branch, but the integration successor requires its own hosted checks and review, tracked on PR #951. No production migration, deployment or browser/device acceptance is implied. Status updates belong on the PR rather than progress-only source commits.
