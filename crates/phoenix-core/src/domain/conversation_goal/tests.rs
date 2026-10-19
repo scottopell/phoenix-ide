@@ -269,3 +269,77 @@ fn fabricated_fresh_report_cannot_release_suspended_blocked_or_terminal_state() 
         );
     }
 }
+
+#[test]
+fn checkpoint_payload_roundtrips_exact_mutation_actor_and_fence() {
+    let snapshot = initial();
+    let mut commands = vec![
+        mutation(
+            0,
+            GoalChange::Create {
+                goal_id: GoalId::parse("next-goal").unwrap(),
+                objective: text("  exact objective — no deployment  "),
+            },
+        ),
+        report(&snapshot),
+    ];
+    for disposition in [
+        GoalDisposition::Underway,
+        GoalDisposition::Blocked(text("restore access")),
+        GoalDisposition::Suspended(text("stopped")),
+        GoalDisposition::Complete(text("done")),
+        GoalDisposition::Exhausted(text("limit")),
+    ] {
+        commands.push(set(&snapshot, disposition));
+    }
+    for command in commands {
+        let bytes = serde_json::to_vec(&command).unwrap();
+        let restored: GoalMutation = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored, command);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+    }
+    let inactive = GoalExecutionBinding {
+        owner: snapshot.owner.clone(),
+        execution: GoalExecution::parse(41, 57).unwrap(),
+        observation: GoalAdmissionObservation::NoGoal {
+            observed_version: snapshot.version,
+        },
+    };
+    let restored: GoalExecutionBinding =
+        serde_json::from_value(serde_json::to_value(&inactive).unwrap()).unwrap();
+    assert_eq!(restored, inactive);
+}
+
+#[test]
+fn checkpoint_deserialization_preserves_checked_scalar_invariants_and_requires_fields() {
+    for value in ["", " ", "\n\t"] {
+        let encoded = serde_json::to_string(value).unwrap();
+        assert!(serde_json::from_str::<GoalText>(&encoded).is_err());
+        assert!(serde_json::from_str::<GoalId>(&encoded).is_err());
+    }
+    for value in [-1, i64::MIN] {
+        assert!(serde_json::from_value::<GoalVersion>(serde_json::json!(value)).is_err());
+        assert!(serde_json::from_value::<GoalTimestampUs>(serde_json::json!(value)).is_err());
+    }
+    for (workflow, turn) in [(0, 1), (1, 0), (-1, 1), (1, -1)] {
+        assert!(serde_json::from_value::<GoalExecution>(
+            serde_json::json!({"workflow_id":workflow,"turn_id":turn})
+        )
+        .is_err());
+    }
+    let serialized = serde_json::to_value(report(&initial())).unwrap();
+    for field in [
+        "owner",
+        "expected_version",
+        "action_id",
+        "attribution",
+        "change",
+    ] {
+        let mut missing = serialized.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<GoalMutation>(missing).is_err(),
+            "missing {field} must not fabricate a pending command"
+        );
+    }
+}

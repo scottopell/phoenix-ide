@@ -1,4 +1,6 @@
-//! Dormant ordinary-conversation goal storage vocabulary.
+//! Ordinary-conversation goal storage and checkpoint vocabulary.
+
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::product_conversation::ProductConversationId;
 
@@ -16,8 +18,15 @@ pub enum GoalError {
     ReportBindingRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct GoalText(String);
+
+impl<'de> Deserialize<'de> for GoalText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl GoalText {
     /// # Errors
@@ -36,7 +45,8 @@ impl GoalText {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct GoalId(GoalText);
 
 impl GoalId {
@@ -52,8 +62,15 @@ impl GoalId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
 pub struct GoalVersion(i64);
+
+impl<'de> Deserialize<'de> for GoalVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(i64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl GoalVersion {
     pub const INITIAL: Self = Self(0);
@@ -77,8 +94,15 @@ impl GoalVersion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct GoalTimestampUs(i64);
+
+impl<'de> Deserialize<'de> for GoalTimestampUs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(i64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl GoalTimestampUs {
     /// # Errors
@@ -96,10 +120,22 @@ impl GoalTimestampUs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct GoalExecution {
     workflow_id: i64,
     turn_id: i64,
+}
+
+impl<'de> Deserialize<'de> for GoalExecution {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireExecution {
+            workflow_id: i64,
+            turn_id: i64,
+        }
+        let wire = WireExecution::deserialize(deserializer)?;
+        Self::parse(wire.workflow_id, wire.turn_id).map_err(serde::de::Error::custom)
+    }
 }
 
 impl GoalExecution {
@@ -126,7 +162,7 @@ impl GoalExecution {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalAgentSource {
     pub product_conversation_id: ProductConversationId,
     pub transcript_id: GoalText,
@@ -136,7 +172,7 @@ pub struct GoalAgentSource {
 }
 
 /// `UserApi` denotes the trusted input channel, not proof of biological authorship.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalActor {
     UserApi {
         transcript_id: GoalText,
@@ -149,13 +185,13 @@ pub enum GoalActor {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalAttribution {
     pub requested_by: GoalActor,
     pub applied_by: GoalActor,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalState {
     Underway,
     Blocked(GoalText),
@@ -164,7 +200,7 @@ pub enum GoalState {
     Exhausted(GoalText),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalDisposition {
     Underway,
     Blocked(GoalText),
@@ -186,7 +222,7 @@ impl GoalDisposition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalSnapshot {
     pub owner: ProductConversationId,
     pub goal_id: GoalId,
@@ -195,7 +231,7 @@ pub struct GoalSnapshot {
     pub state: GoalState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalFence {
     pub owner: ProductConversationId,
     pub goal_id: GoalId,
@@ -213,20 +249,20 @@ impl GoalSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalAdmissionObservation {
     NoGoal { observed_version: GoalVersion },
     Goal(GoalFence),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalExecutionBinding {
     pub owner: ProductConversationId,
     pub execution: GoalExecution,
     pub observation: GoalAdmissionObservation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalChange {
     Create {
         goal_id: GoalId,
@@ -242,7 +278,7 @@ pub enum GoalChange {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalMutation {
     pub owner: ProductConversationId,
     pub expected_version: GoalVersion,
@@ -331,7 +367,7 @@ impl GoalMutation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalHistoryEntry {
     pub snapshot: GoalSnapshot,
     pub mutation: GoalMutation,

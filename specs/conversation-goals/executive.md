@@ -22,6 +22,12 @@ Exact M1 checkpoint `c7d9794f5c8beb06cd634e8de1a3458b268be3a3` normal run3928729
 
 Five admission regressions are authored in `workflow/direct_turn/tests/goal_capture.rs`: no-goal exact replay, Underway fence plus wrong-workflow refusal, Blocked nonactivation, before/after-commit atomicity, and steering exclusion. Combined authored count is **54**, not a passing-test claim. M2 normal CI39290326736/Rust118189160877 remains blocked by inherited federation compile errors (including missing presentation, obsolete federation test APIs/fields and dynamic-SQL test string); no goal pass is established. M1's132 SQL/registry remains unchanged.
 
+### Pending report checkpoint preparation
+
+Goal mutation, actor and immutable binding vocabulary has lossless serde encoding for the existing earned runtime-state/checkpoint aggregate. Checked text/counter/time/execution decoders invoke their constructors, rather than permitting blank identifiers or invalid IDs through derived deserialization. Required command fields have no defaults or skip-serialization paths. Two pure regressions cover exact command/actor/fence roundtrip and invalid/missing-field refusal (**56 total authored; zero proved passing**). This encoding is data, not source authentication or execution authority; a pending ToolResult variant and full-round finalizer are not installed by this preparation.
+
+The exact federation source-repair descendant `866e5e56dd4d6a2276b2a741bd2459629af3dd7d` was non-destructively merged after parent integration approval. Its seven-file diff from the coordinated f744 base adds the genuine missing presentation module and owner-authored source/client corrections, without migrations or ADR changes. This is not federation qualification or a new schema reservation. A separate source-reviewed capture-test fix names the goal identity on its Blocked disposition request.
+
 ## Selected model
 
 - Ordinary stable ProductConversation owns each immutable goal identity and objective; no WorkScope is required. Objective is stored once on the immutable identity row, never repeated as writable history data.
