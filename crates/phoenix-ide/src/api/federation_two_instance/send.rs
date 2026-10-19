@@ -535,7 +535,10 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
     receiver.stop().await;
 }
 
-async fn materialize_received(instance: &TestInstance, transcript: &str) -> crate::db::Message {
+pub(super) async fn materialize_received(
+    instance: &TestInstance,
+    transcript: &str,
+) -> crate::db::Message {
     use phoenix_db::workflow::{
         ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
         MaterializeAuthoritativeTurnOutcome,
@@ -565,7 +568,13 @@ async fn materialize_received(instance: &TestInstance, transcript: &str) -> crat
             turn_id: turn.id,
             authority: claim.authority.unwrap(),
             prepared: PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap(),
-            sequence_id: 1,
+            sequence_id: instance
+                .state
+                .db
+                .get_last_sequence_id(transcript)
+                .await
+                .unwrap()
+                + 1,
             created_at: timestamp,
             accepted_state: crate::db::ConvState::LlmRequesting { attempt: 1 },
             state_updated_at: now,

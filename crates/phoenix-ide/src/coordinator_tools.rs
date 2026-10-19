@@ -276,15 +276,18 @@ struct UnwatchConversation(crate::db::Database);
 struct ListWatchedConversations(crate::db::Database);
 struct SafeRetryClose(Arc<SendChatApplicationService>);
 
-fn watch_id(
-    input: &Value,
-) -> Result<phoenix_core::domain::product_conversation::ProductConversationId, String> {
-    let id = input
-        .get("product_conversation_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "product_conversation_id is required".to_string())?;
-    phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
-        .map_err(|error| error.to_string())
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchInput {
+    product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+    #[serde(default, deserialize_with = "present_instance_selector")]
+    instance: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListWatchInput {
+    #[serde(default, deserialize_with = "present_instance_selector")]
+    instance: Option<String>,
 }
 
 fn watch_output(value: impl Serialize) -> ToolOutput {
@@ -303,13 +306,27 @@ impl Tool for WatchConversation {
         "Subscribe this Global Coordinator to future terminal facts for an open ordinary stable ProductConversation. Returns its current transcript and state atomically with enrollment. No historical events are replayed.".into()
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1}},"required":["product_conversation_id"],"additionalProperties":false})
+        json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1,"maxLength":1024},"instance":{"type":"string","minLength":1,"maxLength":1024,"description":"Optional exact enrolled instance UUID or unambiguous saved-peer name. Omit for local only; explicit remote never falls back."}},"required":["product_conversation_id"],"additionalProperties":false})
     }
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
-        let id = match watch_id(&input) {
-            Ok(id) => id,
-            Err(error) => return ToolOutput::error(error),
+        let parsed = match serde_json::from_value::<WatchInput>(input) {
+            Ok(parsed) => parsed,
+            Err(error) => return ToolOutput::error(error.to_string()),
         };
+        if let Some(instance) = parsed.instance {
+            return match crate::api::federation::subscriptions::create_saved_peer_subscription(
+                &self.0,
+                instance,
+                parsed.product_conversation_id,
+                None,
+            )
+            .await
+            {
+                Ok(remote) => watch_output(remote),
+                Err(error) => ToolOutput::error(error),
+            };
+        }
+        let id = parsed.product_conversation_id;
         match self.0.watch_product_conversation(&id).await {
             Ok(snapshot) => watch_output(snapshot),
             Err(error) => ToolOutput::error(error.to_string()),
@@ -326,13 +343,26 @@ impl Tool for UnwatchConversation {
         "End this Global Coordinator's subscription to a stable ProductConversation. Suppress pending but not already accepted notifications.".into()
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1}},"required":["product_conversation_id"],"additionalProperties":false})
+        json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1,"maxLength":1024},"instance":{"type":"string","minLength":1,"maxLength":1024,"description":"Optional exact enrolled instance UUID or unambiguous saved-peer name. Omit for local only; explicit remote never falls back."}},"required":["product_conversation_id"],"additionalProperties":false})
     }
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
-        let id = match watch_id(&input) {
-            Ok(id) => id,
-            Err(error) => return ToolOutput::error(error),
+        let parsed = match serde_json::from_value::<WatchInput>(input) {
+            Ok(parsed) => parsed,
+            Err(error) => return ToolOutput::error(error.to_string()),
         };
+        if let Some(instance) = parsed.instance {
+            return match crate::api::federation::subscriptions::unsubscribe_saved_peer(
+                &self.0,
+                instance,
+                parsed.product_conversation_id,
+            )
+            .await
+            {
+                Ok(receipt) => watch_output(receipt),
+                Err(error) => ToolOutput::error(error),
+            };
+        }
+        let id = parsed.product_conversation_id;
         match self.0.unwatch_product_conversation(&id).await {
             Ok(ended) => watch_output(json!({"product_conversation_id": id, "ended": ended})),
             Err(error) => ToolOutput::error(error.to_string()),
@@ -346,12 +376,35 @@ impl Tool for ListWatchedConversations {
         "list_watched_conversations"
     }
     fn description(&self) -> String {
-        "List active Global Coordinator stable-conversation subscriptions and their current transcript and state.".into()
+        "List local active watches, or durable remote subscriptions for one explicit saved instance with lifecycle and admitted cursor (not a live remote snapshot). No remote fallback.".into()
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object","additionalProperties":false})
+        json!({"type":"object","properties":{"instance":{"type":"string","minLength":1,"maxLength":1024}},"additionalProperties":false})
     }
-    async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
+        let parsed = match serde_json::from_value::<ListWatchInput>(input) {
+            Ok(parsed) => parsed,
+            Err(error) => return ToolOutput::error(error.to_string()),
+        };
+        if let Some(instance) = parsed.instance {
+            let selector =
+                match phoenix_core::domain::instance_identity::InstanceSelector::parse(instance) {
+                    Ok(selector) => selector,
+                    Err(error) => return ToolOutput::error(error.to_string()),
+                };
+            let peer = match self.0.resolve_federation_peer(&selector).await {
+                Ok(peer) => peer,
+                Err(error) => return ToolOutput::error(error.to_string()),
+            };
+            return match self
+                .0
+                .remote_subscriptions(Some(peer.peer_instance_id), 1024)
+                .await
+            {
+                Ok(rows) => watch_output(rows),
+                Err(error) => ToolOutput::error(error.to_string()),
+            };
+        }
         match self.0.list_coordinator_watches().await {
             Ok(watches) => watch_output(watches),
             Err(error) => ToolOutput::error(error.to_string()),
@@ -1270,6 +1323,47 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn subscription_instance_selector_omission_is_the_only_local_selection() {
+        let product = "colliding-local-product";
+        assert!(
+            serde_json::from_value::<WatchInput>(json!({"product_conversation_id": product}))
+                .unwrap()
+                .instance
+                .is_none()
+        );
+        assert!(serde_json::from_value::<ListWatchInput>(json!({}))
+            .unwrap()
+            .instance
+            .is_none());
+        for instance in [Value::Null, json!(true), json!(42), json!([]), json!({})] {
+            assert!(serde_json::from_value::<WatchInput>(
+                json!({"product_conversation_id": product, "instance": instance.clone()})
+            )
+            .is_err());
+            assert!(
+                serde_json::from_value::<ListWatchInput>(json!({"instance": instance})).is_err()
+            );
+        }
+        let peer = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            serde_json::from_value::<WatchInput>(
+                json!({"product_conversation_id": product, "instance": peer})
+            )
+            .unwrap()
+            .instance
+            .as_deref(),
+            Some(peer)
+        );
+        assert_eq!(
+            serde_json::from_value::<ListWatchInput>(json!({"instance": peer}))
+                .unwrap()
+                .instance
+                .as_deref(),
+            Some(peer)
+        );
+    }
 
     #[test]
     fn snapshot_instability_is_reported_as_an_error_message() {

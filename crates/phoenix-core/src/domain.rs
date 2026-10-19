@@ -9,6 +9,7 @@ pub mod close;
 pub mod conversation_reference;
 pub mod creation_protocol;
 pub mod db_schema;
+pub mod federation_subscription;
 pub mod instance_identity;
 pub mod kill_signal;
 pub mod llm_error_kind;

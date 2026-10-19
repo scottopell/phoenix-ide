@@ -11,6 +11,7 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod federated_subscriptions;
 mod retire_commission_review;
 mod settle_historical_continuation;
 
@@ -665,6 +666,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 130,
         name: "normalized_remote_input_origin",
         sql: "",
+    },
+    Migration {
+        version: 131,
+        name: "bounded_federated_terminal_subscriptions",
+        sql: include_str!("federation_subscriptions/schema.sql"),
     },
 ];
 
@@ -12117,6 +12123,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             continue;
         }
 
+        if migration.version == 131 {
+            federated_subscriptions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 130 {
             run_migration_130(pool, migration).await?;
             applied += 1;
@@ -14878,6 +14890,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (131, "bounded_federated_terminal_subscriptions"),
             (130, "normalized_remote_input_origin"),
             (129, "single_conversation_name_and_route_projection"),
             (128, "product_creation_provisioning_stage"),
@@ -15212,7 +15225,7 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO _migrations (version, name) VALUES (130, 'fixture_skip_remote_origin')",
+            "INSERT INTO _migrations (version, name) VALUES (130, 'fixture_skip_remote_origin'), (131, 'fixture_skip_subscriptions')",
         )
         .execute(db.pool())
         .await
@@ -15226,7 +15239,7 @@ with tempfile.TemporaryDirectory() as directory:
             .await
             .unwrap();
         let ledger_before: Vec<(i64, String, String)> =
-            sqlx::query_as("SELECT version, name, applied_at FROM _migrations ORDER BY version")
+            sqlx::query_as("SELECT version, name, applied_at FROM _migrations WHERE version <= 129 ORDER BY version")
                 .fetch_all(db.pool())
                 .await
                 .unwrap();
@@ -15380,6 +15393,16 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap();
             assert_eq!(null_origins, 4, "{table}");
         }
+        let keys_after_130: Vec<ForeignKeyRow> = sqlx::query_as(foreign_keys)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(keys_after_130, foreign_keys_before);
+        sqlx::query("DELETE FROM _migrations WHERE version = 131")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
         let fresh = crate::Database::open_in_memory().await.unwrap();
         let schema_sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema
             WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name";
@@ -15397,7 +15420,11 @@ with tempfile.TemporaryDirectory() as directory:
         for pool in [db.pool(), fresh.pool()] {
             let keys: Vec<ForeignKeyRow> =
                 sqlx::query_as(foreign_keys).fetch_all(pool).await.unwrap();
-            assert_eq!(keys, foreign_keys_before);
+            let fresh_keys: Vec<ForeignKeyRow> = sqlx::query_as(foreign_keys)
+                .fetch_all(fresh.pool())
+                .await
+                .unwrap();
+            assert_eq!(keys, fresh_keys);
             assert!(sqlx::query("PRAGMA foreign_key_check")
                 .fetch_all(pool)
                 .await
@@ -20421,7 +20448,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
                     (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
-                    (130, 'temporarily_skip_normalized_remote_input_origin')",
+                    (130, 'temporarily_skip_normalized_remote_input_origin'),
+                    (131, 'temporarily_skip_bounded_federated_terminal_subscriptions')",
         )
         .execute(&pool)
         .await
@@ -21289,7 +21317,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
                     (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
-                    (130, 'temporarily_skip_normalized_remote_input_origin')",
+                    (130, 'temporarily_skip_normalized_remote_input_origin'),
+                    (131, 'temporarily_skip_bounded_federated_terminal_subscriptions')",
         )
         .execute(pool)
         .await

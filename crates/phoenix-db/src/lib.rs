@@ -12,6 +12,7 @@ mod coordinator_watches;
 mod coordinator_work_scope;
 mod federation_enrollment;
 mod federation_peers;
+pub mod federation_subscriptions;
 pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
     PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
@@ -500,6 +501,7 @@ pub(crate) async fn commit_continuation_tx(
     }
     sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed', continuation_state = 'suppressed' WHERE source_transcript_id = ?1 AND delivery_state = 'pending' AND terminal_kind = 'failed' AND terminal_reason = 'continuation summary failed'")
         .bind(conversation_id).execute(&mut **tx).await?;
+    federation_subscriptions::suppress_summary_failure_tx(tx, conversation_id).await?;
     admit_automatic_continuation_tx(
         tx,
         conversation_id,
@@ -7982,15 +7984,6 @@ impl Database {
             ExecutionOccurrenceTerminal::Completed => ("Completed", None),
             ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
         };
-        crate::coordinator_watches::record_steering_event_tx(
-            &mut tx,
-            source_kind,
-            source_message_id,
-            conversation_id,
-            terminal_kind,
-            terminal_reason,
-        )
-        .await?;
         sqlx::query(
             "DELETE FROM steering_execution_occurrences
              WHERE conversation_id = ?1 AND message_id = ?2",
@@ -8028,6 +8021,15 @@ impl Database {
         .bind(conversation_id)
         .bind(source_message_id)
         .execute(&mut *tx)
+        .await?;
+        crate::coordinator_watches::record_steering_event_tx(
+            &mut tx,
+            source_kind,
+            source_message_id,
+            conversation_id,
+            terminal_kind,
+            terminal_reason,
+        )
         .await?;
         tx.commit().await?;
         Ok(true)

@@ -1,3 +1,4 @@
+pub(crate) mod subscriptions;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -819,6 +820,8 @@ pub enum FederationClientError {
     ResponseTooLarge(usize),
     #[error("remote query rejected: {0}")]
     RemoteRejected(String),
+    #[error("subscription enrollment authentication rejected")]
+    SubscriptionAuthenticationRejected,
     #[error("invalid federation response: {0}")]
     InvalidResponse(#[from] serde_json::Error),
     #[error("destination identity mismatch")]
@@ -2241,6 +2244,7 @@ mod tests {
         let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let response = query_database_with_admission(
             PeerAuthenticated {
+                enrollment_id: uuid::Uuid::new_v4(),
                 caller_instance_id: InstanceId::new(),
                 caller_display_name: "peer".to_string(),
             },

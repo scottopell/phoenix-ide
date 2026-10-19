@@ -14,6 +14,7 @@ use super::handlers::{create_router, hard_delete_cascade_tests::make_test_state}
 
 mod send;
 mod smoke;
+mod subscriptions;
 
 struct TestInstance {
     _tempdir: tempfile::TempDir,
@@ -31,6 +32,13 @@ impl TestInstance {
     }
 
     async fn start_with_search_ready(search_ready: bool) -> Self {
+        Self::start_with_router(search_ready, create_router).await
+    }
+
+    async fn start_with_router(
+        search_ready: bool,
+        build_router: impl FnOnce(super::AppState) -> axum::Router,
+    ) -> Self {
         let tempdir = tempfile::tempdir().unwrap();
         let mut tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
             dir: tempdir.path().to_path_buf(),
@@ -91,7 +99,7 @@ impl TestInstance {
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
-        let app = create_router(state.clone());
+        let app = build_router(state.clone());
         let shutdown = CancellationToken::new();
         let server = spawn_https(listener, app, tls.server, shutdown.clone()).await;
 
@@ -109,7 +117,7 @@ impl TestInstance {
     async fn enroll(&self, caller_instance_id: InstanceId) -> PeerBearerCredential {
         let credential = PeerBearerCredential::parse(format!(
             "phx_peer_{}aaaaaaaaaaa",
-            caller_instance_id.to_string().replace('-', "")
+            uuid::Uuid::new_v4().simple()
         ))
         .unwrap();
         let verifier = FederationCredentialVerifier::from_bearer(credential.expose().as_bytes());
