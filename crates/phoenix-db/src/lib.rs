@@ -10099,13 +10099,18 @@ impl Database {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
+        if origin_conv_id != assistant.conversation_id {
+            return Err(DbError::Serialization(
+                "fork tool round transcript differs".into(),
+            ));
+        }
         self.persist_fork_tool_round_input(
-            origin_conv_id,
             assistant,
             conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
             proposal,
             state,
             state_updated_at,
+            None,
         )
         .await
         .map(|_| ())
@@ -10113,16 +10118,25 @@ impl Database {
 
     pub(crate) async fn persist_fork_tool_round_input(
         &self,
-        origin_conv_id: &str,
         assistant: &Message,
         input: conversation_goals::round::ToolRoundWrite<'_>,
         proposal: &ForkProposal,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     ) -> DbResult<conversation_goals::round::CommittedGoalRound> {
         use conversation_goals::round::{
             db_error, selected_state_tx, write_round_tx, CommittedGoalRound,
         };
+        let origin_conv_id = assistant.conversation_id.as_str();
+        if matches!(
+            &input,
+            conversation_goals::round::ToolRoundWrite::Pending { .. }
+        ) {
+            if let Some(update) = update {
+                provider_replay::validate_goal_round_replay(assistant, update)?;
+            }
+        }
         if proposal.origin_conversation_id != origin_conv_id {
             return Err(DbError::Serialization(
                 "fork tool round transcript differs".into(),
@@ -10163,6 +10177,11 @@ impl Database {
             selected_state_tx(&mut tx, origin_conv_id, state, state_updated_at, replayed)
                 .await
                 .map_err(db_error)?;
+        if !replayed {
+            if let Some(update) = update {
+                provider_replay::apply_replay_tx(&mut tx, origin_conv_id, update).await?;
+            }
+        }
         tx.commit().await?;
         Ok(CommittedGoalRound {
             results,
@@ -10300,6 +10319,7 @@ impl Database {
             conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
             obligation,
             cut,
+            None,
         )
         .await
         .map(|_| ())
@@ -10312,8 +10332,17 @@ impl Database {
         input: conversation_goals::round::ToolRoundWrite<'_>,
         obligation: &workflow::DirectTurnTerminalObligationInput,
         cut: TerminalEvidenceTransactionCut,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     ) -> DbResult<conversation_goals::round::CommittedGoalTerminalRound> {
         use conversation_goals::round::{write_round_tx, CommittedGoalTerminalRound};
+        if matches!(
+            &input,
+            conversation_goals::round::ToolRoundWrite::Pending { .. }
+        ) {
+            if let Some(update) = update {
+                provider_replay::validate_goal_round_replay(assistant, update)?;
+            }
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let turn_conversation: String =
             sqlx::query_scalar("SELECT conversation_id FROM durable_turns WHERE turn_id=?")
@@ -10337,6 +10366,11 @@ impl Database {
             obligation.projection.state_updated_at,
         )
         .await?;
+        if !replayed {
+            if let Some(update) = update {
+                provider_replay::apply_replay_tx(&mut tx, conversation_id, update).await?;
+            }
+        }
         let obligation_result =
             workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await;
         match obligation_result {
@@ -10433,6 +10467,11 @@ impl Database {
     ) -> DbResult<Option<i64>> {
         let mut tx = self.pool.begin().await?;
         let transcript_generation = match evidence {
+            workflow::TerminalEvidenceExpectation::GoalRound { .. } => {
+                return Err(DbError::Serialization(
+                    "pending goal evidence requires its owning round transaction".into(),
+                ));
+            }
             workflow::TerminalEvidenceExpectation::ObligationOnly { .. } => None,
             workflow::TerminalEvidenceExpectation::Messages(messages) => {
                 for message in messages {
@@ -12244,7 +12283,15 @@ impl Database {
                 Some(sequence_id) => sequence_id,
                 None => self.next_sequence_id(&conv_id).await?,
             };
-            let mut completed_results = completed_results;
+            let mut completed_results: Vec<ToolResult> = completed_results.into_iter().map(|entry| match entry {
+                phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) => result,
+                phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { report, duration_ms } => {
+                    tracing::debug!(conversation_id = %conv_id, tool_use_id = %report.call().tool_use_id.as_str(), "goal report interrupted before checkpoint commit");
+                    let mut result = ToolResult::error(report.call().tool_use_id.as_str().into(), "Goal report interrupted before checkpoint commit; no goal change was applied.".into());
+                    result.duration_ms = Some(duration_ms);
+                    result
+                }
+            }).collect();
             let mut unfinished = Vec::new();
             for tool_id in interrupted_tool_ids {
                 let is_svg = assistant_message.tool_uses().iter().any(|block| {
@@ -15397,7 +15444,7 @@ fn merge_duration_into_display(
 /// fan-in.
 struct NormalizedRound {
     assistant_message: phoenix_core::domain::sm_state::AssistantMessage,
-    completed_results: Vec<ToolResult>,
+    completed_results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
     interrupted_tool_ids: Vec<String>,
     pending_sub_agents: Vec<phoenix_core::domain::sm_state::PendingSubAgent>,
 }
@@ -15682,12 +15729,13 @@ fn build_materialized_tool_round(
     // placeholder whose sub-agents were still pending, which is rewritten into
     // the interrupted fan-in (content + display) computed above.
     for result in completed_results {
+        let persisted_content = result.persisted_tool_content();
         let (output, is_error, display): (String, bool, Option<serde_json::Value>) =
             match spawn_fan_ins.get(&result.tool_use_id) {
                 Some((content, display)) => (content.clone(), false, Some(display.clone())),
                 None => (
-                    result.output().to_string(),
-                    result.is_error(),
+                    persisted_content.content,
+                    persisted_content.is_error,
                     merge_duration_into_display(result.display_data(), result.duration_ms),
                 ),
             };
@@ -15695,7 +15743,7 @@ fn build_materialized_tool_round(
             &result.tool_use_id,
             output,
             is_error,
-            result.images().to_vec(),
+            persisted_content.images,
         );
         tool_msgs.push(Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
@@ -15760,6 +15808,18 @@ async fn persist_tool_round_state_tx(
     Ok(())
 }
 
+fn message_payload_matches(existing: &Message, msg: &Message) -> bool {
+    existing.message_id == msg.message_id
+        && existing.conversation_id == msg.conversation_id
+        && existing.sequence_id == msg.sequence_id
+        && existing.message_type == msg.message_type
+        && existing.content == msg.content
+        && existing.origin == msg.origin
+        && existing.display_data == msg.display_data
+        && existing.usage_data == msg.usage_data
+        && existing.created_at == msg.created_at
+}
+
 async fn insert_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     msg: &Message,
@@ -15817,15 +15877,7 @@ async fn insert_message_tx(
             )));
         };
         message_attachments::hydrate(tx, std::slice::from_mut(&mut existing)).await?;
-        let exact = existing.message_id == msg.message_id
-            && existing.conversation_id == msg.conversation_id
-            && existing.sequence_id == msg.sequence_id
-            && existing.message_type == msg.message_type
-            && existing.content == msg.content
-            && existing.origin == msg.origin
-            && existing.display_data == msg.display_data
-            && existing.usage_data == msg.usage_data
-            && existing.created_at == msg.created_at;
+        let exact = message_payload_matches(&existing, msg);
         if !exact {
             return Err(DbError::Serialization(format!(
                 "message {} conflicts with first durable payload",
@@ -25158,7 +25210,8 @@ mod tests {
             completed_results: vec![ToolResult::success(
                 "tool-1".to_string(),
                 "real output for tool-1".to_string(),
-            )],
+            )
+            .into()],
             pending_sub_agents: vec![],
             assistant_message: assistant,
         };
@@ -25297,7 +25350,8 @@ mod tests {
             completed_results: vec![ToolResult::success(
                 "tool-1".to_string(),
                 "real output for tool-1".to_string(),
-            )],
+            )
+            .into()],
             assistant_message: assistant,
             pending_sub_agents: vec![],
         };
@@ -25480,7 +25534,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new("tool-2", think("t")),
             remaining_tools: vec![],
-            completed_results: vec![ToolResult::success("tool-1".to_string(), placeholder)],
+            completed_results: vec![ToolResult::success("tool-1".to_string(), placeholder).into()],
             pending_sub_agents: vec![
                 PendingSubAgent {
                     agent_id: agent_a.to_string(),
@@ -25669,7 +25723,8 @@ mod tests {
                 completed_results: vec![ToolResult::success(
                     "spawn-tool".to_string(),
                     format!("Spawning 1 sub-agent(s): {child_id}"),
-                )],
+                )
+                .into()],
                 pending_sub_agents: vec![PendingSubAgent {
                     agent_id: child_id.to_string(),
                     task: "audit".to_string(),
@@ -26673,7 +26728,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new("th", think("t")),
             remaining_tools: vec![],
-            completed_results: vec![ToolResult::success("sp".to_string(), placeholder)],
+            completed_results: vec![ToolResult::success("sp".to_string(), placeholder).into()],
             pending_sub_agents: vec![
                 PendingSubAgent {
                     agent_id: done_agent.to_string(),

@@ -5,6 +5,7 @@ use crate::state::{
 };
 use chrono::{DateTime, Utc};
 use phoenix_bash_display::display_command;
+use phoenix_core::domain::conversation_goal::ToolRoundResult;
 use phoenix_core::domain::db_schema::{
     FileAttachment, ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData,
 };
@@ -32,7 +33,7 @@ pub enum CheckpointData {
     /// Constructor enforces matching counts.
     ToolRound {
         assistant_message: AssistantMessage,
-        tool_results: Vec<ToolResult>,
+        tool_results: Vec<ToolRoundResult>,
     },
 }
 
@@ -83,7 +84,7 @@ impl CheckpointData {
     /// in the assistant message differs from the number of tool results.
     pub fn tool_round(
         assistant_message: AssistantMessage,
-        tool_results: Vec<ToolResult>,
+        tool_results: Vec<impl Into<ToolRoundResult>>,
     ) -> Result<Self, PersistError> {
         let tool_use_count = assistant_message.tool_uses().len();
         if tool_use_count != tool_results.len() {
@@ -94,7 +95,7 @@ impl CheckpointData {
         }
         Ok(Self::ToolRound {
             assistant_message,
-            tool_results,
+            tool_results: tool_results.into_iter().map(Into::into).collect(),
         })
     }
 }

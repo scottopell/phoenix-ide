@@ -42,13 +42,41 @@ enum Owner {
     Responses,
     Fork,
     Terminal,
+    ForkAnthropic,
+    ForkResponses,
+    TerminalAnthropic,
+    TerminalResponses,
 }
-const OWNERS: [Owner; 5] = [
+
+impl Owner {
+    fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Terminal | Self::TerminalAnthropic | Self::TerminalResponses
+        )
+    }
+    fn replay(self) -> Option<Self> {
+        match self {
+            Self::Anthropic | Self::ForkAnthropic | Self::TerminalAnthropic => {
+                Some(Self::Anthropic)
+            }
+            Self::Responses | Self::ForkResponses | Self::TerminalResponses => {
+                Some(Self::Responses)
+            }
+            Self::Normal | Self::Fork | Self::Terminal => None,
+        }
+    }
+}
+const OWNERS: [Owner; 9] = [
     Owner::Normal,
     Owner::Anthropic,
     Owner::Responses,
     Owner::Fork,
     Owner::Terminal,
+    Owner::ForkAnthropic,
+    Owner::ForkResponses,
+    Owner::TerminalAnthropic,
+    Owner::TerminalResponses,
 ];
 
 async fn admitted_fixture() -> (Database, Message, GoalPendingReport) {
@@ -144,16 +172,17 @@ fn replay_update(owner: Owner, assistant: &Message) -> ProviderReplayUpdate {
         panic!("assistant")
     };
     match owner {
-        Owner::Responses => ProviderReplayUpdate::Responses(ResponsesResponseSet {
+        Owner::Responses | Owner::ForkResponses | Owner::TerminalResponses => ProviderReplayUpdate::Responses(ResponsesResponseSet {
             response_id: "goal-response".into(),
             model: "model".into(),
             owner_message_id: assistant.message_id.clone(),
             public_content: blocks.clone(),
-            output_items: vec![
-                serde_json::json!({"type":"function_call","call_id":"report-call","name":"goal_report"}),
-            ],
+            output_items: blocks.iter().filter_map(|block| {
+                let ContentBlock::ToolUse { id, name, input } = block else { return None; };
+                Some(serde_json::json!({"type":"function_call","id":format!("fc-{id}"),"call_id":id,"name":name,"arguments":serde_json::to_string(input).unwrap()}))
+            }).collect(),
         }),
-        _ => ProviderReplayUpdate::Anthropic(
+        Owner::Normal | Owner::Anthropic | Owner::Fork | Owner::Terminal | Owner::ForkAnthropic | Owner::TerminalAnthropic => ProviderReplayUpdate::Anthropic(
             AnthropicResponseSet::with_public_content(
                 AnthropicResponseIdentity {
                     response_id: "goal-response".into(),
@@ -211,13 +240,27 @@ async fn persist(
             )
             .await?
         }
-        Owner::Fork => {
-            db.persist_goal_fork_tool_round(checkpoint, &proposal(checkpoint.assistant))
-                .await?
+        Owner::Fork | Owner::ForkAnthropic | Owner::ForkResponses => {
+            let update = owner
+                .replay()
+                .map(|provider| replay_update(provider, checkpoint.assistant));
+            db.persist_goal_fork_tool_round(
+                checkpoint,
+                &proposal(checkpoint.assistant),
+                update.as_ref(),
+            )
+            .await?
         }
-        Owner::Terminal => {
+        Owner::Terminal | Owner::TerminalAnthropic | Owner::TerminalResponses => {
+            let update = owner
+                .replay()
+                .map(|provider| replay_update(provider, checkpoint.assistant));
             let committed = db
-                .persist_goal_terminal_tool_round(checkpoint, &obligation(checkpoint))
+                .persist_goal_terminal_tool_round(
+                    checkpoint,
+                    &obligation(checkpoint),
+                    update.as_ref(),
+                )
                 .await?;
             return Ok((committed.results, committed.replayed));
         }
@@ -227,8 +270,13 @@ async fn persist(
 
 fn selected_state(owner: Owner) -> ConvState {
     match owner {
-        Owner::Terminal => ConvState::Idle,
-        _ => ConvState::LlmRequesting { attempt: 2 },
+        Owner::Terminal | Owner::TerminalAnthropic | Owner::TerminalResponses => ConvState::Idle,
+        Owner::Normal
+        | Owner::Anthropic
+        | Owner::Responses
+        | Owner::Fork
+        | Owner::ForkAnthropic
+        | Owner::ForkResponses => ConvState::LlmRequesting { attempt: 2 },
     }
 }
 
@@ -294,7 +342,7 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
             panic!("finalized")
         };
         assert!(!result.is_error, "{owner:?}");
-        if matches!(owner, Owner::Terminal) {
+        if owner.terminal() {
             assert_eq!(
                 db.get_conversation("full-root").await.unwrap().state,
                 ConvState::LlmRequesting { attempt: 1 },
@@ -328,7 +376,7 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
                 "{owner:?}"
             );
         }
-        if matches!(owner, Owner::Anthropic) {
+        if matches!(owner.replay(), Some(Owner::Anthropic)) {
             assert_eq!(
                 db.load_provider_replay_state("full-root")
                     .await
@@ -339,7 +387,7 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
                 1
             );
         }
-        if matches!(owner, Owner::Responses) {
+        if matches!(owner.replay(), Some(Owner::Responses)) {
             assert_eq!(
                 db.load_responses_replay_state("full-root")
                     .await
@@ -352,7 +400,7 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
         db.update_conversation_state("full-root", &later)
             .await
             .unwrap();
-        if matches!(owner, Owner::Terminal) {
+        if owner.terminal() {
             assert!(
                 persist(owner, &db, &checkpoint).await.is_err(),
                 "a consumed obligation cannot prove a changed projection"
@@ -398,10 +446,10 @@ async fn every_goal_round_owner_rolls_back_report_messages_state_and_side_rows_o
             Owner::Responses => sqlx::query(
                 "CREATE TRIGGER fail_owner BEFORE INSERT ON active_responses_replay_sets BEGIN SELECT RAISE(ABORT,'owner write failed'); END",
             ),
-            Owner::Fork => sqlx::query(
+            Owner::Fork | Owner::ForkAnthropic | Owner::ForkResponses => sqlx::query(
                 "CREATE TRIGGER fail_owner BEFORE INSERT ON fork_proposals BEGIN SELECT RAISE(ABORT,'owner write failed'); END",
             ),
-            Owner::Terminal => sqlx::query(
+            Owner::Terminal | Owner::TerminalAnthropic | Owner::TerminalResponses => sqlx::query(
                 "CREATE TRIGGER fail_owner BEFORE INSERT ON direct_turn_terminal_obligations BEGIN SELECT RAISE(ABORT,'owner write failed'); END",
             ),
         };
@@ -586,6 +634,62 @@ async fn all_goal_round_owners_refuse_changed_arguments_and_source_on_first_writ
 }
 
 #[tokio::test]
+async fn combined_goal_round_replay_failures_roll_back_existing_side_rows_and_state() {
+    for owner in [
+        Owner::ForkAnthropic,
+        Owner::ForkResponses,
+        Owner::TerminalAnthropic,
+        Owner::TerminalResponses,
+    ] {
+        let (db, assistant, report) = admitted_fixture().await;
+        let query = match owner.replay().unwrap() {
+            Owner::Anthropic => sqlx::query("CREATE TRIGGER fail_replay BEFORE INSERT ON active_provider_replay_state BEGIN SELECT RAISE(ABORT,'combined replay failure'); END"),
+            Owner::Responses => sqlx::query("CREATE TRIGGER fail_replay BEFORE INSERT ON active_responses_replay_sets BEGIN SELECT RAISE(ABORT,'combined replay failure'); END"),
+            Owner::Normal | Owner::Fork | Owner::Terminal | Owner::ForkAnthropic | Owner::ForkResponses | Owner::TerminalAnthropic | Owner::TerminalResponses => unreachable!("provider only"),
+        };
+        query.execute(db.pool()).await.unwrap();
+        let results = [ToolRoundResult::PendingGoalReport {
+            report: report.clone(),
+            duration_ms: 7,
+        }];
+        let state = selected_state(owner);
+        let checkpoint = GoalRoundCheckpoint {
+            assistant: &assistant,
+            execution: GoalExecution::parse(1, 1).unwrap(),
+            results: &results,
+            state: &state,
+            state_updated_at: Utc::now(),
+        };
+        let error = persist(owner, &db, &checkpoint).await.unwrap_err();
+        assert!(
+            error.to_string().contains("combined replay failure"),
+            "{owner:?}: {error}"
+        );
+        assert_no_round(&db, &report).await;
+        sqlx::query("DROP TRIGGER fail_replay")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (original, replayed) = persist(owner, &db, &checkpoint).await.unwrap();
+        assert!(!replayed, "{owner:?}");
+        let (retained, replayed) = persist(owner, &db, &checkpoint).await.unwrap();
+        assert!(replayed, "{owner:?}");
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(retained).unwrap()
+        );
+        assert_eq!(
+            db.get_conversation("full-root").await.unwrap().state,
+            if owner.terminal() {
+                ConvState::LlmRequesting { attempt: 1 }
+            } else {
+                state
+            }
+        );
+    }
+}
+
+#[tokio::test]
 async fn terminal_goal_round_commit_cuts_use_existing_obligation_and_never_project_idle_early() {
     let (db, assistant, report) = admitted_fixture().await;
     let results = [ToolRoundResult::PendingGoalReport {
@@ -613,7 +717,8 @@ async fn terminal_goal_round_commit_cuts_use_existing_obligation_and_never_proje
                     results: &results
                 },
                 &terminal,
-                cut
+                cut,
+                None,
             )
             .await
             .is_err());
@@ -636,7 +741,7 @@ async fn terminal_goal_round_commit_cuts_use_existing_obligation_and_never_proje
     let mut changed = terminal.clone();
     changed.projection.state = ConvState::LlmRequesting { attempt: 5 };
     assert!(db
-        .persist_goal_terminal_tool_round(&checkpoint, &changed)
+        .persist_goal_terminal_tool_round(&checkpoint, &changed, None)
         .await
         .is_err());
 }

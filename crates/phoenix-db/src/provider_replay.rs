@@ -10,6 +10,31 @@ use crate::{Database, DbError, DbResult};
 use phoenix_core::domain::provider_replay::AnthropicReplayPayload;
 use sqlx::Row;
 
+pub(crate) fn validate_goal_round_replay(
+    assistant: &Message,
+    update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+) -> DbResult<()> {
+    use phoenix_core::domain::{db_schema::MessageContent, provider_replay::ProviderReplayUpdate};
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        return Err(DbError::Serialization("goal round replay assistant".into()));
+    };
+    let source_matches = match update {
+        ProviderReplayUpdate::Anthropic(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
+        ProviderReplayUpdate::Responses(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
+        ProviderReplayUpdate::Clear => true,
+    };
+    if !source_matches {
+        return Err(DbError::Serialization(
+            "goal round replay owner differs".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Database {
     #[cfg(test)]
     /// # Errors
@@ -182,27 +207,8 @@ impl Database {
         use crate::conversation_goals::round::{
             db_error, selected_state_tx, write_round_tx, CommittedGoalRound, ToolRoundWrite,
         };
-        use phoenix_core::domain::{
-            db_schema::MessageContent, provider_replay::ProviderReplayUpdate,
-        };
         if matches!(&input, ToolRoundWrite::Pending { .. }) {
-            let MessageContent::Agent(blocks) = &assistant.content else {
-                return Err(DbError::Serialization("goal round replay assistant".into()));
-            };
-            let source_matches = match update {
-                ProviderReplayUpdate::Anthropic(set) => {
-                    set.owner_message_id == assistant.message_id && &set.public_content == blocks
-                }
-                ProviderReplayUpdate::Responses(set) => {
-                    set.owner_message_id == assistant.message_id && &set.public_content == blocks
-                }
-                ProviderReplayUpdate::Clear => true,
-            };
-            if !source_matches {
-                return Err(DbError::Serialization(
-                    "goal round replay owner differs".into(),
-                ));
-            }
+            validate_goal_round_replay(assistant, update)?;
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let (results, replayed) = write_round_tx(

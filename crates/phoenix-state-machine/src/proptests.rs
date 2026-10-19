@@ -1084,9 +1084,9 @@ proptest! {
         if let Some(Effect::PersistCheckpoint { data }) = tr.effects.iter().find(|e| matches!(e, Effect::PersistCheckpoint { .. })) {
             let CheckpointData::ToolRound { tool_results, .. } = data;
             // Find the result for our tool - it should be marked as cancelled, not successful
-            let our_result = tool_results.iter().find(|r| r.tool_use_id == tool_use_id);
+            let our_result = tool_results.iter().find(|r| r.tool_use_id() == tool_use_id);
             prop_assert!(our_result.is_some());
-            prop_assert!(!our_result.unwrap().is_success(), "Cancelled tool should not show as successful");
+            prop_assert!(!our_result.unwrap().finalized().unwrap().is_success(), "Cancelled tool should not show as successful");
         }
     }
 
@@ -1476,7 +1476,7 @@ fn test_cancel_mid_tool_chain() {
                 )),
             ),
         ],
-        completed_results: vec![t1_result],
+        completed_results: vec![t1_result.into()],
         pending_sub_agents: vec![],
         assistant_message,
     };
@@ -1533,13 +1533,19 @@ fn test_cancel_mid_tool_chain() {
             "Should have 4 results (completed + aborted + skipped)"
         );
         // t1 should be successful, t2/t3/t4 should be cancelled/skipped
-        let t1 = tool_results.iter().find(|r| r.tool_use_id == "t1").unwrap();
-        assert!(t1.is_success(), "t1 should be successful (was completed)");
+        let t1 = tool_results
+            .iter()
+            .find(|r| r.tool_use_id() == "t1")
+            .unwrap();
+        assert!(
+            t1.finalized().unwrap().is_success(),
+            "t1 should be successful (was completed)"
+        );
         assert!(
             tool_results
                 .iter()
-                .filter(|r| r.tool_use_id != "t1")
-                .all(|r| !r.is_success()),
+                .filter(|r| r.tool_use_id() != "t1")
+                .all(|r| !r.finalized().unwrap().is_success()),
             "t2/t3/t4 should be cancelled/skipped"
         );
     }

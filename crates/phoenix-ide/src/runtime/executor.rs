@@ -638,19 +638,35 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
     }
 }
 
+fn contains_pending_goal_report(
+    results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+) -> bool {
+    results.iter().any(|result| {
+        matches!(
+            result,
+            phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { .. }
+        )
+    })
+}
+
+fn finalized_round_results(
+    results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+) -> Result<Vec<ToolResult>, String> {
+    results
+        .iter()
+        .map(|result| match result {
+            phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) => {
+                Ok(result.clone())
+            }
+            phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport {
+                ..
+            } => Err("pending goal report cannot be rendered before checkpoint commit".into()),
+        })
+        .collect()
+}
+
 fn tool_result_message_content(result: &ToolResult) -> MessageContent {
-    let persisted_output = match &result.outcome {
-        ToolOutcome::TrustedInstructions { .. } => {
-            "Authenticated built-in skill instructions were delivered for this live request."
-        }
-        _ => result.output(),
-    };
-    MessageContent::tool_with_images(
-        &result.tool_use_id,
-        persisted_output,
-        result.is_error(),
-        result.images().to_vec(),
-    )
+    MessageContent::Tool(result.persisted_tool_content())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8962,6 +8978,126 @@ where
         Ok(None)
     }
 
+    async fn persist_pending_goal_round(
+        &mut self,
+        mut assistant: crate::db::Message,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+        proposal: Option<&crate::db::ForkProposal>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
+        use phoenix_db::conversation_goals::round::GoalRoundCheckpoint;
+        let execution = results
+            .iter()
+            .find_map(|entry| match entry {
+                ToolRoundResult::PendingGoalReport { report, .. } => Some(report.execution()),
+                ToolRoundResult::Finalized(_) => None,
+            })
+            .ok_or("pending goal round has no report")?;
+        let active = self
+            .active_direct_turn
+            .as_deref()
+            .ok_or("pending goal round has no active direct turn")?;
+        if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
+            return Err("pending goal report execution differs from active direct turn".into());
+        }
+        if self.storage.message_exists(&assistant.message_id).await? {
+            assistant.sequence_id = self
+                .storage
+                .get_message_by_id(&assistant.message_id)
+                .await?
+                .sequence_id;
+        }
+        let mut trusted = Vec::new();
+        for entry in &results {
+            match entry {
+                ToolRoundResult::Finalized(result) => trusted.extend(trusted_tool_results(
+                    &assistant.message_id,
+                    std::slice::from_ref(result),
+                )),
+                ToolRoundResult::PendingGoalReport { .. } => {}
+            }
+        }
+        let state = self.state.clone();
+        let checkpoint = GoalRoundCheckpoint {
+            assistant: &assistant,
+            execution,
+            results: &results,
+            state: &state,
+            state_updated_at: self.state_updated_at,
+        };
+        let messages = if let Some(settlement) = settlement {
+            if settlement.turn != *active {
+                return Err(
+                    "pending goal terminal settlement differs from active direct turn".into(),
+                );
+            }
+            let obligation = crate::runtime::traits::terminal_obligation(settlement, None);
+            let mut checkpoint = checkpoint;
+            checkpoint.state = &settlement.state;
+            checkpoint.state_updated_at = settlement.state_updated_at;
+            let committed = match self
+                .storage
+                .persist_goal_terminal_tool_round(
+                    &checkpoint,
+                    &obligation,
+                    self.pending_provider_replay_update.as_ref(),
+                )
+                .await
+            {
+                TerminalMutationEstablishment::Established { value, .. } => value,
+                TerminalMutationEstablishment::Retired => {
+                    self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                    return Ok(None);
+                }
+                TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+                TerminalMutationEstablishment::Unclassifiable(error) => {
+                    self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                    return Err(error);
+                }
+            };
+            self.pending_provider_replay_update = None;
+            self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+            committed.results
+        } else {
+            let committed = if let Some(proposal) = proposal {
+                self.storage
+                    .persist_goal_fork_tool_round(
+                        &checkpoint,
+                        proposal,
+                        self.pending_provider_replay_update.as_ref(),
+                    )
+                    .await?
+            } else if let Some(update) = self.pending_provider_replay_update.as_ref() {
+                let committed = self
+                    .storage
+                    .persist_goal_tool_round_state_and_replay(&checkpoint, update)
+                    .await?;
+                committed
+            } else {
+                self.storage
+                    .persist_goal_tool_round_and_state(&checkpoint)
+                    .await?
+            };
+            self.pending_provider_replay_update = None;
+            self.install_live_state(committed.state, committed.state_updated_at, false)?;
+            committed.results
+        };
+        merge_trusted_tool_results(&mut self.pending_trusted_tool_results, trusted);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(assistant);
+        for message in messages {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(message);
+        }
+        Ok(None)
+    }
+
     async fn persist_checkpoint_with_terminal_obligation(
         &mut self,
         data: CheckpointData,
@@ -8972,8 +9108,6 @@ where
             assistant_message,
             tool_results,
         } = data;
-        let new_trusted_results =
-            trusted_tool_results(&assistant_message.message_id, &tool_results);
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
@@ -8994,6 +9128,19 @@ where
             usage_data: assistant_message.usage,
             created_at: assistant_message.created_at,
         };
+        if contains_pending_goal_report(&tool_results) {
+            return self
+                .persist_pending_goal_round(
+                    agent_msg,
+                    tool_results,
+                    None,
+                    Some(settlement),
+                    admitted,
+                )
+                .await;
+        }
+        let tool_results = finalized_round_results(&tool_results)?;
+        let new_trusted_results = trusted_tool_results(&agent_msg.message_id, &tool_results);
         let tool_msgs: Vec<crate::db::Message> = tool_results
             .into_iter()
             .zip(reserved_seqs.into_iter().skip(1))
@@ -9060,8 +9207,6 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                let new_trusted_results =
-                    trusted_tool_results(&assistant_message.message_id, &tool_results);
                 let conv_id = self.context.conversation_id.clone();
 
                 // Build the assistant message row.
@@ -9091,6 +9236,15 @@ where
                     usage_data: assistant_message.usage.clone(),
                     created_at: assistant_message.created_at,
                 };
+
+                if contains_pending_goal_report(&tool_results) {
+                    return self
+                        .persist_pending_goal_round(agent_msg, tool_results, None, None, admitted)
+                        .await;
+                }
+                let tool_results = finalized_round_results(&tool_results)?;
+                let new_trusted_results =
+                    trusted_tool_results(&agent_msg.message_id, &tool_results);
 
                 // Build all tool-result rows.
                 let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
@@ -9226,6 +9380,33 @@ where
             created_at: assistant_message.created_at,
         };
 
+        let proposal = crate::db::ForkProposal {
+            id: proposal_id,
+            origin_conversation_id: conv_id.clone(),
+            task_file: normalized_task_file,
+            title,
+            priority: priority.as_str().to_string(),
+            body,
+            status: crate::db::ForkProposalStatus::Pending,
+            fork_conversation_id: None,
+            refinement_conversation_id: None,
+            created_at: agent_msg.created_at,
+            resolved_at: None,
+        };
+
+        if contains_pending_goal_report(&tool_results) {
+            return self
+                .persist_pending_goal_round(
+                    agent_msg,
+                    tool_results,
+                    Some(&proposal),
+                    None,
+                    admitted,
+                )
+                .await;
+        }
+        let tool_results = finalized_round_results(&tool_results)?;
+
         // Build the synthetic tool-result rows. The success ack carries the
         // `fork_proposal_id` in its display_data (UI-only) per the interception
         // contract; `merge_duration_into_display_data` preserves it.
@@ -9251,20 +9432,6 @@ where
                 created_at: Utc::now(),
             });
         }
-
-        let proposal = crate::db::ForkProposal {
-            id: proposal_id,
-            origin_conversation_id: conv_id.clone(),
-            task_file: normalized_task_file,
-            title,
-            priority: priority.as_str().to_string(),
-            body,
-            status: crate::db::ForkProposalStatus::Pending,
-            fork_conversation_id: None,
-            refinement_conversation_id: None,
-            created_at: Utc::now(),
-            resolved_at: None,
-        };
 
         self.storage
             .persist_fork_proposal_with_tool_round(
@@ -9479,6 +9646,7 @@ where
         let transcript_generation = match establishment {
             TerminalMutationEstablishment::Established {
                 transcript_generation,
+                ..
             } => transcript_generation,
             TerminalMutationEstablishment::Retired => {
                 self.direct_turn_terminal_fact = TerminalFactDurability::Durable;

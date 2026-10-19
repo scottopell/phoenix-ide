@@ -13,6 +13,9 @@ use phoenix_core::domain::provider_replay::{
 use phoenix_llm::{LlmError, LlmResponse};
 use std::sync::Mutex;
 
+#[path = "goal_round_tests.rs"]
+mod goal_round_tests;
+
 const CONVERSATION: &str = "provider-tool-withdrawal";
 const MCP_TOOL: &str = "mcp__slack__read_thread";
 

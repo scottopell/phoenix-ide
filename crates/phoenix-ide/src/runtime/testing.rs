@@ -1281,6 +1281,43 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        Err("pending goal transactions require the SQLite test store".into())
+    }
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        Err("pending goal transactions require the SQLite test store".into())
+    }
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _proposal: &crate::db::ForkProposal,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        Err("pending goal transactions require the SQLite test store".into())
+    }
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> crate::runtime::traits::TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        crate::runtime::traits::TerminalMutationEstablishment::Unclassifiable(
+            "pending goal transactions require the SQLite test store".into(),
+        )
+    }
+
     async fn read_message_continuation_opening(
         &self,
         _message_id: &str,
@@ -1791,6 +1828,7 @@ impl MessageStore for InMemoryStorage {
         }
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
+            value: (),
         }
     }
 
@@ -2027,6 +2065,7 @@ impl MessageStore for InMemoryStorage {
         }
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
+            value: (),
         }
     }
 
@@ -2052,6 +2091,7 @@ impl MessageStore for InMemoryStorage {
                     .push(message.clone());
                 crate::runtime::traits::TerminalMutationEstablishment::Established {
                     transcript_generation: None,
+                    value: (),
                 }
             }
             crate::runtime::traits::TerminalSubAgentEvidence::Update {
@@ -2074,6 +2114,7 @@ impl MessageStore for InMemoryStorage {
                 message.display_data = Some(display_data.clone());
                 crate::runtime::traits::TerminalMutationEstablishment::Established {
                     transcript_generation: Some(1),
+                    value: (),
                 }
             }
         }
@@ -3842,7 +3883,9 @@ mod tests {
             let CheckpointData::ToolRound { tool_results, .. } = data;
             assert_eq!(tool_results.len(), 3, "Should have results for all 3 tools");
             assert!(
-                tool_results.iter().all(|r| !r.is_success()),
+                tool_results
+                    .iter()
+                    .all(|r| !r.finalized().unwrap().is_success()),
                 "All should be marked as failed/cancelled"
             );
         }

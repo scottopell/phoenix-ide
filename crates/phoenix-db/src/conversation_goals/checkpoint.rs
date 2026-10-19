@@ -1,3 +1,5 @@
+use sqlx::Acquire;
+
 use phoenix_core::domain::conversation_goal::{
     GoalExecution, GoalPendingReport, GoalReportOutcome,
 };
@@ -13,7 +15,7 @@ use super::{
     GoalState, GoalTimestampUs, GoalTx, Result,
 };
 
-async fn verify_source_tx(
+pub(super) async fn verify_source_tx(
     tx: &mut GoalTx<'_>,
     assistant: &Message,
     execution: GoalExecution,
@@ -66,7 +68,19 @@ async fn verify_source_tx(
         ContentBlock::ToolUse { id, name, input } if id == report.call().tool_use_id.as_str() => {
             Some((name, input))
         }
-        _ => None,
+        ContentBlock::Text { .. }
+        | ContentBlock::Image { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult { .. }
+        | ContentBlock::ServerToolUse { .. }
+        | ContentBlock::ToolSearchToolResult { .. }
+        | ContentBlock::WebSearchToolResult { .. }
+        | ContentBlock::WebFetchToolResult { .. }
+        | ContentBlock::CodeExecutionToolResult { .. }
+        | ContentBlock::BashCodeExecutionToolResult { .. }
+        | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+        | ContentBlock::McpToolUse { .. }
+        | ContentBlock::McpToolResult { .. } => None,
     });
     let Some((name, input)) = calls.next() else {
         return Err(GoalDbError::Integrity("pending report actual tool call"));
@@ -111,7 +125,7 @@ fn accepted_output(entry: &GoalHistoryEntry) -> Result<String> {
     ))
 }
 
-async fn retained_result_tx(
+pub(super) async fn retained_result_tx(
     tx: &mut GoalTx<'_>,
     report: &GoalPendingReport,
     result_message_id: &str,
@@ -195,26 +209,23 @@ pub(crate) async fn finalize_report_tx(
     if let Some(retained) = retained_result_tx(tx, report, &result_message_id).await? {
         return Ok(retained);
     }
-    sqlx::query("SAVEPOINT goal_report_checkpoint")
-        .execute(&mut **tx)
-        .await?;
+    let mut report_tx = tx.begin().await?;
     let mutation = report.mutation();
     let outcome = apply_goal_tx(
-        tx,
+        &mut report_tx,
         &mutation,
         Some(report.call().transcript_id.as_str()),
         at,
     )
     .await;
     let mut result = match outcome {
-        Ok(entry) => ToolResult::success(
-            report.call().tool_use_id.as_str().into(),
-            accepted_output(&entry)?,
-        ),
+        Ok(entry) => {
+            let output = accepted_output(&entry)?;
+            report_tx.commit().await?;
+            ToolResult::success(report.call().tool_use_id.as_str().into(), output)
+        }
         Err(error) if semantic_refusal(&error) => {
-            sqlx::query("ROLLBACK TO SAVEPOINT goal_report_checkpoint")
-                .execute(&mut **tx)
-                .await?;
+            report_tx.rollback().await?;
             ToolResult::error(
                 report.call().tool_use_id.as_str().into(),
                 format!("Goal report rejected: {error}"),
@@ -222,9 +233,6 @@ pub(crate) async fn finalize_report_tx(
         }
         Err(error) => return Err(error),
     };
-    sqlx::query("RELEASE SAVEPOINT goal_report_checkpoint")
-        .execute(&mut **tx)
-        .await?;
     result.duration_ms = Some(duration_ms);
     Ok(result)
 }

@@ -81,7 +81,12 @@ pub(crate) fn db_error(error: GoalDbError) -> DbError {
     match error {
         GoalDbError::Sqlx(error) => DbError::Sqlx(error),
         GoalDbError::Admission(error) => error,
-        other => DbError::Serialization(other.to_string()),
+        other @ (GoalDbError::Busy
+        | GoalDbError::TargetChanged
+        | GoalDbError::Domain(_)
+        | GoalDbError::RetryConflict
+        | GoalDbError::BindingConflict
+        | GoalDbError::Integrity(_)) => DbError::Serialization(other.to_string()),
     }
 }
 
@@ -168,12 +173,7 @@ pub(super) fn result_message(
         conversation_id: assistant.conversation_id.clone(),
         sequence_id,
         message_type: MessageType::Tool,
-        content: MessageContent::tool_with_images(
-            &result.tool_use_id,
-            result.output(),
-            result.is_error(),
-            result.images().to_vec(),
-        ),
+        content: MessageContent::Tool(result.persisted_tool_content()),
         display_data,
         usage_data: None,
         origin: InputOrigin::SystemGenerated,
@@ -186,10 +186,7 @@ async fn retained_message_tx(tx: &mut GoalTx<'_>, id: &str) -> Result<Option<Mes
         .bind(id).try_map(crate::parse_message_row).fetch_optional(&mut **tx).await?)
 }
 
-pub(crate) async fn finalize_round_tx(
-    tx: &mut GoalTx<'_>,
-    checkpoint: &GoalRoundCheckpoint<'_>,
-) -> Result<(Vec<Message>, bool)> {
+fn validate_round_shape(checkpoint: &GoalRoundCheckpoint<'_>) -> Result<()> {
     let assistant = checkpoint.assistant;
     let MessageContent::Agent(blocks) = &assistant.content else {
         return Err(GoalDbError::Integrity("goal round assistant"));
@@ -198,7 +195,18 @@ pub(crate) async fn finalize_round_tx(
         .iter()
         .filter_map(|block| match block {
             ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-            _ => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. } => None,
         })
         .collect();
     let result_ids: Vec<_> = checkpoint
@@ -218,10 +226,81 @@ pub(crate) async fn finalize_round_tx(
     {
         return Err(GoalDbError::Integrity("goal round tool pairing"));
     }
-    let mut retained = Vec::with_capacity(calls.len());
-    for id in &calls {
+    for result in checkpoint.results {
+        if let ToolRoundResult::Finalized(result) = result {
+            if !result.is_error() && blocks.iter().any(|block| matches!(
+                block, ContentBlock::ToolUse { id, name, .. } if id == &result.tool_use_id && name == "goal_report"
+            )) {
+                return Err(GoalDbError::Integrity("goal report result was finalized before commit"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn retained_round_tx(
+    tx: &mut GoalTx<'_>,
+    checkpoint: &GoalRoundCheckpoint<'_>,
+) -> Result<Option<Vec<Message>>> {
+    validate_round_shape(checkpoint)?;
+    let assistant = checkpoint.assistant;
+    let retained_assistant = retained_message_tx(tx, &assistant.message_id).await?;
+    let mut retained = Vec::with_capacity(checkpoint.results.len());
+    for result in checkpoint.results {
         retained.push(
-            retained_message_tx(tx, &tool_result_message_id(&assistant.message_id, id)).await?,
+            retained_message_tx(
+                tx,
+                &tool_result_message_id(&assistant.message_id, result.tool_use_id()),
+            )
+            .await?,
+        );
+    }
+    if retained_assistant.is_none() && retained.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let retained_assistant =
+        retained_assistant.ok_or(GoalDbError::Integrity("retained round missing assistant"))?;
+    if !crate::message_payload_matches(&retained_assistant, assistant) {
+        return Err(GoalDbError::Integrity("retained round assistant differs"));
+    }
+    let mut messages = Vec::with_capacity(retained.len());
+    for (ordinal, (intent, actual)) in checkpoint.results.iter().zip(retained).enumerate() {
+        let actual = actual.ok_or(GoalDbError::Integrity("retained round missing result"))?;
+        let finalized = match intent {
+            ToolRoundResult::Finalized(result) => result.clone(),
+            ToolRoundResult::PendingGoalReport { report, .. } => {
+                super::checkpoint::verify_source_tx(tx, assistant, checkpoint.execution, report)
+                    .await?;
+                super::checkpoint::retained_result_tx(tx, report, &actual.message_id)
+                    .await?
+                    .ok_or(GoalDbError::Integrity("retained report missing result"))?
+            }
+        };
+        if !crate::message_payload_matches(
+            &actual,
+            &result_message(assistant, ordinal, &finalized)?,
+        ) {
+            return Err(GoalDbError::Integrity("retained round result differs"));
+        }
+        messages.push(actual);
+    }
+    Ok(Some(messages))
+}
+
+pub(crate) async fn finalize_round_tx(
+    tx: &mut GoalTx<'_>,
+    checkpoint: &GoalRoundCheckpoint<'_>,
+) -> Result<(Vec<Message>, bool)> {
+    validate_round_shape(checkpoint)?;
+    let assistant = checkpoint.assistant;
+    let mut retained = Vec::with_capacity(checkpoint.results.len());
+    for result in checkpoint.results {
+        retained.push(
+            retained_message_tx(
+                tx,
+                &tool_result_message_id(&assistant.message_id, result.tool_use_id()),
+            )
+            .await?,
         );
     }
     let replayed = retained.iter().all(Option::is_some);
@@ -229,17 +308,10 @@ pub(crate) async fn finalize_round_tx(
         return Err(GoalDbError::Integrity("goal round partial retained result"));
     }
     crate::insert_message_tx(tx, assistant).await?;
-    let mut messages = Vec::with_capacity(calls.len());
+    let mut messages = Vec::with_capacity(checkpoint.results.len());
     for (ordinal, result) in checkpoint.results.iter().enumerate() {
         let resolved = match result {
-            ToolRoundResult::Finalized(result) => {
-                if !result.is_error() && blocks.iter().any(|block| matches!(
-                    block, ContentBlock::ToolUse { id, name, .. } if id == &result.tool_use_id && name == "goal_report"
-                )) {
-                    return Err(GoalDbError::Integrity("goal report result was finalized before commit"));
-                }
-                result.clone()
-            }
+            ToolRoundResult::Finalized(result) => result.clone(),
             ToolRoundResult::PendingGoalReport {
                 report,
                 duration_ms,
@@ -288,6 +360,25 @@ pub(crate) async fn selected_state_tx(
 }
 
 impl Database {
+    /// Read exact finalized evidence for an already committed pending round.
+    ///
+    /// # Errors
+    /// Partial, changed or unproven retained data is an error, never an inferred success.
+    pub async fn retained_goal_terminal_round(
+        &self,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+    ) -> DbResult<Option<CommittedGoalTerminalRound>> {
+        let mut tx = self.pool().begin().await?;
+        let results = retained_round_tx(&mut tx, checkpoint)
+            .await
+            .map_err(db_error)?;
+        tx.commit().await?;
+        Ok(results.map(|results| CommittedGoalTerminalRound {
+            results,
+            replayed: true,
+        }))
+    }
+
     /// Stage a report round and selected state in the existing terminal obligation.
     /// This does not project selected state ahead of the terminalizing command.
     ///
@@ -298,6 +389,7 @@ impl Database {
         &self,
         checkpoint: &GoalRoundCheckpoint<'_>,
         obligation: &crate::workflow::DirectTurnTerminalObligationInput,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     ) -> DbResult<CommittedGoalTerminalRound> {
         if i64::try_from(obligation.turn_id.0).ok() != Some(checkpoint.execution.turn_id())
             || &obligation.projection.state != checkpoint.state
@@ -317,6 +409,7 @@ impl Database {
             },
             obligation,
             crate::TerminalEvidenceTransactionCut::None,
+            update,
         )
         .await
     }
@@ -354,6 +447,7 @@ impl Database {
         &self,
         checkpoint: &GoalRoundCheckpoint<'_>,
         proposal: &crate::ForkProposal,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     ) -> DbResult<CommittedGoalRound> {
         if proposal.origin_conversation_id != checkpoint.assistant.conversation_id {
             return Err(DbError::Serialization(
@@ -361,7 +455,6 @@ impl Database {
             ));
         }
         self.persist_fork_tool_round_input(
-            &checkpoint.assistant.conversation_id,
             checkpoint.assistant,
             ToolRoundWrite::Pending {
                 execution: checkpoint.execution,
@@ -370,6 +463,7 @@ impl Database {
             proposal,
             checkpoint.state,
             checkpoint.state_updated_at,
+            update,
         )
         .await
     }

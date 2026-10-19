@@ -894,6 +894,24 @@ pub struct ToolResult {
 
 impl ToolResult {
     #[must_use]
+    pub fn persisted_tool_content(&self) -> ToolContent {
+        let persisted_output = match &self.outcome {
+            ToolOutcome::TrustedInstructions { .. } => {
+                "Authenticated built-in skill instructions were delivered for this live request."
+            }
+            ToolOutcome::Success { .. }
+            | ToolOutcome::Error { .. }
+            | ToolOutcome::Cancelled { .. } => self.output(),
+        };
+        ToolContent {
+            tool_use_id: self.tool_use_id.clone(),
+            content: persisted_output.into(),
+            is_error: self.is_error(),
+            images: self.images().to_vec(),
+        }
+    }
+
+    #[must_use]
     pub fn success(tool_use_id: String, output: String) -> Self {
         Self {
             tool_use_id,

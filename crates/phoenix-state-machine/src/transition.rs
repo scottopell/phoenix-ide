@@ -1153,7 +1153,7 @@ fn handle_core_tool_complete(
             result,
         } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
-            new_results.push(result);
+            new_results.push(result.into());
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
@@ -1179,7 +1179,7 @@ fn handle_core_tool_complete(
             && pending_sub_agents.is_empty() =>
         {
             let mut all_results = completed_results.clone();
-            all_results.push(result);
+            all_results.push(result.into());
 
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in last-tool transition");
@@ -1202,7 +1202,7 @@ fn handle_core_tool_complete(
             && !pending_sub_agents.is_empty() =>
         {
             let mut all_results = completed_results.clone();
-            all_results.push(result);
+            all_results.push(result.into());
 
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect(
@@ -1226,7 +1226,7 @@ fn handle_core_tool_complete(
             spawned,
         } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
-            new_results.push(result);
+            new_results.push(result.into());
 
             let mut new_pending = pending_sub_agents.clone();
             new_pending.extend(spawned);
@@ -1257,7 +1257,7 @@ fn handle_core_tool_complete(
 
             let mut all_results = completed_results.clone();
             let spawn_id = result.tool_use_id.clone();
-            all_results.push(result);
+            all_results.push(result.into());
 
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
@@ -1490,21 +1490,16 @@ fn handle_core_cancellation(
 /// Builds the tool results list for cancellation transitions, including the
 /// cancelled current tool and skipped remaining tools.
 fn build_cancellation_results(
-    completed_results: &[ToolResult],
+    completed_results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
     cancelled_tool_id: &str,
     cancel_reason: &str,
     skipped_tools: &[ToolCall],
-) -> Vec<ToolResult> {
+) -> Vec<phoenix_core::domain::conversation_goal::ToolRoundResult> {
     let mut all_results = completed_results.to_vec();
-    all_results.push(ToolResult::cancelled(
-        cancelled_tool_id.to_string(),
-        cancel_reason,
-    ));
+    all_results.push(ToolResult::cancelled(cancelled_tool_id.to_string(), cancel_reason).into());
     for tool in skipped_tools {
-        all_results.push(ToolResult::cancelled(
-            tool.id.clone(),
-            "Skipped due to cancellation",
-        ));
+        all_results
+            .push(ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation").into());
     }
     all_results
 }
@@ -7784,7 +7779,11 @@ mod tests {
             .expect("should persist a tool-round checkpoint with the rejection");
         let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
         assert_eq!(tool_results.len(), 1);
-        match &tool_results[0].outcome {
+        match &tool_results[0]
+            .finalized()
+            .expect("finalized rejection")
+            .outcome
+        {
             ToolOutcome::Error { output, .. } => {
                 assert!(
                     output.contains("parent"),
@@ -9343,7 +9342,7 @@ mod tests {
                 .expect("Direct rejection must persist a tool result");
             let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
             assert!(matches!(
-                &tool_results[0].outcome,
+                &tool_results[0].finalized().expect("finalized rejection").outcome,
                 ToolOutcome::Error { output, .. }
                     if output == "propose_task is unavailable for this conversation."
             ));

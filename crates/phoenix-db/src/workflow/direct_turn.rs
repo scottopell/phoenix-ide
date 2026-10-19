@@ -261,6 +261,11 @@ pub enum TerminalEvidenceExpectation {
         conversation_id: String,
     },
     Messages(Vec<Message>),
+    GoalRound {
+        assistant: Box<Message>,
+        execution: phoenix_core::domain::conversation_goal::GoalExecution,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+    },
     MessageMutation {
         conversation_id: String,
         message_id: String,
@@ -2221,15 +2226,27 @@ impl WorkflowRepository {
                     matches &= actual.as_ref().is_some_and(|actual| {
                         actual.conversation_id == expected_message.conversation_id
                             && (identity_only
-                                || (actual.sequence_id == expected_message.sequence_id
-                                    && actual.message_type == expected_message.message_type
-                                    && actual.content == expected_message.content
-                                    && actual.display_data == expected_message.display_data
-                                    && actual.usage_data == expected_message.usage_data
-                                    && actual.created_at == expected_message.created_at))
+                                || crate::message_payload_matches(actual, expected_message))
                     });
                 }
                 matches
+            }
+            TerminalEvidenceExpectation::GoalRound {
+                assistant,
+                execution,
+                results,
+            } => {
+                let checkpoint = crate::conversation_goals::round::GoalRoundCheckpoint {
+                    assistant,
+                    execution: *execution,
+                    results,
+                    state: &expected.projection.state,
+                    state_updated_at: expected.projection.state_updated_at,
+                };
+                crate::conversation_goals::round::retained_round_tx(&mut tx, &checkpoint)
+                    .await
+                    .map_err(crate::conversation_goals::round::db_error)?
+                    .is_some()
             }
             TerminalEvidenceExpectation::MessageMutation {
                 conversation_id,
@@ -3032,6 +3049,7 @@ fn expected_conversation_id(evidence: &TerminalEvidenceExpectation) -> &str {
         TerminalEvidenceExpectation::Messages(messages) => messages
             .first()
             .map_or("", |message| message.conversation_id.as_str()),
+        TerminalEvidenceExpectation::GoalRound { assistant, .. } => &assistant.conversation_id,
         TerminalEvidenceExpectation::ObligationOnly { conversation_id }
         | TerminalEvidenceExpectation::MessageMutation {
             conversation_id, ..

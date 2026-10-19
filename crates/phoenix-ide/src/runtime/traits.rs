@@ -402,6 +402,33 @@ pub trait MessageStore: Send + Sync {
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment;
 
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String>;
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String>;
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        proposal: &crate::db::ForkProposal,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String>;
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    >;
+
     async fn persist_sub_agent_results_with_terminal_obligation(
         &self,
         evidence: &TerminalSubAgentEvidence,
@@ -418,8 +445,11 @@ pub enum TerminalEvidenceEstablishment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TerminalMutationEstablishment {
-    Established { transcript_generation: Option<i64> },
+pub enum TerminalMutationEstablishment<T = ()> {
+    Established {
+        transcript_generation: Option<i64>,
+        value: T,
+    },
     Retired,
     KnownNotCommitted(String),
     Unclassifiable(String),
@@ -783,6 +813,47 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        (**self).persist_goal_tool_round_and_state(checkpoint).await
+    }
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        (**self)
+            .persist_goal_tool_round_state_and_replay(checkpoint, update)
+            .await
+    }
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        proposal: &crate::db::ForkProposal,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        (**self)
+            .persist_goal_fork_tool_round(checkpoint, proposal, update)
+            .await
+    }
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        (**self)
+            .persist_goal_terminal_tool_round(checkpoint, obligation, update)
+            .await
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -1583,6 +1654,74 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        self.db
+            .persist_goal_tool_round_and_state(checkpoint)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        self.db
+            .persist_goal_tool_round_state_and_replay(checkpoint, update)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        proposal: &crate::db::ForkProposal,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        self.db
+            .persist_goal_fork_tool_round(checkpoint, proposal, update)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        match self
+            .db
+            .persist_goal_terminal_tool_round(checkpoint, obligation, update)
+            .await
+        {
+            Ok(value) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+                value,
+            },
+            Err(error) => {
+                let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::GoalRound {
+                    assistant: Box::new(checkpoint.assistant.clone()),
+                    execution: checkpoint.execution,
+                    results: checkpoint.results.to_vec(),
+                };
+                classify_goal_terminal_mutation(
+                    &self.db,
+                    checkpoint,
+                    &evidence,
+                    obligation,
+                    error.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -2058,6 +2197,7 @@ impl MessageStore for DatabaseStorage {
         match repo.persist_terminal_obligation(&obligation).await {
             Ok(()) => TerminalMutationEstablishment::Established {
                 transcript_generation: None,
+                value: (),
             },
             Err(error) => {
                 classify_terminal_mutation(
@@ -2205,6 +2345,7 @@ impl MessageStore for DatabaseStorage {
         {
             Ok(()) => TerminalMutationEstablishment::Established {
                 transcript_generation: None,
+                value: (),
             },
             Err(error) => {
                 classify_terminal_mutation(
@@ -2248,6 +2389,7 @@ impl MessageStore for DatabaseStorage {
         {
             Ok(transcript_generation) => TerminalMutationEstablishment::Established {
                 transcript_generation,
+                value: (),
             },
             Err(error) => {
                 let transcript_generation = if evidence.is_message_mutation() {
@@ -2275,7 +2417,7 @@ impl MessageStore for DatabaseStorage {
     }
 }
 
-fn terminal_obligation(
+pub(super) fn terminal_obligation(
     settlement: &ActiveDirectTurnSettlement,
     response_message_id: Option<String>,
 ) -> phoenix_db::workflow::DirectTurnTerminalObligationInput {
@@ -2298,6 +2440,38 @@ fn terminal_obligation(
     }
 }
 
+pub(super) async fn classify_goal_terminal_mutation(
+    db: &crate::db::Database,
+    checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    evidence: &phoenix_db::workflow::TerminalEvidenceExpectation,
+    obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+    command_error: String,
+) -> TerminalMutationEstablishment<phoenix_db::conversation_goals::round::CommittedGoalTerminalRound>
+{
+    match classify_terminal_mutation(db, evidence, obligation, command_error, None).await {
+        TerminalMutationEstablishment::Established {
+            transcript_generation,
+            ..
+        } => match db.retained_goal_terminal_round(checkpoint).await {
+            Ok(Some(value)) => TerminalMutationEstablishment::Established {
+                transcript_generation,
+                value,
+            },
+            Ok(None) => TerminalMutationEstablishment::Unclassifiable(
+                "established goal round lost its exact retained rows".into(),
+            ),
+            Err(error) => TerminalMutationEstablishment::Unclassifiable(error.to_string()),
+        },
+        TerminalMutationEstablishment::Retired => TerminalMutationEstablishment::Retired,
+        TerminalMutationEstablishment::KnownNotCommitted(error) => {
+            TerminalMutationEstablishment::KnownNotCommitted(error)
+        }
+        TerminalMutationEstablishment::Unclassifiable(error) => {
+            TerminalMutationEstablishment::Unclassifiable(error)
+        }
+    }
+}
+
 async fn classify_terminal_mutation(
     db: &crate::db::Database,
     evidence: &phoenix_db::workflow::TerminalEvidenceExpectation,
@@ -2314,6 +2488,7 @@ async fn classify_terminal_mutation(
             transcript_generation,
         }) => TerminalMutationEstablishment::Established {
             transcript_generation,
+            value: (),
         },
         Ok(phoenix_db::workflow::TerminalEvidenceProbe::Retired) => {
             TerminalMutationEstablishment::Retired
