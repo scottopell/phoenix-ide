@@ -211,10 +211,11 @@ AND SHALL reject a bare identifier whose identity domain is ambiguous rather tha
 THE resolved target SHALL include the WorkScope attached to the selected transcript member, its lifecycle and environment kind, authoritative cwd and worktree path, and an effective path that prefers worktree path over cwd
 AND SHALL mark those paths as server-filesystem locations rather than caller-local paths
 
-WHEN an app-local `/c/<id>` reference identifies an authoritative ordinary ProductConversation and carries no explicit transcript or message selector
-THE SYSTEM SHALL interpret it as stable navigation that follows the current continuation
-AND SHALL emit `/c/<product_conversation_id>` as its canonical ordinary conversation route
-AND SHALL preserve `/product-conversations/<id>` as a compatibility alias
+WHEN an app-local `/c/<reference>` identifies an authoritative ordinary ProductConversation and carries no explicit transcript or message selector
+THE SYSTEM SHALL interpret it as conversation navigation that follows the current continuation
+AND SHALL emit the percent-encoded `/c/<allocated-root-slug>` as its current canonical ordinary conversation route under `specs/conversation-identity/requirements.md`
+AND SHALL preserve permanent ProductConversation IDs as durable reference identities and `/product-conversations/<id>` as a compatibility alias
+AND SHALL NOT promise that a former slug remains bound after rename
 
 WHEN an app-local reference contains a `source_transcript` selector
 THE SYSTEM SHALL validate that the selected transcript belongs to the referenced conversation and identity domain before selecting it

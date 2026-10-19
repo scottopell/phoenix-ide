@@ -103,7 +103,7 @@ export type SidebarItem =
   | {
       kind: 'chain';
       rootId: string;
-      /** Display name: chain_name on root, falling back to root's slug. */
+      /** Display name: authoritative root title, falling back to its slug. */
       displayName: string;
       /** Members in chain order (root → leaf). */
       members: Conversation[];
@@ -179,13 +179,13 @@ export function groupConversationsForSidebar(
       const members = orderedMembers.get(root) ?? [];
       if (members.length === 0) continue;
       const rootConv = members[0]!;
-      const displayName = rootConv.chain_name ?? rootConv.slug;
+      const displayName = rootConv.title?.trim() || rootConv.slug;
       // Latest member = the non-root member with the largest updated_at,
       // matching the backend `ChainView` rule (see src/api/chains.rs). The
       // root is excluded because edits to root metadata (e.g. setting
-      // chain_name) bump its updated_at without representing real work; if
-      // the root were eligible it would incorrectly become "latest" after
-      // a rename. Members are ordered root-first by chain order, so
+      // The root is excluded because root metadata edits can bump its
+      // updated_at without representing new work. Members are ordered
+      // root-first by chain order, so
       // members[0] is always the root and members[1..] are non-root.
       // A chain has length ≥ 2 (REQ-CHN-002), so members[1] always exists.
       let latest = members[1]!;

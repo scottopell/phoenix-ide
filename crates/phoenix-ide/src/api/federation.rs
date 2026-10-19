@@ -253,9 +253,10 @@ pub async fn resolve_remote_reference(
         (crate::api::global_read::ResolvedWorkScope::Available { .. }, Some(instance_id)) => {
             instance_id == peer.peer_instance_id
         }
-        (crate::api::global_read::ResolvedWorkScope::Available { .. }, None) => false,
+        (crate::api::global_read::ResolvedWorkScope::Available { .. }, None) | (_, Some(_)) => {
+            false
+        }
         (_, None) => true,
-        (_, Some(_)) => false,
     };
     if !path_owner_matches {
         return Err(FederationClientError::ResolveProvenanceMismatch);
@@ -273,14 +274,12 @@ pub async fn resolve_remote_reference(
 }
 
 fn resolved_reference_href_matches(target: &ConversationReferenceTarget, href: &str) -> bool {
-    use crate::api::product_conversations::{
-        canonical_product_conversation_route, exact_transcript_route, message_fragment,
-    };
+    use crate::api::product_conversations::{exact_transcript_route, message_fragment};
 
     match target {
-        ConversationReferenceTarget::ProductConversation {
-            product_conversation_id,
-        } => href == canonical_product_conversation_route(product_conversation_id),
+        ConversationReferenceTarget::ProductConversation { .. } => {
+            canonical_product_route_shape(href)
+        }
         ConversationReferenceTarget::Transcript { transcript_id } => {
             href == exact_transcript_route(transcript_id)
         }
@@ -293,6 +292,31 @@ fn resolved_reference_href_matches(target: &ConversationReferenceTarget, href: &
         }
         ConversationReferenceTarget::Coordinator => href == "/global",
     }
+}
+
+fn canonical_product_route_shape(href: &str) -> bool {
+    let Some(component) = href.strip_prefix("/c/") else {
+        return false;
+    };
+    if component.is_empty() || component.contains(['/', '?', '#']) {
+        return false;
+    }
+    let bytes = component.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') => {
+                index += 1;
+            }
+            b'%' if bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) =>
+            {
+                index += 3;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn decode_remote_resolve_response(
@@ -1194,6 +1218,48 @@ mod tests {
         assert!(first.starts_with("phx_peer_"));
         assert_ne!(first, second);
         assert_eq!(first.len(), "phx_peer_".len() + 43);
+    }
+
+    #[test]
+    fn resolved_routes_distinguish_canonical_navigation_from_exact_evidence() {
+        let product = ConversationReferenceTarget::ProductConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "stable-product-id",
+                )
+                .unwrap(),
+        };
+        assert!(resolved_reference_href_matches(
+            &product,
+            "/c/readable-name"
+        ));
+        assert!(resolved_reference_href_matches(
+            &product,
+            "/c/%C3%BCber-%E6%9D%B1%E4%BA%AC"
+        ));
+        for invalid in [
+            "/c/",
+            "/c/readable-name/extra",
+            "/c/readable-name?source_transcript=other",
+            "https://peer.example/c/readable-name",
+        ] {
+            assert!(!resolved_reference_href_matches(&product, invalid));
+        }
+
+        let transcript = ConversationReferenceTarget::Transcript {
+            transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                "exact-transcript",
+            )
+            .unwrap(),
+        };
+        assert!(resolved_reference_href_matches(
+            &transcript,
+            "/c/exact-transcript?source_transcript=exact-transcript"
+        ));
+        assert!(!resolved_reference_href_matches(
+            &transcript,
+            "/c/readable-name"
+        ));
     }
 
     #[tokio::test]

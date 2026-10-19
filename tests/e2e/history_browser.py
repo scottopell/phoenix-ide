@@ -262,7 +262,9 @@ class Fixture:
             assert creation.get("product_conversation_id") == product_id, creation
             kind = creation.get("kind")
             if kind == "published":
-                assert creation.get("canonical_route") == f"/c/{product_id}", creation
+                canonical_route = creation.get("canonical_route")
+                assert isinstance(canonical_route, str) and canonical_route.startswith("/c/"), creation
+                assert canonical_route.removeprefix("/c/") and "/" not in canonical_route.removeprefix("/c/"), creation
                 row = creation.get("transcript_row_id")
                 assert isinstance(row, str) and row, creation
                 return creation

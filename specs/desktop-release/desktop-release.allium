@@ -3,7 +3,7 @@
 --
 -- Scope: exact-tag gating, paired architecture-specific helper/app builds,
 -- Developer ID signing, notarization, and private publication preparation.
--- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010/011/012.
+-- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010/011/012/013.
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }
@@ -141,12 +141,17 @@ entity IncidentPreparation {
     verified: Boolean
 }
 
+entity LinuxIncidentPreparation {
+    verified: Boolean
+}
+
 surface DesktopReleaseWorkflow {
     context gate: ReleaseGate
     context pair: ArchitecturePair
     context publication: ReleasePublication
     context preparation: DesktopPreparation
     context incident: IncidentPreparation
+    context linux_incident: LinuxIncidentPreparation
 
     provides:
         ReleaseTagCreated(gate)
@@ -170,6 +175,7 @@ surface DesktopReleaseWorkflow {
         PublishedReleaseMismatchFound(publication)
         ProtectedPreparationRequested(preparation)
         ExactArmIncidentPreparationRequested(incident)
+        ExactLinuxIncidentPreparationRequested(linux_incident)
 }
 
 -- Helpers
@@ -272,6 +278,33 @@ surface DesktopReleaseWorkflow {
 --   verification results, notarization submission identity, and independently
 --   rechecked artifact digests without protected credential material; they are
 --   not attached to or published as a GitHub Release.
+-- linux_incident_has_exact_source_and_controller(incident) -> Boolean
+--   REQ-DESKTOP-REL-013: only prepare-incident-237100-linux-x86_64 is admitted,
+--   with no candidate/target/tag selection. The immutable candidate, exact source
+--   version, complete registry digest, origin/main ancestry and distinct workflow
+--   controller match the requirement; the target is x86_64-unknown-linux-musl.
+-- linux_incident_has_closed_payload_and_receipt(incident) -> Boolean
+--   The artifact is a verified nonempty static ELF64 x86-64 binary with exact
+--   embedded candidate identity. The Actions payload contains exactly that named
+--   binary and one schema-1 receipt. The receipt's only top-level fields are
+--   schema=1, operation, target, version, commit, controller_commit,
+--   registry_sha256, positive-integer run_id/run_attempt, event, ref, sha256,
+--   and checks. Operation/target/version/commit/controller/registry/event/ref
+--   are fixed by REQ-DESKTOP-REL-013. sha256 has only the prepared basename;
+--   checks has only clean_source/static_elf/embedded_identity, each verified.
+--   No manifest, extra receipt field, or runtime data is retained. Exact finalized
+--   receipt bytes are hashed. Only after successful upload, authenticated run
+--   evidence and successful job outputs publish receipt_sha256 and artifact_id,
+--   bound to repository/workflow, run ID/attempt, full app/controller commits and
+--   receipt basename. Failed validation/upload publishes no success evidence.
+--   The independent receipt-byte expectation is not an archive digest, self-hash
+--   or third payload file, and is obtained from authenticated selected run evidence
+--   rather than the mutable local payload directory.
+-- linux_incident_has_no_release_or_deployment_authority(incident) -> Boolean
+--   No tag creation/move, release mutation/publication, deployment, installation,
+--   compatibility admission, or general Linux/other-candidate preparation is
+--   authorized. The ARM operation and normal macOS preparation/release are unchanged.
+--
 -- incident_has_exact_source_and_controller(incident) -> Boolean
 --   REQ-DESKTOP-REL-012: only operation prepare-incident-237100-arm64 is admitted,
 --   with no candidate/target/tag selection. The fixed candidate/version/registry
@@ -513,6 +546,21 @@ rule ProtectedMainPreparationProducesActionsEvidence {
     ensures: preparation_has_no_release_authority(preparation)
     ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
     ensures: preparation.verified = (preparation_uses_release_security_path(preparation) and required_native_pairs_passed(preparation))
+}
+
+rule ExactLinuxIncidentPreparationProducesClosedEvidence {
+    when: ExactLinuxIncidentPreparationRequested(incident)
+    requires: linux_incident_has_exact_source_and_controller(incident)
+    ensures: linux_incident_has_no_release_or_deployment_authority(incident)
+    ensures: incident.verified = linux_incident_has_closed_payload_and_receipt(incident)
+}
+
+invariant VerifiedLinuxIncidentHasExactClosedEvidence {
+    LinuxIncidentPreparation.verified implies (
+        linux_incident_has_exact_source_and_controller(LinuxIncidentPreparation) and
+        linux_incident_has_closed_payload_and_receipt(LinuxIncidentPreparation) and
+        linux_incident_has_no_release_or_deployment_authority(LinuxIncidentPreparation)
+    )
 }
 
 rule ExactArmIncidentPreparationProducesSeparateEvidence {

@@ -454,7 +454,7 @@ async fn authenticated_https_resolve_returns_destination_provenance() {
         .create_conversation(
             "remote-resolve-transcript",
             "remote-resolve",
-            "/tmp",
+            "/receiver-owned/worktree",
             true,
             None,
             None,
@@ -473,7 +473,14 @@ async fn authenticated_https_resolve_returns_destination_provenance() {
     .await
     .unwrap();
     assert_eq!(resolution.reference.instance_id, destination);
-    assert!(resolution.path_owner_instance_id.is_none());
+    assert_eq!(resolution.path_owner_instance_id, Some(destination));
+    assert!(matches!(
+        &resolution.work_scope,
+        crate::api::global_read::ResolvedWorkScope::Available {
+            effective_path: Some(path),
+            ..
+        } if path == "/receiver-owned/worktree"
+    ));
     assert!(!resolution.related_references.is_empty());
     assert!(resolution
         .related_references
@@ -485,10 +492,9 @@ async fn authenticated_https_resolve_returns_destination_provenance() {
             product_conversation_id,
         } if product_conversation_id == product_id
     ));
-    assert!(resolution
-        .href
-        .as_deref()
-        .is_some_and(|href| href.starts_with("https://localhost:")));
+    assert!(resolution.href.as_deref().is_some_and(
+        |href| href.starts_with("https://localhost:") && href.ends_with("/c/remote-resolve")
+    ));
 
     let error = crate::api::federation::resolve_remote_reference(
         &caller.state.db,

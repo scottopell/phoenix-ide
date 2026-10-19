@@ -65,15 +65,6 @@ fn encoded_route_component(value: &str) -> String {
     encoded
 }
 
-pub(crate) fn canonical_product_conversation_route(
-    id: &phoenix_core::domain::product_conversation::ProductConversationId,
-) -> String {
-    format!(
-        "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
-        encoded_route_component(id.as_str())
-    )
-}
-
 pub(crate) fn exact_transcript_route(
     id: &phoenix_core::domain::close::TranscriptConversationId,
 ) -> String {
@@ -178,6 +169,99 @@ pub async fn rename_product_conversation(
         .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
     Ok(Json(list_row(&projection)))
 }
+pub async fn regenerate_product_conversation_name(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<ProductConversationListRow>, AppError> {
+    let resolved = state
+        .db
+        .resolve_ordinary_product_conversation(&reference)
+        .await
+        .map_err(db_to_app)?;
+    let root = state
+        .db
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(db_to_app)?
+        .root
+        .conversation;
+    let root_id = root.id.clone();
+    let owner_id = resolved.product_conversation_id.clone();
+    let name_baseline = state
+        .db
+        .capture_conversation_name_baseline(&root_id)
+        .await
+        .map_err(db_to_app)?;
+    let opening = state
+        .runtime
+        .db()
+        .first_opening_message_text(&root_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            tracing::debug!(
+                conv_id = %root_id,
+                "product conversation regenerate-name: no opening message; leaving title unchanged"
+            );
+            AppError::Internal(
+                "cannot regenerate product conversation name: no opening message to summarize"
+                    .to_string(),
+            )
+        })?;
+
+    let (cheap_model_id, cheap_model) =
+        state
+            .llm_registry
+            .get_cheap_model_with_id()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "no cheap LLM model is available for name regeneration".to_string(),
+                )
+            })?;
+    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
+
+    let generated = crate::title_generator::generate_title(
+        &opening,
+        cheap_model,
+        effective_effort,
+        state.llm_registry.output_token_limit(&cheap_model_id),
+    )
+    .await
+    .filter(|slug| !slug.is_empty())
+    .ok_or_else(|| {
+        AppError::Internal(
+            "product conversation name regeneration failed — the existing name is unchanged"
+                .to_string(),
+        )
+    })?;
+
+    let generated = normalize_product_conversation_title(&generated)?;
+    let committed = state
+        .runtime
+        .db()
+        .set_ordinary_product_conversation_title_if_unchanged(
+            owner_id.as_str(),
+            &generated,
+            &name_baseline,
+        )
+        .await
+        .map_err(db_to_app)?;
+    if committed.is_none() {
+        return Err(AppError::Internal(
+            "conversation name changed while regeneration was running".to_string(),
+        ));
+    }
+    let projection = state
+        .db
+        .list_ordinary_product_conversation_projections()
+        .await
+        .map_err(db_to_app)?
+        .into_iter()
+        .find(|projection| projection.product_conversation_id == owner_id)
+        .ok_or_else(|| AppError::NotFound(owner_id.to_string()))?;
+    Ok(Json(list_row(&projection)))
+}
 
 fn normalize_product_conversation_title(title: &str) -> Result<String, AppError> {
     let normalized = title.trim();
@@ -186,11 +270,10 @@ fn normalize_product_conversation_title(title: &str) -> Result<String, AppError>
             "Product conversation title cannot be empty".to_string(),
         ));
     }
-    if normalized.chars().count() > super::chains::CHAIN_NAME_MAX_CHARS {
-        return Err(AppError::BadRequest(format!(
-            "Product conversation title must be at most {} characters",
-            super::chains::CHAIN_NAME_MAX_CHARS,
-        )));
+    if normalized.chars().count() > 200 {
+        return Err(AppError::BadRequest(
+            "Product conversation title must be at most 200 characters".to_string(),
+        ));
     }
     Ok(normalized.to_string())
 }
@@ -705,8 +788,24 @@ pub async fn get_product_conversation(
     .await
 }
 
-fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
-    canonical_product_conversation_route(aggregate.product_conversation.id())
+pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
+    use std::fmt::Write;
+    let mut route = String::from(PRODUCT_CONVERSATION_ROUTE_PREFIX);
+    for byte in slug.unwrap_or(product_id).bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            route.push(char::from(byte));
+        } else {
+            let _ = write!(route, "%{byte:02X}");
+        }
+    }
+    route
+}
+
+pub(super) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
+    product_route(
+        aggregate.root.conversation.slug.as_deref(),
+        aggregate.product_conversation.id().as_str(),
+    )
 }
 
 fn encode_recovery_cursor(updated_at_micros: i64, request_id: &str) -> String {
@@ -794,9 +893,9 @@ mod creation_allowed_actions_tests {
 fn list_row(projection: &ProductConversationListProjection) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
-        canonical_route: format!(
-            "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
-            projection.product_conversation_id
+        canonical_route: product_route(
+            projection.root_slug.as_deref(),
+            projection.product_conversation_id.as_str(),
         ),
         canonical_root: ProductConversationTranscriptRowView {
             transcript_row_id: projection.root_transcript_row_id.clone(),
@@ -911,12 +1010,7 @@ async fn snapshot_view(
         None => None,
     };
     let root_id = aggregate.root.conversation.id.clone();
-    let root_title = aggregate
-        .root
-        .conversation
-        .chain_name
-        .as_deref()
-        .or(aggregate.root.conversation.title.as_deref());
+    let root_title = aggregate.root.conversation.title.as_deref();
     let latest_id = aggregate.latest_transcript_row_id.clone();
     let metadata = ProductConversationSnapshotMetadataView {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
@@ -1500,7 +1594,7 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
-fn db_to_app(error: DbError) -> AppError {
+pub(super) fn db_to_app(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
         DbError::ProductConversationUnavailable(id) => {
@@ -2568,7 +2662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_renames_product_conversation_title_without_changing_slug() {
+    async fn router_renames_product_conversation_name_and_projection() {
         let state = make_test_state().await;
         let root = state
             .db
@@ -2577,7 +2671,7 @@ mod tests {
             .unwrap();
         let _successor =
             create_completed_continuation(&state, &root, "rename-handoff", "rename-opening").await;
-        sqlx::query("UPDATE conversations SET chain_name = 'Legacy Chain Name' WHERE id = ?1")
+        sqlx::query("UPDATE conversations SET title = 'Legacy Chain Name' WHERE id = ?1")
             .bind(&root.id)
             .execute(state.db.pool())
             .await
@@ -2602,7 +2696,10 @@ mod tests {
             body["canonical_root"]["title"],
             "Renamed Product Conversation"
         );
-        assert_eq!(body["canonical_root"]["slug"], "original-slug");
+        assert_eq!(
+            body["canonical_root"]["slug"],
+            "renamed-product-conversation"
+        );
         assert_eq!(
             body["presentation"]["display_name"],
             "Renamed Product Conversation"
@@ -2613,8 +2710,14 @@ mod tests {
             root_after.title.as_deref(),
             Some("Renamed Product Conversation")
         );
-        assert_eq!(root_after.slug.as_deref(), Some("original-slug"));
-        assert_eq!(root_after.chain_name, None);
+        assert_eq!(
+            root_after.slug.as_deref(),
+            Some("renamed-product-conversation")
+        );
+        assert_eq!(
+            root_after.product_conversation_id,
+            root.product_conversation_id
+        );
 
         let legacy_chain = create_router(state)
             .oneshot(
@@ -2658,7 +2761,7 @@ mod tests {
             .create_conversation("pc-long-title", "pc-long-title", "/tmp", true, None, None)
             .await
             .unwrap();
-        let title = "x".repeat(super::super::chains::CHAIN_NAME_MAX_CHARS + 1);
+        let title = "x".repeat(200 + 1);
 
         let response = create_router(state)
             .oneshot(
@@ -3062,10 +3165,7 @@ mod tests {
         let rows = listed["product_conversations"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["canonical_root"]["slug"], "root-slug");
-        assert_eq!(
-            rows[0]["canonical_route"],
-            format!("/c/{}", root.product_conversation_id)
-        );
+        assert_eq!(rows[0]["canonical_route"], "/c/root-slug");
         assert_eq!(rows[0]["presentation"]["display_name"], "Root Slug");
         assert_eq!(rows[0]["latest_transcript_row_id"], successor.id);
 
@@ -3086,10 +3186,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(snapshot["requested_transcript_row_id"], successor.id);
-        assert_eq!(
-            snapshot["canonical_route"],
-            format!("/c/{}", root.product_conversation_id)
-        );
+        assert_eq!(snapshot["canonical_route"], "/c/root-slug");
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
         assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "historical");
         assert_eq!(
@@ -3347,16 +3444,9 @@ mod tests {
     }
 
     #[test]
-    fn canonical_route_helpers_own_stable_and_exact_navigation() {
-        let product_id =
-            phoenix_core::domain::product_conversation::ProductConversationId::parse("product-id")
-                .unwrap();
+    fn exact_route_helpers_preserve_immutable_evidence_identity() {
         let transcript_id =
             phoenix_core::domain::close::TranscriptConversationId::parse("transcript-id").unwrap();
-        assert_eq!(
-            super::canonical_product_conversation_route(&product_id),
-            "/c/product-id"
-        );
         assert_eq!(
             super::exact_transcript_route(&transcript_id),
             "/c/transcript-id?source_transcript=transcript-id"
@@ -3373,18 +3463,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn readable_route_encodes_unicode_as_one_component() {
+        assert_eq!(
+            product_route(Some("über-東京-café"), "stable-id"),
+            "/c/%C3%BCber-%E6%9D%B1%E4%BA%AC-caf%C3%A9"
+        );
+        assert_eq!(product_route(None, "stable-id"), "/c/stable-id");
+    }
+
     #[tokio::test]
-    async fn canonical_route_is_product_keyed_and_aliases_survive_root_rename() {
+    async fn canonical_route_is_readable_and_stable_id_aliases_survive_root_rename() {
         let state = make_test_state().await;
         let root = state
             .db
             .create_conversation("root", "root-slug", "/tmp", true, None, None)
             .await
             .unwrap();
-        let expected_route = format!("/c/{}", root.product_conversation_id);
+        let expected_route = "/c/renamed-root";
         state
             .db
-            .rename_conversation(&root.id, "renamed-root")
+            .set_ordinary_product_conversation_title(&root.id, "renamed-root")
             .await
             .unwrap();
 

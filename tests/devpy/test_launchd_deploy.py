@@ -4380,8 +4380,14 @@ class PreparationTests(unittest.TestCase):
             self.assertIn(asset, workflow)
         self.assertIn("SHA256SUMS", workflow)
         self.assertIn('missing required release asset: $asset', workflow)
-        self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
-        self.assertEqual(4, workflow.count('test -z "$(git status --porcelain)"'))
+        before, preparation_and_after = workflow.split("\n  build-incident-linux:", 1)
+        preparation, after = preparation_and_after.split("\n  build-macos:", 1)
+        release_jobs = before + "\n  build-macos:" + after
+        self.assertEqual(2, release_jobs.count("git restore ui/dist/.gitkeep"))
+        self.assertEqual(4, release_jobs.count('test -z "$(git status --porcelain)"'))
+        self.assertEqual(1, preparation.count("git restore ui/dist/.gitkeep"))
+        self.assertEqual(1, preparation.count('test -z "$(git status --porcelain)"'))
+        self.assertIn("cargo build --locked --profile release-min", preparation)
         self.assertIn('"runner":"macos-15-intel"', workflow)
         self.assertIn('"runner":"macos-15"', workflow)
         self.assertIn("runner: ubuntu-24.04-arm", workflow)
@@ -5471,7 +5477,13 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                     connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
                     connection.executemany(
                         "INSERT INTO _migrations VALUES (?, ?)",
-                        [entry for entry in helper.migration_registry(registry) if entry[0] <= 114],
+                        [
+                            entry
+                            for entry in helper.migration_registry(
+                                registry, qualified_current_target=False,
+                            )
+                            if entry[0] <= 114
+                        ],
                     )
                 before = database.read_bytes()
                 env = {"PATH": "/test", "PHOENIX_DB_PATH": str(database)}

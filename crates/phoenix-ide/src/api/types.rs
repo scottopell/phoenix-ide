@@ -340,12 +340,6 @@ pub struct ImageAttachment {
     pub media_type: String,
 }
 
-/// Request to rename a conversation
-#[derive(Debug, Deserialize)]
-pub struct RenameRequest {
-    pub name: String,
-}
-
 /// Response with a list of conversations
 #[derive(Debug, Serialize)]
 pub struct ConversationListResponse {
