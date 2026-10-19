@@ -217,7 +217,7 @@ impl TryFrom<&str> for SubscriptionState {
 }
 
 pub const REPLAY_BATCH: usize = 16;
-pub const MAX_UNACKNOWLEDGED: i64 = 1024;
+pub const MAX_UNACKNOWLEDGED: usize = 1024;
 pub const RETENTION_US: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 
 #[cfg(test)]

@@ -1,20 +1,29 @@
 use crate::{Database, DbError, DbResult};
 use phoenix_core::domain::{
-    close::TranscriptConversationId, federation_subscription::*, instance_identity::InstanceId,
+    close::TranscriptConversationId,
+    federation_subscription::{
+        FederatedTerminalFact, SubscriptionAuthorization, SubscriptionCurrentState,
+        SubscriptionCursor, SubscriptionDelivery, SubscriptionEnd, SubscriptionGap,
+        SubscriptionReference, SubscriptionReplay, SubscriptionSnapshot, SubscriptionState,
+        TerminalFactOutcome, MAX_UNACKNOWLEDGED, REPLAY_BATCH, RETENTION_US,
+    },
+    instance_identity::InstanceId,
     product_conversation::ProductConversationId,
 };
 use serde::Serialize;
 use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
 
-fn invalid(message: impl ToString) -> DbError {
-    DbError::Serialization(message.to_string())
+fn invalid(message: &str) -> DbError {
+    DbError::Serialization(message.to_owned())
 }
 fn cursor(value: i64) -> DbResult<SubscriptionCursor> {
-    value.try_into().map_err(invalid)
+    value
+        .try_into()
+        .map_err(|error| invalid(&error.to_string()))
 }
-fn uuid(value: String) -> DbResult<Uuid> {
-    Uuid::parse_str(&value).map_err(invalid)
+fn uuid(value: &str) -> DbResult<Uuid> {
+    Uuid::parse_str(value).map_err(|error| invalid(&error.to_string()))
 }
 fn end(value: &str) -> DbResult<SubscriptionEnd> {
     match value {
@@ -46,7 +55,7 @@ pub(crate) async fn append_terminal_tx(
     };
     let projection =
         serde_json::from_str::<phoenix_core::domain::sm_state::ConvState>(row.try_get("state")?)
-            .map_err(invalid)?;
+            .map_err(|error| invalid(&error.to_string()))?;
     if SubscriptionCurrentState::from_projection(&projection, Some(fact.outcome))
         == SubscriptionCurrentState::Nonterminal
     {
@@ -111,7 +120,7 @@ async fn retain_tx(tx: &mut Transaction<'_, Sqlite>, subscription: &str, now: i6
         .bind(subscription).fetch_all(&mut **tx).await?;
     for (index, row) in rows.into_iter().enumerate() {
         let time: i64 = row.try_get("occurred_at_us")?;
-        if index < MAX_UNACKNOWLEDGED as usize && time > now.saturating_sub(RETENTION_US) {
+        if index < MAX_UNACKNOWLEDGED && time > now.saturating_sub(RETENTION_US) {
             continue;
         }
         let event: String = row.try_get("event_id")?;
@@ -138,21 +147,21 @@ async fn snapshot_tx(
     let outcome: Option<String> = row.try_get("outcome")?;
     Ok(SubscriptionSnapshot {
         transcript_id: TranscriptConversationId::parse(row.try_get::<String, _>("id")?)
-            .map_err(invalid)?,
+            .map_err(|error| invalid(&error.to_string()))?,
         state: if row.try_get::<bool, _>("pending")? {
             SubscriptionCurrentState::Nonterminal
         } else {
             let projection = serde_json::from_str::<phoenix_core::domain::sm_state::ConvState>(
                 row.try_get("state")?,
             )
-            .map_err(invalid)?;
+            .map_err(|error| invalid(&error.to_string()))?;
             SubscriptionCurrentState::from_projection(
                 &projection,
                 outcome
                     .as_deref()
                     .map(TerminalFactOutcome::try_from)
                     .transpose()
-                    .map_err(invalid)?,
+                    .map_err(|error| invalid(&error.to_string()))?,
             )
         },
     })
@@ -245,7 +254,7 @@ impl Database {
             }
         } else {
             let rows = sqlx::query("SELECT i.event_id, i.sequence, p.source_transcript_id,p.outcome,p.occurred_at_us FROM federation_terminal_identities i JOIN federation_terminal_payloads p ON p.event_id = i.event_id WHERE i.subscription_id = ?1 AND i.sequence > ?2 AND i.continuation_state = 'none' AND i.sequence < COALESCE((SELECT MIN(blocked.sequence) FROM federation_terminal_identities blocked JOIN federation_terminal_payloads blocked_payload USING(event_id) WHERE blocked.subscription_id = i.subscription_id AND blocked.continuation_state = 'awaiting'), 9223372036854775807) AND NOT EXISTS (SELECT 1 FROM federation_subscriptions s JOIN close_obligations o ON o.product_conversation_id = s.product_id WHERE s.id = i.subscription_id AND o.phase != 'completed') ORDER BY i.sequence LIMIT ?3")
-                .bind(&id).bind(after.get()).bind(REPLAY_BATCH as i64).fetch_all(&mut *tx).await?;
+                .bind(&id).bind(after.get()).bind(i64::try_from(REPLAY_BATCH).expect("replay batch fits in SQLite integer")).fetch_all(&mut *tx).await?;
             let events = rows
                 .iter()
                 .map(|row| {
@@ -255,9 +264,9 @@ impl Database {
                         source_transcript_id: TranscriptConversationId::parse(
                             row.try_get::<String, _>("source_transcript_id")?,
                         )
-                        .map_err(invalid)?,
+                        .map_err(|error| invalid(&error.to_string()))?,
                         outcome: TerminalFactOutcome::try_from(row.try_get::<&str, _>("outcome")?)
-                            .map_err(invalid)?,
+                            .map_err(|error| invalid(&error.to_string()))?,
                         occurred_at_us: row.try_get("occurred_at_us")?,
                     })
                 })
@@ -335,14 +344,15 @@ fn decode_remote(row: &sqlx::sqlite::SqliteRow) -> DbResult<RemoteSubscription> 
             instance_id: row
                 .try_get::<String, _>("destination_instance_id")?
                 .parse()
-                .map_err(invalid)?,
+                .map_err(|error| invalid(&error.to_string()))?,
             product_conversation_id: ProductConversationId::parse(
                 row.try_get::<String, _>("product_id")?,
             )
-            .map_err(invalid)?,
+            .map_err(|error| invalid(&error.to_string()))?,
         },
         subscription_id: uuid(row.try_get("subscription_id")?)?,
-        state: SubscriptionState::try_from(row.try_get::<&str, _>("state")?).map_err(invalid)?,
+        state: SubscriptionState::try_from(row.try_get::<&str, _>("state")?)
+            .map_err(|error| invalid(&error.to_string()))?,
         admitted_cursor: cursor(row.try_get("admitted_cursor")?)?,
         enrolled: row.try_get("enrolled")?,
         pending_unsubscribe: row.try_get("pending_unsubscribe")?,

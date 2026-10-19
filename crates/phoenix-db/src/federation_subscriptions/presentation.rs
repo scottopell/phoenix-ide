@@ -3,7 +3,10 @@ use std::{collections::HashMap, fmt::Write as _, str::FromStr};
 use phoenix_core::domain::instance_identity::PeerBaseUrl;
 use sqlx::QueryBuilder;
 
-use super::{consumer::decode_notification, *};
+use super::{
+    consumer::decode_notification, invalid, Database, DbResult, RemoteNotification,
+    RemoteSubscription, Row, Sqlite, Transaction,
+};
 
 /// Durable received facts paired with optional source-issued navigation paths.
 pub type RemoteNotificationPresentations =
@@ -15,7 +18,7 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error when the staged notification binding is missing, the paths are
-    /// inconsistent with its exact source identity, or SQLite persistence fails.
+    /// inconsistent with its exact source identity, or `SQLite` persistence fails.
     pub async fn save_remote_notification_navigation(
         &self,
         remote: &RemoteSubscription,
@@ -47,9 +50,12 @@ impl Database {
             .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(remote.reference.product_conversation_id.as_str()).fetch_optional(&mut **tx).await?.ok_or_else(|| invalid("staged delivery unavailable for navigation"))?;
         let transcript = encoded_component(&transcript);
         let expected_source = format!("/c/{transcript}?source_transcript={transcript}");
-        let origin = PeerBaseUrl::from_str("https://subscription.invalid").map_err(invalid)?;
+        let origin = PeerBaseUrl::from_str("https://subscription.invalid")
+            .map_err(|error| invalid(&error.to_string()))?;
         for path in [stable_path, source_path] {
-            let url = origin.navigation_url(path).map_err(invalid)?;
+            let url = origin
+                .navigation_url(path)
+                .map_err(|error| invalid(&error.to_string()))?;
             if url.as_url().as_str() != format!("https://subscription.invalid{path}") {
                 return Err(invalid(
                     "source navigation is not a credential-free destination locator",

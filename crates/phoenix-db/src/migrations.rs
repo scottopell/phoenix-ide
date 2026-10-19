@@ -677,14 +677,15 @@ const MIGRATIONS: &[Migration] = &[
 async fn run_migration_130(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
     let result = async {
+        const OLD_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event')";
+        const NEW_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event', 'remote_api', 'remote_conversation', 'remote_coordinator')";
+
         let mut tx = guard.connection().begin().await?;
         let tables = [
             ("messages", "messages"),
             ("steering_messages", "steering"),
             ("durable_turns", "durable_turn"),
         ];
-        const OLD_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event')";
-        const NEW_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event', 'remote_api', 'remote_conversation', 'remote_coordinator')";
         for (table, _) in tables {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {table} ADD COLUMN origin_source_instance_id TEXT CHECK (
