@@ -1,3 +1,4 @@
+import { bashLaunchOutcomes } from '../../testFixtures/bashLaunchOutcomes';
 import { describe, expect, it } from 'vitest';
 import type { ContentBlock, ConversationState, Message } from '../../api';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
@@ -1141,4 +1142,17 @@ describe('explicit disclosure projection modes', () => {
     expect(blocks.map(block => block.searchableText)).toEqual(['Body target']);
     expect(buildMarkdownFileSearchProjection(source, 'Summary').matches).toHaveLength(0);
   });
+});
+
+it.each(bashLaunchOutcomes)('indexes visible uncertainty for $status / $launch_error', (response) => {
+  const projection = buildTerminalToolResultProjection('bash', JSON.stringify(response), undefined);
+  expect(projection.fullText).toContain('no handle');
+  expect(projection.fullText).toContain('No controllable handle; descendants unverified.');
+  expect(projection.fullText).toContain('Output capture incomplete.');
+  expect(projection.fullText).toContain('retained-tail');
+  if (response.status === 'outcome_unknown') {
+    expect(projection.fullText).toContain('Do not automatically retry.');
+    expect(projection.fullText).not.toContain('exit code');
+    expect(projection.fullText).not.toContain('signal 9');
+  }
 });

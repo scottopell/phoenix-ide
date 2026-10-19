@@ -6905,7 +6905,7 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     )
     .await;
     let had_live_handles = !bash_report.live_handle_pgids.is_empty();
-    let had_kill_failures = !bash_report.kill_failures.is_empty();
+    let had_kill_failures = bash_report.has_failures();
     if had_kill_failures {
         tracing::warn!(
             conv_id = %id,
@@ -6913,7 +6913,8 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
             live_handle_pgids = ?bash_report.live_handle_pgids,
             kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
             kill_failures = ?bash_report.kill_failures,
-            "bash cleanup had kill failures; orphan process groups may remain"
+            scope_uncertainty = ?bash_report.scope_uncertainty,
+            "bash cleanup could not verify shutdown; processes may remain"
         );
     } else if had_live_handles {
         tracing::debug!(

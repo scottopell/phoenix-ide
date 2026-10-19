@@ -222,7 +222,7 @@ function summarizeBashInputIdentity(input: Record<string, unknown>, display?: st
 }
 
 function bashStatusLabel(parsed: Record<string, unknown>): string | null {
-  if (typeof parsed['error'] === 'string') return 'error';
+  if (typeof parsed['error'] === 'string' && parsed['status'] !== 'outcome_unknown') return 'error';
   const status = typeof parsed['status'] === 'string' ? parsed['status'] : '';
   const exitCode = parsed['exit_code'];
   const finalCause = stringInput(parsed, 'final_cause');
@@ -230,6 +230,9 @@ function bashStatusLabel(parsed: Record<string, unknown>): string | null {
     case 'running': return 'running';
     case 'still_running': return 'still running';
     case 'kill_pending_kernel': return 'kill pending';
+    case 'unregistered_exited': return `exit ${String(exitCode ?? '?')} · no handle`;
+    case 'unregistered_killed': return `signal ${String(parsed['signal_number'] ?? '?')} · no handle`;
+    case 'outcome_unknown': return 'outcome unknown · no handle · do not automatically retry';
     case 'exited': return exitCode == null ? 'exited' : `exit ${String(exitCode)}`;
     case 'killed': return exitCode == null ? 'killed' : `killed ${String(exitCode)}`;
     case 'tombstoned': return finalCause ? `tombstoned · ${finalCause}` : 'tombstoned';
@@ -280,7 +283,10 @@ function summarizeBashCompactCard(
       outputTail: text.trim() ? truncate(text.trim(), 140) : null,
     };
   }
-  const status = bashStatusLabel(parsed);
+  const statusLabel = bashStatusLabel(parsed);
+  const status = typeof parsed['launch_error'] === 'string'
+    ? `${statusLabel ?? ''} · descendants unverified${parsed['output_complete'] === false ? ' · output incomplete' : ''}`
+    : statusLabel;
   const displayData = result.display_data as Record<string, unknown> | undefined;
   const durationMs = typeof parsed['duration_ms'] === 'number'
     ? parsed['duration_ms']
@@ -309,6 +315,7 @@ function summarizeToolResult(name: string, result: Message | undefined): string 
       const parsed = tryParseJson(text);
       if (!parsed) return null;
       const status = typeof parsed['status'] === 'string' ? parsed['status'] : '';
+      if (status.startsWith('unregistered_') || status === 'outcome_unknown') return bashStatusLabel(parsed);
       const exitCode = parsed['exit_code'];
       return status === 'exited' && exitCode != null ? `exited ${String(exitCode)}` : status.replace(/_/g, ' ') || null;
     }

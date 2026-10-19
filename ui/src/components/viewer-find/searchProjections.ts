@@ -1247,7 +1247,7 @@ function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux
     const parsed = JSON.parse(resultText);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return resultText;
     const record = parsed as Record<string, unknown>;
-    if (typeof record['error'] === 'string') {
+    if (typeof record['error'] === 'string' && !(family === 'bash' && record['status'] === 'outcome_unknown')) {
       const messageKey = family === 'bash' ? 'error_message' : 'message';
       return [
         `error: ${record['error']}`,
@@ -1266,13 +1266,21 @@ function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux
           : status === 'tombstoned' && typeof record['final_cause'] === 'string'
             ? `tombstoned · ${record['final_cause']}`
             : status;
-      if (statusLabel) visible.push(statusLabel);
+      const unregisteredLabel = status === 'unregistered_exited' ? 'exited · no handle'
+        : status === 'unregistered_killed' ? 'signaled · no handle'
+          : status === 'outcome_unknown' ? 'outcome unknown · no handle' : statusLabel;
+      if (unregisteredLabel) visible.push(unregisteredLabel);
+      if (typeof record['launch_error'] === 'string') {
+        visible.push('No controllable handle; descendants unverified.');
+        if (record['output_complete'] === false) visible.push('Output capture incomplete.');
+      }
+      if (typeof record['error_message'] === 'string') visible.push(record['error_message']);
       if (typeof record['handle'] === 'string') visible.push(record['handle']);
       if (typeof record['label'] === 'string') visible.push(record['label']);
-      if ((status === 'exited' || status === 'tombstoned') && record['exit_code'] !== null && record['exit_code'] !== undefined) {
+      if ((status === 'exited' || status === 'unregistered_exited' || status === 'tombstoned') && record['exit_code'] !== null && record['exit_code'] !== undefined) {
         visible.push(`exit code ${String(record['exit_code'])}`);
       }
-      if ((status === 'killed' || status === 'tombstoned') && typeof record['signal_number'] === 'number') {
+      if ((status === 'killed' || status === 'unregistered_killed' || status === 'tombstoned') && typeof record['signal_number'] === 'number') {
         visible.push(`signal ${String(record['signal_number'])}`);
       }
       if (typeof record['kill_signal_sent'] === 'string') visible.push(`kill: ${record['kill_signal_sent']}`);

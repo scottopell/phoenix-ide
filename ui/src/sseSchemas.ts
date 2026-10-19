@@ -713,6 +713,31 @@ const BashRunTombstonePayloadSchema = (status: 'exited' | 'killed') =>
     ...BashRingWindowFieldsSchema,
   });
 
+const BashUnregisteredRunFields = {
+  cmd: v.string(),
+  label: v.nullable(v.string()),
+  launch_error: v.picklist(['identity_unavailable', 'registration_failed']),
+  descendants: v.literal('unverified'),
+  output_complete: v.boolean(),
+  duration_ms: v.number(),
+  ...BashRingWindowFieldsSchema,
+};
+
+const BashUnregisteredTerminalSchema = (status: 'unregistered_exited' | 'unregistered_killed') =>
+  v.looseObject({
+    status: v.literal(status),
+    ...BashUnregisteredRunFields,
+    exit_code: v.nullable(v.number()),
+    signal_number: v.nullable(v.number()),
+  });
+
+const BashOutcomeUnknownSchema = v.looseObject({
+  status: v.literal('outcome_unknown'),
+  ...BashUnregisteredRunFields,
+  error: v.string(),
+  error_message: v.string(),
+});
+
 const BashWaiterPanickedPayloadSchema = v.looseObject({
   status: v.literal('waiter_panicked'),
   handle: v.string(),
@@ -731,6 +756,9 @@ export const BashResponseSchema = v.variant('status', [
   BashTombstonedPayloadSchema,
   BashRunTombstonePayloadSchema('exited'),
   BashRunTombstonePayloadSchema('killed'),
+  BashUnregisteredTerminalSchema('unregistered_exited'),
+  BashUnregisteredTerminalSchema('unregistered_killed'),
+  BashOutcomeUnknownSchema,
   BashWaiterPanickedPayloadSchema,
 ]) satisfies v.GenericSchema<unknown, WireBashResponse>;
 
