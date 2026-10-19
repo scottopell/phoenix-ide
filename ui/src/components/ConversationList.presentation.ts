@@ -6,7 +6,7 @@ export function productConversationDisplayTitle(row: ProductConversationListRow)
 
 export function productConversationOwnsRoute(
   pathname: string,
-  row: ProductConversationListRow,
+  row: Pick<ProductConversationListRow, 'product_conversation_id' | 'canonical_root' | 'latest_transcript_row_id'>,
 ): boolean {
   const match = pathname.match(/^\/(?:c|product-conversations)\/([^/]+)$/);
   if (!match?.[1]) return false;
@@ -28,7 +28,7 @@ export function renamedProductConversationLocation(
   pathname: string,
   search: string,
   hash: string,
-  previous: ProductConversationListRow,
+  previous: Pick<ProductConversationListRow, 'product_conversation_id' | 'canonical_root' | 'latest_transcript_row_id'>,
   renamed: ProductConversationListRow,
 ): { pathname: string; search: string; hash: string } | null {
   if (!productConversationOwnsRoute(pathname, previous)) return null;

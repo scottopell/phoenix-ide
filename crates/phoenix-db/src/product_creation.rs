@@ -3324,7 +3324,7 @@ mod product_creation_tests {
         };
         let reserved_slug = accepted.product_conversation_id.to_string();
 
-        db.rename_conversation(&existing.id, &reserved_slug)
+        db.set_ordinary_product_conversation_title(&existing.id, &reserved_slug)
             .await
             .unwrap();
         let renamed = db.get_conversation(&existing.id).await.unwrap();

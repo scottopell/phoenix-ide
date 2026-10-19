@@ -139,7 +139,10 @@ Controlled-functional build isolation is governed by [ADR-119](119_separate-cont
 | [115](115_protect-exact-114-to-128-published-release-activation.md) | Protect exact 114-to-128 published-release activation with an independently pinned controller | Accepted; partially supersedes ADR-102/105's protected-source restriction | REQ-COMP-012/013, REQ-LDD-004/011/019–024, REQ-PD-010/012/021–022 |
 | [116](116_protect-exact-65-to-128-systemd-published-release-activation.md) | Protect exact 65-to-128 systemd published-release activation | Accepted | REQ-COMP-014, REQ-PD-003/010/012/019, REQ-PD-023–027 |
 | [117](117_recover-interrupted-pre-marker-systemd-activation.md) | Recover interrupted pre-marker systemd activation | Accepted | REQ-COMP-014, REQ-PD-023–026 |
-| [129](129_single-conversation-name-and-allocated-slug.md) | One conversation name with an allocated route projection | Accepted | REQ-CID-001–006, REQ-CHN-007, REQ-COMP-001/002 |
+| [129](129_qualify-exact-prepared-linux-systemd-candidate.md) | Qualify exact prepared Linux systemd candidate | Accepted | REQ-COMP-016, REQ-PD-002/003/012/021/024/025/029 |
+| [130](130_commission-exact-237100-linux-artifact-preparation.md) | Commission the exact 237100 Linux artifact operation | Accepted | REQ-DESKTOP-REL-013; REQ-DESKTOP-REL-012 and REQ-COMP-015 boundaries unchanged |
+| [131](131_single-conversation-name-and-allocated-slug.md) | One conversation name with an allocated route projection | Accepted | REQ-CID-001–006, REQ-CHN-007, REQ-COMP-001/002 |
+| [132](132_retire-duplicate-naming-mutations.md) | Retire duplicate naming mutations after caller migration | Accepted | REQ-CID-001/005, REQ-CHN-007, REQ-COMP-001/002 |
 | [128](128_repair-failure-stopped-truth-includes-persistence.md) | Repair failure stopped truth includes persistent auto-start absence | Accepted | REQ-LDD-025 |
 | [127](127_bound-exact-arm-packaging-controller.md) | Bound the exact ARM packaging repair to a separate controller | Accepted | REQ-DESKTOP-REL-004/010/012, REQ-COMP-015 boundary unchanged |
 | [126](126_seal-exact-current-schema-forward-replacement.md) | Seal one exact current-schema forward replacement | Accepted | REQ-COMP-015, REQ-PD-028, REQ-LDD-025 |

@@ -23,7 +23,7 @@ const { apiMock } = vi.hoisted(() => ({
     getChain: vi.fn(),
     deleteChain: vi.fn(),
     deleteConversation: vi.fn(),
-    renameConversation: vi.fn(),
+    regenerateProductConversationName: vi.fn(),
     renameProductConversation: vi.fn(),
     getProductConversationSnapshot: vi.fn(),
   },
@@ -191,13 +191,17 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 
-  it('renames product conversations through the canonical-root transcript id', async () => {
-    apiMock.renameConversation.mockResolvedValue({ conversation: makeConv('unused', 'renamed-product') });
+  it.each(['manual', 'generated'] as const)('names product conversations through the canonical aggregate (%s)', async (operation) => {
     const row = makeProductConversation('pc-continued', {
       canonical_root: { transcript_row_id: 'canonical-root-row', slug: 'old-product', title: 'Old Product' },
       latest_transcript_row_id: 'latest-continuation-row',
     });
     apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+    apiMock.regenerateProductConversationName.mockResolvedValue({
+      ...row, canonical_route: '/c/generated-name',
+      canonical_root: { ...row.canonical_root, title: 'Generated Name', slug: 'generated-name' },
+      presentation: { kind: 'state', display_name: 'Generated Name', presentation_mode: 'idle' },
+    });
     apiMock.renameProductConversation.mockResolvedValue({
       ...row,
       canonical_root: { ...row.canonical_root, title: 'Renamed Product Title' },
@@ -216,11 +220,17 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation Old Product' })));
     fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
     const input = getByRole('textbox');
-    fireEvent.change(input, { target: { value: 'Renamed Product Title' } });
-    fireEvent.click(getByRole('button', { name: 'Rename' }));
-
-    await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalledWith('pc-continued', 'Renamed Product Title'));
-    expect(apiMock.renameConversation).not.toHaveBeenCalled();
+    expect(input).toHaveValue('Old Product');
+    if (operation === 'manual') {
+      fireEvent.change(input, { target: { value: 'Renamed Product Title' } });
+      fireEvent.click(getByRole('button', { name: 'Rename' }));
+      await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalledWith('pc-continued', 'Renamed Product Title'));
+      expect(apiMock.regenerateProductConversationName).not.toHaveBeenCalled();
+    } else {
+      fireEvent.click(getByRole('button', { name: 'Generate with AI' }));
+      await waitFor(() => expect(apiMock.regenerateProductConversationName).toHaveBeenCalledWith('pc-continued'));
+      expect(apiMock.renameProductConversation).not.toHaveBeenCalled();
+    }
     await waitFor(() => expect(listRevisionListener).toHaveBeenCalledTimes(1));
     unsubscribe();
   });

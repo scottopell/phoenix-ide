@@ -1,8 +1,10 @@
-# ADR-129: One conversation name with an allocated route projection
+# ADR-131: One conversation name with an allocated route projection
 
 - **Status:** Accepted
 - **Date:** 2026-10-18
 - **Affects:** REQ-CID-001–006, REQ-CHN-007, REQ-COMP-001/002 — `specs/conversation-identity/requirements.md`
+
+The legacy mutation-delegation portion of this decision is superseded by [ADR-132](132_retire-duplicate-naming-mutations.md); the single-name authority and allocated projection remain unchanged.
 
 ## Context
 

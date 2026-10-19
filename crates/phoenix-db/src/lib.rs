@@ -9857,16 +9857,6 @@ impl Database {
         }
     }
 
-    /// Compatibility entry point for the single aggregate name authority.
-    ///
-    /// # Errors
-    /// Returns a database, identity, or admission error.
-    pub async fn set_chain_name(&self, reference: &str, name: Option<&str>) -> DbResult<()> {
-        self.set_ordinary_product_conversation_title(reference, name.unwrap_or("Conversation"))
-            .await?;
-        Ok(())
-    }
-
     /// Return the display text of the earliest *opening* message in a
     /// conversation, or `None` when there is none (REQ-CHN-010).
     ///
@@ -9878,8 +9868,7 @@ impl Database {
     /// messages do not.
     ///
     /// "Earliest" is by `sequence_id` (the messages table's append order).
-    /// Used by chain-name regeneration to summarize each member's opening
-    /// intent.
+    /// Used by aggregate name generation.
     ///
     /// # Errors
     ///
@@ -11630,16 +11619,6 @@ impl Database {
                 ))
             }
         }
-    }
-
-    /// Rename the owning ordinary `ProductConversation`, preserving transcript identity.
-    ///
-    /// # Errors
-    /// Returns a database, identity, or admission error.
-    pub async fn rename_conversation(&self, id: &str, name: &str) -> DbResult<()> {
-        self.set_ordinary_product_conversation_title(id, name)
-            .await?;
-        Ok(())
     }
 
     /// List conversations with terminal obligations owed at startup.
@@ -17709,13 +17688,16 @@ mod tests {
             .await
             .unwrap();
         let original = db.get_conversation("conv-name-race").await.unwrap();
-        db.rename_conversation("conv-name-race", "Human title")
+        db.set_ordinary_product_conversation_title("conv-name-race", "Human title")
             .await
             .unwrap();
 
-        db.rename_conversation("conv-name-race", original.title.as_deref().unwrap())
-            .await
-            .unwrap();
+        db.set_ordinary_product_conversation_title(
+            "conv-name-race",
+            original.title.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
         let outcome = db
             .update_conversation_creation_metadata_and_mode(
                 "job-name-race",
@@ -28507,7 +28489,7 @@ mod tests {
         db.create_conversation("conv-named", "slug-named", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.set_chain_name("conv-named", Some("auth refactor"))
+        db.set_ordinary_product_conversation_title("conv-named", "auth refactor")
             .await
             .unwrap();
 
@@ -28817,33 +28799,38 @@ mod tests {
         assert_eq!(by_id("qas-i").status, ChainQaStatus::Abandoned);
     }
 
-    /// REQ-CHN-007: `set_chain_name` round-trips (set, change, clear).
+    /// REQ-CID-001: canonical title writes round-trip through the aggregate.
     #[tokio::test]
-    async fn test_set_chain_name_round_trips() {
+    async fn test_aggregate_title_round_trips() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("scn-root", "slug-scn", "/tmp", true, None, None)
             .await
             .unwrap();
 
-        db.set_chain_name("scn-root", Some("auth refactor"))
+        db.set_ordinary_product_conversation_title("scn-root", "auth refactor")
             .await
             .unwrap();
         let conv = db.get_conversation("scn-root").await.unwrap();
         assert_eq!(conv.title, Some("auth refactor".to_string()));
 
-        db.set_chain_name("scn-root", Some("auth-refactor-v2"))
+        db.set_ordinary_product_conversation_title("scn-root", "auth-refactor-v2")
             .await
             .unwrap();
         let conv = db.get_conversation("scn-root").await.unwrap();
         assert_eq!(conv.title, Some("auth-refactor-v2".to_string()));
 
-        db.set_chain_name("scn-root", None).await.unwrap();
+        db.set_ordinary_product_conversation_title("scn-root", "Conversation")
+            .await
+            .unwrap();
         let conv = db.get_conversation("scn-root").await.unwrap();
         assert_eq!(conv.title.as_deref(), Some("Conversation"));
         assert_eq!(conv.slug.as_deref(), Some("conversation"));
 
         // Missing conversation surfaces as a typed error, not silent no-op.
-        let err = db.set_chain_name("ghost", Some("x")).await.unwrap_err();
+        let err = db
+            .set_ordinary_product_conversation_title("ghost", "x")
+            .await
+            .unwrap_err();
         matches!(err, DbError::ConversationNotFound(_));
     }
 
@@ -28942,7 +28929,9 @@ mod tests {
         let before = db.get_conversation("rc").await.unwrap();
         assert_eq!(before.slug.as_deref(), Some("slug-rc-old"));
 
-        db.rename_conversation("rc", "slug-rc-new").await.unwrap();
+        db.set_ordinary_product_conversation_title("rc", "slug-rc-new")
+            .await
+            .unwrap();
 
         let after = db.get_conversation("rc").await.unwrap();
         assert_eq!(after.slug.as_deref(), Some("slug-rc-new"));
@@ -28965,10 +28954,10 @@ mod tests {
             .await
             .unwrap();
 
-        db.rename_conversation("rc-a", "Shared Human Name")
+        db.set_ordinary_product_conversation_title("rc-a", "Shared Human Name")
             .await
             .unwrap();
-        db.rename_conversation("rc-b", "Shared Human Name")
+        db.set_ordinary_product_conversation_title("rc-b", "Shared Human Name")
             .await
             .unwrap();
         let a = db.get_conversation("rc-a").await.unwrap();
@@ -28989,7 +28978,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.rename_conversation("rc-same", "slug-same")
+        db.set_ordinary_product_conversation_title("rc-same", "slug-same")
             .await
             .unwrap();
 
@@ -29002,7 +28991,10 @@ mod tests {
     #[tokio::test]
     async fn test_rename_conversation_not_found() {
         let db = Database::open_in_memory().await.unwrap();
-        match db.rename_conversation("ghost", "slug-anything").await {
+        match db
+            .set_ordinary_product_conversation_title("ghost", "slug-anything")
+            .await
+        {
             Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "ghost"),
             other => panic!("expected ConversationNotFound, got {other:?}"),
         }

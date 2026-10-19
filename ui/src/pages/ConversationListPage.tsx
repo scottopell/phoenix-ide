@@ -146,8 +146,6 @@ export function ConversationListPage() {
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
 
   // Rename state
-  const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
-  const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
   const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
   const [productDeleteSubmitting, setProductDeleteSubmitting] = useState(false);
@@ -155,7 +153,8 @@ export function ConversationListPage() {
   const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
   const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
   const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
-  const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
+  const renameSelectionRef = useRef(0);
+  const [productRenameTarget, setProductRenameTarget] = useState<Pick<ProductConversationListRow, 'product_conversation_id' | 'canonical_route' | 'canonical_root' | 'latest_transcript_row_id' | 'presentation'> | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
   const finishProductDelete = (
@@ -345,48 +344,37 @@ export function ConversationListPage() {
   };
 
 
-  const handleRename = async (newName: string) => {
-    if (!renameTarget) return;
-    try {
-      await api.renameConversation(renameTarget.id, newName);
-      setRenameTarget(null);
-      setRenameError(undefined);
-      await refresh();
-    } catch (err) {
-      setRenameError(err instanceof Error ? err.message : 'Failed to rename');
-    }
+  const applyProductName = (renamed: ProductConversationListRow) => {
+    if (!productRenameTarget) return;
+    const latestLocation = currentLocation.current;
+    const activeRoute = renamedProductConversationLocation(
+      latestLocation.pathname, latestLocation.search, latestLocation.hash, productRenameTarget, renamed,
+    );
+    if (activeRoute) navigate(activeRoute, { replace: true, state: latestLocation.state });
+    setProductConversations((rows) => rows.map((row) =>
+      row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
+    notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
+    notifyProductConversationListMayHaveChanged();
+    setProductRenameTarget(null);
+    setProductRenameError(undefined);
   };
 
-  const handleGenerateRename = async () => {
-    if (!renameTarget) return;
-    try {
-      await api.regenerateConversationName(renameTarget.id);
-      setRenameTarget(null);
-      setRenameError(undefined);
-      await refresh();
-    } catch (err) {
-      setRenameError(err instanceof Error ? err.message : 'Failed to generate name');
-      throw err;
-    }
-  };
-
-  const handleProductRename = async (newName: string) => {
+  const handleProductRename = async (name: string) => {
     if (!productRenameTarget) return;
     try {
-      const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
-      const latestLocation = currentLocation.current;
-      const activeRoute = renamedProductConversationLocation(
-        latestLocation.pathname, latestLocation.search, latestLocation.hash, productRenameTarget, renamed,
-      );
-      if (activeRoute) navigate(activeRoute, { replace: true, state: latestLocation.state });
-      setProductConversations((rows) => rows.map((row) =>
-        row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
-      notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
-      notifyProductConversationListMayHaveChanged();
-      setProductRenameTarget(null);
-      setProductRenameError(undefined);
-    } catch (err) {
-      setProductRenameError(err instanceof Error ? err.message : 'Failed to rename');
+      applyProductName(await api.renameProductConversation(productRenameTarget.product_conversation_id, name));
+    } catch (error) {
+      setProductRenameError(error instanceof Error ? error.message : 'Failed to rename');
+    }
+  };
+
+  const handleProductGenerate = async () => {
+    if (!productRenameTarget) return;
+    try {
+      applyProductName(await api.regenerateProductConversationName(productRenameTarget.product_conversation_id));
+    } catch (error) {
+      setProductRenameError(error instanceof Error ? error.message : 'Failed to generate name');
+      throw error;
     }
   };
 
@@ -443,9 +431,22 @@ export function ConversationListPage() {
   }, []);
 
   const handleSetRenameTarget = useCallback((conv: Conversation) => {
-    setRenameError(undefined);
-    setRenameTarget(conv);
-  }, []);
+    const selection = ++renameSelectionRef.current;
+    setProductRenameError(undefined);
+    const row = productConversations.find((candidate) =>
+      candidate.product_conversation_id === conv.product_conversation_id
+      || candidate.canonical_root.transcript_row_id === conv.id
+      || candidate.latest_transcript_row_id === conv.id);
+    if (row) {
+      setProductRenameTarget(row);
+      return;
+    }
+    void api.getProductConversationSnapshot(conv.product_conversation_id ?? conv.id)
+      .then((snapshot) => { if (selection === renameSelectionRef.current) setProductRenameTarget(snapshot); })
+      .catch((error: unknown) => {
+        if (selection === renameSelectionRef.current) setProductRenameError(error instanceof Error ? error.message : 'Failed to load conversation name');
+      });
+  }, [productConversations]);
 
 
   // On desktop, the sidebar handles the conversation list.
@@ -542,6 +543,7 @@ export function ConversationListPage() {
               onConversationClick={handleConversationClick}
               onProductConversationClick={(row) => navigate(row.canonical_route)}
               onProductConversationRename={(row) => {
+                renameSelectionRef.current += 1;
                 setProductRenameError(undefined);
                 setProductRenameTarget(row);
               }}
@@ -605,31 +607,24 @@ export function ConversationListPage() {
         {...(productDeleteError ? { error: productDeleteError } : {})}
         onCancel={() => setProductDeleteTarget(null)}
       />
+      {!productRenameTarget && productRenameError && <div role="alert" className="error-message">{productRenameError}</div>}
       <RenameDialog
         visible={productRenameTarget !== null}
         currentName={productRenameTarget?.presentation.display_name ?? ''}
         error={productRenameError}
         onRename={handleProductRename}
+        onGenerate={handleProductGenerate}
         normalizeInput={(value) => value}
         isValidName={(value) => value.trim().length > 0}
         helpText="Enter a title"
         maxLength={200}
         onCancel={() => {
+          ++renameSelectionRef.current;
           setProductRenameTarget(null);
           setProductRenameError(undefined);
         }}
       />
-      <RenameDialog
-        visible={renameTarget !== null}
-        currentName={renameTarget?.slug ?? ''}
-        error={renameError ?? undefined}
-        onRename={handleRename}
-        onGenerate={handleGenerateRename}
-        onCancel={() => {
-          setRenameTarget(null);
-          setRenameError(undefined);
-        }}
-      />
+
       {showAuthPanel && credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
         <CredentialHelperPanel
           active={showAuthPanel}

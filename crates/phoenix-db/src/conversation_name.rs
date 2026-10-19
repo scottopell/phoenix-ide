@@ -123,8 +123,8 @@ mod tests {
             .await
             .unwrap();
         let (a, b) = tokio::join!(
-            db.rename_conversation(&first.id, "Shared Human Name"),
-            other.rename_conversation(&second.id, "Shared Human Name"),
+            db.set_ordinary_product_conversation_title(&first.id, "Shared Human Name"),
+            other.set_ordinary_product_conversation_title(&second.id, "Shared Human Name"),
         );
         a.unwrap();
         b.unwrap();
@@ -171,7 +171,7 @@ mod tests {
             .create_conversation("root-id", "starting-name", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.rename_conversation(&root.id, "  Über 東京 / Café  ")
+        db.set_ordinary_product_conversation_title(&root.id, "  Über 東京 / Café  ")
             .await
             .unwrap();
         let renamed = db.get_conversation(&root.id).await.unwrap();
@@ -189,13 +189,18 @@ mod tests {
                 "00000000-0000-4000-8000-000000000001".to_string(),
             ),
         ] {
-            db.rename_conversation(&root.id, name).await.unwrap();
+            db.set_ordinary_product_conversation_title(&root.id, name)
+                .await
+                .unwrap();
             let renamed = db.get_conversation(&root.id).await.unwrap();
             assert_eq!(renamed.title.as_deref(), Some(name));
             assert_eq!(renamed.slug.as_deref(), Some(expected.as_str()));
         }
         let before = db.get_conversation(&root.id).await.unwrap();
-        assert!(db.rename_conversation(&root.id, "   ").await.is_err());
+        assert!(db
+            .set_ordinary_product_conversation_title(&root.id, "   ")
+            .await
+            .is_err());
         let after = db.get_conversation(&root.id).await.unwrap();
         assert_eq!((before.title, before.slug), (after.title, after.slug));
     }
@@ -279,7 +284,7 @@ mod tests {
             .capture_conversation_name_baseline(&root.id)
             .await
             .unwrap();
-        db.rename_conversation(&root.id, "Human Selected Name")
+        db.set_ordinary_product_conversation_title(&root.id, "Human Selected Name")
             .await
             .unwrap();
         let stale = db
@@ -294,7 +299,7 @@ mod tests {
         let current = db.get_conversation(&root.id).await.unwrap();
         assert_eq!(current.title.as_deref(), Some("Human Selected Name"));
         assert_eq!(current.slug.as_deref(), Some("human-selected-name"));
-        db.rename_conversation(&root.id, root.title.as_deref().unwrap())
+        db.set_ordinary_product_conversation_title(&root.id, root.title.as_deref().unwrap())
             .await
             .unwrap();
         let restored = db.get_conversation(&root.id).await.unwrap();
@@ -343,7 +348,7 @@ mod tests {
         .await
         .unwrap();
         assert!(db
-            .rename_conversation(&root.id, "Not Admitted")
+            .set_ordinary_product_conversation_title(&root.id, "Not Admitted")
             .await
             .is_err());
         let stored = db.get_conversation(&root.id).await.unwrap();

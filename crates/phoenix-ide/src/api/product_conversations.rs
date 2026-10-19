@@ -144,6 +144,99 @@ pub async fn rename_product_conversation(
         .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
     Ok(Json(list_row(&projection)))
 }
+pub async fn regenerate_product_conversation_name(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<ProductConversationListRow>, AppError> {
+    let resolved = state
+        .db
+        .resolve_ordinary_product_conversation(&reference)
+        .await
+        .map_err(db_to_app)?;
+    let root = state
+        .db
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(db_to_app)?
+        .root
+        .conversation;
+    let root_id = root.id.clone();
+    let owner_id = resolved.product_conversation_id.clone();
+    let name_baseline = state
+        .db
+        .capture_conversation_name_baseline(&root_id)
+        .await
+        .map_err(db_to_app)?;
+    let opening = state
+        .runtime
+        .db()
+        .first_opening_message_text(&root_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            tracing::debug!(
+                conv_id = %root_id,
+                "product conversation regenerate-name: no opening message; leaving title unchanged"
+            );
+            AppError::Internal(
+                "cannot regenerate product conversation name: no opening message to summarize"
+                    .to_string(),
+            )
+        })?;
+
+    let (cheap_model_id, cheap_model) =
+        state
+            .llm_registry
+            .get_cheap_model_with_id()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "no cheap LLM model is available for name regeneration".to_string(),
+                )
+            })?;
+    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
+
+    let generated = crate::title_generator::generate_title(
+        &opening,
+        cheap_model,
+        effective_effort,
+        state.llm_registry.output_token_limit(&cheap_model_id),
+    )
+    .await
+    .filter(|slug| !slug.is_empty())
+    .ok_or_else(|| {
+        AppError::Internal(
+            "product conversation name regeneration failed — the existing name is unchanged"
+                .to_string(),
+        )
+    })?;
+
+    let generated = normalize_product_conversation_title(&generated)?;
+    let committed = state
+        .runtime
+        .db()
+        .set_ordinary_product_conversation_title_if_unchanged(
+            owner_id.as_str(),
+            &generated,
+            &name_baseline,
+        )
+        .await
+        .map_err(db_to_app)?;
+    if committed.is_none() {
+        return Err(AppError::Internal(
+            "conversation name changed while regeneration was running".to_string(),
+        ));
+    }
+    let projection = state
+        .db
+        .list_ordinary_product_conversation_projections()
+        .await
+        .map_err(db_to_app)?
+        .into_iter()
+        .find(|projection| projection.product_conversation_id == owner_id)
+        .ok_or_else(|| AppError::NotFound(owner_id.to_string()))?;
+    Ok(Json(list_row(&projection)))
+}
 
 fn normalize_product_conversation_title(title: &str) -> Result<String, AppError> {
     let normalized = title.trim();
@@ -152,11 +245,10 @@ fn normalize_product_conversation_title(title: &str) -> Result<String, AppError>
             "Product conversation title cannot be empty".to_string(),
         ));
     }
-    if normalized.chars().count() > super::chains::CHAIN_NAME_MAX_CHARS {
-        return Err(AppError::BadRequest(format!(
-            "Product conversation title must be at most {} characters",
-            super::chains::CHAIN_NAME_MAX_CHARS,
-        )));
+    if normalized.chars().count() > 200 {
+        return Err(AppError::BadRequest(
+            "Product conversation title must be at most 200 characters".to_string(),
+        ));
     }
     Ok(normalized.to_string())
 }
@@ -2644,7 +2736,7 @@ mod tests {
             .create_conversation("pc-long-title", "pc-long-title", "/tmp", true, None, None)
             .await
             .unwrap();
-        let title = "x".repeat(super::super::chains::CHAIN_NAME_MAX_CHARS + 1);
+        let title = "x".repeat(200 + 1);
 
         let response = create_router(state)
             .oneshot(
@@ -3346,7 +3438,7 @@ mod tests {
         let expected_route = "/c/renamed-root";
         state
             .db
-            .rename_conversation(&root.id, "renamed-root")
+            .set_ordinary_product_conversation_title(&root.id, "renamed-root")
             .await
             .unwrap();
 

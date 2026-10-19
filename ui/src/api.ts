@@ -2253,19 +2253,6 @@ export const api = {
     return resp.json();
   },
 
-  async renameConversation(convId: string, name: string): Promise<{ conversation: Conversation }> {
-    const resp = await fetch(`/api/conversations/${convId}/rename`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error || 'Failed to rename');
-    }
-    return resp.json();
-  },
-
   async closeProductConversation(reference: string): Promise<void> {
     const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/close`, {
       method: 'POST',
@@ -2293,13 +2280,16 @@ export const api = {
     return resp.json();
   },
 
-  async regenerateConversationName(convId: string): Promise<{ conversation: Conversation }> {
-    const resp = await fetch(`/api/conversations/${convId}/regenerate-name`, {
+  async regenerateProductConversationName(reference: string): Promise<ProductConversationListRowType> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/regenerate-name`, {
       method: 'POST',
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to generate name');
+      if (resp.status === 409 && typeof err.error_type === 'string') {
+        throw new ConflictError(err as ConflictErrorDetail);
+      }
+      throw new Error(err.error || 'Failed to generate product conversation name');
     }
     return resp.json();
   },
@@ -2799,47 +2789,6 @@ export const api = {
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to submit question');
-    }
-    return resp.json();
-  },
-
-  /** PATCH /api/chains/:rootId/name — set or clear the user-overridden
-   *  chain name. Pass `null` to clear; the server falls back to the chain
-   *  root's title for `display_name`. Returns the refreshed `ChainView`. */
-  async setChainName(
-    rootId: string,
-    name: string | null,
-  ): Promise<ChainViewType> {
-    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/name`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    if (resp.status === 404) throw new Error('Chain not found');
-    if (resp.status === 409) {
-      const err = await resp.json();
-      throw new ConflictError(err as ConflictErrorDetail);
-    }
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to set chain name');
-    }
-    return resp.json();
-  },
-
-  /** POST /api/chains/:rootId/regenerate-name — re-summarize the chain's
-   *  content into a fresh name and persist it. No request body; the root id
-   *  is the only input. Returns the refreshed `ChainView` (same shape as
-   *  `setChainName`). On any failure the server leaves the name unchanged. */
-  async regenerateChainName(rootId: string): Promise<ChainViewType> {
-    const resp = await fetch(
-      `/api/chains/${encodeURIComponent(rootId)}/regenerate-name`,
-      { method: 'POST' },
-    );
-    if (resp.status === 404) throw new Error('Chain not found');
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to regenerate chain name');
     }
     return resp.json();
   },

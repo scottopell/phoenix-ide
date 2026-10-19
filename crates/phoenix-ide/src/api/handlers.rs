@@ -8,8 +8,7 @@ use super::assets::{
     PUBLIC_ROOT_ASSETS,
 };
 use super::chains::{
-    archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
-    stream_chain, submit_chain_question,
+    archive_chain_handler, delete_chain_handler, get_chain, stream_chain, submit_chain_question,
 };
 use super::event_presentation::{enrich_messages, EventPresentations};
 use super::git_handlers::{
@@ -26,7 +25,7 @@ use super::lifecycle_handlers::{
 };
 use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
-    list_product_conversations, rename_product_conversation,
+    list_product_conversations, regenerate_product_conversation_name, rename_product_conversation,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -44,9 +43,9 @@ use super::types::{
     ProductConversationRouteResponse, ProjectFileSearchQuery, ProjectSkillsQuery,
     ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
     RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
-    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ReconcileAcceptedMessagesResponse, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
+    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -158,6 +157,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/product-conversations/:reference/title",
             axum::routing::patch(rename_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/regenerate-name",
+            post(regenerate_product_conversation_name),
         )
         .route(
             "/api/product-conversations/:reference/close",
@@ -350,7 +353,6 @@ pub fn create_router(state: AppState) -> Router {
         // unarchive — archive is not reversible.
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route("/api/conversations/:id/delete", post(delete_conversation))
-        .route("/api/conversations/:id/rename", post(rename_conversation))
         // Token usage (Phase 4)
         .route(
             "/api/conversations/:id/usage",
@@ -404,14 +406,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
-        .route(
-            "/api/chains/:rootId/name",
-            axum::routing::patch(set_chain_name),
-        )
-        .route(
-            "/api/chains/:rootId/regenerate-name",
-            post(regenerate_chain_name),
-        )
         .route("/api/chains/:rootId/stream", get(stream_chain))
         .route("/api/chains/:rootId/archive", post(archive_chain_handler))
         .route(
@@ -460,10 +454,6 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/credential-helper/invalidate",
             post(invalidate_credential),
-        )
-        .route(
-            "/api/conversations/:id/regenerate-name",
-            post(regenerate_conversation_name),
         )
         .route(
             "/api/conversations/:id/upgrade-model",
@@ -7665,124 +7655,6 @@ async fn cleanup_pending_fork_orphans_on_delete(
         .cleanup_pending_fork_orphans_on_delete(&conv.id, authority)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))
-}
-
-async fn rename_conversation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<RenameRequest>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    if req.name.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "conversation name must not be empty".to_string(),
-        ));
-    }
-    let resolved = state
-        .runtime
-        .db()
-        .resolve_ordinary_product_conversation(&id)
-        .await
-        .map_err(super::product_conversations::db_to_app)?;
-    let id = state
-        .runtime
-        .db()
-        .get_ordinary_product_conversation(&resolved.product_conversation_id)
-        .await
-        .map_err(super::product_conversations::db_to_app)?
-        .root
-        .conversation
-        .id;
-    state
-        .runtime
-        .db()
-        .rename_conversation(&id, &req.name)
-        .await
-        .map_err(super::product_conversations::db_to_app)?;
-
-    conversation_response(&state, &id).await
-}
-
-async fn regenerate_conversation_name(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let resolved = state
-        .runtime
-        .db()
-        .resolve_ordinary_product_conversation(&id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let root = state
-        .runtime
-        .db()
-        .get_ordinary_product_conversation(&resolved.product_conversation_id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?
-        .root
-        .conversation;
-    let id = root.id.clone();
-    let name_baseline = state
-        .db
-        .capture_conversation_name_baseline(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let opening = state
-        .runtime
-        .db()
-        .first_opening_message_text(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .ok_or_else(|| {
-            tracing::debug!(
-                conv_id = %id,
-                "conversation regenerate-name: no opening message; leaving slug unchanged"
-            );
-            AppError::Internal(
-                "cannot regenerate conversation name: no opening message to summarize".to_string(),
-            )
-        })?;
-
-    let (cheap_model_id, cheap_model) =
-        state
-            .llm_registry
-            .get_cheap_model_with_id()
-            .ok_or_else(|| {
-                AppError::Internal(
-                    "no cheap LLM model is available for name regeneration".to_string(),
-                )
-            })?;
-    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
-
-    let generated = crate::title_generator::generate_title(
-        &opening,
-        cheap_model,
-        effective_effort,
-        state.llm_registry.output_token_limit(&cheap_model_id),
-    )
-    .await
-    .filter(|slug| !slug.is_empty())
-    .ok_or_else(|| {
-        AppError::Internal(
-            "conversation name regeneration failed — the existing name is unchanged".to_string(),
-        )
-    })?;
-
-    let committed = state
-        .runtime
-        .db()
-        .set_ordinary_product_conversation_title_if_unchanged(
-            resolved.product_conversation_id.as_str(),
-            &generated,
-            &name_baseline,
-        )
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    if committed.is_none() {
-        return Err(AppError::Internal(
-            "conversation name changed while regeneration was running".to_string(),
-        ));
-    }
-    conversation_response(&state, &id).await
 }
 
 async fn conversation_response(
@@ -17052,26 +16924,39 @@ mod regenerate_conversation_name_tests {
         ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
     };
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[derive(Debug)]
     enum StubLlm {
         Ok(&'static str),
+        Long,
+        Paused {
+            started: Arc<tokio::sync::Semaphore>,
+            resume: Arc<tokio::sync::Semaphore>,
+        },
         Err,
     }
 
     #[async_trait]
     impl LlmService for StubLlm {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            match self {
-                StubLlm::Ok(text) => Ok(LlmResponse {
-                    provider_replay: None,
-                    content: vec![ContentBlock::text(*text)],
-                    end_turn: true,
-                    usage: Usage::default(),
-                    stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-                }),
-                StubLlm::Err => Err(LlmError::server_error("temporary outage")),
-            }
+            let text = match self {
+                StubLlm::Ok(text) => (*text).to_string(),
+                StubLlm::Long => "Word ".repeat(100),
+                StubLlm::Paused { started, resume } => {
+                    started.add_permits(1);
+                    resume.acquire().await.unwrap().forget();
+                    "Stale Generated Name".to_string()
+                }
+                StubLlm::Err => return Err(LlmError::server_error("temporary outage")),
+            };
+            Ok(LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text(text)],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
         }
 
         async fn complete_streaming(
@@ -17157,33 +17042,216 @@ mod regenerate_conversation_name_tests {
 
     async fn regenerate(
         state: &AppState,
-        id: &str,
-    ) -> Result<Json<ConversationResponse>, AppError> {
-        regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
+        reference: &str,
+    ) -> Result<Json<crate::api::types::ProductConversationListRow>, AppError> {
+        crate::api::product_conversations::regenerate_product_conversation_name(
+            State(state.clone()),
+            Path(reference.to_string()),
+        )
+        .await
     }
 
     #[tokio::test]
-    async fn rename_response_uses_canonical_presentation_serializer() {
+    async fn canonical_regenerate_name_route_returns_product_conversation_row() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("unused"),
+            StubLlm::Ok("Route Generated Name"),
         ))))
         .await;
-        seed_conversation(&state, "conv-rename", "before-rename").await;
+        seed_conversation(&state, "conv-route-name", "initial-name").await;
+        seed_opening(&state, "conv-route-name", "name this conversation").await;
 
-        let Json(response) = rename_conversation(
-            State(state.clone()),
-            Path("conv-rename".to_string()),
-            Json(RenameRequest {
-                name: "After Rename".to_string(),
-            }),
+        let owner = state
+            .db
+            .get_conversation("conv-route-name")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let router = create_router(state);
+        for reference in [
+            "initial-name",
+            owner.as_str(),
+            "conv-route-name",
+            "route-generated-name",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/api/product-conversations/{reference}/regenerate-name"
+                        ))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["canonical_root"]["title"], "Route Generated Name");
+            assert_eq!(body["canonical_root"]["slug"], "route-generated-name");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_name_management_routes_are_not_registered() {
+        let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
+        for (method, uri) in [
+            ("POST", "/api/conversations/old/rename"),
+            ("POST", "/api/conversations/old/regenerate-name"),
+            ("PATCH", "/api/chains/old/name"),
+            ("POST", "/api/chains/old/regenerate-name"),
+        ] {
+            let response = create_router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"name":"ignored"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_naming_preserves_validation_and_history_conflicts() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Generated Name"),
+        ))))
+        .await;
+        seed_conversation(&state, "history-name", "retained-history-name").await;
+        seed_opening(&state, "history-name", "opening").await;
+        let before = state.db.get_conversation("history-name").await.unwrap();
+        let router = create_router(state.clone());
+        let invalid = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri("/api/product-conversations/history-name/title")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"title":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
         )
+        .bind(before.product_conversation_id.as_str())
+        .execute(state.db.pool())
         .await
-        .expect("rename");
-        assert_eq!(response.conversation["slug"], "after-rename");
-        assert_eq!(response.conversation["title"], "After Rename");
-        assert!(response.conversation.get("presentation_mode").is_some());
-        assert!(response.conversation.get("requires_action").is_some());
-        assert!(response.conversation.get("work_scope_key").is_some());
+        .unwrap();
+        for (method, suffix, body) in [
+            ("PATCH", "title", r#"{"title":"Changed Name"}"#),
+            ("POST", "regenerate-name", ""),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(format!(
+                            "/api/product-conversations/{}/{suffix}",
+                            before.product_conversation_id
+                        ))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        }
+        let after = state.db.get_conversation("history-name").await.unwrap();
+        assert_eq!((after.title, after.slug), (before.title, before.slug));
+    }
+
+    #[tokio::test]
+    async fn canonical_generation_rejects_invalid_output_without_name_or_route_changes() {
+        for llm in [StubLlm::Long, StubLlm::Ok("\u{0007}"), StubLlm::Ok("")] {
+            let state =
+                make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(llm)))).await;
+            seed_conversation(&state, "invalid-generated", "retained-name").await;
+            seed_opening(&state, "invalid-generated", "opening").await;
+            let before = state
+                .db
+                .get_conversation("invalid-generated")
+                .await
+                .unwrap();
+            assert!(regenerate(&state, "retained-name").await.is_err());
+            let after = state
+                .db
+                .get_conversation("invalid-generated")
+                .await
+                .unwrap();
+            assert_eq!(after.title, before.title);
+            assert_eq!(after.slug, before.slug);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_generation_pins_owner_and_rejects_aba_after_slug_reassignment() {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Paused {
+                started: started.clone(),
+                resume: resume.clone(),
+            },
+        ))))
+        .await;
+        seed_conversation(&state, "generated-owner", "original-name").await;
+        seed_opening(&state, "generated-owner", "opening").await;
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Original Name")
+            .await
+            .unwrap();
+        let generating_state = state.clone();
+        let generation =
+            tokio::spawn(async move { regenerate(&generating_state, "original-name").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Interim Name")
+            .await
+            .unwrap();
+        seed_conversation(&state, "other-owner", "original-name").await;
+        state
+            .db
+            .set_ordinary_product_conversation_title("generated-owner", "Original Name")
+            .await
+            .unwrap();
+        let before = state.db.get_conversation("generated-owner").await.unwrap();
+        let other_before = state.db.get_conversation("other-owner").await.unwrap();
+        resume.add_permits(1);
+        assert!(generation.await.unwrap().is_err());
+        let after = state.db.get_conversation("generated-owner").await.unwrap();
+        let other_after = state.db.get_conversation("other-owner").await.unwrap();
+        assert_eq!((after.title, after.slug), (before.title, before.slug));
+        assert_eq!(
+            (other_after.title, other_after.slug),
+            (other_before.title, other_before.slug)
+        );
     }
 
     #[tokio::test]
@@ -17201,13 +17269,15 @@ mod regenerate_conversation_name_tests {
         .await;
 
         let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
-        assert_eq!(response.conversation["slug"], "useful-auth-fix");
-        assert!(response
-            .conversation
-            .get("product_conversation_id")
-            .is_none());
-        assert!(response.conversation.get("presentation_mode").is_some());
-        assert!(response.conversation.get("work_scope_key").is_some());
+        assert_eq!(
+            response.canonical_root.slug.as_deref(),
+            Some("useful-auth-fix")
+        );
+        assert!(!response.product_conversation_id.is_empty());
+        assert!(matches!(
+            response.presentation,
+            crate::api::types::ProductConversationPresentationView::State { .. }
+        ));
         let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
     }
@@ -17248,56 +17318,6 @@ mod regenerate_conversation_name_tests {
     }
 
     #[tokio::test]
-    async fn legacy_rename_preserves_bad_request_and_history_conflict_statuses() {
-        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("Unused"),
-        ))))
-        .await;
-        seed_conversation(&state, "rename-history", "history-name").await;
-        let empty = rename_conversation(
-            State(state.clone()),
-            Path("rename-history".to_string()),
-            Json(RenameRequest {
-                name: "  ".to_string(),
-            }),
-        )
-        .await;
-        let Err(error) = empty else {
-            panic!("empty name must be rejected");
-        };
-        assert_eq!(
-            axum::response::IntoResponse::into_response(error).status(),
-            axum::http::StatusCode::BAD_REQUEST
-        );
-        let root = state.db.get_conversation("rename-history").await.unwrap();
-        sqlx::query(
-            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
-        )
-        .bind(root.product_conversation_id.as_str())
-        .execute(state.db.pool())
-        .await
-        .unwrap();
-        let closed = rename_conversation(
-            State(state.clone()),
-            Path(root.id.clone()),
-            Json(RenameRequest {
-                name: "Must Not Replace History".to_string(),
-            }),
-        )
-        .await;
-        let Err(error) = closed else {
-            panic!("History rename must be rejected");
-        };
-        assert_eq!(
-            axum::response::IntoResponse::into_response(error).status(),
-            axum::http::StatusCode::CONFLICT
-        );
-        let retained = state.db.get_conversation(&root.id).await.unwrap();
-        assert_eq!(retained.title, root.title);
-        assert_eq!(retained.slug, root.slug);
-    }
-
-    #[tokio::test]
     async fn duplicate_generated_name_allocates_projection_and_preserves_prose() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
             StubLlm::Ok("Taken Slug"),
@@ -17308,8 +17328,11 @@ mod regenerate_conversation_name_tests {
         seed_opening(&state, "conv-rename", "rename this later").await;
 
         let Json(response) = regenerate(&state, "conv-rename").await.expect("regenerate");
-        assert_eq!(response.conversation["slug"], "taken-slug-2");
-        assert_eq!(response.conversation["title"], "Taken Slug");
+        assert_eq!(
+            response.canonical_root.slug.as_deref(),
+            Some("taken-slug-2")
+        );
+        assert_eq!(response.canonical_root.title.as_deref(), Some("Taken Slug"));
         let reloaded = state
             .db
             .get_conversation("conv-rename")

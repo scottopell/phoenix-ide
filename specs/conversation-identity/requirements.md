@@ -18,6 +18,8 @@ THE SYSTEM SHALL accept names containing full words, spaces, and Unicode charact
 
 THE SYSTEM SHALL NOT expose a separate editable slug or chain-name authority.
 
+THE SYSTEM SHALL expose manual title changes and generated-name changes through the ProductConversation naming operations, and SHALL NOT support legacy chain-name mutation routes as alternate callers.
+
 WHEN a generated name is accepted, THE SYSTEM SHALL store human-readable prose rather than a kebab-case substitute for that name.
 
 ### REQ-CID-002 — Allocated route projection

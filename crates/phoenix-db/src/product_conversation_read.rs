@@ -523,31 +523,6 @@ impl Database {
             .await
     }
 
-    /// Compatibility route for the ordinary aggregate name.
-    ///
-    /// # Errors
-    /// Returns an identity, admission, or database error.
-    pub async fn set_ordinary_product_conversation_legacy_title(
-        &self,
-        reference: &str,
-        title: &str,
-    ) -> DbResult<ProductConversationId> {
-        self.set_ordinary_product_conversation_title(reference, title)
-            .await
-    }
-
-    /// Compatibility clear resets the single name, rather than exposing an older override.
-    ///
-    /// # Errors
-    /// Returns an identity, admission, or database error.
-    pub async fn clear_ordinary_product_conversation_legacy_title(
-        &self,
-        reference: &str,
-    ) -> DbResult<ProductConversationId> {
-        self.set_ordinary_product_conversation_title(reference, "Conversation")
-            .await
-    }
-
     async fn mutate_ordinary_product_conversation_title_authority(
         &self,
         reference: &str,
@@ -3641,21 +3616,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_title_clear_resets_the_single_name() {
+    async fn explicit_default_name_is_an_ordinary_name_write() {
         let db = Database::open_in_memory().await.unwrap();
         let conversation = db
             .create_conversation("legacy-title", "original-title", "/tmp", true, None, None)
             .await
             .unwrap();
 
-        db.set_ordinary_product_conversation_legacy_title(&conversation.id, "Temporary Override")
+        db.set_ordinary_product_conversation_title(&conversation.id, "Temporary Override")
             .await
             .unwrap();
         let renamed = db.get_conversation(&conversation.id).await.unwrap();
         assert_eq!(renamed.title.as_deref(), Some("Temporary Override"));
         assert_eq!(renamed.slug.as_deref(), Some("temporary-override"));
 
-        db.clear_ordinary_product_conversation_legacy_title(&conversation.id)
+        db.set_ordinary_product_conversation_title(&conversation.id, "Conversation")
             .await
             .unwrap();
         let cleared = db.get_conversation(&conversation.id).await.unwrap();
@@ -3689,7 +3664,7 @@ mod tests {
                 if id == conversation.product_conversation_id
         ));
         assert!(matches!(
-            db.clear_ordinary_product_conversation_legacy_title(&conversation.id).await,
+            db.set_ordinary_product_conversation_title(&conversation.id, "Conversation").await,
             Err(DbError::ProductConversationUnavailable(id))
                 if id == conversation.product_conversation_id
         ));

@@ -8,11 +8,6 @@
 //! - `POST /api/chains/:rootId/qa { question }` — submit a question; returns
 //!   the `chain_qa_id` synchronously while streaming + persistence run on a
 //!   detached task in [`crate::chain_qa::ChainQa::submit_question`]
-//! - `PATCH /api/chains/:rootId/name { name? }` — set or clear the chain's
-//!   user-overridden name; returns the refreshed snapshot
-//! - `POST /api/chains/:rootId/regenerate-name` (no body) — derive a prose name
-//!   by summarizing each member's first user message via a cheap LLM and persist
-//!   it as `chain_name`; returns the refreshed snapshot (REQ-CHN-010)
 //! - `GET /api/chains/:rootId/stream` — SSE subscription for streaming Q&A
 //!   token events (publishes [`crate::api::wire::ChainSseWireEvent`])
 //!
@@ -50,12 +45,6 @@ use super::AppState;
 use crate::chain_qa::ChainQaError;
 use crate::db::{ChainQaRow, Conversation, DbError};
 use crate::state_machine::ConvState;
-
-/// Maximum length (in chars) of a user-set chain name. The cap is arbitrary
-/// — short enough that the value comfortably fits as a sidebar label and the
-/// chain page header without truncation, long enough that a reasonable label
-/// like "auth refactor — staged migration" is not rejected.
-pub(super) const CHAIN_NAME_MAX_CHARS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Response/request shapes
@@ -160,14 +149,6 @@ pub struct SubmitChainQaResponse {
     pub chain_qa_id: String,
 }
 
-/// Body of `PATCH /api/chains/:rootId/name`. `null` (`None`) clears the
-/// override and falls back to the conversation's title for display.
-#[derive(Debug, Deserialize)]
-pub struct SetChainNameRequest {
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -213,180 +194,6 @@ pub async fn submit_chain_question(
         .await
         .map_err(map_chain_qa_error)?;
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
-}
-
-/// Compatibility route for `PATCH /api/chains/:rootId/name`.
-///
-/// Non-empty names set the compatibility override without replacing the root title. A null or
-/// whitespace-only name clears that override so the original title fallback applies.
-pub async fn set_chain_name(
-    State(state): State<AppState>,
-    Path(root_id): Path<String>,
-    Json(req): Json<SetChainNameRequest>,
-) -> Result<Json<ChainView>, AppError> {
-    validate_chain_root(&state, &root_id).await?;
-
-    // Normalize: trim outer whitespace, then treat empty/whitespace-only as
-    // a clear (None). This matches REQ-CHN-007: setting whitespace is
-    // indistinguishable from "no name" so the wire contract collapses both
-    // to a single state rather than persisting invisible names.
-    let normalized = normalize_chain_name(req.name.as_deref())?;
-
-    if let Some(title) = normalized.as_deref() {
-        state
-            .db
-            .set_ordinary_product_conversation_legacy_title(&root_id, title)
-            .await
-            .map_err(db_to_app)?;
-    } else {
-        state
-            .db
-            .clear_ordinary_product_conversation_legacy_title(&root_id)
-            .await
-            .map_err(db_to_app)?;
-    }
-
-    let view = build_chain_view(&state, &root_id).await?;
-    Ok(Json(view))
-}
-
-/// `POST /api/chains/:rootId/regenerate-name` (REQ-CHN-010).
-///
-/// Derives a prose display name by summarizing the first user message of each
-/// chain member (in chain order) via a cheap LLM, then updates the
-/// `ProductConversation` root title through the same authority as the typed PATCH.
-/// Takes no request body; the chain root id in the path is the only input.
-///
-/// Status choices:
-/// - `<2` members or non-root: 404 via [`validate_chain_root`], matching every
-///   other chain endpoint — a single conversation is not a chain (REQ-CHN-002).
-/// - LLM failure / timeout, or no usable member messages: 500 (`AppError::Internal`).
-///   The existing name is left untouched (REQ-CHN-010 — no partial/empty name
-///   written). 500 matches the existing chain-Q&A LLM-failure convention
-///   (`map_chain_qa_error` maps `ChainQaError::Llm` → `Internal`); a dedicated
-///   502/503 variant would be a one-off in `AppError` that nothing else uses.
-/// - Success: 200 with the rebuilt [`ChainView`], identical to the PATCH shape.
-pub async fn regenerate_chain_name(
-    State(state): State<AppState>,
-    Path(root_id): Path<String>,
-) -> Result<Json<ChainView>, AppError> {
-    validate_chain_root(&state, &root_id).await?;
-    let baseline = state
-        .db
-        .capture_conversation_name_baseline(&root_id)
-        .await
-        .map_err(db_to_app)?;
-
-    let member_ids = state
-        .db
-        .chain_members_forward(&root_id)
-        .await
-        .map_err(db_to_app)?;
-
-    // Collect each member's opening message in chain order, dropping members
-    // that have none (a member may have only agent/tool/continuation content).
-    // An opening is a user message or a skill invocation (its trigger text).
-    let mut first_messages: Vec<String> = Vec::with_capacity(member_ids.len());
-    for id in &member_ids {
-        if let Some(text) = state
-            .db
-            .first_opening_message_text(id)
-            .await
-            .map_err(db_to_app)?
-        {
-            first_messages.push(text);
-        }
-    }
-
-    if first_messages.is_empty() {
-        // Nothing to summarize — every member lacked a usable opening message.
-        // Leave the name untouched (REQ-CHN-010).
-        tracing::debug!(
-            root_conv_id = %root_id,
-            members = member_ids.len(),
-            "regenerate-name: no member had an opening message; leaving name unchanged"
-        );
-        return Err(AppError::Internal(
-            "cannot regenerate chain name: no member has an opening message to summarize"
-                .to_string(),
-        ));
-    }
-
-    let (cheap_model_id, cheap_model) =
-        state
-            .llm_registry
-            .get_cheap_model_with_id()
-            .ok_or_else(|| {
-                AppError::Internal(
-                    "no cheap LLM model is available for name regeneration".to_string(),
-                )
-            })?;
-    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
-
-    let Some(generated) = crate::title_generator::generate_chain_name(
-        &first_messages,
-        cheap_model,
-        effective_effort,
-        state.llm_registry.output_token_limit(&cheap_model_id),
-    )
-    .await
-    else {
-        // LLM failure/timeout — existing name stays as-is (REQ-CHN-010).
-        return Err(AppError::Internal(
-            "chain name regeneration failed — the existing name is unchanged".to_string(),
-        ));
-    };
-
-    // Run the generated name through the same normalization the typed path uses
-    // — single length authority. If it normalizes to empty (e.g. control-char
-    // soup), treat as failure rather than writing an empty name.
-    let normalized = normalize_chain_name(Some(&generated))?;
-    if normalized.is_none() {
-        return Err(AppError::Internal(
-            "chain name regeneration produced an empty name — the existing name is unchanged"
-                .to_string(),
-        ));
-    }
-
-    let committed = state
-        .db
-        .set_ordinary_product_conversation_title_if_unchanged(
-            &root_id,
-            normalized
-                .as_deref()
-                .expect("empty generated name rejected"),
-            &baseline,
-        )
-        .await
-        .map_err(db_to_app)?;
-
-    if committed.is_none() {
-        return Err(AppError::Internal(
-            "conversation name changed while regeneration was running".to_string(),
-        ));
-    }
-    let view = build_chain_view(&state, &root_id).await?;
-    Ok(Json(view))
-}
-
-/// Normalize a chain-name input to its persisted form (REQ-CHN-007): trim outer
-/// whitespace, collapse empty/whitespace-only to `None` (a clear), and reject
-/// anything over [`CHAIN_NAME_MAX_CHARS`]. This is the single length authority
-/// shared by the typed PATCH and the regenerate path (REQ-CHN-010).
-fn normalize_chain_name(name: Option<&str>) -> Result<Option<String>, AppError> {
-    let normalized = name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-
-    if let Some(ref name) = normalized {
-        if name.chars().count() > CHAIN_NAME_MAX_CHARS {
-            return Err(AppError::BadRequest(format!(
-                "chain name must be at most {CHAIN_NAME_MAX_CHARS} characters",
-            )));
-        }
-    }
-    Ok(normalized)
 }
 
 fn chain_member_blocks_cascade(state: &ConvState) -> bool {
@@ -1192,7 +999,7 @@ mod tests {
         build_linear_chain(&db, &["dn-a", "dn-b"]).await;
         add_continuation_summary(&db, "dn-a", "first").await;
         add_user_message(&db, "dn-b", 0, "leaf").await;
-        db.set_chain_name("dn-a", Some("auth refactor"))
+        db.set_ordinary_product_conversation_title("dn-a", "auth refactor")
             .await
             .unwrap();
 
@@ -1227,101 +1034,6 @@ mod tests {
         // be the same string the chain name resolution used.
         let root = db.get_conversation("fb-a").await.unwrap();
         assert_eq!(view.display_name, root.title.unwrap());
-    }
-
-    // ----- rename interaction: chain-name override vs conversation rename -
-
-    async fn set_title(db: &Database, conv_id: &str, title: Option<&str>) {
-        sqlx::query("UPDATE conversations SET title = ?1 WHERE id = ?2")
-            .bind(title)
-            .bind(conv_id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn legacy_name_is_replaced_by_root_conversation_rename() {
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["ro-a", "ro-b"]).await;
-        add_continuation_summary(&db, "ro-a", "first").await;
-        add_user_message(&db, "ro-b", 0, "leaf").await;
-        db.set_chain_name("ro-a", Some("auth refactor"))
-            .await
-            .unwrap();
-
-        // Rename the ROOT conversation's slug out from under the chain.
-        db.rename_conversation("ro-a", "slug-ro-renamed")
-            .await
-            .unwrap();
-
-        let chain_qa = crate::chain_qa::ChainQa::new(
-            db.clone(),
-            registry_with_test_llm(),
-            std::sync::Arc::new(db.fts_retriever()),
-        );
-        let view = build_view_for_test(&db, &chain_qa, "ro-a").await.unwrap();
-
-        assert_eq!(view.chain_name, None);
-        assert_eq!(view.display_name, "slug-ro-renamed");
-    }
-
-    #[tokio::test]
-    async fn fallback_tracks_root_rename_when_title_absent() {
-        use phoenix_core::domain::db_schema::title_from_slug;
-
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["fr-a", "fr-b"]).await;
-        add_continuation_summary(&db, "fr-a", "first").await;
-        add_user_message(&db, "fr-b", 0, "leaf").await;
-        // No chain_name override; null out the stored title so the resolved
-        // name comes from the slug-derived title path.
-        set_title(&db, "fr-a", None).await;
-
-        db.rename_conversation("fr-a", "renamed-root-slug")
-            .await
-            .unwrap();
-
-        let chain_qa = crate::chain_qa::ChainQa::new(
-            db.clone(),
-            registry_with_test_llm(),
-            std::sync::Arc::new(db.fts_retriever()),
-        );
-        let view = build_view_for_test(&db, &chain_qa, "fr-a").await.unwrap();
-
-        assert_eq!(view.chain_name, None);
-        // The fallback tracked the rename via the slug-derived title.
-        assert_eq!(view.display_name, "renamed-root-slug");
-        // And it is not pinned to the pre-rename slug ("slug-fr-a", the build
-        // helper's auto-assigned slug for the root).
-        assert_ne!(
-            view.display_name,
-            title_from_slug("slug-fr-a"),
-            "display_name must not retain the pre-rename slug-derived name",
-        );
-    }
-
-    #[tokio::test]
-    async fn root_rename_replaces_stale_title() {
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["mt-a", "mt-b"]).await;
-        add_continuation_summary(&db, "mt-a", "first").await;
-        add_user_message(&db, "mt-b", 0, "leaf").await;
-        set_title(&db, "mt-a", Some("Original Title")).await;
-
-        db.rename_conversation("mt-a", "brand-new-slug")
-            .await
-            .unwrap();
-
-        let chain_qa = crate::chain_qa::ChainQa::new(
-            db.clone(),
-            registry_with_test_llm(),
-            std::sync::Arc::new(db.fts_retriever()),
-        );
-        let view = build_view_for_test(&db, &chain_qa, "mt-a").await.unwrap();
-
-        assert_eq!(view.chain_name, None);
-        assert_eq!(view.display_name, "brand-new-slug");
     }
 
     #[tokio::test]
@@ -1474,43 +1186,6 @@ mod tests {
         };
         assert!(chain_member_blocks_cascade(&state));
         assert!(!chain_member_blocks_cascade(&ConvState::Idle));
-    }
-
-    // ----- name editing semantics ----------------------------------------
-
-    /// The "normalize the name on the way in" rule lives in `set_chain_name`
-    /// itself. Re-implement the same trim-and-collapse logic here so a
-    /// regression in either side fails this test.
-    fn normalize_for_test(input: Option<&str>) -> Option<String> {
-        input
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    }
-
-    #[test]
-    fn whitespace_only_name_collapses_to_none() {
-        assert_eq!(normalize_for_test(Some("   ")), None);
-        assert_eq!(normalize_for_test(Some("")), None);
-        assert_eq!(normalize_for_test(None), None);
-    }
-
-    #[test]
-    fn name_with_internal_whitespace_is_preserved() {
-        assert_eq!(
-            normalize_for_test(Some("  auth refactor  ")),
-            Some("auth refactor".to_string()),
-        );
-    }
-
-    #[test]
-    fn over_length_names_are_rejected_at_handler_layer() {
-        let too_long = "a".repeat(CHAIN_NAME_MAX_CHARS + 1);
-        // Sanity: the cap counts chars, not bytes, so a multibyte char
-        // string at the exact limit is fine.
-        let utf8_at_limit = "a".repeat(CHAIN_NAME_MAX_CHARS);
-        assert!(too_long.chars().count() > CHAIN_NAME_MAX_CHARS);
-        assert!(utf8_at_limit.chars().count() <= CHAIN_NAME_MAX_CHARS);
     }
 
     // ----- POST validation -----------------------------------------------
