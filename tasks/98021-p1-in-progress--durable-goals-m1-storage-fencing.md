@@ -365,3 +365,107 @@ runtime-emitter journeys and helpers. It identified three inaccurate audit rows
 above; these were corrected against the actual declarations before dispatch.
 This is source-review evidence only, not successful Clippy/test execution or
 proof of a public admission installation path.
+
+### Finite UserControl / stable-Stop allocation packet (unnumbered, not activated)
+
+**Allocation requested:** one later additive migration for the bounded schema
+below, only after Global's actual federation-133 registry receipt. Local registry
+ends at goal storage132. The earlier abbreviated object label `9027bc6de75`
+was incorrect. Parent supplied actual federation commit
+`7bc6de75eeb8483105a51fdc0aa0a66205b103b4`; this writer fetched its exact
+`migrations.rs` contents and verified that registry ends at131 (blob
+`5a272292393bc58dbe765fc444e4c05a88f862ce`). It contains neither132 nor133.
+Thus the missing receipt is an actual federation133 descendant/import or an
+explicit Global release of133, not an unknown-SHA problem. Do not infer134 is
+free, rewrite132, or import an entire large PR as a substitute for the exact
+registry receipt. Parent/Global must return that reachable registry receipt and
+explicitly assigned later slot.
+
+**Exact predecessor:** `conversation_goals/schema.sql` at132 has four normalized
+tables and the actor-source, report-fence and immutable-evidence triggers. Its
+`conversation_goal_actors.kind` CHECK admits only `user_api`, `owning_agent`,
+`coordinator`, `generated_host`; therefore UserControl cannot truthfully be
+encoded as a chat `user_api` actor or silently squeezed into `generated_host`.
+The proposed additive migration has this finite relational delta. In particular,
+Uninitialized/non-admitting is a proposed upgrade representation for review,
+not a newly selected user policy or permission to change activation behavior:
+
+1. `conversation_goal_control_requests`: stable ordinary `owner_id` FK with
+   `ON DELETE CASCADE`; request UUID, host-derived non-secret principal key,
+   command discriminant, observed control version, observed goal owner version,
+   command-specific scalar arguments, durable accepted/rejected outcome,
+   resulting control/goal versions and host timestamp. Primary identity is
+   `(owner_id, principal_key, request_id)`; exact command+observations+arguments
+   determine duplicate equality. Rejected requests are retained too. A changed
+   payload at the same identity returns conflict without mutation; a duplicate
+   rejection returns its original reason rather than re-evaluating newer state.
+   Normalize command-specific arguments as constrained subtype rows/columns, not
+   a generic command/event/JSON framework. Unknown owner/authentication failures
+   cannot create a receipt or reveal another owner's prior request.
+2. `conversation_goal_controls`: one row per initialized ordinary owner, with
+   monotonic `control_version`, protected-stop latch and the last accepted
+   control-request reference. Goal replacement and status writes never update
+   this table. Missing rows are explicitly **Uninitialized / non-admitting**,
+   not an inferred clear Stop. This avoids inventing historical authorization
+   during populated upgrade; it does not fabricate a historical Stop either.
+3. `conversation_goal_control_bindings`: immutable exact workflow/turn locator,
+   owner, admitted control version and accepted open-control request reference.
+   Captured in the same existing admission transaction as the immutable132
+   Goal/NoGoal observation, not during later report/tool dispatch. It must not
+   acquire source FKs that pin transcript/execution deletion; owner deletion
+   cascades, matching132 evidence-locator rules. No model-input constructor can
+   fabricate this binding or a request principal.
+4. Rebuild the actor constraint in the **new migration**, preserving every
+   legacy actor ID and actor/history/binding value, to add `kind='user_control'`
+   with a mandatory exact owner/principal/request reference and all chat/agent/
+   generated-host source columns NULL. Existing kinds keep their exact132 shape
+   and source-validation rules. Recreate dependent constraints/triggers with
+   the new variant; do not weaken the `user_api` message-origin trigger. The
+   history reader/writer must exhaustively thread this new variant. A populated
+   FK cycle must be preserved via an explicitly reviewed migration rebuild,
+   never `writable_schema`, migration132 edits or ad-hoc foreign-key disabling.
+
+**Host admission and race contract:** derive owner identity from authenticated
+host context, not body/model fields, session token, enrollment ID or claimed
+actor name. Current `OwnerAuthenticated` is a unit marker (also installed for
+unconfigured-auth owner access), not a stable person/session identifier;
+`PeerAuthenticated` is a distinct peer capability. The service must mint a
+non-secret host-owner principal receipt only from the owner-authenticated path;
+peer tools/subscriptions do not gain UserControl by naming that principal. UUIDs
+are retry correlation, not proof of biological human authorship or authority.
+No fake chat message is inserted for a control operation.
+
+In the owning `BEGIN IMMEDIATE` transaction: exact-receipt replay first; validate
+current ordinary owner/close gate and expected control+goal versions; apply the
+specific accepted command and receipt atomically. Stop increments/latches the
+stable owner's control version regardless of a current goal and before live
+cancellation/publication; command rejection must not partially latch or release.
+An authorized explicit release is the only operation that clears the latch and
+increments version; new goal/replacement/Underway/report/wait/watch cannot.
+Binding capture races serialize with Stop. Report commit and every subsequent
+model/continuation admission re-check the captured control version and latch:
+Stop after admission invalidates that execution even if a later release clears
+the latch (version differs). Same-text replacement separately invalidates the
+132 goal identity/version fence. Exact committed report replay returns its
+committed factual rows, but never mints another continuation or control release.
+Existing security/resource/close gates remain independently mandatory.
+
+**Required proof before registration/activation:** fresh + populated132 upgrade
+(including report/history/binding cycles), preservation of legacy actor/history
+rows and trigger refusals, command-subtype shape constraints, ordinary-owner
+membership, cross-owner/principal denial, accepted and rejected duplicate replay,
+changed-payload request-ID conflict, Stop without goal, Stop-vs-admission and
+Stop-vs-report races, Stop-release-old-binding rejection, same-text replacement
+race, receipt+goal+control rollback, source transcript deletion without evidence
+loss, and supported owner hard-delete cascading all new rows. Missing controls
+must remain non-admitting after upgrade/restart. No test may prove safety solely
+by a process-local boolean or a public DTO projection.
+
+This is an allocation/review contract, not registered DDL, tested upgrade,
+installed user endpoint, new authority grant or product delivery. The finite
+activation critical path remains: assigned additive migration + concrete typed
+UserControl service/API; authenticated stable-Stop transaction and runtime
+admission binding; exact fenced continuation admission; tools, UI and watch
+projections; then actual end-to-end acceptance. Private emitter default `None`
+and automatic activation OFF remain until those prerequisites are implemented
+and qualified. No speculative lifetime/retry/permission framework is requested.
