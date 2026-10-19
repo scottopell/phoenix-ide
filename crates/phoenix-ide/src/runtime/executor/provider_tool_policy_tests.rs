@@ -335,7 +335,10 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
     ];
     let owner = saved_message("assistant-owner", 2, MessageContent::Agent(public.clone()));
     let result = saved_message(
-        "failed-result",
+        &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+            "assistant-owner",
+            "toolu_slack",
+        ),
         3,
         MessageContent::Tool(ToolContent {
             tool_use_id: "toolu_slack".into(),
