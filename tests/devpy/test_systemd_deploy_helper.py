@@ -2508,6 +2508,129 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         with mock.patch.object(ctl, "property", side_effect=lambda unit, name: good[name, unit]):
             ctl.verify_protected_configuration()
 
+    def prepared_source(self):
+        self.protected()
+        candidate = Path(self.raw["candidate"]["binary"]["path"])
+        retained_candidate = self.transaction / "candidate-binary"
+        candidate.replace(retained_candidate)
+        self.raw["candidate"]["binary"] = {
+            "path": str(retained_candidate),
+            "sha256": digest(retained_candidate),
+        }
+        pin = mock.patch.object(helper, "PREPARED_REGISTRY_SHA256", digest(ROOT / "crates/phoenix-db/src/migrations.rs"))
+        pin.start()
+        self.addCleanup(pin.stop)
+        receipt = self.artifact(helper.PREPARED_RECEIPT, json.dumps({
+            "schema": 1, "operation": helper.PREPARED_OPERATION, "target": helper.PREPARED_TARGET,
+            "version": helper.PREPARED_VERSION, "commit": helper.PREPARED_COMMIT,
+            "controller_commit": "c" * 40, "registry_sha256": helper.PREPARED_REGISTRY_SHA256,
+            "run_id": 42, "run_attempt": 1, "event": "workflow_dispatch", "ref": "refs/heads/main",
+            "sha256": {helper.PREPARED_PAYLOAD: self.raw["candidate"]["binary"]["sha256"]},
+            "checks": {"clean_source": "verified", "static_elf": "verified", "embedded_identity": "verified"},
+        }))
+        self.raw.update(manifest_version=helper.PREPARED_HANDOFF_PROTOCOL_VERSION,
+                        source_kind="prepared_artifact", source_commit=helper.PREPARED_COMMIT,
+                        expected={"version": helper.PREPARED_VERSION, "git_sha": helper.PREPARED_COMMIT},
+                        prepared_artifact_receipt=receipt)
+        for field in ("release_tag", "release_commit", "release_asset_name", "release_asset_sha256"):
+            self.raw.pop(field, None)
+        self.write_manifest()
+        manifest = self.manifest()
+        helper.write_status(manifest, "prepared")
+        return manifest
+
+    def test_prepared_receipt_is_required_and_closed_across_root_validation(self):
+        manifest = self.prepared_source()
+        with mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.expected):
+            helper.validate_manifest(self.manifest_path, manifest, self.policy)
+            for field in ("release_tag", "release_commit", "release_asset_name", "release_asset_sha256"):
+                self.assertNotIn(field, json.loads(self.manifest_path.read_text()))
+                raw = json.loads(self.manifest_path.read_text())
+                raw[field] = None
+                self.manifest_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(helper.ValidationError, "release metadata"):
+                    helper.Manifest.load(self.manifest_path)
+                self.write_manifest()
+            for changes in (dict(prepared_artifact_receipt=None), dict(release_asset_name="asset"),
+                            dict(release_tag=helper.PROTECTED_RELEASE_TAG), dict(source_kind="published_release"),
+                            dict(manifest_version=2), dict(controller_source_commit=helper.PREPARED_COMMIT)):
+                with self.subTest(changes=changes), self.assertRaises(helper.ValidationError):
+                    helper.validate_mode(dataclasses.replace(manifest, **changes))
+            with self.assertRaises(helper.ValidationError):
+                helper.validate_mode(dataclasses.replace(manifest, mode="ordinary"))
+            receipt_path = Path(manifest.prepared_artifact_receipt.path)
+            original = receipt_path.read_bytes()
+            for mutate in (lambda raw: raw.update(run_attempt=False),
+                           lambda raw: raw.update(ref="refs/heads/other"),
+                           lambda raw: raw["sha256"].update(extra="0" * 64),
+                           lambda raw: raw["checks"].update(extra="verified"),
+                           lambda raw: raw.update(registry_sha256="0" * 64),
+                           lambda raw: raw.update(controller_commit="d" * 40)):
+                raw = json.loads(original)
+                mutate(raw)
+                receipt_path.write_text(json.dumps(raw))
+                altered = dataclasses.replace(manifest, prepared_artifact_receipt=helper.Artifact(str(receipt_path), digest(receipt_path)))
+                with self.assertRaises(helper.ValidationError):
+                    helper.validate_manifest(self.manifest_path, altered, self.policy)
+            receipt_path.write_bytes(original)
+            with mock.patch.object(helper, "installed_runtime_identity", return_value=helper.Identity("wrong", helper.PREPARED_COMMIT)):
+                with self.assertRaisesRegex(helper.ValidationError, "embedded identity"):
+                    helper.validate_manifest(self.manifest_path, manifest, self.policy)
+            receipt_path.unlink()
+            receipt_path.symlink_to(self.manifest_path)
+            with self.assertRaises(helper.ValidationError):
+                helper.validate_manifest(self.manifest_path, manifest, self.policy)
+
+    def test_prepared_receipt_candidate_hash_and_path_are_bound_at_root(self):
+        manifest = self.prepared_source()
+        receipt_path = Path(manifest.prepared_artifact_receipt.path)
+        with mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.expected):
+            for changed in (dataclasses.replace(manifest, candidate=dataclasses.replace(
+                                manifest.candidate, binary=dataclasses.replace(manifest.candidate.binary, sha256="0" * 64))),
+                            dataclasses.replace(manifest, controller_source_commit="d" * 40),
+                            dataclasses.replace(manifest, registry=dataclasses.replace(manifest.registry, sha256="0" * 64)),
+                            dataclasses.replace(manifest, prepared_artifact_receipt=dataclasses.replace(
+                                manifest.prepared_artifact_receipt, path=str(self.transaction / "other.json")))):
+                with self.subTest(changed=changed), self.assertRaises(helper.ValidationError):
+                    helper.validate_manifest(self.manifest_path, changed, self.policy)
+            receipt_path.write_bytes(receipt_path.read_bytes() + b" ")
+            with self.assertRaisesRegex(helper.ValidationError, "checksum"):
+                helper.validate_manifest(self.manifest_path, manifest, self.policy)
+
+    def test_published_and_ordinary_manifests_reject_prepared_receipt(self):
+        manifest = self.protected()
+        receipt = helper.Artifact(str(self.transaction / helper.PREPARED_RECEIPT), "0" * 64)
+        with self.assertRaises(helper.ValidationError):
+            helper.validate_mode(dataclasses.replace(manifest, prepared_artifact_receipt=receipt))
+        ordinary = dataclasses.replace(manifest, mode="ordinary", source_kind="local_head",
+                                       release_tag=None, release_commit=None, controller_source_commit=None,
+                                       controller_helper=None, release_asset_name=None, release_asset_sha256=None,
+                                       prepared_artifact_receipt=receipt)
+        with self.assertRaises(helper.ValidationError):
+            helper.validate_mode(ordinary)
+
+    def test_prepared_post_marker_recovery_never_restores_predecessor(self):
+        manifest = self.prepared_source()
+        ctl = ProtectedSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        self.assertEqual("current_forward_failed", self.execute(manifest, ctl, "partial"))
+        with mock.patch.object(helper, "restore", side_effect=AssertionError("predecessor restore forbidden")) as restore, \
+             mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.expected), \
+             mock.patch.object(helper.subprocess, "run", side_effect=self.runtime(manifest)):
+            self.assertEqual("committed", helper.recover_current(manifest, ctl, self.policy))
+        restore.assert_not_called()
+        self.assertEqual(manifest.candidate.binary.sha256, helper.sha256(Path(self.targets.binary)))
+
+    def test_distinct_protocol_queries_preserve_published_v2_and_ordinary_v1(self):
+        import contextlib
+        import io
+        for flag, expected in (("--protocol-version", "1"), ("--protected-protocol-version", "2"),
+                               ("--protected-prepared-protocol-version", "3")):
+            with self.subTest(flag=flag), mock.patch.object(sys, "argv", ["helper.py", flag]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(0, helper.main())
+                self.assertEqual(expected, out.getvalue().strip())
+
     def test_retained_manifest_helper_and_registry_are_revalidated(self):
         manifest = self.protected()
         helper.validate_manifest(self.manifest_path, manifest, self.policy)
@@ -2523,6 +2646,54 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                 helper.validate_mode(dataclasses.replace(manifest, mode=mode))
         with self.assertRaises(helper.ValidationError):
             helper.validate_mode(dataclasses.replace(manifest, mode="ordinary"))
+
+    def test_root_handoff_retains_prepared_receipt_as_hashed_artifact(self):
+        manifest = self.prepared_source()
+        root = self.base.resolve() / "prepared-root-handoff"
+        policy = dataclasses.replace(self.policy, transaction_root=root / "transactions",
+                                    status_path=root / "status.json", active_path=root / "active",
+                                    activation_lock_path=root / "activation.lock", claim_lock_path=root / "claim.lock")
+        destination = policy.transaction_root / manifest.transaction_id
+        raw = dataclasses.asdict(manifest)
+        for field in ("release_tag", "release_commit", "release_asset_name", "release_asset_sha256"):
+            raw.pop(field)
+        raw.update(previous=None, previous_health_url=None, status_path=str(policy.status_path),
+                   active_path=str(policy.active_path), activation_lock_path=str(policy.activation_lock_path),
+                   claim_lock_path=str(policy.claim_lock_path))
+        sources = []
+        for name, artifact in (("candidate-binary", manifest.candidate.binary),
+                               ("candidate.service", manifest.candidate.service),
+                               ("candidate.socket", manifest.candidate.socket),
+                               ("candidate.env", manifest.candidate.environment),
+                               ("helper.py", manifest.controller_helper),
+                               ("migrations.rs", manifest.registry),
+                               (helper.PREPARED_RECEIPT, manifest.prepared_artifact_receipt)):
+            sources.append({"name": name, "source": artifact.path, "sha256": artifact.sha256})
+        for field, filename in (("binary", "candidate-binary"), ("service", "candidate.service"),
+                                ("socket", "candidate.socket"), ("environment", "candidate.env")):
+            raw["candidate"][field]["path"] = str(destination / filename)
+        raw["controller_helper"]["path"] = str(destination / "helper.py")
+        raw["registry"]["path"] = str(destination / "migrations.rs")
+        raw["prepared_artifact_receipt"]["path"] = str(destination / helper.PREPARED_RECEIPT)
+        source_manifest = self.base / "prepared-source-manifest.json"
+        source_manifest.write_text(json.dumps(raw))
+        sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
+        bundle = self.base / "prepared-bundle.json"
+        bundle.write_text(json.dumps({"transaction_id": manifest.transaction_id, "files": sources}))
+        original_copy = helper.copy_handoff_file
+        def copy(source, target, expected, _uid, mode):
+            original_copy(source, target, expected, os.getuid(), mode)
+        def identity(path):
+            return manifest.expected if Path(path).name == "candidate-binary" else manifest.previous
+        with mock.patch.object(helper, "copy_handoff_file", side_effect=copy), \
+             mock.patch.object(helper, "installed_runtime_identity", side_effect=identity), \
+             mock.patch.object(helper, "prepare_data_directory", side_effect=AssertionError("preserve live data ownership")):
+            staged_path = helper.stage_handoff(bundle, os.getuid(), policy)
+            staged = helper.Manifest.load(staged_path)
+            helper.validate_manifest(staged_path, staged, policy)
+        self.assertEqual(manifest.prepared_artifact_receipt.sha256, staged.prepared_artifact_receipt.sha256)
+        self.assertEqual(manifest.prepared_artifact_receipt.sha256, digest(destination / helper.PREPARED_RECEIPT))
+        self.assertEqual(0o400, (destination / helper.PREPARED_RECEIPT).stat().st_mode & 0o777)
 
     def test_root_handoff_captures_installed_config_and_seals_manifest(self):
         manifest = self.protected()

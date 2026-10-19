@@ -24,6 +24,7 @@ import re
 import resource
 import shutil
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -8273,6 +8274,92 @@ SYSTEMD_PROTECTED_ASSET = "phoenix_ide-x86_64-unknown-linux-musl"
 SYSTEMD_PROTECTED_ASSET_SHA256 = "bcb74d565c828843596e5109ea9034a2b0e505aab4ba6c18c5cca8e116f5677e"
 SYSTEMD_PROTECTED_REGISTRY_SHA256 = "700162dd8e41305546cf2acd2763bad5603c642840f5be851fb788353879a36a"
 SYSTEMD_PROTECTED_PROTOCOL = 2
+SYSTEMD_PREPARED_COMMIT = "237100c79d9ce672867b284167a099fa0b7a2bcf"
+SYSTEMD_PREPARED_VERSION = "0.13.0-rc.4"
+SYSTEMD_PREPARED_TARGET = "x86_64-unknown-linux-musl"
+SYSTEMD_PREPARED_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+SYSTEMD_PREPARED_OPERATION = "prepare-incident-237100-linux-x86_64"
+SYSTEMD_PREPARED_PAYLOAD = "phoenix_ide-x86_64-unknown-linux-musl-prepared-237100c79d9c"
+SYSTEMD_PREPARED_RECEIPT = "LINUX-PREPARATION-RECEIPT-x86_64-unknown-linux-musl.json"
+SYSTEMD_PREPARED_PROTOCOL = 3
+
+
+def _copy_prepared_regular(source: Path, destination: Path, mode: int) -> str:
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    try:
+        source_fd = os.open(source, source_flags)
+    except OSError as exc:
+        raise SystemExit(f"cannot open prepared systemd artifact {source.name}: {exc}") from exc
+    destination_fd = None
+    try:
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            raise SystemExit("prepared systemd artifact entries must be regular files")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        digest = hashlib.sha256()
+        with os.fdopen(source_fd, "rb", closefd=False) as source_stream, os.fdopen(
+            destination_fd, "wb", closefd=False
+        ) as destination_stream:
+            while chunk := source_stream.read(1024 * 1024):
+                destination_stream.write(chunk)
+                digest.update(chunk)
+            destination_stream.flush()
+            os.fsync(destination_stream.fileno())
+        os.fchmod(destination_fd, mode)
+        _fsync_directory(destination.parent)
+        return digest.hexdigest()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+
+
+def _prepare_linux_artifact(
+    directory: Path,
+    expected_full_commit: str,
+    controller_commit: str,
+    staging: Path,
+) -> "ValidatedLinuxPreparedCandidate":
+    from scripts.systemd_deploy_helper import ValidationError, parse_prepared_receipt
+
+    if expected_full_commit != SYSTEMD_PREPARED_COMMIT:
+        raise SystemExit("Linux prepared candidate requires exact app commit")
+    if not directory.is_dir() or directory.is_symlink():
+        raise SystemExit("Linux prepared artifact must be a real directory")
+    if {path.name for path in directory.iterdir()} != {SYSTEMD_PREPARED_PAYLOAD, SYSTEMD_PREPARED_RECEIPT}:
+        raise SystemExit("Linux prepared artifact must contain only exact payload and receipt")
+    receipt = staging / SYSTEMD_PREPARED_RECEIPT
+    binary = staging / "prepared-candidate"
+    receipt_sha = _copy_prepared_regular(directory / SYSTEMD_PREPARED_RECEIPT, receipt, 0o600)
+    try:
+        metadata = parse_prepared_receipt(receipt.read_bytes())
+    except (OSError, ValidationError) as exc:
+        raise SystemExit("invalid Linux prepared artifact receipt") from exc
+    if metadata["controller_commit"] != controller_commit:
+        raise SystemExit("Linux preparation receipt controller commit mismatch")
+    binary_sha = _copy_prepared_regular(directory / SYSTEMD_PREPARED_PAYLOAD, binary, 0o700)
+    if metadata["sha256"][SYSTEMD_PREPARED_PAYLOAD] != binary_sha:
+        raise SystemExit("Linux prepared payload checksum mismatch")
+    try:
+        embedded = RuntimeIdentity.from_value(_binary_identity(binary))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit("Linux prepared payload has no valid embedded identity") from exc
+    if embedded != RuntimeIdentity(SYSTEMD_PREPARED_VERSION, SYSTEMD_PREPARED_COMMIT):
+        raise SystemExit("Linux prepared payload embedded identity mismatch")
+    if _file_sha256(binary) != binary_sha or _file_sha256(receipt) != receipt_sha:
+        raise SystemExit("Linux prepared artifact changed during validation")
+    return ValidatedLinuxPreparedCandidate(binary, receipt, binary_sha, receipt_sha, controller_commit)
+
+
+def _require_linux_prepared_unchanged(candidate: "ValidatedLinuxPreparedCandidate") -> None:
+    if any(not path.is_file() or path.is_symlink() or _file_sha256(path) != digest
+           for path, digest in ((candidate.binary, candidate.binary_sha256),
+                                (candidate.receipt, candidate.receipt_sha256))):
+        raise SystemExit("Linux prepared candidate or receipt changed during staging")
 
 
 def _systemd_ordinary_database_preflight(prepared: "PreparedCandidate", staging: Path, environment: dict[str, str]) -> None:
@@ -8324,7 +8411,8 @@ def native_prod_deploy(
     controller = controller or ProdDeployControllerOptions()
     controller.require_systemd_current(release)
     if controller.enabled:
-        release, _expected_full_commit = controller.require_exact_release(release)
+        if controller.prepared_artifact is None:
+            release, _expected_full_commit = controller.require_exact_release(release)
         _require_noninteractive_sudo_ready()
     elif not check_systemd_available():
         raise SystemExit("systemd is not available on this Linux host")
@@ -8338,7 +8426,14 @@ def native_prod_deploy(
     with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
         staging = Path(temporary)
         prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
+            _prepare_linux_artifact(
+                controller.prepared_artifact,
+                controller.expected_full_commit,
+                controller.controller_source_commit,
+                staging,
+            )
+            if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None
+            else _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release
             else _prepare_local_candidate(
                 target=_linux_musl_target(),
@@ -8353,6 +8448,8 @@ def native_prod_deploy(
         if prepared.binary != candidate_binary:
             shutil.copy2(prepared.binary, candidate_binary)
         candidate_binary.chmod(0o700)
+        if isinstance(prepared, ValidatedLinuxPreparedCandidate) and _file_sha256(candidate_binary) != prepared.binary_sha256:
+            raise SystemExit("Linux prepared candidate changed while staging")
 
         candidate_env = staging / "candidate.env"
         candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
@@ -8383,24 +8480,31 @@ def native_prod_deploy(
             controller.controller_source_commit or prepared.source_commit,
             "scripts/systemd_deploy_helper.py",
             helper,
-            "published_release" if controller.systemd_current_schema_upgrade else prepared.source_kind.value,
+            prepared.source_kind.value,
         )
         registry = None
         if controller.systemd_current_schema_upgrade:
-            if (prepared.release_tag != SYSTEMD_PROTECTED_TAG or prepared.release_commit != SYSTEMD_PROTECTED_COMMIT
+            if isinstance(prepared, ValidatedLinuxPreparedCandidate):
+                _require_linux_prepared_unchanged(prepared)
+            elif (prepared.release_tag != SYSTEMD_PROTECTED_TAG or prepared.release_commit != SYSTEMD_PROTECTED_COMMIT
                     or prepared.source_commit != SYSTEMD_PROTECTED_COMMIT
                     or prepared.identity != RuntimeIdentity(SYSTEMD_PROTECTED_VERSION, SYSTEMD_PROTECTED_COMMIT)
                     or _file_sha256(candidate_binary) != SYSTEMD_PROTECTED_ASSET_SHA256):
                 raise SystemExit("protected systemd candidate is not the reviewed release")
             registry = staging / "migrations.rs"
             _materialize_source_file(prepared.source_commit, "crates/phoenix-db/src/migrations.rs", registry, prepared.source_kind.value)
-            if _file_sha256(registry) != SYSTEMD_PROTECTED_REGISTRY_SHA256:
+            expected_registry_sha = (SYSTEMD_PREPARED_REGISTRY_SHA256 if isinstance(prepared, ValidatedLinuxPreparedCandidate)
+                                     else SYSTEMD_PROTECTED_REGISTRY_SHA256)
+            if _file_sha256(registry) != expected_registry_sha:
                 raise SystemExit("protected systemd registry hash is not the reviewed release")
         else:
             _systemd_ordinary_database_preflight(dataclasses.replace(prepared, binary=candidate_binary), staging, env_snapshot)
-        expected_protocol = SYSTEMD_PROTECTED_PROTOCOL if controller.systemd_current_schema_upgrade else SYSTEMD_HANDOFF_PROTOCOL_VERSION
+        is_prepared = isinstance(prepared, ValidatedLinuxPreparedCandidate)
+        expected_protocol = (SYSTEMD_PREPARED_PROTOCOL if is_prepared else SYSTEMD_PROTECTED_PROTOCOL
+                             if controller.systemd_current_schema_upgrade else SYSTEMD_HANDOFF_PROTOCOL_VERSION)
         protocol = subprocess.run(
-            [sys.executable, str(helper), "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"],
+            [sys.executable, str(helper), "--protected-prepared-protocol-version" if is_prepared else
+             "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         if protocol != str(expected_protocol):
@@ -8419,16 +8523,16 @@ def native_prod_deploy(
                 "database_path": env_snapshot.get("PHOENIX_DB_PATH", str(SYSTEMD_DB_PATH)),
                 "controller_source_commit": controller.controller_source_commit,
                 "controller_helper": _systemd_artifact(root_paths["helper.py"], helper),
-                "release_asset_name": controller.expected_asset_name,
-                "release_asset_sha256": controller.expected_asset_sha256,
+                **({"prepared_artifact_receipt": _systemd_artifact(root_transaction / SYSTEMD_PREPARED_RECEIPT, prepared.receipt)}
+                   if is_prepared else {"release_asset_name": controller.expected_asset_name,
+                                        "release_asset_sha256": controller.expected_asset_sha256}),
             } if controller.systemd_current_schema_upgrade else {}),
             "transaction_id": transaction_id,
             "unit_name": PROD_SERVICE_NAME,
             "service_user": service_user,
             "source_kind": prepared.source_kind.value,
             "source_commit": prepared.source_commit,
-            "release_tag": prepared.release_tag,
-            "release_commit": prepared.release_commit,
+            **({} if is_prepared else {"release_tag": prepared.release_tag, "release_commit": prepared.release_commit}),
             "expected": prepared.identity.as_dict(),
             "previous": None,
             "expected_health_url": _prod_api_health_url(env_snapshot),
@@ -8470,6 +8574,9 @@ def native_prod_deploy(
         ]
         if registry is not None:
             files.append(("migrations.rs", registry))
+        if is_prepared:
+            _require_linux_prepared_unchanged(prepared)
+            files.append((SYSTEMD_PREPARED_RECEIPT, prepared.receipt))
         if env_snapshot:
             files.append(("candidate.env", candidate_env))
         root_manifest = _stage_systemd_root_handoff(
@@ -9588,6 +9695,22 @@ class PreparedCandidate:
 
 
 @dataclasses.dataclass(frozen=True)
+class ValidatedLinuxPreparedCandidate:
+    binary: Path
+    receipt: Path
+    binary_sha256: str
+    receipt_sha256: str
+    controller_commit: str
+    source_kind: ProdSourceKind = ProdSourceKind.PREPARED_ARTIFACT
+    source_commit: str = SYSTEMD_PREPARED_COMMIT
+    identity: RuntimeIdentity = RuntimeIdentity(SYSTEMD_PREPARED_VERSION, SYSTEMD_PREPARED_COMMIT)
+    release_tag: None = None
+    release_commit: None = None
+
+
+
+
+@dataclasses.dataclass(frozen=True)
 class ProdDeployControllerOptions:
     enabled: bool = False
     exact_release_tag: str | None = None
@@ -9646,8 +9769,16 @@ class ProdDeployControllerOptions:
         import platform
         if (not self.enabled or self.backend != "systemd" or sys.platform != "linux"
                 or platform.machine().lower() not in {"x86_64", "amd64"}
-                or self.prepared_artifact is not None or self.current_schema_upgrade or self.paired_database_upgrade):
-            raise SystemExit("--systemd-current-schema-upgrade requires Linux x86_64 systemd exact-release controller mode only")
+                or self.current_schema_upgrade or self.paired_database_upgrade):
+            raise SystemExit("--systemd-current-schema-upgrade requires Linux x86_64 systemd controller mode only")
+        if self.prepared_artifact is not None:
+            if (release is not None or self.expected_full_commit != SYSTEMD_PREPARED_COMMIT
+                    or any(value is not None for value in (
+                        self.exact_release_tag, self.expected_asset_name, self.expected_asset_sha256,
+                    )) or re.fullmatch(r"[0-9a-f]{40}", self.controller_source_commit or "") is None
+                    or self.controller_source_commit == self.expected_full_commit):
+                raise SystemExit("protected Linux prepared artifact requires exact app SHA, separate controller and no release pins")
+            return
         self.require_exact_release(release)
         if (release != SYSTEMD_PROTECTED_TAG or self.exact_release_tag != SYSTEMD_PROTECTED_TAG
                 or self.expected_full_commit != SYSTEMD_PROTECTED_COMMIT
@@ -12611,11 +12742,12 @@ def cmd_prod_deploy(
         raise SystemExit("--paired-database-upgrade and --current-schema-upgrade are mutually exclusive")
     if controller.expected_full_commit is not None and release is None and controller.prepared_artifact is None and not any(upgrade_modes):
         raise SystemExit("--expected-full-commit requires all prepared upgrade options or an exact release controller")
-    if not (release is not None and controller.current_schema_upgrade and controller.prepared_artifact is None) and (controller.prepared_artifact is not None or any(upgrade_modes)) and (
+    if not (release is not None and controller.current_schema_upgrade and controller.prepared_artifact is None) and not controller.systemd_current_schema_upgrade and (controller.prepared_artifact is not None or any(upgrade_modes)) and (
         controller.prepared_artifact is None or controller.expected_full_commit is None or not any(upgrade_modes)
     ):
         raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together")
-    if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):
+    if (controller.prepared_artifact is not None and not controller.systemd_current_schema_upgrade
+            and (sys.platform != "darwin" or controller.backend not in (None, "launchd"))):
         raise SystemExit("prepared artifact upgrade is supported only by macOS launchd")
     if controller.prepared_artifact is not None and release:
         raise SystemExit("prepared artifact upgrade excludes --release")
@@ -13009,7 +13141,7 @@ def main():
     deploy_parser.add_argument("--controller-expected-asset-name", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
-    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
+    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepared artifact directory (macOS launchd or Linux systemd)")
     deploy_parser.add_argument("--expected-full-commit", help="Exact full lowercase candidate SHA for --prepared-artifact or protected --release upgrade")
     upgrade_group = deploy_parser.add_mutually_exclusive_group()
     upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")

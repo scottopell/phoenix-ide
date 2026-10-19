@@ -415,6 +415,211 @@ class SystemdDeployCommandTests(unittest.TestCase):
             self.assertEqual(value, getattr(self.dev, "SYSTEMD_PROTECTED_" + name))
             self.assertEqual(value, helper["PROTECTED_" + helper_names.get(name, name)])
 
+    def test_linux_prepared_pins_are_literal_and_helper_agrees(self):
+        import runpy
+        helper = runpy.run_path(str(ROOT / "scripts/systemd_deploy_helper.py"))
+        pins = {
+            "COMMIT": "237100c79d9ce672867b284167a099fa0b7a2bcf",
+            "VERSION": "0.13.0-rc.4", "TARGET": "x86_64-unknown-linux-musl",
+            "REGISTRY_SHA256": "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6",
+            "OPERATION": "prepare-incident-237100-linux-x86_64",
+            "PAYLOAD": "phoenix_ide-x86_64-unknown-linux-musl-prepared-237100c79d9c",
+            "RECEIPT": "LINUX-PREPARATION-RECEIPT-x86_64-unknown-linux-musl.json",
+        }
+        for name, value in pins.items():
+            self.assertEqual(value, getattr(self.dev, "SYSTEMD_PREPARED_" + name))
+            self.assertEqual(value, helper["PREPARED_" + name])
+        self.assertEqual(3, helper["PREPARED_HANDOFF_PROTOCOL_VERSION"])
+        self.assertEqual(2, helper["PROTECTED_HANDOFF_PROTOCOL_VERSION"])
+
+    def linux_prepared_options(self, directory, **changes):
+        values = dict(enabled=True, backend="systemd", systemd_current_schema_upgrade=True,
+                      prepared_artifact=directory, expected_full_commit=self.dev.SYSTEMD_PREPARED_COMMIT,
+                      controller_source_commit="c" * 40)
+        values.update(changes)
+        return self.dev.ProdDeployControllerOptions(**values)
+
+    def linux_prepared_directory(self, base):
+        binary = base / self.dev.SYSTEMD_PREPARED_PAYLOAD
+        binary.write_bytes(b"inert Linux prepared payload")
+        receipt = base / self.dev.SYSTEMD_PREPARED_RECEIPT
+        receipt.write_text(json.dumps({
+            "schema": 1, "operation": self.dev.SYSTEMD_PREPARED_OPERATION,
+            "target": self.dev.SYSTEMD_PREPARED_TARGET, "version": self.dev.SYSTEMD_PREPARED_VERSION,
+            "commit": self.dev.SYSTEMD_PREPARED_COMMIT, "controller_commit": "c" * 40,
+            "registry_sha256": self.dev.SYSTEMD_PREPARED_REGISTRY_SHA256,
+            "run_id": 42, "run_attempt": 1, "event": "workflow_dispatch", "ref": "refs/heads/main",
+            "sha256": {binary.name: self.dev._file_sha256(binary)},
+            "checks": {"clean_source": "verified", "static_elf": "verified", "embedded_identity": "verified"},
+        }))
+        return binary, receipt
+
+    def test_linux_prepared_options_reject_mixed_modes_before_sudo_or_preparation(self):
+        import platform
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(sys, "platform", "linux"), \
+             mock.patch.object(platform, "machine", return_value="x86_64"), \
+             mock.patch.object(self.dev, "_require_noninteractive_sudo_ready") as sudo, \
+             mock.patch.object(self.dev, "_prepare_linux_artifact") as prepare, \
+             mock.patch.object(self.dev, "cmd_check") as check:
+            base = Path(td)
+            cases = [dict(enabled=False), dict(backend="launchd"), dict(prepared_artifact=None),
+                     dict(expected_full_commit="a" * 40), dict(controller_source_commit=None),
+                     dict(controller_source_commit="C" * 40),
+                     dict(controller_source_commit=self.dev.SYSTEMD_PREPARED_COMMIT),
+                     dict(exact_release_tag=self.dev.SYSTEMD_PROTECTED_TAG),
+                     dict(expected_asset_name=self.dev.SYSTEMD_PROTECTED_ASSET),
+                     dict(expected_asset_sha256=self.dev.SYSTEMD_PROTECTED_ASSET_SHA256),
+                     dict(systemd_current_schema_upgrade=False), dict(current_schema_upgrade=True),
+                     dict(paired_database_upgrade=True)]
+            for changes in cases:
+                with self.subTest(changes=changes), self.assertRaises(SystemExit):
+                    self.dev.cmd_prod_deploy(controller=self.linux_prepared_options(base, **changes))
+            with self.assertRaises(SystemExit):
+                self.dev.cmd_prod_deploy(self.dev.SYSTEMD_PROTECTED_TAG,
+                                         controller=self.linux_prepared_options(base))
+            sudo.assert_not_called()
+            prepare.assert_not_called()
+            check.assert_not_called()
+
+    def test_linux_receipt_shape_tamper_symlinks_and_identity_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = root / "source"
+            staging_root = root / "staging"
+            base.mkdir()
+            staging_root.mkdir()
+            binary, receipt = self.linux_prepared_directory(base)
+            expected = self.dev.RuntimeIdentity(self.dev.SYSTEMD_PREPARED_VERSION, self.dev.SYSTEMD_PREPARED_COMMIT)
+
+            def prepare():
+                staging = Path(tempfile.mkdtemp(dir=staging_root))
+                return self.dev._prepare_linux_artifact(
+                    base, self.dev.SYSTEMD_PREPARED_COMMIT, "c" * 40, staging
+                )
+
+            invoked = []
+
+            def identity(path):
+                invoked.append(path)
+                binary.write_bytes(b"mutable source changed after private copy")
+                return expected
+
+            with mock.patch.object(self.dev, "_binary_identity", side_effect=identity):
+                candidate = prepare()
+            self.assertEqual([candidate.binary], invoked)
+            self.assertNotEqual(binary, candidate.binary)
+            self.assertNotEqual(receipt, candidate.receipt)
+            self.assertEqual(self.dev._file_sha256(candidate.receipt), candidate.receipt_sha256)
+            binary.write_bytes(b"inert Linux prepared payload")
+            with mock.patch.object(self.dev, "_binary_identity", return_value=expected):
+                for field, value in (("schema", True), ("event", "push"), ("run_id", 0),
+                                     ("run_attempt", False), ("controller_commit", "d" * 40),
+                                     ("registry_sha256", "0" * 64)):
+                    original = receipt.read_text()
+                    raw = json.loads(original)
+                    raw[field] = value
+                    receipt.write_text(json.dumps(raw))
+                    with self.subTest(field=field), self.assertRaises(SystemExit):
+                        prepare()
+                    receipt.write_text(original)
+                for key in ("surplus", "checks", "sha256"):
+                    original = receipt.read_text()
+                    raw = json.loads(original)
+                    if key == "surplus":
+                        raw[key] = 1
+                    else:
+                        raw[key]["extra"] = "verified"
+                    receipt.write_text(json.dumps(raw))
+                    with self.subTest(key=key), self.assertRaises(SystemExit):
+                        prepare()
+                    receipt.write_text(original)
+                original = receipt.read_text()
+                raw = json.loads(original)
+                raw.pop("checks")
+                receipt.write_text(json.dumps(raw))
+                with self.assertRaises(SystemExit):
+                    prepare()
+                receipt.write_text(original)
+                receipt.write_text(original.replace('"schema": 1,', '"schema": 1, "schema": 1,'))
+                with self.assertRaises(SystemExit):
+                    prepare()
+                receipt.write_text(original)
+                raw = json.loads(original)
+                raw["sha256"][binary.name] = "A" * 64
+                receipt.write_text(json.dumps(raw))
+                with self.assertRaises(SystemExit):
+                    prepare()
+                receipt.write_text(original)
+                (base / "extra-payload").write_bytes(b"extra")
+                with self.assertRaisesRegex(SystemExit, "only exact"):
+                    prepare()
+                (base / "extra-payload").unlink()
+                binary.write_bytes(b"changed")
+                with self.assertRaisesRegex(SystemExit, "checksum"):
+                    prepare()
+                binary.write_bytes(b"inert Linux prepared payload")
+                with mock.patch.object(self.dev, "_binary_identity", return_value=self.dev.RuntimeIdentity("wrong", expected.git_sha)):
+                    with self.assertRaisesRegex(SystemExit, "embedded identity"):
+                        prepare()
+                binary.unlink()
+                binary.symlink_to(receipt)
+                with self.assertRaisesRegex(SystemExit, "open prepared systemd artifact"):
+                    prepare()
+                candidate.binary.write_bytes(b"changed retained copy")
+                with self.assertRaisesRegex(SystemExit, "changed"):
+                    self.dev._require_linux_prepared_unchanged(candidate)
+
+    def test_linux_prepared_manifest_retains_receipt_and_separate_provenance(self):
+        import platform
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            binary, receipt = self.linux_prepared_directory(base)
+            from scripts import systemd_deploy_helper as linux_helper
+            registry_sha = self.dev._file_sha256(ROOT / "crates/phoenix-db/src/migrations.rs")
+            raw = json.loads(receipt.read_text())
+            raw["registry_sha256"] = registry_sha
+            receipt.write_text(json.dumps(raw))
+            captured = {}
+            def materialize(commit, source, destination, kind):
+                captured.setdefault("sources", []).append((commit, source, kind))
+                destination.write_bytes((ROOT / source).read_bytes())
+            def stage(_staging, tx, helper_path, files, **kwargs):
+                captured["manifest"] = json.loads(dict(files)["manifest.json"].read_text())
+                captured["files"] = dict(files)
+                captured["receipt_bytes"] = dict(files)[self.dev.SYSTEMD_PREPARED_RECEIPT].read_bytes()
+                return self.dev.SYSTEMD_TRANSACTION_ROOT / tx / "manifest.json"
+            expected = self.dev.RuntimeIdentity(self.dev.SYSTEMD_PREPARED_VERSION, self.dev.SYSTEMD_PREPARED_COMMIT)
+            with mock.patch.object(sys, "platform", "linux"), \
+                 mock.patch.object(platform, "machine", return_value="x86_64"), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=expected), \
+                 mock.patch.object(self.dev, "SYSTEMD_PREPARED_REGISTRY_SHA256", registry_sha), \
+                 mock.patch.object(linux_helper, "PREPARED_REGISTRY_SHA256", registry_sha), \
+                 mock.patch.object(self.dev, "_require_noninteractive_sudo_ready"), \
+                 mock.patch.object(self.dev, "_read_systemd_installed_env", return_value={"SECRET": "installed"}), \
+                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+                 mock.patch.object(self.dev, "detect_service_user", return_value="nobody"), \
+                 mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
+                 mock.patch.object(self.dev, "_stage_systemd_root_handoff", side_effect=stage), \
+                 mock.patch.object(self.dev, "_launch_systemd_activation"), \
+                 mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "3\n", "")) as run:
+                self.dev.native_prod_deploy(controller=self.linux_prepared_options(base))
+            manifest = captured["manifest"]
+            self.assertEqual("prepared_artifact", manifest["source_kind"])
+            self.assertEqual(3, manifest["manifest_version"])
+            self.assertNotIn("release_asset_name", manifest)
+            self.assertNotIn("release_asset_sha256", manifest)
+            self.assertNotIn("release_tag", manifest)
+            self.assertNotIn("release_commit", manifest)
+            self.assertEqual("c" * 40, manifest["controller_source_commit"])
+            self.assertEqual(self.dev._file_sha256(receipt), manifest["prepared_artifact_receipt"]["sha256"])
+            self.assertNotEqual(receipt, captured["files"][self.dev.SYSTEMD_PREPARED_RECEIPT])
+            self.assertEqual(receipt.read_bytes(), captured["receipt_bytes"])
+            self.assertEqual(self.dev._file_sha256(binary), manifest["candidate"]["binary"]["sha256"])
+            self.assertEqual([("c" * 40, "scripts/systemd_deploy_helper.py", "prepared_artifact"),
+                              (self.dev.SYSTEMD_PREPARED_COMMIT, "crates/phoenix-db/src/migrations.rs", "prepared_artifact")],
+                             captured["sources"])
+            self.assertIn("--protected-prepared-protocol-version", run.call_args_list[0].args[0])
+
     def test_ordinary_old_release_pending_database_refuses_before_handoff_using_candidate_bytes(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as td:

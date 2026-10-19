@@ -43,11 +43,57 @@ GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 RELEASE_TAG_RE = re.compile(r"v[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
-SOURCE_KINDS = {"local_head", "published_release"}
+SOURCE_KINDS = {"local_head", "published_release", "prepared_artifact"}
 
 
 class ValidationError(RuntimeError):
     pass
+
+
+PREPARED_COMMIT = "237100c79d9ce672867b284167a099fa0b7a2bcf"
+PREPARED_VERSION = "0.13.0-rc.4"
+PREPARED_TARGET = "x86_64-unknown-linux-musl"
+PREPARED_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+PREPARED_OPERATION = "prepare-incident-237100-linux-x86_64"
+PREPARED_PAYLOAD = "phoenix_ide-x86_64-unknown-linux-musl-prepared-237100c79d9c"
+PREPARED_RECEIPT = "LINUX-PREPARATION-RECEIPT-x86_64-unknown-linux-musl.json"
+PREPARED_HANDOFF_PROTOCOL_VERSION = 3
+
+
+def parse_prepared_receipt(data: bytes) -> dict:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict:
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValidationError("Linux preparation receipt has duplicate keys")
+            value[key] = item
+        return value
+
+    try:
+        receipt = json.loads(data, object_pairs_hook=unique_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("invalid Linux preparation receipt JSON") from exc
+    if (type(receipt) is not dict or set(receipt) != {
+            "schema", "operation", "target", "version", "commit", "controller_commit",
+            "registry_sha256", "run_id", "run_attempt", "event", "ref", "sha256", "checks",
+        } or type(receipt["sha256"]) is not dict
+            or set(receipt["sha256"]) != {PREPARED_PAYLOAD}
+            or type(receipt["checks"]) is not dict
+            or set(receipt["checks"]) != {"clean_source", "static_elf", "embedded_identity"}
+            or receipt["schema"] != 1 or type(receipt["schema"]) is not int
+            or receipt["operation"] != PREPARED_OPERATION or receipt["target"] != PREPARED_TARGET
+            or receipt["version"] != PREPARED_VERSION or receipt["commit"] != PREPARED_COMMIT
+            or type(receipt["controller_commit"]) is not str
+            or GIT_SHA_RE.fullmatch(receipt["controller_commit"]) is None
+            or receipt["controller_commit"] == PREPARED_COMMIT
+            or receipt["registry_sha256"] != PREPARED_REGISTRY_SHA256
+            or any(type(receipt[field]) is not int or receipt[field] < 1 for field in ("run_id", "run_attempt"))
+            or receipt["event"] != "workflow_dispatch" or receipt["ref"] != "refs/heads/main"
+            or type(receipt["sha256"][PREPARED_PAYLOAD]) is not str
+            or SHA256_RE.fullmatch(receipt["sha256"][PREPARED_PAYLOAD]) is None
+            or receipt["checks"] != {"clean_source": "verified", "static_elf": "verified", "embedded_identity": "verified"}):
+        raise ValidationError("Linux preparation receipt has invalid provenance or shape")
+    return receipt
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,11 +172,17 @@ class Manifest:
     database_path: Optional[str] = None
     release_asset_name: Optional[str] = None
     release_asset_sha256: Optional[str] = None
+    prepared_artifact_receipt: Optional[Artifact] = None
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
         try:
             raw = json.loads(path.read_text())
+            if raw.get("source_kind") == "prepared_artifact":
+                if set(raw) & {"release_tag", "release_commit", "release_asset_name", "release_asset_sha256"}:
+                    raise ValidationError("prepared source manifest contains release metadata")
+                raw["release_tag"] = None
+                raw["release_commit"] = None
             raw["expected"] = Identity(**raw["expected"])
             raw["previous"] = Identity(**raw["previous"]) if raw.get("previous") else None
             raw["candidate"] = CandidateArtifacts(
@@ -143,7 +195,7 @@ class Manifest:
                 name: OptionalArtifact(**raw["rollback"][name])
                 for name in ("binary", "service", "socket", "environment")
             })
-            for field in ("registry", "controller_helper"):
+            for field in ("registry", "controller_helper", "prepared_artifact_receipt"):
                 if raw.get(field) is not None:
                     raw[field] = Artifact(**raw[field])
             raw["targets"] = SystemdTargets(**raw["targets"])
@@ -302,7 +354,9 @@ def validate_health_url(value: Optional[str], description: str) -> None:
 
 
 def validate_manifest(manifest_path: Path, manifest: Manifest, policy: ValidationPolicy) -> None:
-    expected_protocol = PROTECTED_HANDOFF_PROTOCOL_VERSION if manifest.mode == PROTECTED_MODE else HANDOFF_PROTOCOL_VERSION
+    expected_protocol = (PREPARED_HANDOFF_PROTOCOL_VERSION if manifest.source_kind == "prepared_artifact"
+                         else PROTECTED_HANDOFF_PROTOCOL_VERSION if manifest.mode == PROTECTED_MODE
+                         else HANDOFF_PROTOCOL_VERSION)
     if type(manifest.manifest_version) is not int or manifest.manifest_version != expected_protocol:
         raise ValidationError(
             f"unsupported handoff protocol {manifest.manifest_version!r}; expected {expected_protocol}"
@@ -315,7 +369,7 @@ def validate_manifest(manifest_path: Path, manifest: Manifest, policy: Validatio
         raise ValidationError("source commit must be a full lowercase git SHA")
     if manifest.source_kind not in SOURCE_KINDS:
         raise ValidationError("source kind is not allowed")
-    if manifest.source_kind == "local_head":
+    if manifest.source_kind != "published_release":
         if manifest.release_tag is not None or manifest.release_commit is not None:
             raise ValidationError("local candidate has release metadata")
     else:
@@ -344,6 +398,20 @@ def validate_manifest(manifest_path: Path, manifest: Manifest, policy: Validatio
     validate_mode(manifest)
     if manifest.registry is not None:
         validate_regular_file(manifest.registry.path, manifest.registry.sha256, root, policy, "candidate registry")
+    if manifest.prepared_artifact_receipt is not None:
+        receipt_artifact = manifest.prepared_artifact_receipt
+        receipt_path = validate_regular_file(receipt_artifact.path, receipt_artifact.sha256, root, policy, "prepared artifact receipt")
+        if receipt_path != root / PREPARED_RECEIPT:
+            raise ValidationError("prepared artifact receipt has wrong retained path")
+        receipt = parse_prepared_receipt(receipt_path.read_bytes())
+        if (receipt["controller_commit"] != manifest.controller_source_commit
+                or receipt["commit"] != manifest.source_commit
+                or receipt["registry_sha256"] != manifest.registry.sha256
+                or receipt["sha256"][PREPARED_PAYLOAD] != manifest.candidate.binary.sha256
+                or Path(manifest.candidate.binary.path) != root / "candidate-binary"):
+            raise ValidationError("prepared artifact receipt does not bind retained candidate provenance")
+        if installed_runtime_identity(Path(manifest.candidate.binary.path)) != manifest.expected:
+            raise ValidationError("prepared artifact embedded identity differs from receipt")
     if manifest.controller_helper is not None:
         retained = validate_regular_file(manifest.controller_helper.path, manifest.controller_helper.sha256, root, policy, "controller helper")
         if retained != root / "helper.py" or sha256(Path(__file__)) != manifest.controller_helper.sha256:
@@ -938,11 +1006,25 @@ def validate_mode(manifest: Manifest) -> None:
     if manifest.mode not in {"ordinary", PROTECTED_MODE}:
         raise ValidationError("unknown systemd deployment mode")
     if manifest.mode == "ordinary":
-        if any(value is not None for value in (manifest.controller_source_commit, manifest.controller_helper,
-                                               manifest.release_asset_name, manifest.release_asset_sha256)):
+        if (manifest.source_kind == "prepared_artifact" or manifest.prepared_artifact_receipt is not None
+                or any(value is not None for value in (manifest.controller_source_commit, manifest.controller_helper,
+                                                       manifest.release_asset_name, manifest.release_asset_sha256))):
             raise ValidationError("ordinary/source mode mismatch")
         return
-    if (manifest.source_kind != "published_release" or manifest.previous is None
+    if manifest.source_kind == "prepared_artifact":
+        if (manifest.previous is None or manifest.manifest_version != PREPARED_HANDOFF_PROTOCOL_VERSION
+                or manifest.source_commit != PREPARED_COMMIT
+                or manifest.expected != Identity(PREPARED_VERSION, PREPARED_COMMIT)
+                or manifest.release_tag is not None or manifest.release_commit is not None
+                or manifest.release_asset_name is not None or manifest.release_asset_sha256 is not None
+                or manifest.prepared_artifact_receipt is None or manifest.registry is None
+                or manifest.registry.sha256 != PREPARED_REGISTRY_SHA256
+                or manifest.controller_helper is None
+                or not isinstance(manifest.controller_source_commit, str)
+                or GIT_SHA_RE.fullmatch(manifest.controller_source_commit) is None
+                or manifest.controller_source_commit == PREPARED_COMMIT):
+            raise ValidationError("protected prepared source requires exact receipt and separate controller")
+    elif (manifest.source_kind != "published_release" or manifest.previous is None
             or manifest.release_commit != manifest.source_commit
             or not isinstance(manifest.release_tag, str) or not RELEASE_TAG_RE.fullmatch(manifest.release_tag)
             or not isinstance(manifest.controller_source_commit, str)
@@ -956,7 +1038,8 @@ def validate_mode(manifest: Manifest) -> None:
             or manifest.release_asset_name != PROTECTED_ASSET_NAME
             or manifest.release_asset_sha256 != PROTECTED_ASSET_SHA256
             or manifest.candidate.binary.sha256 != PROTECTED_ASSET_SHA256
-            or manifest.registry.sha256 != PROTECTED_REGISTRY_SHA256):
+            or manifest.registry.sha256 != PROTECTED_REGISTRY_SHA256
+            or manifest.prepared_artifact_receipt is not None):
         raise ValidationError("protected mode requires exact release, separate controller provenance and predecessor")
     import platform
     if sys.platform != "linux" or platform.machine().lower() not in {"x86_64", "amd64"}:
@@ -969,7 +1052,7 @@ def candidate_registry(manifest: Manifest) -> tuple[tuple[int, str], ...]:
     artifact = manifest.registry
     if artifact is None or sha256(Path(artifact.path)) != artifact.sha256:
         raise ActivationError("candidate registry missing or changed")
-    if manifest.mode == PROTECTED_MODE and artifact.sha256 != PROTECTED_REGISTRY_SHA256:
+    if manifest.mode == PROTECTED_MODE and artifact.sha256 != (PREPARED_REGISTRY_SHA256 if manifest.source_kind == "prepared_artifact" else PROTECTED_REGISTRY_SHA256):
         raise ActivationError("protected candidate registry hash is not the reviewed release")
     source = Path(artifact.path).read_text()
     sections = re.findall(r"const MIGRATIONS: &\[Migration\] = &\[(.*?)\n\];", source, re.S)
@@ -1878,6 +1961,7 @@ def _stage_handoff_locked(bundle_path: Path, source_uid: int, policy: Validation
         "helper.py": 0o700,
         "manifest.json": 0o600,
         "migrations.rs": 0o600,
+        PREPARED_RECEIPT: 0o400,
     }
     if not isinstance(files, list) or not files or not all(isinstance(item, dict) for item in files):
         raise ValidationError("handoff bundle has invalid file entries")
@@ -2208,12 +2292,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--protected-protocol-version", action="store_true")
+    parser.add_argument("--protected-prepared-protocol-version", action="store_true")
     parser.add_argument("action", nargs="?", choices=("activate", "stage", "abandon", "recover-current"),
                         help="recover-current restores only a proven pre-marker predecessor or resumes the exact post-marker candidate")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--source-uid", type=int)
     args = parser.parse_args()
+    if args.protected_prepared_protocol_version:
+        print(PREPARED_HANDOFF_PROTOCOL_VERSION)
+        return 0
     if args.protected_protocol_version:
         print(PROTECTED_HANDOFF_PROTOCOL_VERSION)
         return 0
