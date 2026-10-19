@@ -81,3 +81,7 @@ Host-confirmed evidence for both candidate ARM failures is `68` after notarizati
 ## Receipt expectation authentication — source correction pending
 
 The installer joint payload/receipt-substitution finding requires an independent receipt-byte expectation. Producer source hashes the finalized validated receipt, then publishes `receipt_sha256` and `artifact_id` only after successful upload, with repository/workflow/run/attempt/application/controller provenance in the run summary. The host supplies `--expected-preparation-receipt-sha256` from that authenticated evidence, not the local payload directory. The archive remains exactly binary plus receipt; no self-hash or third file. Prior qualification at fb421d769 is superseded by this change. Fresh exact-head hosted regressions/review are required; no dispatch, artifact or deployment qualification is claimed.
+
+## Actual installer-main integration
+
+Producer source integrates the legitimately merged installer main `7e5ef0e5254264cd9cb285b6eaa210e7da16d9ed`. Consumer normative requirements, deployment Allium and ADR-129 have no differences from the qualified producer prefix. Only the ADR-index duplicate/addition conflicted; it retains one installer129 entry and producer130. The application pin and receipt-authentication workflow are unchanged. Fresh combined-head hosted review/CI are required before integration readiness; no dispatch or artifact qualification follows from merging these sources.

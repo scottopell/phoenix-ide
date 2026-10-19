@@ -211,6 +211,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Replacing a committed/pending exact current-schema candidate without losing its fence | 126; sealed deterministic child, original claim, no predecessor or snapshot replay |
 | Qualifying the exact prepared source114 launchd candidate | 125, then 114, 115, 105 and 034; no generic prepared114 |
 | Protecting the exact systemd prefix65-to-RC4-target128 published-release activation | 116 and 117, then 034 and 017; bounded pre-marker interruption recovery, no launchd impact or generic interval support |
+| Qualifying the exact prepared237100 Linux systemd prefix65-to-target128 activation | 129, then 116/117, 034 and 017; keep published protocol 2 and prepared protocol 3 as distinct exact source authorities |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
@@ -246,6 +247,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-116 (Protect exact 65-to-128 systemd published-release activation; independent exact-release exception)
       │   │   └── ADR-117 (Recover interrupted pre-marker systemd activation; retained predecessor only, no launchd impact)
+      │   │       └── ADR-129 (Qualify exact prepared237100 Linux candidate; retain protected lifecycle and published route)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
       │   ├── ADR-102 (Current-schema prepared activation commits at the database-write boundary)
       │   │   └── ADR-103 (Ordinary forward candidate launch is the downgrade boundary)
