@@ -1455,7 +1455,7 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
         "federation_terminal_payloads",
     ] {
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
                 .fetch_one(f.db.pool())
                 .await
                 .unwrap(),
@@ -1588,7 +1588,7 @@ async fn authorization_refresh_replaces_an_expired_attempt_without_ending_or_adv
     a.request_remote_notification_authorization(&remote, &note.admission_id)
         .await
         .unwrap();
-    let fresh = f.replay(0, NOW + RETAIN_US).await;
+    let fresh = f.replay(0, NOW + RETENTION_US).await;
     assert_eq!(
         authorize_source(&f, &note.content).await,
         SubscriptionAuthorization::Refresh
@@ -1676,7 +1676,7 @@ async fn failure_gap_snapshots_follow_real_projection_not_terminal_kind_whitelis
         (
             ConvState::Error {
                 message: "provider failed".into(),
-                error_kind: ErrorKind::Other,
+                error_kind: ErrorKind::ServerError,
                 resets_at: None,
             },
             TerminalFactOutcome::Failed,
@@ -1685,7 +1685,7 @@ async fn failure_gap_snapshots_follow_real_projection_not_terminal_kind_whitelis
             ConvState::CreationFailed {
                 job_id: "create".into(),
                 error: "provision failed".into(),
-                error_kind: ErrorKind::Other,
+                error_kind: ErrorKind::ServerError,
             },
             TerminalFactOutcome::Failed,
         ),
@@ -1699,11 +1699,12 @@ async fn failure_gap_snapshots_follow_real_projection_not_terminal_kind_whitelis
             ConvState::RecoverableContinuationFailure {
                 failure: RecoverableContinuationFailure {
                     request: ContinuationSummaryRequest {
-                        successor_conversation_id: "next".into(),
-                        summary_message_id: "summary".into(),
+                        operation_id: "summary".into(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
                     },
                     message: "summary failed".into(),
-                    error_kind: ErrorKind::Other,
+                    error_kind: ErrorKind::ServerError,
                 },
             },
             TerminalFactOutcome::Failed,
@@ -2028,7 +2029,7 @@ async fn production_creation_completion_failure_and_cancellation_fanout_are_atom
                     &f.source.id,
                     &claim,
                     "provision failed",
-                    &ErrorKind::Other,
+                    &ErrorKind::ServerError,
                     chrono::Utc::now(),
                 )
                 .await
@@ -2079,7 +2080,7 @@ async fn production_creation_completion_failure_and_cancellation_fanout_are_atom
                     &f.source.id,
                     &claim,
                     "provision failed",
-                    &ErrorKind::Other,
+                    &ErrorKind::ServerError,
                     chrono::Utc::now(),
                 )
                 .await
@@ -2163,8 +2164,9 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
     };
     let f = Fixture::new().await;
     let request = ContinuationSummaryRequest {
-        successor_conversation_id: "summary-successor".into(),
-        summary_message_id: "real-summary".into(),
+        operation_id: "real-summary".into(),
+        rejected_tool_calls: Vec::new(),
+        attempt: 1,
     };
     f.db.update_conversation_state(
         &f.source.id,
@@ -2180,7 +2182,7 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
         &ConvState::RecoverableContinuationFailure {
             failure: RecoverableContinuationFailure {
                 request,
-                error_kind: ErrorKind::Other,
+                error_kind: ErrorKind::ServerError,
                 message: "summary provider failed".into(),
             },
         },

@@ -10,6 +10,32 @@ pub type RemoteNotificationPresentations =
     HashMap<String, (RemoteNotification, Option<(String, String)>)>;
 
 impl Database {
+    /// Persist source-generated credential-free navigation for a staged notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the staged notification binding is missing, the paths are
+    /// inconsistent with its exact source identity, or SQLite persistence fails.
+    pub async fn save_remote_notification_navigation(
+        &self,
+        remote: &RemoteSubscription,
+        admission_id: &str,
+        stable_path: &str,
+        source_path: &str,
+    ) -> Result<(), crate::DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::save_remote_notification_navigation_tx(
+            &mut tx,
+            remote,
+            admission_id,
+            stable_path,
+            source_path,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub(super) async fn save_remote_notification_navigation_tx(
         tx: &mut Transaction<'_, Sqlite>,
         remote: &RemoteSubscription,
