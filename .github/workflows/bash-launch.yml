@@ -42,7 +42,7 @@ jobs:
           cargo test -p phoenix-tools bash::ring::tests
           cargo test -p phoenix-tools bash::registry::tests::cascade_same_scope_inheritor_reports_unregistered_launch_uncertainty
           cargo test -p phoenix-tools bash::registry::tests::unregistered_launch_retains_pending_reservation_until_settlement
-          cargo test -p phoenix-ide browser_retirement
+          cargo test -p phoenix_ide browser_retirement
       - uses: actions/upload-artifact@v4
         if: always()
         with:
