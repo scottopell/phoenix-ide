@@ -160,6 +160,40 @@ pub(crate) fn explore_bash_prompt_capability(
     }
 }
 
+/// Rendered ordinary metadata only; invocation discovery and bodies remain live.
+#[derive(Debug)]
+pub struct OrdinarySkillCatalog(String);
+
+impl OrdinarySkillCatalog {
+    pub fn discover(working_dir: &Path) -> Self {
+        let builtin_dir = crate::skills::builtin::default_extract_dir();
+        Self::discover_with_options(working_dir, None, builtin_dir.as_deref())
+    }
+
+    fn discover_with_options(
+        working_dir: &Path,
+        home_override: Option<&Path>,
+        builtin_dir: Option<&Path>,
+    ) -> Self {
+        let mut prompt = String::new();
+        let skills = discover_skills_with_options(working_dir, home_override, builtin_dir);
+        if !skills.is_empty() {
+            prompt.push_str("\n\n<available_skills>\n");
+            prompt.push_str("The following skills are available. Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). Do not cat SKILL.md files directly.\n");
+            for skill in &skills {
+                let location = skill.display_location();
+                let _ = writeln!(
+                    prompt,
+                    "\n- **{}** — {} {location}",
+                    skill.name, skill.description
+                );
+            }
+            prompt.push_str("</available_skills>");
+        }
+        Self(prompt)
+    }
+}
+
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(
     working_dir: &Path,
@@ -200,6 +234,31 @@ pub fn build_system_prompt_with_options(
     persona: Option<&str>,
     explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
 ) -> String {
+    let catalog =
+        OrdinarySkillCatalog::discover_with_options(working_dir, home_override, builtin_dir);
+    build_system_prompt_with_catalog(
+        working_dir,
+        tasks_dir_name,
+        is_sub_agent,
+        mode,
+        language,
+        persona,
+        explore_bash,
+        &catalog,
+    )
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub fn build_system_prompt_with_catalog(
+    working_dir: &Path,
+    tasks_dir_name: &str,
+    is_sub_agent: bool,
+    mode: Option<&ModeContext>,
+    language: LlmLanguage,
+    persona: Option<&str>,
+    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
+    catalog: &OrdinarySkillCatalog,
+) -> String {
     let explore_bash = explore_bash.into();
 
     // REQ-AG-006: a named agent's persona replaces the generic assistant
@@ -233,21 +292,7 @@ pub fn build_system_prompt_with_options(
         prompt.push_str("</project_guidance>");
     }
 
-    // Inject skill catalog (metadata only — full instructions loaded on demand via bash)
-    let skills = discover_skills_with_options(working_dir, home_override, builtin_dir);
-    if !skills.is_empty() {
-        prompt.push_str("\n\n<available_skills>\n");
-        prompt.push_str("The following skills are available. Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). Do not cat SKILL.md files directly.\n");
-        for skill in &skills {
-            let location = skill.display_location();
-            let _ = writeln!(
-                prompt,
-                "\n- **{}** — {} {location}",
-                skill.name, skill.description
-            );
-        }
-        prompt.push_str("</available_skills>");
-    }
+    prompt.push_str(&catalog.0);
 
     // Worktree grounding when cwd is inside .phoenix/worktrees/. The Work and
     // Branch mode blocks below already state the concrete worktree path, so
@@ -719,6 +764,78 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn ordinary_catalog_is_metadata_only_and_live_invocation_keeps_name_precedence() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path().join("project");
+        fs::create_dir(&cwd).unwrap();
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "parent",
+            "live-test",
+            "parent metadata",
+        );
+        let snapshot = OrdinarySkillCatalog::discover_with_options(&cwd, Some(temp.path()), None);
+        let render = || {
+            build_system_prompt_with_catalog(
+                &cwd,
+                "tasks",
+                false,
+                None,
+                LlmLanguage::PhoenixNative,
+                None,
+                phoenix_core::llm_language::ExploreBashPromptCapability::Unavailable,
+                &snapshot,
+            )
+        };
+        let before = render();
+        write_skill(
+            &cwd,
+            ".claude/skills",
+            "local",
+            "live-test",
+            "local metadata",
+        );
+        let path = cwd.join(".claude/skills/local/SKILL.md");
+        fs::write(
+            &path,
+            "---\nname: live-test\ndescription: local metadata\n---\ncurrent body",
+        )
+        .unwrap();
+        let invoke = || {
+            let current = discover_skills_with_options(&cwd, Some(temp.path()), None);
+            crate::skills::invoke_skill(
+                "live-test",
+                "",
+                crate::skills::SkillAudience::Conversation,
+                &current,
+            )
+        };
+        let live = invoke().unwrap();
+        assert!(live.body.contains("current body"));
+        assert_eq!(live.skill_dir, path.parent().unwrap().to_string_lossy());
+        assert_eq!(before, render());
+        assert!(!before.contains("current body"));
+        fs::write(
+            &path,
+            "---\nname: live-test\ndescription: local metadata\n---\nedited body",
+        )
+        .unwrap();
+        assert!(invoke().unwrap().body.contains("edited body"));
+        fs::remove_file(&path).unwrap();
+        // Removing the winning path deliberately exposes the current parent winner.
+        assert_eq!(
+            invoke().unwrap().skill_dir,
+            temp.path().join(".claude/skills/parent").to_string_lossy()
+        );
+        fs::remove_file(temp.path().join(".claude/skills/parent/SKILL.md")).unwrap();
+        assert!(invoke().unwrap_err().contains("not found"));
+        assert_eq!(before, render());
+        let empty = OrdinarySkillCatalog::discover_with_options(&cwd, Some(temp.path()), None);
+        assert!(!empty.0.contains("live-test"));
     }
 
     #[test]
