@@ -65,7 +65,6 @@ export function QuestionPanel({
   // --- Wizard step state ---
   const [currentStep, setCurrentStep] = useState(0);
   const [focusedIndex, setFocusedIndex] = useState(0);
-  const [enterPressedOnLast, setEnterPressedOnLast] = useState(false);
 
   // --- Existing answer state ---
   const [answers, setAnswers] = useState<Record<string, string>>(() => {
@@ -117,14 +116,12 @@ export function QuestionPanel({
     (questionText: string, value: string) => {
       setAnswers((prev) => ({ ...prev, [questionText]: value }));
       setFeedback(null);
-      setEnterPressedOnLast(false);
     },
     []
   );
 
   const setOtherText = useCallback((questionText: string, value: string) => {
     setOtherTexts((prev) => ({ ...prev, [questionText]: value }));
-    setEnterPressedOnLast(false);
   }, []);
 
   const toggleMultiSelect = useCallback(
@@ -139,7 +136,6 @@ export function QuestionPanel({
         return { ...prev, [questionText]: current };
       });
       setFeedback(null);
-      setEnterPressedOnLast(false);
     },
     []
   );
@@ -328,7 +324,6 @@ export function QuestionPanel({
       }
       setCurrentStep(step);
       setFocusedIndex(initialFocus);
-      setEnterPressedOnLast(false);
     },
     [totalSteps, questions, answers, multiSelections]
   );
@@ -460,42 +455,9 @@ export function QuestionPanel({
         return;
       }
 
-      // If typing in a text input (Other field), handle Enter for single-select.
-      // Scope to HTMLInputElement only — textareas (notes, preview-Other) need
-      // Enter to insert newlines, not navigate.
-      if (isInInput) {
-        if (e.target instanceof HTMLInputElement && e.key === 'Enter' && !e.shiftKey && !currentQuestion.multiSelect) {
-          e.preventDefault();
-          e.stopPropagation();
-          if (!isLastStep) {
-            setTimeout(() => goNext(), 200);
-          } else {
-            // Same double-enter-to-submit logic as regular Enter on last step
-            const focusedIsOther =
-              focusedIndex >= currentQuestion.options.length;
-            const thisWillBeAnswered = focusedIsOther
-              ? (otherTexts[currentQuestion.question] ?? '').trim().length > 0
-              : true;
-            const othersAnswered = questions.every((q, i) =>
-              i === currentStep ? true : isQuestionAnswered(q)
-            );
-            const willAllBeAnswered = thisWillBeAnswered && othersAnswered;
-
-            if (willAllBeAnswered) {
-              if (enterPressedOnLast) {
-                handleSubmit();
-              } else {
-                setEnterPressedOnLast(true);
-                showToast(
-                  'Press Enter again to submit, or Ctrl+Enter',
-                  3000
-                );
-              }
-            }
-          }
-        }
-        return;
-      }
+      // Textareas keep Enter for newlines. Submission remains available through
+      // the Submit button or the explicit Ctrl/Cmd+Enter shortcut above.
+      if (isInInput) return;
 
       const count = optionCount(currentQuestion);
       const isMulti = currentQuestion.multiSelect;
@@ -528,41 +490,10 @@ export function QuestionPanel({
             // Multi-select: Enter toggles, no auto-advance
             selectFocusedOption();
           } else {
-            // Single-select: Enter selects, then conditionally advances
+            // Single-select: Enter selects. The user advances explicitly with
+            // Next, matching pointer selection behavior. On the final question,
+            // submission remains explicit through Submit or Ctrl/Cmd+Enter.
             selectFocusedOption();
-
-            if (isLastStep) {
-              // Compute whether all questions will be answered after
-              // this selection (current state doesn't reflect the
-              // selection yet since setState is async).
-              const focusedIsOther =
-                focusedIndex >= currentQuestion.options.length;
-              const thisWillBeAnswered = focusedIsOther
-                ? (otherTexts[currentQuestion.question] ?? '').trim().length > 0
-                : true;
-              const othersAnswered = questions.every((q, i) =>
-                i === currentStep ? true : isQuestionAnswered(q)
-              );
-              const willAllBeAnswered = thisWillBeAnswered && othersAnswered;
-
-              if (willAllBeAnswered) {
-                if (enterPressedOnLast) {
-                  // Second press on last step: submit
-                  handleSubmit();
-                } else {
-                  // First press on last step with all answered: toast
-                  setEnterPressedOnLast(true);
-                  showToast(
-                    'Press Enter again to submit, or Ctrl+Enter',
-                    3000
-                  );
-                }
-              }
-              // Last step but not all answered: just select, no submit attempt
-            } else {
-              // Not last step: auto-advance after 200ms delay
-              setTimeout(() => goNext(), 200);
-            }
           }
           break;
         }
@@ -604,22 +535,14 @@ export function QuestionPanel({
     },
     [
       currentQuestion,
-      currentStep,
-      focusedIndex,
       showConfirmDismiss,
-      isLastStep,
-      enterPressedOnLast,
       expandedNotes,
-      otherTexts,
       answers,
-      questions,
       handleSubmit,
       selectFocusedOption,
-      isQuestionAnswered,
       goNext,
       goBack,
       readOnly,
-      showToast,
       toggleNotes,
     ]
   );
