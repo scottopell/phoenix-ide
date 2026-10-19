@@ -2623,7 +2623,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
             "path": str(retained_candidate),
             "sha256": digest(retained_candidate),
         }
-        pin = mock.patch.object(helper, "PREPARED_REGISTRY_SHA256", digest(ROOT / "crates/phoenix-db/src/migrations.rs"))
+        pin = mock.patch.object(helper, "PREPARED_REGISTRY_SHA256", self.raw["registry"]["sha256"])
         pin.start()
         self.addCleanup(pin.stop)
         receipt = self.artifact(helper.PREPARED_RECEIPT, json.dumps({

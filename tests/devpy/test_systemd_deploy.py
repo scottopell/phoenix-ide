@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -804,14 +805,26 @@ class SystemdDeployCommandTests(unittest.TestCase):
             base = Path(td)
             binary, receipt = self.linux_prepared_directory(base)
             from scripts import systemd_deploy_helper as linux_helper
-            registry_sha = self.dev._file_sha256(ROOT / "crates/phoenix-db/src/migrations.rs")
+            registry_source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
+            registry_match = re.search(r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)", registry_source, re.DOTALL)
+            self.assertIsNotNone(registry_match)
+            historical_entries, removed = re.subn(
+                r"    Migration\s*\{\s*version:\s*129,.*?\n    \},", "",
+                registry_match.group(2), count=1, flags=re.DOTALL,
+            )
+            self.assertEqual(removed, 1)
+            historical_registry = base / "qualified-128-migrations.rs"
+            historical_registry.write_text(registry_source[:registry_match.start(2)] + historical_entries
+                                           + registry_source[registry_match.end(2):])
+            registry_sha = self.dev._file_sha256(historical_registry)
             raw = json.loads(receipt.read_text())
             raw["registry_sha256"] = registry_sha
             receipt.write_text(json.dumps(raw))
             captured = {}
             def materialize(commit, source, destination, kind):
                 captured.setdefault("sources", []).append((commit, source, kind))
-                destination.write_bytes((ROOT / source).read_bytes())
+                fixture_source = historical_registry if source == "crates/phoenix-db/src/migrations.rs" else ROOT / source
+                destination.write_bytes(fixture_source.read_bytes())
                 return self.dev._file_sha256(destination)
             def stage(_staging, tx, helper_path, files, **kwargs):
                 captured["manifest"] = json.loads(dict(files)["manifest.json"].read_text())

@@ -29,3 +29,7 @@ Source implementation is delivered in PR #951, including backend/spec/UI integra
 Later user correction relayed by Global selects YAGNI after checking callers. Browser sidebar/list manual and generated naming use ProductConversation identity and aggregate responses; persisted offline rename keeps its payload shape but replays through the canonical authority. The old ChainPage management UI is unrouted (`/chains` redirects); its live Q&A component is retained on ProductConversationPage. No mutable naming caller was found in iOS or phoenix-client.py; external usage is unknown.
 
 Retire transcript rename/regenerate and chain name/regenerate routes, request types, wrappers and uncalled chain-summary generation. Preserve chain read/Q&A routes, aliases, UUIDs and exact evidence. ADR-132 records the narrower mutation compatibility policy. Cleanup is source-only and awaits exact-head hosted Rust/codegen qualification; no production effects authorized.
+
+## Actual-main integration qualification
+
+Installer/producer main `f41de00825ef8993aa2a20d2fbb61d743ae3487a` is integrated, clearing the preceding ADR129–130/normative dependency. Identity runtime/UI retain the qualified c1ed176 behavior. Integration fixes only newly merged historical128 prepared-source fixtures to use their retained registry hash, not HEAD129. Fresh exact-head hosted checks/review remain required; operational results are posted on PR #951 without progress-only source churn. No incident runtime pin or production authority changes.
