@@ -7,7 +7,7 @@
 //! derived from the last response set in the payload on write.
 
 use crate::{Database, DbError, DbResult};
-use phoenix_core::domain::provider_replay::AnthropicReplayPayload;
+use phoenix_core::domain::{db_schema::Message, provider_replay::AnthropicReplayPayload};
 use sqlx::Row;
 
 pub(crate) fn validate_goal_round_replay(
@@ -429,7 +429,7 @@ impl Database {
     }
 }
 
-async fn apply_replay_tx(
+pub(super) async fn apply_replay_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conversation_id: &str,
     update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
