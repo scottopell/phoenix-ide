@@ -1,5 +1,13 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Qualified bounded foundation checkpoint — actual hosted execution
+
+Exact **ed25a228e092b41d5c112e1c7585aab406944ca3**, CI39320605328/Rust118293499801 focused **70 executed,70 passed,3397 skipped/filtered (39.155s)**; full individual statuses artifact12221238348. Includes registered fresh/upgrade/idempotence/deletion coverage, service/admission/capture and genuine continuation/Steering replay+commit-cut tests. This is not whole PR qualification or report activation. Whole Rust independently red:5213/5377executed,5175pass,38fail,191skip;164notrun afterSIGTERM. Outside-focused failure ownership/root causes require assertions, not names.
+
+The final Steering failure was a REAL shared admission defect, not only a fixture issue: after committing accepted Steering it rebuilt its step from an empty model and returnedErr.71e344215 derives the step from the actual loaded Runtime owner BEFORE writes and returns AFTER commit/cuts; generic regressions are included in actual70green. Focused-first coldcompile experiment exited124 without tests; existing workflow restored bounded focused AFTER normal with!cancelled, no skip/resources/retry machinery. Failed historical evidence retained.
+
+Source work after the green checkpoint: local17b4ea368 (unqualified/unpushed at this entry) closes ordinary/fork checkpoint state co-write holes, mandatory state/timestamp threaded through all fork delegates/caller/test sink, and statewrite-failure rollback oracle added. Pending goal-report helper remains private/uncommitted, no public invocation/activation: actual typed round/state/result/replay reconciliation and all production transaction-owner parity tests still owed. Parent alone coordinates fed133/additional UserControl+Stop schema;132 SQL/registry entries unchanged.
+
 ## Actual focused execution and corrected candidate
 
 Exactbe398 CI39305235616/Rust118240613566 focused goal filter ACTUALLY executed65:60passed,5failed,3398skipped/filtered (30.482s); full assertions/statuses artifact12215452602. No count inferred from authored tests. All5 are now proven invalid fixture setup/teardown: ineligible automatic continuation, deleting untransferred reservation, state_kind mismatch in AUQ/continuation, and Steering with no Runtime owner. Source-only corrections b69295f13+913a3c599+1c5212780 are pushed;913 adds actual no-intent continuation settled-transfer positive coverage rather than replacing it with a genericIdle assertion. No product admission/trigger relaxation.
