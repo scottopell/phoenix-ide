@@ -15,6 +15,19 @@ Complete exported span capacity is governed by [ADR-118](118_preserve-complete-s
 
 Controlled-functional build isolation is governed by [ADR-119](119_separate-controlled-functional-telemetry-build.md), affecting REQ-CVT-001/005/006.
 
+## Numbering and validation
+
+ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
+shared chain includes ADR-000; gaps between IDs are allowed so independent
+decisions do not depend on unrelated publication order. Duplicate numeric IDs
+are invalid even when their slugs differ. Keep existing IDs and accepted
+decision history unchanged; do not add placeholders or renumber records to fill
+gaps.
+
+Every ADR must retain its status, date, affected scope, required sections, and
+matching index link. Index links must resolve to the matching numbered record.
+Allowing gaps does not approve an ID allocation, decision, or publication.
+
 ## Quick reference
 
 | ADR | Title | Status | Affects |

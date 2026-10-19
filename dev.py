@@ -6874,12 +6874,13 @@ def _validate_spears_v2_shape(specs_root: Path) -> SpearsV2ShapeResult:
 
     if numbered:
         nums = [n for n, _ in numbered]
-        expected = list(range(0, max(nums) + 1))
-        if nums != expected:
-            errors.append(
-                "specs/adrs/: ADR numbers must be sequential without gaps "
-                f"(found {', '.join(f'{n:03d}' for n in nums)})"
-            )
+        if 0 not in nums:
+            errors.append("specs/adrs/: ADR numbering must start at 000")
+        seen: set[int] = set()
+        for num, path in numbered:
+            if num in seen:
+                errors.append(f"{rel(path)}: duplicate ADR number {num:03d}")
+            seen.add(num)
     else:
         errors.append("specs/adrs/: at least one numbered ADR is required")
 
