@@ -29,6 +29,54 @@ pub struct CommittedGoalRound {
     pub replayed: bool,
 }
 
+/// Committed tool evidence; the existing terminal obligation owns state projection.
+#[derive(Debug)]
+pub struct CommittedGoalTerminalRound {
+    pub results: Vec<Message>,
+    pub replayed: bool,
+}
+
+pub(crate) enum ToolRoundWrite<'a> {
+    Finalized(&'a [Message]),
+    Pending {
+        execution: GoalExecution,
+        results: &'a [ToolRoundResult],
+    },
+}
+
+pub(crate) async fn write_round_tx(
+    tx: &mut GoalTx<'_>,
+    conversation_id: &str,
+    assistant: &Message,
+    input: ToolRoundWrite<'_>,
+    state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<(Vec<Message>, bool)> {
+    if conversation_id != assistant.conversation_id {
+        return Err(DbError::Serialization(
+            "tool round transcript differs".into(),
+        ));
+    }
+    match input {
+        ToolRoundWrite::Finalized(results) => {
+            persist_finalized_round_tx(tx, assistant, results).await?;
+            Ok((results.to_vec(), false))
+        }
+        ToolRoundWrite::Pending { execution, results } => finalize_round_tx(
+            tx,
+            &GoalRoundCheckpoint {
+                assistant,
+                execution,
+                results,
+                state,
+                state_updated_at,
+            },
+        )
+        .await
+        .map_err(db_error),
+    }
+}
+
 pub(crate) fn db_error(error: GoalDbError) -> DbError {
     match error {
         GoalDbError::Sqlx(error) => DbError::Sqlx(error),
@@ -216,21 +264,17 @@ pub(crate) async fn finalize_round_tx(
 
 pub(crate) async fn selected_state_tx(
     tx: &mut GoalTx<'_>,
-    checkpoint: &GoalRoundCheckpoint<'_>,
+    conversation_id: &str,
+    state: &ConvState,
+    state_updated_at: DateTime<Utc>,
     replayed: bool,
 ) -> Result<(ConvState, DateTime<Utc>)> {
     if !replayed {
-        crate::persist_tool_round_state_tx(
-            tx,
-            &checkpoint.assistant.conversation_id,
-            checkpoint.state,
-            checkpoint.state_updated_at,
-        )
-        .await?;
-        return Ok((checkpoint.state.clone(), checkpoint.state_updated_at));
+        crate::persist_tool_round_state_tx(tx, conversation_id, state, state_updated_at).await?;
+        return Ok((state.clone(), state_updated_at));
     }
     let row = sqlx::query("SELECT state,state_updated_at FROM conversations WHERE id=?")
-        .bind(&checkpoint.assistant.conversation_id)
+        .bind(conversation_id)
         .fetch_one(&mut **tx)
         .await?;
     let state: String = row.try_get("state")?;
@@ -244,6 +288,92 @@ pub(crate) async fn selected_state_tx(
 }
 
 impl Database {
+    /// Stage a report round and selected state in the existing terminal obligation.
+    /// This does not project selected state ahead of the terminalizing command.
+    ///
+    /// # Errors
+    /// Refuses mismatched execution/projection and aborts on source, persistence,
+    /// authority or commit failure. An established retry returns original results.
+    pub async fn persist_goal_terminal_tool_round(
+        &self,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+        obligation: &crate::workflow::DirectTurnTerminalObligationInput,
+    ) -> DbResult<CommittedGoalTerminalRound> {
+        if i64::try_from(obligation.turn_id.0).ok() != Some(checkpoint.execution.turn_id())
+            || &obligation.projection.state != checkpoint.state
+            || obligation.projection.state_updated_at.timestamp_micros()
+                != checkpoint.state_updated_at.timestamp_micros()
+        {
+            return Err(DbError::Serialization(
+                "goal round terminal execution/projection differs".into(),
+            ));
+        }
+        self.persist_terminal_tool_round_input(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            obligation,
+            crate::TerminalEvidenceTransactionCut::None,
+        )
+        .await
+    }
+
+    /// Co-commit a pending goal round through the existing provider replay owner.
+    ///
+    /// # Errors
+    /// Returns an error without committing any round data if source/replay identity,
+    /// message/state persistence or the owning transaction fails.
+    pub async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> DbResult<CommittedGoalRound> {
+        self.persist_tool_round_state_and_replay_input(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            checkpoint.state,
+            checkpoint.state_updated_at,
+            update,
+        )
+        .await
+    }
+
+    /// Co-commit a pending goal round through the existing fork proposal owner.
+    ///
+    /// # Errors
+    /// Returns an error without committing any round data when proposal/source
+    /// identity, persistence or the owning transaction fails.
+    pub async fn persist_goal_fork_tool_round(
+        &self,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+        proposal: &crate::ForkProposal,
+    ) -> DbResult<CommittedGoalRound> {
+        if proposal.origin_conversation_id != checkpoint.assistant.conversation_id {
+            return Err(DbError::Serialization(
+                "goal round fork owner differs".into(),
+            ));
+        }
+        self.persist_fork_tool_round_input(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            proposal,
+            checkpoint.state,
+            checkpoint.state_updated_at,
+        )
+        .await
+    }
+
     /// Commit genuine paired results, goal reports and selected state atomically.
     ///
     /// # Errors
@@ -253,19 +383,16 @@ impl Database {
         &self,
         checkpoint: &GoalRoundCheckpoint<'_>,
     ) -> DbResult<CommittedGoalRound> {
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let (results, replayed) = finalize_round_tx(&mut tx, checkpoint)
-            .await
-            .map_err(db_error)?;
-        let (state, state_updated_at) = selected_state_tx(&mut tx, checkpoint, replayed)
-            .await
-            .map_err(db_error)?;
-        tx.commit().await?;
-        Ok(CommittedGoalRound {
-            results,
-            state,
-            state_updated_at,
-            replayed,
-        })
+        self.persist_tool_round_and_state_input(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            checkpoint.state,
+            checkpoint.state_updated_at,
+        )
+        .await
     }
 }

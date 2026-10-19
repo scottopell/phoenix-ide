@@ -289,7 +289,9 @@ pub enum DbError {
     DormantGitRepositoryReadinessCatchupInProgress,
     #[error("dormant git repository readiness receipt targeted a different database lifecycle")]
     DormantGitRepositoryReadinessReceiptTargetMismatch,
-    #[error("dormant git repository readiness receipt did not match an exact completed catch-up operation")]
+    #[error(
+        "dormant git repository readiness receipt did not match an exact completed catch-up operation"
+    )]
     DormantGitRepositoryReadinessReceiptOperationMismatch,
 }
 
@@ -1686,7 +1688,7 @@ enum ExpectedParentScope<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalEvidenceTransactionCut {
+pub(crate) enum TerminalEvidenceTransactionCut {
     None,
     BeforeCommit,
     AfterCommit,
@@ -4415,8 +4417,8 @@ impl Database {
                         if values.0.as_ref() != *expected_scope {
                             tx.rollback().await?;
                             return Err(DbError::CloseFoundationConflict(format!(
-                            "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
-                        )));
+                                "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
+                            )));
                         }
                         values
                     }
@@ -8800,7 +8802,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope lifecycle: {other}"
-                )))
+                )));
             }
         };
         let environment = match environment.as_str() {
@@ -8830,7 +8832,7 @@ impl Database {
             other => {
                 return Err(DbError::Serialization(format!(
                     "unknown WorkScope environment kind: {other}"
-                )))
+                )));
             }
         };
         Ok((authority, lifecycle, environment))
@@ -10097,16 +10099,77 @@ impl Database {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
+        self.persist_fork_tool_round_input(
+            origin_conv_id,
+            assistant,
+            conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            proposal,
+            state,
+            state_updated_at,
+        )
+        .await
+        .map(|_| ())
+    }
 
-        conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
-            .await?;
-
-        insert_fork_proposal_tx(&mut tx, proposal).await?;
-        persist_tool_round_state_tx(&mut tx, origin_conv_id, state, state_updated_at).await?;
-
+    pub(crate) async fn persist_fork_tool_round_input(
+        &self,
+        origin_conv_id: &str,
+        assistant: &Message,
+        input: conversation_goals::round::ToolRoundWrite<'_>,
+        proposal: &ForkProposal,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<conversation_goals::round::CommittedGoalRound> {
+        use conversation_goals::round::{
+            db_error, selected_state_tx, write_round_tx, CommittedGoalRound,
+        };
+        if proposal.origin_conversation_id != origin_conv_id {
+            return Err(DbError::Serialization(
+                "fork tool round transcript differs".into(),
+            ));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (results, replayed) = write_round_tx(
+            &mut tx,
+            origin_conv_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
+        )
+        .await?;
+        if replayed {
+            let retained = sqlx::query(FORK_PROPOSAL_SELECT_COLUMNS)
+                .bind(&proposal.id)
+                .try_map(parse_fork_proposal_row)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| DbError::Serialization("goal round fork proposal missing".into()))?;
+            if retained.origin_conversation_id != proposal.origin_conversation_id
+                || retained.task_file != proposal.task_file
+                || retained.title != proposal.title
+                || retained.priority != proposal.priority
+                || retained.body != proposal.body
+                || retained.created_at != proposal.created_at
+            {
+                return Err(DbError::Serialization(
+                    "goal round fork proposal differs".into(),
+                ));
+            }
+        } else {
+            insert_fork_proposal_tx(&mut tx, proposal).await?;
+        }
+        let (state, state_updated_at) =
+            selected_state_tx(&mut tx, origin_conv_id, state, state_updated_at, replayed)
+                .await
+                .map_err(db_error)?;
         tx.commit().await?;
-        Ok(())
+        Ok(CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        })
     }
 
     /// Atomically persist a completed tool round: the assistant message row and
@@ -10171,12 +10234,51 @@ impl Database {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
-            .await?;
-        persist_tool_round_state_tx(&mut tx, conversation_id, state, state_updated_at).await?;
+        self.persist_tool_round_and_state_input(
+            conversation_id,
+            assistant,
+            conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            state,
+            state_updated_at,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn persist_tool_round_and_state_input(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: conversation_goals::round::ToolRoundWrite<'_>,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<conversation_goals::round::CommittedGoalRound> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (results, replayed) = conversation_goals::round::write_round_tx(
+            &mut tx,
+            conversation_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
+        )
+        .await?;
+        let (state, state_updated_at) = conversation_goals::round::selected_state_tx(
+            &mut tx,
+            conversation_id,
+            state,
+            state_updated_at,
+            replayed,
+        )
+        .await
+        .map_err(conversation_goals::round::db_error)?;
         tx.commit().await?;
-        Ok(())
+        Ok(conversation_goals::round::CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        })
     }
 
     /// Persist a terminal tool checkpoint and its direct-turn obligation atomically.
@@ -10192,15 +10294,82 @@ impl Database {
         obligation: &workflow::DirectTurnTerminalObligationInput,
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
-            .await?;
-        workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
+        self.persist_terminal_tool_round_input(
+            conversation_id,
+            assistant,
+            conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            obligation,
+            cut,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn persist_terminal_tool_round_input(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: conversation_goals::round::ToolRoundWrite<'_>,
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> DbResult<conversation_goals::round::CommittedGoalTerminalRound> {
+        use conversation_goals::round::{write_round_tx, CommittedGoalTerminalRound};
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let turn_conversation: String =
+            sqlx::query_scalar("SELECT conversation_id FROM durable_turns WHERE turn_id=?")
+                .bind(
+                    i64::try_from(obligation.turn_id.0)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+        if turn_conversation != conversation_id {
+            return Err(DbError::Serialization(
+                "terminal tool round transcript differs".into(),
+            ));
+        }
+        let (results, replayed) = write_round_tx(
+            &mut tx,
+            conversation_id,
+            assistant,
+            input,
+            &obligation.projection.state,
+            obligation.projection.state_updated_at,
+        )
+        .await?;
+        let obligation_result =
+            workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await;
+        match obligation_result {
+            Ok(()) => {}
+            Err(DbError::DirectTurnConflict(phoenix_workflow::TurnConflict::StaleGeneration {
+                ..
+            })) if replayed => {
+                tx.rollback().await?;
+                let evidence = workflow::TerminalEvidenceExpectation::Messages(
+                    std::iter::once(assistant.clone())
+                        .chain(results.iter().cloned())
+                        .collect(),
+                );
+                let probe = self
+                    .workflow_repository()
+                    .probe_exact_terminal_evidence(&evidence, obligation)
+                    .await?;
+                if matches!(probe, workflow::TerminalEvidenceProbe::Established { .. }) {
+                    return Ok(CommittedGoalTerminalRound { results, replayed });
+                }
+                return Err(DbError::Serialization(
+                    "goal round terminal evidence is not established".into(),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        if !replayed {
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(Utc::now().to_rfc3339())
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         if cut == TerminalEvidenceTransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(DbError::Serialization(
@@ -10213,7 +10382,7 @@ impl Database {
                 "injected after-commit cut".to_string(),
             ));
         }
-        Ok(())
+        Ok(CommittedGoalTerminalRound { results, replayed })
     }
 
     /// Persist a terminal tool round and its obligation in one transaction.
@@ -12495,7 +12664,7 @@ impl Database {
                     value => {
                         return Err(DbError::Serialization(format!(
                             "unknown startup parent action {value}"
-                        )))
+                        )));
                     }
                 };
                 Ok(StartupParentActionRecord {
@@ -18708,7 +18877,10 @@ mod tests {
             "SELECT server_name, resource_uri, scopes, expires_at FROM mcp_oauth_tokens",
             "SELECT id, caller_instance_id, caller_display_name, created_at_us, revoked_at_us FROM federation_enrollments",
         ] {
-            assert!(!db.coordinator_query(sql).await.unwrap().rows.is_empty(), "{sql}");
+            assert!(
+                !db.coordinator_query(sql).await.unwrap().rows.is_empty(),
+                "{sql}"
+            );
         }
     }
 

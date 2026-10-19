@@ -13,6 +13,9 @@ use super::{at, bound_report, replace, t};
 #[path = "checkpoint/round.rs"]
 mod round;
 
+#[path = "checkpoint/owners.rs"]
+mod owners;
+
 async fn pending_fixture(
     outcome: GoalReportOutcome,
 ) -> (Database, GoalMutation, GoalPendingReport) {

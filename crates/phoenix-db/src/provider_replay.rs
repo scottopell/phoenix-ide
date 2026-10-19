@@ -158,27 +158,76 @@ impl Database {
         state_updated_at: chrono::DateTime<chrono::Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> DbResult<()> {
-        let mut tx = self.pool().begin().await?;
-        crate::conversation_goals::round::persist_finalized_round_tx(
-            &mut tx,
+        self.persist_tool_round_state_and_replay_input(
+            conversation_id,
             assistant,
-            tool_results,
+            crate::conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            state,
+            state_updated_at,
+            update,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn persist_tool_round_state_and_replay_input(
+        &self,
+        conversation_id: &str,
+        assistant: &phoenix_core::domain::db_schema::Message,
+        input: crate::conversation_goals::round::ToolRoundWrite<'_>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> DbResult<crate::conversation_goals::round::CommittedGoalRound> {
+        use crate::conversation_goals::round::{
+            db_error, selected_state_tx, write_round_tx, CommittedGoalRound, ToolRoundWrite,
+        };
+        use phoenix_core::domain::{
+            db_schema::MessageContent, provider_replay::ProviderReplayUpdate,
+        };
+        if matches!(&input, ToolRoundWrite::Pending { .. }) {
+            let MessageContent::Agent(blocks) = &assistant.content else {
+                return Err(DbError::Serialization("goal round replay assistant".into()));
+            };
+            let source_matches = match update {
+                ProviderReplayUpdate::Anthropic(set) => {
+                    set.owner_message_id == assistant.message_id && &set.public_content == blocks
+                }
+                ProviderReplayUpdate::Responses(set) => {
+                    set.owner_message_id == assistant.message_id && &set.public_content == blocks
+                }
+                ProviderReplayUpdate::Clear => true,
+            };
+            if !source_matches {
+                return Err(DbError::Serialization(
+                    "goal round replay owner differs".into(),
+                ));
+            }
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let (results, replayed) = write_round_tx(
+            &mut tx,
+            conversation_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
         )
         .await?;
-        crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        sqlx::query("UPDATE conversations SET state=?1, state_kind=?2, state_updated_at=?3, updated_at=?4 WHERE id=?5")
-            .bind(state_json)
-            .bind(crate::conv_state_kind(state))
-            .bind(state_updated_at.to_rfc3339())
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        apply_replay_tx(&mut tx, conversation_id, update).await?;
+        let (state, state_updated_at) =
+            selected_state_tx(&mut tx, conversation_id, state, state_updated_at, replayed)
+                .await
+                .map_err(db_error)?;
+        if !replayed {
+            apply_replay_tx(&mut tx, conversation_id, update).await?;
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        })
     }
 
     /// Atomically persist one public message and clear private replay state.
