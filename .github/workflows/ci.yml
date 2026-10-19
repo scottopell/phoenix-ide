@@ -104,7 +104,15 @@ jobs:
           git config --global user.name "Phoenix CI"
       - name: Install musl compiler
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: ./dev.py check (rust,cargo-fmt)
+        if: ${{ !cancelled() }}
+        id: rust_check
+        run: |
+          mkdir -p ci-rust-logs
+          set -o pipefail
+          ./dev.py check --lanes rust,cargo-fmt 2>&1 | tee ci-rust-logs/check.log
       - name: Focused goal qualification
+        if: ${{ !cancelled() }}
         id: goal_check
         timeout-minutes: 8
         env:
@@ -119,13 +127,6 @@ jobs:
             --test-threads 2 --no-fail-fast --failure-output immediate-final \
             --status-level all --final-status-level all \
             2>&1 | tee ci-rust-logs/goals.log
-      - name: ./dev.py check (rust,cargo-fmt)
-        if: ${{ !cancelled() }}
-        id: rust_check
-        run: |
-          mkdir -p ci-rust-logs
-          set -o pipefail
-          ./dev.py check --lanes rust,cargo-fmt 2>&1 | tee ci-rust-logs/check.log
       - name: Retain Rust qualification evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
