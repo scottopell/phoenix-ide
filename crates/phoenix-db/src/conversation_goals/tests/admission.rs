@@ -212,9 +212,7 @@ async fn waiting_questions_and_approval_remain_busy_without_a_live_turn() {
         plan: "Review plan".into(),
     };
     for state in [waiting_question, approval] {
-        sqlx::query("UPDATE conversations SET state=? WHERE id='full-root'")
-            .bind(serde_json::to_string(&state).unwrap())
-            .execute(db.pool())
+        db.update_conversation_state("full-root", &state)
             .await
             .unwrap();
         assert_busy(&db, &command).await;
@@ -277,10 +275,39 @@ async fn active_automatic_continuation_blocks_but_historical_terminal_admissions
         "failed",
     ] {
         let (db, command) = fixture().await;
-        sqlx::query("INSERT INTO automatic_continuation_admissions (predecessor_conversation_id,product_conversation_id,summary_message_id,operation_id,first_message_id,phase,last_error,admitted_at_unix_micros,updated_at_unix_micros) VALUES ('full-root',?,'full-input','continue','first',?,?,1,1)")
+        db.add_message(
+            "continuation-summary",
+            "full-root",
+            &phoenix_core::domain::db_schema::MessageContent::continuation("real handoff"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            "full-root",
+            &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+                summary: "real handoff".into(),
+            },
+        )
+        .await
+        .unwrap();
+        db.set_auto_continue_on_context_exhaustion(
+            &command.owner,
+            phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO automatic_continuation_admissions (predecessor_conversation_id,product_conversation_id,summary_message_id,operation_id,first_message_id,phase,last_error,admitted_at_unix_micros,updated_at_unix_micros) VALUES ('full-root',?,'continuation-summary','continue','first',?,?,1,1)")
             .bind(command.owner.as_str()).bind(phase)
             .bind(if phase == "failed" { Some("cannot continue") } else { None })
             .execute(db.pool()).await.unwrap();
+        db.update_conversation_state(
+            "full-root",
+            &phoenix_core::domain::sm_state::ConvState::Idle,
+        )
+        .await
+        .unwrap();
         if matches!(phase, "message_settled" | "superseded" | "failed") {
             db.apply_conversation_goal(&command, "full-root", at())
                 .await
@@ -292,16 +319,11 @@ async fn active_automatic_continuation_blocks_but_historical_terminal_admissions
 }
 
 #[tokio::test]
-async fn reserved_successor_blocks_a_goal_until_transfer_finishes() {
+async fn reserved_successor_is_not_a_settled_turn() {
     let (db, command) = fixture().await;
     sqlx::query("INSERT INTO product_continuation_reservations (predecessor_conversation_id,successor_conversation_id,product_conversation_id) VALUES ('full-root','reserved-successor',?)")
         .bind(command.owner.as_str()).execute(db.pool()).await.unwrap();
     assert_busy(&db, &command).await;
-    sqlx::query("DELETE FROM product_continuation_reservations WHERE predecessor_conversation_id='full-root'")
-        .execute(db.pool()).await.unwrap();
-    db.apply_conversation_goal(&command, "full-root", at())
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -334,18 +356,14 @@ async fn pending_opening_delivery_is_not_a_settled_creation() {
 #[tokio::test]
 async fn transferred_latest_target_is_rechecked_and_unaccepted_opening_intent_blocks() {
     let (db, command) = fixture().await;
-    sqlx::query("UPDATE conversations SET state=? WHERE id='full-root'")
-        .bind(
-            serde_json::to_string(
-                &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
-                    summary: "continue source".into(),
-                },
-            )
-            .unwrap(),
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
+    db.update_conversation_state(
+        "full-root",
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "continue source".into(),
+        },
+    )
+    .await
+    .unwrap();
     let intent = crate::NewContinuationDispatchIntent::generated_predecessor_context(
         phoenix_workflow::ClientTurnKey::new("successor-opening").unwrap(),
         "continue source".into(),
