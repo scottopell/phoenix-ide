@@ -2036,8 +2036,8 @@ def _stage_handoff_locked(
         manifest = Manifest.load(manifest_path)
         if manifest.mode not in {"ordinary", PROTECTED_MODE}:
             raise ValidationError("unknown systemd deployment mode")
-        if manifest.mode == PROTECTED_MODE and expected_bundle_sha256 is None:
-            raise ValidationError("protected systemd staging requires a controller-bound bundle")
+        if manifest.source_kind == "prepared_artifact" and expected_bundle_sha256 is None:
+            raise ValidationError("prepared systemd staging requires a controller-bound bundle")
         capture_rollback(transaction, policy, manifest_path)
         manifest = Manifest.load(manifest_path)
         if manifest.previous is None:

@@ -478,14 +478,14 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
             sources.append({"name": name, "source": str(source), "sha256": digest(source)})
         return sources
 
-    def test_stage_handoff_copies_allowlisted_files_and_acquires_claim(self):
+    def test_ordinary_legacy_stage_handoff_copies_allowlisted_files_and_acquires_claim(self):
         sources = self.staging_sources()
         source_manifest = self.base / "source-manifest.json"
         source_manifest.write_text(json.dumps(self.raw))
         sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
         policy = self.staging_policy()
         with mock.patch.object(helper, "prepare_data_directory", return_value=True):
-            manifest = stage_handoff(self.bundle(sources), os.getuid(), policy)
+            manifest = helper.stage_handoff_legacy(self.bundle(sources), os.getuid(), policy)
         self.assertEqual(policy.transaction_root / self.transaction_id / "manifest.json", manifest)
         self.assertEqual(self.transaction_id, policy.active_path.read_text().strip())
         self.assertEqual("candidate-binary", (manifest.parent / "candidate-binary").read_text())
@@ -2725,7 +2725,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.assertEqual(manifest.prepared_artifact_receipt.sha256, digest(destination / helper.PREPARED_RECEIPT))
         self.assertEqual(0o400, (destination / helper.PREPARED_RECEIPT).stat().st_mode & 0o777)
 
-    def test_root_handoff_captures_installed_config_and_seals_manifest(self):
+    def test_published_legacy_root_handoff_captures_installed_config_and_seals_manifest(self):
         manifest = self.protected()
         root = self.base.resolve() / "root-handoff"
         policy = dataclasses.replace(self.policy, transaction_root=root / "transactions",
@@ -2758,7 +2758,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         with mock.patch.object(helper, "copy_handoff_file", side_effect=copy), \
              mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.previous), \
              mock.patch.object(helper, "prepare_data_directory", side_effect=AssertionError("preserve live data ownership")):
-            staged_path = stage_handoff(bundle, os.getuid(), policy)
+            staged_path = helper.stage_handoff_legacy(bundle, os.getuid(), policy)
         staged = helper.Manifest.load(staged_path)
         self.assertEqual(0o400, staged_path.stat().st_mode & 0o777)
         self.assertEqual(os.getuid(), staged_path.stat().st_uid)
