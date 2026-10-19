@@ -1,4 +1,4 @@
-# ADR-136: Retained exact-root identity results use application-only recovery
+# ADR-139: Retained exact-root identity results use application-only recovery
 
 - **Status:** Accepted
 - **Date:** 2026-10-17
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-135 admits one policy-issued exact-root identity observation, persists its typed
+ADR-138 admits one policy-issued exact-root identity observation, persists its typed
 application before ACK, and permits ACK-only recovery after application. It deliberately
 does not authorize recovery when the same live guardian completed and retained the
 observation before the issuing runner durably applied it.
@@ -65,15 +65,15 @@ release guardian custody. A later crash uses ACK-only recovery and never reappli
 
 ## Supersession
 
-This decision refines ADR-135 only for retained completed-before-application exact-root
+This decision refines ADR-138 only for retained completed-before-application exact-root
 identity results. It does not broaden the admitted identity target or any mutation authority.
 
 ## References
 
-- [ADR-131: Detach-and-fence](131_controller-loss-detaches-and-fences-surviving-guardian.md).
-- [ADR-132: Same-build native guardian IPC](132_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md).
-- [ADR-133: Retained native application-only recovery](133_retained-native-results-use-application-only-recovery.md).
-- [ADR-135: Exact-root identity observation](135_exact-root-identity-observation-is-distinct-native-authority.md).
+- [ADR-134: Detach-and-fence](134_controller-loss-detaches-and-fences-surviving-guardian.md).
+- [ADR-135: Same-build native guardian IPC](135_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md).
+- [ADR-136: Retained native application-only recovery](136_retained-native-results-use-application-only-recovery.md).
+- [ADR-138: Exact-root identity observation](138_exact-root-identity-observation-is-distinct-native-authority.md).
 - [Standalone controller requirements](../standalone-deployment-controller/requirements.md), REQ-SDC-018 and REQ-SDC-022.
 - [Standalone controller behavior](../standalone-deployment-controller/standalone-deployment-controller.allium), `NativeGuardianPersistenceBoundary`.
 - [Compatibility requirements](../compatibility/requirements.md), REQ-COMP-001 and REQ-COMP-005.
