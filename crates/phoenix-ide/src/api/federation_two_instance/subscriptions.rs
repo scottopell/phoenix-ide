@@ -1251,12 +1251,14 @@ async fn source_and_coordinator_continuation_preserve_exact_fact_and_follow_curr
     else {
         panic!("destination-qualified paths required")
     };
-    assert!(stable_url.starts_with(b.origin.as_str()));
+    let origin = b.origin.to_string();
+    assert!(stable_url.starts_with(origin.as_str()));
     assert_eq!(
         source_url,
         b.origin
             .navigation_url(&crate::api::product_conversations::exact_transcript_route(
-                &source.id.parse().unwrap()
+                &phoenix_core::domain::close::TranscriptConversationId::parse(source.id.clone())
+                    .unwrap(),
             ))
             .unwrap()
             .as_url()
@@ -1370,10 +1372,7 @@ async fn source_unsubscribe_or_revoke_before_authorization_suppresses_staged_adm
         if reason == SubscriptionState::Revoked {
             b.state
                 .db
-                .revoke_federation_enrollment(
-                    a.state.db.instance_id().await.unwrap(),
-                    chrono::Utc::now().timestamp_micros(),
-                )
+                .revoke_federation_enrollment(a.state.db.instance_id().await.unwrap())
                 .await
                 .unwrap();
         } else {
