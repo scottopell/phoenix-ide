@@ -407,8 +407,10 @@ async fn outer_round_rollback_removes_genuine_source_result_and_goal_change_toge
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     assert!(matches!(
         apply_goal_tx(&mut tx, &report, Some("full-root"), at()).await,
-        Err(GoalDbError::ActorMismatch)
+        Err(GoalDbError::Integrity("source message missing"))
     ));
+    tx.rollback().await.unwrap();
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     insert_complete_report_round(&mut tx, &source).await;
     let applied = apply_goal_tx(&mut tx, &report, Some("full-root"), at())
         .await
