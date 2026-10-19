@@ -2663,8 +2663,24 @@ impl RuntimeManager {
             return;
         }
 
+        let Some(fence) = self.bash_handles.begin_teardown(work_scope).await else {
+            return;
+        };
+        if let Some(uncertainty) = fence.scope_uncertainty().await {
+            tracing::warn!(work_scope = %scope_id, ?uncertainty, "work scope retirement blocked: bash shutdown remains unverified");
+            return;
+        }
+        for registered in self.bash_handles.owner_handles(work_scope).await {
+            if registered.handle.state().await.is_live() {
+                self.bash_handles
+                    .reopen_spawn_admission(work_scope, fence.generation())
+                    .await;
+                return;
+            }
+        }
+
         let proof = phoenix_core::work_scope::WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(scope_id.clone());
-        match self
+        let retired = match self
             .db
             .retire_work_scope(proof, "browser teardown removed final runtime resource")
             .await
@@ -2682,11 +2698,19 @@ impl RuntimeManager {
                     tracing::warn!(work_scope = %scope_id, pgid, %error, "bash process-group cleanup after work-scope retirement failed");
                 }
                 tracing::debug!(work_scope = %scope_id, "retired unowned work scope after browser teardown");
+                true
             }
-            Ok(_) => {}
+            Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::AlreadyRetired) => true,
+            Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::Blocked(_)) => false,
             Err(error) => {
                 tracing::warn!(work_scope = %scope_id, %error, "work scope retirement after browser teardown failed");
+                false
             }
+        };
+        if !retired {
+            self.bash_handles
+                .reopen_spawn_admission(work_scope, fence.generation())
+                .await;
         }
     }
 
@@ -11912,6 +11936,122 @@ mod scope_liveness_tests {
             mgr.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_retirement_waits_for_pending_launch_and_rejects_uncertainty() {
+        for unregistered in [false, true] {
+            let mgr = test_manager().await;
+            let scope_id = phoenix_core::work_scope::WorkScopeId::parse("pending-browser-scope")
+                .expect("scope id");
+            sqlx::query(
+                "INSERT INTO work_scopes
+                 (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+                 VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+            )
+            .bind(scope_id.as_str())
+            .execute(mgr.db().pool())
+            .await
+            .expect("insert active scope");
+            let scope = ResourceScopeKey::Work(scope_id.clone());
+            let mut reservation = mgr.bash_handles().reserve_spawn(&scope).await.unwrap();
+            let retirement = mgr.retire_scope_after_browser_teardown(&scope);
+            tokio::pin!(retirement);
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut retirement,)
+                    .await
+                    .is_err()
+            );
+            let lifecycle: String =
+                sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                    .bind(scope_id.as_str())
+                    .fetch_one(mgr.db().pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                lifecycle, "active",
+                "pending launch must block DB retirement"
+            );
+            assert!(matches!(
+                mgr.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
+            ));
+
+            if unregistered {
+                reservation.mark_unregistered();
+            }
+            drop(reservation);
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut retirement)
+                .await
+                .expect("settled launch must release retirement waiter");
+            // Exercise a later browser edge after the reservation has already settled.
+            mgr.retire_scope_after_browser_teardown(&scope).await;
+            let lifecycle: String =
+                sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                    .bind(scope_id.as_str())
+                    .fetch_one(mgr.db().pool())
+                    .await
+                    .unwrap();
+            assert_eq!(lifecycle, if unregistered { "active" } else { "retired" });
+            assert!(matches!(
+                mgr.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_retirement_reopens_admission_when_database_rejects_retirement() {
+        for database_error in [false, true] {
+            let mgr = test_manager().await;
+            let scope_id = if database_error {
+                let scope_id =
+                    phoenix_core::work_scope::WorkScopeId::parse("db-error-browser-scope")
+                        .expect("scope id");
+                sqlx::query(
+                    "INSERT INTO work_scopes
+                     (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+                     VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+                )
+                .bind(scope_id.as_str())
+                .execute(mgr.db().pool())
+                .await
+                .unwrap();
+                sqlx::query(
+                    "CREATE TRIGGER reject_browser_retirement
+                     BEFORE UPDATE OF lifecycle ON work_scopes
+                     WHEN NEW.lifecycle = 'retired'
+                     BEGIN SELECT RAISE(ABORT, 'injected retirement failure'); END",
+                )
+                .execute(mgr.db().pool())
+                .await
+                .unwrap();
+                scope_id
+            } else {
+                mgr.db()
+                    .initialize_coordinator_work_scope("/tmp")
+                    .await
+                    .unwrap()
+                    .work_scope_id
+            };
+            let scope = ResourceScopeKey::Work(scope_id.clone());
+
+            mgr.retire_scope_after_browser_teardown(&scope).await;
+
+            let lifecycle: String =
+                sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                    .bind(scope_id.as_str())
+                    .fetch_one(mgr.db().pool())
+                    .await
+                    .unwrap();
+            assert_eq!(lifecycle, "active");
+            let reservation = mgr.bash_handles().reserve_spawn(&scope).await;
+            assert!(
+                reservation.is_ok(),
+                "DB rejection must reopen its own fence"
+            );
+        }
     }
 
     #[tokio::test]

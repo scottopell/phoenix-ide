@@ -2,10 +2,13 @@ name: Bash launch settlement
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/phoenix-tools/src/bash/**'
       - 'crates/phoenix-core/src/process_identity.rs'
       - 'crates/phoenix-core/src/domain/tool_wire.rs'
+      - 'crates/phoenix-ide/src/runtime.rs'
+      - 'crates/phoenix-ide/src/runtime/**'
       - '.github/workflows/bash-launch.yml'
   workflow_dispatch:
 
@@ -14,6 +17,7 @@ permissions:
 
 jobs:
   fault-tests:
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
     name: Bash launch faults (${{ matrix.os }}, exact head)
     strategy:
       fail-fast: false
@@ -33,9 +37,12 @@ jobs:
       - name: Fault-injected launch and identity regressions
         run: |
           cargo test -p phoenix-core process_identity::tests
+          cargo test -p phoenix-core domain::tool_wire::bash_tmux_wire_tests
           cargo test -p phoenix-tools bash::operations::tests
           cargo test -p phoenix-tools bash::ring::tests
           cargo test -p phoenix-tools bash::registry::tests::cascade_same_scope_inheritor_reports_unregistered_launch_uncertainty
+          cargo test -p phoenix-tools bash::registry::tests::unregistered_launch_retains_pending_reservation_until_settlement
+          cargo test -p phoenix-ide browser_retirement
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -126,6 +126,16 @@ impl BashTeardownFence {
     pub fn generation(&self) -> BashTeardownGeneration {
         self.generation
     }
+
+    pub async fn scope_uncertainty(&self) -> Option<BashScopeUncertainty> {
+        self.entry
+            .read()
+            .await
+            .admission
+            .unverified_launch
+            .load(Ordering::Acquire)
+            .then_some(BashScopeUncertainty::UnregisteredLaunch)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
