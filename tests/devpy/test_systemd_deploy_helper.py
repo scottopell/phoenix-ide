@@ -2615,9 +2615,11 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.assertEqual("current_forward_failed", self.execute(manifest, ctl, "partial"))
         with mock.patch.object(helper, "restore", side_effect=AssertionError("predecessor restore forbidden")) as restore, \
              mock.patch.object(helper, "installed_runtime_identity", return_value=manifest.expected), \
-             mock.patch.object(helper.subprocess, "run", side_effect=self.runtime(manifest)):
+             mock.patch.object(helper.subprocess, "run", side_effect=self.runtime(manifest)), \
+             mock.patch.object(helper, "wait_for_identity") as health:
             self.assertEqual("committed", helper.recover_current(manifest, ctl, self.policy))
         restore.assert_not_called()
+        health.assert_called_once_with(manifest, manifest.expected, manifest.expected_health_url)
         self.assertEqual(manifest.candidate.binary.sha256, helper.sha256(Path(self.targets.binary)))
 
     def test_distinct_protocol_queries_preserve_published_v2_and_ordinary_v1(self):
