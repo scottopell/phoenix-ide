@@ -28,7 +28,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const REQUEST_BYTES: usize = 8 * 1024;
-const RESPONSE_BYTES: usize = 64 * 1024;
+pub(crate) const RESPONSE_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubscriptionOperation {
