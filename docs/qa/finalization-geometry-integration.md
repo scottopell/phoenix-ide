@@ -30,7 +30,7 @@ stock runtime job is preserved.
 | Prose/table/transcript fixtures | `ui/src/fixtures/assistantFinalization/`: `acl-reply.md`, `renderFixture.{tsx,css}`, `tableFixture.{tsx,css}`, `transcriptFixture.{tsx,css}` |
 | Ladle entrypoints | `ui/src/stories/`: `assistant-finalization.stories.tsx`, `streaming-table.stories.tsx`, `assistant-finalization-transcript.stories.tsx`, `subagent-task-details.stories.tsx` |
 | Component regressions | `AssistantMessageChrome.test.tsx`, `StreamingMessage.tables.test.tsx`, `StreamingMessage.disclosures.test.tsx`, `MessageList.test.tsx`, `SubAgentTaskDetails.test.tsx`, `SubAgentViewerPanel.test.tsx` under `ui/src/components/` |
-| Source-only preflight | `tests/e2e/history_stock_prepare.test.py`: `geometry_source_preflight` and five geometry tests; existing unconditional offline UI step runs this suite |
+| Source-only preflight | `tests/e2e/history_stock_prepare.test.py`: `geometry_source_preflight` and seven geometry tests; existing unconditional offline UI step runs this suite |
 | Normative contract and status | `specs/conversation-ui/requirements.md`, REQ-CONV-019; `specs/conversation-ui/executive.md`, Assistant Finalization Geometry Qualification |
 | Diagnostic tools and results | [stock packet](../../tests/e2e/history-stock-prepare.md), [primary diagnostics](stock-f16-primary-diagnostic.md), [offline proof](stock-f16-lifecycle-offline-proof.md), [context-close result](results/context-close-39146439582/README.md), [actual reporter result](results/reporter-pagehide-39148822485/README.md) |
 
@@ -46,9 +46,10 @@ reject a missing entrypoint before a mock installer can be called, even when an
 ambient copy exists; missing fixture/story, changed checkout/source/hash commands,
 a missing capture command, and either omitted aggregator dependency also fail.
 Dirty ambient bytes do not change the selected-head source/hash observation.
-These tests neither import nor execute a capture entrypoint and do not add a
-pre-install gate to the geometry job. This is source discoverability, not new
-source authority or geometry qualification.
+The geometry job invokes the selected-HEAD CLI immediately after checkout and
+before pnpm, setup, or dependency installation. The CLI and regression tests
+neither import nor execute a capture entrypoint. This is an early source-only
+admission gate, not new source authority or geometry qualification.
 
 **NOT DONE:** new browser/script capture execution, Ladle/server launch, builds,
 dependency installation, SQL, full `dev.py check`, hosted CI, push, label changes,
