@@ -79,13 +79,14 @@ The exact prepared source is eligible only after its producer and installer sour
 ```bash
 ./dev.py prod deploy \
   --prepared-artifact PREPARED_DIR \
+  --expected-preparation-receipt-sha256 AUTHENTICATED_RECEIPT_SHA256 \
   --expected-full-commit 237100c79d9ce672867b284167a099fa0b7a2bcf \
   --controller-mode --controller-backend systemd \
   --controller-expected-full-commit 237100c79d9ce672867b284167a099fa0b7a2bcf \
   --systemd-current-schema-upgrade --controller-source-commit CONTROLLER_SHA
 ```
 
-`PREPARED_DIR` must contain only the exact payload and Linux preparation receipt named in REQ-PD-029. The receipt controller commit must equal `CONTROLLER_SHA`; local JSON validation does not replace independent GitHub run/source/artifact association.
+`PREPARED_DIR` must contain only the exact payload and Linux preparation receipt named in REQ-PD-029. `AUTHENTICATED_RECEIPT_SHA256` must be the exact receipt-byte digest from the selected successful run's authenticated post-upload evidence, not the Actions archive digest and not a digest derived from the local directory. The receipt controller commit must equal `CONTROLLER_SHA`; local JSON validation does not replace independent GitHub run/source/artifact association.
 
 Required host dependencies: Python SSL/SQLite support and an exact usable `lsof` executable; manual TLS with `PHOENIX_TLS_CA_CERT_PATH` also requires an exact usable `openssl`. Root staging interprets the CA only with both manual cert/key paths. It checks absolute regular non-symlink paths and service-user traversal/read modes for all three, proves cert/key parse and match with `SSLContext.load_cert_chain`, parses CA with `load_verify_locations`, resolves/probes openssl, requires exactly one CA certificate within 32 KiB with CA Basic Constraints and signing Key Usage if present, then runs `openssl verify -trusted CA -partial_chain -untrusted CERT -purpose sslserver CERT`. This admits intermediates in the configured server chain without trusting ambient system roots. Missing/unreadable/invalid/unrelated CA or mismatched cert/key rejects before staging completes or disruption; no alternate CA is saved. Activation revalidates manual TLS and resolves/probes `lsof` **before inhibits or stop**, and exclusivity uses that exact resolved executable. Missing/unusable lsof is a precondition failure without inhibits, stop or a leaked claim. Do not install dependencies or rewrite TLS evidence as part of a stopped transaction recovery.
 

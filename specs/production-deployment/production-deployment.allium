@@ -191,7 +191,9 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   the closed exact Linux receipt, sole payload/hash, candidate identity, target,
 --   registry digest, workflow run/attempt and verified checks satisfy REQ-PD-029.
 --   The operator establishes protected run/source/artifact association independently
---   of local JSON validation. This does not assert database lifecycle observations.
+--   of local JSON validation and supplies that evidence's exact receipt-byte SHA-256;
+--   the anchored copied receipt must match it before its payload hash is trusted.
+--   This does not assert database lifecycle observations.
 -- paired_database_preflight_is_valid(transaction) -> Boolean
 --   True unless transaction.kind = PreparedArtifactDeployment. For that launchd
 --   paired variant, the immutable proof has Candidate and captured predecessor

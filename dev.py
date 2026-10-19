@@ -8157,12 +8157,21 @@ def _stage_systemd_root_handoff(
     *,
     noninteractive: bool = False,
     bind_bundle: bool = True,
+    expected_helper_sha256: str | None = None,
 ) -> Path:
+    if re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        raise SystemExit("systemd handoff requires an exact transaction id")
     bundle = staging / "bundle.json"
     bundle_value = {
         "transaction_id": transaction_id,
         "files": [
-            {"name": name, "source": str(path), "sha256": _file_sha256(path)}
+            {
+                "name": name,
+                "source": str(path),
+                "sha256": expected_helper_sha256
+                if name == "helper.py" and expected_helper_sha256 is not None
+                else _file_sha256(path),
+            }
             for name, path in files
         ],
     }
@@ -8355,6 +8364,7 @@ def _prepare_linux_artifact(
     directory: Path,
     expected_full_commit: str,
     controller_commit: str,
+    expected_receipt_sha256: str,
     staging: Path,
 ) -> "ValidatedLinuxPreparedCandidate":
     from scripts.systemd_deploy_helper import ValidationError, parse_prepared_receipt
@@ -8394,6 +8404,8 @@ def _prepare_linux_artifact(
         completed_receipt_fd = receipt_fd
         receipt_fd = None
         os.close(completed_receipt_fd)
+        if receipt_sha != expected_receipt_sha256:
+            raise SystemExit("Linux prepared receipt does not match independently authenticated digest")
         try:
             metadata = parse_prepared_receipt(receipt.read_bytes())
         except (OSError, ValidationError) as exc:
@@ -8494,6 +8506,8 @@ def native_prod_deploy(
 
     controller = controller or ProdDeployControllerOptions()
     controller.require_systemd_current(release)
+    if controller.transaction_id is not None and re.fullmatch(r"[0-9a-f]{32}", controller.transaction_id) is None:
+        raise SystemExit("systemd deployment requires a 32-character lowercase transaction id")
     if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None:
         controller_commit = controller.controller_source_commit
         if controller_commit is None:
@@ -8519,6 +8533,7 @@ def native_prod_deploy(
                 controller.prepared_artifact,
                 controller.expected_full_commit,
                 controller.controller_source_commit,
+                controller.expected_preparation_receipt_sha256,
                 staging,
             )
             if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None
@@ -8565,7 +8580,7 @@ def native_prod_deploy(
         candidate_socket.chmod(0o600)
 
         helper = staging / "helper.py"
-        _materialize_source_file(
+        expected_helper_sha256 = _materialize_source_file(
             controller.controller_source_commit or prepared.source_commit,
             "scripts/systemd_deploy_helper.py",
             helper,
@@ -8591,11 +8606,24 @@ def native_prod_deploy(
         is_prepared = isinstance(prepared, ValidatedLinuxPreparedCandidate)
         expected_protocol = (SYSTEMD_PREPARED_PROTOCOL if is_prepared else SYSTEMD_PROTECTED_PROTOCOL
                              if controller.systemd_current_schema_upgrade else SYSTEMD_HANDOFF_PROTOCOL_VERSION)
-        protocol = subprocess.run(
-            [sys.executable, str(helper), "--protected-prepared-protocol-version" if is_prepared else
-             "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
+        protocol_argument = (
+            "--protected-prepared-protocol-version" if is_prepared else
+            "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"
+        )
+        if is_prepared:
+            helper_bytes = helper.read_bytes()
+            if hashlib.sha256(helper_bytes).hexdigest() != expected_helper_sha256:
+                raise SystemExit("prepared systemd helper changed after exact controller materialization")
+            protocol_result = subprocess.run(
+                [sys.executable, "-", protocol_argument], input=helper_bytes,
+                capture_output=True, check=True,
+            )
+            protocol = protocol_result.stdout.decode().strip()
+        else:
+            protocol = subprocess.run(
+                [sys.executable, str(helper), protocol_argument],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
         if protocol != str(expected_protocol):
             raise SystemExit(f"systemd helper protocol mismatch: expected {expected_protocol}, got {protocol!r}")
 
@@ -8668,6 +8696,9 @@ def native_prod_deploy(
             files.append((SYSTEMD_PREPARED_RECEIPT, prepared.receipt))
         if env_snapshot:
             files.append(("candidate.env", candidate_env))
+        prepared_stage_kwargs = (
+            {"expected_helper_sha256": expected_helper_sha256} if is_prepared else {}
+        )
         root_manifest = _stage_systemd_root_handoff(
             staging,
             transaction_id,
@@ -8675,6 +8706,7 @@ def native_prod_deploy(
             files,
             noninteractive=controller.enabled,
             bind_bundle=prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT,
+            **prepared_stage_kwargs,
         )
 
     _launch_systemd_activation(
@@ -9810,12 +9842,15 @@ class ProdDeployControllerOptions:
     transaction_id: str | None = None
     backend: str | None = None
     prepared_artifact: Path | None = None
+    expected_preparation_receipt_sha256: str | None = None
     paired_database_upgrade: bool = False
     current_schema_upgrade: bool = False
     systemd_current_schema_upgrade: bool = False
     controller_source_commit: str | None = None
 
     def require_controller_source(self, release: str | None) -> None:
+        if self.expected_preparation_receipt_sha256 is not None and not self.systemd_current_schema_upgrade:
+            raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
         if self.systemd_current_schema_upgrade:
             self.require_systemd_current(release)
             return
@@ -9855,6 +9890,8 @@ class ProdDeployControllerOptions:
         if not self.systemd_current_schema_upgrade:
             if self.controller_source_commit is not None:
                 raise SystemExit("--controller-source-commit requires --systemd-current-schema-upgrade")
+            if self.expected_preparation_receipt_sha256 is not None:
+                raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
             return
         import platform
         if (not self.enabled or self.backend != "systemd" or sys.platform != "linux"
@@ -9866,9 +9903,15 @@ class ProdDeployControllerOptions:
                     or any(value is not None for value in (
                         self.exact_release_tag, self.expected_asset_name, self.expected_asset_sha256,
                     )) or re.fullmatch(r"[0-9a-f]{40}", self.controller_source_commit or "") is None
-                    or self.controller_source_commit == self.expected_full_commit):
-                raise SystemExit("protected Linux prepared artifact requires exact app SHA, separate controller and no release pins")
+                    or self.controller_source_commit == self.expected_full_commit
+                    or re.fullmatch(r"[0-9a-f]{64}", self.expected_preparation_receipt_sha256 or "") is None):
+                raise SystemExit(
+                    "protected Linux prepared artifact requires exact app SHA, separate controller, "
+                    "authenticated --expected-preparation-receipt-sha256 and no release pins"
+                )
             return
+        if self.expected_preparation_receipt_sha256 is not None:
+            raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
         self.require_exact_release(release)
         if (release != SYSTEMD_PROTECTED_TAG or self.exact_release_tag != SYSTEMD_PROTECTED_TAG
                 or self.expected_full_commit != SYSTEMD_PROTECTED_COMMIT
@@ -11202,7 +11245,7 @@ def _materialize_source_file(
     source_path: str,
     destination: Path,
     source_kind: str,
-) -> None:
+) -> str:
     if source_kind == "local_head":
         result = subprocess.run(
             ["git", "show", f"{source_commit}:{source_path}"],
@@ -11225,6 +11268,7 @@ def _materialize_source_file(
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
+        return hashlib.sha256(result.stdout).hexdigest()
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -13232,6 +13276,10 @@ def main():
     deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepared artifact directory (macOS launchd or Linux systemd)")
+    deploy_parser.add_argument(
+        "--expected-preparation-receipt-sha256",
+        help="Authenticated exact receipt-byte SHA-256 for protected prepared Linux systemd deployment",
+    )
     deploy_parser.add_argument("--expected-full-commit", help="Exact full lowercase candidate SHA for --prepared-artifact or protected --release upgrade")
     upgrade_group = deploy_parser.add_mutually_exclusive_group()
     upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
@@ -13444,6 +13492,7 @@ def main():
                     expected_asset_sha256=args.controller_expected_asset_sha256,
                     transaction_id=args.transaction_id,
                     prepared_artifact=args.prepared_artifact,
+                    expected_preparation_receipt_sha256=args.expected_preparation_receipt_sha256,
                     paired_database_upgrade=args.paired_database_upgrade,
                     current_schema_upgrade=args.current_schema_upgrade,
                     systemd_current_schema_upgrade=args.systemd_current_schema_upgrade,

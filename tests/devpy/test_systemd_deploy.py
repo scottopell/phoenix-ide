@@ -34,6 +34,21 @@ class SystemdDeployCommandTests(unittest.TestCase):
         serialized = self.dev._serialize_env_snapshot({"TOKEN": "secret", "HEADERS": "a\nb"})
         self.assertEqual("TOKEN=secret\nHEADERS=a\\nb\n", serialized)
 
+    def test_root_staging_rejects_transaction_path_escape_before_sudo(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            helper = staging / "helper.py"
+            helper.write_text("trusted helper")
+            with self.assertRaisesRegex(SystemExit, "exact transaction id"):
+                self.dev._stage_systemd_root_handoff(
+                    staging,
+                    "../attacker-owned/bootstrap",
+                    helper,
+                    [("helper.py", helper)],
+                )
+        run.assert_not_called()
+
     def test_root_staging_failure_prevents_transient_activation(self):
         with tempfile.TemporaryDirectory() as td:
             staging = Path(td)
@@ -63,15 +78,17 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 stage_command[digest_index],
             )
 
-    def test_root_staging_rejects_unverified_bootstrap_helper(self):
+    def test_root_staging_rejects_bootstrap_outside_exact_controller_digest(self):
         with tempfile.TemporaryDirectory() as td:
             staging = Path(td)
             helper = staging / "helper.py"
-            helper.write_text("trusted helper")
+            helper.write_text("substituted helper")
+            helper_sha256 = self.dev._file_sha256(helper)
+            expected_helper_sha256 = "a" * 64
             results = [
                 subprocess.CompletedProcess([], 0, "", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
-                subprocess.CompletedProcess([], 1, "", "sha256sum failed"),
+                subprocess.CompletedProcess([], 0, f"{helper_sha256}  helper.py\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
             with mock.patch.object(self.dev.subprocess, "run", side_effect=results) as run:
@@ -81,8 +98,11 @@ class SystemdDeployCommandTests(unittest.TestCase):
                         "a" * 32,
                         helper,
                         [("helper.py", helper)],
+                        expected_helper_sha256=expected_helper_sha256,
                     )
             self.assertFalse(any("python3" in call.args[0] for call in run.call_args_list))
+            bundle = json.loads((staging / "bundle.json").read_text())
+            self.assertEqual(expected_helper_sha256, bundle["files"][0]["sha256"])
 
     def test_ordinary_root_staging_preserves_legacy_helper_cli(self):
         with tempfile.TemporaryDirectory() as td:
@@ -494,9 +514,18 @@ class SystemdDeployCommandTests(unittest.TestCase):
         self.assertEqual(2, helper["PROTECTED_HANDOFF_PROTOCOL_VERSION"])
 
     def linux_prepared_options(self, directory, **changes):
-        values = dict(enabled=True, backend="systemd", systemd_current_schema_upgrade=True,
-                      prepared_artifact=directory, expected_full_commit=self.dev.SYSTEMD_PREPARED_COMMIT,
-                      controller_source_commit="c" * 40)
+        receipt = directory / self.dev.SYSTEMD_PREPARED_RECEIPT
+        values = dict(
+            enabled=True,
+            backend="systemd",
+            systemd_current_schema_upgrade=True,
+            prepared_artifact=directory,
+            expected_preparation_receipt_sha256=(
+                self.dev._file_sha256(receipt) if receipt.is_file() else "e" * 64
+            ),
+            expected_full_commit=self.dev.SYSTEMD_PREPARED_COMMIT,
+            controller_source_commit="c" * 40,
+        )
         values.update(changes)
         return self.dev.ProdDeployControllerOptions(**values)
 
@@ -559,6 +588,9 @@ class SystemdDeployCommandTests(unittest.TestCase):
                      dict(expected_full_commit="a" * 40), dict(controller_source_commit=None),
                      dict(controller_source_commit="C" * 40),
                      dict(controller_source_commit=self.dev.SYSTEMD_PREPARED_COMMIT),
+                     dict(expected_preparation_receipt_sha256=None),
+                     dict(expected_preparation_receipt_sha256="A" * 64),
+                     dict(transaction_id="../attacker-owned/bootstrap"),
                      dict(exact_release_tag=self.dev.SYSTEMD_PROTECTED_TAG),
                      dict(expected_asset_name=self.dev.SYSTEMD_PROTECTED_ASSET),
                      dict(expected_asset_sha256=self.dev.SYSTEMD_PROTECTED_ASSET_SHA256),
@@ -584,10 +616,14 @@ class SystemdDeployCommandTests(unittest.TestCase):
             binary, receipt = self.linux_prepared_directory(base)
             expected = self.dev.RuntimeIdentity(self.dev.SYSTEMD_PREPARED_VERSION, self.dev.SYSTEMD_PREPARED_COMMIT)
 
-            def prepare():
+            def prepare(expected_receipt_sha256=None):
                 staging = Path(tempfile.mkdtemp(dir=staging_root))
                 return self.dev._prepare_linux_artifact(
-                    base, self.dev.SYSTEMD_PREPARED_COMMIT, "c" * 40, staging
+                    base,
+                    self.dev.SYSTEMD_PREPARED_COMMIT,
+                    "c" * 40,
+                    expected_receipt_sha256 or self.dev._file_sha256(receipt),
+                    staging,
                 )
 
             invoked = []
@@ -604,6 +640,16 @@ class SystemdDeployCommandTests(unittest.TestCase):
             self.assertNotEqual(receipt, candidate.receipt)
             self.assertEqual(self.dev._file_sha256(candidate.receipt), candidate.receipt_sha256)
             binary.write_bytes(b"inert Linux prepared payload")
+            authenticated_receipt_sha256 = self.dev._file_sha256(receipt)
+            original_receipt = receipt.read_text()
+            binary.write_bytes(b"jointly substituted payload")
+            substituted = json.loads(original_receipt)
+            substituted["sha256"][binary.name] = self.dev._file_sha256(binary)
+            receipt.write_text(json.dumps(substituted))
+            with self.assertRaisesRegex(SystemExit, "independently authenticated digest"):
+                prepare(authenticated_receipt_sha256)
+            binary.write_bytes(b"inert Linux prepared payload")
+            receipt.write_text(original_receipt)
             with mock.patch.object(self.dev, "_binary_identity", return_value=expected):
                 for field, value in (("schema", True), ("event", "push"), ("run_id", 0),
                                      ("run_attempt", False), ("controller_commit", "d" * 40),
@@ -701,6 +747,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                         source,
                         self.dev.SYSTEMD_PREPARED_COMMIT,
                         "c" * 40,
+                        self.dev._file_sha256(source / self.dev.SYSTEMD_PREPARED_RECEIPT),
                         staging,
                     )
             identity.assert_not_called()
@@ -719,6 +766,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             def materialize(commit, source, destination, kind):
                 captured.setdefault("sources", []).append((commit, source, kind))
                 destination.write_bytes((ROOT / source).read_bytes())
+                return self.dev._file_sha256(destination)
             def stage(_staging, tx, helper_path, files, **kwargs):
                 captured["manifest"] = json.loads(dict(files)["manifest.json"].read_text())
                 captured["stage_kwargs"] = kwargs
@@ -739,12 +787,20 @@ class SystemdDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
                  mock.patch.object(self.dev, "_stage_systemd_root_handoff", side_effect=stage), \
                  mock.patch.object(self.dev, "_launch_systemd_activation"), \
-                 mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "3\n", "")) as run:
+                 mock.patch.object(
+                     self.dev.subprocess,
+                     "run",
+                     return_value=subprocess.CompletedProcess([], 0, b"3\n", b""),
+                 ) as run:
                 self.dev.native_prod_deploy(controller=self.linux_prepared_options(base))
             manifest = captured["manifest"]
             self.assertEqual("prepared_artifact", manifest["source_kind"])
             self.assertEqual(3, manifest["manifest_version"])
             self.assertTrue(captured["stage_kwargs"]["bind_bundle"])
+            self.assertEqual(
+                self.dev._file_sha256(ROOT / "scripts/systemd_deploy_helper.py"),
+                captured["stage_kwargs"]["expected_helper_sha256"],
+            )
             self.assertNotIn("release_asset_name", manifest)
             self.assertNotIn("release_asset_sha256", manifest)
             self.assertNotIn("release_tag", manifest)
@@ -758,6 +814,11 @@ class SystemdDeployCommandTests(unittest.TestCase):
                               (self.dev.SYSTEMD_PREPARED_COMMIT, "crates/phoenix-db/src/migrations.rs", "prepared_artifact")],
                              captured["sources"])
             self.assertIn("--protected-prepared-protocol-version", run.call_args_list[0].args[0])
+            self.assertEqual("-", run.call_args_list[0].args[0][1])
+            self.assertEqual(
+                (ROOT / "scripts/systemd_deploy_helper.py").read_bytes(),
+                run.call_args_list[0].kwargs["input"],
+            )
             checkout.assert_called_once_with("c" * 40)
 
     def test_ordinary_old_release_pending_database_refuses_before_handoff_using_candidate_bytes(self):
