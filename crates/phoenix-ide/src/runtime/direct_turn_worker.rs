@@ -143,6 +143,8 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
     watch_delivery: Option<Arc<RuntimeManager>>,
+    subscription_sync:
+        Arc<tokio::sync::Mutex<crate::api::federation::subscriptions::SubscriptionSync>>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -167,6 +169,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             clock,
             process_incarnation,
             watch_delivery: None,
+            subscription_sync: Arc::default(),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
@@ -180,6 +183,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
     async fn deliver_watch_events(&self) {
         if let Some(manager) = &self.watch_delivery {
             crate::coordinator_watch_delivery::deliver_pass(manager).await;
+            self.subscription_sync.lock().await.sync_pass(manager).await;
         }
     }
 

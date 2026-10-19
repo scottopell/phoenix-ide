@@ -30,6 +30,7 @@ use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, Inst
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAuthenticated {
+    pub enrollment_id: uuid::Uuid,
     pub caller_instance_id: InstanceId,
     pub caller_display_name: String,
 }
@@ -505,18 +506,31 @@ pub async fn peer_auth_middleware(
         .filter(|token| token.starts_with("phx_peer_"))
         .map(|token| FederationCredentialVerifier::from_bearer(token.as_bytes()));
     let enrollment = match authenticated {
-        Some(verifier) => match state.db.authenticate_federation_verifier(&verifier).await {
-            Ok(enrollment) => enrollment,
-            Err(error) => {
-                tracing::warn!(%error, "federation credential lookup failed closed");
-                None
+        Some(verifier) => {
+            let enrollment = if req.method() == axum::http::Method::POST
+                && req.uri().path() == "/api/federation/peer/subscriptions/authorize"
+            {
+                state
+                    .db
+                    .authenticate_federation_delivery_verifier(&verifier)
+                    .await
+            } else {
+                state.db.authenticate_federation_verifier(&verifier).await
+            };
+            match enrollment {
+                Ok(enrollment) => enrollment,
+                Err(error) => {
+                    tracing::warn!(%error, "federation credential lookup failed closed");
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
 
     if let Some(enrollment) = enrollment {
         req.extensions_mut().insert(PeerAuthenticated {
+            enrollment_id: enrollment.enrollment_id,
             caller_instance_id: enrollment.caller_instance_id,
             caller_display_name: enrollment.caller_display_name,
         });
